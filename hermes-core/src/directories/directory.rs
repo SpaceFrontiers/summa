@@ -350,6 +350,30 @@ impl OwnedBytes {
         self.as_slice().to_vec()
     }
 
+    /// Issue `madvise(MADV_WILLNEED)` to start asynchronous kernel readahead.
+    ///
+    /// Non-blocking: returns immediately. The kernel will start paging data in
+    /// the background. For non-mmap-backed data this is a no-op.
+    ///
+    /// Call this at load time so that by the time the first query arrives
+    /// (typically 100ms+ later), pages are already in the page cache.
+    pub(crate) fn advise_willneed(&self) {
+        if self.range.is_empty() {
+            return;
+        }
+        #[cfg(all(unix, feature = "native"))]
+        if let SharedBytes::Mmap(ref mmap) = self.data {
+            let base = mmap.as_ptr().wrapping_add(self.range.start);
+            let len = self.range.len();
+            unsafe {
+                unsafe extern "C" {
+                    fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
+                }
+                madvise(base, len, 3); // MADV_WILLNEED = 3
+            }
+        }
+    }
+
     /// Touch every page in this slice to force the OS to page in the data.
     ///
     /// For mmap-backed data, this triggers page faults now (at a predictable time)

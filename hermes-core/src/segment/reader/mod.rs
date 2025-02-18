@@ -283,6 +283,16 @@ impl SegmentReader {
         &self.bmp_indexes
     }
 
+    /// Synchronously prefault all BMP index data into the page cache.
+    ///
+    /// Blocks until all pages are resident. Call from a blocking context
+    /// (e.g., `spawn_blocking`) to avoid stalling the async executor.
+    pub fn warmup_bmp(&self) {
+        for idx in self.bmp_indexes.values() {
+            idx.warmup();
+        }
+    }
+
     /// Get vector indexes for all fields
     pub fn vector_indexes(&self) -> &FxHashMap<u32, VectorIndex> {
         &self.vector_indexes

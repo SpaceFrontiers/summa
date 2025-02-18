@@ -1,16 +1,16 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V6 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V8 zero-copy**.
 //!
-//! V6 stores contiguous arrays on disk so that at load time the entire blob
-//! is acquired as a single `OwnedBytes` (mmap-backed or Arc-Vec) and sliced
-//! into typed sections. No heap allocation — all data including the superblock
-//! grid is mmap-backed.
+//! V8 uses a block-interleaved format where all data needed to score one block
+//! is contiguous (~200-2000 bytes, fits in 1-2 pages). This reduces cold-query
+//! page faults from 4+ per block to 1.
 //!
-//! V6 packs the block grid to 4-bit (50% grid memory reduction) while keeping
-//! the superblock grid at full 8-bit precision for safe hierarchical pruning.
+//! At load time the entire blob is acquired as a single `OwnedBytes` (mmap-backed
+//! or Arc-Vec) and sliced into sections. No heap allocation — all data including
+//! the superblock grid is mmap-backed.
 //!
 //! Uses **compact virtual coordinates**: sequential IDs assigned to unique
-//! `(doc_id, ordinal)` pairs. A doc_map lookup table (Section 9) maps virtual
-//! IDs back to original coordinates at query time.
+//! `(doc_id, ordinal)` pairs. A doc_map lookup table maps virtual IDs back
+//! to original coordinates at query time.
 //!
 //! Based on Mallia, Suel & Tonellotto (SIGIR 2024).
 
@@ -63,25 +63,15 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
     }
 }
 
-/// BMP V7 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V8 index for a single sparse field — fully zero-copy mmap-backed.
+///
+/// V8 uses a block-interleaved format: all scoring data for one block is
+/// contiguous. On cold queries, a single page fault loads all data needed
+/// to score a block (instead of 4+ scattered page faults in V7).
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
 /// a zero-copy OwnedBytes slice.
-///
-/// V7 packs the block grid to 4-bit (50% grid memory) while keeping sb_grid at
-/// full 8-bit. The reader unpacks 4-bit values via ×17 to get u8-equivalent
-/// upper bounds, so the same `/255.0` weight scale works for both levels.
-///
-/// V7 uses compact virtual IDs with a doc_map lookup table (Section 9) instead
-/// of the sparse `doc_id * num_ordinals + ordinal` scheme.
-///
-/// V7 stores dim_indices in Section 2 instead of dim_ids, using u16 entries
-/// when `num_dims ≤ 65536` (halving section 2 size for typical SPLADE models).
-///
-/// Hot-path accessors cache raw pointers from the OwnedBytes slices and use
-/// unchecked reads with `ptr::read_unaligned` to eliminate per-iteration bounds
-/// checks in the binary search and posting lookup loops.
 ///
 /// Uses two-level pruning hierarchy (Carlson et al., SIGIR 2025):
 /// 1. **Superblock grid**: coarse upper bounds over groups of `BMP_SUPERBLOCK_SIZE` blocks
@@ -99,19 +89,19 @@ pub struct BmpIndex {
     /// Total sparse vectors (from TOC entry)
     pub total_vectors: u32,
 
-    // ── V7 section metadata ──────────────────────────────────────────
+    // ── V8 section metadata ──────────────────────────────────────────
     num_dims: u32,
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
-    /// Bytes per element in term_dim_ids section: 2 (u16) or 4 (u32)
-    term_dim_id_width: u8,
+    /// Bytes per element in term_dim_ids within each block: 2 (u16) or 4 (u32)
+    pub(crate) term_dim_id_width: u8,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
-    block_term_starts_bytes: OwnedBytes,
-    term_dim_ids_bytes: OwnedBytes,
-    term_posting_starts_bytes: OwnedBytes,
-    postings_bytes: OwnedBytes,
+    /// Section A: block_data_starts[block_id] = byte offset into block_data_bytes
+    block_data_starts_bytes: OwnedBytes,
+    /// Section B: interleaved per-block data (all scoring data contiguous per block)
+    block_data_bytes: OwnedBytes,
     dim_ids_bytes: OwnedBytes,
     /// 4-bit packed block grid: `grid[dim_idx * packed_row_size + block_id/2]`
     grid_bytes: OwnedBytes,
@@ -131,15 +121,13 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V7 blob from the given file handle.
+    /// Parse a BMP V8 blob from the given file handle.
     ///
     /// Reads the 48-byte footer, then acquires the entire blob as a single
-    /// `OwnedBytes` and slices it into zero-copy sections. The superblock
-    /// grid is persisted on disk and loaded as a zero-copy slice — no heap
-    /// allocation at load time.
+    /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V7 stores dim_indices in Section 2 (u16 when num_dims ≤ 65536, else u32).
-    /// Uses compact virtual IDs with a doc_map lookup table (Section 9).
+    /// V8 block-interleaved format: Section A (block_data_starts) + Section B
+    /// (per-block interleaved data). All data for one block is contiguous.
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -147,22 +135,22 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V7, BMP_BLOB_MAGIC_V7};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V8, BMP_BLOB_MAGIC_V8};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V7 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V8 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
         // Read the footer (last 48 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V7 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V8 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V7 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V8 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
-        let total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
+        let _total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
         let total_postings = u32::from_le_bytes(fb[4..8].try_into().unwrap());
         let dim_ids_offset = u32::from_le_bytes(fb[8..12].try_into().unwrap());
         let _grid_offset = u32::from_le_bytes(fb[12..16].try_into().unwrap());
@@ -175,15 +163,15 @@ impl BmpIndex {
         let doc_map_offset = u32::from_le_bytes(fb[40..44].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[44..48].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V7 {
+        if magic != BMP_BLOB_MAGIC_V8 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP7 {:#x})",
-                magic, BMP_BLOB_MAGIC_V7
+                "Invalid BMP blob magic: {:#x} (expected BMP8 {:#x})",
+                magic, BMP_BLOB_MAGIC_V8
             )));
         }
 
         // Handle empty index
-        if num_blocks == 0 || total_terms == 0 {
+        if num_blocks == 0 {
             return Ok(Self {
                 bmp_block_size,
                 num_blocks,
@@ -194,10 +182,8 @@ impl BmpIndex {
                 total_postings: 0,
                 packed_row_size: 0,
                 term_dim_id_width: if num_dims <= 65536 { 2 } else { 4 },
-                block_term_starts_bytes: OwnedBytes::empty(),
-                term_dim_ids_bytes: OwnedBytes::empty(),
-                term_posting_starts_bytes: OwnedBytes::empty(),
-                postings_bytes: OwnedBytes::empty(),
+                block_data_starts_bytes: OwnedBytes::empty(),
+                block_data_bytes: OwnedBytes::empty(),
                 dim_ids_bytes: OwnedBytes::empty(),
                 grid_bytes: OwnedBytes::empty(),
                 sb_grid_bytes: OwnedBytes::empty(),
@@ -208,69 +194,62 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V7 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V8 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
 
-        // V7: Section 2 uses u16 when num_dims ≤ 65536, else u32
+        // Start async kernel readahead for the entire blob.
+        blob.advise_willneed();
+
         let term_dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
 
-        // Compute section boundaries
-        let bts_len = (num_blocks as usize + 1) * 4;
-        let tdi_len = total_terms as usize * term_dim_id_width as usize;
-        let tps_len = (total_terms as usize + 1) * 4;
-        let post_len = total_postings as usize * 2;
+        // V8 Section A: block_data_starts [u32 × (num_blocks + 1)]
+        let section_a_size = (num_blocks as usize + 1) * 4;
 
-        let bts_end = bts_len;
-        let tdi_end = bts_end + tdi_len;
-        let tps_end = tdi_end + tps_len;
-        let post_end = tps_end + post_len;
+        // V8 Section B: block_data (from end of Section A up to dim_ids_offset,
+        // which includes padding bytes that are never referenced)
+        let block_data_end = dim_ids_offset as usize;
 
-        // dim_ids and grid offsets come from footer
+        // Sections C-G: dim_ids, grid, sb_grid, doc_map
         let dim_ids_start = dim_ids_offset as usize;
         let dim_ids_end = dim_ids_start + num_dims as usize * 4;
 
-        // Grid is 4-bit packed — packed_row_size = ceil(num_blocks / 2)
         let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
         let grid_start = dim_ids_end;
         let grid_end = grid_start + num_dims as usize * packed_row_size as usize;
 
-        // sb_grid from footer — full 8-bit precision
         let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
         let sb_grid_start = sb_grid_offset as usize;
         let sb_grid_end = sb_grid_start + num_dims as usize * num_superblocks as usize;
 
-        // Section 9: doc_map (compact virtual_id → (doc_id, ordinal) lookup)
         let dm_start = doc_map_offset as usize;
         let dm_ids_end = dm_start + num_virtual_docs as usize * 4;
         let dm_ords_end = dm_ids_end + num_virtual_docs as usize * 2;
-        let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
-        let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
-        let block_term_starts_bytes = blob.slice(0..bts_end);
-        let term_dim_ids_bytes = blob.slice(bts_end..tdi_end);
-        let term_posting_starts_bytes = blob.slice(tdi_end..tps_end);
-        let postings_bytes = blob.slice(tps_end..post_end);
+        let block_data_starts_bytes = blob.slice(0..section_a_size);
+        let block_data_bytes = blob.slice(section_a_size..block_data_end);
         let dim_ids_bytes = blob.slice(dim_ids_start..dim_ids_end);
         let grid_bytes = blob.slice(grid_start..grid_end);
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
+        let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
+        let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         log::debug!(
-            "BMP V7 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
-             num_virtual_docs={}, max_weight_scale={:.4}, terms={}, postings={}, packed_row_size={}, \
-             term_dim_id_width={}, doc_map={}B",
+            "BMP V8 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
+             num_virtual_docs={}, max_weight_scale={:.4}, postings={}, packed_row_size={}, \
+             term_dim_id_width={}, block_data={}B, doc_map={}B",
             num_blocks,
             num_superblocks,
             num_dims,
             bmp_block_size,
             num_virtual_docs,
             max_weight_scale,
-            total_terms,
             total_postings,
             packed_row_size,
             term_dim_id_width,
+            block_data_end - section_a_size,
             num_virtual_docs as usize * 6,
         );
 
@@ -284,10 +263,8 @@ impl BmpIndex {
             total_postings,
             packed_row_size,
             term_dim_id_width,
-            block_term_starts_bytes,
-            term_dim_ids_bytes,
-            term_posting_starts_bytes,
-            postings_bytes,
+            block_data_starts_bytes,
+            block_data_bytes,
             dim_ids_bytes,
             grid_bytes,
             sb_grid_bytes,
@@ -406,190 +383,78 @@ impl BmpIndex {
         );
     }
 
-    // ── Hot-path query-time accessors (unchecked reads) ─────────────
+    // ── V8 hot-path block-data accessors ─────────────────────────────
 
-    /// Get the term range for a block: [start..end) into term arrays.
-    ///
-    /// Uses unchecked reads — block_id is validated by the caller
-    /// (superblock loop bounds guarantee block_id < num_blocks).
+    /// Byte offset range in block_data_bytes for a block.
     #[inline(always)]
-    pub fn block_term_range(&self, block_id: u32) -> (u32, u32) {
-        let d = self.block_term_starts_bytes.as_slice();
+    pub(crate) fn block_data_range(&self, block_id: u32) -> (u32, u32) {
+        let d = self.block_data_starts_bytes.as_slice();
         debug_assert!((block_id as usize + 2) * 4 <= d.len());
-        let base = d.as_ptr();
         unsafe {
-            let start = read_u32_unchecked(base, block_id as usize);
-            let end = read_u32_unchecked(base, block_id as usize + 1);
+            let start = read_u32_unchecked(d.as_ptr(), block_id as usize);
+            let end = read_u32_unchecked(d.as_ptr(), block_id as usize + 1);
             (start, end)
         }
     }
 
-    /// Binary search for a dimension index in a block's term range.
-    ///
-    /// V7 stores dim_indices (not dim_ids) in Section 2, using u16 or u32
-    /// depending on `term_dim_id_width`. The `dim_idx` parameter is the
-    /// position in the dim_ids array.
-    ///
-    /// Returns the absolute term index if found, or None.
-    ///
-    /// Uses unchecked pointer reads in the inner loop — bounds are validated
-    /// once via debug_assert at entry, not per-iteration.
+    /// Get a raw pointer to the start of a block's contiguous data.
+    /// Used for software prefetching — 1 prefetch loads all block scoring data.
     #[inline(always)]
-    pub fn find_dim_in_block(&self, term_start: u32, term_end: u32, dim_idx: u32) -> Option<u32> {
-        let count = (term_end - term_start) as usize;
-        if count == 0 {
-            return None;
-        }
-        let d = self.term_dim_ids_bytes.as_slice();
-        let base_idx = term_start as usize;
-        let base = d.as_ptr();
-
-        if self.term_dim_id_width == 2 {
-            // u16 path
-            debug_assert!((base_idx + count) * 2 <= d.len());
-            let mut lo = 0usize;
-            let mut hi = count;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let val = unsafe {
-                    let p = base.add((base_idx + mid) * 2);
-                    u16::from_le((p as *const u16).read_unaligned()) as u32
-                };
-                match val.cmp(&dim_idx) {
-                    std::cmp::Ordering::Less => lo = mid + 1,
-                    std::cmp::Ordering::Equal => return Some(term_start + mid as u32),
-                    std::cmp::Ordering::Greater => hi = mid,
-                }
-            }
-        } else {
-            // u32 path
-            debug_assert!((base_idx + count) * 4 <= d.len());
-            let mut lo = 0usize;
-            let mut hi = count;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let val = unsafe { read_u32_unchecked(base, base_idx + mid) };
-                match val.cmp(&dim_idx) {
-                    std::cmp::Ordering::Less => lo = mid + 1,
-                    std::cmp::Ordering::Equal => return Some(term_start + mid as u32),
-                    std::cmp::Ordering::Greater => hi = mid,
-                }
-            }
-        }
-        None
-    }
-
-    /// Get the dim_idx at the given term index (bounds-checked, for merger).
-    ///
-    /// V7 stores dim_indices in Section 2. To get the actual dim_id,
-    /// callers use `dim_id_at(dim_idx)`.
-    #[inline]
-    pub fn block_term_dim_idx(&self, term_idx: u32) -> u32 {
-        let d = self.term_dim_ids_bytes.as_slice();
-        if self.term_dim_id_width == 2 {
-            let off = term_idx as usize * 2;
-            u16::from_le_bytes(d[off..off + 2].try_into().unwrap()) as u32
-        } else {
-            read_u32_le(d, term_idx as usize)
-        }
-    }
-
-    /// Get the dimension ID at the given term index (for merger compatibility).
-    ///
-    /// Reads dim_idx from Section 2, then looks up actual dim_id from Section 6.
-    #[inline]
-    pub fn block_term_dim_id(&self, term_idx: u32) -> u32 {
-        let dim_idx = self.block_term_dim_idx(term_idx);
-        self.dim_id_at(dim_idx as usize)
-    }
-
-    /// Get postings for a term.
-    ///
-    /// Uses unchecked reads for the prefix-sum lookup. BmpPosting has align=1
-    /// (#[repr(C)], two u8 fields), so the pointer cast is always valid.
-    #[inline(always)]
-    pub fn term_postings(&self, term_idx: u32) -> &[BmpPosting] {
-        let tps = self.term_posting_starts_bytes.as_slice();
-        debug_assert!((term_idx as usize + 2) * 4 <= tps.len());
-        let tps_base = tps.as_ptr();
-        let start = unsafe { read_u32_unchecked(tps_base, term_idx as usize) } as usize;
-        let end = unsafe { read_u32_unchecked(tps_base, term_idx as usize + 1) } as usize;
-        let count = end - start;
-        if count == 0 {
-            return &[];
-        }
-        let pb = self.postings_bytes.as_slice();
-        debug_assert!(end * 2 <= pb.len());
-        // SAFETY: BmpPosting is #[repr(C)] with align=1 (two u8 fields).
-        // Size is exactly 2 bytes. Any byte pointer is valid for this type.
+    pub(crate) fn block_data_ptr(&self, block_id: u32) -> *const u8 {
+        let (start, _) = self.block_data_range(block_id);
         unsafe {
-            let ptr = pb.as_ptr().add(start * 2) as *const BmpPosting;
-            std::slice::from_raw_parts(ptr, count)
-        }
-    }
-
-    // ── Prefetch support ─────────────────────────────────────────────
-
-    /// Get a raw pointer to the first posting of the given block's first term.
-    /// Returns `None` if the block has no terms. Used for software prefetching.
-    ///
-    /// Uses unchecked reads — this is only called for prefetch hints where
-    /// correctness of the pointer value is not critical (worst case: prefetch
-    /// a wrong cache line, which is harmless).
-    #[inline(always)]
-    pub fn first_posting_ptr(&self, block_id: u32) -> Option<*const u8> {
-        let bts = self.block_term_starts_bytes.as_slice();
-        let bts_base = bts.as_ptr();
-        let term_start = unsafe { read_u32_unchecked(bts_base, block_id as usize) };
-        let term_end = unsafe { read_u32_unchecked(bts_base, block_id as usize + 1) };
-        if term_start >= term_end {
-            return None;
-        }
-        let tps_base = self.term_posting_starts_bytes.as_slice().as_ptr();
-        let posting_start = unsafe { read_u32_unchecked(tps_base, term_start as usize) } as usize;
-        let posting_end = unsafe { read_u32_unchecked(tps_base, term_start as usize + 1) } as usize;
-        if posting_start >= posting_end {
-            return None;
-        }
-        Some(unsafe {
-            self.postings_bytes
+            self.block_data_bytes
                 .as_slice()
                 .as_ptr()
-                .add(posting_start * 2)
-        })
-    }
-
-    /// Get a raw pointer to the term_dim_ids at the given term index.
-    #[inline(always)]
-    pub fn term_dim_ids_ptr(&self, term_start: u32) -> *const u8 {
-        unsafe {
-            self.term_dim_ids_bytes
-                .as_slice()
-                .as_ptr()
-                .add(term_start as usize * self.term_dim_id_width as usize)
+                .add(start as usize)
         }
     }
 
-    /// Get a raw pointer to the block_term_starts at the given block.
+    /// Parse a V8 block header: returns (num_terms, dim_ptr, ps_ptr, post_ptr).
+    /// All pointers are within block_data_bytes — guaranteed contiguous.
+    ///
+    /// Returns `(0, null, null, null)` for empty blocks.
     #[inline(always)]
-    pub fn block_term_starts_ptr(&self, block_id: u32) -> *const u8 {
+    pub(crate) fn parse_block(&self, block_id: u32) -> (u16, *const u8, *const u8, *const u8) {
+        let (start, end) = self.block_data_range(block_id);
+        if start == end {
+            return (0, std::ptr::null(), std::ptr::null(), std::ptr::null());
+        }
+        let base = unsafe {
+            self.block_data_bytes
+                .as_slice()
+                .as_ptr()
+                .add(start as usize)
+        };
+        let num_terms = unsafe { u16::from_le((base as *const u16).read_unaligned()) };
+        let dim_ptr = unsafe { base.add(2) };
+        let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * self.term_dim_id_width as usize) };
+        let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 2) };
+        (num_terms, dim_ptr, ps_ptr, post_ptr)
+    }
+
+    /// Get a raw pointer to block_data_starts at the given block.
+    /// Used for prefetching the N+2 block's offset during scoring.
+    #[inline(always)]
+    pub(crate) fn block_data_starts_ptr(&self, block_id: u32) -> *const u8 {
         unsafe {
-            self.block_term_starts_bytes
+            self.block_data_starts_bytes
                 .as_slice()
                 .as_ptr()
                 .add(block_id as usize * 4)
         }
     }
 
-    /// Get a raw pointer to the term_posting_starts at the given term index.
-    /// Used for prefetching the posting starts for the next block's terms.
-    #[inline(always)]
-    pub fn term_posting_starts_ptr(&self, term_start: u32) -> *const u8 {
-        unsafe {
-            self.term_posting_starts_bytes
-                .as_slice()
-                .as_ptr()
-                .add(term_start as usize * 4)
+    /// Iterate terms in a block (for merger). Returns (dim_id, &[BmpPosting]) per term.
+    pub fn iter_block_terms(&self, block_id: u32) -> BlockTermIter<'_> {
+        let (num_terms, dim_ptr, ps_ptr, post_ptr) = self.parse_block(block_id);
+        BlockTermIter {
+            index: self,
+            dim_ptr,
+            ps_ptr,
+            post_ptr,
+            num_terms,
+            current: 0,
         }
     }
 
@@ -621,14 +486,12 @@ impl BmpIndex {
 
     /// Estimated memory usage in bytes (mmap-backed region sizes).
     ///
-    /// V7 fully zero-copy: all data is mmap-backed OwnedBytes, but the
+    /// V8 fully zero-copy: all data is mmap-backed OwnedBytes, but the
     /// mapped regions still consume RSS when paged in by the OS.
     pub fn estimated_memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.block_term_starts_bytes.len()
-            + self.term_dim_ids_bytes.len()
-            + self.term_posting_starts_bytes.len()
-            + self.postings_bytes.len()
+            + self.block_data_starts_bytes.len()
+            + self.block_data_bytes.len()
             + self.dim_ids_bytes.len()
             + self.grid_bytes.len()
             + self.sb_grid_bytes.len()
@@ -642,19 +505,16 @@ impl BmpIndex {
     /// faults at a predictable time (segment load) rather than during query
     /// execution. On Unix, also issues `madvise(MADV_WILLNEED)` for readahead.
     ///
-    /// Sections are prefaulted in query access order:
+    /// V8 sections are prefaulted in query access order:
     /// 1. sb_grid (superblock UB computation)
     /// 2. grid (block UB + mask computation)
-    /// 3. block_term_starts + term_dim_ids + term_posting_starts (block scoring)
-    /// 4. postings (actual posting data)
-    /// 5. doc_map (virtual-to-doc mapping for result output)
+    /// 3. block_data_starts + block_data (block scoring — all contiguous per block)
+    /// 4. doc_map (virtual-to-doc mapping for result output)
     pub fn warmup(&self) {
         self.sb_grid_bytes.prefault();
         self.grid_bytes.prefault();
-        self.block_term_starts_bytes.prefault();
-        self.term_dim_ids_bytes.prefault();
-        self.term_posting_starts_bytes.prefault();
-        self.postings_bytes.prefault();
+        self.block_data_starts_bytes.prefault();
+        self.block_data_bytes.prefault();
         self.dim_ids_bytes.prefault();
         self.doc_map_ids_bytes.prefault();
         self.doc_map_ordinals_bytes.prefault();
@@ -726,6 +586,134 @@ impl<'a> Iterator for DimIdIter<'a> {
 }
 
 impl<'a> ExactSizeIterator for DimIdIter<'a> {}
+
+/// Iterator over terms in a V8 block. Returns `(dim_id, &[BmpPosting])` per term.
+pub struct BlockTermIter<'a> {
+    index: &'a BmpIndex,
+    dim_ptr: *const u8,
+    ps_ptr: *const u8,
+    post_ptr: *const u8,
+    num_terms: u16,
+    current: u16,
+}
+
+impl<'a> Iterator for BlockTermIter<'a> {
+    type Item = (u32, &'a [BmpPosting]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.num_terms {
+            return None;
+        }
+        let i = self.current;
+        self.current += 1;
+
+        // Read dim_idx from block-local dim_ptr
+        let dim_idx = if self.index.term_dim_id_width == 2 {
+            unsafe {
+                let p = self.dim_ptr.add(i as usize * 2);
+                u16::from_le((p as *const u16).read_unaligned()) as u32
+            }
+        } else {
+            unsafe { read_u32_unchecked(self.dim_ptr, i as usize) }
+        };
+
+        // Convert dim_idx to dim_id via Section C
+        let dim_id = self.index.dim_id_at(dim_idx as usize);
+
+        // Get postings from block-local ps_ptr/post_ptr
+        let postings = unsafe { block_term_postings(self.ps_ptr, self.post_ptr, i) };
+        Some((dim_id, postings))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = (self.num_terms - self.current) as usize;
+        (rem, Some(rem))
+    }
+}
+
+impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
+
+// ============================================================================
+// V8 block-data free functions (used by query and merger)
+// ============================================================================
+
+/// Binary search for a dimension index in a V8 block's term_dim_indices.
+///
+/// `dim_ptr` points to the block's term_dim_indices array.
+/// Returns the local term index (0..num_terms) if found.
+///
+/// # Safety
+/// `dim_ptr` must be valid for `num_terms * dim_id_width` bytes.
+#[inline(always)]
+pub(crate) fn find_dim_in_block_data(
+    dim_ptr: *const u8,
+    num_terms: u16,
+    dim_id_width: u8,
+    dim_idx: u32,
+) -> Option<u16> {
+    let count = num_terms as usize;
+    if count == 0 {
+        return None;
+    }
+
+    if dim_id_width == 2 {
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let val = unsafe {
+                let p = dim_ptr.add(mid * 2);
+                u16::from_le((p as *const u16).read_unaligned()) as u32
+            };
+            match val.cmp(&dim_idx) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => return Some(mid as u16),
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+    } else {
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let val = unsafe { read_u32_unchecked(dim_ptr, mid) };
+            match val.cmp(&dim_idx) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => return Some(mid as u16),
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+    }
+    None
+}
+
+/// Get postings for a local term index within a parsed V8 block.
+///
+/// `ps_ptr` points to the block's posting_starts array [u16 × (num_terms + 1)].
+/// `post_ptr` points to the block's postings array [(u8, u8) × total].
+///
+/// # Safety
+/// Pointers must be valid and derived from a BmpIndex's block_data_bytes.
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(crate) unsafe fn block_term_postings<'a>(
+    ps_ptr: *const u8,
+    post_ptr: *const u8,
+    local_term: u16,
+) -> &'a [BmpPosting] {
+    let start_p = ps_ptr.add(local_term as usize * 2);
+    let end_p = ps_ptr.add((local_term as usize + 1) * 2);
+    let start = u16::from_le((start_p as *const u16).read_unaligned()) as usize;
+    let end = u16::from_le((end_p as *const u16).read_unaligned()) as usize;
+    let count = end - start;
+    if count == 0 {
+        return &[];
+    }
+    // SAFETY: BmpPosting is #[repr(C)] with align=1 (two u8 fields).
+    let ptr = post_ptr.add(start * 2) as *const BmpPosting;
+    std::slice::from_raw_parts(ptr, count)
+}
 
 // ============================================================================
 // SIMD-accelerated helpers for BMP scoring

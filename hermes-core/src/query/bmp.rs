@@ -40,7 +40,7 @@
 use super::scoring::{ScoreCollector, ScoredDoc};
 use crate::segment::{
     BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_u4_weighted, accumulate_u8_weighted,
-    compute_block_masks_4bit,
+    block_term_postings, compute_block_masks_4bit, find_dim_in_block_data,
 };
 
 // ============================================================================
@@ -218,7 +218,7 @@ fn execute_bmp_inner(
         return Ok(Vec::new());
     }
 
-    // Sort by dim_idx for binary search within blocks (V7 stores dim_idx, not dim_id).
+    // Sort by dim_idx for binary search within blocks (blocks store dim_idx, not dim_id).
     // Since dim_ids is sorted and dim_idx preserves order, sorting by dim_idx gives
     // the same relative ordering as sorting by dim_id.
     query_info.sort_unstable_by_key(|&(_, idx, _)| idx);
@@ -235,7 +235,7 @@ fn execute_bmp_inner(
     } else {
         (0.0, 0.0)
     };
-    // V7: query_by_dim_u16 stores (dim_idx, weight) — matches Section 2 dim_indices
+    // query_by_dim_u16 stores (dim_idx, weight) — matches per-block dim_indices
     let query_by_dim_u16: Vec<(u32, u16)> = query_info
         .iter()
         .map(|&(_, idx, w)| {
@@ -246,7 +246,7 @@ fn execute_bmp_inner(
         })
         .collect();
 
-    let _start = std::time::Instant::now();
+    let t_start = std::time::Instant::now();
 
     let result = BMP_SCRATCH.with(|cell| {
         let scratch = &mut *cell.borrow_mut();
@@ -344,7 +344,6 @@ fn execute_bmp_inner(
                 &scratch.local_block_masks,
                 &query_by_dim_u16,
                 dequant,
-                block_size,
                 alpha,
                 k,
                 &predicate,
@@ -356,7 +355,7 @@ fn execute_bmp_inner(
             sbs_scored += 1;
         }
 
-        let elapsed_ms = _start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         if elapsed_ms > 500.0 {
             log::warn!(
                 "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}",
@@ -398,22 +397,27 @@ fn execute_bmp_inner(
 // Integer scoring: u32 accumulators with u16 quantized query weights
 // ============================================================================
 
-/// Score a block using integer arithmetic (u32 accumulators, u16 weights).
+/// Score a V8 block using integer arithmetic (u32 accumulators, u16 weights).
 ///
 /// Uses **bitmask skip**: checks `block_mask & (1 << q) != 0` before binary search.
 /// Accumulates `w_u16 * impact_u8` into u32 — eliminates u8→f32 conversion per posting.
 ///
-/// V7: searches by dim_idx (position in dim_ids array), not dim_id.
+/// V8: all block data is contiguous — `dim_ptr`, `ps_ptr`, `post_ptr` point into
+/// the same ~200-2000 byte region (1-2 pages). Binary search and posting reads
+/// touch only this contiguous region.
 ///
 /// Tracks touched slots via a u64 bitmask (works for block_size ≤ 64).
 /// Caller uses the bitmask for lazy accumulator zeroing.
 ///
 /// Complexity: O(|present_query_dims| × log|block_terms|) per block.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn score_block_bsearch_int(
-    index: &BmpIndex,
-    term_start: u32,
-    term_end: u32,
+    num_terms: u16,
+    dim_ptr: *const u8,
+    ps_ptr: *const u8,
+    post_ptr: *const u8,
+    dim_id_width: u8,
     query_by_dim_u16: &[(u32, u16)],
     block_mask: u64,
     acc: &mut [u32],
@@ -424,8 +428,10 @@ fn score_block_bsearch_int(
         if block_mask & (1u64 << q) == 0 {
             continue;
         }
-        if let Some(ti) = index.find_dim_in_block(term_start, term_end, dim_idx) {
-            for p in index.term_postings(ti) {
+        if let Some(local_term) = find_dim_in_block_data(dim_ptr, num_terms, dim_id_width, dim_idx)
+        {
+            let postings = unsafe { block_term_postings(ps_ptr, post_ptr, local_term) };
+            for p in postings {
                 let slot = p.local_slot as usize;
                 // SAFETY: local_slot < block_size = acc.len()
                 unsafe {
@@ -458,7 +464,6 @@ fn score_superblock_blocks(
     local_masks: &[u64],
     query_by_dim_u16: &[(u32, u16)],
     dequant: f32,
-    _block_size: usize,
     alpha: f32,
     k: usize,
     predicate: &Option<&dyn Fn(crate::DocId) -> bool>,
@@ -466,6 +471,8 @@ fn score_superblock_blocks(
     blocks_scored: &mut u32,
     acc: &mut [u32],
 ) {
+    let dim_id_width = index.term_dim_id_width;
+
     for (order_idx, &local_idx) in local_order.iter().enumerate() {
         if local_idx as usize >= count {
             break;
@@ -479,42 +486,40 @@ fn score_superblock_blocks(
 
         let block_id = (block_start + local_idx as usize) as u32;
 
-        // Extended prefetch: next block in local order
+        // V8 prefetch: single prefetch loads all block scoring data (contiguous)
         if order_idx + 1 < local_order.len() {
             let next_local = local_order[order_idx + 1] as usize;
             if next_local < count {
                 let next_block = (block_start + next_local) as u32;
-                let (ts, te) = index.block_term_range(next_block);
-                if ts < te {
-                    prefetch_read(index.term_dim_ids_ptr(ts));
-                    prefetch_read(index.term_posting_starts_ptr(ts));
-                    if let Some(ptr) = index.first_posting_ptr(next_block) {
-                        prefetch_read(ptr);
-                    }
-                }
+                prefetch_read(index.block_data_ptr(next_block));
+                // N+2: prefetch block_data_starts entry
                 if order_idx + 2 < local_order.len() {
                     let next2_local = local_order[order_idx + 2] as usize;
                     if next2_local < count {
                         prefetch_read(
-                            index.block_term_starts_ptr((block_start + next2_local) as u32),
+                            index.block_data_starts_ptr((block_start + next2_local) as u32),
                         );
                     }
                 }
             }
         }
 
-        let (term_start, term_end) = index.block_term_range(block_id);
+        let (num_terms, dim_ptr, ps_ptr, post_ptr) = index.parse_block(block_id);
         let mask = local_masks[local_idx as usize];
         let mut touched: u64 = 0;
-        score_block_bsearch_int(
-            index,
-            term_start,
-            term_end,
-            query_by_dim_u16,
-            mask,
-            acc,
-            &mut touched,
-        );
+        if num_terms > 0 {
+            score_block_bsearch_int(
+                num_terms,
+                dim_ptr,
+                ps_ptr,
+                post_ptr,
+                dim_id_width,
+                query_by_dim_u16,
+                mask,
+                acc,
+                &mut touched,
+            );
+        }
 
         // Collect results: dequantize u32 → f32, only visit touched slots
         let base = block_id * index.bmp_block_size;

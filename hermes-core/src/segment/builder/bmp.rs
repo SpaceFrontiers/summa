@@ -1,8 +1,8 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V7 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V8 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
-//! table (Section 9) enables query-time recovery of the original coordinates.
+//! table enables query-time recovery of the original coordinates.
 //!
 //! Postings are 2 bytes each: `(local_slot: u8, impact: u8)`.
 //!
@@ -15,45 +15,43 @@
 //! `compact_virtual_id` = sorted by `block_id`, so a min-heap merges them in
 //! block order directly into the output arrays.
 //!
-//! V7 replaces the `FxHashMap vid_map` with binary search on sorted `vid_pairs`,
-//! saving ~50-80 bytes per entry during build.
-//!
 //! Peak memory: `output arrays only + O(num_dims) heap`.
 //!
-//! ## BMP V7 Blob Layout
+//! ## BMP V8 Blob Layout (block-interleaved)
 //!
-//! V7 uses compact virtual IDs (sequential assignment) instead of the sparse
-//! `doc_id * num_ordinals + ordinal` scheme, eliminating catastrophic space
-//! blowup when ordinal distribution is skewed.
-//!
-//! V7 stores dim_indices (position in dim_ids) instead of raw dim_ids in
-//! Section 2, using u16 entries when num_dims ≤ 65536 (halving section size).
+//! V8 interleaves scoring data per-block so that all data needed to score
+//! one block is contiguous (~200-2000 bytes, fits in 1-2 pages). This
+//! reduces cold-query page faults from 4+ per block to 1.
 //!
 //! ```text
-//! Section 1:  block_term_starts    [u32-LE × (num_blocks + 1)]
-//! Section 2:  term_dim_indices     [u16-LE or u32-LE × total_terms]  ← u16 when num_dims ≤ 65536
-//! Section 3:  term_posting_starts  [u32-LE × (total_terms + 1)]      ← prefix sums
-//! Section 4:  postings             [(u8, u8) × total_postings]       ← BmpPosting pairs
-//! Section 5:  padding              [0-3 bytes to next 4-byte boundary]
-//! Section 6:  dim_ids              [u32-LE × num_dims]
-//! Section 7:  grid_packed4         [u8 × (num_dims × packed_row_size)]  ← 4-bit packed
-//! Section 8:  sb_grid              [u8 × (num_dims × num_superblocks)]  ← 8-bit
-//! Section 9a: doc_map_ids          [u32-LE × num_virtual_docs]
-//! Section 9b: doc_map_ordinals     [u16-LE × num_virtual_docs]
+//! Section A:  block_data_starts  [u32-LE × (num_blocks + 1)]   byte offsets into Section B
+//! Section B:  block_data         [per-block interleaved data]   variable-length per block
+//!             padding            [0-3 bytes to 4-byte boundary]
+//! Section C:  dim_ids            [u32-LE × num_dims]
+//! Section D:  grid_packed4       [u8 × (num_dims × packed_row_size)]  ← 4-bit packed
+//! Section E:  sb_grid            [u8 × (num_dims × num_superblocks)]  ← 8-bit
+//! Section F:  doc_map_ids        [u32-LE × num_virtual_docs]
+//! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
 //!
-//! BMP7 Footer (48 bytes):
-//!   total_terms: u32              // 0-3
-//!   total_postings: u32           // 4-7
-//!   dim_ids_offset: u32           // 8-11   (byte offset of section 6)
-//!   grid_offset: u32              // 12-15  (byte offset of section 7)
+//! Per-block data layout (for non-empty blocks):
+//!   num_terms: u16                                    offset 0
+//!   term_dim_indices: [dim_width × num_terms]         offset 2
+//!   posting_starts: [u16-LE × (num_terms + 1)]        relative cumulative counts
+//!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
+//!
+//! BMP8 Footer (48 bytes):
+//!   total_terms: u32              // 0-3   (stats only)
+//!   total_postings: u32           // 4-7   (stats only)
+//!   dim_ids_offset: u32           // 8-11  (byte offset of Section C)
+//!   grid_offset: u32              // 12-15 (byte offset of Section D)
 //!   num_blocks: u32               // 16-19
 //!   num_dims: u32                 // 20-23
 //!   bmp_block_size: u32           // 24-27
-//!   num_virtual_docs: u32         // 28-31  (= actual vector count)
+//!   num_virtual_docs: u32         // 28-31 (= actual vector count)
 //!   max_weight_scale: f32         // 32-35
-//!   sb_grid_offset: u32           // 36-39  (byte offset of section 8)
-//!   doc_map_offset: u32           // 40-43  (byte offset of section 9)
-//!   magic: u32                    // 44-47  (BMP7 = 0x37504D42)
+//!   sb_grid_offset: u32           // 36-39 (byte offset of Section E)
+//!   doc_map_offset: u32           // 40-43 (byte offset of Section F)
+//!   magic: u32                    // 44-47 (BMP8 = 0x38504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -73,10 +71,10 @@ pub(crate) fn vid_lookup(vid_pairs: &[(crate::DocId, u16)], key: (crate::DocId, 
 }
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V7;
+use crate::segment::format::BMP_BLOB_MAGIC_V8;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V7 blob from per-dimension postings.
+/// Build a BMP V8 blob from per-dimension postings.
 ///
 /// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
 /// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
@@ -85,6 +83,8 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// into a single Vec + global sort. Each dim's postings are already sorted by
 /// `(doc_id, ordinal)` = sorted by `compact_virtual_id` = sorted by `block_id`.
 /// A min-heap merges them in `(block_id, dim_id)` order.
+///
+/// V8 writes block-interleaved data so all scoring data for one block is contiguous.
 ///
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 pub(crate) fn build_bmp_blob(
@@ -310,77 +310,57 @@ pub(crate) fn build_bmp_blob(
     // Sort grid entries by (dim_idx, block_id) for streaming write
     grid_entries.sort_unstable();
 
-    let packed_row_size = num_blocks.div_ceil(2);
-    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
-    let tdi_elem_size = if num_dims <= 65536 { 2 } else { 4 };
+    let dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
     log::info!(
-        "[bmp_build] num_virtual_docs={} num_blocks={} num_dims={} \
-         total_terms={} total_postings={} grid_entries={} \
-         block_term_starts={}B term_dim_indices={}B(u{}) term_posting_starts={}B \
-         postings_flat={}B grid={}B sb_grid={}B doc_map={}B",
+        "[bmp_build] V8 num_virtual_docs={} num_blocks={} num_dims={} \
+         total_terms={} total_postings={} grid_entries={} dim_id_width={}",
         num_virtual_docs,
         num_blocks,
         num_dims,
         total_terms,
         total_postings,
         grid_entries.len(),
-        (num_blocks + 1) * 4,
-        total_terms as usize * tdi_elem_size,
-        tdi_elem_size * 8,
-        (total_terms as usize + 1) * 4,
-        total_postings as usize * 2,
-        num_dims * packed_row_size,
-        num_dims * num_superblocks,
-        num_virtual_docs * 6,
+        dim_id_width,
     );
 
-    // ── Write V7 sections ───────────────────────────────────────────────
+    // ── Write V8 interleaved sections ───────────────────────────────────
     let mut bytes_written: u64 = 0;
 
-    // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
-    bytes_written += write_u32_slice_le(writer, &block_term_starts)?;
+    // Sections A+B: block-interleaved data
+    bytes_written += write_v8_interleaved_sections(
+        writer,
+        &block_term_starts,
+        &term_dim_ids,
+        &term_posting_starts,
+        &postings_flat,
+        num_blocks,
+        num_dims,
+    )?;
 
-    // Section 2: term_dim_indices — u16 when num_dims ≤ 65536, else u32
-    bytes_written += write_dim_indices_section(writer, &term_dim_ids, num_dims)?;
-
-    // Section 3: term_posting_starts [u32-LE × (total_terms + 1)]
-    bytes_written += write_u32_slice_le(writer, &term_posting_starts)?;
-
-    // Section 4: postings [(u8, u8) × total_postings]
-    writer.write_all(&postings_flat)?;
-    bytes_written += postings_flat.len() as u64;
-
-    // Section 5: padding to 4-byte boundary
-    let padding = (4 - (bytes_written % 4) as usize) % 4;
-    if padding > 0 {
-        writer.write_all(&[0u8; 4][..padding])?;
-        bytes_written += padding as u64;
-    }
-
-    // Section 6: dim_ids [u32-LE × num_dims]
+    // Section C: dim_ids [u32-LE × num_dims]
     let dim_ids_offset = bytes_written as u32;
     bytes_written += write_u32_slice_le(writer, &dim_ids)?;
 
-    // Sections 7+8: packed grid + sb_grid (streaming from sparse grid entries)
+    // Sections D+E: packed grid + sb_grid (streaming from sparse grid entries)
     let grid_offset = bytes_written as u32;
     let (packed_bytes, sb_bytes) = stream_write_grids(&grid_entries, num_dims, num_blocks, writer)?;
     let sb_grid_offset = (bytes_written + packed_bytes) as u32;
     bytes_written += packed_bytes + sb_bytes;
 
-    // Section 9a: doc_map_ids [u32-LE × num_virtual_docs]
+    // Section F: doc_map_ids [u32-LE × num_virtual_docs]
     let doc_map_offset = bytes_written as u32;
     for &(doc_id, _) in &vid_pairs {
         writer.write_u32::<LittleEndian>(doc_id)?;
     }
     bytes_written += num_virtual_docs as u64 * 4;
 
-    // Section 9b: doc_map_ordinals [u16-LE × num_virtual_docs]
+    // Section G: doc_map_ordinals [u16-LE × num_virtual_docs]
     for &(_, ord) in &vid_pairs {
         writer.write_u16::<LittleEndian>(ord)?;
     }
     bytes_written += num_virtual_docs as u64 * 2;
 
-    // BMP V7 Footer (48 bytes)
+    // BMP V8 Footer (48 bytes)
     writer.write_u32::<LittleEndian>(total_terms)?;
     writer.write_u32::<LittleEndian>(total_postings)?;
     writer.write_u32::<LittleEndian>(dim_ids_offset)?;
@@ -392,7 +372,7 @@ pub(crate) fn build_bmp_blob(
     writer.write_f32::<LittleEndian>(max_weight_scale)?;
     writer.write_u32::<LittleEndian>(sb_grid_offset)?;
     writer.write_u32::<LittleEndian>(doc_map_offset)?;
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V7)?;
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V8)?;
     bytes_written += 48;
 
     Ok(bytes_written)
@@ -422,43 +402,79 @@ pub(crate) fn write_u32_slice_le(writer: &mut dyn Write, data: &[u32]) -> std::i
     Ok(data.len() as u64 * 4)
 }
 
-/// Write V7 Section 2 (term_dim_indices): u16 when num_dims ≤ 65536, else u32.
+/// Write V8 interleaved block data: Sections A (block_data_starts) + B (per-block data) + padding.
 ///
-/// `indices` contains dim_idx values (positions in dim_ids array, not raw dim_ids).
-pub(crate) fn write_dim_indices_section(
+/// Converts V7-style intermediate arrays (block_term_starts, term_dim_ids,
+/// term_posting_starts, postings_flat) into per-block interleaved data where
+/// all scoring data for one block is contiguous.
+///
+/// Returns total bytes written (sections A + B + padding).
+pub(crate) fn write_v8_interleaved_sections(
     writer: &mut dyn Write,
-    indices: &[u32],
+    block_term_starts: &[u32],
+    term_dim_ids: &[u32],
+    term_posting_starts: &[u32],
+    postings_flat: &[u8],
+    num_blocks: usize,
     num_dims: usize,
 ) -> std::io::Result<u64> {
-    if indices.is_empty() {
-        return Ok(0);
-    }
-    if num_dims <= 65536 {
-        let u16_vals: Vec<u16> = indices.iter().map(|&v| v as u16).collect();
-        write_u16_slice_le(writer, &u16_vals)
-    } else {
-        write_u32_slice_le(writer, indices)
-    }
-}
+    let dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
 
-/// Bulk-write a `&[u16]` slice as little-endian bytes.
-pub(crate) fn write_u16_slice_le(writer: &mut dyn Write, data: &[u16]) -> std::io::Result<u64> {
-    if data.is_empty() {
-        return Ok(0);
-    }
-    #[cfg(target_endian = "little")]
-    {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
-        writer.write_all(bytes)?;
-    }
-    #[cfg(target_endian = "big")]
-    {
-        for &v in data {
-            writer.write_all(&v.to_le_bytes())?;
+    let mut block_data_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
+    let mut block_data_buf: Vec<u8> = Vec::new();
+
+    for b in 0..num_blocks {
+        block_data_starts.push(block_data_buf.len() as u32);
+        let ts = block_term_starts[b] as usize;
+        let te = block_term_starts[b + 1] as usize;
+        let nt = te - ts;
+        if nt == 0 {
+            continue;
         }
+
+        // num_terms (u16)
+        block_data_buf.extend_from_slice(&(nt as u16).to_le_bytes());
+
+        // term_dim_indices
+        for &dim_id in &term_dim_ids[ts..te] {
+            if dim_id_width == 2 {
+                block_data_buf.extend_from_slice(&(dim_id as u16).to_le_bytes());
+            } else {
+                block_data_buf.extend_from_slice(&dim_id.to_le_bytes());
+            }
+        }
+
+        // posting_starts (u16, relative to this block)
+        let first_posting = term_posting_starts[ts];
+        for &ps in &term_posting_starts[ts..=te] {
+            let relative = (ps - first_posting) as u16;
+            block_data_buf.extend_from_slice(&relative.to_le_bytes());
+        }
+
+        // postings [(u8, u8) × block_posting_count]
+        let p_start = term_posting_starts[ts] as usize * 2;
+        let p_end = term_posting_starts[te] as usize * 2;
+        block_data_buf.extend_from_slice(&postings_flat[p_start..p_end]);
     }
-    Ok(data.len() as u64 * 2)
+    block_data_starts.push(block_data_buf.len() as u32);
+
+    let mut bytes_written: u64 = 0;
+
+    // Section A: block_data_starts [u32 × (num_blocks + 1)]
+    bytes_written += write_u32_slice_le(writer, &block_data_starts)?;
+
+    // Section B: block_data
+    writer.write_all(&block_data_buf)?;
+    bytes_written += block_data_buf.len() as u64;
+
+    // Padding to 4-byte boundary
+    let padding = (4 - (bytes_written % 4) as usize) % 4;
+    if padding > 0 {
+        writer.write_all(&[0u8; 4][..padding])?;
+        bytes_written += padding as u64;
+    }
+
+    Ok(bytes_written)
 }
 
 /// Ceiling quantize u8 → u4. Guarantees `u4 * 17 >= original`.
@@ -576,7 +592,7 @@ mod tests {
         // Verify footer magic
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V7);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V8);
     }
 
     #[test]

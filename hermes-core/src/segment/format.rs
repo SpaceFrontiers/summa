@@ -92,16 +92,18 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V7 blob footer ("BMP7" in LE)
+/// Magic number for BMP V8 blob footer ("BMP8" in LE)
 ///
-/// V7 changes from V6:
-/// - Section 2 stores `dim_idx` (position in dim_ids array) instead of `dim_id`
-/// - When `num_dims ≤ 65536`, section 2 uses `u16-LE` entries (halving size)
-/// - Otherwise section 2 uses `u32-LE` entries (same as V6)
-pub const BMP_BLOB_MAGIC_V7: u32 = 0x37504D42;
+/// V8 changes from V7:
+/// - Block-interleaved format: all data for one block is contiguous (~200-2000 bytes)
+/// - Sections A+B replace V7's Sections 1-4 (block_term_starts, term_dim_ids,
+///   term_posting_starts, postings)
+/// - Per-block posting_starts use u16 (relative within block, not global u32)
+/// - Reduces cold-query page faults from 4+ per block to 1
+pub const BMP_BLOB_MAGIC_V8: u32 = 0x38504D42;
 
-/// BMP V7 blob footer size (same as V6: 48 bytes)
-pub const BMP_BLOB_FOOTER_SIZE_V7: usize = 48;
+/// BMP V8 blob footer size (same structure as V7: 48 bytes)
+pub const BMP_BLOB_FOOTER_SIZE_V8: usize = 48;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;
