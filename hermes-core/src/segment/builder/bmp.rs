@@ -157,8 +157,6 @@ pub(crate) fn build_bmp_blob(
     vid_pairs.sort_unstable();
     let num_virtual_docs = vid_pairs.len();
 
-    // Lookup: binary search on sorted vid_pairs (O(log N) per lookup, saves ~50-80 bytes/entry)
-
     // Safety: local_slot is u8, so block_size must not exceed 256
     let effective_block_size = bmp_block_size.min(256);
     let num_blocks = num_virtual_docs.div_ceil(effective_block_size as usize);
