@@ -1,13 +1,12 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V9 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V10 zero-copy**.
 //!
-//! V9 uses a data-first layout: block data (Section B) appears before
-//! block_data_starts (Section A). This enables fully streaming merge
-//! (no buffering of block data). The reader derives the Section A offset
-//! from `dim_ids_offset - (num_blocks + 1) * 4`.
+//! V10 uses u64 section offsets and block_data_starts (fixing V9's u32 overflow
+//! for blobs >4 GB). Data-first layout: block data (Section B) appears before
+//! block_data_starts (Section A). The reader derives the Section A offset
+//! from `dim_ids_offset - (num_blocks + 1) * 8`.
 //!
-//! V8/V9 uses a block-interleaved format where all data needed to score one block
-//! is contiguous (~200-2000 bytes, fits in 1-2 pages). This reduces cold-query
-//! page faults from 4+ per block to 1.
+//! Block-interleaved format: all data needed to score one block is contiguous
+//! (~200-2000 bytes, fits in 1-2 pages). Reduces cold-query page faults to 1.
 //!
 //! At load time the entire blob is acquired as a single `OwnedBytes` (mmap-backed
 //! or Arc-Vec) and sliced into sections. No heap allocation — all data including
@@ -68,11 +67,25 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
     }
 }
 
-/// BMP V9 index for a single sparse field — fully zero-copy mmap-backed.
+/// Read a little-endian u64 from a raw pointer at element index.
+/// No bounds check — used in the hot scoring loop for block_data_starts (V10).
 ///
-/// V9 uses a data-first layout with block-interleaved format: all scoring data
-/// for one block is contiguous. On cold queries, a single page fault loads all
-/// data needed to score a block (instead of 4+ scattered page faults in V7).
+/// # Safety
+/// Caller must ensure `base.add(idx * 8 + 7)` is within the allocation.
+#[inline(always)]
+unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
+    unsafe {
+        let p = base.add(idx * 8);
+        u64::from_le((p as *const u64).read_unaligned())
+    }
+}
+
+/// BMP V10 index for a single sparse field — fully zero-copy mmap-backed.
+///
+/// V10 uses u64 section offsets and block_data_starts (fixing V9's u32 overflow
+/// for blobs >4 GB). Data-first layout with block-interleaved format: all scoring
+/// data for one block is contiguous. On cold queries, a single page fault loads all
+/// data needed to score a block.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -127,13 +140,13 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V9 blob from the given file handle.
+    /// Parse a BMP V10 blob from the given file handle.
     ///
-    /// Reads the 48-byte footer, then acquires the entire blob as a single
+    /// Reads the 64-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V9 data-first layout: Section B (per-block interleaved data) first,
-    /// then Section A (block_data_starts). All data for one block is contiguous.
+    /// V10 data-first layout: Section B (per-block interleaved data) first,
+    /// then Section A (block_data_starts with u64 entries).
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -141,38 +154,38 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V9, BMP_BLOB_MAGIC_V9};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V10, BMP_BLOB_MAGIC_V10};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V9 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V10 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
-        // Read the footer (last 48 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V9 as u64;
+        // Read the footer (last 64 bytes of the blob)
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V10 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V9 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V10 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
         let total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
         let total_postings = u32::from_le_bytes(fb[4..8].try_into().unwrap());
-        let dim_ids_offset = u32::from_le_bytes(fb[8..12].try_into().unwrap());
-        let _grid_offset = u32::from_le_bytes(fb[12..16].try_into().unwrap());
-        let num_blocks = u32::from_le_bytes(fb[16..20].try_into().unwrap());
-        let num_dims = u32::from_le_bytes(fb[20..24].try_into().unwrap());
-        let bmp_block_size = u32::from_le_bytes(fb[24..28].try_into().unwrap());
-        let num_virtual_docs = u32::from_le_bytes(fb[28..32].try_into().unwrap());
-        let max_weight_scale = f32::from_le_bytes(fb[32..36].try_into().unwrap());
-        let sb_grid_offset = u32::from_le_bytes(fb[36..40].try_into().unwrap());
-        let doc_map_offset = u32::from_le_bytes(fb[40..44].try_into().unwrap());
-        let magic = u32::from_le_bytes(fb[44..48].try_into().unwrap());
+        let dim_ids_offset = u64::from_le_bytes(fb[8..16].try_into().unwrap());
+        let _grid_offset = u64::from_le_bytes(fb[16..24].try_into().unwrap());
+        let num_blocks = u32::from_le_bytes(fb[24..28].try_into().unwrap());
+        let num_dims = u32::from_le_bytes(fb[28..32].try_into().unwrap());
+        let bmp_block_size = u32::from_le_bytes(fb[32..36].try_into().unwrap());
+        let num_virtual_docs = u32::from_le_bytes(fb[36..40].try_into().unwrap());
+        let max_weight_scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
+        let sb_grid_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
+        let doc_map_offset = u64::from_le_bytes(fb[52..60].try_into().unwrap());
+        let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V9 {
+        if magic != BMP_BLOB_MAGIC_V10 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP9 {:#x})",
-                magic, BMP_BLOB_MAGIC_V9
+                "Invalid BMP blob magic: {:#x} (expected BMP0 {:#x})",
+                magic, BMP_BLOB_MAGIC_V10
             )));
         }
 
@@ -201,16 +214,17 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V9 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V10 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
 
         let term_dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
 
-        // V9 layout: Section B (block_data) at offset 0, Section A (block_data_starts)
+        // V10 layout: Section B (block_data) at offset 0, Section A (block_data_starts)
         // immediately before dim_ids. Derive Section A position from footer fields.
-        let section_a_size = (num_blocks as usize + 1) * 4;
+        // V10 uses u64 entries in block_data_starts (8 bytes each).
+        let section_a_size = (num_blocks as usize + 1) * 8;
         let bds_start = dim_ids_offset as usize - section_a_size;
 
         // Section B: block_data [0..bds_start) (includes padding before Section A)
@@ -242,7 +256,7 @@ impl BmpIndex {
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         log::debug!(
-            "BMP V9 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
+            "BMP V10 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
              num_virtual_docs={}, max_weight_scale={:.4}, postings={}, packed_row_size={}, \
              term_dim_id_width={}, block_data={}B, doc_map={}B",
             num_blocks,
@@ -331,14 +345,14 @@ impl BmpIndex {
 
     // ── Hot-path block-data accessors ────────────────────────────────
 
-    /// Byte offset range in block_data_bytes for a block.
+    /// Byte offset range in block_data_bytes for a block (u64 entries in V10).
     #[inline(always)]
-    pub(crate) fn block_data_range(&self, block_id: u32) -> (u32, u32) {
+    pub(crate) fn block_data_range(&self, block_id: u32) -> (u64, u64) {
         let d = self.block_data_starts_bytes.as_slice();
-        debug_assert!((block_id as usize + 2) * 4 <= d.len());
+        debug_assert!((block_id as usize + 2) * 8 <= d.len());
         unsafe {
-            let start = read_u32_unchecked(d.as_ptr(), block_id as usize);
-            let end = read_u32_unchecked(d.as_ptr(), block_id as usize + 1);
+            let start = read_u64_unchecked(d.as_ptr(), block_id as usize);
+            let end = read_u64_unchecked(d.as_ptr(), block_id as usize + 1);
             (start, end)
         }
     }
@@ -381,13 +395,14 @@ impl BmpIndex {
 
     /// Get a raw pointer to block_data_starts at the given block.
     /// Used for prefetching the N+2 block's offset during scoring.
+    /// V10: each entry is 8 bytes (u64).
     #[inline(always)]
     pub(crate) fn block_data_starts_ptr(&self, block_id: u32) -> *const u8 {
         unsafe {
             self.block_data_starts_bytes
                 .as_slice()
                 .as_ptr()
-                .add(block_id as usize * 4)
+                .add(block_id as usize * 8)
         }
     }
 
@@ -531,7 +546,7 @@ impl<'a> Iterator for DimIdIter<'a> {
 
 impl<'a> ExactSizeIterator for DimIdIter<'a> {}
 
-/// Iterator over terms in a V9 block. Returns `(dim_id, &[BmpPosting])` per term.
+/// Iterator over terms in a V10 block. Returns `(dim_id, &[BmpPosting])` per term.
 pub struct BlockTermIter<'a> {
     index: &'a BmpIndex,
     dim_ptr: *const u8,

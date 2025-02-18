@@ -18,11 +18,28 @@ fn bmp_config() -> SparseVectorConfig {
     }
 }
 
+/// Helper: MaxScore config for comparison tests.
+fn maxscore_config() -> SparseVectorConfig {
+    SparseVectorConfig {
+        format: SparseFormat::MaxScore,
+        weight_quantization: WeightQuantization::UInt8,
+        ..SparseVectorConfig::default()
+    }
+}
+
 /// Helper: create BMP schema with a text field and a BMP sparse field.
 fn bmp_schema() -> (crate::dsl::Schema, crate::dsl::Field, crate::dsl::Field) {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    (sb.build(), title, sparse)
+}
+
+/// Helper: create MaxScore schema with a text field and a MaxScore sparse field.
+fn maxscore_schema() -> (crate::dsl::Schema, crate::dsl::Field, crate::dsl::Field) {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, maxscore_config());
     (sb.build(), title, sparse)
 }
 
@@ -239,10 +256,7 @@ async fn test_bmp_vs_maxscore_equivalence() {
         .unwrap();
 
     // --- MaxScore ---
-    let mut sb_ms = SchemaBuilder::default();
-    let _title_ms = sb_ms.add_text_field("title", true, true);
-    let sparse_ms = sb_ms.add_sparse_vector_field("sparse", true, true);
-    let schema_ms = sb_ms.build();
+    let (schema_ms, _title_ms, sparse_ms) = maxscore_schema();
     let dir_ms = RamDirectory::new();
     let mut writer_ms = IndexWriter::create(dir_ms.clone(), schema_ms.clone(), config.clone())
         .await
@@ -331,10 +345,7 @@ async fn test_bmp_vs_maxscore_multi_ordinal() {
         .unwrap();
 
     // --- MaxScore ---
-    let mut sb_ms = SchemaBuilder::default();
-    let _title_ms = sb_ms.add_text_field("title", true, true);
-    let sparse_ms = sb_ms.add_sparse_vector_field("sparse", true, true);
-    let schema_ms = sb_ms.build();
+    let (schema_ms, _title_ms, sparse_ms) = maxscore_schema();
     let dir_ms = RamDirectory::new();
     let mut writer_ms = IndexWriter::create(dir_ms.clone(), schema_ms.clone(), config.clone())
         .await
@@ -482,6 +493,162 @@ async fn test_bmp_many_blocks() {
     assert!(
         results.len() >= 20,
         "Dim 5 should match ~25 docs, got {}",
+        results.len()
+    );
+}
+
+/// BMP merge exact doc ID verification: every result after merge must map to correct doc.
+///
+/// Uses a unique dimension per document so each query returns exactly one result.
+/// Verifies the doc_id in the result matches the expected document content.
+#[tokio::test]
+async fn test_bmp_merge_exact_doc_ids() {
+    let (schema, title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    const DOCS_PER_SEG: usize = 100;
+    const NUM_SEGS: usize = 5;
+
+    // Each doc gets a unique dim = seg * DOCS_PER_SEG + i, plus a shared dim 9999
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let mut doc = Document::new();
+            doc.add_text(title, format!("seg{} doc{}", seg, i));
+            doc.add_sparse_vector(sparse, vec![(unique_dim, 1.0), (9999, 0.1)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    // Merge all segments
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(
+        index.num_docs().await.unwrap() as usize,
+        DOCS_PER_SEG * NUM_SEGS
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Query each unique dim — must return exactly the right doc
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let expected_title = format!("seg{} doc{}", seg, i);
+            let query = SparseVectorQuery::new(sparse, vec![(unique_dim, 1.0)]);
+            let results = searcher.search(&query, 5).await.unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "dim {} should match exactly 1 doc, got {}",
+                unique_dim,
+                results.len()
+            );
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got_title = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+            assert_eq!(
+                got_title, expected_title,
+                "dim {} returned wrong doc: got '{}', expected '{}'",
+                unique_dim, got_title, expected_title
+            );
+        }
+    }
+}
+
+/// MaxScore merge: verify MaxScore-configured fields produce correct results after merge.
+///
+/// This ensures that when a field is configured with SparseFormat::MaxScore,
+/// all segments use MaxScore format through build and merge.
+#[tokio::test]
+async fn test_maxscore_merge() {
+    let (schema, title, sparse) = maxscore_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    const DOCS_PER_SEG: usize = 50;
+    const NUM_SEGS: usize = 3;
+
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let mut doc = Document::new();
+            doc.add_text(title, format!("seg{} doc{}", seg, i));
+            doc.add_sparse_vector(sparse, vec![(unique_dim, 1.0), (9999, 0.1)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    // Merge all segments
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(
+        index.num_docs().await.unwrap() as usize,
+        DOCS_PER_SEG * NUM_SEGS
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Query each unique dim — must return exactly the right doc
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let expected_title = format!("seg{} doc{}", seg, i);
+            let query = SparseVectorQuery::new(sparse, vec![(unique_dim, 1.0)]);
+            let results = searcher.search(&query, 5).await.unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "MaxScore merge: dim {} should match exactly 1 doc, got {}",
+                unique_dim,
+                results.len()
+            );
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got_title = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+            assert_eq!(
+                got_title, expected_title,
+                "MaxScore merge: dim {} returned wrong doc: got '{}', expected '{}'",
+                unique_dim, got_title, expected_title
+            );
+        }
+    }
+
+    // Query shared dim — should match all docs
+    let query = SparseVectorQuery::new(sparse, vec![(9999, 1.0)]);
+    let results = searcher.search(&query, 200).await.unwrap();
+    assert_eq!(
+        results.len(),
+        DOCS_PER_SEG * NUM_SEGS,
+        "MaxScore merge: dim 9999 should match all {} docs, got {}",
+        DOCS_PER_SEG * NUM_SEGS,
         results.len()
     );
 }

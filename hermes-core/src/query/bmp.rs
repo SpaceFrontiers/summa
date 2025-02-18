@@ -334,14 +334,14 @@ fn execute_bmp_inner(
             let block_end = (block_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
             let count = block_end - block_start;
 
-            // Level 1: Warm block_data_starts for this superblock (~260 bytes, 4-5 cache lines).
+            // Level 1: Warm block_data_starts for this superblock (~520 bytes, 8-9 cache lines).
             // Ensures block_data_ptr() never stalls on offset lookups during scoring.
             // Range includes the sentinel at block_end (needed by block_data_range).
             {
                 let bds_base = index.block_data_starts_ptr(0);
-                // 16 blocks × 4 bytes = 64 bytes = 1 cache line per prefetch
-                for b in (block_start..block_end + 1).step_by(16) {
-                    prefetch_read(unsafe { bds_base.add(b * 4) });
+                // 8 blocks × 8 bytes = 64 bytes = 1 cache line per prefetch
+                for b in (block_start..block_end + 1).step_by(8) {
+                    prefetch_read(unsafe { bds_base.add(b * 8) });
                 }
             }
 
@@ -392,8 +392,8 @@ fn execute_bmp_inner(
                 let next_start = next_sb as usize * BMP_SUPERBLOCK_SIZE as usize;
                 let next_end = (next_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
                 let bds_base = index.block_data_starts_ptr(0);
-                for b in (next_start..next_end + 1).step_by(16) {
-                    prefetch_read(unsafe { bds_base.add(b * 4) });
+                for b in (next_start..next_end + 1).step_by(8) {
+                    prefetch_read(unsafe { bds_base.add(b * 8) });
                 }
             }
 

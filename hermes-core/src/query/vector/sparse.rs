@@ -30,6 +30,10 @@ pub struct SparseVectorQuery {
     /// indexing-time `pruning`: sort by abs(weight) descending,
     /// keep top fraction. None or 1.0 = no pruning.
     pub pruning: Option<f32>,
+    /// Minimum number of query dimensions before pruning and weight_threshold
+    /// filtering are applied. Protects short queries from losing signal.
+    /// Default: 4. Set to 0 to always apply.
+    pub min_query_dims: usize,
     /// Multiplier on executor limit for ordinal deduplication (1.0 = no over-fetch)
     pub over_fetch_factor: f32,
     /// Cached pruned vector; None = use `vector` as-is (no pruning applied)
@@ -66,6 +70,7 @@ impl SparseVectorQuery {
             weight_threshold: 0.0,
             max_query_dims: Some(crate::query::MAX_QUERY_TERMS),
             pruning: None,
+            min_query_dims: 4,
             over_fetch_factor: 2.0,
             pruned: None,
         };
@@ -127,27 +132,38 @@ impl SparseVectorQuery {
         self
     }
 
+    /// Set minimum query dimensions before pruning/filtering are applied.
+    /// Queries with fewer dimensions than this skip weight_threshold and pruning.
+    pub fn with_min_query_dims(mut self, min_dims: usize) -> Self {
+        self.min_query_dims = min_dims;
+        self.pruned = Some(self.compute_pruned_vector());
+        self
+    }
+
     /// Apply weight_threshold, pruning, and max_query_dims, returning the pruned vector.
     fn compute_pruned_vector(&self) -> Vec<(u32, f32)> {
         let original_len = self.vector.len();
 
         // Step 1: weight_threshold — drop dimensions below minimum weight
-        let mut v: Vec<(u32, f32)> = if self.weight_threshold > 0.0 {
-            self.vector
-                .iter()
-                .copied()
-                .filter(|(_, w)| w.abs() >= self.weight_threshold)
-                .collect()
-        } else {
-            self.vector.clone()
-        };
+        // Skip when query has fewer than min_query_dims dimensions
+        let mut v: Vec<(u32, f32)> =
+            if self.weight_threshold > 0.0 && self.vector.len() >= self.min_query_dims {
+                self.vector
+                    .iter()
+                    .copied()
+                    .filter(|(_, w)| w.abs() >= self.weight_threshold)
+                    .collect()
+            } else {
+                self.vector.clone()
+            };
         let after_threshold = v.len();
 
         // Step 2: pruning — keep top fraction by abs(weight), same as indexing
+        // Skip when query has fewer than min_query_dims dimensions
         let mut sorted_by_weight = false;
         if let Some(fraction) = self.pruning
             && fraction < 1.0
-            && v.len() > 1
+            && v.len() >= self.min_query_dims
         {
             v.sort_unstable_by(|a, b| {
                 b.1.abs()

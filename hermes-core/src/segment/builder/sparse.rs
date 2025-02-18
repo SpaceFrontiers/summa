@@ -102,12 +102,13 @@ pub(super) fn build_sparse_streaming(
             .unwrap_or(WeightQuantization::Float32);
 
         let pruning_fraction = sparse_config.and_then(|c| c.pruning);
+        let weight_threshold = sparse_config.map(|c| c.weight_threshold).unwrap_or(0.0);
+        let min_terms = sparse_config.map(|c| c.min_terms).unwrap_or(4);
         let total_vectors = builder.total_vectors;
 
         match format {
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
-                let weight_threshold = sparse_config.map(|c| c.weight_threshold).unwrap_or(0.0);
                 let quantization_factor = sparse_config.and_then(|c| c.quantization_factor);
 
                 let blob_offset = current_offset;
@@ -117,6 +118,7 @@ pub(super) fn build_sparse_streaming(
                     weight_threshold,
                     pruning_fraction,
                     quantization_factor,
+                    min_terms,
                     writer,
                 )
                 .map_err(crate::Error::Io)?;
@@ -153,6 +155,8 @@ pub(super) fn build_sparse_streaming(
                     field_id,
                     quantization,
                     pruning_fraction,
+                    weight_threshold,
+                    min_terms,
                     total_vectors,
                     writer,
                     &mut current_offset,
@@ -189,6 +193,8 @@ fn build_maxscore_field(
     field_id: u32,
     quantization: WeightQuantization,
     pruning_fraction: Option<f32>,
+    weight_threshold: f32,
+    min_terms: usize,
     total_vectors: u32,
     writer: &mut dyn Write,
     current_offset: &mut u64,
@@ -202,8 +208,17 @@ fn build_maxscore_field(
     let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
         .into_par_iter()
         .map(|(dim_id, mut postings)| {
+            // Filter by weight threshold (same as BMP path)
+            // Skip filtering when the dimension has fewer than min_terms postings
+            if weight_threshold > 0.0 && postings.len() >= min_terms {
+                postings.retain(|(_, _, w)| w.abs() >= weight_threshold);
+            }
+            if postings.is_empty() {
+                return Ok((dim_id, 0, Vec::new(), Vec::new()));
+            }
+
             let pruned = if let Some(fraction) = pruning_fraction
-                && postings.len() > 1
+                && postings.len() >= min_terms
                 && fraction < 1.0
             {
                 let original_len = postings.len();
@@ -246,6 +261,9 @@ fn build_maxscore_field(
     // Phase 1: Write block data sequentially, accumulate skip entries
     let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(serialized_dims.len());
     for (dim_id, doc_count, block_data, skip_entries) in &serialized_dims {
+        if block_data.is_empty() {
+            continue; // dim eliminated by weight_threshold / pruning
+        }
         let block_data_offset = *current_offset;
         let skip_start = all_skip_entries.len() as u32;
         let num_blocks = skip_entries.len() as u32;

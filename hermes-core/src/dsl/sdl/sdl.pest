@@ -127,7 +127,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | quantization_factor_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | query_config_block | positions_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | quantization_factor_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | query_config_block | positions_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -148,6 +148,10 @@ block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
 block_size_spec = @{ ASCII_DIGIT+ }
 pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
 pruning_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+min_terms_kwarg = { "min_terms" ~ ":" ~ min_terms_spec }
+min_terms_spec = @{ ASCII_DIGIT+ }
+sparse_format_kwarg = { "format" ~ ":" ~ sparse_format_spec }
+sparse_format_spec = { "bmp" | "maxscore" }
 nprobe_spec = @{ ASCII_DIGIT+ }
 path_chars = @{ (!("\"" ) ~ ANY)* }
 
@@ -155,7 +159,7 @@ path_chars = @{ (!("\"" ) ~ ANY)* }
 // Example: query<tokenizer: "model/name", weighting: idf>
 query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
 query_config_params = { query_config_param ~ ("," ~ query_config_param)* }
-query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg }
+query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg | query_min_query_dims_kwarg }
 query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
 query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
 tokenizer_path = { "\"" ~ path_chars ~ "\"" }
@@ -163,6 +167,7 @@ weighting_spec = { "one" | "idf_file" | "idf" }
 query_weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
 query_max_dims_kwarg = { "max_dims" ~ ":" ~ nprobe_spec }
 query_pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
+query_min_query_dims_kwarg = { "min_query_dims" ~ ":" ~ min_terms_spec }
 
 // Identifier (field names, index names, tokenizer names)
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

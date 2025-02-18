@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SparseFormat {
     /// Per-dimension variable-size blocks (existing format, DAAT MaxScore)
+    #[default]
     MaxScore,
     /// Fixed doc_id range blocks (BMP, BAAT block-at-a-time)
-    #[default]
     Bmp,
 }
 
@@ -165,6 +165,12 @@ pub struct SparseQueryConfig {
     /// keep top fraction. None or 1.0 = no pruning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruning: Option<f32>,
+    /// Minimum number of query dimensions before pruning and weight_threshold
+    /// filtering are applied. Protects short queries from losing most signal.
+    ///
+    /// Default: 4. Set to 0 to always apply pruning/filtering.
+    #[serde(default = "default_min_terms")]
+    pub min_query_dims: usize,
 }
 
 fn default_heap_factor() -> f32 {
@@ -180,6 +186,7 @@ impl Default for SparseQueryConfig {
             weight_threshold: 0.0,
             max_query_dims: None,
             pruning: None,
+            min_query_dims: 4,
         }
     }
 }
@@ -259,6 +266,13 @@ pub struct SparseVectorConfig {
     /// Standard in production IR systems (PISA, Anserini).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization_factor: Option<f32>,
+    /// Minimum number of postings in a dimension before pruning and
+    /// weight_threshold filtering are applied. Protects dimensions with
+    /// very few postings from losing most of their signal.
+    ///
+    /// Default: 4. Set to 0 to always apply pruning/filtering.
+    #[serde(default = "default_min_terms")]
+    pub min_terms: usize,
 }
 
 fn default_block_size() -> usize {
@@ -277,10 +291,14 @@ fn default_bmp_superblock_size() -> u32 {
     64
 }
 
+fn default_min_terms() -> usize {
+    4
+}
+
 impl Default for SparseVectorConfig {
     fn default() -> Self {
         Self {
-            format: SparseFormat::Bmp,
+            format: SparseFormat::MaxScore,
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
@@ -291,6 +309,7 @@ impl Default for SparseVectorConfig {
             pruning: None,
             query_config: None,
             quantization_factor: None,
+            min_terms: 4,
         }
     }
 }
@@ -329,8 +348,10 @@ impl SparseVectorConfig {
                 weight_threshold: 0.01,   // Drop low-IDF query tokens
                 max_query_dims: Some(20), // Process top 20 query dimensions
                 pruning: Some(0.1),       // Keep top 10% of query dims
+                min_query_dims: 4,
             }),
             quantization_factor: None,
+            min_terms: 4,
         }
     }
 
@@ -358,8 +379,10 @@ impl SparseVectorConfig {
                 weight_threshold: 0.01,
                 max_query_dims: Some(20),
                 pruning: Some(0.1),
+                min_query_dims: 4,
             }),
             quantization_factor: None,
+            min_terms: 4,
         }
     }
 
@@ -389,8 +412,10 @@ impl SparseVectorConfig {
                 weight_threshold: 0.02,   // Drop low-IDF query tokens
                 max_query_dims: Some(15), // Fewer query dimensions
                 pruning: Some(0.15),      // Keep top 15% of query dims
+                min_query_dims: 4,
             }),
             quantization_factor: None,
+            min_terms: 4,
         }
     }
 
@@ -410,6 +435,7 @@ impl SparseVectorConfig {
             pruning: None,
             query_config: None,
             quantization_factor: None,
+            min_terms: 4,
         }
     }
 
@@ -440,8 +466,10 @@ impl SparseVectorConfig {
                 weight_threshold: 0.005,  // Minimal query pruning
                 max_query_dims: Some(50), // Process more dimensions
                 pruning: None,            // No fraction-based pruning
+                min_query_dims: 4,
             }),
             quantization_factor: None,
+            min_terms: 4,
         }
     }
 
@@ -499,6 +527,7 @@ impl SparseVectorConfig {
             pruning: None,
             query_config: None,
             quantization_factor: None,
+            min_terms: 4,
         })
     }
 

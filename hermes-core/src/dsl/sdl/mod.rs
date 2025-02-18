@@ -56,7 +56,8 @@ pub struct SdlParser;
 
 use super::schema::DenseVectorConfig;
 use crate::structures::{
-    IndexSize, QueryWeighting, SparseQueryConfig, SparseVectorConfig, WeightQuantization,
+    IndexSize, QueryWeighting, SparseFormat, SparseQueryConfig, SparseVectorConfig,
+    WeightQuantization,
 };
 
 /// Parsed field definition
@@ -218,17 +219,20 @@ struct IndexConfig {
     nprobe: Option<usize>,
     build_threshold: Option<usize>,
     // Sparse vector index params
+    sparse_format: Option<SparseFormat>,
     quantization: Option<WeightQuantization>,
     quantization_factor: Option<f32>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
     pruning: Option<f32>,
+    min_terms: Option<usize>,
     // Sparse vector query-time config
     query_tokenizer: Option<String>,
     query_weighting: Option<QueryWeighting>,
     query_weight_threshold: Option<f32>,
     query_max_dims: Option<usize>,
     query_pruning: Option<f32>,
+    query_min_query_dims: Option<usize>,
     // Position tracking mode for phrase queries
     positions: Option<super::schema::PositionMode>,
 }
@@ -423,6 +427,24 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 }));
             }
         }
+        Rule::min_terms_kwarg => {
+            if let Some(n) = p.into_inner().next() {
+                config.min_terms = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!("Invalid min_terms value '{}', using default 4", n.as_str());
+                    4
+                }));
+            }
+        }
+        Rule::sparse_format_kwarg => {
+            // sparse_format_kwarg = { "format" ~ ":" ~ sparse_format_spec }
+            if let Some(f) = p.into_inner().next() {
+                config.sparse_format = Some(match f.as_str() {
+                    "bmp" => SparseFormat::Bmp,
+                    "maxscore" => SparseFormat::MaxScore,
+                    _ => SparseFormat::default(),
+                });
+            }
+        }
         Rule::query_config_block => {
             // query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
             parse_query_config_block(config, p);
@@ -500,6 +522,18 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                                 t.as_str()
                                             );
                                             1.0
+                                        }));
+                                }
+                            }
+                            Rule::query_min_query_dims_kwarg => {
+                                if let Some(t) = p.into_inner().next() {
+                                    config.query_min_query_dims =
+                                        Some(t.as_str().parse().unwrap_or_else(|_| {
+                                            log::warn!(
+                                                "Invalid query min_query_dims '{}', using 4",
+                                                t.as_str()
+                                            );
+                                            4
                                         }));
                                 }
                             }
@@ -643,7 +677,7 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
     }
 
     SparseVectorConfig {
-        format: crate::structures::SparseFormat::Bmp,
+        format: SparseFormat::default(),
         index_size,
         weight_quantization: WeightQuantization::default(),
         weight_threshold: 0.0,
@@ -654,11 +688,15 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
         pruning: None,
         query_config: None,
         quantization_factor: None,
+        min_terms: 4,
     }
 }
 
 /// Apply index configuration from indexed<...> to SparseVectorConfig
 fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg: IndexConfig) {
+    if let Some(f) = idx_cfg.sparse_format {
+        config.format = f;
+    }
     if let Some(q) = idx_cfg.quantization {
         config.weight_quantization = q;
     }
@@ -690,12 +728,16 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         config.pruning = Some(clamped);
     }
+    if let Some(mt) = idx_cfg.min_terms {
+        config.min_terms = mt;
+    }
     // Apply query-time configuration if present
     if idx_cfg.query_tokenizer.is_some()
         || idx_cfg.query_weighting.is_some()
         || idx_cfg.query_weight_threshold.is_some()
         || idx_cfg.query_max_dims.is_some()
         || idx_cfg.query_pruning.is_some()
+        || idx_cfg.query_min_query_dims.is_some()
     {
         let query_config = config
             .query_config
@@ -714,6 +756,9 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         if let Some(p) = idx_cfg.query_pruning {
             query_config.pruning = Some(p);
+        }
+        if let Some(m) = idx_cfg.query_min_query_dims {
+            query_config.min_query_dims = m;
         }
     }
 }
@@ -1849,6 +1894,40 @@ mod tests {
         assert!((rqc.weight_threshold - 0.03).abs() < 0.001);
         assert_eq!(rqc.max_query_dims, Some(25));
         assert!((rqc.pruning.unwrap() - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sparse_vector_format_maxscore() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<format: maxscore, quantization: uint8>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.format, SparseFormat::MaxScore);
+        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
+
+        // Verify schema roundtrip
+        let schema = indexes[0].to_schema();
+        let field = schema.get_field("embedding").unwrap();
+        let entry = schema.get_field_entry(field).unwrap();
+        let sc = entry.sparse_vector_config.as_ref().unwrap();
+        assert_eq!(sc.format, SparseFormat::MaxScore);
+    }
+
+    #[test]
+    fn test_sparse_vector_format_bmp() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<format: bmp, quantization: uint8>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.format, SparseFormat::Bmp);
     }
 
     #[test]

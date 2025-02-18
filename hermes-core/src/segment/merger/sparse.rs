@@ -280,7 +280,7 @@ impl SegmentMerger {
     }
 }
 
-/// Emit one output block: serialize V9 interleaved data to writer, update grids.
+/// Emit one output block: serialize V10 interleaved data to writer, update grids.
 ///
 /// `block_buf` contains `(dim_idx, local_slot, impact)` tuples for this block.
 /// The caller is responsible for pushing the current cumulative offset to
@@ -289,7 +289,7 @@ impl SegmentMerger {
 /// Returns the number of bytes written to the writer for this block.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn emit_v9_block(
+fn emit_v10_block(
     block_buf: &mut Vec<(u32, u8, u8)>,
     block_id: u32,
     writer: &mut OffsetWriter,
@@ -399,20 +399,19 @@ fn emit_v9_block(
     Ok(block_bytes)
 }
 
-/// Merge BMP fields with **fully streaming V9 format**.
+/// Merge BMP fields with **fully streaming V10 format**.
 ///
-/// V9 data-first layout eliminates the ~1.4 GB `block_data_buf`:
+/// V10 data-first layout eliminates the ~1.4 GB `block_data_buf`:
 ///
 /// 1. **No vid_pairs allocation**: `vid_bases[seg] + src_vid` for O(1) vid remapping;
 ///    doc_map sections (F+G) re-derived from source BmpIndex at write time.
 /// 2. **In-place grids**: packed_grid + sb_grid arrays (~40 MB for 100 dims × 400K blocks)
 ///    replace grid_entries Vec (~1.2 GB for 100M terms × 12B).
 /// 3. **Streaming block writes**: each block is written directly to the output file
-///    via a small reusable scratch buffer (~4 KB). Only `block_data_starts` (~3 MB)
+///    via a small reusable scratch buffer (~4 KB). Only `block_data_starts` (~6 MB)
 ///    is accumulated in memory.
 ///
-/// Peak memory: grids (~40 MB) + block_data_starts (~3 MB) + scratch (~4 KB).
-/// V8 merger: ~1.44 GB (block_data_buf 1.4 GB + grids 40 MB).
+/// Peak memory: grids (~40 MB) + block_data_starts (~6 MB) + scratch (~4 KB).
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
@@ -424,7 +423,7 @@ fn merge_bmp_field(
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    use crate::segment::builder::bmp::write_u32_slice_le;
+    use crate::segment::builder::bmp::{write_u32_slice_le, write_u64_slice_le};
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
     use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -501,8 +500,8 @@ fn merge_bmp_field(
     let mut packed_grid: Vec<u8> = vec![0u8; num_dims * packed_row_size];
     let mut sb_grid_arr: Vec<u8> = vec![0u8; num_dims * num_superblocks];
 
-    // ── V9 streaming: block_data_starts accumulated, blocks written directly ─
-    let mut block_data_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
+    // ── V10 streaming: block_data_starts accumulated, blocks written directly ─
+    let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks + 1);
     let mut blk_scratch: Vec<u8> = Vec::with_capacity(4096);
     let mut block_bytes_written: u64 = 0;
 
@@ -552,8 +551,8 @@ fn merge_bmp_field(
             for &(new_block, dim_idx, new_slot, imp) in &src_block_buf {
                 while current_block < new_block as i64 {
                     if current_block >= 0 {
-                        block_data_starts.push(block_bytes_written as u32);
-                        block_bytes_written += emit_v9_block(
+                        block_data_starts.push(block_bytes_written);
+                        block_bytes_written += emit_v10_block(
                             &mut block_buf,
                             current_block as u32,
                             writer,
@@ -577,8 +576,8 @@ fn merge_bmp_field(
     // Flush remaining blocks up to num_blocks
     while current_block < num_blocks as i64 {
         if current_block >= 0 {
-            block_data_starts.push(block_bytes_written as u32);
-            block_bytes_written += emit_v9_block(
+            block_data_starts.push(block_bytes_written);
+            block_bytes_written += emit_v10_block(
                 &mut block_buf,
                 current_block as u32,
                 writer,
@@ -595,7 +594,7 @@ fn merge_bmp_field(
         current_block += 1;
     }
     // Sentinel
-    block_data_starts.push(block_bytes_written as u32);
+    block_data_starts.push(block_bytes_written);
 
     if total_terms == 0 {
         return Ok(());
@@ -611,42 +610,42 @@ fn merge_bmp_field(
         effective_block_size,
     );
 
-    // ── Write remaining V9 sections ───────────────────────────────────────
-    // Section B (block data) already written above via emit_v9_block.
+    // ── Write remaining V10 sections ───────────────────────────────────────
+    // Section B (block data) already written above via emit_v10_block.
     let mut bytes_written: u64 = block_bytes_written;
 
-    // Padding to 4-byte boundary
-    let padding = (4 - (bytes_written % 4) as usize) % 4;
+    // Padding to 8-byte boundary (for u64 alignment of Section A)
+    let padding = (8 - (bytes_written % 8) as usize) % 8;
     if padding > 0 {
         writer
-            .write_all(&[0u8; 4][..padding])
+            .write_all(&[0u8; 8][..padding])
             .map_err(crate::Error::Io)?;
         bytes_written += padding as u64;
     }
 
-    // Section A: block_data_starts [u32-LE × (num_blocks + 1)]
-    bytes_written += write_u32_slice_le(writer, &block_data_starts).map_err(crate::Error::Io)?;
+    // Section A: block_data_starts [u64-LE × (num_blocks + 1)]
+    bytes_written += write_u64_slice_le(writer, &block_data_starts).map_err(crate::Error::Io)?;
     drop(block_data_starts);
 
     // Section C: dim_ids [u32-LE × num_dims]
-    let dim_ids_offset = bytes_written as u32;
+    let dim_ids_offset = bytes_written;
     bytes_written += write_u32_slice_le(writer, &dim_ids).map_err(crate::Error::Io)?;
 
     // Section D: packed grid [u8 × (num_dims × packed_row_size)]
-    let grid_offset = bytes_written as u32;
+    let grid_offset = bytes_written;
     writer.write_all(&packed_grid).map_err(crate::Error::Io)?;
     bytes_written += packed_grid.len() as u64;
     drop(packed_grid);
 
     // Section E: superblock grid [u8 × (num_dims × num_superblocks)]
-    let sb_grid_offset = bytes_written as u32;
+    let sb_grid_offset = bytes_written;
     writer.write_all(&sb_grid_arr).map_err(crate::Error::Io)?;
     bytes_written += sb_grid_arr.len() as u64;
     drop(sb_grid_arr);
 
     // Section F: doc_map_ids [u32-LE × num_virtual_docs]
     // Re-derived from source BmpIndex — no vid_pairs allocation needed.
-    let doc_map_offset = bytes_written as u32;
+    let doc_map_offset = bytes_written;
     for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
         let bmp = match bmp_opt {
             Some(b) => b,
@@ -677,45 +676,24 @@ fn merge_bmp_field(
     }
     bytes_written += num_virtual_docs as u64 * 2;
 
-    // BMP V9 Footer (48 bytes)
-    use crate::segment::format::BMP_BLOB_MAGIC_V9;
-    writer
-        .write_u32::<LittleEndian>(total_terms)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(total_postings)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(dim_ids_offset)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(grid_offset)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(num_blocks as u32)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(num_dims as u32)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(effective_block_size)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(num_virtual_docs as u32)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_f32::<LittleEndian>(new_max_weight_scale)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(sb_grid_offset)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(doc_map_offset)
-        .map_err(crate::Error::Io)?;
-    writer
-        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V9)
-        .map_err(crate::Error::Io)?;
-    bytes_written += 48;
+    // BMP V10 Footer (64 bytes)
+    use crate::segment::builder::bmp::write_v10_footer;
+    write_v10_footer(
+        writer,
+        total_terms,
+        total_postings,
+        dim_ids_offset,
+        grid_offset,
+        num_blocks as u32,
+        num_dims as u32,
+        effective_block_size,
+        num_virtual_docs as u32,
+        new_max_weight_scale,
+        sb_grid_offset,
+        doc_map_offset,
+    )
+    .map_err(crate::Error::Io)?;
+    bytes_written += 64;
 
     let blob_len = bytes_written;
     if blob_len > 0 {

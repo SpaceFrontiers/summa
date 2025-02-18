@@ -92,24 +92,28 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V9 blob footer ("BMP9" in LE)
+/// Magic number for BMP V10 blob footer ("BMP0" in LE)
+///
+/// V10 changes from V9:
+/// - Footer offsets (dim_ids_offset, grid_offset, sb_grid_offset, doc_map_offset)
+///   widened from u32 to u64, fixing silent overflow when blob exceeds 4 GB
+/// - block_data_starts entries widened from u32 to u64 (total block data can exceed 4 GB)
+/// - Footer size increased from 48 to 64 bytes
+/// - Padding alignment changed from 4-byte to 8-byte (for u64 alignment)
 ///
 /// V9 changes from V8:
 /// - Data-first layout: Section B (block data) written before Section A
 ///   (block_data_starts), enabling fully streaming merge (no buffering)
 /// - Reader derives block_data_starts offset from dim_ids_offset
-/// - Same 48-byte footer, same per-block interleaved format
 ///
 /// V8 changes from V7:
 /// - Block-interleaved format: all data for one block is contiguous (~200-2000 bytes)
-/// - Sections A+B replace V7's Sections 1-4 (block_term_starts, term_dim_ids,
-///   term_posting_starts, postings)
 /// - Per-block posting_starts use u16 (relative within block, not global u32)
 /// - Reduces cold-query page faults from 4+ per block to 1
-pub const BMP_BLOB_MAGIC_V9: u32 = 0x39504D42;
+pub const BMP_BLOB_MAGIC_V10: u32 = 0x30504D42;
 
-/// BMP V9 blob footer size (same structure as V8: 48 bytes)
-pub const BMP_BLOB_FOOTER_SIZE_V9: usize = 48;
+/// BMP V10 blob footer size: 64 bytes (up from 48 in V9)
+pub const BMP_BLOB_FOOTER_SIZE_V10: usize = 64;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

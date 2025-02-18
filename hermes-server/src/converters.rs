@@ -301,6 +301,11 @@ pub fn convert_query(
                 query = query.with_pruning(p);
             }
 
+            // min_query_dims: schema default (no per-request override)
+            if let Some(qc) = schema_qc {
+                query = query.with_min_query_dims(qc.min_query_dims);
+            }
+
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::DenseVector(dv_query)) => {
@@ -534,6 +539,9 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 if let Some(p) = cfg.pruning {
                     idx_params.push(format!("pruning: {}", p));
                 }
+                if cfg.min_terms != 4 {
+                    idx_params.push(format!("min_terms: {}", cfg.min_terms));
+                }
                 // Query config sub-block
                 if let Some(ref qc) = cfg.query_config {
                     let mut qparams = Vec::new();
@@ -556,6 +564,9 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     }
                     if let Some(p) = qc.pruning {
                         qparams.push(format!("pruning: {}", p));
+                    }
+                    if qc.min_query_dims != 4 {
+                        qparams.push(format!("min_query_dims: {}", qc.min_query_dims));
                     }
                     if !qparams.is_empty() {
                         idx_params.push(format!("query<{}>", qparams.join(", ")));
