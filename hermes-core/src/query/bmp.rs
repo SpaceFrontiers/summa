@@ -38,7 +38,10 @@
 //! - **Early termination**: stop when superblock/block UB < top-k threshold
 
 use super::scoring::{ScoreCollector, ScoredDoc};
-use crate::segment::{BMP_SUPERBLOCK_SIZE, BmpIndex};
+use crate::segment::{
+    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_u4_weighted, accumulate_u8_weighted,
+    compute_block_masks_4bit,
+};
 
 // ============================================================================
 // Software prefetch: hint the CPU to load data into cache ahead of time
@@ -89,6 +92,10 @@ struct BmpScratch {
     local_block_order: Vec<u32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
+    // Compact grid buffers: query-relevant dim rows copied contiguously for L1 locality.
+    // Resized per query to num_query_dims × row_size. Typical: 20 dims → ~16KB total.
+    compact_sb_grid: Vec<u8>,
+    compact_grid: Vec<u8>,
 }
 
 impl BmpScratch {
@@ -251,8 +258,30 @@ fn execute_bmp_inner(
             block_size,
         );
 
-        // Phase 2: Compute SUPERBLOCK UBs
-        index.compute_superblock_ubs(&resolved, &mut scratch.sb_ubs);
+        // ── Extract compact grids for L1 cache locality ─────────────
+        // Copy only query-relevant dim rows into contiguous buffers.
+        // For ~20 query dims: sb_grid ~480B + grid ~15KB ≈ 16KB → L1 cache.
+        // Eliminates scattered DRAM accesses across the full grid (potentially MBs).
+        let dim_indices: Vec<usize> = resolved.iter().map(|&(idx, _)| idx).collect();
+        index.extract_compact_grids(
+            &dim_indices,
+            &mut scratch.compact_sb_grid,
+            &mut scratch.compact_grid,
+        );
+
+        // Compact resolved: local dim indices (0..num_query_dims) into compact grid
+        let compact_resolved: Vec<(usize, f32)> =
+            (0..resolved.len()).map(|i| (i, resolved[i].1)).collect();
+
+        let prs = index.packed_row_size();
+
+        // Phase 2: Compute SUPERBLOCK UBs from compact grid
+        compute_sb_ubs_compact(
+            &scratch.compact_sb_grid,
+            num_superblocks_total,
+            &compact_resolved,
+            &mut scratch.sb_ubs,
+        );
         bucket_sort_blocks_desc_into(
             &scratch.sb_ubs[..num_superblocks_total],
             &mut scratch.sb_order,
@@ -283,17 +312,21 @@ fn execute_bmp_inner(
             let block_end = (block_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
             let count = block_end - block_start;
 
-            // Compute block UBs + masks for ONLY this superblock's blocks
-            index.compute_block_ubs_range(
-                &resolved,
+            // Compute block UBs + masks from compact grid (L1-cached)
+            compute_block_ubs_compact(
+                &scratch.compact_grid,
+                prs,
+                &compact_resolved,
                 block_start,
                 block_end,
                 &mut scratch.local_block_ubs,
             );
-            index.compute_block_masks_range(
-                &resolved,
+            compute_block_masks_4bit(
+                &scratch.compact_grid,
+                prs,
+                &compact_resolved,
                 block_start,
-                block_end,
+                block_end - block_start,
                 &mut scratch.local_block_masks,
             );
 
@@ -599,4 +632,49 @@ fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
             ordinal,
         })
         .collect()
+}
+
+// ============================================================================
+// Compact grid helpers: operate on query-local contiguous grid buffers
+// ============================================================================
+
+/// Compute superblock UBs from compact (query-local) sb_grid.
+///
+/// `compact_sb_grid` layout: `compact_sb_grid[local_dim * nsb + sb_id]`
+/// `compact_dims[i] = (i, weight)` where `i` is the local dim index.
+#[inline]
+fn compute_sb_ubs_compact(
+    compact_sb_grid: &[u8],
+    nsb: usize,
+    compact_dims: &[(usize, f32)],
+    out: &mut [f32],
+) {
+    debug_assert!(out.len() >= nsb);
+    out[..nsb].fill(0.0);
+    for &(local_idx, weight) in compact_dims {
+        let row = &compact_sb_grid[local_idx * nsb..local_idx * nsb + nsb];
+        accumulate_u8_weighted(row, weight, &mut out[..nsb]);
+    }
+}
+
+/// Compute block UBs from compact 4-bit grid for blocks `[block_start..block_end)`.
+///
+/// Same as `BmpIndex::compute_block_ubs_range` but operates on a compact grid
+/// where dim rows are contiguous in memory (L1-cache friendly).
+#[inline]
+fn compute_block_ubs_compact(
+    compact_grid: &[u8],
+    prs: usize,
+    compact_dims: &[(usize, f32)],
+    block_start: usize,
+    block_end: usize,
+    out: &mut [f32],
+) {
+    let count = block_end - block_start;
+    debug_assert!(out.len() >= count);
+    out[..count].fill(0.0);
+    for &(local_idx, weight) in compact_dims {
+        let row = &compact_grid[local_idx * prs..(local_idx + 1) * prs];
+        accumulate_u4_weighted(row, block_start, count, weight, &mut out[..count]);
+    }
 }

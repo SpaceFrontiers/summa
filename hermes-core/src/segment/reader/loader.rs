@@ -327,7 +327,7 @@ pub async fn load_sparse_file<D: Directory>(
                     bmp_indexes.insert(field_id, idx);
                 }
                 Err(e) => {
-                    log::warn!("Failed to load BMP index for field {}: {}", field_id, e);
+                    return Err(e);
                 }
             }
         } else {

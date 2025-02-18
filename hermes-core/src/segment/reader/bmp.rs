@@ -394,56 +394,16 @@ impl BmpIndex {
         block_end: usize,
         masks: &mut [u64],
     ) {
-        let count = block_end - block_start;
-        debug_assert!(masks.len() >= count);
         let prs = self.packed_row_size as usize;
         let grid = self.grid_bytes.as_slice();
-
-        masks[..count].fill(0);
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if block_start.is_multiple_of(2) {
-                unsafe {
-                    compute_block_masks_range_neon(grid, prs, query_dims, block_start, count, masks)
-                };
-                return;
-            }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if block_start.is_multiple_of(2) && is_x86_feature_detected!("sse4.1") {
-                unsafe {
-                    compute_block_masks_range_sse41(
-                        grid,
-                        prs,
-                        query_dims,
-                        block_start,
-                        count,
-                        masks,
-                    )
-                };
-                return;
-            }
-        }
-
-        for (q, &(dim_idx, _weight)) in query_dims.iter().enumerate() {
-            let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
-            let bit = 1u64 << q;
-            for b in 0..count {
-                let abs_b = block_start + b;
-                let byte_val = unsafe { *row.get_unchecked(abs_b / 2) };
-                let val = if abs_b.is_multiple_of(2) {
-                    byte_val & 0x0F
-                } else {
-                    byte_val >> 4
-                };
-                if val > 0 {
-                    unsafe { *masks.get_unchecked_mut(b) |= bit };
-                }
-            }
-        }
+        compute_block_masks_4bit(
+            grid,
+            prs,
+            query_dims,
+            block_start,
+            block_end - block_start,
+            masks,
+        );
     }
 
     // ── Hot-path query-time accessors (unchecked reads) ─────────────
@@ -661,7 +621,7 @@ impl BmpIndex {
 
     /// Estimated memory usage in bytes (mmap-backed region sizes).
     ///
-    /// V6 fully zero-copy: all data is mmap-backed OwnedBytes, but the
+    /// V7 fully zero-copy: all data is mmap-backed OwnedBytes, but the
     /// mapped regions still consume RSS when paged in by the OS.
     pub fn estimated_memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -674,6 +634,68 @@ impl BmpIndex {
             + self.sb_grid_bytes.len()
             + self.doc_map_ids_bytes.len()
             + self.doc_map_ordinals_bytes.len()
+    }
+
+    /// Prefault all mmap-backed sections into the OS page cache.
+    ///
+    /// Eliminates 20-50ms cold-start penalty on first query by forcing page
+    /// faults at a predictable time (segment load) rather than during query
+    /// execution. On Unix, also issues `madvise(MADV_WILLNEED)` for readahead.
+    ///
+    /// Sections are prefaulted in query access order:
+    /// 1. sb_grid (superblock UB computation)
+    /// 2. grid (block UB + mask computation)
+    /// 3. block_term_starts + term_dim_ids + term_posting_starts (block scoring)
+    /// 4. postings (actual posting data)
+    /// 5. doc_map (virtual-to-doc mapping for result output)
+    pub fn warmup(&self) {
+        self.sb_grid_bytes.prefault();
+        self.grid_bytes.prefault();
+        self.block_term_starts_bytes.prefault();
+        self.term_dim_ids_bytes.prefault();
+        self.term_posting_starts_bytes.prefault();
+        self.postings_bytes.prefault();
+        self.dim_ids_bytes.prefault();
+        self.doc_map_ids_bytes.prefault();
+        self.doc_map_ordinals_bytes.prefault();
+    }
+
+    /// Extract compact grid data for query-relevant dims into caller-provided buffers.
+    ///
+    /// Copies only the rows corresponding to `dim_indices`, creating a contiguous
+    /// layout that fits in L1/L2 cache. For ~20 query dims with 1500 blocks:
+    /// sb_grid ~480B + grid ~15KB = ~16KB — comfortably in L1 (32-64KB).
+    ///
+    /// After extraction, local dim index `i` maps to `compact_sb_grid[i * nsb..]`
+    /// and `compact_grid[i * prs..]`.
+    pub(crate) fn extract_compact_grids(
+        &self,
+        dim_indices: &[usize],
+        compact_sb_grid: &mut Vec<u8>,
+        compact_grid: &mut Vec<u8>,
+    ) {
+        let nsb = self.num_superblocks as usize;
+        let prs = self.packed_row_size as usize;
+        let nqd = dim_indices.len();
+
+        compact_sb_grid.resize(nqd * nsb, 0);
+        compact_grid.resize(nqd * prs, 0);
+
+        let sb_grid = self.sb_grid_bytes.as_slice();
+        let grid = self.grid_bytes.as_slice();
+
+        for (local, &dim_idx) in dim_indices.iter().enumerate() {
+            compact_sb_grid[local * nsb..(local + 1) * nsb]
+                .copy_from_slice(&sb_grid[dim_idx * nsb..(dim_idx + 1) * nsb]);
+            compact_grid[local * prs..(local + 1) * prs]
+                .copy_from_slice(&grid[dim_idx * prs..(dim_idx + 1) * prs]);
+        }
+    }
+
+    /// Packed row size (bytes per dim row in 4-bit grid).
+    #[inline]
+    pub(crate) fn packed_row_size(&self) -> usize {
+        self.packed_row_size as usize
     }
 }
 
@@ -713,7 +735,7 @@ impl<'a> ExactSizeIterator for DimIdIter<'a> {}
 ///
 /// Uses NEON on aarch64, SSE4.1 on x86_64, scalar fallback on other platforms.
 #[inline]
-fn accumulate_u8_weighted(input: &[u8], weight: f32, out: &mut [f32]) {
+pub(crate) fn accumulate_u8_weighted(input: &[u8], weight: f32, out: &mut [f32]) {
     debug_assert_eq!(input.len(), out.len());
     let n = input.len();
 
@@ -877,7 +899,7 @@ unsafe fn accumulate_u8_weighted_sse41(input: &[u8], weight: f32, out: &mut [f32
 ///
 /// `packed[i/2]`: low nibble = even element, high nibble = odd element.
 #[inline]
-fn accumulate_u4_weighted(
+pub(crate) fn accumulate_u4_weighted(
     packed: &[u8],
     elem_offset: usize,
     count: usize,
@@ -1169,7 +1191,69 @@ unsafe fn accumulate_u4_weighted_sse41(
 }
 
 // ============================================================================
-// Block mask SIMD: compute presence masks for blocks in a superblock
+// Block mask computation: standalone function with SIMD dispatch
+// ============================================================================
+
+/// Compute per-block query-dim presence masks from 4-bit packed grid data.
+///
+/// Standalone function that works with any grid slice (full index grid or
+/// compact query-local grid). Uses SIMD when available.
+///
+/// `grid` layout: `grid[dim_idx * prs + byte_idx]` where each byte packs
+/// two 4-bit values (low nibble = even block, high nibble = odd block).
+///
+/// `query_dims` entries: `(dim_idx, weight)` where dim_idx indexes into grid rows.
+pub(crate) fn compute_block_masks_4bit(
+    grid: &[u8],
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    debug_assert!(masks.len() >= count);
+    masks[..count].fill(0);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if block_start.is_multiple_of(2) {
+            unsafe {
+                compute_block_masks_range_neon(grid, prs, query_dims, block_start, count, masks)
+            };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if block_start.is_multiple_of(2) && is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                compute_block_masks_range_sse41(grid, prs, query_dims, block_start, count, masks)
+            };
+            return;
+        }
+    }
+
+    for (q, &(dim_idx, _)) in query_dims.iter().enumerate() {
+        let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
+        let bit = 1u64 << q;
+        for b in 0..count {
+            let abs_b = block_start + b;
+            let byte_val = unsafe { *row.get_unchecked(abs_b / 2) };
+            let val = if abs_b.is_multiple_of(2) {
+                byte_val & 0x0F
+            } else {
+                byte_val >> 4
+            };
+            if val > 0 {
+                unsafe { *masks.get_unchecked_mut(b) |= bit };
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Block mask SIMD kernels
 // ============================================================================
 
 /// NEON kernel: compute block masks for 4-bit grid.
