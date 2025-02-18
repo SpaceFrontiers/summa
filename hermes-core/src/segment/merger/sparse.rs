@@ -280,17 +280,139 @@ impl SegmentMerger {
     }
 }
 
-/// Merge BMP fields using a **streaming block-at-a-time** approach.
+/// Emit one output block: serialize V9 interleaved data to writer, update grids.
 ///
-/// V8 block-interleaved format with compact virtual IDs and memory-bounded merge:
-/// - **Compact virtual IDs**: `new_vid = vid_base[seg] + src_vid` — O(1) per posting.
-///   Since doc_offsets produce non-overlapping ranges, segments occupy contiguous
-///   vid_pairs ranges. No HashMap or binary search needed.
-/// - **Streaming**: processes one source block at a time, flushing completed output
-///   blocks incrementally. Peak memory is O(output_arrays) — the O(N×12) all_postings
-///   Vec is eliminated entirely.
-/// - **Per-source-block sort**: only sorts the postings from one source block (~64K max),
-///   not all postings globally (which could be 100M+).
+/// `block_buf` contains `(dim_idx, local_slot, impact)` tuples for this block.
+/// The caller is responsible for pushing the current cumulative offset to
+/// `block_data_starts` before calling this function.
+///
+/// Returns the number of bytes written to the writer for this block.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn emit_v9_block(
+    block_buf: &mut Vec<(u32, u8, u8)>,
+    block_id: u32,
+    writer: &mut OffsetWriter,
+    blk_scratch: &mut Vec<u8>,
+    packed_grid: &mut [u8],
+    sb_grid: &mut [u8],
+    packed_row_size: usize,
+    num_superblocks: usize,
+    dim_id_width: u8,
+    total_terms: &mut u32,
+    total_postings: &mut u32,
+) -> Result<u64> {
+    use crate::segment::builder::bmp::quantize_u8_to_u4_ceil;
+    use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
+
+    if block_buf.is_empty() {
+        // Empty block — no data
+        return Ok(0);
+    }
+
+    // Sort by dim_idx to group postings by dimension
+    block_buf.sort_unstable_by_key(|&(di, _, _)| di);
+
+    blk_scratch.clear();
+
+    // Pass 1: count terms (= distinct dim_idx values in sorted block_buf)
+    let mut num_block_terms: u16 = 0;
+    {
+        let mut i = 0;
+        while i < block_buf.len() {
+            num_block_terms += 1;
+            let dim = block_buf[i].0;
+            while i < block_buf.len() && block_buf[i].0 == dim {
+                i += 1;
+            }
+        }
+    }
+
+    // Write num_terms (u16)
+    blk_scratch.extend_from_slice(&num_block_terms.to_le_bytes());
+
+    // Write term_dim_indices
+    {
+        let mut i = 0;
+        while i < block_buf.len() {
+            let dim_idx = block_buf[i].0;
+            if dim_id_width == 2 {
+                blk_scratch.extend_from_slice(&(dim_idx as u16).to_le_bytes());
+            } else {
+                blk_scratch.extend_from_slice(&dim_idx.to_le_bytes());
+            }
+            while i < block_buf.len() && block_buf[i].0 == dim_idx {
+                i += 1;
+            }
+        }
+    }
+
+    // Write posting_starts (u16, relative) + update grids
+    {
+        let mut i = 0;
+        let mut cumul: u16 = 0;
+        let b = block_id as usize;
+        while i < block_buf.len() {
+            let dim_idx = block_buf[i].0;
+            blk_scratch.extend_from_slice(&cumul.to_le_bytes());
+            let start = i;
+            let mut max_imp = 0u8;
+            while i < block_buf.len() && block_buf[i].0 == dim_idx {
+                max_imp = max_imp.max(block_buf[i].2);
+                i += 1;
+            }
+            cumul += (i - start) as u16;
+
+            // Update packed grid (4-bit ceiling quantized)
+            let q4 = quantize_u8_to_u4_ceil(max_imp);
+            let row = dim_idx as usize * packed_row_size;
+            if b.is_multiple_of(2) {
+                packed_grid[row + b / 2] |= q4;
+            } else {
+                packed_grid[row + b / 2] |= q4 << 4;
+            }
+            // Update superblock grid (8-bit max)
+            let sb = b / BMP_SUPERBLOCK_SIZE as usize;
+            let sr = dim_idx as usize * num_superblocks + sb;
+            if max_imp > sb_grid[sr] {
+                sb_grid[sr] = max_imp;
+            }
+        }
+        // Sentinel posting_start
+        blk_scratch.extend_from_slice(&cumul.to_le_bytes());
+        *total_postings += cumul as u32;
+    }
+
+    // Write postings [(u8, u8)] — already grouped by dim_idx after sort
+    for &(_, slot, imp) in block_buf.iter() {
+        blk_scratch.push(slot);
+        blk_scratch.push(imp);
+    }
+
+    *total_terms += num_block_terms as u32;
+    block_buf.clear();
+
+    // Write block data directly to writer
+    let block_bytes = blk_scratch.len() as u64;
+    writer.write_all(blk_scratch).map_err(crate::Error::Io)?;
+
+    Ok(block_bytes)
+}
+
+/// Merge BMP fields with **fully streaming V9 format**.
+///
+/// V9 data-first layout eliminates the ~1.4 GB `block_data_buf`:
+///
+/// 1. **No vid_pairs allocation**: `vid_bases[seg] + src_vid` for O(1) vid remapping;
+///    doc_map sections (F+G) re-derived from source BmpIndex at write time.
+/// 2. **In-place grids**: packed_grid + sb_grid arrays (~40 MB for 100 dims × 400K blocks)
+///    replace grid_entries Vec (~1.2 GB for 100M terms × 12B).
+/// 3. **Streaming block writes**: each block is written directly to the output file
+///    via a small reusable scratch buffer (~4 KB). Only `block_data_starts` (~3 MB)
+///    is accumulated in memory.
+///
+/// Peak memory: grids (~40 MB) + block_data_starts (~3 MB) + scratch (~4 KB).
+/// V8 merger: ~1.44 GB (block_data_buf 1.4 GB + grids 40 MB).
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
@@ -302,9 +424,8 @@ fn merge_bmp_field(
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    use crate::segment::builder::bmp::{
-        stream_write_grids, write_u32_slice_le, write_v8_interleaved_sections,
-    };
+    use crate::segment::builder::bmp::write_u32_slice_le;
+    use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
     use byteorder::{LittleEndian, WriteBytesExt};
 
     // ── Phase 0: Compute merged parameters from source segments ──────────
@@ -353,113 +474,47 @@ fn merge_bmp_field(
     let effective_block_size = bmp_block_size.min(256);
     let ebs = effective_block_size as u64;
 
-    // ── Compute vid_bases and vid_pairs ──────────────────────────────────
-    // Since doc_offsets produce non-overlapping doc_id ranges, segments
-    // occupy contiguous ranges in vid_pairs. new_vid = vid_base[seg] + src_vid.
-    // No sort or binary search needed — sequential enumeration is already sorted.
-    let total_vids: usize = bmp_indexes
-        .iter()
-        .filter_map(|bi| bi.map(|b| b.num_virtual_docs as usize))
-        .sum();
-    let mut vid_pairs: Vec<(u32, u16)> = Vec::with_capacity(total_vids);
+    // ── Compute vid_bases and num_virtual_docs (no vid_pairs allocation) ─
+    // doc_map sections (F+G) will be re-derived from source BmpIndex at write time,
+    // saving ~300 MB for 50M vdocs.
+    let mut num_virtual_docs: usize = 0;
     let mut vid_bases: Vec<u64> = Vec::with_capacity(bmp_indexes.len());
-    for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
-        vid_bases.push(vid_pairs.len() as u64);
-        let bmp = match bmp_opt {
-            Some(b) => b,
-            None => continue,
-        };
-        let doc_offset = doc_offs[seg_idx];
-        for vid in 0..bmp.num_virtual_docs {
-            let (doc_id, ordinal) = bmp.virtual_to_doc(vid);
-            vid_pairs.push((doc_id + doc_offset, ordinal));
+    for bmp_opt in bmp_indexes.iter() {
+        vid_bases.push(num_virtual_docs as u64);
+        if let Some(bmp) = bmp_opt {
+            num_virtual_docs += bmp.num_virtual_docs as usize;
         }
     }
-    debug_assert!(
-        vid_pairs.windows(2).all(|w| w[0] <= w[1]),
-        "BMP merge: vid_pairs not sorted — doc_offsets may overlap"
-    );
-    let num_virtual_docs = vid_pairs.len();
 
     if num_virtual_docs == 0 {
         return Ok(());
     }
 
     let num_blocks = num_virtual_docs.div_ceil(effective_block_size as usize);
+    let dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
+    let packed_row_size = num_blocks.div_ceil(2);
+    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
-    // ── Streaming merge: process one source block at a time ──────────────
-    // Instead of collecting all postings (12B × N) into a Vec and sorting globally,
-    // we process each source block independently. Within a source block, postings
-    // are remapped and sorted locally (~64K entries max), then distributed to
-    // the output block buffer. Completed output blocks are flushed incrementally.
-    //
-    // Memory: O(output_arrays + one_source_block) instead of O(all_postings).
-    //
-    // Pre-allocate from source segment stats to avoid realloc+copy during growth.
-    let est_total_postings: usize = bmp_indexes
-        .iter()
-        .filter_map(|bi| bi.map(|b| b.total_postings() as usize))
-        .sum();
-    // total_terms from footer = unique (dim, block) pairs. Merging can split source
-    // blocks across ≤2 output blocks, so 2× sum is a tight upper bound.
-    let est_total_terms: usize = bmp_indexes
-        .iter()
-        .filter_map(|bi| bi.map(|b| b.total_terms() as usize))
-        .sum::<usize>()
-        * 2;
-    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_total_terms);
-    let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
-    let mut term_dim_ids: Vec<u32> = Vec::with_capacity(est_total_terms);
-    let mut term_posting_starts: Vec<u32> = Vec::with_capacity(est_total_terms + 1);
-    term_posting_starts.push(0);
-    let mut cumulative_postings: u32 = 0;
-    let mut postings_buf: Vec<u8> = Vec::with_capacity(est_total_postings * 2);
+    // ── In-place grids (replaces grid_entries Vec) ───────────────────────
+    // packed_grid: 4-bit packed, ~40 MB for 100 dims × 400K blocks
+    // sb_grid:     8-bit max,    ~1.2 MB for 100 dims × 12.5K superblocks
+    let mut packed_grid: Vec<u8> = vec![0u8; num_dims * packed_row_size];
+    let mut sb_grid_arr: Vec<u8> = vec![0u8; num_dims * num_superblocks];
 
-    // Buffer for the current output block being assembled
+    // ── V9 streaming: block_data_starts accumulated, blocks written directly ─
+    let mut block_data_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
+    let mut blk_scratch: Vec<u8> = Vec::with_capacity(4096);
+    let mut block_bytes_written: u64 = 0;
+
+    // Buffer for current output block being assembled
     let mut block_buf: Vec<(u32, u8, u8)> = Vec::with_capacity(256); // (dim_idx, local_slot, impact)
     let mut current_block: i64 = -1;
+    let mut total_terms: u32 = 0;
+    let mut total_postings: u32 = 0;
 
     // Temporary buffer for one source block's remapped postings (reused across iterations)
     let mut src_block_buf: Vec<(u32, u32, u8, u8)> =
         Vec::with_capacity(effective_block_size as usize * 256);
-
-    /// Flush the current output block buffer: sort by dim_idx, group, emit to output arrays.
-    #[inline(never)]
-    fn flush_block(
-        block_buf: &mut Vec<(u32, u8, u8)>,
-        term_dim_ids: &mut Vec<u32>,
-        term_posting_starts: &mut Vec<u32>,
-        postings_buf: &mut Vec<u8>,
-        cumulative_postings: &mut u32,
-        grid_entries: &mut Vec<(u32, u32, u8)>,
-        block_id: u32,
-    ) {
-        if block_buf.is_empty() {
-            return;
-        }
-        // Sort by dim_idx to group postings by dimension
-        block_buf.sort_unstable_by_key(|&(di, _, _)| di);
-
-        let mut i = 0;
-        while i < block_buf.len() {
-            let dim_idx = block_buf[i].0;
-            let mut max_imp = 0u8;
-            while i < block_buf.len() && block_buf[i].0 == dim_idx {
-                let (_, slot, imp) = block_buf[i];
-                postings_buf.push(slot);
-                postings_buf.push(imp);
-                if imp > max_imp {
-                    max_imp = imp;
-                }
-                *cumulative_postings += 1;
-                i += 1;
-            }
-            term_dim_ids.push(dim_idx);
-            term_posting_starts.push(*cumulative_postings);
-            grid_entries.push((dim_idx, block_id, max_imp));
-        }
-        block_buf.clear();
-    }
 
     // Process segments sequentially — they occupy contiguous vid ranges
     for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
@@ -497,17 +552,20 @@ fn merge_bmp_field(
             for &(new_block, dim_idx, new_slot, imp) in &src_block_buf {
                 while current_block < new_block as i64 {
                     if current_block >= 0 {
-                        // Flush completed block
-                        block_term_starts.push(term_dim_ids.len() as u32);
-                        flush_block(
+                        block_data_starts.push(block_bytes_written as u32);
+                        block_bytes_written += emit_v9_block(
                             &mut block_buf,
-                            &mut term_dim_ids,
-                            &mut term_posting_starts,
-                            &mut postings_buf,
-                            &mut cumulative_postings,
-                            &mut grid_entries,
                             current_block as u32,
-                        );
+                            writer,
+                            &mut blk_scratch,
+                            &mut packed_grid,
+                            &mut sb_grid_arr,
+                            packed_row_size,
+                            num_superblocks,
+                            dim_id_width,
+                            &mut total_terms,
+                            &mut total_postings,
+                        )?;
                     }
                     current_block += 1;
                 }
@@ -519,24 +577,25 @@ fn merge_bmp_field(
     // Flush remaining blocks up to num_blocks
     while current_block < num_blocks as i64 {
         if current_block >= 0 {
-            block_term_starts.push(term_dim_ids.len() as u32);
-            flush_block(
+            block_data_starts.push(block_bytes_written as u32);
+            block_bytes_written += emit_v9_block(
                 &mut block_buf,
-                &mut term_dim_ids,
-                &mut term_posting_starts,
-                &mut postings_buf,
-                &mut cumulative_postings,
-                &mut grid_entries,
                 current_block as u32,
-            );
+                writer,
+                &mut blk_scratch,
+                &mut packed_grid,
+                &mut sb_grid_arr,
+                packed_row_size,
+                num_superblocks,
+                dim_id_width,
+                &mut total_terms,
+                &mut total_postings,
+            )?;
         }
         current_block += 1;
     }
     // Sentinel
-    block_term_starts.push(term_dim_ids.len() as u32);
-
-    let total_terms = term_dim_ids.len();
-    let total_postings = cumulative_postings;
+    block_data_starts.push(block_bytes_written as u32);
 
     if total_terms == 0 {
         return Ok(());
@@ -552,62 +611,76 @@ fn merge_bmp_field(
         effective_block_size,
     );
 
-    debug_assert_eq!(
-        postings_buf.len() as u32,
-        total_postings * 2,
-        "BMP merge posting count mismatch: buffered {} bytes but expected {} postings × 2",
-        postings_buf.len(),
-        total_postings
-    );
+    // ── Write remaining V9 sections ───────────────────────────────────────
+    // Section B (block data) already written above via emit_v9_block.
+    let mut bytes_written: u64 = block_bytes_written;
 
-    // ── Write V8 blob — block-interleaved format ──────────────────────────
-    let mut bytes_written: u64 = 0;
+    // Padding to 4-byte boundary
+    let padding = (4 - (bytes_written % 4) as usize) % 4;
+    if padding > 0 {
+        writer
+            .write_all(&[0u8; 4][..padding])
+            .map_err(crate::Error::Io)?;
+        bytes_written += padding as u64;
+    }
 
-    // Sections A+B: block-interleaved data (consumes intermediate arrays, freeing ~2× postings memory)
-    bytes_written += write_v8_interleaved_sections(
-        writer,
-        block_term_starts,
-        term_dim_ids,
-        term_posting_starts,
-        postings_buf,
-        num_blocks,
-        num_dims,
-    )
-    .map_err(crate::Error::Io)?;
+    // Section A: block_data_starts [u32-LE × (num_blocks + 1)]
+    bytes_written += write_u32_slice_le(writer, &block_data_starts).map_err(crate::Error::Io)?;
+    drop(block_data_starts);
 
     // Section C: dim_ids [u32-LE × num_dims]
     let dim_ids_offset = bytes_written as u32;
     bytes_written += write_u32_slice_le(writer, &dim_ids).map_err(crate::Error::Io)?;
 
-    // Sections D+E: packed grid + sb_grid (streaming from sparse grid entries)
-    grid_entries.sort_unstable();
+    // Section D: packed grid [u8 × (num_dims × packed_row_size)]
     let grid_offset = bytes_written as u32;
-    let (packed_bytes, sb_bytes) = stream_write_grids(&grid_entries, num_dims, num_blocks, writer)
-        .map_err(crate::Error::Io)?;
-    let sb_grid_offset = (bytes_written + packed_bytes) as u32;
-    bytes_written += packed_bytes + sb_bytes;
+    writer.write_all(&packed_grid).map_err(crate::Error::Io)?;
+    bytes_written += packed_grid.len() as u64;
+    drop(packed_grid);
+
+    // Section E: superblock grid [u8 × (num_dims × num_superblocks)]
+    let sb_grid_offset = bytes_written as u32;
+    writer.write_all(&sb_grid_arr).map_err(crate::Error::Io)?;
+    bytes_written += sb_grid_arr.len() as u64;
+    drop(sb_grid_arr);
 
     // Section F: doc_map_ids [u32-LE × num_virtual_docs]
+    // Re-derived from source BmpIndex — no vid_pairs allocation needed.
     let doc_map_offset = bytes_written as u32;
-    for &(doc_id, _) in &vid_pairs {
-        writer
-            .write_u32::<LittleEndian>(doc_id)
-            .map_err(crate::Error::Io)?;
+    for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
+        let bmp = match bmp_opt {
+            Some(b) => b,
+            None => continue,
+        };
+        let doc_offset = doc_offs[seg_idx];
+        for vid in 0..bmp.num_virtual_docs {
+            let (doc_id, _ordinal) = bmp.virtual_to_doc(vid);
+            writer
+                .write_u32::<LittleEndian>(doc_id + doc_offset)
+                .map_err(crate::Error::Io)?;
+        }
     }
     bytes_written += num_virtual_docs as u64 * 4;
 
     // Section G: doc_map_ordinals [u16-LE × num_virtual_docs]
-    for &(_, ord) in &vid_pairs {
-        writer
-            .write_u16::<LittleEndian>(ord)
-            .map_err(crate::Error::Io)?;
+    for bmp_opt in bmp_indexes.iter() {
+        let bmp = match bmp_opt {
+            Some(b) => b,
+            None => continue,
+        };
+        for vid in 0..bmp.num_virtual_docs {
+            let (_doc_id, ordinal) = bmp.virtual_to_doc(vid);
+            writer
+                .write_u16::<LittleEndian>(ordinal)
+                .map_err(crate::Error::Io)?;
+        }
     }
     bytes_written += num_virtual_docs as u64 * 2;
 
-    // BMP V8 Footer (48 bytes)
-    use crate::segment::format::BMP_BLOB_MAGIC_V8;
+    // BMP V9 Footer (48 bytes)
+    use crate::segment::format::BMP_BLOB_MAGIC_V9;
     writer
-        .write_u32::<LittleEndian>(total_terms as u32)
+        .write_u32::<LittleEndian>(total_terms)
         .map_err(crate::Error::Io)?;
     writer
         .write_u32::<LittleEndian>(total_postings)
@@ -640,7 +713,7 @@ fn merge_bmp_field(
         .write_u32::<LittleEndian>(doc_map_offset)
         .map_err(crate::Error::Io)?;
     writer
-        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V8)
+        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V9)
         .map_err(crate::Error::Io)?;
     bytes_written += 48;
 

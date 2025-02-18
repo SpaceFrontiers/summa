@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V8 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V9 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -17,16 +17,16 @@
 //!
 //! Peak memory: `output arrays only + O(num_dims) heap`.
 //!
-//! ## BMP V8 Blob Layout (block-interleaved)
+//! ## BMP V9 Blob Layout (data-first, block-interleaved)
 //!
-//! V8 interleaves scoring data per-block so that all data needed to score
-//! one block is contiguous (~200-2000 bytes, fits in 1-2 pages). This
-//! reduces cold-query page faults from 4+ per block to 1.
+//! V9 writes block data before block_data_starts, enabling fully streaming
+//! merge. Per-block interleaved scoring data is contiguous (~200-2000 bytes,
+//! fits in 1-2 pages), reducing cold-query page faults from 4+ to 1.
 //!
 //! ```text
-//! Section A:  block_data_starts  [u32-LE × (num_blocks + 1)]   byte offsets into Section B
-//! Section B:  block_data         [per-block interleaved data]   variable-length per block
+//! Section B:  block_data         [per-block interleaved data]   variable-length
 //!             padding            [0-3 bytes to 4-byte boundary]
+//! Section A:  block_data_starts  [u32-LE × (num_blocks + 1)]   byte offsets into Section B
 //! Section C:  dim_ids            [u32-LE × num_dims]
 //! Section D:  grid_packed4       [u8 × (num_dims × packed_row_size)]  ← 4-bit packed
 //! Section E:  sb_grid            [u8 × (num_dims × num_superblocks)]  ← 8-bit
@@ -39,7 +39,7 @@
 //!   posting_starts: [u16-LE × (num_terms + 1)]        relative cumulative counts
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP8 Footer (48 bytes):
+//! BMP9 Footer (48 bytes):
 //!   total_terms: u32              // 0-3   (stats only)
 //!   total_postings: u32           // 4-7   (stats only)
 //!   dim_ids_offset: u32           // 8-11  (byte offset of Section C)
@@ -51,7 +51,7 @@
 //!   max_weight_scale: f32         // 32-35
 //!   sb_grid_offset: u32           // 36-39 (byte offset of Section E)
 //!   doc_map_offset: u32           // 40-43 (byte offset of Section F)
-//!   magic: u32                    // 44-47 (BMP8 = 0x38504D42)
+//!   magic: u32                    // 44-47 (BMP9 = 0x39504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -71,10 +71,10 @@ pub(crate) fn vid_lookup(vid_pairs: &[(crate::DocId, u16)], key: (crate::DocId, 
 }
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V8;
+use crate::segment::format::BMP_BLOB_MAGIC_V9;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V8 blob from per-dimension postings.
+/// Build a BMP V9 blob from per-dimension postings.
 ///
 /// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
 /// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
@@ -84,7 +84,7 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// `(doc_id, ordinal)` = sorted by `compact_virtual_id` = sorted by `block_id`.
 /// A min-heap merges them in `(block_id, dim_id)` order.
 ///
-/// V8 writes block-interleaved data so all scoring data for one block is contiguous.
+/// V9 writes block data first (streamable), then block_data_starts.
 ///
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 pub(crate) fn build_bmp_blob(
@@ -313,7 +313,7 @@ pub(crate) fn build_bmp_blob(
 
     let dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
     log::info!(
-        "[bmp_build] V8 num_virtual_docs={} num_blocks={} num_dims={} \
+        "[bmp_build] V9 num_virtual_docs={} num_blocks={} num_dims={} \
          total_terms={} total_postings={} grid_entries={} dim_id_width={}",
         num_virtual_docs,
         num_blocks,
@@ -324,11 +324,11 @@ pub(crate) fn build_bmp_blob(
         dim_id_width,
     );
 
-    // ── Write V8 interleaved sections ───────────────────────────────────
+    // ── Write V9 interleaved sections (data-first) ──────────────────────
     let mut bytes_written: u64 = 0;
 
-    // Sections A+B: block-interleaved data (consumes intermediate arrays)
-    bytes_written += write_v8_interleaved_sections(
+    // Sections B+A: block data first, then block_data_starts (consumes intermediate arrays)
+    bytes_written += write_v9_interleaved_sections(
         writer,
         block_term_starts,
         term_dim_ids,
@@ -361,7 +361,7 @@ pub(crate) fn build_bmp_blob(
     }
     bytes_written += num_virtual_docs as u64 * 2;
 
-    // BMP V8 Footer (48 bytes)
+    // BMP V9 Footer (48 bytes)
     writer.write_u32::<LittleEndian>(total_terms)?;
     writer.write_u32::<LittleEndian>(total_postings)?;
     writer.write_u32::<LittleEndian>(dim_ids_offset)?;
@@ -373,7 +373,7 @@ pub(crate) fn build_bmp_blob(
     writer.write_f32::<LittleEndian>(max_weight_scale)?;
     writer.write_u32::<LittleEndian>(sb_grid_offset)?;
     writer.write_u32::<LittleEndian>(doc_map_offset)?;
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V8)?;
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V9)?;
     bytes_written += 48;
 
     Ok(bytes_written)
@@ -403,18 +403,22 @@ pub(crate) fn write_u32_slice_le(writer: &mut dyn Write, data: &[u32]) -> std::i
     Ok(data.len() as u64 * 4)
 }
 
-/// Write V8 interleaved block data: Sections A (block_data_starts) + B (per-block data) + padding.
+/// Write V9 interleaved block data: Section B (per-block data) + padding + Section A (block_data_starts).
+///
+/// V9 data-first layout: block data is written first (streamable), then
+/// block_data_starts (small, ~3 MB for 780K blocks). This enables the merger
+/// to write blocks directly to the output file without buffering.
 ///
 /// **Consumes** the intermediate arrays to free memory before writing.
-/// Uses a two-pass approach to avoid building a giant `block_data_buf`:
-///   Pass 1: compute per-block data sizes → fill `block_data_starts`, write Section A
+/// Uses a two-pass approach:
+///   Pass 1: compute per-block data sizes → fill `block_data_starts`
 ///   Pass 2: stream each block's data directly to writer using a small reusable buffer
+///   Finally: write padding + block_data_starts
 ///
 /// Peak memory: only the input arrays + small per-block scratch (~4 KB).
-/// Previous approach held inputs + full block_data_buf (~2× data size).
 ///
-/// Returns total bytes written (sections A + B + padding).
-pub(crate) fn write_v8_interleaved_sections(
+/// Returns total bytes written (sections B + padding + A).
+pub(crate) fn write_v9_interleaved_sections(
     writer: &mut dyn Write,
     block_term_starts: Vec<u32>,
     term_dim_ids: Vec<u32>,
@@ -445,11 +449,7 @@ pub(crate) fn write_v8_interleaved_sections(
 
     let mut bytes_written: u64 = 0;
 
-    // Section A: block_data_starts [u32 × (num_blocks + 1)]
-    bytes_written += write_u32_slice_le(writer, &block_data_starts)?;
-    drop(block_data_starts);
-
-    // Pass 2: stream each block's interleaved data directly to writer.
+    // Section B: stream each block's interleaved data directly to writer.
     // Small per-block scratch buffer (~200-2000 bytes typical, reused).
     let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
 
@@ -502,6 +502,9 @@ pub(crate) fn write_v8_interleaved_sections(
         writer.write_all(&[0u8; 4][..padding])?;
         bytes_written += padding as u64;
     }
+
+    // Section A: block_data_starts [u32 × (num_blocks + 1)]
+    bytes_written += write_u32_slice_le(writer, &block_data_starts)?;
 
     Ok(bytes_written)
 }
@@ -621,7 +624,7 @@ mod tests {
         // Verify footer magic
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V8);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V9);
     }
 
     #[test]

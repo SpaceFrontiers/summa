@@ -100,6 +100,25 @@ Full SDL reference: `docs/schema.md`
 - wasm-pack (for WASM builds)
 - protoc (for gRPC)
 
+## CI/CD
+
+Uses GitHub Actions. Trigger workflows with the `gh` CLI:
+
+```bash
+# Publish (bumps version, publishes to crates.io/npm/pypi/docker)
+gh workflow run publish.yml
+
+# Check CI status
+gh run list --workflow=ci.yml --limit=5
+```
+
+**Workflows:**
+
+- **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python lint, TypeScript build, cargo audit.
+- **publish.yml**: Manual trigger (`workflow_dispatch`). Bumps version, publishes to crates.io, NPM (WASM + TS client), PyPI, and GHCR Docker.
+
+When the user says "publish" or "trigger publish", run `gh workflow run publish.yml`.
+
 ## Key Dependencies
 
 - **tokio**: Async runtime

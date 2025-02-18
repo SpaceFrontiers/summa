@@ -1,6 +1,11 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V8 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V9 zero-copy**.
 //!
-//! V8 uses a block-interleaved format where all data needed to score one block
+//! V9 uses a data-first layout: block data (Section B) appears before
+//! block_data_starts (Section A). This enables fully streaming merge
+//! (no buffering of block data). The reader derives the Section A offset
+//! from `dim_ids_offset - (num_blocks + 1) * 4`.
+//!
+//! V8/V9 uses a block-interleaved format where all data needed to score one block
 //! is contiguous (~200-2000 bytes, fits in 1-2 pages). This reduces cold-query
 //! page faults from 4+ per block to 1.
 //!
@@ -63,11 +68,11 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
     }
 }
 
-/// BMP V8 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V9 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V8 uses a block-interleaved format: all scoring data for one block is
-/// contiguous. On cold queries, a single page fault loads all data needed
-/// to score a block (instead of 4+ scattered page faults in V7).
+/// V9 uses a data-first layout with block-interleaved format: all scoring data
+/// for one block is contiguous. On cold queries, a single page fault loads all
+/// data needed to score a block (instead of 4+ scattered page faults in V7).
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -89,7 +94,7 @@ pub struct BmpIndex {
     /// Total sparse vectors (from TOC entry)
     pub total_vectors: u32,
 
-    // ── V8 section metadata ──────────────────────────────────────────
+    // ── Section metadata ──────────────────────────────────────────────
     num_dims: u32,
     total_terms: u32,
     total_postings: u32,
@@ -122,13 +127,13 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V8 blob from the given file handle.
+    /// Parse a BMP V9 blob from the given file handle.
     ///
     /// Reads the 48-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V8 block-interleaved format: Section A (block_data_starts) + Section B
-    /// (per-block interleaved data). All data for one block is contiguous.
+    /// V9 data-first layout: Section B (per-block interleaved data) first,
+    /// then Section A (block_data_starts). All data for one block is contiguous.
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -136,18 +141,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V8, BMP_BLOB_MAGIC_V8};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V9, BMP_BLOB_MAGIC_V9};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V8 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V9 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
         // Read the footer (last 48 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V8 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V9 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V8 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V9 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -164,10 +169,10 @@ impl BmpIndex {
         let doc_map_offset = u32::from_le_bytes(fb[40..44].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[44..48].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V8 {
+        if magic != BMP_BLOB_MAGIC_V9 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP8 {:#x})",
-                magic, BMP_BLOB_MAGIC_V8
+                "Invalid BMP blob magic: {:#x} (expected BMP9 {:#x})",
+                magic, BMP_BLOB_MAGIC_V9
             )));
         }
 
@@ -196,19 +201,22 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V8 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V9 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
 
         let term_dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
 
-        // V8 Section A: block_data_starts [u32 × (num_blocks + 1)]
+        // V9 layout: Section B (block_data) at offset 0, Section A (block_data_starts)
+        // immediately before dim_ids. Derive Section A position from footer fields.
         let section_a_size = (num_blocks as usize + 1) * 4;
+        let bds_start = dim_ids_offset as usize - section_a_size;
 
-        // V8 Section B: block_data (from end of Section A up to dim_ids_offset,
-        // which includes padding bytes that are never referenced)
-        let block_data_end = dim_ids_offset as usize;
+        // Section B: block_data [0..bds_start) (includes padding before Section A)
+        let block_data_bytes = blob.slice(0..bds_start);
+        // Section A: block_data_starts [bds_start..dim_ids_offset)
+        let block_data_starts_bytes = blob.slice(bds_start..dim_ids_offset as usize);
 
         // Sections C-G: dim_ids, grid, sb_grid, doc_map
         let dim_ids_start = dim_ids_offset as usize;
@@ -227,8 +235,6 @@ impl BmpIndex {
         let dm_ords_end = dm_ids_end + num_virtual_docs as usize * 2;
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
-        let block_data_starts_bytes = blob.slice(0..section_a_size);
-        let block_data_bytes = blob.slice(section_a_size..block_data_end);
         let dim_ids_bytes = blob.slice(dim_ids_start..dim_ids_end);
         let grid_bytes = blob.slice(grid_start..grid_end);
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
@@ -236,7 +242,7 @@ impl BmpIndex {
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         log::debug!(
-            "BMP V8 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
+            "BMP V9 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
              num_virtual_docs={}, max_weight_scale={:.4}, postings={}, packed_row_size={}, \
              term_dim_id_width={}, block_data={}B, doc_map={}B",
             num_blocks,
@@ -248,7 +254,7 @@ impl BmpIndex {
             total_postings,
             packed_row_size,
             term_dim_id_width,
-            block_data_end - section_a_size,
+            bds_start,
             num_virtual_docs as usize * 6,
         );
 
@@ -323,7 +329,7 @@ impl BmpIndex {
         None
     }
 
-    // ── V8 hot-path block-data accessors ─────────────────────────────
+    // ── Hot-path block-data accessors ────────────────────────────────
 
     /// Byte offset range in block_data_bytes for a block.
     #[inline(always)]
@@ -350,7 +356,7 @@ impl BmpIndex {
         }
     }
 
-    /// Parse a V8 block header: returns (num_terms, dim_ptr, ps_ptr, post_ptr).
+    /// Parse a block header: returns (num_terms, dim_ptr, ps_ptr, post_ptr).
     /// All pointers are within block_data_bytes — guaranteed contiguous.
     ///
     /// Returns `(0, null, null, null)` for empty blocks.
@@ -431,7 +437,7 @@ impl BmpIndex {
 
     /// Estimated memory usage in bytes (mmap-backed region sizes).
     ///
-    /// V8 fully zero-copy: all data is mmap-backed OwnedBytes, but the
+    /// Fully zero-copy: all data is mmap-backed OwnedBytes, but the
     /// mapped regions still consume RSS when paged in by the OS.
     pub fn estimated_memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -525,7 +531,7 @@ impl<'a> Iterator for DimIdIter<'a> {
 
 impl<'a> ExactSizeIterator for DimIdIter<'a> {}
 
-/// Iterator over terms in a V8 block. Returns `(dim_id, &[BmpPosting])` per term.
+/// Iterator over terms in a V9 block. Returns `(dim_id, &[BmpPosting])` per term.
 pub struct BlockTermIter<'a> {
     index: &'a BmpIndex,
     dim_ptr: *const u8,
@@ -573,10 +579,10 @@ impl<'a> Iterator for BlockTermIter<'a> {
 impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
 
 // ============================================================================
-// V8 block-data free functions (used by query and merger)
+// Block-data free functions (used by query and merger)
 // ============================================================================
 
-/// Binary search for a dimension index in a V8 block's term_dim_indices.
+/// Binary search for a dimension index in a block's term_dim_indices.
 ///
 /// `dim_ptr` points to the block's term_dim_indices array.
 /// Returns the local term index (0..num_terms) if found.
@@ -626,7 +632,7 @@ pub(crate) fn find_dim_in_block_data(
     None
 }
 
-/// Get postings for a local term index within a parsed V8 block.
+/// Get postings for a local term index within a parsed block.
 ///
 /// `ps_ptr` points to the block's posting_starts array [u16 × (num_terms + 1)].
 /// `post_ptr` points to the block's postings array [(u8, u8) × total].
