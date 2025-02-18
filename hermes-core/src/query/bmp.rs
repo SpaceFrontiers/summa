@@ -211,8 +211,10 @@ fn execute_bmp_inner(
         return Ok(Vec::new());
     }
 
-    // Sort by dim_id for binary search within blocks
-    query_info.sort_unstable_by_key(|&(dim_id, _, _)| dim_id);
+    // Sort by dim_idx for binary search within blocks (V7 stores dim_idx, not dim_id).
+    // Since dim_ids is sorted and dim_idx preserves order, sorting by dim_idx gives
+    // the same relative ordering as sorting by dim_id.
+    query_info.sort_unstable_by_key(|&(_, idx, _)| idx);
 
     // Split into parallel arrays with matching order
     // resolved: (dim_idx, f32_weight) — for grid UB computation (sb_grid u8 + block grid u4×17)
@@ -226,11 +228,12 @@ fn execute_bmp_inner(
     } else {
         (0.0, 0.0)
     };
+    // V7: query_by_dim_u16 stores (dim_idx, weight) — matches Section 2 dim_indices
     let query_by_dim_u16: Vec<(u32, u16)> = query_info
         .iter()
-        .map(|&(d, _, w)| {
+        .map(|&(_, idx, w)| {
             (
-                d,
+                idx as u32,
                 (w.abs() * quant_scale).round().clamp(0.0, 16383.0) as u16,
             )
         })
@@ -367,6 +370,11 @@ fn execute_bmp_inner(
 /// Uses **bitmask skip**: checks `block_mask & (1 << q) != 0` before binary search.
 /// Accumulates `w_u16 * impact_u8` into u32 — eliminates u8→f32 conversion per posting.
 ///
+/// V7: searches by dim_idx (position in dim_ids array), not dim_id.
+///
+/// Tracks touched slots via a u64 bitmask (works for block_size ≤ 64).
+/// Caller uses the bitmask for lazy accumulator zeroing.
+///
 /// Complexity: O(|present_query_dims| × log|block_terms|) per block.
 #[inline(always)]
 fn score_block_bsearch_int(
@@ -376,18 +384,21 @@ fn score_block_bsearch_int(
     query_by_dim_u16: &[(u32, u16)],
     block_mask: u64,
     acc: &mut [u32],
+    touched: &mut u64,
 ) {
-    for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
+    for (q, &(dim_idx, w)) in query_by_dim_u16.iter().enumerate() {
         // Bitmask skip: if this query dim has zero max in this block, skip
         if block_mask & (1u64 << q) == 0 {
             continue;
         }
-        if let Some(ti) = index.find_dim_in_block(term_start, term_end, dim_id) {
+        if let Some(ti) = index.find_dim_in_block(term_start, term_end, dim_idx) {
             for p in index.term_postings(ti) {
+                let slot = p.local_slot as usize;
                 // SAFETY: local_slot < block_size = acc.len()
                 unsafe {
-                    *acc.get_unchecked_mut(p.local_slot as usize) += w as u32 * p.impact as u32;
+                    *acc.get_unchecked_mut(slot) += w as u32 * p.impact as u32;
                 }
+                *touched |= 1u64 << slot;
             }
         }
     }
@@ -414,7 +425,7 @@ fn score_superblock_blocks(
     local_masks: &[u64],
     query_by_dim_u16: &[(u32, u16)],
     dequant: f32,
-    block_size: usize,
+    _block_size: usize,
     alpha: f32,
     k: usize,
     predicate: &Option<&dyn Fn(crate::DocId) -> bool>,
@@ -422,8 +433,6 @@ fn score_superblock_blocks(
     blocks_scored: &mut u32,
     acc: &mut [u32],
 ) {
-    acc[..block_size].fill(0);
-
     for (order_idx, &local_idx) in local_order.iter().enumerate() {
         if local_idx as usize >= count {
             break;
@@ -463,31 +472,50 @@ fn score_superblock_blocks(
 
         let (term_start, term_end) = index.block_term_range(block_id);
         let mask = local_masks[local_idx as usize];
-        score_block_bsearch_int(index, term_start, term_end, query_by_dim_u16, mask, acc);
+        let mut touched: u64 = 0;
+        score_block_bsearch_int(
+            index,
+            term_start,
+            term_end,
+            query_by_dim_u16,
+            mask,
+            acc,
+            &mut touched,
+        );
 
-        // Collect results: dequantize u32 → f32
+        // Collect results: dequantize u32 → f32, only visit touched slots
         let base = block_id * index.bmp_block_size;
         let num_vdocs = index.num_virtual_docs;
-        for (i, &score_u32) in acc[..block_size].iter().enumerate() {
+        let mut scan = touched;
+        while scan != 0 {
+            let i = scan.trailing_zeros() as usize;
+            scan &= scan - 1; // clear lowest set bit
+            let score_u32 = acc[i];
             if score_u32 > 0 {
                 let virtual_id = base + i as u32;
                 // Guard against phantom slots in the last block
-                if virtual_id >= num_vdocs {
-                    continue;
-                }
-                let score = score_u32 as f32 * dequant;
-                if collector.would_enter(score) {
-                    if let Some(pred) = predicate {
-                        let doc_id = index.doc_id_for_virtual(virtual_id);
-                        if !pred(doc_id) {
-                            continue;
+                if virtual_id < num_vdocs {
+                    let score = score_u32 as f32 * dequant;
+                    if collector.would_enter(score) {
+                        if let Some(pred) = predicate {
+                            let doc_id = index.doc_id_for_virtual(virtual_id);
+                            if !pred(doc_id) {
+                                continue;
+                            }
                         }
+                        collector.insert_with_ordinal(virtual_id, score, 0);
                     }
-                    collector.insert_with_ordinal(virtual_id, score, 0);
                 }
             }
         }
-        acc[..block_size].fill(0);
+
+        // Lazy zeroing: only clear touched slots instead of acc[..block_size].fill(0)
+        let mut clear = touched;
+        while clear != 0 {
+            let bit = clear.trailing_zeros() as usize;
+            acc[bit] = 0;
+            clear &= clear - 1;
+        }
         *blocks_scored += 1;
     }
 }

@@ -63,18 +63,21 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
     }
 }
 
-/// BMP V6 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V7 index for a single sparse field — fully zero-copy mmap-backed.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
 /// a zero-copy OwnedBytes slice.
 ///
-/// V6 packs the block grid to 4-bit (50% grid memory) while keeping sb_grid at
+/// V7 packs the block grid to 4-bit (50% grid memory) while keeping sb_grid at
 /// full 8-bit. The reader unpacks 4-bit values via ×17 to get u8-equivalent
 /// upper bounds, so the same `/255.0` weight scale works for both levels.
 ///
-/// V6 uses compact virtual IDs with a doc_map lookup table (Section 9) instead
+/// V7 uses compact virtual IDs with a doc_map lookup table (Section 9) instead
 /// of the sparse `doc_id * num_ordinals + ordinal` scheme.
+///
+/// V7 stores dim_indices in Section 2 instead of dim_ids, using u16 entries
+/// when `num_dims ≤ 65536` (halving section 2 size for typical SPLADE models).
 ///
 /// Hot-path accessors cache raw pointers from the OwnedBytes slices and use
 /// unchecked reads with `ptr::read_unaligned` to eliminate per-iteration bounds
@@ -96,11 +99,13 @@ pub struct BmpIndex {
     /// Total sparse vectors (from TOC entry)
     pub total_vectors: u32,
 
-    // ── V6 section metadata ──────────────────────────────────────────
+    // ── V7 section metadata ──────────────────────────────────────────
     num_dims: u32,
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
+    /// Bytes per element in term_dim_ids section: 2 (u16) or 4 (u32)
+    term_dim_id_width: u8,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
     block_term_starts_bytes: OwnedBytes,
@@ -126,15 +131,15 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V6 blob from the given file handle.
+    /// Parse a BMP V7 blob from the given file handle.
     ///
     /// Reads the 48-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections. The superblock
     /// grid is persisted on disk and loaded as a zero-copy slice — no heap
     /// allocation at load time.
     ///
-    /// V6 stores the block grid in 4-bit packed format (50% smaller) and uses
-    /// compact virtual IDs with a doc_map lookup table (Section 9).
+    /// V7 stores dim_indices in Section 2 (u16 when num_dims ≤ 65536, else u32).
+    /// Uses compact virtual IDs with a doc_map lookup table (Section 9).
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -142,18 +147,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V6, BMP_BLOB_MAGIC_V6};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V7, BMP_BLOB_MAGIC_V7};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V6 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V7 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
         // Read the footer (last 48 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V6 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V7 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V6 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V7 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -170,10 +175,10 @@ impl BmpIndex {
         let doc_map_offset = u32::from_le_bytes(fb[40..44].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[44..48].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V6 {
+        if magic != BMP_BLOB_MAGIC_V7 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP6 {:#x})",
-                magic, BMP_BLOB_MAGIC_V6
+                "Invalid BMP blob magic: {:#x} (expected BMP7 {:#x})",
+                magic, BMP_BLOB_MAGIC_V7
             )));
         }
 
@@ -188,6 +193,7 @@ impl BmpIndex {
                 num_dims,
                 total_postings: 0,
                 packed_row_size: 0,
+                term_dim_id_width: if num_dims <= 65536 { 2 } else { 4 },
                 block_term_starts_bytes: OwnedBytes::empty(),
                 term_dim_ids_bytes: OwnedBytes::empty(),
                 term_posting_starts_bytes: OwnedBytes::empty(),
@@ -202,14 +208,17 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V6 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V7 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
 
+        // V7: Section 2 uses u16 when num_dims ≤ 65536, else u32
+        let term_dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
+
         // Compute section boundaries
         let bts_len = (num_blocks as usize + 1) * 4;
-        let tdi_len = total_terms as usize * 4;
+        let tdi_len = total_terms as usize * term_dim_id_width as usize;
         let tps_len = (total_terms as usize + 1) * 4;
         let post_len = total_postings as usize * 2;
 
@@ -222,7 +231,7 @@ impl BmpIndex {
         let dim_ids_start = dim_ids_offset as usize;
         let dim_ids_end = dim_ids_start + num_dims as usize * 4;
 
-        // V6: grid is 4-bit packed — packed_row_size = ceil(num_blocks / 2)
+        // Grid is 4-bit packed — packed_row_size = ceil(num_blocks / 2)
         let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
         let grid_start = dim_ids_end;
         let grid_end = grid_start + num_dims as usize * packed_row_size as usize;
@@ -249,9 +258,9 @@ impl BmpIndex {
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
 
         log::debug!(
-            "BMP V6 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
+            "BMP V7 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
              num_virtual_docs={}, max_weight_scale={:.4}, terms={}, postings={}, packed_row_size={}, \
-             doc_map={}B",
+             term_dim_id_width={}, doc_map={}B",
             num_blocks,
             num_superblocks,
             num_dims,
@@ -261,6 +270,7 @@ impl BmpIndex {
             total_terms,
             total_postings,
             packed_row_size,
+            term_dim_id_width,
             num_virtual_docs as usize * 6,
         );
 
@@ -273,6 +283,7 @@ impl BmpIndex {
             num_dims,
             total_postings,
             packed_row_size,
+            term_dim_id_width,
             block_term_starts_bytes,
             term_dim_ids_bytes,
             term_posting_starts_bytes,
@@ -375,6 +386,7 @@ impl BmpIndex {
     /// Build per-block query-dim presence masks for blocks `[block_start..block_end)`.
     ///
     /// Reads 4-bit packed grid, unpacks inline to check presence.
+    /// Uses SIMD when available to process 32 blocks at a time per query dim.
     pub fn compute_block_masks_range(
         &self,
         query_dims: &[(usize, f32)],
@@ -388,6 +400,33 @@ impl BmpIndex {
         let grid = self.grid_bytes.as_slice();
 
         masks[..count].fill(0);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if block_start.is_multiple_of(2) {
+                unsafe {
+                    compute_block_masks_range_neon(grid, prs, query_dims, block_start, count, masks)
+                };
+                return;
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if block_start.is_multiple_of(2) && is_x86_feature_detected!("sse4.1") {
+                unsafe {
+                    compute_block_masks_range_sse41(
+                        grid,
+                        prs,
+                        query_dims,
+                        block_start,
+                        count,
+                        masks,
+                    )
+                };
+                return;
+            }
+        }
 
         for (q, &(dim_idx, _weight)) in query_dims.iter().enumerate() {
             let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
@@ -425,44 +464,83 @@ impl BmpIndex {
         }
     }
 
-    /// Binary search for a dimension in a block's term range.
+    /// Binary search for a dimension index in a block's term range.
+    ///
+    /// V7 stores dim_indices (not dim_ids) in Section 2, using u16 or u32
+    /// depending on `term_dim_id_width`. The `dim_idx` parameter is the
+    /// position in the dim_ids array.
     ///
     /// Returns the absolute term index if found, or None.
-    /// Replaces the old `block_term_dim_ids()` + `binary_search()` pattern.
     ///
     /// Uses unchecked pointer reads in the inner loop — bounds are validated
-    /// once via debug_assert at entry, not per-iteration. This matches V2's
-    /// performance where `slice.binary_search()` had no per-iteration checks.
+    /// once via debug_assert at entry, not per-iteration.
     #[inline(always)]
-    pub fn find_dim_in_block(&self, term_start: u32, term_end: u32, dim_id: u32) -> Option<u32> {
+    pub fn find_dim_in_block(&self, term_start: u32, term_end: u32, dim_idx: u32) -> Option<u32> {
         let count = (term_end - term_start) as usize;
         if count == 0 {
             return None;
         }
         let d = self.term_dim_ids_bytes.as_slice();
         let base_idx = term_start as usize;
-        // SAFETY: term_start..term_end comes from block_term_starts which contains
-        // valid indices into term_dim_ids. Validated once here, not per-iteration.
-        debug_assert!((base_idx + count) * 4 <= d.len());
         let base = d.as_ptr();
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let val = unsafe { read_u32_unchecked(base, base_idx + mid) };
-            match val.cmp(&dim_id) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Some(term_start + mid as u32),
-                std::cmp::Ordering::Greater => hi = mid,
+
+        if self.term_dim_id_width == 2 {
+            // u16 path
+            debug_assert!((base_idx + count) * 2 <= d.len());
+            let mut lo = 0usize;
+            let mut hi = count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let val = unsafe {
+                    let p = base.add((base_idx + mid) * 2);
+                    u16::from_le((p as *const u16).read_unaligned()) as u32
+                };
+                match val.cmp(&dim_idx) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Equal => return Some(term_start + mid as u32),
+                    std::cmp::Ordering::Greater => hi = mid,
+                }
+            }
+        } else {
+            // u32 path
+            debug_assert!((base_idx + count) * 4 <= d.len());
+            let mut lo = 0usize;
+            let mut hi = count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let val = unsafe { read_u32_unchecked(base, base_idx + mid) };
+                match val.cmp(&dim_idx) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Equal => return Some(term_start + mid as u32),
+                    std::cmp::Ordering::Greater => hi = mid,
+                }
             }
         }
         None
     }
 
-    /// Get the dimension ID at the given term index (bounds-checked, for merger).
+    /// Get the dim_idx at the given term index (bounds-checked, for merger).
+    ///
+    /// V7 stores dim_indices in Section 2. To get the actual dim_id,
+    /// callers use `dim_id_at(dim_idx)`.
+    #[inline]
+    pub fn block_term_dim_idx(&self, term_idx: u32) -> u32 {
+        let d = self.term_dim_ids_bytes.as_slice();
+        if self.term_dim_id_width == 2 {
+            let off = term_idx as usize * 2;
+            u16::from_le_bytes(d[off..off + 2].try_into().unwrap()) as u32
+        } else {
+            read_u32_le(d, term_idx as usize)
+        }
+    }
+
+    /// Get the dimension ID at the given term index (for merger compatibility).
+    ///
+    /// Reads dim_idx from Section 2, then looks up actual dim_id from Section 6.
     #[inline]
     pub fn block_term_dim_id(&self, term_idx: u32) -> u32 {
-        read_u32_le(self.term_dim_ids_bytes.as_slice(), term_idx as usize)
+        let dim_idx = self.block_term_dim_idx(term_idx);
+        self.dim_id_at(dim_idx as usize)
     }
 
     /// Get postings for a term.
@@ -528,7 +606,7 @@ impl BmpIndex {
             self.term_dim_ids_bytes
                 .as_slice()
                 .as_ptr()
-                .add(term_start as usize * 4)
+                .add(term_start as usize * self.term_dim_id_width as usize)
         }
     }
 
@@ -633,7 +711,7 @@ impl<'a> ExactSizeIterator for DimIdIter<'a> {}
 
 /// Accumulate `out[i] += input[i] as f32 * weight` for all i.
 ///
-/// Uses NEON on aarch64, auto-vectorization hint on other platforms.
+/// Uses NEON on aarch64, SSE4.1 on x86_64, scalar fallback on other platforms.
 #[inline]
 fn accumulate_u8_weighted(input: &[u8], weight: f32, out: &mut [f32]) {
     debug_assert_eq!(input.len(), out.len());
@@ -645,9 +723,19 @@ fn accumulate_u8_weighted(input: &[u8], weight: f32, out: &mut [f32]) {
         unsafe { accumulate_u8_weighted_neon(input, weight, out, n) };
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        // Scalar fallback — auto-vectorizes well with -O2
+        if is_x86_feature_detected!("sse4.1") {
+            unsafe { accumulate_u8_weighted_sse41(input, weight, out, n) };
+            return;
+        }
+        for i in 0..n {
+            out[i] += input[i] as f32 * weight;
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
         for i in 0..n {
             out[i] += input[i] as f32 * weight;
         }
@@ -711,6 +799,73 @@ unsafe fn accumulate_u8_weighted_neon(input: &[u8], weight: f32, out: &mut [f32]
     }
 }
 
+/// SSE4.1 implementation for u8-weighted accumulation.
+///
+/// Processes 16 u8 elements per iteration: widen u8→u32→f32, multiply, add.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn accumulate_u8_weighted_sse41(input: &[u8], weight: f32, out: &mut [f32], n: usize) {
+    use std::arch::x86_64::*;
+
+    let weight_v = _mm_set1_ps(weight);
+    let zero = _mm_setzero_si128();
+    let chunks = n / 16;
+    let remainder = n % 16;
+
+    for chunk in 0..chunks {
+        let base = chunk * 16;
+        let in_ptr = input.as_ptr().add(base);
+        let out_ptr = out.as_mut_ptr().add(base);
+
+        // Load 16 u8 values
+        let bytes = _mm_loadu_si128(in_ptr as *const __m128i);
+
+        // Unpack u8→u16
+        let lo8 = _mm_unpacklo_epi8(bytes, zero);
+        let hi8 = _mm_unpackhi_epi8(bytes, zero);
+
+        // Group 0: elements 0-3
+        let u32_0 = _mm_unpacklo_epi16(lo8, zero);
+        let f32_0 = _mm_cvtepi32_ps(u32_0);
+        let acc_0 = _mm_loadu_ps(out_ptr);
+        _mm_storeu_ps(out_ptr, _mm_add_ps(acc_0, _mm_mul_ps(f32_0, weight_v)));
+
+        // Group 1: elements 4-7
+        let u32_1 = _mm_unpackhi_epi16(lo8, zero);
+        let f32_1 = _mm_cvtepi32_ps(u32_1);
+        let acc_1 = _mm_loadu_ps(out_ptr.add(4));
+        _mm_storeu_ps(
+            out_ptr.add(4),
+            _mm_add_ps(acc_1, _mm_mul_ps(f32_1, weight_v)),
+        );
+
+        // Group 2: elements 8-11
+        let u32_2 = _mm_unpacklo_epi16(hi8, zero);
+        let f32_2 = _mm_cvtepi32_ps(u32_2);
+        let acc_2 = _mm_loadu_ps(out_ptr.add(8));
+        _mm_storeu_ps(
+            out_ptr.add(8),
+            _mm_add_ps(acc_2, _mm_mul_ps(f32_2, weight_v)),
+        );
+
+        // Group 3: elements 12-15
+        let u32_3 = _mm_unpackhi_epi16(hi8, zero);
+        let f32_3 = _mm_cvtepi32_ps(u32_3);
+        let acc_3 = _mm_loadu_ps(out_ptr.add(12));
+        _mm_storeu_ps(
+            out_ptr.add(12),
+            _mm_add_ps(acc_3, _mm_mul_ps(f32_3, weight_v)),
+        );
+    }
+
+    // Scalar remainder
+    let base = chunks * 16;
+    for i in 0..remainder {
+        *out.get_unchecked_mut(base + i) += *input.get_unchecked(base + i) as f32 * weight;
+    }
+}
+
 // ============================================================================
 // 4-bit grid accumulation
 // ============================================================================
@@ -742,7 +897,15 @@ fn accumulate_u4_weighted(
         }
     }
 
-    // Scalar fallback (also used for odd elem_offset on aarch64)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if elem_offset.is_multiple_of(2) && is_x86_feature_detected!("sse4.1") {
+            unsafe { accumulate_u4_weighted_sse41(packed, elem_offset, count, weight, out) };
+            return;
+        }
+    }
+
+    // Scalar fallback (also used for odd elem_offset)
     for i in 0..count {
         let abs_idx = elem_offset + i;
         let byte_val = unsafe { *packed.get_unchecked(abs_idx / 2) };
@@ -880,5 +1043,297 @@ unsafe fn accumulate_u4_weighted_neon(
             byte_val >> 4
         };
         *out.get_unchecked_mut(base_elem + i) += (val as u32 * 17) as f32 * weight;
+    }
+}
+
+/// SSE4.1 implementation for 4-bit packed grid accumulation.
+///
+/// Processes 32 elements (16 packed bytes) per iteration:
+/// 1. Load 16 packed bytes
+/// 2. AND with 0x0F for low nibbles, SHR 4 for high nibbles
+/// 3. Scale ×17 via `(v << 4) + v` (shift+add replaces multiply)
+/// 4. Interleave to element order
+/// 5. Widen to f32 and FMA into output
+///
+/// Requires `elem_offset` to be even.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn accumulate_u4_weighted_sse41(
+    packed: &[u8],
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!(elem_offset.is_multiple_of(2));
+
+    let weight_v = _mm_set1_ps(weight);
+    let mask_lo = _mm_set1_epi8(0x0F);
+    let zero = _mm_setzero_si128();
+
+    let byte_offset = elem_offset / 2;
+    let packed_ptr = packed.as_ptr().add(byte_offset);
+    let out_ptr = out.as_mut_ptr();
+
+    let chunks = count / 32;
+    let remainder = count % 32;
+
+    for chunk in 0..chunks {
+        let pb = packed_ptr.add(chunk * 16);
+        let ob = out_ptr.add(chunk * 32);
+
+        // Load 16 packed bytes (= 32 elements)
+        let bytes = _mm_loadu_si128(pb as *const __m128i);
+
+        // Extract nibbles
+        let low = _mm_and_si128(bytes, mask_lo);
+        let high = _mm_srli_epi16::<4>(bytes);
+        let high = _mm_and_si128(high, mask_lo); // clean high bits after shift
+
+        // Scale ×17 using (v << 4) + v
+        let low_scaled = _mm_add_epi8(_mm_slli_epi16::<4>(_mm_and_si128(low, mask_lo)), low);
+        let high_scaled = _mm_add_epi8(_mm_slli_epi16::<4>(_mm_and_si128(high, mask_lo)), high);
+
+        // Interleave to element order: (low[0],high[0],low[1],high[1],...)
+        let elems_0_15 = _mm_unpacklo_epi8(low_scaled, high_scaled);
+        let elems_16_31 = _mm_unpackhi_epi8(low_scaled, high_scaled);
+
+        // Process first 16 elements
+        {
+            let lo8 = _mm_unpacklo_epi8(elems_0_15, zero);
+            let hi8 = _mm_unpackhi_epi8(elems_0_15, zero);
+
+            let u32_0 = _mm_unpacklo_epi16(lo8, zero);
+            let f32_0 = _mm_cvtepi32_ps(u32_0);
+            let acc_0 = _mm_loadu_ps(ob);
+            _mm_storeu_ps(ob, _mm_add_ps(acc_0, _mm_mul_ps(f32_0, weight_v)));
+
+            let u32_1 = _mm_unpackhi_epi16(lo8, zero);
+            let f32_1 = _mm_cvtepi32_ps(u32_1);
+            let acc_1 = _mm_loadu_ps(ob.add(4));
+            _mm_storeu_ps(ob.add(4), _mm_add_ps(acc_1, _mm_mul_ps(f32_1, weight_v)));
+
+            let u32_2 = _mm_unpacklo_epi16(hi8, zero);
+            let f32_2 = _mm_cvtepi32_ps(u32_2);
+            let acc_2 = _mm_loadu_ps(ob.add(8));
+            _mm_storeu_ps(ob.add(8), _mm_add_ps(acc_2, _mm_mul_ps(f32_2, weight_v)));
+
+            let u32_3 = _mm_unpackhi_epi16(hi8, zero);
+            let f32_3 = _mm_cvtepi32_ps(u32_3);
+            let acc_3 = _mm_loadu_ps(ob.add(12));
+            _mm_storeu_ps(ob.add(12), _mm_add_ps(acc_3, _mm_mul_ps(f32_3, weight_v)));
+        }
+
+        // Process second 16 elements
+        {
+            let lo8 = _mm_unpacklo_epi8(elems_16_31, zero);
+            let hi8 = _mm_unpackhi_epi8(elems_16_31, zero);
+
+            let u32_0 = _mm_unpacklo_epi16(lo8, zero);
+            let f32_0 = _mm_cvtepi32_ps(u32_0);
+            let acc_0 = _mm_loadu_ps(ob.add(16));
+            _mm_storeu_ps(ob.add(16), _mm_add_ps(acc_0, _mm_mul_ps(f32_0, weight_v)));
+
+            let u32_1 = _mm_unpackhi_epi16(lo8, zero);
+            let f32_1 = _mm_cvtepi32_ps(u32_1);
+            let acc_1 = _mm_loadu_ps(ob.add(20));
+            _mm_storeu_ps(ob.add(20), _mm_add_ps(acc_1, _mm_mul_ps(f32_1, weight_v)));
+
+            let u32_2 = _mm_unpacklo_epi16(hi8, zero);
+            let f32_2 = _mm_cvtepi32_ps(u32_2);
+            let acc_2 = _mm_loadu_ps(ob.add(24));
+            _mm_storeu_ps(ob.add(24), _mm_add_ps(acc_2, _mm_mul_ps(f32_2, weight_v)));
+
+            let u32_3 = _mm_unpackhi_epi16(hi8, zero);
+            let f32_3 = _mm_cvtepi32_ps(u32_3);
+            let acc_3 = _mm_loadu_ps(ob.add(28));
+            _mm_storeu_ps(ob.add(28), _mm_add_ps(acc_3, _mm_mul_ps(f32_3, weight_v)));
+        }
+    }
+
+    // Scalar remainder
+    let base_elem = chunks * 32;
+    for i in 0..remainder {
+        let abs_idx = elem_offset + base_elem + i;
+        let byte_val = *packed.get_unchecked(abs_idx / 2);
+        let val = if abs_idx.is_multiple_of(2) {
+            byte_val & 0x0F
+        } else {
+            byte_val >> 4
+        };
+        *out.get_unchecked_mut(base_elem + i) += (val as u32 * 17) as f32 * weight;
+    }
+}
+
+// ============================================================================
+// Block mask SIMD: compute presence masks for blocks in a superblock
+// ============================================================================
+
+/// NEON kernel: compute block masks for 4-bit grid.
+///
+/// Processes 32 blocks (16 packed bytes) per iteration per query dim.
+/// For each packed byte, extracts both nibbles, checks non-zero, and ORs
+/// the query dim's bit into the corresponding mask.
+///
+/// Requires `block_start` to be even (always true: BMP_SUPERBLOCK_SIZE=64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn compute_block_masks_range_neon(
+    grid: &[u8],
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    use std::arch::aarch64::*;
+
+    debug_assert!(block_start.is_multiple_of(2));
+    let byte_offset = block_start / 2;
+    let zero = vdupq_n_u8(0);
+    let mask_lo = vdupq_n_u8(0x0F);
+
+    for (q, &(dim_idx, _)) in query_dims.iter().enumerate() {
+        let row_ptr = grid.as_ptr().add(dim_idx * prs + byte_offset);
+        let bit = 1u64 << q;
+
+        let chunks = count / 32;
+        let remainder = count % 32;
+
+        for chunk in 0..chunks {
+            let pb = row_ptr.add(chunk * 16);
+            let base = chunk * 32;
+
+            // Load 16 packed bytes = 32 elements
+            let bytes = vld1q_u8(pb);
+
+            // Extract nibbles
+            let low = vandq_u8(bytes, mask_lo);
+            let high = vshrq_n_u8::<4>(bytes);
+
+            // Interleave to element order
+            let elems_lo = vzip1q_u8(low, high); // elements 0-15
+            let elems_hi = vzip2q_u8(low, high); // elements 16-31
+
+            // Compare > 0: result bytes are 0xFF or 0x00
+            let nz_lo = vcgtq_u8(elems_lo, zero);
+            let nz_hi = vcgtq_u8(elems_hi, zero);
+
+            // Extract per-byte results — store to temp array
+            let mut lo_arr = [0u8; 16];
+            let mut hi_arr = [0u8; 16];
+            vst1q_u8(lo_arr.as_mut_ptr(), nz_lo);
+            vst1q_u8(hi_arr.as_mut_ptr(), nz_hi);
+
+            for (i, &v) in lo_arr.iter().enumerate() {
+                if v != 0 {
+                    *masks.get_unchecked_mut(base + i) |= bit;
+                }
+            }
+            for (i, &v) in hi_arr.iter().enumerate() {
+                if v != 0 {
+                    *masks.get_unchecked_mut(base + 16 + i) |= bit;
+                }
+            }
+        }
+
+        // Scalar remainder
+        let base = chunks * 32;
+        for i in 0..remainder {
+            let abs_b = block_start + base + i;
+            let byte_val = *grid.get_unchecked(dim_idx * prs + abs_b / 2);
+            let val = if abs_b.is_multiple_of(2) {
+                byte_val & 0x0F
+            } else {
+                byte_val >> 4
+            };
+            if val > 0 {
+                *masks.get_unchecked_mut(base + i) |= bit;
+            }
+        }
+    }
+}
+
+/// SSE4.1 kernel: compute block masks for 4-bit grid.
+///
+/// Uses `_mm_movemask_epi8` to extract 16-bit masks efficiently, then
+/// scatters bits using `trailing_zeros` loop.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn compute_block_masks_range_sse41(
+    grid: &[u8],
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!(block_start.is_multiple_of(2));
+    let byte_offset = block_start / 2;
+    let zero = _mm_setzero_si128();
+    let mask_lo_v = _mm_set1_epi8(0x0F);
+
+    for (q, &(dim_idx, _)) in query_dims.iter().enumerate() {
+        let row_ptr = grid.as_ptr().add(dim_idx * prs + byte_offset);
+        let bit = 1u64 << q;
+
+        let chunks = count / 32;
+        let remainder = count % 32;
+
+        for chunk in 0..chunks {
+            let pb = row_ptr.add(chunk * 16);
+            let base = chunk * 32;
+
+            // Load 16 packed bytes = 32 elements
+            let bytes = _mm_loadu_si128(pb as *const __m128i);
+
+            // Extract nibbles
+            let low = _mm_and_si128(bytes, mask_lo_v);
+            let high = _mm_and_si128(_mm_srli_epi16::<4>(bytes), mask_lo_v);
+
+            // Interleave to element order
+            let elems_lo = _mm_unpacklo_epi8(low, high); // elements 0-15
+            let elems_hi = _mm_unpackhi_epi8(low, high); // elements 16-31
+
+            // Compare > 0
+            let nz_lo = _mm_cmpgt_epi8(elems_lo, zero);
+            let nz_hi = _mm_cmpgt_epi8(elems_hi, zero);
+
+            // Extract 16-bit masks
+            let mut m = _mm_movemask_epi8(nz_lo) as u32;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                *masks.get_unchecked_mut(base + i) |= bit;
+            }
+            let mut m = _mm_movemask_epi8(nz_hi) as u32;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                *masks.get_unchecked_mut(base + 16 + i) |= bit;
+            }
+        }
+
+        // Scalar remainder
+        let base = chunks * 32;
+        for i in 0..remainder {
+            let abs_b = block_start + base + i;
+            let byte_val = *grid.get_unchecked(dim_idx * prs + abs_b / 2);
+            let val = if abs_b.is_multiple_of(2) {
+                byte_val & 0x0F
+            } else {
+                byte_val >> 4
+            };
+            if val > 0 {
+                *masks.get_unchecked_mut(base + i) |= bit;
+            }
+        }
     }
 }

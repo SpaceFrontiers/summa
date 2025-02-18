@@ -299,7 +299,9 @@ fn merge_bmp_field(
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    use crate::segment::builder::bmp::{stream_write_grids, write_u32_slice_le};
+    use crate::segment::builder::bmp::{
+        stream_write_grids, write_dim_indices_section, write_u32_slice_le,
+    };
     use byteorder::{LittleEndian, WriteBytesExt};
 
     // ── Phase 0: Compute merged parameters from source segments ──────────
@@ -369,11 +371,7 @@ fn merge_bmp_field(
         return Ok(());
     }
 
-    let vid_map: rustc_hash::FxHashMap<(u32, u16), u32> = vid_pairs
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| (p, i as u32))
-        .collect();
+    // Lookup: binary search on sorted vid_pairs (O(log N) per lookup, saves ~50-80 bytes/entry)
 
     let num_blocks = num_virtual_docs.div_ceil(effective_block_size as usize);
     let ebs = effective_block_size as u64;
@@ -389,12 +387,6 @@ fn merge_bmp_field(
 
     // Single pass over all source segments: collect all postings with compact virtual IDs.
     // Sort by (block_id, dim_idx) for ordered output. No source_blocks_for_output needed.
-    assert!(
-        num_dims <= u16::MAX as usize + 1,
-        "BMP merge: {} dims exceeds u16 limit (65536)",
-        num_dims
-    );
-
     let total_source_postings: usize = bmp_indexes
         .iter()
         .filter_map(|bi| bi.map(|b| b.total_postings() as usize))
@@ -405,7 +397,7 @@ fn merge_bmp_field(
 
     struct MergedPosting {
         block_id: u32,
-        dim_idx: u16,
+        dim_idx: u32,
         local_slot: u8,
         impact: u8,
     }
@@ -429,7 +421,9 @@ fn merge_bmp_field(
                     let src_virtual = src_block * bmp.bmp_block_size + p.local_slot as u32;
                     let (doc_id, ordinal) = bmp.virtual_to_doc(src_virtual);
                     let new_doc_id = doc_id + doc_offset;
-                    let new_virtual = vid_map[&(new_doc_id, ordinal)] as u64;
+                    let new_virtual =
+                        crate::segment::builder::bmp::vid_lookup(&vid_pairs, (new_doc_id, ordinal))
+                            as u64;
                     let new_block_id = (new_virtual / ebs) as u32;
                     let new_local_slot = (new_virtual % ebs) as u8;
                     let imp = rescale_impact(p.impact, rescale);
@@ -438,7 +432,7 @@ fn merge_bmp_field(
                     }
                     all_postings.push(MergedPosting {
                         block_id: new_block_id,
-                        dim_idx: dim_idx as u16,
+                        dim_idx: dim_idx as u32,
                         local_slot: new_local_slot,
                         impact: imp,
                     });
@@ -449,7 +443,7 @@ fn merge_bmp_field(
 
     // Sort by (block_id, dim_idx) for block-ordered, dim-sorted output.
     // Pack into u64 for single-comparison sort key.
-    all_postings.sort_unstable_by_key(|p| (p.block_id as u64) << 16 | p.dim_idx as u64);
+    all_postings.sort_unstable_by_key(|p| (p.block_id as u64) << 32 | p.dim_idx as u64);
 
     // Build output arrays from sorted postings
     let mut pi = 0; // cursor into all_postings
@@ -477,7 +471,7 @@ fn merge_bmp_field(
             }
 
             let count = (pi - dim_start) as u32;
-            term_dim_ids.push(dim_ids[dim_idx]);
+            term_dim_ids.push(dim_idx as u32);
             cumulative_postings += count;
             term_posting_starts.push(cumulative_postings);
             grid_entries.push((dim_idx as u32, block, max_imp));
@@ -503,15 +497,16 @@ fn merge_bmp_field(
         effective_block_size,
     );
 
-    // ── Write V6 blob — no second pass ───────────────────────────────────
+    // ── Write V7 blob — no second pass ───────────────────────────────────
     let blob_start = writer.offset();
     let mut bytes_written: u64 = 0;
 
     // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
     bytes_written += write_u32_slice_le(writer, &block_term_starts).map_err(crate::Error::Io)?;
 
-    // Section 2: term_dim_ids [u32-LE × total_terms]
-    bytes_written += write_u32_slice_le(writer, &term_dim_ids).map_err(crate::Error::Io)?;
+    // Section 2: term_dim_indices — u16 when num_dims ≤ 65536, else u32
+    bytes_written +=
+        write_dim_indices_section(writer, &term_dim_ids, num_dims).map_err(crate::Error::Io)?;
 
     // Section 3: term_posting_starts [u32-LE × (total_terms + 1)]
     bytes_written += write_u32_slice_le(writer, &term_posting_starts).map_err(crate::Error::Io)?;
@@ -566,8 +561,8 @@ fn merge_bmp_field(
     }
     bytes_written += num_virtual_docs as u64 * 2;
 
-    // BMP V6 Footer (48 bytes)
-    use crate::segment::format::BMP_BLOB_MAGIC_V6;
+    // BMP V7 Footer (48 bytes)
+    use crate::segment::format::BMP_BLOB_MAGIC_V7;
     writer
         .write_u32::<LittleEndian>(total_terms as u32)
         .map_err(crate::Error::Io)?;
@@ -602,7 +597,7 @@ fn merge_bmp_field(
         .write_u32::<LittleEndian>(doc_map_offset)
         .map_err(crate::Error::Io)?;
     writer
-        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V6)
+        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V7)
         .map_err(crate::Error::Io)?;
     bytes_written += 48;
 

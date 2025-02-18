@@ -92,14 +92,16 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V6 blob footer within `.sparse` file ("BMP6" in LE)
-pub const BMP_BLOB_MAGIC_V6: u32 = 0x36504D42;
+/// Magic number for BMP V7 blob footer ("BMP7" in LE)
+///
+/// V7 changes from V6:
+/// - Section 2 stores `dim_idx` (position in dim_ids array) instead of `dim_id`
+/// - When `num_dims ≤ 65536`, section 2 uses `u16-LE` entries (halving size)
+/// - Otherwise section 2 uses `u32-LE` entries (same as V6)
+pub const BMP_BLOB_MAGIC_V7: u32 = 0x37504D42;
 
-/// BMP V6 blob footer size (48 bytes):
-/// total_terms(4) + total_postings(4) + dim_ids_offset(4) + grid_offset(4) +
-/// num_blocks(4) + num_dims(4) + bmp_block_size(4) + num_virtual_docs(4) +
-/// max_weight_scale(4) + sb_grid_offset(4) + doc_map_offset(4) + magic(4)
-pub const BMP_BLOB_FOOTER_SIZE_V6: usize = 48;
+/// BMP V7 blob footer size (same as V6: 48 bytes)
+pub const BMP_BLOB_FOOTER_SIZE_V7: usize = 48;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;
