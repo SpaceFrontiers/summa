@@ -91,6 +91,7 @@ pub struct BmpIndex {
 
     // ── V8 section metadata ──────────────────────────────────────────
     num_dims: u32,
+    total_terms: u32,
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
@@ -150,7 +151,7 @@ impl BmpIndex {
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
-        let _total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
+        let total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
         let total_postings = u32::from_le_bytes(fb[4..8].try_into().unwrap());
         let dim_ids_offset = u32::from_le_bytes(fb[8..12].try_into().unwrap());
         let _grid_offset = u32::from_le_bytes(fb[12..16].try_into().unwrap());
@@ -179,6 +180,7 @@ impl BmpIndex {
                 max_weight_scale,
                 total_vectors,
                 num_dims,
+                total_terms: 0,
                 total_postings: 0,
                 packed_row_size: 0,
                 term_dim_id_width: if num_dims <= 65536 { 2 } else { 4 },
@@ -257,6 +259,7 @@ impl BmpIndex {
             max_weight_scale,
             total_vectors,
             num_dims,
+            total_terms,
             total_postings,
             packed_row_size,
             term_dim_id_width,
@@ -414,6 +417,11 @@ impl BmpIndex {
             pos: 0,
             count: self.num_dims as usize,
         }
+    }
+
+    /// Total number of terms (unique dim×block pairs) stored in the index.
+    pub fn total_terms(&self) -> u64 {
+        self.total_terms as u64
     }
 
     /// Total number of postings stored in the index.

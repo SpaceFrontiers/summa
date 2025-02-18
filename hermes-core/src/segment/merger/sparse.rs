@@ -400,9 +400,13 @@ fn merge_bmp_field(
         .iter()
         .filter_map(|bi| bi.map(|b| b.total_postings() as usize))
         .sum();
-    // grid_entries has one entry per (dim, block) pair with non-zero postings.
-    // No exact stat available; total_postings is a safe upper bound (terms ≤ postings).
-    let est_total_terms = est_total_postings;
+    // total_terms from footer = unique (dim, block) pairs. Merging can split source
+    // blocks across ≤2 output blocks, so 2× sum is a tight upper bound.
+    let est_total_terms: usize = bmp_indexes
+        .iter()
+        .filter_map(|bi| bi.map(|b| b.total_terms() as usize))
+        .sum::<usize>()
+        * 2;
     let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_total_terms);
     let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
     let mut term_dim_ids: Vec<u32> = Vec::with_capacity(est_total_terms);
