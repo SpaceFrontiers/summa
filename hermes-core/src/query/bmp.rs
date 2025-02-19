@@ -94,6 +94,10 @@ struct BmpScratch {
     local_block_order: Vec<u32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
+    // Per-block predicate bitmasks (sized to BMP_SUPERBLOCK_SIZE, reused per superblock).
+    // Bit `i` set = virtual slot `i` passes the predicate. Precomputed to enable
+    // block-level skip (mask==0 → zero UB) and per-slot intersection (touched & mask).
+    local_pred_masks: Vec<u64>,
     // Compact grid buffers: query-relevant dim rows copied contiguously for L1 locality.
     // Resized per query to num_query_dims × row_size. Typical: 20 dims → ~16KB total.
     compact_sb_grid: Vec<u8>,
@@ -120,6 +124,9 @@ impl BmpScratch {
         }
         if self.acc.len() < block_size {
             self.acc.resize(block_size, 0);
+        }
+        if self.local_pred_masks.len() < sb_size {
+            self.local_pred_masks.resize(sb_size, 0u64);
         }
     }
 }
@@ -366,6 +373,30 @@ fn execute_bmp_inner(
                 &mut scratch.local_block_masks,
             );
 
+            // Predicate bitmask: precompute per-block which virtual slots pass the filter.
+            // Blocks with pred_mask==0 get UB zeroed → sorted to end → skipped.
+            // Remaining blocks use bitmask intersection (touched & pred_mask) instead
+            // of per-doc predicate evaluation in the hot scoring loop.
+            let pred_masks_opt: Option<&[u64]> = if let Some(pred) = &predicate {
+                compute_block_pred_masks(
+                    index,
+                    block_start,
+                    count,
+                    *pred,
+                    &mut scratch.local_pred_masks,
+                );
+                // Zero UBs for blocks with no matching docs.
+                // sort_local_blocks_desc filters UB==0, so these blocks are excluded.
+                for i in 0..count {
+                    if scratch.local_pred_masks[i] == 0 {
+                        scratch.local_block_ubs[i] = 0.0;
+                    }
+                }
+                Some(&scratch.local_pred_masks[..count])
+            } else {
+                None
+            };
+
             sort_local_blocks_desc(
                 &scratch.local_block_ubs[..count],
                 &mut scratch.local_block_order,
@@ -382,7 +413,7 @@ fn execute_bmp_inner(
                 dequant,
                 alpha,
                 k,
-                &predicate,
+                pred_masks_opt,
                 &mut collector,
                 &mut blocks_scored,
                 &mut scratch.acc,
@@ -493,6 +524,43 @@ fn score_block_bsearch_int(
 }
 
 // ============================================================================
+// Block-level predicate bitmasks
+// ============================================================================
+
+/// Precompute per-block predicate bitmasks for a range of blocks.
+///
+/// For each block, bit `i` is set if virtual slot `i` passes the predicate.
+/// Blocks where `pred_mask == 0` have no matching docs and can be skipped
+/// entirely (their UB is zeroed before sorting).
+///
+/// Sequential doc_map access (contiguous virtual IDs) is L1-cache friendly.
+/// Cost: `count × block_size` doc_map lookups + predicate evaluations per
+/// superblock (~4096 at block_size=64, SB_SIZE=64).
+#[inline]
+fn compute_block_pred_masks(
+    index: &BmpIndex,
+    block_start: usize,
+    count: usize,
+    predicate: &dyn Fn(crate::DocId) -> bool,
+    out: &mut [u64],
+) {
+    let block_size = index.bmp_block_size as usize;
+    let num_vdocs = index.num_virtual_docs as usize;
+    for (local, out_mask) in out.iter_mut().enumerate().take(count) {
+        let base = (block_start + local) * block_size;
+        let end = (base + block_size).min(num_vdocs);
+        let mut mask: u64 = 0;
+        for slot in 0..(end - base) {
+            let doc_id = index.doc_id_for_virtual((base + slot) as u32);
+            if doc_id != u32::MAX && predicate(doc_id) {
+                mask |= 1u64 << slot;
+            }
+        }
+        *out_mask = mask;
+    }
+}
+
+// ============================================================================
 // Superblock-at-a-time scoring
 // ============================================================================
 
@@ -515,7 +583,7 @@ fn score_superblock_blocks(
     dequant: f32,
     alpha: f32,
     k: usize,
-    predicate: &Option<&dyn Fn(crate::DocId) -> bool>,
+    pred_masks: Option<&[u64]>,
     collector: &mut ScoreCollector,
     blocks_scored: &mut u32,
     acc: &mut [u32],
@@ -575,28 +643,38 @@ fn score_superblock_blocks(
             );
         }
 
-        // Collect results + lazy zeroing in one pass over touched slots.
-        // Dequantize u32 → f32, clear each slot immediately after reading.
+        // Collect results + lazy zeroing.
+        // When pred_masks is active, split into collect (touched & pred_mask) and
+        // reject (touched & !pred_mask) passes. The reject pass only zeros accumulators.
+        // When no predicate, pred_mask = u64::MAX so collect_scan == touched and
+        // reject == 0 (zero overhead).
         let base = block_id * index.bmp_block_size;
         let num_vdocs = index.num_virtual_docs;
-        let mut scan = touched;
+        let pred_mask = pred_masks.map_or(u64::MAX, |m| m[local_idx as usize]);
+        let collect_scan = touched & pred_mask;
+
+        // Zero rejected slots (touched but filtered out by predicate)
+        {
+            let mut reject = touched & !pred_mask;
+            while reject != 0 {
+                let i = reject.trailing_zeros() as usize;
+                reject &= reject - 1;
+                acc[i] = 0;
+            }
+        }
+
+        // Collect matching slots: dequantize u32 → f32, clear, insert
+        let mut scan = collect_scan;
         while scan != 0 {
             let i = scan.trailing_zeros() as usize;
-            scan &= scan - 1; // clear lowest set bit
+            scan &= scan - 1;
             let score_u32 = acc[i];
-            acc[i] = 0; // lazy zero: clear immediately after read
+            acc[i] = 0;
             if score_u32 > 0 {
                 let virtual_id = base + i as u32;
-                // Guard against phantom slots in the last block
                 if virtual_id < num_vdocs {
                     let score = score_u32 as f32 * dequant;
                     if collector.would_enter(score) {
-                        if let Some(pred) = predicate {
-                            let doc_id = index.doc_id_for_virtual(virtual_id);
-                            if !pred(doc_id) {
-                                continue;
-                            }
-                        }
                         collector.insert_with_ordinal(virtual_id, score, 0);
                     }
                 }
