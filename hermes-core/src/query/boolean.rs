@@ -7,9 +7,10 @@ use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
 use super::planner::{
-    build_sparse_bmp_results, build_sparse_bmp_results_filtered, build_sparse_maxscore_executor,
-    chain_predicates, combine_sparse_results, compute_idf, extract_all_sparse_infos,
-    finish_text_maxscore, prepare_per_field_grouping, prepare_text_maxscore,
+    build_combined_bitset, build_sparse_bmp_results, build_sparse_bmp_results_filtered,
+    build_sparse_maxscore_executor, chain_predicates, combine_sparse_results, compute_idf,
+    extract_all_sparse_infos, finish_text_maxscore, prepare_per_field_grouping,
+    prepare_text_maxscore,
 };
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
 
@@ -285,7 +286,24 @@ macro_rules! boolean_plan {
                 && !predicates.is_empty()
             {
                 if let Some(infos) = extract_all_sparse_infos(should) {
-                    // Try BMP with predicate first (BMP is the default format)
+                    // Try BMP with bitset first: build compact bitset from MUST/MUST_NOT
+                    // posting lists (O(M) for term queries) for fast per-slot lookup.
+                    let bitset_result = build_combined_bitset(must, must_not, reader);
+                    if let Some(ref bitset) = bitset_result {
+                        let bitset_pred = |doc_id: crate::DocId| bitset.contains(doc_id);
+                        if let Some((raw, info)) =
+                            build_sparse_bmp_results_filtered(&infos, reader, limit, &bitset_pred)
+                        {
+                            log::debug!(
+                                "BooleanQuery planner: bitset-aware sparse BMP, {} dims, {} matching docs",
+                                infos.len(),
+                                bitset.count()
+                            );
+                            return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
+                        }
+                    }
+
+                    // Fallback: closure predicate (for queries that don't support bitsets)
                     let combined = chain_predicates(predicates);
                     if let Some((raw, info)) =
                         build_sparse_bmp_results_filtered(&infos, reader, limit, &*combined)

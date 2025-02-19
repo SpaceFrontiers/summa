@@ -41,6 +41,59 @@ pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + Send + Sync + 'a>;
 #[cfg(target_arch = "wasm32")]
 pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
 
+/// Compact bitset indexed by doc_id. O(1) lookup, ~2.25 MB for 18M docs.
+///
+/// Built from posting lists or predicate scans. Used by BMP filtered queries
+/// for fast per-slot predicate evaluation (~2ns per lookup vs ~30-40ns for
+/// a fast-field closure).
+pub struct DocBitset {
+    pub(crate) bits: Vec<u64>,
+}
+
+impl DocBitset {
+    /// Create an empty bitset for `num_docs` documents.
+    pub fn new(num_docs: u32) -> Self {
+        let num_words = (num_docs as usize).div_ceil(64);
+        Self {
+            bits: vec![0u64; num_words],
+        }
+    }
+
+    /// Set bit for `doc_id`.
+    #[inline]
+    pub fn set(&mut self, doc_id: u32) {
+        let word = doc_id as usize / 64;
+        let bit = doc_id as usize % 64;
+        if word < self.bits.len() {
+            self.bits[word] |= 1u64 << bit;
+        }
+    }
+
+    /// Test if `doc_id` is in the bitset.
+    #[inline(always)]
+    pub fn contains(&self, doc_id: u32) -> bool {
+        let word = doc_id as usize / 64;
+        let bit = doc_id as usize % 64;
+        word < self.bits.len() && self.bits[word] & (1u64 << bit) != 0
+    }
+
+    /// Number of set bits (matching docs).
+    pub fn count(&self) -> u32 {
+        self.bits.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// Build bitset from a predicate by scanning all docs. O(N).
+    pub fn from_predicate(num_docs: u32, pred: &dyn Fn(DocId) -> bool) -> Self {
+        let mut bs = Self::new(num_docs);
+        for doc_id in 0..num_docs {
+            if pred(doc_id) {
+                bs.set(doc_id);
+            }
+        }
+        bs
+    }
+}
+
 /// Info for MaxScore-optimizable term queries
 #[derive(Debug, Clone)]
 pub struct TermQueryInfo {
@@ -149,6 +202,19 @@ macro_rules! define_query_traits {
             ) -> Option<DocPredicate<'a>> {
                 None
             }
+
+            /// Build a compact bitset of matching doc_ids for this query.
+            ///
+            /// Preferred over `as_doc_predicate` for BMP filtered queries because
+            /// bitset lookup is ~2ns vs ~30-40ns for a fast-field closure.
+            /// Default returns None; TermQuery overrides this to build from its
+            /// posting list in O(M) time.
+            fn as_doc_bitset(
+                &self,
+                _reader: &SegmentReader,
+            ) -> Option<DocBitset> {
+                None
+            }
         }
 
         /// Scored document stream: a DocSet that also provides scores.
@@ -190,6 +256,10 @@ impl Query for Box<dyn Query> {
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<DocPredicate<'a>> {
         (**self).as_doc_predicate(reader)
+    }
+
+    fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<DocBitset> {
+        (**self).as_doc_bitset(reader)
     }
 
     #[cfg(feature = "sync")]

@@ -194,6 +194,13 @@ impl Query for RangeQuery {
             }
         }))
     }
+
+    fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        // Build bitset from fast-field scan: O(N). Slower than posting-list-based
+        // bitsets but still faster than per-call predicate in BMP (~2ns lookup vs ~30ns).
+        let pred = self.as_doc_predicate(reader)?;
+        Some(super::DocBitset::from_predicate(reader.num_docs(), &*pred))
+    }
 }
 
 // ── RangeScorer ──────────────────────────────────────────────────────────

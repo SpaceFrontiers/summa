@@ -287,6 +287,72 @@ pub(super) fn chain_predicates<'a>(predicates: Vec<DocPredicate<'a>>) -> DocPred
     Box::new(move |doc_id| predicates.iter().all(|p| p(doc_id)))
 }
 
+/// Build a combined DocBitset from MUST and MUST_NOT clause bitsets.
+///
+/// Returns None if any clause doesn't support bitset creation.
+/// For term queries this is O(M) (posting list iteration); for range queries O(N).
+/// The resulting bitset enables ~2ns per-doc lookups in BMP (vs ~30-40ns for closures).
+pub(super) fn build_combined_bitset(
+    must: &[std::sync::Arc<dyn super::Query>],
+    must_not: &[std::sync::Arc<dyn super::Query>],
+    reader: &crate::segment::SegmentReader,
+) -> Option<super::DocBitset> {
+    if must.is_empty() && must_not.is_empty() {
+        return None;
+    }
+
+    let num_docs = reader.num_docs();
+    let mut result: Option<super::DocBitset> = None;
+
+    // Intersect MUST bitsets
+    for q in must {
+        let bs = q.as_doc_bitset(reader)?;
+        result = Some(match result {
+            None => bs,
+            Some(mut acc) => {
+                // AND: intersect
+                for (a, b) in acc.bits.iter_mut().zip(bs.bits.iter()) {
+                    *a &= *b;
+                }
+                acc
+            }
+        });
+    }
+
+    // Subtract MUST_NOT bitsets
+    for q in must_not {
+        let bs = q.as_doc_bitset(reader)?;
+        result = Some(match result {
+            None => {
+                // No MUST clauses — start with all-ones, then subtract
+                let mut all = super::DocBitset::new(num_docs);
+                for w in &mut all.bits {
+                    *w = u64::MAX;
+                }
+                // Clear bits beyond num_docs
+                let tail_bits = num_docs as usize % 64;
+                if tail_bits > 0 && !all.bits.is_empty() {
+                    let last = all.bits.len() - 1;
+                    all.bits[last] &= (1u64 << tail_bits) - 1;
+                }
+                for (a, b) in all.bits.iter_mut().zip(bs.bits.iter()) {
+                    *a &= !*b;
+                }
+                all
+            }
+            Some(mut acc) => {
+                // ANDNOT: subtract
+                for (a, b) in acc.bits.iter_mut().zip(bs.bits.iter()) {
+                    *a &= !*b;
+                }
+                acc
+            }
+        });
+    }
+
+    result
+}
+
 // ── Result scorers ───────────────────────────────────────────────────────
 
 /// Scorer that iterates over pre-computed top-k results

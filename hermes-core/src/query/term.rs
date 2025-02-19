@@ -205,6 +205,23 @@ impl Query for TermQuery {
         }
     }
 
+    fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        // Build bitset from posting list: O(M) where M = matching doc count.
+        // Much faster than O(N) fast-field scan for selective terms.
+        let pl = reader.get_postings_sync(self.field, &self.term).ok()??;
+        let mut bitset = super::DocBitset::new(reader.num_docs());
+        let mut iter = pl.iterator();
+        loop {
+            let doc = iter.doc();
+            if doc == crate::structures::TERMINATED {
+                break;
+            }
+            bitset.set(doc);
+            iter.advance();
+        }
+        Some(bitset)
+    }
+
     fn decompose(&self) -> super::QueryDecomposition {
         super::QueryDecomposition::TextTerm(TermQueryInfo {
             field: self.field,
