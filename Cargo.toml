@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.7.82"
+version = "1.7.83"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -24,7 +24,7 @@ categories = ["database", "text-processing"]
 
 [workspace.dependencies]
 # Internal crates
-hermes-core = { version = "1.7.82", path = "hermes-core", default-features = false }
+hermes-core = { version = "1.7.83", path = "hermes-core", default-features = false }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
