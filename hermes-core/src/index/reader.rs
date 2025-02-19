@@ -200,11 +200,32 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     }
 
     /// Internal reload with specific segment IDs.
+    /// Reuses existing segment readers for unchanged segments (avoids re-opening
+    /// mmaps, fast fields, sparse indexes, etc.).
     /// Atomic swap via ArcSwap::store (wait-free for readers).
     async fn reload_with_segments(&self, new_segment_ids: Vec<String>) -> Result<()> {
-        let new_reader =
-            Self::create_reader(&self.schema, &self.segment_manager, self.term_cache_blocks)
-                .await?;
+        // Collect existing segment readers for reuse
+        let existing_segments: Vec<Arc<crate::segment::SegmentReader>> =
+            self.state.load().searcher.segment_readers().to_vec();
+
+        // Read trained centroids from ArcSwap (lock-free)
+        let trained = self.segment_manager.trained();
+        let trained_centroids = trained
+            .as_ref()
+            .map(|t| t.centroids.clone())
+            .unwrap_or_default();
+
+        let snapshot = self.segment_manager.acquire_snapshot().await;
+
+        let new_reader = Searcher::from_snapshot_reuse(
+            self.segment_manager.directory(),
+            Arc::clone(&self.schema),
+            snapshot,
+            trained_centroids,
+            self.term_cache_blocks,
+            &existing_segments,
+        )
+        .await?;
 
         // Atomic swap — readers see old or new state, never a torn read
         self.state.store(Arc::new(SearcherState {

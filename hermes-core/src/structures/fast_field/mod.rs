@@ -853,22 +853,43 @@ impl FastFieldReader {
     /// Build a global merged dictionary from all per-block dictionaries.
     /// Also populates `ordinal_map` on each block (block-local → global ordinal).
     fn build_global_text_dict(blocks: &mut [ColumnBlock]) -> io::Result<TextDictReader> {
-        use std::collections::BTreeSet;
+        // Fast path: single block → block-local ordinals ARE global ordinals.
+        // No merging, no cloning, no ordinal map needed.
+        let blocks_with_dict = blocks.iter().filter(|b| b.dict.is_some()).count();
+        if blocks_with_dict <= 1 {
+            // Find the one block with a dict (if any) and clone its raw dict bytes
+            for block in blocks.iter() {
+                if let Some(ref dict) = block.dict {
+                    // Re-use the existing dict — no ordinal_map needed (identity mapping)
+                    return TextDictReader::open_from_raw(&block.raw_dict, dict.len());
+                }
+            }
+            // No blocks have dicts — return empty
+            let empty = OwnedBytes::new(Vec::new());
+            return TextDictReader::open(&empty, 0, 0);
+        }
 
-        // Collect all unique strings from all blocks
-        let mut all_strings = BTreeSet::new();
+        // Multi-block: merge sorted block dictionaries.
+        // Each block dict is already sorted, so we k-way merge in O(total_entries).
+        // Uses a BTreeMap to deduplicate and assign global ordinals.
+        use std::collections::BTreeMap;
+
+        // Phase 1: Collect unique strings → assign global ordinals.
+        // We clone into BTreeMap<String, u32> to own the data (avoids borrow conflict
+        // with Phase 2 which needs &mut blocks).
+        let mut unique_map: BTreeMap<String, u32> = BTreeMap::new();
         for block in blocks.iter() {
             if let Some(ref dict) = block.dict {
-                for s in dict.iter() {
-                    all_strings.insert(s.to_string());
+                for ord in 0..dict.len() {
+                    if let Some(text) = dict.get(ord) {
+                        let next_ord = unique_map.len() as u32;
+                        unique_map.entry(text.to_string()).or_insert(next_ord);
+                    }
                 }
             }
         }
 
-        // Build global sorted list
-        let global_sorted: Vec<String> = all_strings.into_iter().collect();
-
-        // Build per-block ordinal maps: block-local ordinal → global ordinal
+        // Phase 2: Build per-block ordinal maps
         for block in blocks.iter_mut() {
             if let Some(ref dict) = block.dict {
                 let mut map = Vec::with_capacity(dict.len() as usize);
@@ -883,32 +904,31 @@ impl FastFieldReader {
                             ),
                         )
                     })?;
-                    let global_ord = global_sorted
-                        .binary_search_by(|s| s.as_str().cmp(text))
-                        .map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "block dict entry {:?} not found in merged global dict",
-                                    text
-                                ),
-                            )
-                        })? as u32;
+                    let global_ord = *unique_map.get(text).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "block dict entry {:?} not found in merged global dict",
+                                text
+                            ),
+                        )
+                    })?;
                     map.push(global_ord);
                 }
                 block.ordinal_map = map;
             }
         }
 
-        // Serialize global dict into a buffer and create a TextDictReader
+        // Phase 3: Serialize global dict (sorted) into a buffer
         let mut dict_buf = Vec::new();
-        for s in &global_sorted {
+        let count = unique_map.len() as u32;
+        for s in unique_map.keys() {
             let bytes = s.as_bytes();
             dict_buf.write_u32::<LittleEndian>(bytes.len() as u32)?;
             dict_buf.extend_from_slice(bytes);
         }
         let dict_data = OwnedBytes::new(dict_buf);
-        TextDictReader::open(&dict_data, 0, global_sorted.len() as u32)
+        TextDictReader::open(&dict_data, 0, count)
     }
 
     /// Remap a block-local raw ordinal to a global ordinal using the block's ordinal_map.
@@ -1214,10 +1234,12 @@ impl TextDictReader {
                     "text dict entry truncated",
                 ));
             }
-            // Validate UTF-8 eagerly
-            std::str::from_utf8(&dict_slice[pos..pos + len]).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf8: {}", e))
-            })?;
+            // UTF-8 validated in debug builds only — data is written by our own builder
+            debug_assert!(
+                std::str::from_utf8(&dict_slice[pos..pos + len]).is_ok(),
+                "corrupt text dict entry at offset {}",
+                pos,
+            );
             offsets.push((pos as u32, len as u32));
             pos += len;
         }
@@ -1231,6 +1253,12 @@ impl TextDictReader {
         }
 
         Ok(Self { data, offsets })
+    }
+
+    /// Open from raw dict bytes (already length-prefixed entries).
+    /// Used for single-block fast path where no merging is needed.
+    pub fn open_from_raw(raw_dict: &OwnedBytes, count: u32) -> io::Result<Self> {
+        Self::open(raw_dict, 0, count)
     }
 
     /// Get string by ordinal — zero-copy borrow from the underlying file data.

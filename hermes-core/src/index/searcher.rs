@@ -80,6 +80,43 @@ impl<D: Directory + 'static> Searcher<D> {
             snapshot.segment_ids(),
             &trained_centroids,
             term_cache_blocks,
+            &[],
+        )
+        .await?;
+
+        Ok(Self {
+            _snapshot: snapshot,
+            _phantom: std::marker::PhantomData,
+            segments,
+            schema,
+            default_fields,
+            tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
+            trained_centroids,
+            global_stats,
+            segment_map,
+            total_docs,
+        })
+    }
+
+    /// Create from a snapshot, reusing existing segment readers for unchanged segments.
+    /// This avoids re-opening mmaps, fast fields, sparse indexes, etc. for segments
+    /// that weren't touched by merge.
+    #[cfg(feature = "native")]
+    pub(crate) async fn from_snapshot_reuse(
+        directory: Arc<D>,
+        schema: Arc<Schema>,
+        snapshot: SegmentSnapshot,
+        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+        term_cache_blocks: usize,
+        existing_segments: &[Arc<SegmentReader>],
+    ) -> Result<Self> {
+        let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
+            &directory,
+            &schema,
+            snapshot.segment_ids(),
+            &trained_centroids,
+            term_cache_blocks,
+            existing_segments,
         )
         .await?;
 
@@ -111,6 +148,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             &trained_centroids,
             term_cache_blocks,
+            &[],
         )
         .await?;
 
@@ -143,6 +181,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
+        existing_segments: &[Arc<SegmentReader>],
     ) -> Result<(
         Vec<Arc<SegmentReader>>,
         Vec<crate::Field>,
@@ -156,6 +195,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             trained_centroids,
             term_cache_blocks,
+            existing_segments,
         )
         .await?;
         let default_fields = Self::build_default_fields(schema);
@@ -170,14 +210,23 @@ impl<D: Directory + 'static> Searcher<D> {
         ))
     }
 
-    /// Load segment readers from IDs (parallel loading for performance)
+    /// Load segment readers from IDs (parallel loading for performance).
+    /// Reuses existing segment readers for unchanged segments when `existing_segments`
+    /// is non-empty — avoids re-opening mmaps, fast fields, sparse indexes, etc.
     async fn load_segments(
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         segment_ids: &[String],
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
+        existing_segments: &[Arc<SegmentReader>],
     ) -> Result<Vec<Arc<SegmentReader>>> {
+        // Build lookup from existing segment readers for reuse
+        let existing_map: FxHashMap<u128, Arc<SegmentReader>> = existing_segments
+            .iter()
+            .map(|seg| (seg.meta().id, Arc::clone(seg)))
+            .collect();
+
         // Parse segment IDs and filter invalid ones
         let valid_segments: Vec<(usize, SegmentId)> = segment_ids
             .iter()
@@ -185,8 +234,27 @@ impl<D: Directory + 'static> Searcher<D> {
             .filter_map(|(idx, id_str)| SegmentId::from_hex(id_str).map(|sid| (idx, sid)))
             .collect();
 
-        // Load all segments in parallel
-        let futures: Vec<_> = valid_segments
+        // Separate into reusable and new segments
+        let mut reused: Vec<(usize, Arc<SegmentReader>)> = Vec::new();
+        let mut to_load: Vec<(usize, SegmentId)> = Vec::new();
+        for (idx, sid) in &valid_segments {
+            if let Some(existing) = existing_map.get(&sid.0) {
+                reused.push((*idx, Arc::clone(existing)));
+            } else {
+                to_load.push((*idx, *sid));
+            }
+        }
+
+        if !existing_segments.is_empty() {
+            log::info!(
+                "[searcher] reusing {} segment readers, loading {} new",
+                reused.len(),
+                to_load.len(),
+            );
+        }
+
+        // Load only NEW segments in parallel
+        let futures: Vec<_> = to_load
             .iter()
             .map(|(_, segment_id)| {
                 let dir = Arc::clone(directory);
@@ -198,11 +266,22 @@ impl<D: Directory + 'static> Searcher<D> {
 
         let results = futures::future::join_all(futures).await;
 
-        // Collect results — fail fast if any segment fails to open
-        let mut loaded: Vec<(usize, SegmentReader)> = Vec::with_capacity(valid_segments.len());
-        for ((idx, sid), result) in valid_segments.into_iter().zip(results) {
+        // Collect newly loaded results — fail fast if any segment fails to open
+        let mut loaded: Vec<(usize, Arc<SegmentReader>)> = Vec::with_capacity(valid_segments.len());
+
+        // Add reused segments
+        loaded.extend(reused);
+
+        // Add newly loaded segments
+        for ((idx, sid), result) in to_load.into_iter().zip(results) {
             match result {
-                Ok(reader) => loaded.push((idx, reader)),
+                Ok(mut reader) => {
+                    // Inject per-field centroids into reader for IVF/ScaNN search
+                    if !trained_centroids.is_empty() {
+                        reader.set_coarse_centroids(trained_centroids.clone());
+                    }
+                    loaded.push((idx, Arc::new(reader)));
+                }
                 Err(e) => {
                     return Err(crate::error::Error::Internal(format!(
                         "Failed to open segment {:016x}: {:?}",
@@ -215,14 +294,7 @@ impl<D: Directory + 'static> Searcher<D> {
         // Sort by original index to maintain deterministic ordering
         loaded.sort_by_key(|(idx, _)| *idx);
 
-        let mut segments = Vec::with_capacity(loaded.len());
-        for (_, mut reader) in loaded {
-            // Inject per-field centroids into reader for IVF/ScaNN search
-            if !trained_centroids.is_empty() {
-                reader.set_coarse_centroids(trained_centroids.clone());
-            }
-            segments.push(Arc::new(reader));
-        }
+        let segments: Vec<Arc<SegmentReader>> = loaded.into_iter().map(|(_, seg)| seg).collect();
 
         // Log searcher loading summary with per-segment memory breakdown
         let total_docs: u64 = segments.iter().map(|s| s.meta().num_docs as u64).sum();
