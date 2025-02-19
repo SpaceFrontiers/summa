@@ -307,22 +307,16 @@ pub(super) fn build_combined_bitset(
     // Intersect MUST bitsets
     for q in must {
         let bs = q.as_doc_bitset(reader)?;
-        result = Some(match result {
-            None => bs,
-            Some(mut acc) => {
-                // AND: intersect
-                for (a, b) in acc.bits.iter_mut().zip(bs.bits.iter()) {
-                    *a &= *b;
-                }
-                acc
-            }
-        });
+        match result {
+            None => result = Some(bs),
+            Some(ref mut acc) => acc.intersect_with(&bs),
+        }
     }
 
     // Subtract MUST_NOT bitsets
     for q in must_not {
         let bs = q.as_doc_bitset(reader)?;
-        result = Some(match result {
+        match result {
             None => {
                 // No MUST clauses — start with all-ones, then subtract
                 let mut all = super::DocBitset::new(num_docs);
@@ -335,19 +329,11 @@ pub(super) fn build_combined_bitset(
                     let last = all.bits.len() - 1;
                     all.bits[last] &= (1u64 << tail_bits) - 1;
                 }
-                for (a, b) in all.bits.iter_mut().zip(bs.bits.iter()) {
-                    *a &= !*b;
-                }
-                all
+                all.subtract(&bs);
+                result = Some(all);
             }
-            Some(mut acc) => {
-                // ANDNOT: subtract
-                for (a, b) in acc.bits.iter_mut().zip(bs.bits.iter()) {
-                    *a &= !*b;
-                }
-                acc
-            }
-        });
+            Some(ref mut acc) => acc.subtract(&bs),
+        }
     }
 
     result

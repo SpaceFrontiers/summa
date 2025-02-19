@@ -92,6 +92,31 @@ impl DocBitset {
         }
         bs
     }
+
+    /// In-place OR (union): `self |= other`.
+    pub fn union_with(&mut self, other: &DocBitset) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a |= *b;
+        }
+    }
+
+    /// In-place AND (intersection): `self &= other`.
+    pub fn intersect_with(&mut self, other: &DocBitset) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a &= *b;
+        }
+        // Zero out any words beyond `other`'s length
+        for a in self.bits.iter_mut().skip(other.bits.len()) {
+            *a = 0;
+        }
+    }
+
+    /// In-place ANDNOT (subtract): `self &= !other`.
+    pub fn subtract(&mut self, other: &DocBitset) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a &= !*b;
+        }
+    }
 }
 
 /// Info for MaxScore-optimizable term queries

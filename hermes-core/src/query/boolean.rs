@@ -454,6 +454,57 @@ impl Query for BooleanQuery {
         )
     }
 
+    fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        if self.must.is_empty() && self.should.is_empty() {
+            return None;
+        }
+
+        let num_docs = reader.num_docs();
+
+        // MUST clauses: intersect bitsets (AND)
+        let mut result: Option<super::DocBitset> = None;
+        for q in &self.must {
+            let bs = q.as_doc_bitset(reader)?;
+            match result {
+                None => result = Some(bs),
+                Some(ref mut acc) => acc.intersect_with(&bs),
+            }
+        }
+
+        // SHOULD clauses: union bitsets (OR), then intersect with MUST result
+        if !self.should.is_empty() {
+            let mut should_union = super::DocBitset::new(num_docs);
+            for q in &self.should {
+                let bs = q.as_doc_bitset(reader)?;
+                should_union.union_with(&bs);
+            }
+            match result {
+                None => result = Some(should_union),
+                Some(ref mut acc) => {
+                    // When MUST clauses exist, SHOULD is optional (doesn't filter).
+                    // When no MUST clauses, at least one SHOULD must match.
+                    if self.must.is_empty() {
+                        *acc = should_union;
+                    }
+                }
+            }
+        }
+
+        // MUST_NOT clauses: subtract bitsets (ANDNOT)
+        if let Some(ref mut acc) = result {
+            for q in &self.must_not {
+                if let Some(bs) = q.as_doc_bitset(reader) {
+                    acc.subtract(&bs);
+                } else {
+                    // Can't build bitset for this MUST_NOT clause — bail
+                    return None;
+                }
+            }
+        }
+
+        result
+    }
+
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         // Need at least some clauses
         if self.must.is_empty() && self.should.is_empty() {
