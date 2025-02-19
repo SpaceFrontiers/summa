@@ -114,7 +114,7 @@ pub(super) fn build_sparse_streaming(
 
                 let blob_offset = current_offset;
                 let blob_len = super::bmp::build_bmp_blob(
-                    &mut builder.postings,
+                    std::mem::take(&mut builder.postings),
                     bmp_block_size,
                     weight_threshold,
                     pruning_fraction,

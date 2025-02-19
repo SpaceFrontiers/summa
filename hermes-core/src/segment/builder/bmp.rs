@@ -66,13 +66,31 @@ use std::io::Write;
 use byteorder::{LittleEndian, WriteBytesExt};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Look up a compact virtual ID by binary search on sorted `vid_pairs`.
+/// O(1) virtual-ID lookup table, built from sorted `(doc_id, ordinal)` pairs.
 ///
-/// `vid_pairs` must be sorted. Returns the index (= compact virtual ID).
-/// Panics if the key is not found (all valid postings must have a vid).
-#[inline]
-pub(crate) fn vid_lookup(vid_pairs: &[(crate::DocId, u16)], key: (crate::DocId, u16)) -> u32 {
-    vid_pairs.binary_search(&key).unwrap() as u32
+/// Uses FxHashMap for O(1) amortised lookup instead of O(log N) binary search.
+/// Memory: ~18 bytes per entry (~48 MB for 2.7M entries) — a speed/memory
+/// trade-off that eliminates billions of binary search comparisons during
+/// the K-way merge (267M postings × 21 comparisons = 5.6B comparisons).
+pub(crate) struct VidLookup {
+    map: FxHashMap<(crate::DocId, u16), u32>,
+}
+
+impl VidLookup {
+    /// Build from sorted `(doc_id, ordinal)` pairs. The index in the sorted
+    /// order becomes the virtual ID.
+    pub fn from_sorted_pairs(vid_pairs: &[(crate::DocId, u16)]) -> Self {
+        let mut map = FxHashMap::with_capacity_and_hasher(vid_pairs.len(), Default::default());
+        for (vid, &pair) in vid_pairs.iter().enumerate() {
+            map.insert(pair, vid as u32);
+        }
+        Self { map }
+    }
+
+    #[inline]
+    pub fn get(&self, key: (crate::DocId, u16)) -> u32 {
+        self.map[&key]
+    }
 }
 
 use crate::DocId;
@@ -80,6 +98,10 @@ use crate::segment::format::BMP_BLOB_MAGIC_V11;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
 /// Build a BMP V11 blob from per-dimension postings.
+///
+/// **Takes ownership** of the postings HashMap. Per-dim vectors are drained
+/// as they're consumed in the K-way merge, freeing memory incrementally
+/// instead of keeping the entire input alive alongside the output buffers.
 ///
 /// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
 /// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
@@ -95,7 +117,7 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_bmp_blob(
-    postings: &mut FxHashMap<u32, Vec<(DocId, u16, f32)>>,
+    mut postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,
     bmp_block_size: u32,
     weight_threshold: f32,
     pruning_fraction: Option<f32>,
@@ -160,6 +182,10 @@ pub(crate) fn build_bmp_blob(
     vid_pairs.sort_unstable();
     let num_real_docs = vid_pairs.len();
 
+    // Build O(1) lookup table from (doc_id, ordinal) → virtual_id.
+    // Replaces O(log N) binary search per-posting in the K-way merge.
+    let vid_lookup = VidLookup::from_sorted_pairs(&vid_pairs);
+
     // Safety: local_slot is u8, so block_size must not exceed 256
     let effective_block_size = bmp_block_size.min(256);
 
@@ -173,11 +199,16 @@ pub(crate) fn build_bmp_blob(
 
     // Phase 2: K-way merge over per-dim cursors
     //
-    // Collect dim slices (avoid repeated HashMap lookups in hot loop)
-    let dim_slices: Vec<&[(DocId, u16, f32)]> = dim_ids
+    // Take ownership of per-dim posting Vecs. This drains the HashMap so
+    // its memory can be reclaimed by the allocator during the merge.
+    let dim_vecs: Vec<Vec<(DocId, u16, f32)>> = dim_ids
         .iter()
-        .map(|&d| postings.get(&d).map(|v| v.as_slice()).unwrap_or(&[]))
+        .map(|&d| postings.remove(&d).unwrap_or_default())
         .collect();
+    drop(postings); // Free HashMap shell now
+
+    // Borrow slices for the merge loop
+    let dim_slices: Vec<&[(DocId, u16, f32)]> = dim_vecs.iter().map(|v| v.as_slice()).collect();
 
     // Per-dim flag: true means this dim has fewer than min_terms postings,
     // so weight_threshold should not be applied.
@@ -205,7 +236,7 @@ pub(crate) fn build_bmp_blob(
             if impact == 0 {
                 continue;
             }
-            let virtual_id = vid_lookup(&vid_pairs, (doc_id, ordinal)) as u64;
+            let virtual_id = vid_lookup.get((doc_id, ordinal)) as u64;
             let block_id = (virtual_id / bs64) as u32;
             cursors[dim_idx] = pos;
             heap.push(Reverse((block_id, dim_id, dim_idx)));
@@ -265,7 +296,7 @@ pub(crate) fn build_bmp_blob(
                     continue;
                 }
 
-                let virtual_id = vid_lookup(&vid_pairs, (doc_id, ordinal)) as u64;
+                let virtual_id = vid_lookup.get((doc_id, ordinal)) as u64;
                 let bid2 = (virtual_id / bs64) as u32;
                 if bid2 != block_id {
                     // This posting belongs to a later block — record and stop
@@ -298,7 +329,7 @@ pub(crate) fn build_bmp_blob(
                     if skip_wt || abs_w >= weight_threshold {
                         let impact = quantize_weight(abs_w, max_weight_scale);
                         if impact > 0 {
-                            let virtual_id = vid_lookup(&vid_pairs, (doc_id, ordinal)) as u64;
+                            let virtual_id = vid_lookup.get((doc_id, ordinal)) as u64;
                             let nb = (virtual_id / bs64) as u32;
                             cursors[dim_idx] = pos;
                             heap.push(Reverse((nb, dim_id, dim_idx)));
@@ -336,6 +367,12 @@ pub(crate) fn build_bmp_blob(
         total_postings,
         grid_entries.len(),
     );
+
+    // Free K-way merge inputs before writing output — reclaims per-dim
+    // posting Vecs and the O(1) vid lookup table.
+    drop(dim_slices); // borrows dim_vecs, must drop first
+    drop(dim_vecs);
+    drop(vid_lookup);
 
     // ── Write V11 interleaved sections (data-first) ──────────────────────
     let mut bytes_written: u64 = 0;
@@ -647,9 +684,9 @@ mod tests {
 
     #[test]
     fn test_build_bmp_blob_empty() {
-        let mut postings = FxHashMap::default();
+        let postings = FxHashMap::default();
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert_eq!(size, 0);
         assert!(buf.is_empty());
     }
@@ -663,7 +700,7 @@ mod tests {
         postings.insert(1, vec![(0, 0, 0.8)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
@@ -680,7 +717,7 @@ mod tests {
         postings.insert(0u32, vec![(0u32, 0u16, 1.0f32), (0, 1, 0.8), (1, 0, 0.5)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
         // Verify footer: num_virtual_docs should be 64 (padded to block_size)
@@ -705,7 +742,7 @@ mod tests {
         // impact(2.0) = round(2.0/5.0*255) = round(102) = 102
         // impact(1.0) = round(1.0/5.0*255) = round(51) = 51
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
         // Verify max_weight_scale in V11 footer (bytes 40-43)
@@ -730,7 +767,7 @@ mod tests {
 
         // Fixed max_weight=5.0: same scale
         let mut buf_a = Vec::new();
-        build_bmp_blob(&mut postings_a, 64, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
+        build_bmp_blob(postings_a, 64, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
         let scale_a = f32::from_le_bytes(
             buf_a[buf_a.len() - 64 + 40..buf_a.len() - 64 + 44]
                 .try_into()
@@ -738,7 +775,7 @@ mod tests {
         );
 
         let mut buf_b = Vec::new();
-        build_bmp_blob(&mut postings_b, 64, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
+        build_bmp_blob(postings_b, 64, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
         let scale_b = f32::from_le_bytes(
             buf_b[buf_b.len() - 64 + 40..buf_b.len() - 64 + 44]
                 .try_into()

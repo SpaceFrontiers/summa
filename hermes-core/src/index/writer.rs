@@ -439,9 +439,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     // Require minimum 100 docs before flushing to avoid tiny segments
                     const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
 
-                    if builder_memory >= state.memory_budget_per_worker
-                        && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH
-                    {
+                    // Reserve 20% headroom for segment build overhead (vid_set,
+                    // VidLookup, postings_flat, grid_entries). These temporary
+                    // allocations exist alongside the builder's data during build.
+                    let effective_budget = state.memory_budget_per_worker * 4 / 5;
+
+                    if builder_memory >= effective_budget && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH {
                         log::info!(
                             "[indexing] memory budget reached, building segment: \
                              docs={}, memory={:.2} MB, budget={:.2} MB",

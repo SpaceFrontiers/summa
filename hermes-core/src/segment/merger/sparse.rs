@@ -444,9 +444,6 @@ fn merge_bmp_field(
     let grid_offset = bytes_written;
     let mut row_buf = vec![0u8; packed_row_size];
 
-    // Also accumulate sb_grid for Phase 4
-    let mut sb_grid_buf = vec![0u8; dims as usize * num_superblocks];
-
     for dim_id in 0..dims {
         row_buf.fill(0);
 
@@ -464,14 +461,36 @@ fn merge_bmp_field(
             let src_row_end = src_row_start + src_prs;
             let src_grid = bmp.grid_slice();
             if src_row_end > src_grid.len() {
-                continue; // dim_id has no data in this source (shouldn't happen with fixed dims)
+                continue;
             }
             let src_row = &src_grid[src_row_start..src_row_end];
 
             // Copy nibbles at column offset
             copy_nibbles(src_row, src_num_blocks, &mut row_buf, col_offset);
+        }
 
-            // Copy sb_grid values from source to output positions
+        writer.write_all(&row_buf).map_err(crate::Error::Io)?;
+    }
+    bytes_written += (dims as usize * packed_row_size) as u64;
+    drop(row_buf);
+
+    // ── Phase 4: Stream Section E (sb_grid) — one row at a time ─────────
+    // Uses O(num_superblocks) buffer instead of O(dims × num_superblocks).
+    // For 100M docs with 105K dims: ~24 KB buffer vs ~2.5 GB.
+    let sb_grid_offset = bytes_written;
+    let mut sb_row = vec![0u8; num_superblocks];
+    let sb_size = BMP_SUPERBLOCK_SIZE as usize;
+
+    for dim_id in 0..dims {
+        sb_row.fill(0);
+
+        for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
+            let bmp = match bmp_opt {
+                Some(b) => b,
+                None => continue,
+            };
+            let col_offset = block_offsets[seg_idx] as usize;
+            let src_num_blocks = bmp.num_blocks as usize;
             let src_num_sbs = bmp.num_source_superblocks();
             let src_sb_grid = bmp.sb_grid_slice();
             let src_sb_row_start = dim_id as usize * src_num_sbs;
@@ -481,7 +500,6 @@ fn merge_bmp_field(
             }
             let src_sb_row = &src_sb_grid[src_sb_row_start..src_sb_row_end];
 
-            let sb_size = BMP_SUPERBLOCK_SIZE as usize;
             for sb_src in 0..src_num_sbs {
                 let val = src_sb_row[sb_src];
                 if val == 0 {
@@ -493,24 +511,17 @@ fn merge_bmp_field(
                 let first_out_sb = first_block / sb_size;
                 let last_out_sb = last_block / sb_size;
                 for out_sb in first_out_sb..=last_out_sb {
-                    let idx = dim_id as usize * num_superblocks + out_sb;
-                    if val > sb_grid_buf[idx] {
-                        sb_grid_buf[idx] = val;
+                    if val > sb_row[out_sb] {
+                        sb_row[out_sb] = val;
                     }
                 }
             }
         }
 
-        writer.write_all(&row_buf).map_err(crate::Error::Io)?;
+        writer.write_all(&sb_row).map_err(crate::Error::Io)?;
     }
-    bytes_written += (dims as usize * packed_row_size) as u64;
-    drop(row_buf);
-
-    // ── Phase 4: Write Section E (sb_grid) from buffer ──────────────────
-    let sb_grid_offset = bytes_written;
-    writer.write_all(&sb_grid_buf).map_err(crate::Error::Io)?;
-    bytes_written += sb_grid_buf.len() as u64;
-    drop(sb_grid_buf);
+    bytes_written += (dims as usize * num_superblocks) as u64;
+    drop(sb_row);
 
     // ── Phase 5: Stream Section F+G (doc_map) from source mmaps ─────────
     let doc_map_offset = bytes_written;
