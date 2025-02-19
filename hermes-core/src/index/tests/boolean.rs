@@ -455,7 +455,8 @@ async fn test_pruning_weight_threshold_drops_shared_dim() {
         embedding,
         vec![(1000, 10.0), (2000, 5.0), (3000, 0.01), (0, 0.001)],
     )
-    .with_weight_threshold(0.005);
+    .with_weight_threshold(0.005)
+    .with_min_query_dims(1);
 
     let results = index.search(&q, 200).await.unwrap();
 
@@ -489,7 +490,8 @@ async fn test_pruning_weight_threshold_drops_weak_and_shared() {
         embedding,
         vec![(1000, 10.0), (2000, 5.0), (3000, 0.01), (0, 0.001)],
     )
-    .with_weight_threshold(0.05);
+    .with_weight_threshold(0.05)
+    .with_min_query_dims(1);
 
     let results = index.search(&q, 200).await.unwrap();
 
@@ -583,7 +585,8 @@ async fn test_pruning_fraction_half() {
         embedding,
         vec![(1000, 10.0), (2000, 5.0), (3000, 0.01), (0, 0.001)],
     )
-    .with_pruning(0.5);
+    .with_pruning(0.5)
+    .with_min_query_dims(1);
 
     let results = index.search(&q, 200).await.unwrap();
 
@@ -613,7 +616,8 @@ async fn test_pruning_fraction_quarter() {
         embedding,
         vec![(1000, 10.0), (2000, 5.0), (3000, 0.01), (0, 0.001)],
     )
-    .with_pruning(0.25);
+    .with_pruning(0.25)
+    .with_min_query_dims(1);
 
     let results = index.search(&q, 200).await.unwrap();
 
@@ -651,7 +655,8 @@ async fn test_pruning_score_impact() {
         embedding,
         vec![(1000, 10.0), (2000, 5.0), (3000, 0.01), (0, 0.001)],
     )
-    .with_weight_threshold(0.05);
+    .with_weight_threshold(0.05)
+    .with_min_query_dims(1);
 
     let full = index.search(&q_full, 200).await.unwrap();
     let pruned = index.search(&q_pruned, 200).await.unwrap();

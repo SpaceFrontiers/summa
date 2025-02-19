@@ -72,6 +72,13 @@ impl PrimaryKeyIndex {
             }
         }
 
+        let bloom_bytes = bloom.size_bytes();
+        log::info!(
+            "[primary_key] bloom filter: {} keys, {:.2} MB",
+            total_keys,
+            bloom_bytes as f64 / (1024.0 * 1024.0),
+        );
+
         Self {
             field,
             state: parking_lot::Mutex::new(PrimaryKeyState {
@@ -81,6 +88,12 @@ impl PrimaryKeyIndex {
             committed_readers: readers,
             _snapshot: Some(snapshot),
         }
+    }
+
+    /// Memory used by the bloom filter and uncommitted set.
+    pub fn memory_bytes(&self) -> usize {
+        let state = self.state.lock();
+        state.bloom.size_bytes() + state.uncommitted.len() * 32 // estimate 32 bytes per key
     }
 
     /// Check whether a document's primary key is unique, and if so, register it.

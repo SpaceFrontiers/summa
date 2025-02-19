@@ -678,7 +678,7 @@ impl SSTableWriterConfig {
                 compression_level: CompressionLevel::BETTER, // Level 9
                 use_dictionary: false,
                 dict_size: DEFAULT_DICT_SIZE,
-                use_bloom_filter: false,
+                use_bloom_filter: true, // Bloom is cheap (~1.25 B/key) and avoids needless block reads
                 bloom_bits_per_key: BLOOM_BITS_PER_KEY,
             },
             IndexOptimization::SizeOptimized => Self {
@@ -1644,13 +1644,13 @@ mod tests {
         // Default = Adaptive
         let config = SSTableWriterConfig::default();
         assert_eq!(config.compression_level.0, 9); // BETTER
-        assert!(!config.use_bloom_filter);
+        assert!(config.use_bloom_filter); // Bloom always on — cheap and fast
         assert!(!config.use_dictionary);
 
         // Adaptive
         let adaptive = SSTableWriterConfig::from_optimization(IndexOptimization::Adaptive);
         assert_eq!(adaptive.compression_level.0, 9);
-        assert!(!adaptive.use_bloom_filter);
+        assert!(adaptive.use_bloom_filter);
         assert!(!adaptive.use_dictionary);
 
         // SizeOptimized

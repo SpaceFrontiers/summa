@@ -147,7 +147,7 @@ impl SparseVectorQuery {
         // Step 1: weight_threshold — drop dimensions below minimum weight
         // Skip when query has fewer than min_query_dims dimensions
         let mut v: Vec<(u32, f32)> =
-            if self.weight_threshold > 0.0 && self.vector.len() >= self.min_query_dims {
+            if self.weight_threshold > 0.0 && self.vector.len() > self.min_query_dims {
                 self.vector
                     .iter()
                     .copied()
@@ -163,7 +163,7 @@ impl SparseVectorQuery {
         let mut sorted_by_weight = false;
         if let Some(fraction) = self.pruning
             && fraction < 1.0
-            && v.len() >= self.min_query_dims
+            && v.len() > self.min_query_dims
         {
             v.sort_unstable_by(|a, b| {
                 b.1.abs()

@@ -877,16 +877,24 @@ impl FastFieldReader {
         // Phase 1: Collect unique strings → assign global ordinals.
         // We clone into BTreeMap<String, u32> to own the data (avoids borrow conflict
         // with Phase 2 which needs &mut blocks).
+        //
+        // BTreeMap is sorted by key, so ordinals assigned by iterating values_mut()
+        // match the order that Phase 3 writes the dictionary (also key-sorted).
+        // This is critical: TextDictReader::ordinal() does binary search by position,
+        // so the ordinal_map values MUST equal the sorted position, not insertion order.
         let mut unique_map: BTreeMap<String, u32> = BTreeMap::new();
         for block in blocks.iter() {
             if let Some(ref dict) = block.dict {
                 for ord in 0..dict.len() {
                     if let Some(text) = dict.get(ord) {
-                        let next_ord = unique_map.len() as u32;
-                        unique_map.entry(text.to_string()).or_insert(next_ord);
+                        unique_map.entry(text.to_string()).or_insert(0);
                     }
                 }
             }
+        }
+        // Assign ordinals by sorted position (BTreeMap iterates keys in order).
+        for (i, value) in unique_map.values_mut().enumerate() {
+            *value = i as u32;
         }
 
         // Phase 2: Build per-block ordinal maps
@@ -1862,6 +1870,61 @@ mod tests {
         assert_eq!(reader.get_u64(1), 1); // beta
         assert_eq!(reader.get_u64(2), 2); // gamma
         assert_eq!(reader.get_u64(3), 0); // alpha
+    }
+
+    /// Regression test: ordinal mismatch when blocks have disjoint dicts
+    /// that arrive in non-sorted order.
+    ///
+    /// Block A has ["book","wiki"], Block B has ["apple","wiki"].
+    /// "apple" < "book" < "wiki" alphabetically, but "book" is encountered
+    /// first. Before the fix, insertion-order ordinals were used instead of
+    /// sorted-position ordinals, causing text_ordinal() and get_u64() to
+    /// disagree — wrong documents would pass fast-field predicates.
+    #[test]
+    fn test_multi_block_text_ordinal_mismatch_regression() {
+        // Block A: 2 docs ["book", "wiki"]
+        let mut wa = FastFieldWriter::new_text();
+        wa.add_text(0, "book");
+        wa.add_text(1, "wiki");
+        let (data_a, dict_a, entry_a) = serialize_single_block(&mut wa);
+
+        // Block B: 2 docs ["apple", "wiki"]  ("apple" < "book" alphabetically)
+        let mut wb = FastFieldWriter::new_text();
+        wb.add_text(0, "apple");
+        wb.add_text(1, "wiki");
+        let (data_b, dict_b, entry_b) = serialize_single_block(&mut wb);
+
+        let (buf, toc) = assemble_blocked_column(
+            2,
+            FastFieldColumnType::TextOrdinal,
+            false,
+            &[
+                (entry_a.num_docs, &data_a, entry_a.dict_count, &dict_a),
+                (entry_b.num_docs, &data_b, entry_b.dict_count, &dict_b),
+            ],
+        );
+
+        let ob = owned(buf);
+        let reader = FastFieldReader::open(&ob, &toc).unwrap();
+
+        // Global dict should be sorted: apple(0), book(1), wiki(2)
+        assert_eq!(reader.text_dict().unwrap().len(), 3);
+        assert_eq!(reader.text_ordinal("apple"), Some(0));
+        assert_eq!(reader.text_ordinal("book"), Some(1));
+        assert_eq!(reader.text_ordinal("wiki"), Some(2));
+
+        // get_u64 must return the SAME global ordinals that text_ordinal returns
+        assert_eq!(reader.get_u64(0), 1); // doc0 in block A = "book" → global 1
+        assert_eq!(reader.get_u64(1), 2); // doc1 in block A = "wiki" → global 2
+        assert_eq!(reader.get_u64(2), 0); // doc0 in block B = "apple" → global 0
+        assert_eq!(reader.get_u64(3), 2); // doc1 in block B = "wiki" → global 2
+
+        // Simulate TermQuery predicate: text_ordinal("wiki") == get_u64(doc_id)
+        let wiki_ord = reader.text_ordinal("wiki").unwrap();
+        assert_eq!(reader.get_u64(1), wiki_ord, "wiki doc should match");
+        assert_eq!(reader.get_u64(3), wiki_ord, "wiki doc should match");
+        assert_ne!(reader.get_u64(0), wiki_ord, "book doc must NOT match wiki");
+        assert_ne!(reader.get_u64(2), wiki_ord, "apple doc must NOT match wiki");
     }
 
     #[test]

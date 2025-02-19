@@ -534,10 +534,15 @@ fn merge_bmp_field(
         let doc_offset = doc_offs[seg_idx];
         for vid in 0..bmp.num_virtual_docs {
             let (doc_id, _ordinal) = bmp.virtual_to_doc(vid);
-            // Use wrapping_add: padding entries have doc_id=u32::MAX, wrapping is fine
-            // since they'll be overwritten or ignored at query time
+            // Padding entries have doc_id=u32::MAX — preserve sentinel as-is.
+            // Only add doc_offset to real doc_ids.
+            let adjusted = if doc_id == u32::MAX {
+                u32::MAX
+            } else {
+                doc_id + doc_offset
+            };
             writer
-                .write_u32::<LittleEndian>(doc_id.wrapping_add(doc_offset))
+                .write_u32::<LittleEndian>(adjusted)
                 .map_err(crate::Error::Io)?;
         }
     }
