@@ -220,7 +220,7 @@ impl SegmentReader {
                 parts.push(format!(
                     "bmp field {}: {} dims, {} blocks",
                     field_id,
-                    idx.num_dimensions(),
+                    idx.dims(),
                     idx.num_blocks
                 ));
             }

@@ -527,9 +527,6 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 if let Some(q) = quant {
                     idx_params.push(format!("quantization: {}", q));
                 }
-                if let Some(qf) = cfg.quantization_factor {
-                    idx_params.push(format!("quantization_factor: {}", qf));
-                }
                 if cfg.weight_threshold > 0.0 {
                     idx_params.push(format!("weight_threshold: {}", cfg.weight_threshold));
                 }

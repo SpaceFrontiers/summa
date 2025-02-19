@@ -221,7 +221,6 @@ struct IndexConfig {
     // Sparse vector index params
     sparse_format: Option<SparseFormat>,
     quantization: Option<WeightQuantization>,
-    quantization_factor: Option<f32>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
     pruning: Option<f32>,
@@ -233,6 +232,9 @@ struct IndexConfig {
     query_max_dims: Option<usize>,
     query_pruning: Option<f32>,
     query_min_query_dims: Option<usize>,
+    // BMP fixed dims (vocabulary size) and max weight scale
+    dims: Option<u32>,
+    max_weight: Option<f32>,
     // Position tracking mode for phrase queries
     positions: Option<super::schema::PositionMode>,
 }
@@ -382,18 +384,6 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 });
             }
         }
-        Rule::quantization_factor_kwarg => {
-            // quantization_factor_kwarg = { "quantization_factor" ~ ":" ~ quantization_factor_spec }
-            if let Some(f) = p.into_inner().next() {
-                config.quantization_factor = Some(f.as_str().parse().unwrap_or_else(|_| {
-                    log::warn!(
-                        "Invalid quantization_factor value '{}', using default 50.0",
-                        f.as_str()
-                    );
-                    50.0
-                }));
-            }
-        }
         Rule::weight_threshold_kwarg => {
             // weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
             if let Some(t) = p.into_inner().next() {
@@ -443,6 +433,25 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                     "maxscore" => SparseFormat::MaxScore,
                     _ => SparseFormat::default(),
                 });
+            }
+        }
+        Rule::sparse_dims_kwarg => {
+            if let Some(n) = p.into_inner().next() {
+                config.dims = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!("Invalid dims value '{}', using default 105879", n.as_str());
+                    105879
+                }));
+            }
+        }
+        Rule::sparse_max_weight_kwarg => {
+            if let Some(f) = p.into_inner().next() {
+                config.max_weight = Some(f.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid max_weight value '{}', using default 5.0",
+                        f.as_str()
+                    );
+                    5.0
+                }));
             }
         }
         Rule::query_config_block => {
@@ -687,7 +696,8 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
         bmp_superblock_size: 64,
         pruning: None,
         query_config: None,
-        quantization_factor: None,
+        dims: None,
+        max_weight: None,
         min_terms: 4,
     }
 }
@@ -699,9 +709,6 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
     if let Some(q) = idx_cfg.quantization {
         config.weight_quantization = q;
-    }
-    if let Some(f) = idx_cfg.quantization_factor {
-        config.quantization_factor = Some(f);
     }
     if let Some(t) = idx_cfg.weight_threshold {
         config.weight_threshold = t;
@@ -730,6 +737,12 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
     if let Some(mt) = idx_cfg.min_terms {
         config.min_terms = mt;
+    }
+    if let Some(d) = idx_cfg.dims {
+        config.dims = Some(d);
+    }
+    if let Some(mw) = idx_cfg.max_weight {
+        config.max_weight = Some(mw);
     }
     // Apply query-time configuration if present
     if idx_cfg.query_tokenizer.is_some()
@@ -1423,22 +1436,6 @@ mod tests {
         let config = f.sparse_vector_config.as_ref().unwrap();
         assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
         assert_eq!(config.pruning, Some(0.1));
-    }
-
-    #[test]
-    fn test_sparse_vector_with_quantization_factor() {
-        let sdl = r#"
-            index documents {
-                field embedding: sparse_vector<u16> [indexed<quantization: uint8, quantization_factor: 50>, stored]
-            }
-        "#;
-
-        let indexes = parse_sdl(sdl).unwrap();
-        let f = &indexes[0].fields[0];
-        assert_eq!(f.name, "embedding");
-        let config = f.sparse_vector_config.as_ref().unwrap();
-        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
-        assert_eq!(config.quantization_factor, Some(50.0));
     }
 
     #[test]

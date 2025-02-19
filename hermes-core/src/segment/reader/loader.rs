@@ -318,9 +318,9 @@ pub async fn load_sparse_file<D: Directory>(
             ) {
                 Ok(idx) => {
                     log::debug!(
-                        "Loaded BMP index for field {}: num_dims={}, num_blocks={}, total_vectors={}",
+                        "Loaded BMP index for field {}: dims={}, num_blocks={}, total_vectors={}",
                         field_id,
-                        idx.num_dimensions(),
+                        idx.dims(),
                         idx.num_blocks,
                         total_vectors,
                     );

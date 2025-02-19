@@ -109,7 +109,8 @@ pub(super) fn build_sparse_streaming(
         match format {
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
-                let quantization_factor = sparse_config.and_then(|c| c.quantization_factor);
+                let dims = sparse_config.and_then(|c| c.dims).unwrap_or(105879); // default SPLADE vocab
+                let max_weight = sparse_config.and_then(|c| c.max_weight).unwrap_or(5.0); // default SPLADE max
 
                 let blob_offset = current_offset;
                 let blob_len = super::bmp::build_bmp_blob(
@@ -117,7 +118,8 @@ pub(super) fn build_sparse_streaming(
                     bmp_block_size,
                     weight_threshold,
                     pruning_fraction,
-                    quantization_factor,
+                    dims,
+                    max_weight,
                     min_terms,
                     writer,
                 )

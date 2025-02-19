@@ -1,9 +1,10 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V10 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V11 zero-copy**.
 //!
-//! V10 uses u64 section offsets and block_data_starts (fixing V9's u32 overflow
-//! for blobs >4 GB). Data-first layout: block data (Section B) appears before
-//! block_data_starts (Section A). The reader derives the Section A offset
-//! from `dim_ids_offset - (num_blocks + 1) * 8`.
+//! V11 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! Grid is indexed by dim_id as row index (no Section C dim_ids array).
+//! Data-first layout: block data (Section B) appears before block_data_starts
+//! (Section A). The reader derives the Section A offset from
+//! `grid_offset - (num_blocks + 1) * 8`.
 //!
 //! Block-interleaved format: all data needed to score one block is contiguous
 //! (~200-2000 bytes, fits in 1-2 pages). Reduces cold-query page faults to 1.
@@ -42,14 +43,6 @@ pub struct BmpPosting {
 
 // ── u32 read helpers ─────────────────────────────────────────────────────────
 
-/// Read a little-endian u32 from a byte slice at element index (bounds-checked).
-/// Used for non-hot-path reads (load time, merger iteration).
-#[inline(always)]
-fn read_u32_le(bytes: &[u8], idx: usize) -> u32 {
-    let off = idx * 4;
-    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
-}
-
 /// Read a little-endian u32 from a raw pointer at element index.
 /// No bounds check — used in the hot scoring loop where bounds are
 /// validated once at the method boundary via debug_assert.
@@ -68,7 +61,7 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
 }
 
 /// Read a little-endian u64 from a raw pointer at element index.
-/// No bounds check — used in the hot scoring loop for block_data_starts (V10).
+/// No bounds check — used in the hot scoring loop for block_data_starts.
 ///
 /// # Safety
 /// Caller must ensure `base.add(idx * 8 + 7)` is within the allocation.
@@ -80,12 +73,10 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V10 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V11 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V10 uses u64 section offsets and block_data_starts (fixing V9's u32 overflow
-/// for blobs >4 GB). Data-first layout with block-interleaved format: all scoring
-/// data for one block is contiguous. On cold queries, a single page fault loads all
-/// data needed to score a block.
+/// V11 uses fixed `dims` (vocabulary size) and dim_id directly in blocks.
+/// Grid is indexed by dim_id as row index. No Section C (dim_ids).
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -100,7 +91,7 @@ pub struct BmpIndex {
     pub bmp_block_size: u32,
     /// Number of blocks
     pub num_blocks: u32,
-    /// Number of compact virtual documents (= actual vector count)
+    /// Number of compact virtual documents (= num_blocks × bmp_block_size, padded)
     pub num_virtual_docs: u32,
     /// Global max weight scale factor (for dequantizing u8 impacts back to f32)
     pub max_weight_scale: f32,
@@ -108,23 +99,23 @@ pub struct BmpIndex {
     pub total_vectors: u32,
 
     // ── Section metadata ──────────────────────────────────────────────
-    num_dims: u32,
+    /// Fixed vocabulary size — grid has `dims` rows
+    dims: u32,
     total_terms: u32,
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
-    /// Bytes per element in term_dim_ids within each block: 2 (u16) or 4 (u32)
-    pub(crate) term_dim_id_width: u8,
+    /// Actual vector count before padding
+    num_real_docs: u32,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
     /// Section A: block_data_starts[block_id] = byte offset into block_data_bytes
     block_data_starts_bytes: OwnedBytes,
     /// Section B: interleaved per-block data (all scoring data contiguous per block)
     block_data_bytes: OwnedBytes,
-    dim_ids_bytes: OwnedBytes,
-    /// 4-bit packed block grid: `grid[dim_idx * packed_row_size + block_id/2]`
+    /// 4-bit packed block grid: `grid[dim_id * packed_row_size + block_id/2]`
     grid_bytes: OwnedBytes,
-    /// sb_grid[dim_idx * num_superblocks + sb_id] = max impact across all blocks in superblock
+    /// sb_grid[dim_id * num_superblocks + sb_id] = max impact across all blocks in superblock
     sb_grid_bytes: OwnedBytes,
     /// Number of superblocks
     pub num_superblocks: u32,
@@ -140,12 +131,12 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V10 blob from the given file handle.
+    /// Parse a BMP V11 blob from the given file handle.
     ///
     /// Reads the 64-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V10 data-first layout: Section B (per-block interleaved data) first,
+    /// V11 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries).
     pub fn parse(
         handle: FileHandle,
@@ -154,38 +145,39 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V10, BMP_BLOB_MAGIC_V10};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V11, BMP_BLOB_MAGIC_V11};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V10 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V11 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
         // Read the footer (last 64 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V10 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V11 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V10 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V11 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
         let total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
         let total_postings = u32::from_le_bytes(fb[4..8].try_into().unwrap());
-        let dim_ids_offset = u64::from_le_bytes(fb[8..16].try_into().unwrap());
-        let _grid_offset = u64::from_le_bytes(fb[16..24].try_into().unwrap());
+        let grid_offset = u64::from_le_bytes(fb[8..16].try_into().unwrap());
+        let sb_grid_offset = u64::from_le_bytes(fb[16..24].try_into().unwrap());
         let num_blocks = u32::from_le_bytes(fb[24..28].try_into().unwrap());
-        let num_dims = u32::from_le_bytes(fb[28..32].try_into().unwrap());
+        let dims = u32::from_le_bytes(fb[28..32].try_into().unwrap());
         let bmp_block_size = u32::from_le_bytes(fb[32..36].try_into().unwrap());
         let num_virtual_docs = u32::from_le_bytes(fb[36..40].try_into().unwrap());
         let max_weight_scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
-        let sb_grid_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
-        let doc_map_offset = u64::from_le_bytes(fb[52..60].try_into().unwrap());
+        let doc_map_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
+        let num_real_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
+        // fb[56..60] = reserved
         let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V10 {
+        if magic != BMP_BLOB_MAGIC_V11 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP0 {:#x})",
-                magic, BMP_BLOB_MAGIC_V10
+                "Invalid BMP blob magic: {:#x} (expected BMP1 {:#x})",
+                magic, BMP_BLOB_MAGIC_V11
             )));
         }
 
@@ -197,14 +189,13 @@ impl BmpIndex {
                 num_virtual_docs,
                 max_weight_scale,
                 total_vectors,
-                num_dims,
+                dims,
                 total_terms: 0,
                 total_postings: 0,
                 packed_row_size: 0,
-                term_dim_id_width: if num_dims <= 65536 { 2 } else { 4 },
+                num_real_docs,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
-                dim_ids_bytes: OwnedBytes::empty(),
                 grid_bytes: OwnedBytes::empty(),
                 sb_grid_bytes: OwnedBytes::empty(),
                 num_superblocks: 0,
@@ -214,60 +205,53 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V10 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V11 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
 
-        let term_dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
-
-        // V10 layout: Section B (block_data) at offset 0, Section A (block_data_starts)
-        // immediately before dim_ids. Derive Section A position from footer fields.
-        // V10 uses u64 entries in block_data_starts (8 bytes each).
+        // V11 layout: Section B (block_data) at offset 0, Section A (block_data_starts)
+        // immediately before grid. Derive Section A position from grid_offset.
         let section_a_size = (num_blocks as usize + 1) * 8;
-        let bds_start = dim_ids_offset as usize - section_a_size;
+        let bds_start = grid_offset as usize - section_a_size;
 
         // Section B: block_data [0..bds_start) (includes padding before Section A)
         let block_data_bytes = blob.slice(0..bds_start);
-        // Section A: block_data_starts [bds_start..dim_ids_offset)
-        let block_data_starts_bytes = blob.slice(bds_start..dim_ids_offset as usize);
+        // Section A: block_data_starts [bds_start..grid_offset)
+        let block_data_starts_bytes = blob.slice(bds_start..grid_offset as usize);
 
-        // Sections C-G: dim_ids, grid, sb_grid, doc_map
-        let dim_ids_start = dim_ids_offset as usize;
-        let dim_ids_end = dim_ids_start + num_dims as usize * 4;
-
+        // Sections D+E: grid, sb_grid, doc_map
         let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
-        let grid_start = dim_ids_end;
-        let grid_end = grid_start + num_dims as usize * packed_row_size as usize;
+        let grid_start = grid_offset as usize;
+        let grid_end = grid_start + dims as usize * packed_row_size as usize;
 
         let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
         let sb_grid_start = sb_grid_offset as usize;
-        let sb_grid_end = sb_grid_start + num_dims as usize * num_superblocks as usize;
+        let sb_grid_end = sb_grid_start + dims as usize * num_superblocks as usize;
 
         let dm_start = doc_map_offset as usize;
         let dm_ids_end = dm_start + num_virtual_docs as usize * 4;
         let dm_ords_end = dm_ids_end + num_virtual_docs as usize * 2;
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
-        let dim_ids_bytes = blob.slice(dim_ids_start..dim_ids_end);
         let grid_bytes = blob.slice(grid_start..grid_end);
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         log::debug!(
-            "BMP V10 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
-             num_virtual_docs={}, max_weight_scale={:.4}, postings={}, packed_row_size={}, \
-             term_dim_id_width={}, block_data={}B, doc_map={}B",
+            "BMP V11 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
+             num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
+             packed_row_size={}, block_data={}B, doc_map={}B",
             num_blocks,
             num_superblocks,
-            num_dims,
+            dims,
             bmp_block_size,
             num_virtual_docs,
+            num_real_docs,
             max_weight_scale,
             total_postings,
             packed_row_size,
-            term_dim_id_width,
             bds_start,
             num_virtual_docs as usize * 6,
         );
@@ -278,14 +262,13 @@ impl BmpIndex {
             num_virtual_docs,
             max_weight_scale,
             total_vectors,
-            num_dims,
+            dims,
             total_terms,
             total_postings,
             packed_row_size,
-            term_dim_id_width,
+            num_real_docs,
             block_data_starts_bytes,
             block_data_bytes,
-            dim_ids_bytes,
             grid_bytes,
             sb_grid_bytes,
             num_superblocks,
@@ -321,31 +304,9 @@ impl BmpIndex {
         unsafe { read_u32_unchecked(d.as_ptr(), virtual_id as usize) }
     }
 
-    /// Binary search for a dimension ID in the global dim_ids array.
-    #[inline]
-    pub fn find_dim_idx(&self, dim_id: u32) -> Option<usize> {
-        let d = self.dim_ids_bytes.as_slice();
-        let n = self.num_dims as usize;
-        // SAFETY: dim_ids_bytes has exactly num_dims × 4 bytes (validated at parse time)
-        debug_assert!(n * 4 <= d.len());
-        let base = d.as_ptr();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let val = unsafe { read_u32_unchecked(base, mid) };
-            match val.cmp(&dim_id) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Some(mid),
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        None
-    }
-
     // ── Hot-path block-data accessors ────────────────────────────────
 
-    /// Byte offset range in block_data_bytes for a block (u64 entries in V10).
+    /// Byte offset range in block_data_bytes for a block (u64 entries).
     #[inline(always)]
     pub(crate) fn block_data_range(&self, block_id: u32) -> (u64, u64) {
         let d = self.block_data_starts_bytes.as_slice();
@@ -373,6 +334,8 @@ impl BmpIndex {
     /// Parse a block header: returns (num_terms, dim_ptr, ps_ptr, post_ptr).
     /// All pointers are within block_data_bytes — guaranteed contiguous.
     ///
+    /// V11: always 4-byte dim IDs.
+    ///
     /// Returns `(0, null, null, null)` for empty blocks.
     #[inline(always)]
     pub(crate) fn parse_block(&self, block_id: u32) -> (u16, *const u8, *const u8, *const u8) {
@@ -388,14 +351,15 @@ impl BmpIndex {
         };
         let num_terms = unsafe { u16::from_le((base as *const u16).read_unaligned()) };
         let dim_ptr = unsafe { base.add(2) };
-        let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * self.term_dim_id_width as usize) };
+        // V11: always u32 dim IDs (4 bytes each)
+        let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * 4) };
         let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 2) };
         (num_terms, dim_ptr, ps_ptr, post_ptr)
     }
 
     /// Get a raw pointer to block_data_starts at the given block.
     /// Used for prefetching the N+2 block's offset during scoring.
-    /// V10: each entry is 8 bytes (u64).
+    /// Each entry is 8 bytes (u64).
     #[inline(always)]
     pub(crate) fn block_data_starts_ptr(&self, block_id: u32) -> *const u8 {
         unsafe {
@@ -407,37 +371,25 @@ impl BmpIndex {
     }
 
     /// Iterate terms in a block (for merger). Returns (dim_id, &[BmpPosting]) per term.
+    ///
+    /// V11: reads u32 dim_id directly from block data (no dim_idx→dim_id lookup).
     pub fn iter_block_terms(&self, block_id: u32) -> BlockTermIter<'_> {
         let (num_terms, dim_ptr, ps_ptr, post_ptr) = self.parse_block(block_id);
         BlockTermIter {
-            index: self,
             dim_ptr,
             ps_ptr,
             post_ptr,
             num_terms,
             current: 0,
+            _marker: std::marker::PhantomData,
         }
     }
 
     // ── Non-hot-path accessors ───────────────────────────────────────
 
-    /// Number of unique dimensions.
-    pub fn num_dimensions(&self) -> usize {
-        self.num_dims as usize
-    }
-
-    /// Get the dim_id at the given dimension index.
-    pub fn dim_id_at(&self, idx: usize) -> u32 {
-        read_u32_le(self.dim_ids_bytes.as_slice(), idx)
-    }
-
-    /// Iterate over all dimension IDs.
-    pub fn dim_ids(&self) -> DimIdIter<'_> {
-        DimIdIter {
-            bytes: self.dim_ids_bytes.as_slice(),
-            pos: 0,
-            count: self.num_dims as usize,
-        }
+    /// Fixed vocabulary size (number of grid rows).
+    pub fn dims(&self) -> u32 {
+        self.dims
     }
 
     /// Total number of terms (unique dim×block pairs) stored in the index.
@@ -450,6 +402,11 @@ impl BmpIndex {
         self.total_postings as u64
     }
 
+    /// Actual vector count before block-alignment padding.
+    pub fn num_real_docs(&self) -> u32 {
+        self.num_real_docs
+    }
+
     /// Estimated memory usage in bytes (mmap-backed region sizes).
     ///
     /// Fully zero-copy: all data is mmap-backed OwnedBytes, but the
@@ -458,7 +415,6 @@ impl BmpIndex {
         std::mem::size_of::<Self>()
             + self.block_data_starts_bytes.len()
             + self.block_data_bytes.len()
-            + self.dim_ids_bytes.len()
             + self.grid_bytes.len()
             + self.sb_grid_bytes.len()
             + self.doc_map_ids_bytes.len()
@@ -466,6 +422,8 @@ impl BmpIndex {
     }
 
     /// Extract compact grid data for query-relevant dims into caller-provided buffers.
+    ///
+    /// V11: `dim_indices` are dim_id values (used directly as grid row indices).
     ///
     /// Copies only the rows corresponding to `dim_indices`, creating a contiguous
     /// layout that fits in L1/L2 cache. For ~20 query dims with 1500 blocks:
@@ -516,45 +474,59 @@ impl BmpIndex {
     pub(crate) fn grid_slice(&self) -> &[u8] {
         self.grid_bytes.as_slice()
     }
-}
 
-/// Iterator over dimension IDs stored in zero-copy OwnedBytes.
-pub struct DimIdIter<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    count: usize,
-}
+    // ── Streaming merge accessors (V11 block-copy) ───────────────────
 
-impl<'a> Iterator for DimIdIter<'a> {
-    type Item = u32;
-
+    /// Raw block data bytes (Section B). For block-copy merge.
     #[inline]
-    fn next(&mut self) -> Option<u32> {
-        if self.pos >= self.count {
-            return None;
-        }
-        let val = read_u32_le(self.bytes, self.pos);
-        self.pos += 1;
-        Some(val)
+    pub fn block_data_slice(&self) -> &[u8] {
+        self.block_data_bytes.as_slice()
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.count - self.pos;
-        (rem, Some(rem))
+    /// Byte offset of block `block_id` in block data (from block_data_starts).
+    #[inline]
+    pub fn block_data_start(&self, block_id: u32) -> u64 {
+        let d = self.block_data_starts_bytes.as_slice();
+        let off = block_id as usize * 8;
+        u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
+    }
+
+    /// Sentinel value = total bytes in Section B (block_data_starts[num_blocks]).
+    #[inline]
+    pub fn block_data_sentinel(&self) -> u64 {
+        self.block_data_start(self.num_blocks)
+    }
+
+    /// Number of superblocks in this source segment.
+    #[inline]
+    pub fn num_source_superblocks(&self) -> usize {
+        self.num_superblocks as usize
+    }
+
+    /// Packed row size for source segment's grid.
+    #[inline]
+    pub fn src_packed_row_size(&self) -> usize {
+        self.packed_row_size as usize
     }
 }
 
-impl<'a> ExactSizeIterator for DimIdIter<'a> {}
-
-/// Iterator over terms in a V10 block. Returns `(dim_id, &[BmpPosting])` per term.
+/// Iterator over terms in a V11 block. Returns `(dim_id, &[BmpPosting])` per term.
+///
+/// V11: reads u32 dim_id directly from block data (no dim_idx→dim_id lookup).
 pub struct BlockTermIter<'a> {
-    index: &'a BmpIndex,
     dim_ptr: *const u8,
     ps_ptr: *const u8,
     post_ptr: *const u8,
     num_terms: u16,
     current: u16,
+    // lifetime marker for the underlying BmpIndex data
+    _marker: std::marker::PhantomData<&'a ()>,
 }
+
+// Manually implement Send+Sync. The raw pointers are derived from OwnedBytes
+// (which is Send+Sync) and are never mutated. The iterator borrows &BmpIndex.
+unsafe impl<'a> Send for BlockTermIter<'a> {}
+unsafe impl<'a> Sync for BlockTermIter<'a> {}
 
 impl<'a> Iterator for BlockTermIter<'a> {
     type Item = (u32, &'a [BmpPosting]);
@@ -567,18 +539,8 @@ impl<'a> Iterator for BlockTermIter<'a> {
         let i = self.current;
         self.current += 1;
 
-        // Read dim_idx from block-local dim_ptr
-        let dim_idx = if self.index.term_dim_id_width == 2 {
-            unsafe {
-                let p = self.dim_ptr.add(i as usize * 2);
-                u16::from_le((p as *const u16).read_unaligned()) as u32
-            }
-        } else {
-            unsafe { read_u32_unchecked(self.dim_ptr, i as usize) }
-        };
-
-        // Convert dim_idx to dim_id via Section C
-        let dim_id = self.index.dim_id_at(dim_idx as usize);
+        // V11: read u32 dim_id directly from block data
+        let dim_id = unsafe { read_u32_unchecked(self.dim_ptr, i as usize) };
 
         // Get postings from block-local ps_ptr/post_ptr
         let postings = unsafe { block_term_postings(self.ps_ptr, self.post_ptr, i) };
@@ -597,51 +559,33 @@ impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
 // Block-data free functions (used by query and merger)
 // ============================================================================
 
-/// Binary search for a dimension index in a block's term_dim_indices.
+/// Binary search for a dimension ID in a block's term_dim_ids.
 ///
-/// `dim_ptr` points to the block's term_dim_indices array.
+/// V11: always u32 dim_ids. `dim_ptr` points to the block's term_dim_ids array.
 /// Returns the local term index (0..num_terms) if found.
 ///
 /// # Safety
-/// `dim_ptr` must be valid for `num_terms * dim_id_width` bytes.
+/// `dim_ptr` must be valid for `num_terms * 4` bytes.
 #[inline(always)]
 pub(crate) fn find_dim_in_block_data(
     dim_ptr: *const u8,
     num_terms: u16,
-    dim_id_width: u8,
-    dim_idx: u32,
+    dim_id: u32,
 ) -> Option<u16> {
     let count = num_terms as usize;
     if count == 0 {
         return None;
     }
 
-    if dim_id_width == 2 {
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let val = unsafe {
-                let p = dim_ptr.add(mid * 2);
-                u16::from_le((p as *const u16).read_unaligned()) as u32
-            };
-            match val.cmp(&dim_idx) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Some(mid as u16),
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-    } else {
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let val = unsafe { read_u32_unchecked(dim_ptr, mid) };
-            match val.cmp(&dim_idx) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Some(mid as u16),
-                std::cmp::Ordering::Greater => hi = mid,
-            }
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let val = unsafe { read_u32_unchecked(dim_ptr, mid) };
+        match val.cmp(&dim_id) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Equal => return Some(mid as u16),
+            std::cmp::Ordering::Greater => hi = mid,
         }
     }
     None
@@ -726,51 +670,40 @@ unsafe fn accumulate_u8_weighted_neon(input: &[u8], weight: f32, out: &mut [f32]
         let in_ptr = input.as_ptr().add(base);
         let out_ptr = out.as_mut_ptr().add(base);
 
-        // Load 16 u8 values
         let bytes = vld1q_u8(in_ptr);
 
-        // Widen u8 → u16
         let low8 = vget_low_u8(bytes);
         let high8 = vget_high_u8(bytes);
         let low16 = vmovl_u8(low8);
         let high16 = vmovl_u8(high8);
 
-        // Widen u16 → u32 → f32, FMA into output
-        // Group 0: elements 0-3
         let u32_0 = vmovl_u16(vget_low_u16(low16));
         let f32_0 = vcvtq_f32_u32(u32_0);
         let acc_0 = vld1q_f32(out_ptr);
         vst1q_f32(out_ptr, vfmaq_f32(acc_0, f32_0, weight_v));
 
-        // Group 1: elements 4-7
         let u32_1 = vmovl_u16(vget_high_u16(low16));
         let f32_1 = vcvtq_f32_u32(u32_1);
         let acc_1 = vld1q_f32(out_ptr.add(4));
         vst1q_f32(out_ptr.add(4), vfmaq_f32(acc_1, f32_1, weight_v));
 
-        // Group 2: elements 8-11
         let u32_2 = vmovl_u16(vget_low_u16(high16));
         let f32_2 = vcvtq_f32_u32(u32_2);
         let acc_2 = vld1q_f32(out_ptr.add(8));
         vst1q_f32(out_ptr.add(8), vfmaq_f32(acc_2, f32_2, weight_v));
 
-        // Group 3: elements 12-15
         let u32_3 = vmovl_u16(vget_high_u16(high16));
         let f32_3 = vcvtq_f32_u32(u32_3);
         let acc_3 = vld1q_f32(out_ptr.add(12));
         vst1q_f32(out_ptr.add(12), vfmaq_f32(acc_3, f32_3, weight_v));
     }
 
-    // Scalar remainder
     let base = chunks * 16;
     for i in 0..remainder {
         *out.get_unchecked_mut(base + i) += *input.get_unchecked(base + i) as f32 * weight;
     }
 }
 
-/// SSE4.1 implementation for u8-weighted accumulation.
-///
-/// Processes 16 u8 elements per iteration: widen u8→u32→f32, multiply, add.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -787,20 +720,16 @@ unsafe fn accumulate_u8_weighted_sse41(input: &[u8], weight: f32, out: &mut [f32
         let in_ptr = input.as_ptr().add(base);
         let out_ptr = out.as_mut_ptr().add(base);
 
-        // Load 16 u8 values
         let bytes = _mm_loadu_si128(in_ptr as *const __m128i);
 
-        // Unpack u8→u16
         let lo8 = _mm_unpacklo_epi8(bytes, zero);
         let hi8 = _mm_unpackhi_epi8(bytes, zero);
 
-        // Group 0: elements 0-3
         let u32_0 = _mm_unpacklo_epi16(lo8, zero);
         let f32_0 = _mm_cvtepi32_ps(u32_0);
         let acc_0 = _mm_loadu_ps(out_ptr);
         _mm_storeu_ps(out_ptr, _mm_add_ps(acc_0, _mm_mul_ps(f32_0, weight_v)));
 
-        // Group 1: elements 4-7
         let u32_1 = _mm_unpackhi_epi16(lo8, zero);
         let f32_1 = _mm_cvtepi32_ps(u32_1);
         let acc_1 = _mm_loadu_ps(out_ptr.add(4));
@@ -809,7 +738,6 @@ unsafe fn accumulate_u8_weighted_sse41(input: &[u8], weight: f32, out: &mut [f32
             _mm_add_ps(acc_1, _mm_mul_ps(f32_1, weight_v)),
         );
 
-        // Group 2: elements 8-11
         let u32_2 = _mm_unpacklo_epi16(hi8, zero);
         let f32_2 = _mm_cvtepi32_ps(u32_2);
         let acc_2 = _mm_loadu_ps(out_ptr.add(8));
@@ -818,7 +746,6 @@ unsafe fn accumulate_u8_weighted_sse41(input: &[u8], weight: f32, out: &mut [f32
             _mm_add_ps(acc_2, _mm_mul_ps(f32_2, weight_v)),
         );
 
-        // Group 3: elements 12-15
         let u32_3 = _mm_unpackhi_epi16(hi8, zero);
         let f32_3 = _mm_cvtepi32_ps(u32_3);
         let acc_3 = _mm_loadu_ps(out_ptr.add(12));
@@ -828,7 +755,6 @@ unsafe fn accumulate_u8_weighted_sse41(input: &[u8], weight: f32, out: &mut [f32
         );
     }
 
-    // Scalar remainder
     let base = chunks * 16;
     for i in 0..remainder {
         *out.get_unchecked_mut(base + i) += *input.get_unchecked(base + i) as f32 * weight;
@@ -860,7 +786,6 @@ pub(crate) fn accumulate_u4_weighted(
     #[cfg(target_arch = "aarch64")]
     {
         if elem_offset.is_multiple_of(2) {
-            // SAFETY: NEON is always available on aarch64. Even-aligned fast path.
             unsafe { accumulate_u4_weighted_neon(packed, elem_offset, count, weight, out) };
             return;
         }
@@ -889,17 +814,6 @@ pub(crate) fn accumulate_u4_weighted(
     }
 }
 
-/// NEON implementation for 4-bit grid accumulation.
-///
-/// Processes 32 elements (16 packed bytes) per iteration:
-/// 1. Load 16 packed bytes
-/// 2. Extract low/high nibbles
-/// 3. Scale ×17 to get u8-equivalent values
-/// 4. Interleave to element order
-/// 5. Widen to f32 and FMA into output
-///
-/// Requires `elem_offset` to be even (always true since block_start is
-/// a multiple of BMP_SUPERBLOCK_SIZE=64).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -929,22 +843,17 @@ unsafe fn accumulate_u4_weighted_neon(
         let pb = packed_ptr.add(chunk * 16);
         let ob = out_ptr.add(chunk * 32);
 
-        // Load 16 packed bytes (= 32 elements)
         let bytes = vld1q_u8(pb);
 
-        // Extract nibbles
         let low = vandq_u8(bytes, mask_lo);
         let high = vshrq_n_u8::<4>(bytes);
 
-        // Scale to u8 range: val * 17 (15*17=255, fits in u8)
         let low_scaled = vmulq_u8(low, scale17);
         let high_scaled = vmulq_u8(high, scale17);
 
-        // Interleave to element order: (low[0],high[0],low[1],high[1],...)
         let elems_0_15 = vzip1q_u8(low_scaled, high_scaled);
         let elems_16_31 = vzip2q_u8(low_scaled, high_scaled);
 
-        // Process first 16 elements through u8→f32 widen+FMA pipeline
         {
             let lo8 = vget_low_u8(elems_0_15);
             let hi8 = vget_high_u8(elems_0_15);
@@ -972,7 +881,6 @@ unsafe fn accumulate_u4_weighted_neon(
             vst1q_f32(ob.add(12), vfmaq_f32(acc_3, f32_3, weight_v));
         }
 
-        // Process second 16 elements
         {
             let lo8 = vget_low_u8(elems_16_31);
             let hi8 = vget_high_u8(elems_16_31);
@@ -1001,7 +909,6 @@ unsafe fn accumulate_u4_weighted_neon(
         }
     }
 
-    // Scalar remainder
     let base_elem = chunks * 32;
     for i in 0..remainder {
         let abs_idx = elem_offset + base_elem + i;
@@ -1015,16 +922,6 @@ unsafe fn accumulate_u4_weighted_neon(
     }
 }
 
-/// SSE4.1 implementation for 4-bit packed grid accumulation.
-///
-/// Processes 32 elements (16 packed bytes) per iteration:
-/// 1. Load 16 packed bytes
-/// 2. AND with 0x0F for low nibbles, SHR 4 for high nibbles
-/// 3. Scale ×17 via `(v << 4) + v` (shift+add replaces multiply)
-/// 4. Interleave to element order
-/// 5. Widen to f32 and FMA into output
-///
-/// Requires `elem_offset` to be even.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1054,23 +951,18 @@ unsafe fn accumulate_u4_weighted_sse41(
         let pb = packed_ptr.add(chunk * 16);
         let ob = out_ptr.add(chunk * 32);
 
-        // Load 16 packed bytes (= 32 elements)
         let bytes = _mm_loadu_si128(pb as *const __m128i);
 
-        // Extract nibbles
         let low = _mm_and_si128(bytes, mask_lo);
         let high = _mm_srli_epi16::<4>(bytes);
-        let high = _mm_and_si128(high, mask_lo); // clean high bits after shift
+        let high = _mm_and_si128(high, mask_lo);
 
-        // Scale ×17 using (v << 4) + v
         let low_scaled = _mm_add_epi8(_mm_slli_epi16::<4>(_mm_and_si128(low, mask_lo)), low);
         let high_scaled = _mm_add_epi8(_mm_slli_epi16::<4>(_mm_and_si128(high, mask_lo)), high);
 
-        // Interleave to element order: (low[0],high[0],low[1],high[1],...)
         let elems_0_15 = _mm_unpacklo_epi8(low_scaled, high_scaled);
         let elems_16_31 = _mm_unpackhi_epi8(low_scaled, high_scaled);
 
-        // Process first 16 elements
         {
             let lo8 = _mm_unpacklo_epi8(elems_0_15, zero);
             let hi8 = _mm_unpackhi_epi8(elems_0_15, zero);
@@ -1096,7 +988,6 @@ unsafe fn accumulate_u4_weighted_sse41(
             _mm_storeu_ps(ob.add(12), _mm_add_ps(acc_3, _mm_mul_ps(f32_3, weight_v)));
         }
 
-        // Process second 16 elements
         {
             let lo8 = _mm_unpacklo_epi8(elems_16_31, zero);
             let hi8 = _mm_unpackhi_epi8(elems_16_31, zero);
@@ -1123,7 +1014,6 @@ unsafe fn accumulate_u4_weighted_sse41(
         }
     }
 
-    // Scalar remainder
     let base_elem = chunks * 32;
     for i in 0..remainder {
         let abs_idx = elem_offset + base_elem + i;
@@ -1203,13 +1093,6 @@ pub(crate) fn compute_block_masks_4bit(
 // Block mask SIMD kernels
 // ============================================================================
 
-/// NEON kernel: compute block masks for 4-bit grid.
-///
-/// Processes 32 blocks (16 packed bytes) per iteration per query dim.
-/// For each packed byte, extracts both nibbles, checks non-zero, and ORs
-/// the query dim's bit into the corresponding mask.
-///
-/// Requires `block_start` to be even (always true: BMP_SUPERBLOCK_SIZE=64).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1239,22 +1122,17 @@ unsafe fn compute_block_masks_range_neon(
             let pb = row_ptr.add(chunk * 16);
             let base = chunk * 32;
 
-            // Load 16 packed bytes = 32 elements
             let bytes = vld1q_u8(pb);
 
-            // Extract nibbles
             let low = vandq_u8(bytes, mask_lo);
             let high = vshrq_n_u8::<4>(bytes);
 
-            // Interleave to element order
-            let elems_lo = vzip1q_u8(low, high); // elements 0-15
-            let elems_hi = vzip2q_u8(low, high); // elements 16-31
+            let elems_lo = vzip1q_u8(low, high);
+            let elems_hi = vzip2q_u8(low, high);
 
-            // Compare > 0: result bytes are 0xFF or 0x00
             let nz_lo = vcgtq_u8(elems_lo, zero);
             let nz_hi = vcgtq_u8(elems_hi, zero);
 
-            // Extract per-byte results — store to temp array
             let mut lo_arr = [0u8; 16];
             let mut hi_arr = [0u8; 16];
             vst1q_u8(lo_arr.as_mut_ptr(), nz_lo);
@@ -1272,7 +1150,6 @@ unsafe fn compute_block_masks_range_neon(
             }
         }
 
-        // Scalar remainder
         let base = chunks * 32;
         for i in 0..remainder {
             let abs_b = block_start + base + i;
@@ -1289,10 +1166,6 @@ unsafe fn compute_block_masks_range_neon(
     }
 }
 
-/// SSE4.1 kernel: compute block masks for 4-bit grid.
-///
-/// Uses `_mm_movemask_epi8` to extract 16-bit masks efficiently, then
-/// scatters bits using `trailing_zeros` loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1322,22 +1195,17 @@ unsafe fn compute_block_masks_range_sse41(
             let pb = row_ptr.add(chunk * 16);
             let base = chunk * 32;
 
-            // Load 16 packed bytes = 32 elements
             let bytes = _mm_loadu_si128(pb as *const __m128i);
 
-            // Extract nibbles
             let low = _mm_and_si128(bytes, mask_lo_v);
             let high = _mm_and_si128(_mm_srli_epi16::<4>(bytes), mask_lo_v);
 
-            // Interleave to element order
-            let elems_lo = _mm_unpacklo_epi8(low, high); // elements 0-15
-            let elems_hi = _mm_unpackhi_epi8(low, high); // elements 16-31
+            let elems_lo = _mm_unpacklo_epi8(low, high);
+            let elems_hi = _mm_unpackhi_epi8(low, high);
 
-            // Compare > 0
             let nz_lo = _mm_cmpgt_epi8(elems_lo, zero);
             let nz_hi = _mm_cmpgt_epi8(elems_hi, zero);
 
-            // Extract 16-bit masks
             let mut m = _mm_movemask_epi8(nz_lo) as u32;
             while m != 0 {
                 let i = m.trailing_zeros() as usize;
@@ -1352,7 +1220,6 @@ unsafe fn compute_block_masks_range_sse41(
             }
         }
 
-        // Scalar remainder
         let base = chunks * 32;
         for i in 0..remainder {
             let abs_b = block_start + base + i;
