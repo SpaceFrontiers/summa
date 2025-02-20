@@ -205,6 +205,7 @@ impl Query for TermQuery {
         }
     }
 
+    #[cfg(feature = "sync")]
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
         // Build bitset from posting list: O(M) where M = matching doc count.
         // Much faster than O(N) fast-field scan for selective terms.
