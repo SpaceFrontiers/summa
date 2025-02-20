@@ -104,13 +104,21 @@ impl SegmentMerger {
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
 
-        // === All 4 phases concurrent: postings || store || dense || sparse ===
-        // Each phase reads from independent parts of source segments (SSTable,
-        // store blocks, flat vectors, sparse index) and writes to independent
-        // output files. No phase consumes another's output.
-        // tokio::try_join! interleaves I/O across the four futures on the same task.
+        // === Two-stage merge to bound page cache pressure ===
+        //
+        // Stage 1: postings + store + fast_fields (concurrent)
+        //   Touches .term_dict, .postings, .positions, .store, .fast files.
+        //
+        // Stage 2: sparse + dense vectors (concurrent)
+        //   Touches .sparse, .vectors files.
+        //
+        // Running all phases concurrently caused OOM on large merges because
+        // mmap'd source files from all 16+ segments compete for page cache
+        // simultaneously (200+ GB of mmap'd data for BMP grids alone).
+        // Two stages halve the concurrent working set.
         let merge_start = std::time::Instant::now();
 
+        // ── Stage 1: text + store + fast fields ─────────────────────────
         let postings_fut = async {
             let mut postings_writer =
                 OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
@@ -162,19 +170,27 @@ impl SegmentMerger {
             Ok::<(usize, u32), crate::Error>((bytes, store_num_docs))
         };
 
+        let fast_fut = async { self.merge_fast_fields(dir, segments, &files).await };
+
+        let (postings_result, store_result, fast_bytes) =
+            tokio::try_join!(postings_fut, store_fut, fast_fut)?;
+
+        log::info!(
+            "[merge] stage 1 done in {:.1}s (postings + store + fast)",
+            merge_start.elapsed().as_secs_f64()
+        );
+
+        // ── Stage 2: sparse + dense vectors ─────────────────────────────
+        // Page cache from stage 1 files can now be evicted by the kernel
+        // as stage 2 accesses different mmap regions (.sparse, .vectors).
+        let sparse_fut = async { self.merge_sparse_vectors(dir, segments, &files).await };
+
         let dense_fut = async {
             self.merge_dense_vectors(dir, segments, &files, trained)
                 .await
         };
 
-        let sparse_fut = async { self.merge_sparse_vectors(dir, segments, &files).await };
-
-        let fast_fut = async { self.merge_fast_fields(dir, segments, &files).await };
-
-        let (postings_result, store_result, vectors_bytes, (sparse_bytes, fast_bytes)) =
-            tokio::try_join!(postings_fut, store_fut, dense_fut, async {
-                tokio::try_join!(sparse_fut, fast_fut)
-            })?;
+        let (sparse_bytes, vectors_bytes) = tokio::try_join!(sparse_fut, dense_fut)?;
         let (store_bytes, store_num_docs) = store_result;
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
