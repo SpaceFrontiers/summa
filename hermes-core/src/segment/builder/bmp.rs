@@ -99,9 +99,10 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
 /// Build a BMP V11 blob from per-dimension postings.
 ///
-/// **Takes ownership** of the postings HashMap. Per-dim vectors are drained
-/// as they're consumed in the K-way merge, freeing memory incrementally
-/// instead of keeping the entire input alive alongside the output buffers.
+/// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
+/// out of the HashMap into `dim_vecs` before the K-way merge starts, and
+/// the HashMap shell is dropped immediately. After the merge completes,
+/// `dim_vecs` and `vid_lookup` are explicitly dropped before output write.
 ///
 /// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
 /// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
@@ -153,7 +154,12 @@ pub(crate) fn build_bmp_blob(
     //
     // Weight threshold is skipped for dims with fewer than min_terms postings
     // to protect small dimensions from losing signal.
-    let mut vid_set: FxHashSet<(DocId, u16)> = FxHashSet::default();
+    // Capacity hint: total postings is an upper bound on unique pairs (since
+    // the same (doc_id, ordinal) may appear in multiple dims). This avoids
+    // repeated FxHashSet resizing and rehashing during the dedup pass.
+    let total_postings_hint: usize = postings.values().map(|v| v.len()).sum();
+    let mut vid_set: FxHashSet<(DocId, u16)> =
+        FxHashSet::with_capacity_and_hasher(total_postings_hint, Default::default());
 
     for dim_postings in postings.values() {
         let skip_threshold = dim_postings.len() < min_terms;
@@ -395,6 +401,7 @@ pub(crate) fn build_bmp_blob(
         stream_write_grids(&grid_entries, dims as usize, num_blocks, writer)?;
     let sb_grid_offset = bytes_written + packed_bytes;
     bytes_written += packed_bytes + sb_bytes;
+    drop(grid_entries); // Free grid entries before doc_map write
 
     // Section F: doc_map_ids [u32-LE × num_virtual_docs]
     // Real entries from vid_pairs, then padding entries (u32::MAX sentinel)
@@ -417,6 +424,7 @@ pub(crate) fn build_bmp_blob(
         writer.write_u16::<LittleEndian>(0)?;
     }
     bytes_written += num_virtual_docs as u64 * 2;
+    drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
     // BMP V11 Footer (64 bytes)
     write_v11_footer(
@@ -513,9 +521,6 @@ pub(crate) fn write_v11_interleaved_sections(
     postings_flat: Vec<u8>,
     num_blocks: usize,
 ) -> std::io::Result<u64> {
-    // V11: always 4-byte dim IDs
-    let dim_id_width: usize = 4;
-
     // Pass 1: compute per-block byte sizes for block_data_starts
     let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks + 1);
     let mut cumulative: u64 = 0;
@@ -527,9 +532,9 @@ pub(crate) fn write_v11_interleaved_sections(
         if nt == 0 {
             continue;
         }
-        // num_terms(2) + dim_ids(nt × 4) + posting_starts((nt+1) × 2) + postings
         let posting_bytes = (term_posting_starts[te] - term_posting_starts[ts]) as usize * 2;
-        let block_size = 2 + nt * dim_id_width + (nt + 1) * 2 + posting_bytes;
+        // num_terms(2) + dim_ids(nt × 4) + posting_starts((nt+1) × 2) + postings
+        let block_size = 2 + nt * 4 + (nt + 1) * 2 + posting_bytes;
         cumulative += block_size as u64;
     }
     block_data_starts.push(cumulative);

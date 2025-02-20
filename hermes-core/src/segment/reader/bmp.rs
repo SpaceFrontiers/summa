@@ -497,16 +497,68 @@ impl BmpIndex {
         self.block_data_start(self.num_blocks)
     }
 
-    /// Number of superblocks in this source segment.
+    /// Raw doc_map_ids bytes (Section F). For bulk merge copy.
+    /// Layout: `[u32-LE × num_virtual_docs]`.
     #[inline]
-    pub fn num_source_superblocks(&self) -> usize {
-        self.num_superblocks as usize
+    pub fn doc_map_ids_slice(&self) -> &[u8] {
+        self.doc_map_ids_bytes.as_slice()
     }
 
-    /// Packed row size for source segment's grid.
+    /// Raw doc_map_ordinals bytes (Section G). For bulk merge copy.
+    /// Layout: `[u16-LE × num_virtual_docs]`.
     #[inline]
-    pub fn src_packed_row_size(&self) -> usize {
-        self.packed_row_size as usize
+    pub fn doc_map_ordinals_slice(&self) -> &[u8] {
+        self.doc_map_ordinals_bytes.as_slice()
+    }
+
+    /// Advise the kernel about sequential access patterns for merge.
+    ///
+    /// Hints `MADV_SEQUENTIAL` on all sections that will be read during merge.
+    /// No-op on non-native platforms.
+    #[cfg(feature = "native")]
+    pub fn madvise_sequential(&self) {
+        Self::madvise_slice(self.block_data_bytes.as_slice(), libc::MADV_SEQUENTIAL);
+        Self::madvise_slice(
+            self.block_data_starts_bytes.as_slice(),
+            libc::MADV_SEQUENTIAL,
+        );
+        Self::madvise_slice(self.grid_bytes.as_slice(), libc::MADV_SEQUENTIAL);
+        Self::madvise_slice(self.sb_grid_bytes.as_slice(), libc::MADV_SEQUENTIAL);
+        Self::madvise_slice(self.doc_map_ids_bytes.as_slice(), libc::MADV_SEQUENTIAL);
+        Self::madvise_slice(
+            self.doc_map_ordinals_bytes.as_slice(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+
+    /// Release block data pages after Phase 1 completes.
+    /// Keeps block_data_starts — needed for Phase 2 recomputation.
+    #[cfg(feature = "native")]
+    pub fn madvise_dontneed_block_data(&self) {
+        Self::madvise_slice(self.block_data_bytes.as_slice(), libc::MADV_DONTNEED);
+    }
+
+    /// Release grid pages after Phase 3+4 complete.
+    #[cfg(feature = "native")]
+    pub fn madvise_dontneed_grids(&self) {
+        Self::madvise_slice(self.grid_bytes.as_slice(), libc::MADV_DONTNEED);
+        Self::madvise_slice(self.sb_grid_bytes.as_slice(), libc::MADV_DONTNEED);
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn madvise_slice(slice: &[u8], advice: i32) {
+        if slice.is_empty() {
+            return;
+        }
+        let ptr = slice.as_ptr();
+        let len = slice.len();
+        // Align down to page boundary
+        let page_size = 4096usize;
+        let aligned_ptr = (ptr as usize) & !(page_size - 1);
+        let aligned_len = len + (ptr as usize - aligned_ptr);
+        unsafe {
+            libc::madvise(aligned_ptr as *mut libc::c_void, aligned_len, advice);
+        }
     }
 }
 
