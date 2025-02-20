@@ -346,6 +346,16 @@ impl OwnedBytes {
         &self.data.as_bytes()[self.range.clone()]
     }
 
+    /// Returns `true` if the backing store is a memory-mapped file.
+    ///
+    /// Used to guard `madvise` calls: `MADV_DONTNEED` on heap memory
+    /// zeroes pages on Linux and corrupts allocator metadata.
+    #[cfg(feature = "native")]
+    #[inline]
+    pub fn is_mmap(&self) -> bool {
+        matches!(self.data, SharedBytes::Mmap(_))
+    }
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_slice().to_vec()
     }

@@ -513,40 +513,43 @@ impl BmpIndex {
 
     /// Advise the kernel about sequential access patterns for merge.
     ///
-    /// Hints `MADV_SEQUENTIAL` on all sections that will be read during merge.
-    /// No-op on non-native platforms.
+    /// Only effective on mmap-backed data. No-op for heap (Vec) or non-native.
     #[cfg(feature = "native")]
     pub fn madvise_sequential(&self) {
-        Self::madvise_slice(self.block_data_bytes.as_slice(), libc::MADV_SEQUENTIAL);
-        Self::madvise_slice(
-            self.block_data_starts_bytes.as_slice(),
-            libc::MADV_SEQUENTIAL,
-        );
-        Self::madvise_slice(self.grid_bytes.as_slice(), libc::MADV_SEQUENTIAL);
-        Self::madvise_slice(self.sb_grid_bytes.as_slice(), libc::MADV_SEQUENTIAL);
-        Self::madvise_slice(self.doc_map_ids_bytes.as_slice(), libc::MADV_SEQUENTIAL);
-        Self::madvise_slice(
-            self.doc_map_ordinals_bytes.as_slice(),
-            libc::MADV_SEQUENTIAL,
-        );
+        Self::madvise_owned(&self.block_data_bytes, libc::MADV_SEQUENTIAL);
+        Self::madvise_owned(&self.block_data_starts_bytes, libc::MADV_SEQUENTIAL);
+        Self::madvise_owned(&self.grid_bytes, libc::MADV_SEQUENTIAL);
+        Self::madvise_owned(&self.sb_grid_bytes, libc::MADV_SEQUENTIAL);
+        Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_SEQUENTIAL);
+        Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_SEQUENTIAL);
     }
 
     /// Release block data pages after Phase 1 completes.
     /// Keeps block_data_starts — needed for Phase 2 recomputation.
     #[cfg(feature = "native")]
     pub fn madvise_dontneed_block_data(&self) {
-        Self::madvise_slice(self.block_data_bytes.as_slice(), libc::MADV_DONTNEED);
+        Self::madvise_owned(&self.block_data_bytes, libc::MADV_DONTNEED);
     }
 
     /// Release grid pages after Phase 3+4 complete.
     #[cfg(feature = "native")]
     pub fn madvise_dontneed_grids(&self) {
-        Self::madvise_slice(self.grid_bytes.as_slice(), libc::MADV_DONTNEED);
-        Self::madvise_slice(self.sb_grid_bytes.as_slice(), libc::MADV_DONTNEED);
+        Self::madvise_owned(&self.grid_bytes, libc::MADV_DONTNEED);
+        Self::madvise_owned(&self.sb_grid_bytes, libc::MADV_DONTNEED);
     }
 
+    /// Call `madvise` only when the backing store is mmap.
+    ///
+    /// `MADV_DONTNEED` on heap (Vec) memory zeroes pages on Linux and can
+    /// corrupt allocator metadata (the page-aligned pointer may reach into
+    /// malloc headers before the allocation). This caused `free(): invalid
+    /// pointer` crashes in CI where tests use RamDirectory (Vec-backed).
     #[cfg(feature = "native")]
-    pub(crate) fn madvise_slice(slice: &[u8], advice: i32) {
+    fn madvise_owned(bytes: &crate::directories::OwnedBytes, advice: i32) {
+        if !bytes.is_mmap() {
+            return;
+        }
+        let slice = bytes.as_slice();
         if slice.is_empty() {
             return;
         }
