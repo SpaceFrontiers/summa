@@ -10,12 +10,13 @@
 //!
 //! ## Memory efficiency
 //!
-//! Uses a K-way merge over per-dim cursors — **zero intermediate allocation**.
+//! Uses a K-way merge over per-dim cursors with **streaming block writes**.
 //! Each dim's postings are already sorted by `(doc_id, ordinal)` = sorted by
 //! `compact_virtual_id` = sorted by `block_id`, so a min-heap merges them in
-//! block order directly into the output arrays.
+//! block order. Each block's data is serialized and written immediately —
+//! no intermediate arrays for postings, dim_ids, or posting_starts.
 //!
-//! Peak memory: `output arrays only + O(num_dims) heap`.
+//! Peak memory: `input + grid_entries + O(num_blocks) block_data_starts`.
 //!
 //! ## V11 changes from V10
 //!
@@ -102,15 +103,19 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
 /// the HashMap shell is dropped immediately. After the merge completes,
-/// `dim_vecs` and `vid_lookup` are explicitly dropped before output write.
+/// `dim_vecs` and `vid_lookup` are explicitly dropped before grid/doc_map write.
 ///
 /// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
 /// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
 ///
-/// Uses a K-way merge over per-dim cursors to avoid flattening all postings
-/// into a single Vec + global sort. Each dim's postings are already sorted by
-/// `(doc_id, ordinal)` = sorted by `compact_virtual_id` = sorted by `block_id`.
-/// A min-heap merges them in `(block_id, dim_id)` order.
+/// **Streaming block writes**: the K-way merge writes each block's data directly
+/// to the writer as it's produced, instead of collecting all postings into
+/// intermediate arrays. This eliminates `postings_flat` (O(total_postings × 2)),
+/// `term_dim_ids` (O(total_terms × 4)), and `term_posting_starts` (O(total_terms × 4))
+/// — saving ~740 MB for 7M-doc segments with 50 dims.
+///
+/// Only `grid_entries` (O(total_terms × 12)) and `block_data_starts` (O(num_blocks × 8))
+/// are buffered for later sections.
 ///
 /// V11: block data uses u32 dim_id directly (not dim_idx). Grid has `dims` rows.
 /// num_virtual_docs is padded to block_size alignment.
@@ -256,22 +261,40 @@ pub(crate) fn build_bmp_blob(
         return Ok(0);
     }
 
-    // Output arrays — V11: term_dim_ids stores dim_id (not dim_idx)
-    let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
-    let mut term_dim_ids: Vec<u32> = Vec::new();
-    let mut term_posting_starts: Vec<u32> = Vec::new();
-    let mut postings_flat: Vec<u8> = Vec::new();
-    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new(); // (dim_id, block_id, max_impact)
-    let mut posting_count: u32 = 0;
-    let mut last_block_filled: i64 = -1; // tracks which blocks have block_term_starts entries
+    // ── Phase 2: K-way merge + streaming block write ──────────────────
+    //
+    // Write each block's data directly during the merge instead of collecting
+    // into intermediate arrays. Eliminates postings_flat (O(total_postings × 2)),
+    // term_dim_ids (O(total_terms × 4)), and term_posting_starts (O(total_terms × 4)).
+    //
+    // Only block_data_starts (O(num_blocks) = ~880 KB) and grid_entries
+    // (O(total_terms) = ~66 MB) are buffered.
+    let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks + 1);
+    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new();
+    let mut total_terms: u32 = 0;
+    let mut total_postings: u32 = 0;
+    let mut cumulative_bytes: u64 = 0;
+    let mut last_block_filled: i64 = -1;
+
+    // Per-block scratch (reused per block, bounded by one block's data ~4 KB)
+    let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut blk_dim_ids: Vec<u32> = Vec::new();
+    let mut blk_posting_counts: Vec<u16> = Vec::new();
+    let mut blk_postings: Vec<u8> = Vec::new();
 
     while let Some(&Reverse((block_id, _, _))) = heap.peek() {
-        // Fill block_term_starts for empty blocks up to and including this one
-        let fill_from = (last_block_filled + 1) as u32;
-        for _ in fill_from..=block_id {
-            block_term_starts.push(term_dim_ids.len() as u32);
+        // Fill block_data_starts for empty blocks before this one
+        for _ in (last_block_filled + 1) as u32..block_id {
+            block_data_starts.push(cumulative_bytes);
         }
+        // This block's start offset
+        block_data_starts.push(cumulative_bytes);
         last_block_filled = block_id as i64;
+
+        // Clear per-block scratch
+        blk_dim_ids.clear();
+        blk_posting_counts.clear();
+        blk_postings.clear();
 
         // Process all dims with postings in this block
         while let Some(&Reverse((bid, dim_id, dim_idx))) = heap.peek() {
@@ -285,10 +308,9 @@ pub(crate) fn build_bmp_blob(
             let mut pos = cursors[dim_idx];
             let mut max_impact = 0u8;
             let mut next_block: Option<u32> = None;
+            let mut term_posting_count: u16 = 0;
 
-            // V11: store dim_id directly (not dim_idx)
-            term_dim_ids.push(dim_id);
-            term_posting_starts.push(posting_count);
+            blk_dim_ids.push(dim_id);
 
             // Process all postings for this dim in this block
             while pos < posts.len() {
@@ -307,29 +329,30 @@ pub(crate) fn build_bmp_blob(
                 let virtual_id = vid_lookup.get((doc_id, ordinal)) as u64;
                 let bid2 = (virtual_id / bs64) as u32;
                 if bid2 != block_id {
-                    // This posting belongs to a later block — record and stop
                     next_block = Some(bid2);
                     break;
                 }
 
                 let local_slot = (virtual_id % bs64) as u8;
-                postings_flat.push(local_slot);
-                postings_flat.push(impact);
-                posting_count += 1;
+                blk_postings.push(local_slot);
+                blk_postings.push(impact);
+                term_posting_count += 1;
                 max_impact = max_impact.max(impact);
                 pos += 1;
             }
+
+            blk_posting_counts.push(term_posting_count);
+            total_postings += term_posting_count as u32;
+            total_terms += 1;
 
             // Grid entry — V11: indexed by dim_id directly
             grid_entries.push((dim_id, block_id, max_impact));
 
             // Advance cursor
             if let Some(nb) = next_block {
-                // Already found the next valid posting at `pos`
                 cursors[dim_idx] = pos;
                 heap.push(Reverse((nb, dim_id, dim_idx)));
             } else {
-                // Scan for next valid posting (skipping invalids past this block)
                 cursors[dim_idx] = pos;
                 while pos < posts.len() {
                     let (doc_id, ordinal, weight) = posts[pos];
@@ -348,18 +371,42 @@ pub(crate) fn build_bmp_blob(
                 }
             }
         }
+
+        // Serialize and write this block's data directly to writer
+        if !blk_dim_ids.is_empty() {
+            blk_buf.clear();
+            let nt = blk_dim_ids.len();
+
+            // num_terms (u16)
+            blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
+
+            // term_dim_ids [u32 × nt]
+            for &did in &blk_dim_ids {
+                blk_buf.extend_from_slice(&did.to_le_bytes());
+            }
+
+            // posting_starts [u16 × (nt + 1)] — relative cumulative
+            let mut cum: u16 = 0;
+            for &count in &blk_posting_counts {
+                blk_buf.extend_from_slice(&cum.to_le_bytes());
+                cum += count;
+            }
+            blk_buf.extend_from_slice(&cum.to_le_bytes());
+
+            // postings [(u8, u8) × total_block_postings]
+            blk_buf.extend_from_slice(&blk_postings);
+
+            writer.write_all(&blk_buf)?;
+            cumulative_bytes += blk_buf.len() as u64;
+        }
     }
 
     // Fill remaining empty blocks
     for _ in (last_block_filled + 1) as u32..num_blocks as u32 {
-        block_term_starts.push(term_dim_ids.len() as u32);
+        block_data_starts.push(cumulative_bytes);
     }
-    // Sentinels
-    block_term_starts.push(term_dim_ids.len() as u32);
-    term_posting_starts.push(posting_count);
-
-    let total_terms = term_dim_ids.len() as u32;
-    let total_postings = posting_count;
+    // Sentinel
+    block_data_starts.push(cumulative_bytes);
 
     // Sort grid entries by (dim_id, block_id) for streaming write
     grid_entries.sort_unstable();
@@ -376,25 +423,24 @@ pub(crate) fn build_bmp_blob(
         grid_entries.len(),
     );
 
-    // Free K-way merge inputs before writing output — reclaims per-dim
-    // posting Vecs and the O(1) vid lookup table.
+    // Free K-way merge inputs — reclaims per-dim posting Vecs and vid lookup.
     drop(dim_slices); // borrows dim_vecs, must drop first
     drop(dim_vecs);
     drop(vid_lookup);
 
-    // ── Write V11 interleaved sections (data-first) ──────────────────────
-    let mut bytes_written: u64 = 0;
+    // ── Write remaining sections ──────────────────────────────────────────
+    let mut bytes_written: u64 = cumulative_bytes;
 
-    // Sections B+A: block data first, then block_data_starts
-    // V11: always 4-byte dim IDs
-    bytes_written += write_v11_interleaved_sections(
-        writer,
-        block_term_starts,
-        term_dim_ids,
-        term_posting_starts,
-        postings_flat,
-        num_blocks,
-    )?;
+    // Padding to 8-byte boundary (for u64 alignment of Section A)
+    let padding = (8 - (bytes_written % 8) as usize) % 8;
+    if padding > 0 {
+        writer.write_all(&[0u8; 8][..padding])?;
+        bytes_written += padding as u64;
+    }
+
+    // Section A: block_data_starts [u64 × (num_blocks + 1)]
+    bytes_written += write_u64_slice_le(writer, &block_data_starts)?;
+    drop(block_data_starts);
 
     // Sections D+E: packed grid + sb_grid (streaming from sparse grid entries)
     // V11: `dims` rows (not num_dims)
@@ -502,100 +548,6 @@ pub(crate) fn write_u64_slice_le(writer: &mut dyn Write, data: &[u64]) -> std::i
         }
     }
     Ok(data.len() as u64 * 8)
-}
-
-/// Write V11 interleaved block data: Section B (per-block data) + padding + Section A (block_data_starts).
-///
-/// V11: always uses u32 dim_ids (no dim_id_width concept).
-///
-/// **Consumes** the intermediate arrays to free memory before writing.
-/// Uses a two-pass approach:
-///   Pass 1: compute per-block data sizes → fill `block_data_starts`
-///   Pass 2: stream each block's data directly to writer using a small reusable buffer
-///   Finally: write padding + block_data_starts
-///
-/// Returns total bytes written (sections B + padding + A).
-pub(crate) fn write_v11_interleaved_sections(
-    writer: &mut dyn Write,
-    block_term_starts: Vec<u32>,
-    term_dim_ids: Vec<u32>,
-    term_posting_starts: Vec<u32>,
-    postings_flat: Vec<u8>,
-    num_blocks: usize,
-) -> std::io::Result<u64> {
-    // Pass 1: compute per-block byte sizes for block_data_starts
-    let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks + 1);
-    let mut cumulative: u64 = 0;
-    for b in 0..num_blocks {
-        block_data_starts.push(cumulative);
-        let ts = block_term_starts[b] as usize;
-        let te = block_term_starts[b + 1] as usize;
-        let nt = te - ts;
-        if nt == 0 {
-            continue;
-        }
-        let posting_bytes = (term_posting_starts[te] - term_posting_starts[ts]) as usize * 2;
-        // num_terms(2) + dim_ids(nt × 4) + posting_starts((nt+1) × 2) + postings
-        let block_size = 2 + nt * 4 + (nt + 1) * 2 + posting_bytes;
-        cumulative += block_size as u64;
-    }
-    block_data_starts.push(cumulative);
-
-    let mut bytes_written: u64 = 0;
-
-    // Section B: stream each block's interleaved data directly to writer.
-    let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
-
-    for b in 0..num_blocks {
-        let ts = block_term_starts[b] as usize;
-        let te = block_term_starts[b + 1] as usize;
-        let nt = te - ts;
-        if nt == 0 {
-            continue;
-        }
-        blk_buf.clear();
-
-        // num_terms (u16)
-        blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
-
-        // V11: term_dim_ids — always u32
-        for &dim_id in &term_dim_ids[ts..te] {
-            blk_buf.extend_from_slice(&dim_id.to_le_bytes());
-        }
-
-        // posting_starts (u16, relative to this block)
-        let first_posting = term_posting_starts[ts];
-        for &ps in &term_posting_starts[ts..=te] {
-            let relative = (ps - first_posting) as u16;
-            blk_buf.extend_from_slice(&relative.to_le_bytes());
-        }
-
-        // postings [(u8, u8) × block_posting_count]
-        let p_start = term_posting_starts[ts] as usize * 2;
-        let p_end = term_posting_starts[te] as usize * 2;
-        blk_buf.extend_from_slice(&postings_flat[p_start..p_end]);
-
-        writer.write_all(&blk_buf)?;
-    }
-    bytes_written += cumulative;
-
-    // Inputs consumed — freed here
-    drop(block_term_starts);
-    drop(term_dim_ids);
-    drop(term_posting_starts);
-    drop(postings_flat);
-
-    // Padding to 8-byte boundary (for u64 alignment of Section A)
-    let padding = (8 - (bytes_written % 8) as usize) % 8;
-    if padding > 0 {
-        writer.write_all(&[0u8; 8][..padding])?;
-        bytes_written += padding as u64;
-    }
-
-    // Section A: block_data_starts [u64 × (num_blocks + 1)]
-    bytes_written += write_u64_slice_le(writer, &block_data_starts)?;
-
-    Ok(bytes_written)
 }
 
 /// Ceiling quantize u8 → u4. Guarantees `u4 * 17 >= original`.
