@@ -40,6 +40,7 @@ pub mod codec;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::sync::OnceLock;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -687,10 +688,8 @@ pub struct ColumnBlock {
     pub offset_data: OwnedBytes,
     /// For multi-value blocks: value sub-column.
     pub value_data: OwnedBytes,
-    /// Per-block text dictionary (text columns only).
+    /// Per-block text dictionary (text columns only). Lazy — offsets built on first access.
     pub dict: Option<TextDictReader>,
-    /// Block-local ordinal → global ordinal mapping (text columns with >1 block).
-    pub ordinal_map: Vec<u32>,
     /// Raw dictionary bytes for this block (for merge: memcpy).
     pub raw_dict: OwnedBytes,
 }
@@ -701,6 +700,10 @@ pub struct ColumnBlock {
 /// have one block; merged segments may have multiple (one per source segment).
 ///
 /// **Zero-copy**: all data is borrowed from the underlying mmap / `OwnedBytes`.
+///
+/// **Lazy text state**: for text-ordinal columns, the global merged dictionary
+/// and per-block ordinal maps are built lazily on first access (not at load time).
+/// This avoids scanning all dictionary pages from mmap during segment loading.
 pub struct FastFieldReader {
     pub column_type: FastFieldColumnType,
     pub num_docs: u32,
@@ -709,13 +712,25 @@ pub struct FastFieldReader {
     /// Blocks in doc_id order.
     blocks: Vec<ColumnBlock>,
 
-    /// Global merged text dictionary (for text_ordinal lookups and filters).
-    /// Built at open time by merging per-block dictionaries.
-    global_text_dict: Option<TextDictReader>,
+    /// Lazy-initialized text state (global dict + ordinal maps).
+    /// Built on first text-related access, not at load time.
+    text_state: OnceLock<TextState>,
+}
+
+/// Lazily-built state for text-ordinal columns.
+struct TextState {
+    /// Global merged dictionary across all blocks.
+    global_dict: TextDictReader,
+    /// Per-block ordinal maps: `ordinal_maps[block_idx][local_ord] → global_ord`.
+    /// Empty Vec for blocks without dicts or single-block columns (identity mapping).
+    ordinal_maps: Vec<Vec<u32>>,
 }
 
 impl FastFieldReader {
     /// Open a blocked column from an `OwnedBytes` file buffer using a TOC entry.
+    ///
+    /// For text-ordinal columns, dictionary scanning and global dict merging are
+    /// deferred to first access — no mmap pages are touched for dict data here.
     pub fn open(file_data: &OwnedBytes, toc: &FastFieldTocEntry) -> io::Result<Self> {
         let region_start = toc.data_offset as usize;
         let region_end = region_start + toc.data_len as usize;
@@ -802,13 +817,12 @@ impl FastFieldReader {
                 )
             };
 
-            // Parse block dict
+            // Create lazy block dict — no scanning, just stores the data slice + count
             let dict = if entry.dict_count > 0 {
-                Some(TextDictReader::open(
-                    file_data,
-                    dict_start,
+                Some(TextDictReader::new_lazy(
+                    file_data.slice(dict_start..dict_end),
                     entry.dict_count,
-                )?)
+                ))
             } else {
                 None
             };
@@ -826,7 +840,6 @@ impl FastFieldReader {
                 offset_data,
                 value_data,
                 dict,
-                ordinal_map: Vec::new(),
                 raw_dict,
             });
 
@@ -834,49 +847,50 @@ impl FastFieldReader {
             pos = dict_end;
         }
 
-        // Build global text dictionary for multi-block text columns
-        let global_text_dict = if toc.column_type == FastFieldColumnType::TextOrdinal {
-            Some(Self::build_global_text_dict(&mut blocks)?)
-        } else {
-            None
-        };
-
         Ok(Self {
             column_type: toc.column_type,
             num_docs: toc.num_docs,
             multi: toc.multi,
             blocks,
-            global_text_dict,
+            text_state: OnceLock::new(),
         })
     }
 
-    /// Build a global merged dictionary from all per-block dictionaries.
-    /// Also populates `ordinal_map` on each block (block-local → global ordinal).
-    fn build_global_text_dict(blocks: &mut [ColumnBlock]) -> io::Result<TextDictReader> {
+    /// Lazily initialize and return the text state (global dict + ordinal maps).
+    /// Only called for text-ordinal columns.
+    fn ensure_text_state(&self) -> &TextState {
+        self.text_state
+            .get_or_init(|| Self::build_text_state(&self.blocks))
+    }
+
+    /// Build text state: global merged dictionary + per-block ordinal maps.
+    /// Called lazily on first text-related access (not at segment load time).
+    fn build_text_state(blocks: &[ColumnBlock]) -> TextState {
         // Fast path: single block → block-local ordinals ARE global ordinals.
         // No merging, no cloning, no ordinal map needed.
         let blocks_with_dict = blocks.iter().filter(|b| b.dict.is_some()).count();
         if blocks_with_dict <= 1 {
-            // Find the one block with a dict (if any) and clone its raw dict bytes
             for block in blocks.iter() {
                 if let Some(ref dict) = block.dict {
                     // Re-use the existing dict — no ordinal_map needed (identity mapping)
-                    return TextDictReader::open_from_raw(&block.raw_dict, dict.len());
+                    return TextState {
+                        global_dict: TextDictReader::new_lazy(block.raw_dict.clone(), dict.len()),
+                        ordinal_maps: vec![Vec::new(); blocks.len()],
+                    };
                 }
             }
             // No blocks have dicts — return empty
-            let empty = OwnedBytes::new(Vec::new());
-            return TextDictReader::open(&empty, 0, 0);
+            return TextState {
+                global_dict: TextDictReader::new_lazy(OwnedBytes::new(Vec::new()), 0),
+                ordinal_maps: vec![Vec::new(); blocks.len()],
+            };
         }
 
         // Multi-block: merge sorted block dictionaries.
         // Each block dict is already sorted, so we k-way merge in O(total_entries).
         // Uses a BTreeMap to deduplicate and assign global ordinals.
-        use std::collections::BTreeMap;
 
         // Phase 1: Collect unique strings → assign global ordinals.
-        // We clone into BTreeMap<String, u32> to own the data (avoids borrow conflict
-        // with Phase 2 which needs &mut blocks).
         //
         // BTreeMap is sorted by key, so ordinals assigned by iterating values_mut()
         // match the order that Phase 3 writes the dictionary (also key-sorted).
@@ -898,32 +912,22 @@ impl FastFieldReader {
         }
 
         // Phase 2: Build per-block ordinal maps
-        for block in blocks.iter_mut() {
+        let mut ordinal_maps = Vec::with_capacity(blocks.len());
+        for block in blocks.iter() {
             if let Some(ref dict) = block.dict {
                 let mut map = Vec::with_capacity(dict.len() as usize);
                 for local_ord in 0..dict.len() {
-                    let text = dict.get(local_ord).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "block dict ordinal {} out of range (dict len {})",
-                                local_ord,
-                                dict.len()
-                            ),
-                        )
-                    })?;
-                    let global_ord = *unique_map.get(text).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "block dict entry {:?} not found in merged global dict",
-                                text
-                            ),
-                        )
-                    })?;
+                    let text = dict
+                        .get(local_ord)
+                        .expect("block dict ordinal out of range");
+                    let global_ord = *unique_map
+                        .get(text)
+                        .expect("block dict entry not found in merged global dict");
                     map.push(global_ord);
                 }
-                block.ordinal_map = map;
+                ordinal_maps.push(map);
+            } else {
+                ordinal_maps.push(Vec::new());
             }
         }
 
@@ -932,27 +936,35 @@ impl FastFieldReader {
         let count = unique_map.len() as u32;
         for s in unique_map.keys() {
             let bytes = s.as_bytes();
-            dict_buf.write_u32::<LittleEndian>(bytes.len() as u32)?;
+            dict_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             dict_buf.extend_from_slice(bytes);
         }
-        let dict_data = OwnedBytes::new(dict_buf);
-        TextDictReader::open(&dict_data, 0, count)
+
+        TextState {
+            global_dict: TextDictReader::new_lazy(OwnedBytes::new(dict_buf), count),
+            ordinal_maps,
+        }
     }
 
-    /// Remap a block-local raw ordinal to a global ordinal using the block's ordinal_map.
-    /// Returns raw unchanged for non-text columns, missing ordinals, or if no map exists.
+    /// Remap a block-local raw ordinal to a global ordinal using the ordinal map.
+    /// Returns raw unchanged for non-text columns, single-block columns, or missing ordinals.
     #[inline]
-    fn remap_ordinal(&self, block: &ColumnBlock, raw: u64) -> u64 {
+    fn remap_ordinal(&self, block_idx: usize, raw: u64) -> u64 {
         if self.column_type == FastFieldColumnType::TextOrdinal
             && raw != FAST_FIELD_MISSING
-            && !block.ordinal_map.is_empty()
+            && self.blocks.len() > 1
         {
-            let idx = raw as usize;
-            if idx < block.ordinal_map.len() {
-                block.ordinal_map[idx] as u64
+            let state = self.ensure_text_state();
+            let map = &state.ordinal_maps[block_idx];
+            if !map.is_empty() {
+                let idx = raw as usize;
+                if idx < map.len() {
+                    map[idx] as u64
+                } else {
+                    FAST_FIELD_MISSING
+                }
             } else {
-                // Corrupt ordinal — treat as missing
-                FAST_FIELD_MISSING
+                raw
             }
         } else {
             raw
@@ -997,11 +1009,11 @@ impl FastFieldReader {
                 return FAST_FIELD_MISSING;
             }
             let raw = codec::auto_read(block.value_data.as_slice(), start as usize);
-            return self.remap_ordinal(block, raw);
+            return self.remap_ordinal(bi, raw);
         }
 
         let raw = codec::auto_read(block.data.as_slice(), local as usize);
-        self.remap_ordinal(block, raw)
+        self.remap_ordinal(bi, raw)
     }
 
     /// Get the value range for a multi-valued column within its block.
@@ -1034,7 +1046,7 @@ impl FastFieldReader {
         // For single-block (common case), delegate directly
         if self.blocks.len() == 1 {
             let raw = codec::auto_read(self.blocks[0].value_data.as_slice(), index as usize);
-            return self.remap_ordinal(&self.blocks[0], raw);
+            return self.remap_ordinal(0, raw);
         }
         // Multi-block fallback — index is block-local, caller should use get_multi_values
         0
@@ -1050,7 +1062,7 @@ impl FastFieldReader {
         (start..end)
             .map(|idx| {
                 let raw = codec::auto_read(block.value_data.as_slice(), idx as usize);
-                self.remap_ordinal(block, raw)
+                self.remap_ordinal(bi, raw)
             })
             .collect()
     }
@@ -1066,7 +1078,7 @@ impl FastFieldReader {
         let block = &self.blocks[bi];
         for idx in start..end {
             let raw = codec::auto_read(block.value_data.as_slice(), idx as usize);
-            if f(self.remap_ordinal(block, raw)) {
+            if f(self.remap_ordinal(bi, raw)) {
                 return true;
             }
         }
@@ -1085,21 +1097,34 @@ impl FastFieldReader {
         }
         const BATCH: usize = 256;
         let mut buf = [0u64; BATCH];
-        let needs_remap = self.column_type == FastFieldColumnType::TextOrdinal;
+        let needs_remap =
+            self.column_type == FastFieldColumnType::TextOrdinal && self.blocks.len() > 1;
 
-        for block in &self.blocks {
+        // Pre-fetch ordinal maps once (only for multi-block text columns)
+        let ordinal_maps = if needs_remap {
+            Some(&self.ensure_text_state().ordinal_maps)
+        } else {
+            None
+        };
+
+        for (block_idx, block) in self.blocks.iter().enumerate() {
             let n = block.num_docs as usize;
             let mut pos = 0;
+
+            let map = ordinal_maps.map(|maps| &maps[block_idx]);
+            let has_map = map.is_some_and(|m| !m.is_empty());
+
             while pos < n {
                 let chunk = (n - pos).min(BATCH);
                 codec::auto_read_batch(block.data.as_slice(), pos, &mut buf[..chunk]);
 
-                if needs_remap && !block.ordinal_map.is_empty() {
+                if has_map {
+                    let map = map.unwrap();
                     for (i, &raw) in buf[..chunk].iter().enumerate() {
                         let val = if raw != FAST_FIELD_MISSING {
                             let idx = raw as usize;
-                            if idx < block.ordinal_map.len() {
-                                block.ordinal_map[idx] as u64
+                            if idx < map.len() {
+                                map[idx] as u64
                             } else {
                                 FAST_FIELD_MISSING
                             }
@@ -1181,12 +1206,18 @@ impl FastFieldReader {
 
     /// Look up text string → global ordinal. Returns None if not found.
     pub fn text_ordinal(&self, text: &str) -> Option<u64> {
-        self.global_text_dict.as_ref().and_then(|d| d.ordinal(text))
+        if self.column_type != FastFieldColumnType::TextOrdinal {
+            return None;
+        }
+        self.ensure_text_state().global_dict.ordinal(text)
     }
 
     /// Access the global text dictionary reader (if this is a text column).
     pub fn text_dict(&self) -> Option<&TextDictReader> {
-        self.global_text_dict.as_ref()
+        if self.column_type != FastFieldColumnType::TextOrdinal {
+            return None;
+        }
+        Some(&self.ensure_text_state().global_dict)
     }
 
     /// Number of blocks in this column.
@@ -1205,23 +1236,37 @@ impl FastFieldReader {
 /// Sorted dictionary for text ordinal columns.
 ///
 /// **Zero-copy**: the dictionary data is a shared slice of the `.fast` file.
-/// An offset table (one u32 per entry) is built at open time so that
-/// individual strings can be accessed without scanning.
+/// **Lazy**: the offset table is built on first access (not at load time),
+/// avoiding mmap page faults during segment loading.
 pub struct TextDictReader {
     /// The raw dictionary bytes from the `.fast` file (zero-copy).
     data: OwnedBytes,
-    /// Per-entry (offset, len) pairs into `data` — built at open time.
-    offsets: Vec<(u32, u32)>,
+    /// Number of entries in this dictionary.
+    count: u32,
+    /// Per-entry (offset, len) pairs into `data` — built lazily on first access.
+    offsets: OnceLock<Vec<(u32, u32)>>,
 }
 
 impl TextDictReader {
+    /// Create a lazy text dictionary from pre-sliced data.
+    /// No scanning is performed — offsets are built on first `get()`/`ordinal()` call.
+    pub fn new_lazy(data: OwnedBytes, count: u32) -> Self {
+        Self {
+            data,
+            count,
+            offsets: OnceLock::new(),
+        }
+    }
+
     /// Open a zero-copy text dictionary from `file_data` starting at `dict_start`.
+    /// Scans to find the dict end position for slicing, but defers offset building.
     pub fn open(file_data: &OwnedBytes, dict_start: usize, count: u32) -> io::Result<Self> {
-        // First pass: scan len-prefixed entries to build offset table
+        if count == 0 {
+            return Ok(Self::new_lazy(OwnedBytes::new(Vec::new()), 0));
+        }
+        // Scan to find end position (need to know the slice range)
         let dict_slice = file_data.as_slice();
         let mut pos = dict_start;
-        let mut offsets = Vec::with_capacity(count as usize);
-
         for _ in 0..count {
             if pos + 4 > dict_slice.len() {
                 return Err(io::Error::new(
@@ -1229,12 +1274,7 @@ impl TextDictReader {
                     "text dict truncated",
                 ));
             }
-            let len = u32::from_le_bytes([
-                dict_slice[pos],
-                dict_slice[pos + 1],
-                dict_slice[pos + 2],
-                dict_slice[pos + 3],
-            ]) as usize;
+            let len = u32::from_le_bytes(dict_slice[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             if pos + len > dict_slice.len() {
                 return Err(io::Error::new(
@@ -1242,47 +1282,56 @@ impl TextDictReader {
                     "text dict entry truncated",
                 ));
             }
-            // UTF-8 validated in debug builds only — data is written by our own builder
-            debug_assert!(
-                std::str::from_utf8(&dict_slice[pos..pos + len]).is_ok(),
-                "corrupt text dict entry at offset {}",
-                pos,
-            );
-            offsets.push((pos as u32, len as u32));
             pos += len;
         }
-
-        // Slice the full dict region (dict_start..pos) zero-copy
         let data = file_data.slice(dict_start..pos);
-
-        // Adjust offsets to be relative to `data` (subtract dict_start)
-        for entry in offsets.iter_mut() {
-            entry.0 -= dict_start as u32;
-        }
-
-        Ok(Self { data, offsets })
+        Ok(Self::new_lazy(data, count))
     }
 
     /// Open from raw dict bytes (already length-prefixed entries).
-    /// Used for single-block fast path where no merging is needed.
     pub fn open_from_raw(raw_dict: &OwnedBytes, count: u32) -> io::Result<Self> {
-        Self::open(raw_dict, 0, count)
+        Ok(Self::new_lazy(raw_dict.clone(), count))
+    }
+
+    /// Build offset table lazily on first access.
+    #[inline]
+    fn ensure_offsets(&self) -> &[(u32, u32)] {
+        self.offsets.get_or_init(|| {
+            let dict_slice = self.data.as_slice();
+            let mut pos = 0usize;
+            let mut offsets = Vec::with_capacity(self.count as usize);
+            for _ in 0..self.count {
+                debug_assert!(
+                    pos + 4 <= dict_slice.len(),
+                    "text dict truncated during lazy init"
+                );
+                let len = u32::from_le_bytes(dict_slice[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                debug_assert!(
+                    pos + len <= dict_slice.len(),
+                    "text dict entry truncated during lazy init"
+                );
+                offsets.push((pos as u32, len as u32));
+                pos += len;
+            }
+            offsets
+        })
     }
 
     /// Get string by ordinal — zero-copy borrow from the underlying file data.
     pub fn get(&self, ordinal: u32) -> Option<&str> {
-        let &(off, len) = self.offsets.get(ordinal as usize)?;
+        let offsets = self.ensure_offsets();
+        let &(off, len) = offsets.get(ordinal as usize)?;
         let slice = &self.data.as_slice()[off as usize..off as usize + len as usize];
-        // Safety: we validated UTF-8 in open()
         Some(unsafe { std::str::from_utf8_unchecked(slice) })
     }
 
     /// Binary search for a string → ordinal.
     pub fn ordinal(&self, text: &str) -> Option<u64> {
-        self.offsets
+        let offsets = self.ensure_offsets();
+        offsets
             .binary_search_by(|&(off, len)| {
                 let slice = &self.data.as_slice()[off as usize..off as usize + len as usize];
-                // Safety: validated UTF-8 in open()
                 let entry = unsafe { std::str::from_utf8_unchecked(slice) };
                 entry.cmp(text)
             })
@@ -1292,17 +1341,18 @@ impl TextDictReader {
 
     /// Number of entries in the dictionary.
     pub fn len(&self) -> u32 {
-        self.offsets.len() as u32
+        self.count
     }
 
     /// Whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.count == 0
     }
 
     /// Iterate all entries.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.offsets.iter().map(|&(off, len)| {
+        let offsets = self.ensure_offsets();
+        offsets.iter().map(|&(off, len)| {
             let slice = &self.data.as_slice()[off as usize..off as usize + len as usize];
             unsafe { std::str::from_utf8_unchecked(slice) }
         })
