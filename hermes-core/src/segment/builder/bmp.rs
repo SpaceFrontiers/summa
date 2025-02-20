@@ -154,12 +154,14 @@ pub(crate) fn build_bmp_blob(
     //
     // Weight threshold is skipped for dims with fewer than min_terms postings
     // to protect small dimensions from losing signal.
-    // Capacity hint: total postings is an upper bound on unique pairs (since
-    // the same (doc_id, ordinal) may appear in multiple dims). This avoids
-    // repeated FxHashSet resizing and rehashing during the dedup pass.
-    let total_postings_hint: usize = postings.values().map(|v| v.len()).sum();
+    //
+    // Capacity: use the LARGEST single dim's posting count as a lower bound on
+    // unique pairs (each doc appears at least once). This avoids the old bug
+    // of pre-allocating for total_postings (50× larger than unique pairs when
+    // docs appear in ~50 dims), which wasted GBs of heap.
+    let max_dim_postings: usize = postings.values().map(|v| v.len()).max().unwrap_or(0);
     let mut vid_set: FxHashSet<(DocId, u16)> =
-        FxHashSet::with_capacity_and_hasher(total_postings_hint, Default::default());
+        FxHashSet::with_capacity_and_hasher(max_dim_postings, Default::default());
 
     for dim_postings in postings.values() {
         let skip_threshold = dim_postings.len() < min_terms;
