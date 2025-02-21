@@ -731,3 +731,221 @@ async fn test_bmp_multi_round_merge() {
         results.len()
     );
 }
+
+/// BMP SimHash reorder: verify correctness after merge with SimHash block reordering.
+///
+/// Builds multiple segments with `simhash=true`, force_merges (triggering block
+/// reordering by SimHash similarity), and verifies every document is still findable
+/// by its unique dimension.
+#[tokio::test]
+async fn test_bmp_simhash_reorder_merge() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_simhash(sparse, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    const DOCS_PER_SEG: usize = 100;
+    const NUM_SEGS: usize = 5;
+
+    // Each doc gets a unique dim plus a shared dim 9999
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let mut doc = Document::new();
+            doc.add_text(title, format!("seg{} doc{}", seg, i));
+            // Multiple dims per doc so SimHash has something to differentiate
+            let topic_dim = 10000 + (seg as u32 * 100);
+            doc.add_sparse_vector(
+                sparse,
+                vec![(unique_dim, 1.0), (9999, 0.1), (topic_dim, 0.5)],
+            );
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    // Verify pre-merge: should have 5 segments
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert!(
+        segments.len() >= 5,
+        "Should have >= 5 segments before merge"
+    );
+
+    // Force merge — triggers SimHash block reordering
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(
+        index.num_docs().await.unwrap() as usize,
+        DOCS_PER_SEG * NUM_SEGS
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Query each unique dim — must return exactly the right doc
+    let mut failures = Vec::new();
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let expected_title = format!("seg{} doc{}", seg, i);
+            let query = SparseVectorQuery::new(sparse, vec![(unique_dim, 1.0)]);
+            let results = searcher.search(&query, 5).await.unwrap();
+            if results.len() != 1 {
+                failures.push(format!(
+                    "dim {}: expected 1 result, got {}",
+                    unique_dim,
+                    results.len()
+                ));
+                continue;
+            }
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got_title = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+            if got_title != expected_title {
+                failures.push(format!(
+                    "dim {}: got '{}', expected '{}'",
+                    unique_dim, got_title, expected_title
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "SimHash reorder merge: {} failures:\n{}",
+        failures.len(),
+        failures[..failures.len().min(20)].join("\n")
+    );
+
+    // Query shared dim 9999 — should match all docs
+    let query = SparseVectorQuery::new(sparse, vec![(9999, 1.0)]);
+    let results = searcher.search(&query, 600).await.unwrap();
+    assert_eq!(
+        results.len(),
+        DOCS_PER_SEG * NUM_SEGS,
+        "SimHash reorder: dim 9999 should match all {} docs, got {}",
+        DOCS_PER_SEG * NUM_SEGS,
+        results.len()
+    );
+}
+
+/// BMP SimHash reorder: stress test with many blocks and multi-segment merge.
+///
+/// Uses enough documents to span many superblocks (>64 blocks), with varied
+/// topic distributions to trigger aggressive reordering.
+#[tokio::test]
+async fn test_bmp_simhash_reorder_large() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_simhash(sparse, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // 3 segments × 500 docs = 1500 docs → ~24 blocks → spans multiple superblocks
+    const DOCS_PER_SEG: usize = 500;
+    const NUM_SEGS: usize = 3;
+
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            // Assign docs to different "topics" — each topic cluster shares dims
+            let topic = i / 50;
+            let topic_dim = 20000 + (topic as u32 * 10);
+            let topic_dim2 = 20001 + (topic as u32 * 10);
+            let mut doc = Document::new();
+            doc.add_text(title, format!("s{}d{}", seg, i));
+            doc.add_sparse_vector(
+                sparse,
+                vec![
+                    (unique_dim, 1.0),
+                    (9999, 0.1),
+                    (topic_dim, 0.8),
+                    (topic_dim2, 0.5),
+                ],
+            );
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    // Force merge with SimHash reordering
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Verify every doc by its unique dim
+    let mut failures = Vec::new();
+    for seg in 0..NUM_SEGS {
+        for i in 0..DOCS_PER_SEG {
+            let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
+            let expected = format!("s{}d{}", seg, i);
+            let query = SparseVectorQuery::new(sparse, vec![(unique_dim, 1.0)]);
+            let results = searcher.search(&query, 5).await.unwrap();
+            if results.len() != 1 {
+                failures.push(format!(
+                    "dim {}: expected 1 result, got {}",
+                    unique_dim,
+                    results.len()
+                ));
+                continue;
+            }
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+            if got != expected {
+                failures.push(format!(
+                    "dim {}: got '{}', expected '{}'",
+                    unique_dim, got, expected
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "SimHash reorder large: {} failures (of {}):\n{}",
+        failures.len(),
+        DOCS_PER_SEG * NUM_SEGS,
+        failures[..failures.len().min(30)].join("\n")
+    );
+
+    // Topic query should match docs from that topic across all segments
+    let query = SparseVectorQuery::new(sparse, vec![(20000, 1.0), (20001, 0.5)]);
+    let results = searcher.search(&query, 200).await.unwrap();
+    // Topic 0: docs 0-49 from each segment = 150 docs
+    assert!(
+        results.len() >= 100,
+        "Topic query should match >=100 docs, got {}",
+        results.len()
+    );
+}

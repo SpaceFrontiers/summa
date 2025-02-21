@@ -132,8 +132,9 @@ thread_local! {
 /// Execute a BMP query against the given index.
 ///
 /// Returns top-k results sorted by score descending.
-/// Scores are computed over compact virtual documents, then mapped back to
-/// real (doc_id, ordinal) pairs via the doc_map lookup table.
+/// Scores are computed over compact virtual documents and resolved to real
+/// (doc_id, ordinal) pairs at collection time. The caller's `combine_ordinal_results`
+/// handles multi-ordinal grouping via the configured combiner.
 ///
 /// Uses superblock pruning: computes coarse UBs over groups of 64 blocks,
 /// prunes entire superblocks, then scores only surviving blocks.
@@ -249,6 +250,17 @@ fn execute_bmp_inner(
         })
         .collect();
 
+    // Over-fetch for multi-ordinal: each real doc may occupy multiple collector
+    // slots (one per ordinal). Inflate collector so combine_ordinal_results has
+    // enough unique docs after grouping. Cap at 10× to avoid degenerate cases
+    // (e.g., 200 ordinals/doc). For single-ordinal, collector_k == k (no overhead).
+    let ordinals_per_doc = if index.num_real_docs() > 0 {
+        (index.num_virtual_docs as f32 / index.num_real_docs() as f32).ceil() as usize
+    } else {
+        1
+    };
+    let collector_k = (k * ordinals_per_doc).min(k * 10);
+
     let t_start = std::time::Instant::now();
 
     let result = BMP_SCRATCH.with(|cell| {
@@ -319,7 +331,7 @@ fn execute_bmp_inner(
         // Phase 3: Score superblocks in UB-descending order
         let mut blocks_scored = 0u32;
         let mut sbs_scored = 0u32;
-        let mut collector = ScoreCollector::new(k);
+        let mut collector = ScoreCollector::new(collector_k);
 
         for (idx, &sb_id) in scratch.sb_order.iter().enumerate() {
             // LSP/0: hard cap on superblock visits
@@ -329,7 +341,7 @@ fn execute_bmp_inner(
 
             let sb_ub = scratch.sb_ubs[sb_id as usize];
             // Threshold pruning still applies within the cap
-            if collector.len() >= k && sb_ub * alpha <= collector.threshold() {
+            if collector.len() >= collector_k && sb_ub * alpha <= collector.threshold() {
                 break;
             }
 
@@ -381,7 +393,7 @@ fn execute_bmp_inner(
                 &query_by_dim_u16,
                 dequant,
                 alpha,
-                k,
+                collector_k,
                 &predicate,
                 &mut collector,
                 &mut blocks_scored,
@@ -429,16 +441,8 @@ fn execute_bmp_inner(
         collector_to_results(collector)
     });
 
-    let mut results = result;
-
-    // ── Phase 4: Map compact virtual_ids back to (doc_id, ordinal) ────
-    for r in &mut results {
-        let (doc_id, ordinal) = index.virtual_to_doc(r.doc_id);
-        r.doc_id = doc_id;
-        r.ordinal = ordinal;
-    }
-
-    Ok(results)
+    // Collector already contains real doc_ids and ordinals (deduped at collection time).
+    Ok(result)
 }
 
 // ============================================================================
@@ -456,7 +460,7 @@ fn execute_bmp_inner(
 /// the same ~200-2000 byte region (1-2 pages). Binary search and posting reads
 /// touch only this contiguous region.
 ///
-/// Tracks touched slots via a u64 bitmask (works for block_size ≤ 64).
+/// Tracks touched slots via a `[u64; 4]` bitmask (works for block_size ≤ 256).
 /// Caller uses the bitmask for lazy accumulator zeroing.
 ///
 /// Complexity: O(|present_query_dims| × log|block_terms|) per block.
@@ -470,7 +474,7 @@ fn score_block_bsearch_int(
     query_by_dim_u16: &[(u32, u16)],
     block_mask: u64,
     acc: &mut [u32],
-    touched: &mut u64,
+    touched: &mut [u64; 4],
 ) {
     for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
         // Bitmask skip: if this query dim has zero max in this block, skip
@@ -486,7 +490,7 @@ fn score_block_bsearch_int(
                 unsafe {
                     *acc.get_unchecked_mut(slot) += w as u32 * p.impact as u32;
                 }
-                *touched |= 1u64 << slot;
+                touched[slot / 64] |= 1u64 << (slot % 64);
             }
         }
     }
@@ -547,25 +551,25 @@ fn score_superblock_blocks(
         let block_id = (block_start + local_idx as usize) as u32;
 
         // Lazy per-block predicate bitmask: only evaluated for blocks that survive
-        // UB pruning. For each of the block's 64 slots, check the predicate.
-        // If pred_mask == 0, skip the entire block (no scoring needed).
-        // Cost: block_size predicate evaluations per block (~64 × ~30ns = ~2μs).
-        let pred_mask: u64 = if let Some(pred) = predicate {
+        // UB pruning. For each slot, check the predicate.
+        // If all words are 0, skip the entire block (no scoring needed).
+        // Cost: block_size predicate evaluations per block.
+        let pred_mask: [u64; 4] = if let Some(pred) = predicate {
             let base = block_id as usize * block_size;
             let end = (base + block_size).min(num_vdocs_total);
-            let mut mask: u64 = 0;
+            let mut mask = [0u64; 4];
             for slot in 0..(end - base) {
                 let doc_id = index.doc_id_for_virtual((base + slot) as u32);
                 if doc_id != u32::MAX && pred(doc_id) {
-                    mask |= 1u64 << slot;
+                    mask[slot / 64] |= 1u64 << (slot % 64);
                 }
             }
-            if mask == 0 {
+            if mask == [0u64; 4] {
                 continue; // skip scoring entirely — no matching docs
             }
             mask
         } else {
-            u64::MAX
+            [u64::MAX; 4]
         };
 
         // Level 3: Two-deep data prefetch (N+1 and N+2 block data).
@@ -586,7 +590,7 @@ fn score_superblock_blocks(
 
         let (num_terms, dim_ptr, ps_ptr, post_ptr) = index.parse_block(block_id);
         let mask = local_masks[local_idx as usize];
-        let mut touched: u64 = 0;
+        let mut touched = [0u64; 4];
         if num_terms > 0 {
             score_block_bsearch_int(
                 num_terms,
@@ -602,39 +606,50 @@ fn score_superblock_blocks(
 
         // Collect results + lazy zeroing.
         // Split into collect (touched & pred_mask) and reject (touched & !pred_mask).
-        // The reject pass only zeros accumulators. When no predicate, pred_mask = u64::MAX
-        // so collect_scan == touched and reject == 0 (zero overhead).
-        let base = block_id * index.bmp_block_size;
-        let num_vdocs = index.num_virtual_docs;
-        let collect_scan = touched & pred_mask;
+        // When no predicate, pred_mask = [u64::MAX; 4] so reject is all zeros.
+        //
+        // Resolve virtual → real (doc_id, ordinal) inline and insert with real
+        // doc_id. The combine_ordinal_results layer handles multi-ordinal grouping.
+        let base = block_id as usize * block_size;
+        let num_vdocs = index.num_virtual_docs as usize;
 
-        // Zero rejected slots (touched but filtered out by predicate)
-        {
-            let mut reject = touched & !pred_mask;
+        for word in 0..4 {
+            // Zero rejected slots (touched but filtered out by predicate)
+            let mut reject = touched[word] & !pred_mask[word];
             while reject != 0 {
-                let i = reject.trailing_zeros() as usize;
+                let bit = reject.trailing_zeros() as usize;
                 reject &= reject - 1;
-                acc[i] = 0;
+                acc[word * 64 + bit] = 0;
             }
-        }
 
-        // Collect matching slots: dequantize u32 → f32, clear, insert
-        let mut scan = collect_scan;
-        while scan != 0 {
-            let i = scan.trailing_zeros() as usize;
-            scan &= scan - 1;
-            let score_u32 = acc[i];
-            acc[i] = 0;
-            if score_u32 > 0 {
-                let virtual_id = base + i as u32;
-                if virtual_id < num_vdocs {
-                    let score = score_u32 as f32 * dequant;
-                    if collector.would_enter(score) {
-                        collector.insert_with_ordinal(virtual_id, score, 0);
-                    }
+            // Collect matching slots
+            let mut scan = touched[word] & pred_mask[word];
+            while scan != 0 {
+                let bit = scan.trailing_zeros() as usize;
+                scan &= scan - 1;
+                let i = word * 64 + bit;
+                let score_u32 = acc[i];
+                acc[i] = 0;
+                if score_u32 == 0 {
+                    continue;
+                }
+
+                let virtual_id = base + i;
+                if virtual_id >= num_vdocs {
+                    continue;
+                }
+                let (doc_id, ordinal) = index.virtual_to_doc(virtual_id as u32);
+                if doc_id == u32::MAX {
+                    continue;
+                }
+
+                let score = score_u32 as f32 * dequant;
+                if collector.would_enter(score) {
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
                 }
             }
         }
+
         *blocks_scored += 1;
     }
 }
