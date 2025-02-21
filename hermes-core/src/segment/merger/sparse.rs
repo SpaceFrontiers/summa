@@ -106,9 +106,15 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
+                    let simhash_reorder = self
+                        .schema
+                        .get_field_entry(*field)
+                        .is_some_and(|e| e.simhash);
                     merge_bmp_field(
                         &bmp_indexes,
+                        segments,
                         &doc_offs,
+                        simhash_reorder,
                         field.0,
                         quantization,
                         dims,
@@ -306,8 +312,12 @@ impl SegmentMerger {
 /// V11 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
 /// and `max_weight_scale`, so blocks are self-contained and can be copied directly.
 ///
+/// When `simhash_reorder` is true and source segments have the simhash fast field,
+/// blocks are reordered by SimHash similarity before merging. This clusters similar
+/// documents within the same superblocks, dramatically improving superblock pruning.
+///
 /// Phases:
-/// 1. Stream Section B (block data) — chunked file-to-file copy from source mmaps
+/// 1. Stream Section B (block data) — chunked copy (sequential or permuted)
 /// 2. Write padding + Section A (block_data_starts) — recomputed on-the-fly
 /// 3. Stream Section D (packed_grid) — one row at a time
 /// 4. Write Section E (sb_grid) — one row at a time
@@ -315,10 +325,13 @@ impl SegmentMerger {
 /// 6. Write V11 footer (64 bytes)
 ///
 /// Peak memory: row_buf (~4 MB) + sb_row (~120 KB) + id_buf (256 KB) + tiny Vecs.
+/// Reordering adds ~12 bytes/block for permutation tables.
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
+    segments: &[SegmentReader],
     doc_offs: &[u32],
+    simhash_reorder: bool,
     field_id: u32,
     quantization: crate::structures::WeightQuantization,
     dims: u32,
@@ -344,6 +357,13 @@ fn merge_bmp_field(
     if sources.is_empty() {
         return Ok(());
     }
+
+    // Map from source index → original segment index (for fast field lookup)
+    let source_seg_idx: Vec<usize> = bmp_indexes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, opt)| if opt.is_some() { Some(i) } else { None })
+        .collect();
 
     // ── Phase 0: Validate all sources share dims, block_size, max_weight_scale ──
     let mut total_source_blocks: u32 = 0;
@@ -382,15 +402,110 @@ fn merge_bmp_field(
     let packed_row_size = num_blocks.div_ceil(2);
     let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
+    // Pre-compute aggregate stats (needed for footer, independent of block order)
+    let mut total_terms: u32 = 0;
+    let mut total_postings: u32 = 0;
+    for &(bmp, _) in &sources {
+        total_terms += bmp.total_terms() as u32;
+        total_postings += bmp.total_postings() as u32;
+    }
+    if total_terms == 0 {
+        return Ok(());
+    }
+
+    // Pre-compute per-source block offsets (first global block id for each source)
+    let mut block_offsets: Vec<u32> = Vec::with_capacity(sources.len());
+    {
+        let mut cumulative: u32 = 0;
+        for &(bmp, _) in &sources {
+            block_offsets.push(cumulative);
+            cumulative += bmp.num_blocks;
+        }
+    }
+
+    // ── Block-reordering via SimHash ────────────────────────────────────
+    // Build block_source_map and compute permutation if simhash is available.
+    let block_source_map: Vec<(usize, u32)> = {
+        let mut map = Vec::with_capacity(num_blocks);
+        for (src_i, &(bmp, _)) in sources.iter().enumerate() {
+            for local in 0..bmp.num_blocks {
+                map.push((src_i, local));
+            }
+        }
+        map
+    };
+
+    let permutation: Option<(Vec<u32>, Vec<u32>)> = if simhash_reorder {
+        // Check if any source segment has simhash data for this field
+        let has_simhash = source_seg_idx
+            .iter()
+            .any(|&si| segments[si].fast_field(field_id).is_some());
+        if !has_simhash {
+            None
+        } else {
+            // Compute per-block representative SimHash
+            let bs = effective_block_size as usize;
+            let mut representatives: Vec<u64> = Vec::with_capacity(num_blocks);
+            let mut hash_buf: Vec<u64> = Vec::new();
+
+            for (global_block, &(src_i, local)) in block_source_map.iter().enumerate() {
+                let _ = global_block;
+                let bmp = sources[src_i].0;
+                let seg_idx = source_seg_idx[src_i];
+
+                hash_buf.clear();
+                if let Some(reader) = segments[seg_idx].fast_field(field_id) {
+                    for slot in 0..bs {
+                        let virtual_id = local as usize * bs + slot;
+                        let doc_id = bmp.doc_id_for_virtual(virtual_id as u32);
+                        if doc_id != u32::MAX {
+                            let h = reader.get_u64(doc_id);
+                            if h != u64::MAX {
+                                hash_buf.push(h);
+                            }
+                        }
+                    }
+                }
+
+                representatives.push(if hash_buf.is_empty() {
+                    0 // padding-only blocks sort to beginning
+                } else {
+                    majority_simhash(&hash_buf)
+                });
+            }
+
+            // Sort blocks by representative
+            let mut perm: Vec<u32> = (0..num_blocks as u32).collect();
+            perm.sort_by_key(|&i| representatives[i as usize]);
+
+            // Build inverse permutation
+            let mut inv_perm = vec![0u32; num_blocks];
+            for (new_pos, &old) in perm.iter().enumerate() {
+                inv_perm[old as usize] = new_pos as u32;
+            }
+
+            log::info!(
+                "[merge_bmp_v11] field {}: reordering {} blocks by simhash",
+                field_id,
+                num_blocks,
+            );
+
+            Some((perm, inv_perm))
+        }
+    } else {
+        None
+    };
+
     log::debug!(
         "[merge_bmp_v11] field {}: dims={}, {} sources, {} total_blocks, \
-         block_size={}, max_weight_scale={:.4}",
+         block_size={}, max_weight_scale={:.4}, reordered={}",
         field_id,
         dims,
         sources.len(),
         num_blocks,
         effective_block_size,
         max_weight_scale,
+        permutation.is_some(),
     );
 
     // Hint sequential access on all source mmaps before reading
@@ -401,193 +516,333 @@ fn merge_bmp_field(
 
     let blob_start = writer.offset();
 
-    // ── Phase 1: Stream Section B (block data) — chunked copy ─────────
-    // Copy in 4 MB chunks to let the kernel evict pages between chunks,
-    // avoiding multi-GB RSS spikes from a single write_all.
     const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 
-    let mut total_terms: u32 = 0;
-    let mut total_postings: u32 = 0;
+    // ═══════════════════════════════════════════════════════════════════
+    // Branch: reordered merge (SimHash) vs sequential merge (original)
+    // ═══════════════════════════════════════════════════════════════════
+    let (grid_offset, sb_grid_offset, doc_map_offset) = if let Some((ref perm, ref inv_perm)) =
+        permutation
+    {
+        // ── Reordered Phase 1: Block data in permuted order ──────────
+        let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks + 1);
+        let mut cumulative_bytes: u64 = 0;
 
-    // Per-source cumulative byte/block offsets for Phase 2 recomputation
-    // and Phase 3/4 grid column positioning.
-    let mut source_byte_offsets: Vec<u64> = Vec::with_capacity(sources.len());
-    let mut block_offsets: Vec<u32> = Vec::with_capacity(sources.len());
-    let mut cumulative_bytes: u64 = 0;
-    let mut cumulative_blocks: u32 = 0;
+        for &old_global_u32 in perm.iter() {
+            let old_global = old_global_u32 as usize;
+            let (src_i, local) = block_source_map[old_global];
+            let bmp = sources[src_i].0;
 
-    for &(bmp, _) in &sources {
-        source_byte_offsets.push(cumulative_bytes);
-        block_offsets.push(cumulative_blocks);
+            let start = bmp.block_data_start(local) as usize;
+            let end = if local + 1 < bmp.num_blocks {
+                bmp.block_data_start(local + 1) as usize
+            } else {
+                bmp.block_data_sentinel() as usize
+            };
+            let block_bytes = &bmp.block_data_slice()[start..end];
 
-        let sentinel = bmp.block_data_sentinel() as usize;
-        let src_data = &bmp.block_data_slice()[..sentinel];
-        for chunk in src_data.chunks(CHUNK_SIZE) {
-            writer.write_all(chunk).map_err(crate::Error::Io)?;
+            block_data_starts.push(cumulative_bytes);
+            writer.write_all(block_bytes).map_err(crate::Error::Io)?;
+            cumulative_bytes += (end - start) as u64;
         }
-        cumulative_bytes += sentinel as u64;
-        cumulative_blocks += bmp.num_blocks;
+        block_data_starts.push(cumulative_bytes); // sentinel
 
-        total_terms += bmp.total_terms() as u32;
-        total_postings += bmp.total_postings() as u32;
-    }
+        // Release block data pages
+        #[cfg(feature = "native")]
+        for &(bmp, _) in &sources {
+            bmp.madvise_dontneed_block_data();
+        }
 
-    if total_terms == 0 {
-        return Ok(());
-    }
-
-    // Release block data pages — no longer needed after Phase 1.
-    // Keep block_data_starts (needed for Phase 2 recomputation).
-    #[cfg(feature = "native")]
-    for &(bmp, _) in &sources {
-        bmp.madvise_dontneed_block_data();
-    }
-
-    // ── Phase 2: Write padding + Section A (block_data_starts) ──────────
-    // Recompute from source metadata on-the-fly (no buffering).
-    let block_data_len = writer.offset() - blob_start;
-    let padding = (8 - (block_data_len % 8) as usize) % 8;
-    if padding > 0 {
-        writer
-            .write_all(&[0u8; 8][..padding])
-            .map_err(crate::Error::Io)?;
-    }
-
-    for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
-        let base = source_byte_offsets[src_idx];
-        for b in 0..bmp.num_blocks {
-            let val = base + bmp.block_data_start(b);
+        // ── Reordered Phase 2: Padding + block_data_starts ──────────
+        let block_data_len = writer.offset() - blob_start;
+        let padding = (8 - (block_data_len % 8) as usize) % 8;
+        if padding > 0 {
+            writer
+                .write_all(&[0u8; 8][..padding])
+                .map_err(crate::Error::Io)?;
+        }
+        for &val in &block_data_starts {
             writer
                 .write_all(&val.to_le_bytes())
                 .map_err(crate::Error::Io)?;
         }
-    }
-    // Sentinel
-    writer
-        .write_all(&cumulative_bytes.to_le_bytes())
-        .map_err(crate::Error::Io)?;
+        drop(block_data_starts);
 
-    // ── Phase 3: Stream Section D (packed_grid) — one row at a time ─────
-    let grid_offset = writer.offset() - blob_start;
-    let mut row_buf = vec![0u8; packed_row_size];
+        // ── Reordered Phase 3: Grid with permuted columns ───────────
+        let grid_offset = writer.offset() - blob_start;
+        let mut row_buf = vec![0u8; packed_row_size];
 
-    for dim_id in 0..dims {
-        row_buf.fill(0);
-
-        for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
-            let col_offset = block_offsets[src_idx] as usize;
-            let src_prs = bmp.packed_row_size();
-            let src_num_blocks = bmp.num_blocks as usize;
-
-            let src_row_start = dim_id as usize * src_prs;
-            let src_row_end = src_row_start + src_prs;
-            let src_grid = bmp.grid_slice();
-            if src_row_end > src_grid.len() {
-                continue;
-            }
-            let src_row = &src_grid[src_row_start..src_row_end];
-
-            copy_nibbles(src_row, src_num_blocks, &mut row_buf, col_offset);
-        }
-
-        writer.write_all(&row_buf).map_err(crate::Error::Io)?;
-    }
-    drop(row_buf);
-
-    // ── Phase 4: Stream Section E (sb_grid) — one row at a time ─────────
-    let sb_grid_offset = writer.offset() - blob_start;
-    let mut sb_row = vec![0u8; num_superblocks];
-    let sb_size = BMP_SUPERBLOCK_SIZE as usize;
-
-    for dim_id in 0..dims {
-        sb_row.fill(0);
-
-        for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
-            let col_offset = block_offsets[src_idx] as usize;
-            let src_num_blocks = bmp.num_blocks as usize;
-            let src_num_sbs = bmp.num_superblocks as usize;
-            let src_sb_grid = bmp.sb_grid_slice();
-            let src_sb_row_start = dim_id as usize * src_num_sbs;
-            let src_sb_row_end = src_sb_row_start + src_num_sbs;
-            if src_sb_row_end > src_sb_grid.len() {
-                continue;
-            }
-            let src_sb_row = &src_sb_grid[src_sb_row_start..src_sb_row_end];
-
-            for (sb_src, &val) in src_sb_row.iter().enumerate() {
-                if val == 0 {
+        for dim_id in 0..dims {
+            row_buf.fill(0);
+            for (src_i, &(bmp, _)) in sources.iter().enumerate() {
+                let base_global = block_offsets[src_i] as usize;
+                let src_prs = bmp.packed_row_size();
+                let src_num_blocks = bmp.num_blocks as usize;
+                let src_row_start = dim_id as usize * src_prs;
+                let src_row_end = src_row_start + src_prs;
+                let src_grid = bmp.grid_slice();
+                if src_row_end > src_grid.len() {
                     continue;
                 }
-                // Map source SB to output SB(s) — may span boundary
-                let first_block = col_offset + sb_src * sb_size;
-                let last_block = (first_block + sb_size).min(col_offset + src_num_blocks) - 1;
-                let first_out_sb = first_block / sb_size;
-                let last_out_sb = last_block / sb_size;
-                for slot in &mut sb_row[first_out_sb..=last_out_sb] {
-                    if val > *slot {
-                        *slot = val;
+                let src_row = &src_grid[src_row_start..src_row_end];
+                copy_nibbles_permuted(src_row, src_num_blocks, &mut row_buf, base_global, inv_perm);
+            }
+            writer.write_all(&row_buf).map_err(crate::Error::Io)?;
+        }
+        drop(row_buf);
+
+        // ── Reordered Phase 4: sb_grid from packed grid nibbles ─────
+        let sb_grid_offset = writer.offset() - blob_start;
+        let mut sb_row = vec![0u8; num_superblocks];
+        let sb_size = BMP_SUPERBLOCK_SIZE as usize;
+
+        for dim_id in 0..dims {
+            sb_row.fill(0);
+            for (src_i, &(bmp, _)) in sources.iter().enumerate() {
+                let base_global = block_offsets[src_i] as usize;
+                let src_prs = bmp.packed_row_size();
+                let src_num_blocks = bmp.num_blocks as usize;
+                let src_row_start = dim_id as usize * src_prs;
+                let src_row_end = src_row_start + src_prs;
+                let src_grid = bmp.grid_slice();
+                if src_row_end > src_grid.len() {
+                    continue;
+                }
+
+                for b in 0..src_num_blocks {
+                    let val = if b.is_multiple_of(2) {
+                        src_grid[src_row_start + b / 2] & 0x0F
+                    } else {
+                        src_grid[src_row_start + b / 2] >> 4
+                    };
+                    if val == 0 {
+                        continue;
+                    }
+                    let new_pos = inv_perm[base_global + b] as usize;
+                    let out_sb = new_pos / sb_size;
+                    if val > sb_row[out_sb] {
+                        sb_row[out_sb] = val;
                     }
                 }
             }
+            writer.write_all(&sb_row).map_err(crate::Error::Io)?;
+        }
+        drop(sb_row);
+
+        // Release grid pages
+        #[cfg(feature = "native")]
+        for &(bmp, _) in &sources {
+            bmp.madvise_dontneed_grids();
         }
 
-        writer.write_all(&sb_row).map_err(crate::Error::Io)?;
-    }
-    drop(sb_row);
+        // ── Reordered Phase 5: Doc map in permuted order ────────────
+        let doc_map_offset = writer.offset() - blob_start;
+        let bs = effective_block_size as usize;
 
-    // Release grid pages — no longer needed after Phase 3+4
-    #[cfg(feature = "native")]
-    for &(bmp, _) in &sources {
-        bmp.madvise_dontneed_grids();
-    }
+        // Section F: doc_map_ids — block by block in permuted order
+        let mut id_block_buf = vec![0u8; bs * 4];
+        for &old_global_u32 in perm.iter() {
+            let old_global = old_global_u32 as usize;
+            let (src_i, local) = block_source_map[old_global];
+            let bmp = sources[src_i].0;
+            let doc_offset = sources[src_i].1;
+            let off = local as usize * bs * 4;
+            let src_ids = &bmp.doc_map_ids_slice()[off..off + bs * 4];
 
-    // ── Phase 5: Stream Section F+G (doc_map) — bulk copy from mmaps ──
-    let doc_map_offset = writer.offset() - blob_start;
+            if doc_offset == 0 {
+                writer.write_all(src_ids).map_err(crate::Error::Io)?;
+            } else {
+                id_block_buf.copy_from_slice(src_ids);
+                for i in 0..bs {
+                    let o = i * 4;
+                    let doc_id = u32::from_le_bytes(id_block_buf[o..o + 4].try_into().unwrap());
+                    if doc_id != u32::MAX {
+                        id_block_buf[o..o + 4]
+                            .copy_from_slice(&(doc_id + doc_offset).to_le_bytes());
+                    }
+                }
+                writer.write_all(&id_block_buf).map_err(crate::Error::Io)?;
+            }
+        }
+        drop(id_block_buf);
 
-    // Section F: doc_map_ids [u32-LE × num_virtual_docs]
-    const DOC_MAP_CHUNK: usize = 64 * 1024; // 64K entries × 4 bytes = 256 KB
-    let mut id_buf = vec![0u8; DOC_MAP_CHUNK * 4];
+        // Section G: doc_map_ordinals — block by block in permuted order
+        let mut ord_block_buf = vec![0u8; bs * 2];
+        for &old_global_u32 in perm.iter() {
+            let old_global = old_global_u32 as usize;
+            let (src_i, local) = block_source_map[old_global];
+            let bmp = sources[src_i].0;
+            let off = local as usize * bs * 2;
+            let src_ords = &bmp.doc_map_ordinals_slice()[off..off + bs * 2];
+            // Ordinals don't need offset patching — copy directly
+            // Use buffer to avoid potential alignment issues with mmap slices
+            ord_block_buf.copy_from_slice(src_ords);
+            writer.write_all(&ord_block_buf).map_err(crate::Error::Io)?;
+        }
+        drop(ord_block_buf);
 
-    for &(bmp, doc_offset) in &sources {
-        let src_ids = bmp.doc_map_ids_slice();
-        let n = bmp.num_virtual_docs as usize;
+        (grid_offset, sb_grid_offset, doc_map_offset)
+    } else {
+        // ═══ Sequential merge (original fast path) ══════════════════
 
-        if doc_offset == 0 {
-            for chunk in src_ids[..n * 4].chunks(CHUNK_SIZE) {
+        // ── Phase 1: Stream Section B (block data) — chunked copy ───
+        let mut source_byte_offsets: Vec<u64> = Vec::with_capacity(sources.len());
+        let mut cumulative_bytes: u64 = 0;
+
+        for &(bmp, _) in &sources {
+            source_byte_offsets.push(cumulative_bytes);
+            let sentinel = bmp.block_data_sentinel() as usize;
+            let src_data = &bmp.block_data_slice()[..sentinel];
+            for chunk in src_data.chunks(CHUNK_SIZE) {
                 writer.write_all(chunk).map_err(crate::Error::Io)?;
             }
-        } else {
-            for chunk_start in (0..n).step_by(DOC_MAP_CHUNK) {
-                let chunk_end = (chunk_start + DOC_MAP_CHUNK).min(n);
-                let chunk_len = chunk_end - chunk_start;
-                let src = &src_ids[chunk_start * 4..chunk_end * 4];
-                let dst = &mut id_buf[..chunk_len * 4];
-                dst.copy_from_slice(src);
+            cumulative_bytes += sentinel as u64;
+        }
 
-                for i in 0..chunk_len {
-                    let off = i * 4;
-                    let doc_id = u32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
-                    if doc_id != u32::MAX {
-                        let adjusted = doc_id + doc_offset;
-                        dst[off..off + 4].copy_from_slice(&adjusted.to_le_bytes());
-                    }
-                }
-                writer.write_all(dst).map_err(crate::Error::Io)?;
+        // Release block data pages
+        #[cfg(feature = "native")]
+        for &(bmp, _) in &sources {
+            bmp.madvise_dontneed_block_data();
+        }
+
+        // ── Phase 2: Write padding + Section A (block_data_starts) ──
+        let block_data_len = writer.offset() - blob_start;
+        let padding = (8 - (block_data_len % 8) as usize) % 8;
+        if padding > 0 {
+            writer
+                .write_all(&[0u8; 8][..padding])
+                .map_err(crate::Error::Io)?;
+        }
+
+        for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
+            let base = source_byte_offsets[src_idx];
+            for b in 0..bmp.num_blocks {
+                let val = base + bmp.block_data_start(b);
+                writer
+                    .write_all(&val.to_le_bytes())
+                    .map_err(crate::Error::Io)?;
             }
         }
-    }
-    drop(id_buf);
+        // Sentinel
+        writer
+            .write_all(&cumulative_bytes.to_le_bytes())
+            .map_err(crate::Error::Io)?;
 
-    // Section G: doc_map_ordinals [u16-LE × num_virtual_docs]
-    for &(bmp, _) in &sources {
-        let src_ords = bmp.doc_map_ordinals_slice();
-        let n = bmp.num_virtual_docs as usize;
-        for chunk in src_ords[..n * 2].chunks(CHUNK_SIZE) {
-            writer.write_all(chunk).map_err(crate::Error::Io)?;
+        // ── Phase 3: Stream Section D (packed_grid) — one row at a time
+        let grid_offset = writer.offset() - blob_start;
+        let mut row_buf = vec![0u8; packed_row_size];
+
+        for dim_id in 0..dims {
+            row_buf.fill(0);
+            for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
+                let col_offset = block_offsets[src_idx] as usize;
+                let src_prs = bmp.packed_row_size();
+                let src_num_blocks = bmp.num_blocks as usize;
+                let src_row_start = dim_id as usize * src_prs;
+                let src_row_end = src_row_start + src_prs;
+                let src_grid = bmp.grid_slice();
+                if src_row_end > src_grid.len() {
+                    continue;
+                }
+                let src_row = &src_grid[src_row_start..src_row_end];
+                copy_nibbles(src_row, src_num_blocks, &mut row_buf, col_offset);
+            }
+            writer.write_all(&row_buf).map_err(crate::Error::Io)?;
         }
-    }
+        drop(row_buf);
 
-    // ── Phase 6: Write V11 footer (64 bytes) ────────────────────────────
+        // ── Phase 4: Stream Section E (sb_grid) — one row at a time ─
+        let sb_grid_offset = writer.offset() - blob_start;
+        let mut sb_row = vec![0u8; num_superblocks];
+        let sb_size = BMP_SUPERBLOCK_SIZE as usize;
+
+        for dim_id in 0..dims {
+            sb_row.fill(0);
+            for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
+                let col_offset = block_offsets[src_idx] as usize;
+                let src_num_blocks = bmp.num_blocks as usize;
+                let src_num_sbs = bmp.num_superblocks as usize;
+                let src_sb_grid = bmp.sb_grid_slice();
+                let src_sb_row_start = dim_id as usize * src_num_sbs;
+                let src_sb_row_end = src_sb_row_start + src_num_sbs;
+                if src_sb_row_end > src_sb_grid.len() {
+                    continue;
+                }
+                let src_sb_row = &src_sb_grid[src_sb_row_start..src_sb_row_end];
+
+                for (sb_src, &val) in src_sb_row.iter().enumerate() {
+                    if val == 0 {
+                        continue;
+                    }
+                    let first_block = col_offset + sb_src * sb_size;
+                    let last_block = (first_block + sb_size).min(col_offset + src_num_blocks) - 1;
+                    let first_out_sb = first_block / sb_size;
+                    let last_out_sb = last_block / sb_size;
+                    for slot in &mut sb_row[first_out_sb..=last_out_sb] {
+                        if val > *slot {
+                            *slot = val;
+                        }
+                    }
+                }
+            }
+            writer.write_all(&sb_row).map_err(crate::Error::Io)?;
+        }
+        drop(sb_row);
+
+        // Release grid pages
+        #[cfg(feature = "native")]
+        for &(bmp, _) in &sources {
+            bmp.madvise_dontneed_grids();
+        }
+
+        // ── Phase 5: Stream Section F+G (doc_map) — bulk copy ───────
+        let doc_map_offset = writer.offset() - blob_start;
+
+        const DOC_MAP_CHUNK: usize = 64 * 1024;
+        let mut id_buf = vec![0u8; DOC_MAP_CHUNK * 4];
+
+        for &(bmp, doc_offset) in &sources {
+            let src_ids = bmp.doc_map_ids_slice();
+            let n = bmp.num_virtual_docs as usize;
+
+            if doc_offset == 0 {
+                for chunk in src_ids[..n * 4].chunks(CHUNK_SIZE) {
+                    writer.write_all(chunk).map_err(crate::Error::Io)?;
+                }
+            } else {
+                for chunk_start in (0..n).step_by(DOC_MAP_CHUNK) {
+                    let chunk_end = (chunk_start + DOC_MAP_CHUNK).min(n);
+                    let chunk_len = chunk_end - chunk_start;
+                    let src = &src_ids[chunk_start * 4..chunk_end * 4];
+                    let dst = &mut id_buf[..chunk_len * 4];
+                    dst.copy_from_slice(src);
+
+                    for i in 0..chunk_len {
+                        let off = i * 4;
+                        let doc_id = u32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
+                        if doc_id != u32::MAX {
+                            let adjusted = doc_id + doc_offset;
+                            dst[off..off + 4].copy_from_slice(&adjusted.to_le_bytes());
+                        }
+                    }
+                    writer.write_all(dst).map_err(crate::Error::Io)?;
+                }
+            }
+        }
+        drop(id_buf);
+
+        for &(bmp, _) in &sources {
+            let src_ords = bmp.doc_map_ordinals_slice();
+            let n = bmp.num_virtual_docs as usize;
+            for chunk in src_ords[..n * 2].chunks(CHUNK_SIZE) {
+                writer.write_all(chunk).map_err(crate::Error::Io)?;
+            }
+        }
+
+        (grid_offset, sb_grid_offset, doc_map_offset)
+    };
+
+    // ── Phase 6: Write V11 footer (64 bytes) — common to both paths ───
     write_v11_footer(
         writer,
         total_terms,
@@ -630,6 +885,27 @@ fn merge_bmp_field(
     Ok(())
 }
 
+/// Compute per-bit majority vote SimHash from a set of hashes.
+///
+/// For each of the 64 bit positions, sets the output bit to 1 if more than
+/// half the input hashes have that bit set. This produces the "centroid"
+/// in SimHash space — the representative that minimizes Hamming distance
+/// to the input set.
+fn majority_simhash(hashes: &[u64]) -> u64 {
+    if hashes.is_empty() {
+        return 0;
+    }
+    let threshold = hashes.len() / 2;
+    let mut result: u64 = 0;
+    for bit in 0..64 {
+        let count = hashes.iter().filter(|&&h| h & (1u64 << bit) != 0).count();
+        if count > threshold {
+            result |= 1u64 << bit;
+        }
+    }
+    result
+}
+
 /// Copy 4-bit nibbles from a source grid row to a destination row at a column offset.
 ///
 /// Hot inner loop for grid merge (~8 KB per row).
@@ -646,6 +922,36 @@ fn copy_nibbles(src_row: &[u8], src_blocks: usize, dst_row: &mut [u8], offset: u
             continue;
         }
         let out_b = offset + b;
+        if out_b.is_multiple_of(2) {
+            dst_row[out_b / 2] |= val;
+        } else {
+            dst_row[out_b / 2] |= val << 4;
+        }
+    }
+}
+
+/// Copy 4-bit nibbles from a source grid row to a destination row with permutation.
+///
+/// Like `copy_nibbles`, but each source block `b` maps to output position
+/// `inv_perm[base_global + b]` instead of `offset + b`.
+#[inline]
+fn copy_nibbles_permuted(
+    src_row: &[u8],
+    src_blocks: usize,
+    dst_row: &mut [u8],
+    base_global: usize,
+    inv_perm: &[u32],
+) {
+    for b in 0..src_blocks {
+        let val = if b.is_multiple_of(2) {
+            src_row[b / 2] & 0x0F
+        } else {
+            src_row[b / 2] >> 4
+        };
+        if val == 0 {
+            continue;
+        }
+        let out_b = inv_perm[base_global + b] as usize;
         if out_b.is_multiple_of(2) {
             dst_row[out_b / 2] |= val;
         } else {

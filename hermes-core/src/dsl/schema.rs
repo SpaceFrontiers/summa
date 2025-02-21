@@ -64,6 +64,9 @@ pub struct FieldEntry {
     /// Whether this field is a primary key (unique constraint, at most one per schema)
     #[serde(default)]
     pub primary_key: bool,
+    /// Whether this sparse_vector field has auto-computed SimHash for BMP block reordering
+    #[serde(default)]
+    pub simhash: bool,
 }
 
 /// Position tracking mode for text fields
@@ -483,6 +486,7 @@ impl SchemaBuilder {
             dense_vector_config: None,
             fast: false,
             primary_key: false,
+            simhash: false,
         });
         field
     }
@@ -533,6 +537,7 @@ impl SchemaBuilder {
             dense_vector_config: Some(config),
             fast: false,
             primary_key: false,
+            simhash: false,
         });
         field
     }
@@ -580,6 +585,7 @@ impl SchemaBuilder {
             dense_vector_config: None,
             fast: false,
             primary_key: false,
+            simhash: false,
         });
         field
     }
@@ -603,6 +609,13 @@ impl SchemaBuilder {
     pub fn set_primary_key(&mut self, field: Field) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.primary_key = true;
+        }
+    }
+
+    /// Enable auto-computed SimHash on a sparse_vector field for BMP block reordering
+    pub fn set_simhash(&mut self, field: Field, simhash: bool) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.simhash = simhash;
         }
     }
 

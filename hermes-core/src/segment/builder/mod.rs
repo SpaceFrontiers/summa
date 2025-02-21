@@ -14,6 +14,7 @@ mod dense;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 mod postings;
+pub(crate) mod simhash;
 mod sparse;
 mod store;
 
@@ -197,6 +198,15 @@ impl SegmentBuilder {
                     }
                 };
                 fast_fields.insert(field.0, writer);
+            }
+        }
+
+        // Auto-create simhash satellite column (U64) for BMP block reordering
+        for (field, entry) in schema.fields() {
+            if entry.simhash && entry.field_type == FieldType::SparseVector {
+                fast_fields
+                    .entry(field.0)
+                    .or_insert_with(|| FastFieldWriter::new_numeric(FastFieldColumnType::U64));
             }
         }
 
@@ -455,8 +465,16 @@ impl SegmentBuilder {
                     self.index_dense_vector_field(*field, doc_id, ordinal as u16, vec)?;
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
+                    let has_simhash = entry.simhash;
                     let ordinal = self.next_element_ordinal(field.0);
                     self.index_sparse_vector_field(*field, doc_id, ordinal as u16, entries)?;
+                    // Auto-compute simhash from first vector (ordinal 0)
+                    if ordinal == 0
+                        && has_simhash
+                        && let Some(ff) = self.fast_fields.get_mut(&field.0)
+                    {
+                        ff.add_u64(doc_id, simhash::simhash_from_sparse_vector(entries));
+                    }
                 }
                 _ => {}
             }

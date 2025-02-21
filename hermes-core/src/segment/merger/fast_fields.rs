@@ -33,18 +33,28 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         files: &SegmentFiles,
     ) -> Result<usize> {
-        // Collect fast-enabled fields from schema
+        // Collect fields with columnar storage (fast fields + simhash satellite columns)
         let fast_fields: Vec<(u32, FieldType)> = self
             .schema
             .fields()
-            .filter(|(_, entry)| entry.fast)
             .filter(|(_, entry)| {
-                matches!(
-                    entry.field_type,
-                    FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Text
-                )
+                if entry.fast {
+                    matches!(
+                        entry.field_type,
+                        FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Text
+                    )
+                } else {
+                    // simhash satellite column stored in fast field format
+                    entry.simhash && entry.field_type == FieldType::SparseVector
+                }
             })
-            .map(|(field, entry)| (field.0, entry.field_type.clone()))
+            .map(|(field, entry)| {
+                if entry.simhash && entry.field_type == FieldType::SparseVector {
+                    (field.0, FieldType::U64)
+                } else {
+                    (field.0, entry.field_type.clone())
+                }
+            })
             .collect();
 
         if fast_fields.is_empty() {
