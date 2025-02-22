@@ -264,6 +264,36 @@ fn execute_bmp_inner(
         })
         .collect();
 
+    // ── Two-phase lazy block scoring setup ────────────────────────────
+    // For queries with >5 dims, score only the top-3 heaviest dims first (phase1).
+    // If max_partial_score + remaining_block_ub <= threshold, skip phase2.
+    // For ≤5 dims: full scoring directly (zero overhead).
+    const PHASE1_DIMS: usize = 3;
+    const MIN_DIMS_FOR_TWO_PHASE: usize = 6;
+    let two_phase_active = query_by_dim_u16.len() >= MIN_DIMS_FOR_TWO_PHASE;
+    // phase1_mask: bitmask of which query dim indices are in phase1
+    let phase1_mask: u64 = if two_phase_active {
+        let mut weight_indices: Vec<(u16, usize)> = query_by_dim_u16
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, w))| (w, i))
+            .collect();
+        weight_indices.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+        weight_indices[..PHASE1_DIMS]
+            .iter()
+            .fold(0u64, |m, &(_, i)| m | (1u64 << i))
+    } else {
+        u64::MAX
+    };
+    // phase1 grid dims for UB computation (indices into grid_dims/resolved)
+    let phase1_grid_indices: Vec<usize> = if two_phase_active {
+        (0..query_by_dim_u16.len())
+            .filter(|&i| phase1_mask & (1u64 << i) != 0)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Over-fetch for multi-ordinal: each real doc may occupy multiple collector
     // slots (one per ordinal). Inflate collector so combine_ordinal_results has
     // enough unique docs after grouping. Cap at 10× to avoid degenerate cases
@@ -442,6 +472,22 @@ fn execute_bmp_inner(
                 &mut scratch.local_block_masks,
             );
 
+            // Two-phase: compute phase1 block UBs (only top-3 dims)
+            if two_phase_active {
+                let phase1_dims: Vec<(usize, f32)> = phase1_grid_indices
+                    .iter()
+                    .map(|&i| grid_dims[i])
+                    .collect();
+                compute_block_ubs_compact(
+                    grid_slice,
+                    prs,
+                    &phase1_dims,
+                    block_start,
+                    block_end,
+                    &mut scratch.phase1_local_block_ubs,
+                );
+            }
+
             sort_local_blocks_desc(
                 &scratch.local_block_ubs[..count],
                 &mut scratch.local_block_order,
@@ -462,6 +508,12 @@ fn execute_bmp_inner(
                 &mut collector,
                 &mut blocks_scored,
                 &mut scratch.acc,
+                phase1_mask,
+                if two_phase_active {
+                    Some(&scratch.phase1_local_block_ubs)
+                } else {
+                    None
+                },
             );
 
             // Cross-superblock lookahead: prefetch next superblock's block_data_starts.
@@ -516,6 +568,36 @@ fn execute_bmp_inner(
 // ============================================================================
 // Integer scoring: u32 accumulators with u16 quantized query weights
 // ============================================================================
+
+/// Find the maximum u32 value across touched accumulator slots.
+///
+/// Uses the touched bitmask for O(|touched_slots|) — typically 5-20 slots per block.
+#[inline(always)]
+fn max_touched_acc(acc: &[u32], touched: &[u64; 4]) -> u32 {
+    let mut max_val = 0u32;
+    for word in 0..4 {
+        let mut bits = touched[word];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            max_val = max_val.max(acc[word * 64 + bit]);
+        }
+    }
+    max_val
+}
+
+/// Zero all touched accumulator slots.
+#[inline(always)]
+fn zero_touched_acc(acc: &mut [u32], touched: &[u64; 4]) {
+    for word in 0..4 {
+        let mut bits = touched[word];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            acc[word * 64 + bit] = 0;
+        }
+    }
+}
 
 /// Score a block using integer arithmetic (u32 accumulators, u16 weights).
 ///
@@ -573,6 +655,10 @@ fn score_block_bsearch_int(
 /// `block_start` is the global block ID of the first block in this superblock.
 /// `local_order`, `local_ubs`, `local_masks` are indexed by local offset (0..count).
 ///
+/// **Two-phase lazy scoring**: When `phase1_mask != u64::MAX` and `phase1_local_ubs`
+/// is `Some`, scores only phase1 dims first. If the best possible score from phase1 +
+/// remaining block UB <= threshold, skips phase2 dims entirely (~40-60% of scoring work).
+///
 /// Integer scoring: accumulates u16×u8 products into u32, then dequantizes to f32
 /// for collector comparison.
 #[allow(clippy::too_many_arguments)]
@@ -591,9 +677,12 @@ fn score_superblock_blocks(
     collector: &mut ScoreCollector,
     blocks_scored: &mut u32,
     acc: &mut [u32],
+    phase1_mask: u64,
+    phase1_local_ubs: Option<&[f32]>,
 ) {
     let block_size = index.bmp_block_size as usize;
     let num_vdocs_total = index.num_virtual_docs as usize;
+    let two_phase = phase1_mask != u64::MAX && phase1_local_ubs.is_some();
 
     // Level 2: Pre-warm first few blocks' data (eliminates cold-start for first block).
     // block_data_starts offsets are already in cache from superblock-level prefetch.
@@ -660,16 +749,56 @@ fn score_superblock_blocks(
         let mask = local_masks[local_idx as usize];
         let mut touched = [0u64; 4];
         if num_terms > 0 {
-            score_block_bsearch_int(
-                num_terms,
-                dim_ptr,
-                ps_ptr,
-                post_ptr,
-                query_by_dim_u16,
-                mask,
-                acc,
-                &mut touched,
-            );
+            if two_phase && collector.len() >= k {
+                // Phase 1: Score only the heaviest dims
+                score_block_bsearch_int(
+                    num_terms,
+                    dim_ptr,
+                    ps_ptr,
+                    post_ptr,
+                    query_by_dim_u16,
+                    mask & phase1_mask,
+                    acc,
+                    &mut touched,
+                );
+
+                // Check if phase2 can be skipped:
+                // max_partial_score + remaining_ub <= threshold?
+                // remaining_ub = full_block_ub - phase1_block_ub
+                let max_partial = max_touched_acc(acc, &touched) as f32 * dequant;
+                let phase1_ub = phase1_local_ubs.unwrap()[local_idx as usize];
+                let remaining_ub = (ub - phase1_ub).max(0.0);
+                if (max_partial + remaining_ub) * alpha <= collector.threshold() {
+                    // Skip phase2 — zero touched slots and continue
+                    zero_touched_acc(acc, &touched);
+                    *blocks_scored += 1;
+                    continue;
+                }
+
+                // Phase 2: Score remaining dims
+                score_block_bsearch_int(
+                    num_terms,
+                    dim_ptr,
+                    ps_ptr,
+                    post_ptr,
+                    query_by_dim_u16,
+                    mask & !phase1_mask,
+                    acc,
+                    &mut touched,
+                );
+            } else {
+                // Single-phase: score all dims at once
+                score_block_bsearch_int(
+                    num_terms,
+                    dim_ptr,
+                    ps_ptr,
+                    post_ptr,
+                    query_by_dim_u16,
+                    mask,
+                    acc,
+                    &mut touched,
+                );
+            }
         }
 
         // Collect results + lazy zeroing.
