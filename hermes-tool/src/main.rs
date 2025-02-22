@@ -193,6 +193,13 @@ enum Commands {
         index: PathBuf,
     },
 
+    /// Reorder BMP blocks by SimHash similarity for better pruning
+    Reorder {
+        /// Path to the index directory
+        #[arg(short, long)]
+        index: PathBuf,
+    },
+
     /// Show index info
     Info {
         /// Path to the index directory
@@ -397,6 +404,9 @@ async fn main() -> Result<()> {
         }
         Commands::Merge { index } => {
             index_ops::merge_index(index).await?;
+        }
+        Commands::Reorder { index } => {
+            index_ops::reorder_index(index).await?;
         }
         Commands::Info { index } => {
             index_ops::show_info(index).await?;

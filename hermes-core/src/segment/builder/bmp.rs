@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V11 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V12 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -18,16 +18,15 @@
 //!
 //! Peak memory: `input + grid_entries + O(num_blocks) block_data_starts`.
 //!
-//! ## V11 changes from V10
+//! ## V12 changes from V11
 //!
-//! - **Fixed `dims`**: vocabulary size stored in footer, grid indexed by dim_id directly
-//! - **dim_id in per-block data**: u32 dim_id replaces dim_idx, blocks are portable
-//! - **Block-aligned segments**: padded to block_size for block-copy merge
-//! - **Fixed `max_weight_scale`**: no impact rescaling during merge
-//! - **Section C (dim_ids) removed**: grid uses dim_id as row index
-//! - **num_real_docs** footer field: actual vector count before padding
+//! - **Per-ordinal SimHash**: each ordinal gets its own SimHash, independently placed
+//! - **Section H**: per-block majority SimHash stored in blob (replaces fast field)
+//! - **72-byte footer**: adds `block_simhash_offset` field
+//! - Merger reads SimHash from Section H (O(1) per block) instead of fast fields
+//! - Builder re-sorts per-dim postings by virtual_id when SimHash is active
 //!
-//! ## BMP V11 Blob Layout (data-first, block-interleaved)
+//! ## BMP V12 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -37,6 +36,7 @@
 //! Section E:  sb_grid            [u8 × (dims × num_superblocks)]  ← indexed by dim_id directly
 //! Section F:  doc_map_ids        [u32-LE × num_virtual_docs]
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
+//! Section H:  block_simhashes    [u64-LE × num_blocks]  (0 = no simhash)
 //!
 //! Per-block data layout (for non-empty blocks):
 //!   num_terms: u16                                    offset 0
@@ -44,7 +44,7 @@
 //!   posting_starts: [u16-LE × (num_terms + 1)]        relative cumulative counts
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP V11 Footer (64 bytes):
+//! BMP V12 Footer (72 bytes):
 //!   total_terms: u32              //  0- 3  (stats only)
 //!   total_postings: u32           //  4- 7  (stats only)
 //!   grid_offset: u64              //  8-15  (byte offset of Section D)
@@ -56,8 +56,9 @@
 //!   max_weight_scale: f32         // 40-43
 //!   doc_map_offset: u64           // 44-51  (byte offset of Section F)
 //!   num_real_docs: u32            // 52-55  (actual vector count before padding)
-//!   reserved: u32                 // 56-59
-//!   magic: u32                    // 60-63  (BMP1 = 0x31504D42)
+//!   block_simhash_offset: u64     // 56-63  (0 = no simhash)
+//!   reserved: u32                 // 64-67
+//!   magic: u32                    // 68-71  (BMP2 = 0x32504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -95,10 +96,10 @@ impl VidLookup {
 }
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V11;
+use crate::segment::format::BMP_BLOB_MAGIC_V12;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V11 blob from per-dimension postings.
+/// Build a BMP V12 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -117,10 +118,14 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// Only `grid_entries` (O(total_terms × 12)) and `block_data_starts` (O(num_blocks × 8))
 /// are buffered for later sections.
 ///
-/// V11: block data uses u32 dim_id directly (not dim_idx). Grid has `dims` rows.
+/// Block data uses u32 dim_id directly (not dim_idx). Grid has `dims` rows.
 /// num_virtual_docs is padded to block_size alignment.
 ///
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
+///
+/// When `ordinal_simhashes` is provided, vid_pairs are sorted by
+/// `(simhash, doc_id, ordinal)` to cluster similar content, and
+/// Section H (per-block majority SimHash) is written after Section G.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_bmp_blob(
     mut postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,
@@ -130,6 +135,7 @@ pub(crate) fn build_bmp_blob(
     dims: u32,
     max_weight: f32,
     min_terms: usize,
+    ordinal_simhashes: Option<&FxHashMap<(DocId, u16), u64>>,
     writer: &mut dyn Write,
 ) -> std::io::Result<u64> {
     if postings.is_empty() {
@@ -187,12 +193,20 @@ pub(crate) fn build_bmp_blob(
         return Ok(0);
     }
 
-    // V11: max_weight_scale is fixed (= max_weight parameter)
+    // max_weight_scale is fixed (= max_weight parameter)
     let max_weight_scale = max_weight;
 
     // Assign compact virtual IDs: sequential IDs for unique (doc_id, ordinal) pairs.
     let mut vid_pairs: Vec<(DocId, u16)> = vid_set.into_iter().collect();
-    vid_pairs.sort_unstable();
+    if let Some(sh_map) = ordinal_simhashes {
+        // V12: Sort by (simhash, doc_id, ordinal) — cluster similar content
+        vid_pairs.sort_unstable_by_key(|&(doc_id, ord)| {
+            let h = sh_map.get(&(doc_id, ord)).copied().unwrap_or(0);
+            (h, doc_id, ord)
+        });
+    } else {
+        vid_pairs.sort_unstable(); // default: (doc_id, ordinal)
+    }
     let num_real_docs = vid_pairs.len();
 
     // Build O(1) lookup table from (doc_id, ordinal) → virtual_id.
@@ -202,7 +216,7 @@ pub(crate) fn build_bmp_blob(
     // Safety: local_slot is u8, so block_size must not exceed 256
     let effective_block_size = bmp_block_size.min(256);
 
-    // V11: Pad num_virtual_docs to block_size alignment
+    // Pad num_virtual_docs to block_size alignment
     let num_virtual_docs =
         num_real_docs.div_ceil(effective_block_size as usize) * effective_block_size as usize;
     let num_blocks = num_virtual_docs / effective_block_size as usize;
@@ -214,11 +228,21 @@ pub(crate) fn build_bmp_blob(
     //
     // Take ownership of per-dim posting Vecs. This drains the HashMap so
     // its memory can be reclaimed by the allocator during the merge.
-    let dim_vecs: Vec<Vec<(DocId, u16, f32)>> = dim_ids
+    let mut dim_vecs: Vec<Vec<(DocId, u16, f32)>> = dim_ids
         .iter()
         .map(|&d| postings.remove(&d).unwrap_or_default())
         .collect();
     drop(postings); // Free HashMap shell now
+
+    // When SimHash reordering is active, virtual IDs are not monotonic with
+    // (doc_id, ordinal) order. Re-sort per-dim postings by virtual_id so the
+    // K-way merge's sequential cursor assumption holds.
+    if ordinal_simhashes.is_some() {
+        for dim_posts in &mut dim_vecs {
+            dim_posts
+                .sort_unstable_by_key(|&(doc_id, ordinal, _)| vid_lookup.get((doc_id, ordinal)));
+        }
+    }
 
     // Borrow slices for the merge loop
     let dim_slices: Vec<&[(DocId, u16, f32)]> = dim_vecs.iter().map(|v| v.as_slice()).collect();
@@ -345,7 +369,7 @@ pub(crate) fn build_bmp_blob(
             total_postings += term_posting_count as u32;
             total_terms += 1;
 
-            // Grid entry — V11: indexed by dim_id directly
+            // Grid entry — indexed by dim_id directly
             grid_entries.push((dim_id, block_id, max_impact));
 
             // Advance cursor
@@ -412,8 +436,8 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V11 num_real_docs={} num_virtual_docs={} num_blocks={} dims={} \
-         total_terms={} total_postings={} grid_entries={}",
+        "[bmp_build] V12 num_real_docs={} num_virtual_docs={} num_blocks={} dims={} \
+         total_terms={} total_postings={} grid_entries={} simhash={}",
         num_real_docs,
         num_virtual_docs,
         num_blocks,
@@ -421,6 +445,7 @@ pub(crate) fn build_bmp_blob(
         total_terms,
         total_postings,
         grid_entries.len(),
+        ordinal_simhashes.is_some(),
     );
 
     // Free K-way merge inputs — reclaims per-dim posting Vecs and vid lookup.
@@ -443,7 +468,7 @@ pub(crate) fn build_bmp_blob(
     drop(block_data_starts);
 
     // Sections D+E: packed grid + sb_grid (streaming from sparse grid entries)
-    // V11: `dims` rows (not num_dims)
+    // `dims` rows (not num_dims)
     let grid_offset = bytes_written;
     let (packed_bytes, sb_bytes) =
         stream_write_grids(&grid_entries, dims as usize, num_blocks, writer)?;
@@ -472,10 +497,37 @@ pub(crate) fn build_bmp_blob(
         writer.write_u16::<LittleEndian>(0)?;
     }
     bytes_written += num_virtual_docs as u64 * 2;
+
+    // Section H: per-block majority SimHash [u64-LE × num_blocks]
+    let block_simhash_offset = if let Some(sh_map) = ordinal_simhashes {
+        let offset = bytes_written;
+        let bs = effective_block_size as usize;
+        let mut hash_buf: Vec<u64> = Vec::new();
+        for block_id in 0..num_blocks {
+            hash_buf.clear();
+            let start = block_id * bs;
+            let end = (start + bs).min(num_real_docs);
+            for &(doc_id, ord) in &vid_pairs[start..end] {
+                if let Some(&h) = sh_map.get(&(doc_id, ord)) {
+                    hash_buf.push(h);
+                }
+            }
+            let majority = if hash_buf.is_empty() {
+                0
+            } else {
+                super::simhash::majority_simhash(&hash_buf)
+            };
+            writer.write_u64::<LittleEndian>(majority)?;
+        }
+        bytes_written += num_blocks as u64 * 8;
+        offset
+    } else {
+        0 // sentinel: no simhash data
+    };
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V11 Footer (64 bytes)
-    write_v11_footer(
+    // BMP V12 Footer (72 bytes)
+    write_v12_footer(
         writer,
         total_terms,
         total_postings,
@@ -488,15 +540,16 @@ pub(crate) fn build_bmp_blob(
         max_weight_scale,
         doc_map_offset,
         num_real_docs as u32,
+        block_simhash_offset,
     )?;
-    bytes_written += 64;
+    bytes_written += 72;
 
     Ok(bytes_written)
 }
 
-/// Write the BMP V11 footer (64 bytes).
+/// Write the BMP V12 footer (72 bytes).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_v11_footer(
+pub(crate) fn write_v12_footer(
     writer: &mut dyn Write,
     total_terms: u32,
     total_postings: u32,
@@ -509,6 +562,7 @@ pub(crate) fn write_v11_footer(
     max_weight_scale: f32,
     doc_map_offset: u64,
     num_real_docs: u32,
+    block_simhash_offset: u64,
 ) -> std::io::Result<()> {
     writer.write_u32::<LittleEndian>(total_terms)?; //  0- 3
     writer.write_u32::<LittleEndian>(total_postings)?; //  4- 7
@@ -521,8 +575,9 @@ pub(crate) fn write_v11_footer(
     writer.write_f32::<LittleEndian>(max_weight_scale)?; // 40-43
     writer.write_u64::<LittleEndian>(doc_map_offset)?; // 44-51
     writer.write_u32::<LittleEndian>(num_real_docs)?; // 52-55
-    writer.write_u32::<LittleEndian>(0)?; // 56-59 reserved
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V11)?; // 60-63
+    writer.write_u64::<LittleEndian>(block_simhash_offset)?; // 56-63
+    writer.write_u32::<LittleEndian>(0)?; // 64-67 reserved
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V12)?; // 68-71
     Ok(())
 }
 
@@ -564,7 +619,7 @@ pub(crate) fn quantize_u8_to_u4_ceil(val: u8) -> u8 {
 
 /// Stream-write 4-bit packed grid (Section D) and 8-bit superblock grid (Section E).
 ///
-/// V11: `grid_entries` sorted by `(dim_id, block_id)`. `num_dims` is the fixed
+/// `grid_entries` sorted by `(dim_id, block_id)`. `num_dims` is the fixed
 /// vocabulary size (dims), so the grid has `num_dims` rows.
 /// Each entry is `(dim_id, block_id, max_impact_u8)`.
 ///
@@ -645,7 +700,7 @@ mod tests {
     fn test_build_bmp_blob_empty() {
         let postings = FxHashMap::default();
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, None, &mut buf).unwrap();
         assert_eq!(size, 0);
         assert!(buf.is_empty());
     }
@@ -659,14 +714,14 @@ mod tests {
         postings.insert(1, vec![(0, 0, 0.8)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, None, &mut buf).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
-        // Verify footer magic
+        // Verify V12 footer magic (last 4 bytes of 72-byte footer)
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V11);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V12);
     }
 
     #[test]
@@ -676,12 +731,12 @@ mod tests {
         postings.insert(0u32, vec![(0u32, 0u16, 1.0f32), (0, 1, 0.8), (1, 0, 0.5)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, None, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify footer: num_virtual_docs should be 64 (padded to block_size)
+        // Verify V12 footer: num_virtual_docs should be 64 (padded to block_size)
         // 3 real docs padded to 64
-        let footer_start = buf.len() - 64;
+        let footer_start = buf.len() - 72;
         let fb = &buf[footer_start..];
         let num_virtual_docs = u32::from_le_bytes(fb[36..40].try_into().unwrap());
         assert_eq!(num_virtual_docs, 64); // padded to block_size
@@ -701,11 +756,11 @@ mod tests {
         // impact(2.0) = round(2.0/5.0*255) = round(102) = 102
         // impact(1.0) = round(1.0/5.0*255) = round(51) = 51
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, None, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify max_weight_scale in V11 footer (bytes 40-43)
-        let footer_start = buf.len() - 64;
+        // Verify max_weight_scale in V12 footer (bytes 40-43)
+        let footer_start = buf.len() - 72;
         let fb = &buf[footer_start..];
         let scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
         assert!((scale - 5.0).abs() < 0.001, "scale={}, expected 5.0", scale);
@@ -726,17 +781,17 @@ mod tests {
 
         // Fixed max_weight=5.0: same scale
         let mut buf_a = Vec::new();
-        build_bmp_blob(postings_a, 64, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
+        build_bmp_blob(postings_a, 64, 0.0, None, 105879, 5.0, 4, None, &mut buf_a).unwrap();
         let scale_a = f32::from_le_bytes(
-            buf_a[buf_a.len() - 64 + 40..buf_a.len() - 64 + 44]
+            buf_a[buf_a.len() - 72 + 40..buf_a.len() - 72 + 44]
                 .try_into()
                 .unwrap(),
         );
 
         let mut buf_b = Vec::new();
-        build_bmp_blob(postings_b, 64, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
+        build_bmp_blob(postings_b, 64, 0.0, None, 105879, 5.0, 4, None, &mut buf_b).unwrap();
         let scale_b = f32::from_le_bytes(
-            buf_b[buf_b.len() - 64 + 40..buf_b.len() - 64 + 44]
+            buf_b[buf_b.len() - 72 + 40..buf_b.len() - 72 + 44]
                 .try_into()
                 .unwrap(),
         );

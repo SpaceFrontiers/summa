@@ -385,6 +385,15 @@ export interface BatchIndexDocumentsRequest {
 export interface BatchIndexDocumentsResponse {
   indexedCount: number;
   errorCount: number;
+  errors: DocumentError[];
+}
+
+/** Per-document error detail (e.g. duplicate primary key) */
+export interface DocumentError {
+  /** 0-based index in the request batch */
+  index: number;
+  /** Human-readable error message */
+  error: string;
 }
 
 /** Index document request/response */
@@ -395,6 +404,7 @@ export interface IndexDocumentRequest {
 
 export interface IndexDocumentsResponse {
   indexedCount: number;
+  errors: DocumentError[];
 }
 
 /** Commit request/response */
@@ -441,6 +451,16 @@ export interface RetrainVectorIndexRequest {
 
 export interface RetrainVectorIndexResponse {
   success: boolean;
+}
+
+/** Reorder request/response */
+export interface ReorderRequest {
+  indexName: string;
+}
+
+export interface ReorderResponse {
+  success: boolean;
+  numSegments: number;
 }
 
 function createBaseQuery(): Query {
@@ -2884,7 +2904,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
       SearchHit.encode(v!, writer.uint32(10).fork()).join();
     }
     if (message.totalHits !== 0) {
-      writer.uint32(16).uint32(message.totalHits);
+      writer.uint32(16).uint64(message.totalHits);
     }
     if (message.tookMs !== 0) {
       writer.uint32(24).uint64(message.tookMs);
@@ -2915,7 +2935,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
             break;
           }
 
-          message.totalHits = reader.uint32();
+          message.totalHits = longToNumber(reader.uint64());
           continue;
         }
         case 3: {
@@ -4558,7 +4578,7 @@ export const BatchIndexDocumentsRequest: MessageFns<BatchIndexDocumentsRequest> 
 };
 
 function createBaseBatchIndexDocumentsResponse(): BatchIndexDocumentsResponse {
-  return { indexedCount: 0, errorCount: 0 };
+  return { indexedCount: 0, errorCount: 0, errors: [] };
 }
 
 export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse> = {
@@ -4568,6 +4588,9 @@ export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse
     }
     if (message.errorCount !== 0) {
       writer.uint32(16).uint32(message.errorCount);
+    }
+    for (const v of message.errors) {
+      DocumentError.encode(v!, writer.uint32(26).fork()).join();
     }
     return writer;
   },
@@ -4595,6 +4618,14 @@ export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse
           message.errorCount = reader.uint32();
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.errors.push(DocumentError.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4616,6 +4647,7 @@ export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse
         : isSet(object.error_count)
         ? globalThis.Number(object.error_count)
         : 0,
+      errors: globalThis.Array.isArray(object?.errors) ? object.errors.map((e: any) => DocumentError.fromJSON(e)) : [],
     };
   },
 
@@ -4627,6 +4659,9 @@ export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse
     if (message.errorCount !== 0) {
       obj.errorCount = Math.round(message.errorCount);
     }
+    if (message.errors?.length) {
+      obj.errors = message.errors.map((e) => DocumentError.toJSON(e));
+    }
     return obj;
   },
 
@@ -4637,6 +4672,83 @@ export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse
     const message = createBaseBatchIndexDocumentsResponse();
     message.indexedCount = object.indexedCount ?? 0;
     message.errorCount = object.errorCount ?? 0;
+    message.errors = object.errors?.map((e) => DocumentError.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseDocumentError(): DocumentError {
+  return { index: 0, error: "" };
+}
+
+export const DocumentError: MessageFns<DocumentError> = {
+  encode(message: DocumentError, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.index !== 0) {
+      writer.uint32(8).uint32(message.index);
+    }
+    if (message.error !== "") {
+      writer.uint32(18).string(message.error);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): DocumentError {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseDocumentError();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.index = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.error = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): DocumentError {
+    return {
+      index: isSet(object.index) ? globalThis.Number(object.index) : 0,
+      error: isSet(object.error) ? globalThis.String(object.error) : "",
+    };
+  },
+
+  toJSON(message: DocumentError): unknown {
+    const obj: any = {};
+    if (message.index !== 0) {
+      obj.index = Math.round(message.index);
+    }
+    if (message.error !== "") {
+      obj.error = message.error;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<DocumentError>): DocumentError {
+    return DocumentError.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<DocumentError>): DocumentError {
+    const message = createBaseDocumentError();
+    message.index = object.index ?? 0;
+    message.error = object.error ?? "";
     return message;
   },
 };
@@ -4722,13 +4834,16 @@ export const IndexDocumentRequest: MessageFns<IndexDocumentRequest> = {
 };
 
 function createBaseIndexDocumentsResponse(): IndexDocumentsResponse {
-  return { indexedCount: 0 };
+  return { indexedCount: 0, errors: [] };
 }
 
 export const IndexDocumentsResponse: MessageFns<IndexDocumentsResponse> = {
   encode(message: IndexDocumentsResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.indexedCount !== 0) {
       writer.uint32(8).uint32(message.indexedCount);
+    }
+    for (const v of message.errors) {
+      DocumentError.encode(v!, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -4748,6 +4863,14 @@ export const IndexDocumentsResponse: MessageFns<IndexDocumentsResponse> = {
           message.indexedCount = reader.uint32();
           continue;
         }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.errors.push(DocumentError.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4764,6 +4887,7 @@ export const IndexDocumentsResponse: MessageFns<IndexDocumentsResponse> = {
         : isSet(object.indexed_count)
         ? globalThis.Number(object.indexed_count)
         : 0,
+      errors: globalThis.Array.isArray(object?.errors) ? object.errors.map((e: any) => DocumentError.fromJSON(e)) : [],
     };
   },
 
@@ -4771,6 +4895,9 @@ export const IndexDocumentsResponse: MessageFns<IndexDocumentsResponse> = {
     const obj: any = {};
     if (message.indexedCount !== 0) {
       obj.indexedCount = Math.round(message.indexedCount);
+    }
+    if (message.errors?.length) {
+      obj.errors = message.errors.map((e) => DocumentError.toJSON(e));
     }
     return obj;
   },
@@ -4781,6 +4908,7 @@ export const IndexDocumentsResponse: MessageFns<IndexDocumentsResponse> = {
   fromPartial(object: DeepPartial<IndexDocumentsResponse>): IndexDocumentsResponse {
     const message = createBaseIndexDocumentsResponse();
     message.indexedCount = object.indexedCount ?? 0;
+    message.errors = object.errors?.map((e) => DocumentError.fromPartial(e)) || [];
     return message;
   },
 };
@@ -5424,6 +5552,150 @@ export const RetrainVectorIndexResponse: MessageFns<RetrainVectorIndexResponse> 
   },
 };
 
+function createBaseReorderRequest(): ReorderRequest {
+  return { indexName: "" };
+}
+
+export const ReorderRequest: MessageFns<ReorderRequest> = {
+  encode(message: ReorderRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.indexName !== "") {
+      writer.uint32(10).string(message.indexName);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReorderRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReorderRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReorderRequest {
+    return {
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+    };
+  },
+
+  toJSON(message: ReorderRequest): unknown {
+    const obj: any = {};
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ReorderRequest>): ReorderRequest {
+    return ReorderRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ReorderRequest>): ReorderRequest {
+    const message = createBaseReorderRequest();
+    message.indexName = object.indexName ?? "";
+    return message;
+  },
+};
+
+function createBaseReorderResponse(): ReorderResponse {
+  return { success: false, numSegments: 0 };
+}
+
+export const ReorderResponse: MessageFns<ReorderResponse> = {
+  encode(message: ReorderResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.success !== false) {
+      writer.uint32(8).bool(message.success);
+    }
+    if (message.numSegments !== 0) {
+      writer.uint32(16).uint32(message.numSegments);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReorderResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReorderResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.success = reader.bool();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.numSegments = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReorderResponse {
+    return {
+      success: isSet(object.success) ? globalThis.Boolean(object.success) : false,
+      numSegments: isSet(object.numSegments)
+        ? globalThis.Number(object.numSegments)
+        : isSet(object.num_segments)
+        ? globalThis.Number(object.num_segments)
+        : 0,
+    };
+  },
+
+  toJSON(message: ReorderResponse): unknown {
+    const obj: any = {};
+    if (message.success !== false) {
+      obj.success = message.success;
+    }
+    if (message.numSegments !== 0) {
+      obj.numSegments = Math.round(message.numSegments);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ReorderResponse>): ReorderResponse {
+    return ReorderResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ReorderResponse>): ReorderResponse {
+    const message = createBaseReorderResponse();
+    message.success = object.success ?? false;
+    message.numSegments = object.numSegments ?? 0;
+    return message;
+  },
+};
+
 /** Search service */
 export type SearchServiceDefinition = typeof SearchServiceDefinition;
 export const SearchServiceDefinition = {
@@ -5508,6 +5780,15 @@ export const IndexServiceDefinition = {
       requestType: ForceMergeRequest,
       requestStream: false,
       responseType: ForceMergeResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Reorder BMP blocks by SimHash similarity */
+    reorder: {
+      name: "Reorder",
+      requestType: ReorderRequest,
+      requestStream: false,
+      responseType: ReorderResponse,
       responseStream: false,
       options: {},
     },

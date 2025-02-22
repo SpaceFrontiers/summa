@@ -385,6 +385,43 @@ impl IndexService for IndexServiceImpl {
         Ok(Response::new(ListIndexesResponse { index_names }))
     }
 
+    async fn reorder(
+        &self,
+        request: Request<ReorderRequest>,
+    ) -> Result<Response<ReorderResponse>, Status> {
+        let req = request.into_inner();
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let writer = self.registry.get_writer(&req.index_name).await?;
+
+        writer
+            .write()
+            .await
+            .reorder()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+
+        // Force reader reload to pick up reordered segments
+        let reader = index
+            .reader()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+        reader
+            .reload()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+        let searcher = reader
+            .searcher()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+
+        info!("Reordered: {}", req.index_name);
+
+        Ok(Response::new(ReorderResponse {
+            success: true,
+            num_segments: searcher.segment_readers().len() as u32,
+        }))
+    }
+
     async fn retrain_vector_index(
         &self,
         request: Request<RetrainVectorIndexRequest>,

@@ -92,27 +92,17 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V11 blob footer ("BMP1" in LE)
+/// Magic number for BMP V12 blob footer ("BMP2" in LE)
 ///
-/// V11 changes from V10:
-/// - **Fixed `dims`**: vocabulary size stored in footer, grid indexed by dim_id directly
-/// - **dim_id in per-block data**: u32 dim_id replaces dim_idx, blocks are portable
-/// - **Block-aligned segments**: padded to block_size for block-copy merge
-/// - **Fixed `max_weight_scale`**: no impact rescaling during merge
-/// - **Section C (dim_ids) removed**: grid uses dim_id as row index
-/// - **num_real_docs** footer field: actual vector count before padding
-/// - Merge is fully streaming block-copy (memcpy), ~13 MB peak memory
-///
-/// V10 changes from V9:
-/// - u64 section offsets and block_data_starts (fixing >4 GB overflow)
-/// - 64-byte footer, 8-byte padding alignment
-///
-/// V9: Data-first layout (streaming merge)
-/// V8: Block-interleaved format (1-2 page faults per block)
-pub const BMP_BLOB_MAGIC_V11: u32 = 0x31504D42;
+/// V12 changes from V11:
+/// - **Per-ordinal SimHash**: each ordinal gets its own SimHash, independently placed
+/// - **Section H**: per-block majority SimHash stored in blob (replaces fast field)
+/// - **72-byte footer**: adds `block_simhash_offset` field
+/// - Merger reads SimHash from Section H (O(1) per block) instead of fast fields
+pub const BMP_BLOB_MAGIC_V12: u32 = 0x32504D42;
 
-/// BMP V11 blob footer size: 64 bytes
-pub const BMP_BLOB_FOOTER_SIZE_V11: usize = 64;
+/// BMP V12 blob footer size: 72 bytes
+pub const BMP_BLOB_FOOTER_SIZE_V12: usize = 72;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

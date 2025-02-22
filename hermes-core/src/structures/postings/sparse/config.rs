@@ -264,7 +264,7 @@ pub struct SparseVectorConfig {
     /// enabling zero-copy block-copy merge. The grid is indexed by dim_id directly
     /// (no dim_ids Section C needed).
     ///
-    /// Required for BMP V11 format. Typical values:
+    /// Required for BMP V12 format. Typical values:
     /// - SPLADE/BERT: 30522 or 105879 (WordPiece / Unigram vocabulary)
     /// - uniCOIL: 30522
     /// - Custom models: set to vocabulary size

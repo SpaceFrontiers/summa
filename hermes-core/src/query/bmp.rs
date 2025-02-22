@@ -43,7 +43,7 @@ use crate::segment::{
     block_term_postings, compute_block_masks_4bit, find_dim_in_block_data,
 };
 
-// V11: dim_id is used directly as grid row index. No dim_idx indirection.
+// dim_id is used directly as grid row index. No dim_idx indirection.
 
 // ============================================================================
 // Software prefetch: hint the CPU to load data into cache ahead of time
@@ -204,7 +204,7 @@ fn execute_bmp_inner(
     let num_superblocks_total = index.num_superblocks as usize;
 
     // ── Phase 1: Resolve query dims and pre-scale weights ──────────────
-    // V11: dim_id is used directly as grid row index (no dim_idx indirection).
+    // dim_id is used directly as grid row index (no dim_idx indirection).
     // Build combined info, sort by dim_id, then split into resolved + query_by_dim_u16.
     // Both arrays MUST have the same ordering so mask bit `q` corresponds to the
     // same dimension in both compute_block_masks (uses resolved) and
@@ -213,7 +213,7 @@ fn execute_bmp_inner(
     let mut query_info: Vec<(u32, usize, f32)> = Vec::with_capacity(query_terms.len());
 
     for &(dim_id, weight) in query_terms {
-        // V11: dim_id IS the grid row index — just check bounds
+        // dim_id IS the grid row index — just check bounds
         if dim_id < dims {
             let scaled = weight * scale;
             query_info.push((dim_id, dim_id as usize, scaled));
@@ -224,7 +224,7 @@ fn execute_bmp_inner(
         return Ok(Vec::new());
     }
 
-    // Sort by dim_id for binary search within blocks (V11 blocks store dim_id directly).
+    // Sort by dim_id for binary search within blocks (blocks store dim_id directly).
     query_info.sort_unstable_by_key(|&(dim_id, _, _)| dim_id);
 
     // Split into parallel arrays with matching order
@@ -239,7 +239,7 @@ fn execute_bmp_inner(
     } else {
         (0.0, 0.0)
     };
-    // V11: query_by_dim_u16 stores (dim_id, weight) — matches per-block dim_ids
+    // query_by_dim_u16 stores (dim_id, weight) — matches per-block dim_ids
     let query_by_dim_u16: Vec<(u32, u16)> = query_info
         .iter()
         .map(|&(dim_id, _, w)| {
@@ -454,7 +454,7 @@ fn execute_bmp_inner(
 /// Uses **bitmask skip**: checks `block_mask & (1 << q) != 0` before binary search.
 /// Accumulates `w_u16 * impact_u8` into u32 — eliminates u8→f32 conversion per posting.
 ///
-/// V11: blocks store u32 dim_id directly. Binary search on dim_id (always 4 bytes).
+/// Blocks store u32 dim_id directly. Binary search on dim_id (always 4 bytes).
 ///
 /// Block data is contiguous — `dim_ptr`, `ps_ptr`, `post_ptr` point into
 /// the same ~200-2000 byte region (1-2 pages). Binary search and posting reads
@@ -481,7 +481,7 @@ fn score_block_bsearch_int(
         if block_mask & (1u64 << q) == 0 {
             continue;
         }
-        // V11: find_dim_in_block_data always uses u32 dim_ids
+        // find_dim_in_block_data always uses u32 dim_ids
         if let Some(local_term) = find_dim_in_block_data(dim_ptr, num_terms, dim_id) {
             let postings = unsafe { block_term_postings(ps_ptr, post_ptr, local_term) };
             for p in postings {

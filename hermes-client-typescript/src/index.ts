@@ -58,6 +58,8 @@ export {
   CommitResponse,
   ForceMergeRequest,
   ForceMergeResponse,
+  ReorderRequest,
+  ReorderResponse,
   DeleteIndexRequest,
   DeleteIndexResponse,
   ListIndexesRequest,

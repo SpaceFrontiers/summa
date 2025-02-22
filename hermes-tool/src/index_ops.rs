@@ -212,6 +212,18 @@ pub async fn merge_index(index_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub async fn reorder_index(index_path: PathBuf) -> Result<()> {
+    let dir = FsDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::open(dir, config).await?;
+
+    info!("Starting SimHash reorder...");
+    writer.reorder().await?;
+    info!("Reorder completed");
+
+    Ok(())
+}
+
 pub async fn search_index(
     index_path: PathBuf,
     query_str: &str,

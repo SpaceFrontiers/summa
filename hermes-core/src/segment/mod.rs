@@ -12,6 +12,8 @@ mod types;
 mod vector_data;
 
 #[cfg(feature = "native")]
+pub use builder::simhash::{majority_simhash, simhash_from_sparse_vector};
+#[cfg(feature = "native")]
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};

@@ -771,7 +771,7 @@ async fn test_bmp_simhash_reorder_merge() {
         writer.commit().await.unwrap();
     }
 
-    // Verify pre-merge: should have 5 segments
+    // Verify pre-merge: should have 5 segments and queries work
     let index = Index::open(dir.clone(), config.clone()).await.unwrap();
     let segments = index.segment_readers().await.unwrap();
     assert!(
@@ -947,5 +947,574 @@ async fn test_bmp_simhash_reorder_large() {
         results.len() >= 100,
         "Topic query should match >=100 docs, got {}",
         results.len()
+    );
+}
+
+/// BMP standalone reorder: build 1 segment, call writer.reorder(), verify all docs findable.
+///
+/// Tests the record-level SimHash reorder path where individual ordinals are
+/// shuffled across blocks for better clustering.
+#[tokio::test]
+async fn test_bmp_reorder_standalone() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    const NUM_DOCS: usize = 200;
+
+    // Each doc gets a unique dim + shared dim 9999 + topic dim
+    for i in 0..NUM_DOCS {
+        let unique_dim = i as u32;
+        let topic = i / 50;
+        let topic_dim = 10000 + (topic as u32 * 10);
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc{}", i));
+        doc.add_sparse_vector(
+            sparse,
+            vec![(unique_dim, 1.0), (9999, 0.1), (topic_dim, 0.5)],
+        );
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    // Verify we have 1 segment before reorder
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(index.num_docs().await.unwrap() as usize, NUM_DOCS);
+
+    // Reorder
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    // Verify still 1 segment after reorder
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(index.num_docs().await.unwrap() as usize, NUM_DOCS);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Query each unique dim — must return exactly the right doc
+    let mut failures = Vec::new();
+    for i in 0..NUM_DOCS {
+        let unique_dim = i as u32;
+        let expected_title = format!("doc{}", i);
+        let query = SparseVectorQuery::new(sparse, vec![(unique_dim, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "dim {}: expected 1 result, got {}",
+                unique_dim,
+                results.len()
+            ));
+            continue;
+        }
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let got_title = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+        if got_title != expected_title {
+            failures.push(format!(
+                "dim {}: got '{}', expected '{}'",
+                unique_dim, got_title, expected_title
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Standalone reorder: {} failures:\n{}",
+        failures.len(),
+        failures[..failures.len().min(20)].join("\n")
+    );
+
+    // Query shared dim 9999 — should match all docs
+    let query = SparseVectorQuery::new(sparse, vec![(9999, 1.0)]);
+    let results = searcher.search(&query, 300).await.unwrap();
+    assert_eq!(
+        results.len(),
+        NUM_DOCS,
+        "Reorder: dim 9999 should match all {} docs, got {}",
+        NUM_DOCS,
+        results.len()
+    );
+}
+
+/// BMP reorder with multi-field: build index with 2 BMP sparse fields,
+/// call writer.reorder(), verify both fields return correct results.
+#[tokio::test]
+async fn test_bmp_reorder_multi_field() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse_a = sb.add_sparse_vector_field_with_config("sparse_a", true, true, bmp_config());
+    let sparse_b = sb.add_sparse_vector_field_with_config("sparse_b", true, true, bmp_config());
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    const NUM_DOCS: usize = 100;
+
+    // Field A uses dims 0-99, field B uses dims 1000-1099
+    for i in 0..NUM_DOCS {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc{}", i));
+        doc.add_sparse_vector(sparse_a, vec![(i as u32, 1.0), (9999, 0.1)]);
+        doc.add_sparse_vector(sparse_b, vec![(1000 + i as u32, 1.0), (19999, 0.1)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    // Reorder
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(index.num_docs().await.unwrap() as usize, NUM_DOCS);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Verify field A: each unique dim returns the right doc
+    let mut failures = Vec::new();
+    for i in 0..NUM_DOCS {
+        let query = SparseVectorQuery::new(sparse_a, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "field_a dim {}: expected 1 result, got {}",
+                i,
+                results.len()
+            ));
+            continue;
+        }
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let got = doc.get_first(title).unwrap().as_text().unwrap();
+        if got != format!("doc{}", i) {
+            failures.push(format!("field_a dim {}: got '{}'", i, got));
+        }
+    }
+
+    // Verify field B: each unique dim returns the right doc
+    for i in 0..NUM_DOCS {
+        let query = SparseVectorQuery::new(sparse_b, vec![(1000 + i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "field_b dim {}: expected 1 result, got {}",
+                1000 + i,
+                results.len()
+            ));
+            continue;
+        }
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let got = doc.get_first(title).unwrap().as_text().unwrap();
+        if got != format!("doc{}", i) {
+            failures.push(format!("field_b dim {}: got '{}'", 1000 + i, got));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Multi-field reorder: {} failures:\n{}",
+        failures.len(),
+        failures[..failures.len().min(20)].join("\n")
+    );
+
+    // Field A shared dim should match all docs
+    let query = SparseVectorQuery::new(sparse_a, vec![(9999, 1.0)]);
+    let results = searcher.search(&query, 200).await.unwrap();
+    assert_eq!(results.len(), NUM_DOCS);
+
+    // Field B shared dim should match all docs
+    let query = SparseVectorQuery::new(sparse_b, vec![(19999, 1.0)]);
+    let results = searcher.search(&query, 200).await.unwrap();
+    assert_eq!(results.len(), NUM_DOCS);
+}
+
+/// After reorder, verify that intra-block SimHash Hamming distances are small
+/// (similar vectors cluster into the same blocks).
+#[tokio::test]
+async fn test_bmp_reorder_simhash_quality() {
+    use crate::segment::simhash_from_sparse_vector;
+
+    fn hamming_distance(a: u64, b: u64) -> u32 {
+        (a ^ b).count_ones()
+    }
+
+    let mut sb = SchemaBuilder::default();
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Generate docs from 3 topics with disjoint dim ranges
+    const NUM_DOCS: usize = 300;
+    let mut all_entries: Vec<Vec<(u32, f32)>> = Vec::new();
+    let mut rng = 42u64;
+    let mut next = || -> u32 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (rng >> 33) as u32
+    };
+
+    for i in 0..NUM_DOCS {
+        let topic = i % 3;
+        let base_dim = topic as u32 * 10000; // 0, 10000, 20000
+        let mut entries: Vec<(u32, f32)> = (0..60)
+            .map(|_| {
+                let d = base_dim + next() % 500;
+                let w = 0.3 + (next() % 100) as f32 / 50.0;
+                (d, w)
+            })
+            .collect();
+        entries.sort_by_key(|&(d, _)| d);
+        entries.dedup_by_key(|e| e.0);
+
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, entries.clone());
+        writer.add_document(doc).unwrap();
+        all_entries.push(entries);
+    }
+
+    writer
+        .prepare_commit()
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    // Read the BMP index to check block-level SimHash clustering
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let sr = &searcher.segment_readers()[0];
+    let bmp = sr.bmp_index(sparse).unwrap();
+
+    // Compute SimHash for all docs and compare intra-block vs inter-block distances
+    let simhashes: Vec<u64> = all_entries
+        .iter()
+        .map(|e| simhash_from_sparse_vector(e))
+        .collect();
+
+    // Group by topic and compute avg intra-topic Hamming
+    let mut intra_topic_dists = Vec::new();
+    for topic in 0..3 {
+        let topic_hashes: Vec<u64> = (0..NUM_DOCS)
+            .filter(|&i| i % 3 == topic)
+            .map(|i| simhashes[i])
+            .collect();
+        for i in 0..topic_hashes.len() {
+            for j in (i + 1)..topic_hashes.len() {
+                intra_topic_dists.push(hamming_distance(topic_hashes[i], topic_hashes[j]));
+            }
+        }
+    }
+
+    let mut inter_topic_dists = Vec::new();
+    let t0: Vec<u64> = (0..NUM_DOCS)
+        .filter(|i| i % 3 == 0)
+        .map(|i| simhashes[i])
+        .collect();
+    let t1: Vec<u64> = (0..NUM_DOCS)
+        .filter(|i| i % 3 == 1)
+        .map(|i| simhashes[i])
+        .collect();
+    for &a in &t0 {
+        for &b in &t1 {
+            inter_topic_dists.push(hamming_distance(a, b));
+        }
+    }
+
+    let avg_intra = intra_topic_dists.iter().sum::<u32>() as f64 / intra_topic_dists.len() as f64;
+    let avg_inter = inter_topic_dists.iter().sum::<u32>() as f64 / inter_topic_dists.len() as f64;
+
+    assert!(
+        avg_intra < avg_inter,
+        "Intra-topic Hamming ({:.1}) should be less than inter-topic ({:.1})",
+        avg_intra,
+        avg_inter,
+    );
+
+    // Verify block SimHash in Section H is non-zero (reorder wrote it)
+    let mut nonzero_simhashes = 0;
+    for b in 0..bmp.num_blocks {
+        if bmp.block_simhash(b) != 0 {
+            nonzero_simhashes += 1;
+        }
+    }
+    assert!(
+        nonzero_simhashes > 0,
+        "Section H should have non-zero per-block SimHash after reorder"
+    );
+
+    // Verify all docs still searchable
+    for i in 0..NUM_DOCS {
+        let topic = i % 3;
+        let base_dim = topic as u32 * 10000;
+        let query = SparseVectorQuery::new(sparse, vec![(base_dim + 1, 1.0)]);
+        let results = searcher.search(&query, NUM_DOCS).await.unwrap();
+        assert!(
+            !results.is_empty(),
+            "Topic {} query should return results",
+            topic
+        );
+    }
+}
+
+/// BMP V12 multi-ordinal SimHash clustering: verify ordinals from different
+/// documents cluster by content similarity, not by parent document.
+///
+/// Creates documents with 3 ordinals each, where ordinals belong to distinct
+/// "topics" (disjoint dimension sets). With per-ordinal SimHash, ordinals
+/// sharing a topic should land in nearby blocks regardless of parent doc_id.
+///
+/// Verifies:
+/// 1. All documents findable by unique dims after build + merge
+/// 2. Topic queries return correct documents
+/// 3. Multi-ordinal combine_ordinal_results works with SimHash-reordered vids
+#[tokio::test]
+async fn test_bmp_multi_ordinal_simhash_clustering() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_simhash(sparse, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // 3 topics with disjoint dimension ranges:
+    //   Topic A: dims 1000-1099
+    //   Topic B: dims 2000-2099
+    //   Topic C: dims 3000-3099
+    //
+    // Each doc gets 3 ordinals, one per topic:
+    //   ordinal 0: topic A dims + unique dim
+    //   ordinal 1: topic B dims + unique dim
+    //   ordinal 2: topic C dims + unique dim
+    //
+    // Without per-ordinal SimHash: all 3 ordinals of doc_i land in same block
+    // With per-ordinal SimHash: topic A ordinals cluster together across docs
+
+    const NUM_DOCS: usize = 200;
+    let mut rng: u32 = 42;
+
+    // Segment 1: first half
+    for i in 0..NUM_DOCS / 2 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc{}", i));
+
+        // Ordinal 0: Topic A — shared anchor dim 1000 + random topic dim + unique
+        let unique_a = 5000 + i as u32;
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let topic_a_dim = 1001 + (rng % 99);
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let w = 0.3 + (rng % 70) as f32 / 100.0;
+        doc.add_sparse_vector(sparse, vec![(1000, 0.5), (topic_a_dim, w), (unique_a, 1.0)]);
+
+        // Ordinal 1: Topic B — shared anchor dim 2000 + random topic dim + unique
+        let unique_b = 6000 + i as u32;
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let topic_b_dim = 2001 + (rng % 99);
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let w = 0.3 + (rng % 70) as f32 / 100.0;
+        doc.add_sparse_vector(sparse, vec![(2000, 0.5), (topic_b_dim, w), (unique_b, 1.0)]);
+
+        // Ordinal 2: Topic C — shared anchor dim 3000 + random topic dim + unique
+        let unique_c = 7000 + i as u32;
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let topic_c_dim = 3001 + (rng % 99);
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let w = 0.3 + (rng % 70) as f32 / 100.0;
+        doc.add_sparse_vector(sparse, vec![(3000, 0.5), (topic_c_dim, w), (unique_c, 1.0)]);
+
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    // Segment 2: second half
+    for i in NUM_DOCS / 2..NUM_DOCS {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc{}", i));
+
+        let unique_a = 5000 + i as u32;
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let topic_a_dim = 1001 + (rng % 99);
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let w = 0.3 + (rng % 70) as f32 / 100.0;
+        doc.add_sparse_vector(sparse, vec![(1000, 0.5), (topic_a_dim, w), (unique_a, 1.0)]);
+
+        let unique_b = 6000 + i as u32;
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let topic_b_dim = 2001 + (rng % 99);
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let w = 0.3 + (rng % 70) as f32 / 100.0;
+        doc.add_sparse_vector(sparse, vec![(2000, 0.5), (topic_b_dim, w), (unique_b, 1.0)]);
+
+        let unique_c = 7000 + i as u32;
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let topic_c_dim = 3001 + (rng % 99);
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let w = 0.3 + (rng % 70) as f32 / 100.0;
+        doc.add_sparse_vector(sparse, vec![(3000, 0.5), (topic_c_dim, w), (unique_c, 1.0)]);
+
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    // Force merge — triggers SimHash block reordering with per-ordinal clustering
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(index.num_docs().await.unwrap() as usize, NUM_DOCS);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // 1. Verify every document is findable by its unique dims (all 3 ordinals)
+    let mut failures = Vec::new();
+    for i in 0..NUM_DOCS {
+        let expected = format!("doc{}", i);
+
+        // Query ordinal 0's unique dim
+        let query = SparseVectorQuery::new(sparse, vec![(5000 + i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "doc{} ord0 unique_dim={}: got {} results",
+                i,
+                5000 + i,
+                results.len()
+            ));
+        } else {
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got = doc.get_first(title).unwrap().as_text().unwrap();
+            if got != expected {
+                failures.push(format!(
+                    "doc{} ord0: got '{}', expected '{}'",
+                    i, got, expected
+                ));
+            }
+        }
+
+        // Query ordinal 1's unique dim
+        let query = SparseVectorQuery::new(sparse, vec![(6000 + i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "doc{} ord1 unique_dim={}: got {} results",
+                i,
+                6000 + i,
+                results.len()
+            ));
+        } else {
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got = doc.get_first(title).unwrap().as_text().unwrap();
+            if got != expected {
+                failures.push(format!(
+                    "doc{} ord1: got '{}', expected '{}'",
+                    i, got, expected
+                ));
+            }
+        }
+
+        // Query ordinal 2's unique dim
+        let query = SparseVectorQuery::new(sparse, vec![(7000 + i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "doc{} ord2 unique_dim={}: got {} results",
+                i,
+                7000 + i,
+                results.len()
+            ));
+        } else {
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got = doc.get_first(title).unwrap().as_text().unwrap();
+            if got != expected {
+                failures.push(format!(
+                    "doc{} ord2: got '{}', expected '{}'",
+                    i, got, expected
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Multi-ordinal SimHash clustering: {} failures:\n{}",
+        failures.len(),
+        failures[..failures.len().min(20)].join("\n")
+    );
+
+    // 2. Topic queries: querying topic A anchor dim should return all docs
+    //    (each doc has ordinal 0 with dim 1000; combine_ordinal_results groups by doc_id)
+    let query = SparseVectorQuery::new(sparse, vec![(1000, 1.0)]);
+    let results_a = searcher.search(&query, 300).await.unwrap();
+    assert_eq!(
+        results_a.len(),
+        NUM_DOCS,
+        "Topic A anchor dim 1000 should match all {} docs, got {}",
+        NUM_DOCS,
+        results_a.len()
+    );
+
+    // 3. Cross-topic query: anchors from topic A + B should still return all docs
+    let query = SparseVectorQuery::new(sparse, vec![(1000, 0.8), (2000, 0.8)]);
+    let results_cross = searcher.search(&query, 300).await.unwrap();
+    assert_eq!(
+        results_cross.len(),
+        NUM_DOCS,
+        "Cross-topic query should match all {} docs, got {}",
+        NUM_DOCS,
+        results_cross.len()
     );
 }

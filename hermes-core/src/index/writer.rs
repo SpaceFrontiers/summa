@@ -668,6 +668,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.force_merge().await
     }
 
+    /// Reorder all segments by SimHash similarity for better BMP pruning.
+    ///
+    /// Each segment is individually rebuilt with record-level SimHash reordering:
+    /// ordinals are shuffled across blocks so that similar content clusters tightly.
+    pub async fn reorder(&mut self) -> Result<()> {
+        self.prepare_commit().await?.commit().await?;
+        self.segment_manager.reorder_segments().await
+    }
+
     /// Resume workers with a fresh channel. Called after commit or abort.
     ///
     /// Workers are already alive — just give them a new channel and wake them.

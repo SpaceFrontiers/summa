@@ -185,6 +185,13 @@ export class HermesClient {
     return response.success;
   }
 
+  /** Reorder BMP blocks by SimHash similarity for better pruning. Returns number of segments. */
+  async reorder(indexName: string): Promise<number> {
+    this.ensureConnected();
+    const response = await this.indexClient!.reorder({ indexName });
+    return response.numSegments;
+  }
+
   // =========================================================================
   // Search
   // =========================================================================

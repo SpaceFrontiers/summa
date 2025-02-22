@@ -283,6 +283,24 @@ class HermesClient:
         response = await self._index_stub.ForceMerge(request)
         return response.num_segments
 
+    async def reorder(self, index_name: str) -> int:
+        """Reorder BMP blocks by SimHash similarity for better pruning.
+
+        Performs record-level reordering: shuffles individual ordinals across
+        blocks so that ordinals with similar SimHash cluster tightly. This
+        improves block-max pruning effectiveness for BMP sparse vector queries.
+
+        Args:
+            index_name: Name of the index
+
+        Returns:
+            Number of segments after reorder
+        """
+        self._ensure_connected()
+        request = pb.ReorderRequest(index_name=index_name)
+        response = await self._index_stub.Reorder(request)
+        return response.num_segments
+
     async def retrain_vector_index(self, index_name: str) -> bool:
         """Retrain vector index centroids/codebooks from current data.
 

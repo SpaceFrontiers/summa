@@ -238,6 +238,12 @@ class IndexServiceStub:
             response_deserializer=hermes__pb2.ForceMergeResponse.FromString,
             _registered_method=True,
         )
+        self.Reorder = channel.unary_unary(
+            "/hermes.IndexService/Reorder",
+            request_serializer=hermes__pb2.ReorderRequest.SerializeToString,
+            response_deserializer=hermes__pb2.ReorderResponse.FromString,
+            _registered_method=True,
+        )
         self.DeleteIndex = channel.unary_unary(
             "/hermes.IndexService/DeleteIndex",
             request_serializer=hermes__pb2.DeleteIndexRequest.SerializeToString,
@@ -291,6 +297,12 @@ class IndexServiceServicer:
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def Reorder(self, request, context):
+        """Reorder BMP blocks by SimHash similarity"""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
     def DeleteIndex(self, request, context):
         """Delete an index"""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -336,6 +348,11 @@ def add_IndexServiceServicer_to_server(servicer, server):
             servicer.ForceMerge,
             request_deserializer=hermes__pb2.ForceMergeRequest.FromString,
             response_serializer=hermes__pb2.ForceMergeResponse.SerializeToString,
+        ),
+        "Reorder": grpc.unary_unary_rpc_method_handler(
+            servicer.Reorder,
+            request_deserializer=hermes__pb2.ReorderRequest.FromString,
+            response_serializer=hermes__pb2.ReorderResponse.SerializeToString,
         ),
         "DeleteIndex": grpc.unary_unary_rpc_method_handler(
             servicer.DeleteIndex,
@@ -503,6 +520,36 @@ class IndexService:
             "/hermes.IndexService/ForceMerge",
             hermes__pb2.ForceMergeRequest.SerializeToString,
             hermes__pb2.ForceMergeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def Reorder(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/hermes.IndexService/Reorder",
+            hermes__pb2.ReorderRequest.SerializeToString,
+            hermes__pb2.ReorderResponse.FromString,
             options,
             channel_credentials,
             insecure,
