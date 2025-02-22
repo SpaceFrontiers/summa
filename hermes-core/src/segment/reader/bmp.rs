@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V12 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V13 zero-copy**.
 //!
-//! V12 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! V13 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -73,9 +73,9 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V12 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V13 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V12 format with Section H (per-block SimHash) for merge-time reordering.
+/// V13 format with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -122,9 +122,6 @@ pub struct BmpIndex {
     doc_map_ids_bytes: OwnedBytes,
     /// doc_map_ordinals[virtual_id] = original ordinal — zero-copy OwnedBytes
     doc_map_ordinals_bytes: OwnedBytes,
-    /// Section H: per-block majority SimHash [u64-LE × num_blocks].
-    /// Empty when SimHash is disabled.
-    block_simhash_bytes: OwnedBytes,
 }
 
 // SAFETY: All raw pointer access is derived from OwnedBytes which are Send+Sync
@@ -133,14 +130,13 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V12 blob from the given file handle.
+    /// Parse a BMP V13 blob from the given file handle.
     ///
-    /// Reads the 72-byte footer, then acquires the entire blob as a single
+    /// Reads the 64-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V12 data-first layout: Section B (per-block interleaved data) first,
-    /// then Section A (block_data_starts with u64 entries), grids, doc_map,
-    /// and Section H (per-block SimHash).
+    /// V13 data-first layout: Section B (per-block interleaved data) first,
+    /// then Section A (block_data_starts with u64 entries), grids, doc_map.
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -148,18 +144,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V12, BMP_BLOB_MAGIC_V12};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V13, BMP_BLOB_MAGIC_V13};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V12 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V13 as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V12 footer".into(),
+                "BMP blob too small for V13 footer".into(),
             ));
         }
 
-        // Read the footer (last 72 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V12 as u64;
+        // Read the footer (last 64 bytes of the blob)
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V13 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V12 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V13 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -174,14 +170,13 @@ impl BmpIndex {
         let max_weight_scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
         let doc_map_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
         let num_real_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
-        let block_simhash_offset = u64::from_le_bytes(fb[56..64].try_into().unwrap());
-        // fb[64..68] = reserved
-        let magic = u32::from_le_bytes(fb[68..72].try_into().unwrap());
+        // fb[56..60] = reserved
+        let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V12 {
+        if magic != BMP_BLOB_MAGIC_V13 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP2 {:#x})",
-                magic, BMP_BLOB_MAGIC_V12
+                "Invalid BMP blob magic: {:#x} (expected BMP3 {:#x})",
+                magic, BMP_BLOB_MAGIC_V13
             )));
         }
 
@@ -205,12 +200,11 @@ impl BmpIndex {
                 num_superblocks: 0,
                 doc_map_ids_bytes: OwnedBytes::empty(),
                 doc_map_ordinals_bytes: OwnedBytes::empty(),
-                block_simhash_bytes: OwnedBytes::empty(),
             });
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V12 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V13 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
@@ -238,15 +232,6 @@ impl BmpIndex {
         let dm_ids_end = dm_start + num_virtual_docs as usize * 4;
         let dm_ords_end = dm_ids_end + num_virtual_docs as usize * 2;
 
-        // Section H: per-block SimHash (V12)
-        let block_simhash_bytes = if block_simhash_offset > 0 {
-            let sh_start = block_simhash_offset as usize;
-            let sh_end = sh_start + num_blocks as usize * 8;
-            blob.slice(sh_start..sh_end)
-        } else {
-            OwnedBytes::empty()
-        };
-
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
         let grid_bytes = blob.slice(grid_start..grid_end);
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
@@ -254,9 +239,9 @@ impl BmpIndex {
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         log::debug!(
-            "BMP V12 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
+            "BMP V13 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
-             packed_row_size={}, block_data={}B, doc_map={}B, simhash={}",
+             packed_row_size={}, block_data={}B, doc_map={}B",
             num_blocks,
             num_superblocks,
             dims,
@@ -268,7 +253,6 @@ impl BmpIndex {
             packed_row_size,
             bds_start,
             num_virtual_docs as usize * 6,
-            !block_simhash_bytes.is_empty(),
         );
 
         Ok(Self {
@@ -289,7 +273,6 @@ impl BmpIndex {
             num_superblocks,
             doc_map_ids_bytes,
             doc_map_ordinals_bytes,
-            block_simhash_bytes,
         })
     }
 
@@ -435,7 +418,6 @@ impl BmpIndex {
             + self.sb_grid_bytes.len()
             + self.doc_map_ids_bytes.len()
             + self.doc_map_ordinals_bytes.len()
-            + self.block_simhash_bytes.len()
     }
 
     /// Extract compact grid data for query-relevant dims into caller-provided buffers.
@@ -527,25 +509,6 @@ impl BmpIndex {
         self.doc_map_ordinals_bytes.as_slice()
     }
 
-    /// Per-block majority SimHash for block `block_id` (V12 Section H).
-    /// Returns 0 if no SimHash data is present.
-    #[inline]
-    pub fn block_simhash(&self, block_id: u32) -> u64 {
-        let d = self.block_simhash_bytes.as_slice();
-        if d.is_empty() {
-            return 0;
-        }
-        let off = block_id as usize * 8;
-        u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
-    }
-
-    /// Raw per-block SimHash bytes (Section H). For merge copy.
-    /// Layout: `[u64-LE × num_blocks]`. Empty if no SimHash data.
-    #[inline]
-    pub fn block_simhash_slice(&self) -> &[u8] {
-        self.block_simhash_bytes.as_slice()
-    }
-
     /// Advise the kernel about sequential access patterns for merge.
     ///
     /// Only effective on mmap-backed data. No-op for heap (Vec) or non-native.
@@ -557,7 +520,6 @@ impl BmpIndex {
         Self::madvise_owned(&self.sb_grid_bytes, libc::MADV_SEQUENTIAL);
         Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_SEQUENTIAL);
         Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_SEQUENTIAL);
-        Self::madvise_owned(&self.block_simhash_bytes, libc::MADV_SEQUENTIAL);
     }
 
     /// Release block data pages after Phase 1 completes.

@@ -417,9 +417,7 @@ pub async fn load_fast_fields_file<D: Directory>(
     };
 
     // Skip if no fast fields in schema
-    let has_fast = schema
-        .fields()
-        .any(|(_, entry)| entry.fast || entry.simhash);
+    let has_fast = schema.fields().any(|(_, entry)| entry.fast);
     if !has_fast {
         return Ok(FxHashMap::default());
     }

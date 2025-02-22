@@ -92,17 +92,17 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V12 blob footer ("BMP2" in LE)
+/// Magic number for BMP V13 blob footer ("BMP3" in LE)
 ///
-/// V12 changes from V11:
-/// - **Per-ordinal SimHash**: each ordinal gets its own SimHash, independently placed
-/// - **Section H**: per-block majority SimHash stored in blob (replaces fast field)
-/// - **72-byte footer**: adds `block_simhash_offset` field
-/// - Merger reads SimHash from Section H (O(1) per block) instead of fast fields
-pub const BMP_BLOB_MAGIC_V12: u32 = 0x32504D42;
+/// V13 changes from V12:
+/// - **Recursive Graph Bisection (BP)** replaces SimHash for document ordering
+/// - **Section H removed**: no per-block SimHash (BP needs no stored metadata)
+/// - **64-byte footer** (was 72): `block_simhash_offset` field removed
+/// - V12 segments are incompatible — must rebuild
+pub const BMP_BLOB_MAGIC_V13: u32 = 0x33504D42;
 
-/// BMP V12 blob footer size: 72 bytes
-pub const BMP_BLOB_FOOTER_SIZE_V12: usize = 72;
+/// BMP V13 blob footer size: 64 bytes
+pub const BMP_BLOB_FOOTER_SIZE_V13: usize = 64;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

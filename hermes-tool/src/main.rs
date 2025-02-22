@@ -193,7 +193,7 @@ enum Commands {
         index: PathBuf,
     },
 
-    /// Reorder BMP blocks by SimHash similarity for better pruning
+    /// Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning
     Reorder {
         /// Path to the index directory
         #[arg(short, long)]

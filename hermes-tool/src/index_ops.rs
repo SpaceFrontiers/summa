@@ -217,7 +217,7 @@ pub async fn reorder_index(index_path: PathBuf) -> Result<()> {
     let config = IndexConfig::default();
     let mut writer = IndexWriter::open(dir, config).await?;
 
-    info!("Starting SimHash reorder...");
+    info!("Starting BP reorder...");
     writer.reorder().await?;
     info!("Reorder completed");
 

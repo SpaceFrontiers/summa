@@ -81,8 +81,8 @@ pub struct FieldDef {
     pub fast: bool,
     /// Whether this field is a primary key (unique constraint)
     pub primary: bool,
-    /// Whether this sparse_vector field has auto-computed SimHash for BMP block reordering
-    pub simhash: bool,
+    /// Whether build-time document reordering (BP) is enabled for BMP fields
+    pub reorder: bool,
 }
 
 /// Parsed index definition
@@ -151,8 +151,8 @@ impl IndexDef {
             if field.primary {
                 builder.set_primary_key(f);
             }
-            if field.simhash {
-                builder.set_simhash(f, true);
+            if field.reorder {
+                builder.set_reorder(f, true);
             }
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
@@ -244,36 +244,43 @@ struct IndexConfig {
     positions: Option<super::schema::PositionMode>,
 }
 
+/// Parsed attributes from SDL field definition
+struct ParsedAttributes {
+    indexed: bool,
+    stored: bool,
+    multi: bool,
+    fast: bool,
+    primary: bool,
+    reorder: bool,
+    index_config: Option<IndexConfig>,
+}
+
 /// Parse attributes from pest pair
-/// Returns (indexed, stored, multi, fast, primary, simhash, index_config)
-/// positions is now inside index_config (via indexed<positions> or indexed<ordinal> etc.)
-/// multi is now inside stored<multi>
-fn parse_attributes(
-    pair: pest::iterators::Pair<Rule>,
-) -> (bool, bool, bool, bool, bool, bool, Option<IndexConfig>) {
-    let mut indexed = false;
-    let mut stored = false;
-    let mut multi = false;
-    let mut fast = false;
-    let mut primary = false;
-    let mut simhash = false;
-    let mut index_config = None;
+fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> ParsedAttributes {
+    let mut attrs = ParsedAttributes {
+        indexed: false,
+        stored: false,
+        multi: false,
+        fast: false,
+        primary: false,
+        reorder: false,
+        index_config: None,
+    };
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::attribute {
-            // attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "simhash" }
             let mut found_config = false;
             for inner in attr.clone().into_inner() {
                 match inner.as_rule() {
                     Rule::indexed_with_config => {
-                        indexed = true;
-                        index_config = Some(parse_index_config(inner));
+                        attrs.indexed = true;
+                        attrs.index_config = Some(parse_index_config(inner));
                         found_config = true;
                         break;
                     }
                     Rule::stored_with_config => {
-                        stored = true;
-                        multi = true; // stored<multi>
+                        attrs.stored = true;
+                        attrs.multi = true; // stored<multi>
                         found_config = true;
                         break;
                     }
@@ -281,22 +288,19 @@ fn parse_attributes(
                 }
             }
             if !found_config {
-                // Simple attribute
                 match attr.as_str() {
-                    "indexed" => indexed = true,
-                    "stored" => stored = true,
-                    "fast" => fast = true,
-                    "primary" => primary = true,
-                    "simhash" => {
-                        simhash = true;
-                    }
+                    "indexed" => attrs.indexed = true,
+                    "stored" => attrs.stored = true,
+                    "fast" => attrs.fast = true,
+                    "primary" => attrs.primary = true,
+                    "reorder" => attrs.reorder = true,
                     _ => {}
                 }
             }
         }
     }
 
-    (indexed, stored, multi, fast, primary, simhash, index_config)
+    attrs
 }
 
 /// Parse index configuration from indexed<...> attribute
@@ -590,7 +594,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut multi = false;
     let mut fast = false;
     let mut primary = false;
-    let mut simhash = false;
+    let mut reorder = false;
     let mut index_config: Option<IndexConfig> = None;
 
     for item in inner {
@@ -610,14 +614,14 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 dense_vector_config = Some(parse_dense_vector_config(item));
             }
             Rule::attributes => {
-                let (idx, sto, mul, fst, pri, sim, idx_cfg) = parse_attributes(item);
-                indexed = idx;
-                stored = sto;
-                multi = mul;
-                fast = fst;
-                primary = pri;
-                simhash = sim;
-                index_config = idx_cfg;
+                let attrs = parse_attributes(item);
+                indexed = attrs.indexed;
+                stored = attrs.stored;
+                multi = attrs.multi;
+                fast = attrs.fast;
+                primary = attrs.primary;
+                reorder = attrs.reorder;
+                index_config = attrs.index_config;
             }
             _ => {}
         }
@@ -627,14 +631,6 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     if primary {
         fast = true;
         indexed = true;
-    }
-
-    // simhash requires sparse_vector — auto-computed from vector data during indexing
-    if simhash && field_type != FieldType::SparseVector {
-        return Err(Error::Schema(format!(
-            "simhash attribute on field '{}' requires type sparse_vector, got {:?}",
-            name, field_type
-        )));
     }
 
     // Merge index config into vector configs if both exist
@@ -662,7 +658,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         dense_vector_config,
         fast,
         primary,
-        simhash,
+        reorder,
     })
 }
 
@@ -2113,84 +2109,28 @@ mod tests {
     }
 
     #[test]
-    fn test_simhash_attribute_sparse_vector() {
+    fn test_reorder_attribute() {
         let sdl = r#"
             index documents {
-                field embedding: sparse_vector<u32> [indexed<format: bmp, dims: 105879>, simhash]
+                field embedding: sparse_vector<u16> [indexed<format: bmp, quantization: uint8>, reorder]
+                field embedding2: sparse_vector [indexed<format: bmp>]
             }
         "#;
 
         let indexes = parse_sdl(sdl).unwrap();
-        let index = &indexes[0];
-        assert_eq!(index.fields.len(), 1);
+        assert_eq!(indexes[0].fields.len(), 2);
 
-        let sh_field = &index.fields[0];
-        assert_eq!(sh_field.name, "embedding");
-        assert!(sh_field.simhash);
-        assert!(!sh_field.fast, "simhash no longer implies fast");
-        assert!(matches!(sh_field.field_type, FieldType::SparseVector));
+        // First field should have reorder=true
+        assert!(indexes[0].fields[0].reorder);
+        // Second field should have reorder=false
+        assert!(!indexes[0].fields[1].reorder);
 
-        // Verify schema conversion preserves simhash
-        let schema = index.to_schema();
-        let field = schema.get_field("embedding").unwrap();
-        let entry = schema.get_field_entry(field).unwrap();
-        assert!(entry.simhash);
-    }
-
-    #[test]
-    fn test_simhash_must_be_sparse_vector() {
-        // u64 should fail now
-        let sdl = r#"
-            index documents {
-                field simhash: u64 [simhash]
-            }
-        "#;
-
-        let result = parse_sdl(sdl);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("sparse_vector"),
-            "Error should mention sparse_vector: {}",
-            err
-        );
-
-        // text should fail too
-        let sdl2 = r#"
-            index documents {
-                field simhash: text [simhash]
-            }
-        "#;
-        let result2 = parse_sdl(sdl2);
-        assert!(result2.is_err());
-    }
-
-    #[test]
-    fn test_simhash_multiple_fields() {
-        let sdl = r#"
-            index documents {
-                field embed1: sparse_vector<u32> [indexed<format: bmp>, simhash]
-                field embed2: sparse_vector<u32> [indexed<format: bmp>, simhash]
-            }
-        "#;
-
-        let indexes = parse_sdl(sdl).unwrap();
-        let index = &indexes[0];
-        assert!(index.fields[0].simhash);
-        assert!(index.fields[1].simhash);
-    }
-
-    #[test]
-    fn test_no_simhash_field() {
-        let sdl = r#"
-            index documents {
-                field title: text [indexed, stored]
-            }
-        "#;
-
-        let indexes = parse_sdl(sdl).unwrap();
+        // Verify schema roundtrip
         let schema = indexes[0].to_schema();
-        // No field should have simhash set
-        assert!(schema.fields().all(|(_, entry)| !entry.simhash));
+        let f1 = schema.get_field("embedding").unwrap();
+        assert!(schema.get_field_entry(f1).unwrap().reorder);
+
+        let f2 = schema.get_field("embedding2").unwrap();
+        assert!(!schema.get_field_entry(f2).unwrap().reorder);
     }
 }

@@ -20,7 +20,6 @@ use crate::structures::{
 };
 
 use crate::DocId;
-use rustc_hash::FxHashMap as FxHashMapRust;
 
 /// Builder for sparse vector index using BlockSparsePostingList
 ///
@@ -71,7 +70,6 @@ impl SparseVectorBuilder {
 pub(super) fn build_sparse_streaming(
     sparse_vectors: &mut FxHashMap<u32, SparseVectorBuilder>,
     schema: &Schema,
-    ordinal_simhashes: &FxHashMapRust<u32, FxHashMapRust<(DocId, u16), u64>>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     if sparse_vectors.is_empty() {
@@ -108,6 +106,11 @@ pub(super) fn build_sparse_streaming(
         let min_terms = sparse_config.map(|c| c.min_terms).unwrap_or(4);
         let total_vectors = builder.total_vectors;
 
+        let reorder = schema
+            .get_field_entry(field)
+            .map(|e| e.reorder)
+            .unwrap_or(false);
+
         match format {
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
@@ -115,7 +118,6 @@ pub(super) fn build_sparse_streaming(
                 let max_weight = sparse_config.and_then(|c| c.max_weight).unwrap_or(5.0); // default SPLADE max
 
                 let blob_offset = current_offset;
-                let field_simhashes = ordinal_simhashes.get(&field_id);
                 let blob_len = super::bmp::build_bmp_blob(
                     std::mem::take(&mut builder.postings),
                     bmp_block_size,
@@ -124,7 +126,7 @@ pub(super) fn build_sparse_streaming(
                     dims,
                     max_weight,
                     min_terms,
-                    field_simhashes,
+                    reorder,
                     writer,
                 )
                 .map_err(crate::Error::Io)?;

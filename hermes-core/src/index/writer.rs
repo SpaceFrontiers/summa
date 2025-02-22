@@ -668,9 +668,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.force_merge().await
     }
 
-    /// Reorder all segments by SimHash similarity for better BMP pruning.
+    /// Reorder all segments via Recursive Graph Bisection (BP) for better BMP pruning.
     ///
-    /// Each segment is individually rebuilt with record-level SimHash reordering:
+    /// Each segment is individually rebuilt with record-level BP reordering:
     /// ordinals are shuffled across blocks so that similar content clusters tightly.
     pub async fn reorder(&mut self) -> Result<()> {
         self.prepare_commit().await?.commit().await?;

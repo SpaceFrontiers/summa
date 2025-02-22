@@ -13,8 +13,8 @@ mod config;
 mod dense;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
+pub(crate) mod graph_bisection;
 mod postings;
-pub(crate) mod simhash;
 mod sparse;
 mod store;
 
@@ -129,9 +129,6 @@ pub struct SegmentBuilder {
 
     /// Fast-field columnar writers per field_id (only for fields with fast=true)
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldWriter>,
-
-    /// Per-ordinal SimHash for BMP block clustering: field_id → (doc_id, ordinal) → simhash
-    ordinal_simhashes: FxHashMap<u32, FxHashMap<(DocId, u16), u64>>,
 }
 
 impl SegmentBuilder {
@@ -229,7 +226,6 @@ impl SegmentBuilder {
             estimated_memory: 0,
             doc_serialize_buffer: Vec::with_capacity(256),
             fast_fields,
-            ordinal_simhashes: FxHashMap::default(),
         })
     }
 
@@ -460,30 +456,8 @@ impl SegmentBuilder {
                     self.index_dense_vector_field(*field, doc_id, ordinal as u16, vec)?;
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
-                    let has_simhash = entry.simhash;
-                    // Extract config before mutable borrows below
-                    let sparse_cfg = entry.sparse_vector_config.as_ref();
-                    let wt = sparse_cfg.map(|c| c.weight_threshold).unwrap_or(0.0);
-                    let mw = sparse_cfg.and_then(|c| c.max_weight).unwrap_or(5.0);
                     let ordinal = self.next_element_ordinal(field.0);
                     self.index_sparse_vector_field(*field, doc_id, ordinal as u16, entries)?;
-                    // V12: compute simhash for every ordinal (not just ordinal 0)
-                    // Uses quantized u8 impacts (matching reorder_bmp_blob) so that
-                    // build-time and reorder-time SimHash are identical.
-                    if has_simhash {
-                        let h = simhash::simhash_from_sparse_vector(entries, wt, mw);
-                        let is_new_field = !self.ordinal_simhashes.contains_key(&field.0);
-                        self.ordinal_simhashes
-                            .entry(field.0)
-                            .or_default()
-                            .insert((doc_id, ordinal as u16), h);
-                        // Memory: (doc_id, ordinal) key (6B) + u64 hash (8B) + hashmap overhead (~8B)
-                        self.estimated_memory += size_of::<(DocId, u16)>() + size_of::<u64>() + 8;
-                        if is_new_field {
-                            self.estimated_memory +=
-                                size_of::<u32>() + size_of::<FxHashMap<(DocId, u16), u64>>() + 8;
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -811,7 +785,6 @@ impl SegmentBuilder {
         let compression_level = self.config.compression_level;
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
         let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
-        let ordinal_simhashes = std::mem::take(&mut self.ordinal_simhashes);
         let schema = &self.schema;
 
         // Pre-create all streaming writers (async) before entering sync rayon scope
@@ -889,7 +862,6 @@ impl SegmentBuilder {
                                         sparse::build_sparse_streaming(
                                             &mut sparse_vectors,
                                             schema,
-                                            &ordinal_simhashes,
                                             w,
                                         )?;
                                     }

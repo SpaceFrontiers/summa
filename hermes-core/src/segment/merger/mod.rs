@@ -78,21 +78,21 @@ pub use super::types::TrainedVectorStructures;
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
-    /// When true, force record-level SimHash reorder on all BMP fields.
-    force_simhash_reorder: bool,
+    /// When true, force record-level BP reorder on all BMP fields.
+    force_reorder: bool,
 }
 
 impl SegmentMerger {
     pub fn new(schema: Arc<Schema>) -> Self {
         Self {
             schema,
-            force_simhash_reorder: false,
+            force_reorder: false,
         }
     }
 
-    /// Enable forced SimHash reorder on all BMP fields during merge.
-    pub fn with_force_simhash_reorder(mut self, force: bool) -> Self {
-        self.force_simhash_reorder = force;
+    /// Enable forced BP reorder on all BMP fields during merge.
+    pub fn with_force_reorder(mut self, force: bool) -> Self {
+        self.force_reorder = force;
         self
     }
 

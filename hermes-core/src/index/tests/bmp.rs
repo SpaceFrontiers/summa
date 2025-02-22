@@ -732,17 +732,15 @@ async fn test_bmp_multi_round_merge() {
     );
 }
 
-/// BMP SimHash reorder: verify correctness after merge with SimHash block reordering.
+/// BMP merge correctness: verify all documents are still findable after merge.
 ///
-/// Builds multiple segments with `simhash=true`, force_merges (triggering block
-/// reordering by SimHash similarity), and verifies every document is still findable
-/// by its unique dimension.
+/// Builds multiple segments, force_merges, and verifies every document is still
+/// findable by its unique dimension.
 #[tokio::test]
-async fn test_bmp_simhash_reorder_merge() {
+async fn test_bmp_merge_correctness() {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
-    sb.set_simhash(sparse, true);
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -760,7 +758,7 @@ async fn test_bmp_simhash_reorder_merge() {
             let unique_dim = (seg * DOCS_PER_SEG + i) as u32;
             let mut doc = Document::new();
             doc.add_text(title, format!("seg{} doc{}", seg, i));
-            // Multiple dims per doc so SimHash has something to differentiate
+            // Multiple dims per doc for differentiation
             let topic_dim = 10000 + (seg as u32 * 100);
             doc.add_sparse_vector(
                 sparse,
@@ -779,7 +777,7 @@ async fn test_bmp_simhash_reorder_merge() {
         "Should have >= 5 segments before merge"
     );
 
-    // Force merge — triggers SimHash block reordering
+    // Force merge
     let mut writer = IndexWriter::open(dir.clone(), config.clone())
         .await
         .unwrap();
@@ -827,7 +825,7 @@ async fn test_bmp_simhash_reorder_merge() {
     }
     assert!(
         failures.is_empty(),
-        "SimHash reorder merge: {} failures:\n{}",
+        "Merge correctness: {} failures:\n{}",
         failures.len(),
         failures[..failures.len().min(20)].join("\n")
     );
@@ -838,22 +836,21 @@ async fn test_bmp_simhash_reorder_merge() {
     assert_eq!(
         results.len(),
         DOCS_PER_SEG * NUM_SEGS,
-        "SimHash reorder: dim 9999 should match all {} docs, got {}",
+        "Merge: dim 9999 should match all {} docs, got {}",
         DOCS_PER_SEG * NUM_SEGS,
         results.len()
     );
 }
 
-/// BMP SimHash reorder: stress test with many blocks and multi-segment merge.
+/// BMP merge large: stress test with many blocks and multi-segment merge.
 ///
 /// Uses enough documents to span many superblocks (>64 blocks), with varied
-/// topic distributions to trigger aggressive reordering.
+/// topic distributions.
 #[tokio::test]
-async fn test_bmp_simhash_reorder_large() {
+async fn test_bmp_merge_large() {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
-    sb.set_simhash(sparse, true);
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -889,7 +886,7 @@ async fn test_bmp_simhash_reorder_large() {
         writer.commit().await.unwrap();
     }
 
-    // Force merge with SimHash reordering
+    // Force merge
     let mut writer = IndexWriter::open(dir.clone(), config.clone())
         .await
         .unwrap();
@@ -933,7 +930,7 @@ async fn test_bmp_simhash_reorder_large() {
     }
     assert!(
         failures.is_empty(),
-        "SimHash reorder large: {} failures (of {}):\n{}",
+        "Merge large: {} failures (of {}):\n{}",
         failures.len(),
         DOCS_PER_SEG * NUM_SEGS,
         failures[..failures.len().min(30)].join("\n")
@@ -952,7 +949,7 @@ async fn test_bmp_simhash_reorder_large() {
 
 /// BMP standalone reorder: build 1 segment, call writer.reorder(), verify all docs findable.
 ///
-/// Tests the record-level SimHash reorder path where individual ordinals are
+/// Tests the record-level BP reorder path where individual ordinals are
 /// shuffled across blocks for better clustering.
 #[tokio::test]
 async fn test_bmp_reorder_standalone() {
@@ -1156,158 +1153,21 @@ async fn test_bmp_reorder_multi_field() {
     assert_eq!(results.len(), NUM_DOCS);
 }
 
-/// After reorder, verify that intra-block SimHash Hamming distances are small
-/// (similar vectors cluster into the same blocks).
-#[tokio::test]
-async fn test_bmp_reorder_simhash_quality() {
-    use crate::segment::simhash_from_sparse_vector;
-
-    fn hamming_distance(a: u64, b: u64) -> u32 {
-        (a ^ b).count_ones()
-    }
-
-    let mut sb = SchemaBuilder::default();
-    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
-    let schema = sb.build();
-
-    let dir = RamDirectory::new();
-    let config = IndexConfig::default();
-    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
-        .await
-        .unwrap();
-
-    // Generate docs from 3 topics with disjoint dim ranges
-    const NUM_DOCS: usize = 300;
-    let mut all_entries: Vec<Vec<(u32, f32)>> = Vec::new();
-    let mut rng = 42u64;
-    let mut next = || -> u32 {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (rng >> 33) as u32
-    };
-
-    for i in 0..NUM_DOCS {
-        let topic = i % 3;
-        let base_dim = topic as u32 * 10000; // 0, 10000, 20000
-        let mut entries: Vec<(u32, f32)> = (0..60)
-            .map(|_| {
-                let d = base_dim + next() % 500;
-                let w = 0.3 + (next() % 100) as f32 / 50.0;
-                (d, w)
-            })
-            .collect();
-        entries.sort_by_key(|&(d, _)| d);
-        entries.dedup_by_key(|e| e.0);
-
-        let mut doc = Document::new();
-        doc.add_sparse_vector(sparse, entries.clone());
-        writer.add_document(doc).unwrap();
-        all_entries.push(entries);
-    }
-
-    writer
-        .prepare_commit()
-        .await
-        .unwrap()
-        .commit()
-        .await
-        .unwrap();
-    writer.reorder().await.unwrap();
-
-    // Read the BMP index to check block-level SimHash clustering
-    let index = Index::open(dir, config).await.unwrap();
-    let reader = index.reader().await.unwrap();
-    let searcher = reader.searcher().await.unwrap();
-    let sr = &searcher.segment_readers()[0];
-    let bmp = sr.bmp_index(sparse).unwrap();
-
-    // Compute SimHash for all docs and compare intra-block vs inter-block distances
-    let simhashes: Vec<u64> = all_entries
-        .iter()
-        .map(|e| simhash_from_sparse_vector(e, 0.0, 5.0))
-        .collect();
-
-    // Group by topic and compute avg intra-topic Hamming
-    let mut intra_topic_dists = Vec::new();
-    for topic in 0..3 {
-        let topic_hashes: Vec<u64> = (0..NUM_DOCS)
-            .filter(|&i| i % 3 == topic)
-            .map(|i| simhashes[i])
-            .collect();
-        for i in 0..topic_hashes.len() {
-            for j in (i + 1)..topic_hashes.len() {
-                intra_topic_dists.push(hamming_distance(topic_hashes[i], topic_hashes[j]));
-            }
-        }
-    }
-
-    let mut inter_topic_dists = Vec::new();
-    let t0: Vec<u64> = (0..NUM_DOCS)
-        .filter(|i| i % 3 == 0)
-        .map(|i| simhashes[i])
-        .collect();
-    let t1: Vec<u64> = (0..NUM_DOCS)
-        .filter(|i| i % 3 == 1)
-        .map(|i| simhashes[i])
-        .collect();
-    for &a in &t0 {
-        for &b in &t1 {
-            inter_topic_dists.push(hamming_distance(a, b));
-        }
-    }
-
-    let avg_intra = intra_topic_dists.iter().sum::<u32>() as f64 / intra_topic_dists.len() as f64;
-    let avg_inter = inter_topic_dists.iter().sum::<u32>() as f64 / inter_topic_dists.len() as f64;
-
-    assert!(
-        avg_intra < avg_inter,
-        "Intra-topic Hamming ({:.1}) should be less than inter-topic ({:.1})",
-        avg_intra,
-        avg_inter,
-    );
-
-    // Verify block SimHash in Section H is non-zero (reorder wrote it)
-    let mut nonzero_simhashes = 0;
-    for b in 0..bmp.num_blocks {
-        if bmp.block_simhash(b) != 0 {
-            nonzero_simhashes += 1;
-        }
-    }
-    assert!(
-        nonzero_simhashes > 0,
-        "Section H should have non-zero per-block SimHash after reorder"
-    );
-
-    // Verify all docs still searchable
-    for i in 0..NUM_DOCS {
-        let topic = i % 3;
-        let base_dim = topic as u32 * 10000;
-        let query = SparseVectorQuery::new(sparse, vec![(base_dim + 1, 1.0)]);
-        let results = searcher.search(&query, NUM_DOCS).await.unwrap();
-        assert!(
-            !results.is_empty(),
-            "Topic {} query should return results",
-            topic
-        );
-    }
-}
-
-/// BMP V12 multi-ordinal SimHash clustering: verify ordinals from different
-/// documents cluster by content similarity, not by parent document.
+/// BMP multi-ordinal clustering: verify ordinals from different
+/// documents are findable after merge with BP reordering.
 ///
 /// Creates documents with 3 ordinals each, where ordinals belong to distinct
-/// "topics" (disjoint dimension sets). With per-ordinal SimHash, ordinals
-/// sharing a topic should land in nearby blocks regardless of parent doc_id.
+/// "topics" (disjoint dimension sets).
 ///
 /// Verifies:
 /// 1. All documents findable by unique dims after build + merge
 /// 2. Topic queries return correct documents
-/// 3. Multi-ordinal combine_ordinal_results works with SimHash-reordered vids
+/// 3. Multi-ordinal combine_ordinal_results works with BP-reordered vids
 #[tokio::test]
-async fn test_bmp_multi_ordinal_simhash_clustering() {
+async fn test_bmp_multi_ordinal_clustering() {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
-    sb.set_simhash(sparse, true);
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -1325,9 +1185,6 @@ async fn test_bmp_multi_ordinal_simhash_clustering() {
     //   ordinal 0: topic A dims + unique dim
     //   ordinal 1: topic B dims + unique dim
     //   ordinal 2: topic C dims + unique dim
-    //
-    // Without per-ordinal SimHash: all 3 ordinals of doc_i land in same block
-    // With per-ordinal SimHash: topic A ordinals cluster together across docs
 
     const NUM_DOCS: usize = 200;
     let mut rng: u32 = 42;
@@ -1395,7 +1252,7 @@ async fn test_bmp_multi_ordinal_simhash_clustering() {
     }
     writer.commit().await.unwrap();
 
-    // Force merge — triggers SimHash block reordering with per-ordinal clustering
+    // Force merge
     let mut writer = IndexWriter::open(dir.clone(), config.clone())
         .await
         .unwrap();
@@ -1490,7 +1347,7 @@ async fn test_bmp_multi_ordinal_simhash_clustering() {
     }
     assert!(
         failures.is_empty(),
-        "Multi-ordinal SimHash clustering: {} failures:\n{}",
+        "Multi-ordinal clustering: {} failures:\n{}",
         failures.len(),
         failures[..failures.len().min(20)].join("\n")
     );
