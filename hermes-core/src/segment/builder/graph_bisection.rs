@@ -17,6 +17,8 @@ use super::bmp::VidLookup;
 // ── Forward index (CSR) ──────────────────────────────────────────────────
 
 /// Forward index in CSR format: doc `d`'s terms are `terms[offsets[d]..offsets[d+1]]`.
+///
+/// Term IDs are remapped to compact range `0..num_terms` for flat-array degree tracking.
 pub(crate) struct ForwardIndex {
     terms: Vec<u32>,
     offsets: Vec<u32>,
@@ -39,6 +41,11 @@ impl ForwardIndex {
         let end = self.offsets[doc + 1] as usize;
         &self.terms[start..end]
     }
+
+    /// Total postings in the forward index.
+    pub fn total_postings(&self) -> u32 {
+        self.offsets.last().copied().unwrap_or(0)
+    }
 }
 
 // ── BP configuration ─────────────────────────────────────────────────────
@@ -57,6 +64,7 @@ pub(crate) struct BpParams {
 /// Build forward index from BMP postings (inverted → forward).
 ///
 /// Filters dims with doc_freq outside `[min_doc_freq, max_doc_freq]`.
+/// Remaps term IDs to compact range `0..num_active_terms` for flat-array degree tracking.
 /// `vid_lookup` maps `(doc_id, ordinal)` → virtual_id.
 pub(crate) fn build_forward_index(
     num_docs: usize,
@@ -71,18 +79,26 @@ pub(crate) fn build_forward_index(
         min_doc_freq,
         max_doc_freq,
     } = *params;
-    // Phase 1: count terms per doc
-    let mut counts = vec![0u32; num_docs];
-    let mut num_active_terms = 0usize;
 
-    for (&_dim_id, dim_posts) in postings {
-        // Filter by doc frequency
+    // Phase 1: Assign compact term IDs to active dimensions
+    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
+    for (&dim_id, dim_posts) in postings {
         let df = dim_posts.len();
-        if df < min_doc_freq || df > max_doc_freq {
-            continue;
+        if df >= min_doc_freq && df <= max_doc_freq {
+            let compact_id = term_remap.len() as u32;
+            term_remap.insert(dim_id, compact_id);
         }
-        num_active_terms += 1;
-        let skip_wt = df < min_terms;
+    }
+    let num_active_terms = term_remap.len();
+
+    // Phase 2: count terms per doc
+    let mut counts = vec![0u32; num_docs];
+
+    for (&dim_id, dim_posts) in postings {
+        let Some(&_compact) = term_remap.get(&dim_id) else {
+            continue;
+        };
+        let skip_wt = dim_posts.len() < min_terms;
         for &(doc_id, ordinal, weight) in dim_posts {
             let abs_w = weight.abs();
             if !skip_wt && abs_w < weight_threshold {
@@ -101,7 +117,7 @@ pub(crate) fn build_forward_index(
         }
     }
 
-    // Phase 2: build CSR offsets
+    // Phase 3: build CSR offsets
     let mut offsets = Vec::with_capacity(num_docs + 1);
     offsets.push(0u32);
     for &c in &counts {
@@ -109,16 +125,15 @@ pub(crate) fn build_forward_index(
     }
     let total = *offsets.last().unwrap() as usize;
 
-    // Phase 3: fill terms
+    // Phase 4: fill terms (using compact IDs)
     let mut terms = vec![0u32; total];
     counts.fill(0);
 
     for (&dim_id, dim_posts) in postings {
-        let df = dim_posts.len();
-        if df < min_doc_freq || df > max_doc_freq {
+        let Some(&compact) = term_remap.get(&dim_id) else {
             continue;
-        }
-        let skip_wt = df < min_terms;
+        };
+        let skip_wt = dim_posts.len() < min_terms;
         for &(doc_id, ordinal, weight) in dim_posts {
             let abs_w = weight.abs();
             if !skip_wt && abs_w < weight_threshold {
@@ -132,7 +147,7 @@ pub(crate) fn build_forward_index(
                 let vid = vid as usize;
                 if vid < num_docs {
                     let pos = offsets[vid] as usize + counts[vid] as usize;
-                    terms[pos] = dim_id;
+                    terms[pos] = compact;
                     counts[vid] += 1;
                 }
             }
@@ -150,6 +165,7 @@ pub(crate) fn build_forward_index(
 ///
 /// Iterates all blocks and postings to invert the BMP block data into a
 /// per-virtual-doc forward index. Filters by doc frequency bounds.
+/// Remaps term IDs to compact range `0..num_active_terms`.
 pub(crate) fn build_forward_index_from_bmp(
     bmp: &crate::segment::reader::bmp::BmpIndex,
     min_doc_freq: usize,
@@ -159,7 +175,7 @@ pub(crate) fn build_forward_index_from_bmp(
     let num_blocks = bmp.num_blocks as usize;
     let block_size = bmp.bmp_block_size as usize;
 
-    // Phase 1: count doc freq per dimension
+    // Phase 1: count doc freq per dimension + assign compact IDs
     let mut dim_df: FxHashMap<u32, usize> = FxHashMap::default();
     for block_id in 0..num_blocks {
         for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
@@ -172,31 +188,29 @@ pub(crate) fn build_forward_index_from_bmp(
         }
     }
 
+    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
+    for (&dim_id, &df) in &dim_df {
+        if df >= min_doc_freq && df <= max_doc_freq {
+            let compact_id = term_remap.len() as u32;
+            term_remap.insert(dim_id, compact_id);
+        }
+    }
+    let num_active_terms = term_remap.len();
+
     // Phase 2: count terms per doc (filtered)
     let mut counts = vec![0u32; num_docs];
-    let mut num_active_terms = 0usize;
 
     for block_id in 0..num_blocks {
         for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-            let df = dim_df.get(&dim_id).copied().unwrap_or(0);
-            if df < min_doc_freq || df > max_doc_freq {
+            if !term_remap.contains_key(&dim_id) {
                 continue;
             }
-            // Count active terms only once
-            // (we'll deduplicate after)
             for p in postings {
                 let vid = block_id * block_size + p.local_slot as usize;
                 if vid < num_docs && p.impact > 0 {
                     counts[vid] += 1;
                 }
             }
-        }
-    }
-
-    // Count distinct active terms
-    for &df in dim_df.values() {
-        if df >= min_doc_freq && df <= max_doc_freq {
-            num_active_terms += 1;
         }
     }
 
@@ -208,21 +222,20 @@ pub(crate) fn build_forward_index_from_bmp(
     }
     let total = *offsets.last().unwrap() as usize;
 
-    // Phase 4: fill terms
+    // Phase 4: fill terms (compact IDs)
     let mut terms = vec![0u32; total];
     counts.fill(0);
 
     for block_id in 0..num_blocks {
         for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-            let df = dim_df.get(&dim_id).copied().unwrap_or(0);
-            if df < min_doc_freq || df > max_doc_freq {
+            let Some(&compact) = term_remap.get(&dim_id) else {
                 continue;
-            }
+            };
             for p in postings {
                 let vid = block_id * block_size + p.local_slot as usize;
                 if vid < num_docs && p.impact > 0 {
                     let pos = offsets[vid] as usize + counts[vid] as usize;
-                    terms[pos] = dim_id;
+                    terms[pos] = compact;
                     counts[vid] += 1;
                 }
             }
@@ -242,6 +255,9 @@ pub(crate) fn build_forward_index_from_bmp(
 ///
 /// `min_partition_size` should be the BMP block_size (64).
 /// `max_iters` controls convergence (20 is standard).
+///
+/// Term IDs in the forward index must be compact (0..num_terms) so we can
+/// use flat arrays for O(1) degree lookups instead of hash maps.
 pub(crate) fn graph_bisection(
     fwd: &ForwardIndex,
     min_partition_size: usize,
@@ -252,23 +268,18 @@ pub(crate) fn graph_bisection(
         return Vec::new();
     }
 
-    // Initialize document order as identity permutation
     let mut docs: Vec<u32> = (0..n as u32).collect();
-
-    // Precompute fast_log2 table
     let log_table = build_log_table(4096);
 
-    // Allocate degree arrays — shared across recursive calls via slicing.
-    // Two arrays: left_deg[term], right_deg[term] for the current partition.
-    // We need term_id → degree, using the max dim_id as upper bound won't work
-    // efficiently. Instead, use a FxHashMap approach within each bisection call.
-    // For efficiency, allocate scratch buffers once.
     bisect(&mut docs, fwd, min_partition_size, max_iters, &log_table);
 
     docs
 }
 
 /// Recursive bisection of a document slice.
+///
+/// Uses flat `Vec<u32>` degree arrays indexed by compact term_id for cache-friendly
+/// O(1) lookups (vs FxHashMap which has poor cache locality at scale).
 fn bisect(
     docs: &mut [u32],
     fwd: &ForwardIndex,
@@ -282,12 +293,13 @@ fn bisect(
     }
 
     let mid = n / 2;
+    let nt = fwd.num_terms;
 
-    // Build term degree arrays for left and right halves.
-    // left_deg[term_id] = count of docs in left half containing term_id
-    // right_deg[term_id] = count of docs in right half containing term_id
-    let mut left_deg: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut right_deg: FxHashMap<u32, u32> = FxHashMap::default();
+    // Flat degree arrays: left_deg[term] and right_deg[term].
+    // Allocated per bisection level; freed on return before recursion uses the
+    // memory for sub-problems. Peak = O(num_terms × log2(n/min_partition_size)).
+    let mut left_deg = vec![0u32; nt];
+    let mut right_deg = vec![0u32; nt];
 
     for (i, &doc) in docs.iter().enumerate() {
         let target = if i < mid {
@@ -296,33 +308,30 @@ fn bisect(
             &mut right_deg
         };
         for &term in fwd.doc_terms(doc as usize) {
-            *target.entry(term).or_insert(0) += 1;
+            target[term as usize] += 1;
         }
     }
 
-    // Iterative refinement
+    // Scratch buffers reused across iterations
     let mut gains: Vec<f32> = vec![0.0; n];
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut new_left: Vec<u32> = Vec::with_capacity(mid);
+    let mut new_right: Vec<u32> = Vec::with_capacity(n - mid);
 
     for iter in 0..max_iters {
-        // Compute gain for each document
-        // gain(d) = sum over terms t in d:
-        //   if d is in left:  log2(right_deg[t] + 2) - log2(left_deg[t]) - 1/(1 + right_deg[t])
-        //   if d is in right: log2(left_deg[t] + 2) - log2(right_deg[t]) - 1/(1 + left_deg[t])
-        // (approx_1 from the paper: gain for moving d from its current side to the other)
+        // Compute gain for each document (approx_1 from Dhulipala et al.)
         for (i, &doc) in docs.iter().enumerate() {
             let mut gain = 0.0f32;
             let in_left = i < mid;
             for &term in fwd.doc_terms(doc as usize) {
-                let ld = *left_deg.get(&term).unwrap_or(&0);
-                let rd = *right_deg.get(&term).unwrap_or(&0);
+                let t = term as usize;
+                let ld = left_deg[t];
+                let rd = right_deg[t];
                 if in_left {
-                    // Moving from left to right
-                    // from_deg = ld, to_deg = rd
                     gain += fast_log2_lookup(rd as usize + 2, log_table)
                         - fast_log2_lookup(ld as usize, log_table)
                         - std::f32::consts::LOG2_E / (1.0 + rd as f32);
                 } else {
-                    // Moving from right to left
                     gain += fast_log2_lookup(ld as usize + 2, log_table)
                         - fast_log2_lookup(rd as usize, log_table)
                         - std::f32::consts::LOG2_E / (1.0 + ld as f32);
@@ -331,22 +340,18 @@ fn bisect(
             gains[i] = gain;
         }
 
-        // Partition: highest-gain docs go to left, lowest to right.
-        // Use select_nth_unstable_by to partition around midpoint.
-        // We want the top `mid` docs by gain in left, rest in right.
-        // So partition by descending gain — docs[0..mid] = highest gain (want to be in left).
-
-        // Create index array sorted by gain
-        let mut indices: Vec<usize> = (0..n).collect();
+        // Partition: top `mid` by gain go to left
+        indices.clear();
+        indices.extend(0..n);
         indices.select_nth_unstable_by(mid, |&a, &b| {
             gains[b]
                 .partial_cmp(&gains[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Determine which docs are swapping sides
-        let mut new_left: Vec<u32> = Vec::with_capacity(mid);
-        let mut new_right: Vec<u32> = Vec::with_capacity(n - mid);
+        // Apply partition, update degree arrays for swapped docs
+        new_left.clear();
+        new_right.clear();
         let mut any_swap = false;
 
         for (rank, &idx) in indices.iter().enumerate() {
@@ -362,22 +367,19 @@ fn bisect(
 
             if was_left != now_left {
                 any_swap = true;
-                // Update degree arrays
                 for &term in fwd.doc_terms(doc as usize) {
+                    let t = term as usize;
                     if was_left {
-                        // Moved left → right
-                        *left_deg.entry(term).or_insert(0) -= 1;
-                        *right_deg.entry(term).or_insert(0) += 1;
+                        left_deg[t] -= 1;
+                        right_deg[t] += 1;
                     } else {
-                        // Moved right → left
-                        *right_deg.entry(term).or_insert(0) -= 1;
-                        *left_deg.entry(term).or_insert(0) += 1;
+                        right_deg[t] -= 1;
+                        left_deg[t] += 1;
                     }
                 }
             }
         }
 
-        // Apply new ordering
         docs[..mid].copy_from_slice(&new_left);
         docs[mid..].copy_from_slice(&new_right);
 
@@ -385,7 +387,7 @@ fn bisect(
             break;
         }
 
-        // Cooling: if gains are very small in later iterations, break early
+        // Cooling: break early if gains are negligible
         if iter > 5 {
             let max_gain = gains.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             if max_gain.abs() < 0.001 {
@@ -394,7 +396,14 @@ fn bisect(
         }
     }
 
-    // Recurse on left and right halves
+    // Drop scratch before recursion to free memory for sub-problems
+    drop(left_deg);
+    drop(right_deg);
+    drop(gains);
+    drop(indices);
+    drop(new_left);
+    drop(new_right);
+
     let (left, right) = docs.split_at_mut(mid);
     rayon::join(
         || bisect(left, fwd, min_partition_size, max_iters, log_table),

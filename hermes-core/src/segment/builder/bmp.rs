@@ -206,11 +206,14 @@ pub(crate) fn build_bmp_blob(
     let bp_perm = if reorder {
         let vid_lookup = VidLookup::from_sorted_pairs(&vid_pairs);
         let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
+        // min_doc_freq=2: include all terms appearing in at least 2 docs.
+        // Rare terms are the most discriminative for clustering — aggressive
+        // filtering (e.g. 128) removes the signal BP needs.
         let bp_params = super::graph_bisection::BpParams {
             weight_threshold,
             max_weight,
             min_terms,
-            min_doc_freq: 128.min(num_real_docs),
+            min_doc_freq: 2,
             max_doc_freq: max_doc_freq.max(1),
         };
         let fwd = super::graph_bisection::build_forward_index(
@@ -222,7 +225,18 @@ pub(crate) fn build_bmp_blob(
         drop(vid_lookup);
 
         if fwd.num_terms > 0 && num_real_docs > bmp_block_size as usize {
+            log::info!(
+                "BP reorder: {} docs, {} active terms, {} total postings in forward index",
+                num_real_docs,
+                fwd.num_terms,
+                fwd.total_postings(),
+            );
+            let bp_start = std::time::Instant::now();
             let perm = super::graph_bisection::graph_bisection(&fwd, bmp_block_size as usize, 20);
+            log::info!(
+                "BP reorder completed in {:.1}ms",
+                bp_start.elapsed().as_secs_f64() * 1000.0
+            );
             drop(fwd);
             let reordered: Vec<(DocId, u16)> =
                 perm.iter().map(|&i| vid_pairs[i as usize]).collect();
