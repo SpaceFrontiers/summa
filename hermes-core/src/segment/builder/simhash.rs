@@ -14,17 +14,41 @@ pub(crate) fn stafford_mix(dim_id: u32) -> u64 {
     h
 }
 
+/// Accumulate one (dim_id, impact) pair into a 64-element SimHash accumulator.
+///
+/// This is the shared primitive used by both `simhash_from_sparse_vector`
+/// (build-time) and `reorder_bmp_blob` (reorder-time).
+#[inline]
+pub(crate) fn simhash_accumulate(acc: &mut [i32; 64], dim_id: u32, impact: i32) {
+    let mut mask = stafford_mix(dim_id);
+    for chunk in acc.chunks_exact_mut(4) {
+        chunk[0] += if mask & 1 != 0 { impact } else { -impact };
+        chunk[1] += if mask & 2 != 0 { impact } else { -impact };
+        chunk[2] += if mask & 4 != 0 { impact } else { -impact };
+        chunk[3] += if mask & 8 != 0 { impact } else { -impact };
+        mask >>= 4;
+    }
+}
+
+/// Convert a 64-element accumulator to a SimHash fingerprint.
+/// Bit i = 1 iff accumulator[i] > 0.
+#[inline]
+pub(crate) fn simhash_finalize(acc: &[i32; 64]) -> u64 {
+    let mut hash = 0u64;
+    for (bit, &a) in acc.iter().enumerate() {
+        if a > 0 {
+            hash |= 1u64 << bit;
+        }
+    }
+    hash
+}
+
 /// Compute SimHash from a sparse vector using quantized u8 impacts.
 ///
 /// This matches exactly what `reorder_bmp_blob` computes from BMP block data,
 /// ensuring build-time and reorder-time SimHash are identical. Entries below
 /// `weight_threshold` or that quantize to zero impact are excluded — same as
 /// what survives into the BMP block postings.
-///
-/// Each surviving (dim_id, impact) pair contributes to a 64-bit fingerprint:
-/// - Hash dim_id with splitmix64 to get a 64-bit pseudo-random mask
-/// - For each bit, accumulate +impact or -impact based on that bit
-/// - Final hash: bit i = 1 iff accumulator[i] > 0
 #[inline]
 pub fn simhash_from_sparse_vector(
     entries: &[(u32, f32)],
@@ -46,24 +70,9 @@ pub fn simhash_from_sparse_vector(
         if impact == 0 {
             continue;
         }
-        let h = stafford_mix(dim);
-        let w = impact as i32;
-        let mut mask = h;
-        for chunk in acc.chunks_exact_mut(4) {
-            chunk[0] += if mask & 1 != 0 { w } else { -w };
-            chunk[1] += if mask & 2 != 0 { w } else { -w };
-            chunk[2] += if mask & 4 != 0 { w } else { -w };
-            chunk[3] += if mask & 8 != 0 { w } else { -w };
-            mask >>= 4;
-        }
+        simhash_accumulate(&mut acc, dim, impact as i32);
     }
-    let mut hash = 0u64;
-    for (bit, &a) in acc.iter().enumerate() {
-        if a > 0 {
-            hash |= 1u64 << bit;
-        }
-    }
-    hash
+    simhash_finalize(&acc)
 }
 
 /// Compute per-bit majority vote SimHash from a set of hashes.

@@ -942,7 +942,9 @@ fn reorder_bmp_blob(
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
     use crate::segment::builder::bmp::{stream_write_grids, write_v12_footer};
-    use crate::segment::builder::simhash::{majority_simhash, stafford_mix};
+    use crate::segment::builder::simhash::{
+        majority_simhash, simhash_accumulate, simhash_finalize,
+    };
 
     let num_blocks = bmp.num_blocks as usize;
     let effective_block_size = bmp.bmp_block_size as usize;
@@ -994,36 +996,18 @@ fn reorder_bmp_blob(
 
         // Accumulate weighted SimHash from block postings
         for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-            let dim_hash = stafford_mix(dim_id);
             for p in postings {
                 let slot = p.local_slot as usize;
                 if slot >= slots_in_block || p.impact == 0 {
                     continue;
                 }
-                let w = p.impact as i32;
-                let acc = &mut slot_acc[slot];
-                let mut mask = dim_hash;
-                // Unrolled 4-at-a-time, matching simhash_from_sparse_vector
-                for chunk in acc.chunks_exact_mut(4) {
-                    chunk[0] += if mask & 1 != 0 { w } else { -w };
-                    chunk[1] += if mask & 2 != 0 { w } else { -w };
-                    chunk[2] += if mask & 4 != 0 { w } else { -w };
-                    chunk[3] += if mask & 8 != 0 { w } else { -w };
-                    mask >>= 4;
-                }
+                simhash_accumulate(&mut slot_acc[slot], dim_id, p.impact as i32);
             }
         }
 
         // Convert accumulators to SimHash
         for (slot, acc) in slot_acc.iter().enumerate().take(slots_in_block) {
-            let vid = block_start_vid + slot;
-            let mut hash = 0u64;
-            for (bit, &a) in acc.iter().enumerate() {
-                if a > 0 {
-                    hash |= 1u64 << bit;
-                }
-            }
-            vid_simhash[vid] = hash;
+            vid_simhash[block_start_vid + slot] = simhash_finalize(acc);
         }
     }
 
