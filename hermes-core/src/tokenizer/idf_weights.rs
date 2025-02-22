@@ -225,8 +225,26 @@ impl IdfWeightsCache {
         IdfWeights::from_json_with_tokenizer(&json_bytes, &tokenizer.tokenizer)
     }
 
-    /// Download raw idf.json bytes from HuggingFace hub
+    /// Load idf.json bytes, preferring the HF hub's local cache (no network)
+    /// and only downloading if not already cached.
     fn download_idf_json(&self, model_name: &str) -> Result<Vec<u8>> {
+        // Check HF hub's disk cache first — no network request
+        let cache = hf_hub::Cache::from_env();
+        let cache_repo = cache.model(model_name.to_string());
+        if let Some(cached_path) = cache_repo.get("idf.json") {
+            debug!(
+                "Loaded idf.json from HF cache: {:?} for model '{}'",
+                cached_path, model_name
+            );
+            return std::fs::read(&cached_path).map_err(|e| {
+                Error::Tokenizer(format!(
+                    "Failed to read cached idf.json at {:?}: {}",
+                    cached_path, e
+                ))
+            });
+        }
+
+        // Not in cache — download via API
         let api = hf_hub::api::sync::Api::new()
             .map_err(|e| Error::Tokenizer(format!("Failed to create HF hub API: {}", e)))?;
         let repo = api.model(model_name.to_string());
