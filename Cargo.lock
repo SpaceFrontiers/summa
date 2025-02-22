@@ -1788,7 +1788,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -3718,9 +3718,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.36"
+version = "0.23.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c665f33d38cea657d9614f766881e4d510e0eda4239891eea56b4cadcf01801b"
+checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
 dependencies = [
  "aws-lc-rs",
  "log",
