@@ -571,7 +571,10 @@ fn merge_bmp_field(
         }
         drop(row_buf);
 
-        // ── Reordered Phase 4: sb_grid from packed grid nibbles ─────
+        // ── Reordered Phase 4: sb_grid from source sb_grids (permuted) ──
+        // Use source sb_grid (u8 values) NOT the 4-bit packed grid (nibbles 0-15).
+        // The sb_grid stores max u8 impact per (dim, superblock) — must stay on u8 scale
+        // to match the scoring path which uses u8 block impacts.
         let sb_grid_offset = writer.offset() - blob_start;
         let mut sb_row = vec![0u8; num_superblocks];
         let sb_size = BMP_SUPERBLOCK_SIZE as usize;
@@ -580,21 +583,21 @@ fn merge_bmp_field(
             sb_row.fill(0);
             for (src_i, &(bmp, _)) in sources.iter().enumerate() {
                 let base_global = block_offsets[src_i] as usize;
-                let src_prs = bmp.packed_row_size();
                 let src_num_blocks = bmp.num_blocks as usize;
-                let src_row_start = dim_id as usize * src_prs;
-                let src_row_end = src_row_start + src_prs;
-                let src_grid = bmp.grid_slice();
-                if src_row_end > src_grid.len() {
+                let src_num_sbs = bmp.num_superblocks as usize;
+                let src_sb_grid = bmp.sb_grid_slice();
+                let src_sb_row_start = dim_id as usize * src_num_sbs;
+                let src_sb_row_end = src_sb_row_start + src_num_sbs;
+                if src_sb_row_end > src_sb_grid.len() {
                     continue;
                 }
+                let src_sb_row = &src_sb_grid[src_sb_row_start..src_sb_row_end];
 
+                // For each source block, map to permuted position and propagate
+                // the source superblock's u8 max impact to the output superblock.
                 for b in 0..src_num_blocks {
-                    let val = if b.is_multiple_of(2) {
-                        src_grid[src_row_start + b / 2] & 0x0F
-                    } else {
-                        src_grid[src_row_start + b / 2] >> 4
-                    };
+                    let src_sb = b / sb_size;
+                    let val = src_sb_row[src_sb];
                     if val == 0 {
                         continue;
                     }

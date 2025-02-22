@@ -430,7 +430,7 @@ fn execute_bmp_inner(
         let threshold = collector.threshold();
         if elapsed_ms > 500.0 {
             log::warn!(
-                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}",
+                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}, alpha={:.2}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
@@ -438,10 +438,11 @@ fn execute_bmp_inner(
                 num_blocks,
                 collector.len(),
                 threshold,
+                alpha,
             );
         } else {
             log::debug!(
-                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}",
+                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}, alpha={:.2}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
@@ -449,16 +450,20 @@ fn execute_bmp_inner(
                 num_blocks,
                 collector.len(),
                 threshold,
+                alpha,
             );
         }
 
-        // Diagnostic: check if any pruned superblock has UB above threshold
+        // Diagnostic: check if any pruned superblock has UB above effective
+        // pruning threshold (threshold / alpha). Only a real bug if alpha=1.0
+        // and SBs with UB > threshold were skipped.
         if log::log_enabled!(log::Level::Debug) && sbs_scored < num_superblocks_total as u32 {
+            let effective_threshold = if alpha > 0.0 { threshold / alpha } else { threshold };
             let mut pruned_above = 0u32;
             let mut max_pruned_ub = 0.0f32;
             for sb in 0..num_superblocks_total {
                 let ub = scratch.sb_ubs[sb];
-                if ub > threshold && ub > 0.0 {
+                if ub > effective_threshold && ub > 0.0 {
                     // Check if this SB was actually visited
                     let was_visited = scratch.sb_order[..sbs_scored as usize]
                         .iter()
@@ -471,9 +476,9 @@ fn execute_bmp_inner(
             }
             if pruned_above > 0 {
                 log::warn!(
-                    "BMP PRUNING BUG: {} superblocks pruned with UB > threshold ({:.4}), max_pruned_ub={:.4}",
+                    "BMP PRUNING BUG: {} superblocks with UB > {:.4} (threshold/alpha) pruned, max_pruned_ub={:.4}",
                     pruned_above,
-                    threshold,
+                    effective_threshold,
                     max_pruned_ub,
                 );
             }
