@@ -66,7 +66,7 @@ use std::collections::BinaryHeap;
 use std::io::Write;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// O(1) virtual-ID lookup table, built from sorted `(doc_id, ordinal)` pairs.
 ///
@@ -159,9 +159,8 @@ pub(crate) fn build_bmp_blob(
         }
     }
 
-    // Phase 1: Collect unique (doc_id, ordinal) pairs and track dominant dimension.
-    // Single pass over all postings — dedup by FxHashMap keyed on (doc_id, ordinal).
-    // Each entry also stores (max_impact, argmax_dim) for sorting.
+    // Phase 1: Find global max weight AND collect unique (doc_id, ordinal) pairs.
+    // Single pass over all postings — dedup by FxHashSet keyed on (doc_id, ordinal).
     //
     // Weight threshold is skipped for dims with fewer than min_terms postings
     // to protect small dimensions from losing signal.
@@ -169,12 +168,10 @@ pub(crate) fn build_bmp_blob(
     // Capacity: use the LARGEST single dim's posting count as a lower bound on
     // unique pairs (each doc appears at least once).
     let max_dim_postings: usize = postings.values().map(|v| v.len()).max().unwrap_or(0);
-    // Track unique (doc_id, ordinal) pairs AND their dominant (highest-impact) dimension.
-    // Used for (argmax_dim, simhash) sorting that concentrates per-dimension postings.
-    let mut vid_info: FxHashMap<(DocId, u16), (u8, u32)> =
-        FxHashMap::with_capacity_and_hasher(max_dim_postings, Default::default());
+    let mut vid_set: FxHashSet<(DocId, u16)> =
+        FxHashSet::with_capacity_and_hasher(max_dim_postings, Default::default());
 
-    for (&dim_id, dim_postings) in &postings {
+    for dim_postings in postings.values() {
         let skip_threshold = dim_postings.len() < min_terms;
         for &(doc_id, ordinal, weight) in dim_postings {
             let abs_w = weight.abs();
@@ -185,14 +182,11 @@ pub(crate) fn build_bmp_blob(
             if impact == 0 {
                 continue;
             }
-            let entry = vid_info.entry((doc_id, ordinal)).or_insert((0, 0));
-            if impact > entry.0 {
-                *entry = (impact, dim_id);
-            }
+            vid_set.insert((doc_id, ordinal));
         }
     }
 
-    if vid_info.is_empty() {
+    if vid_set.is_empty() {
         return Ok(0);
     }
 
@@ -200,25 +194,16 @@ pub(crate) fn build_bmp_blob(
     let max_weight_scale = max_weight;
 
     // Assign compact virtual IDs: sequential IDs for unique (doc_id, ordinal) pairs.
-    let mut vid_pairs: Vec<(DocId, u16)> = vid_info.keys().copied().collect();
+    let mut vid_pairs: Vec<(DocId, u16)> = vid_set.into_iter().collect();
     if let Some(sh_map) = ordinal_simhashes {
-        // V12: Sort by (argmax_dim, simhash, doc_id, ordinal).
-        // Primary key = dominant dimension: concentrates per-dimension postings
-        // in few superblocks for effective superblock pruning.
-        // Secondary key = SimHash: within each dimension group, orders by
-        // overall content similarity for block-level locality.
+        // V12: Sort by (simhash, doc_id, ordinal) — cluster similar content
         vid_pairs.sort_unstable_by_key(|&(doc_id, ord)| {
             let h = sh_map.get(&(doc_id, ord)).copied().unwrap_or(0);
-            let argmax_dim = vid_info
-                .get(&(doc_id, ord))
-                .map(|&(_, dim)| dim)
-                .unwrap_or(0);
-            (argmax_dim, h, doc_id, ord)
+            (h, doc_id, ord)
         });
     } else {
         vid_pairs.sort_unstable(); // default: (doc_id, ordinal)
     }
-    drop(vid_info);
     let num_real_docs = vid_pairs.len();
 
     // Build O(1) lookup table from (doc_id, ordinal) → virtual_id.
