@@ -39,8 +39,8 @@
 
 use super::scoring::{ScoreCollector, ScoredDoc};
 use crate::segment::{
-    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_u4_weighted, accumulate_u8_weighted,
-    block_term_postings, compute_block_masks_4bit, find_dim_in_block_data,
+    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_u4_weighted, block_term_postings,
+    compute_block_masks_4bit, find_dim_in_block_data,
 };
 
 // dim_id is used directly as grid row index. No dim_idx indirection.
@@ -287,6 +287,8 @@ fn execute_bmp_inner(
 
         // grid_dims: (dim_index_into_grid, weight) — local for compact, global for direct
         let grid_dims: Vec<(usize, f32)>;
+        // sb_int_weights: (dim_index_into_sb_grid, u16_weight) — for integer-consistent SB UBs
+        let sb_int_weights: Vec<(usize, u16)>;
         let sb_grid_slice: &[u8];
         let grid_slice: &[u8];
 
@@ -298,11 +300,19 @@ fn execute_bmp_inner(
                 &mut scratch.compact_grid,
             );
             grid_dims = (0..resolved.len()).map(|i| (i, resolved[i].1)).collect();
+            sb_int_weights = (0..resolved.len())
+                .map(|i| (i, query_by_dim_u16[i].1))
+                .collect();
             sb_grid_slice = &scratch.compact_sb_grid;
             grid_slice = &scratch.compact_grid;
         } else {
             // Direct mmap access — zero allocation. Grid layout uses global dim indices.
             grid_dims = resolved.clone();
+            sb_int_weights = resolved
+                .iter()
+                .enumerate()
+                .map(|(i, &(idx, _))| (idx, query_by_dim_u16[i].1))
+                .collect();
             sb_grid_slice = index.sb_grid_slice();
             grid_slice = index.grid_slice();
             // Shrink oversized compact buffers from previous queries
@@ -312,14 +322,15 @@ fn execute_bmp_inner(
             }
         }
 
-        // Phase 2: Compute SUPERBLOCK UBs from grid
-        compute_sb_ubs_compact(
+        // Phase 2: Compute SUPERBLOCK UBs using integer weights (matching scoring path)
+        compute_sb_ubs_int(
             sb_grid_slice,
             num_superblocks_total,
-            &grid_dims,
+            &sb_int_weights,
+            dequant,
             &mut scratch.sb_ubs,
         );
-        bucket_sort_blocks_desc_into(
+        sort_sb_desc_into(
             &scratch.sb_ubs[..num_superblocks_total],
             &mut scratch.sb_order,
         );
@@ -416,26 +427,56 @@ fn execute_bmp_inner(
         }
 
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        let threshold = collector.threshold();
         if elapsed_ms > 500.0 {
             log::warn!(
-                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}",
+                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
                 blocks_scored,
                 num_blocks,
-                collector.len()
+                collector.len(),
+                threshold,
             );
         } else {
             log::debug!(
-                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}",
+                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
                 blocks_scored,
                 num_blocks,
-                collector.len()
+                collector.len(),
+                threshold,
             );
+        }
+
+        // Diagnostic: check if any pruned superblock has UB above threshold
+        if log::log_enabled!(log::Level::Debug) && sbs_scored < num_superblocks_total as u32 {
+            let mut pruned_above = 0u32;
+            let mut max_pruned_ub = 0.0f32;
+            for sb in 0..num_superblocks_total {
+                let ub = scratch.sb_ubs[sb];
+                if ub > threshold && ub > 0.0 {
+                    // Check if this SB was actually visited
+                    let was_visited = scratch.sb_order[..sbs_scored as usize]
+                        .iter()
+                        .any(|&id| id as usize == sb);
+                    if !was_visited {
+                        pruned_above += 1;
+                        max_pruned_ub = max_pruned_ub.max(ub);
+                    }
+                }
+            }
+            if pruned_above > 0 {
+                log::warn!(
+                    "BMP PRUNING BUG: {} superblocks pruned with UB > threshold ({:.4}), max_pruned_ub={:.4}",
+                    pruned_above,
+                    threshold,
+                    max_pruned_ub,
+                );
+            }
         }
 
         collector_to_results(collector)
@@ -676,51 +717,27 @@ fn sort_local_blocks_desc(local_ubs: &[f32], out: &mut Vec<u32>) {
     });
 }
 
-/// Bucket sort block IDs by their upper bounds in descending order, into `out`.
+/// Sort superblock IDs by their upper bounds in strictly descending order, into `out`.
 ///
-/// Uses 256 buckets. O(n) time vs O(n log n) for comparison sort.
+/// Uses comparison sort for correctness: the `break` in the superblock loop relies
+/// on strict descending order — if a SB with UB <= threshold appears, ALL subsequent
+/// SBs must also have UB <= threshold. Approximate sorts (bucket sort) can violate
+/// this within a bucket, causing the `break` to skip SBs that should be processed.
+///
+/// For ~2K superblocks, comparison sort takes ~30μs — negligible vs BMP query time.
 /// Reuses `out` Vec to avoid allocation.
-fn bucket_sort_blocks_desc_into(block_ubs: &[f32], out: &mut Vec<u32>) {
+fn sort_sb_desc_into(block_ubs: &[f32], out: &mut Vec<u32>) {
     out.clear();
-
-    // Find max UB for normalization
-    let max_ub = block_ubs.iter().cloned().fold(0.0f32, f32::max);
-    if max_ub <= 0.0 {
-        return;
-    }
-
-    const NUM_BUCKETS: usize = 256;
-    let inv_max = (NUM_BUCKETS - 1) as f32 / max_ub;
-
-    // Count pass: how many blocks per bucket
-    let mut counts = [0u32; NUM_BUCKETS];
-    for &ub in block_ubs {
+    for (i, &ub) in block_ubs.iter().enumerate() {
         if ub > 0.0 {
-            let bucket = (ub * inv_max) as usize;
-            counts[bucket.min(NUM_BUCKETS - 1)] += 1;
+            out.push(i as u32);
         }
     }
-
-    // Prefix sum (from high to low for descending order)
-    let total: u32 = counts.iter().sum();
-    let mut offsets = [0u32; NUM_BUCKETS];
-    let mut running = 0u32;
-    for i in (0..NUM_BUCKETS).rev() {
-        offsets[i] = running;
-        running += counts[i];
-    }
-
-    // Scatter pass
-    out.resize(total as usize, 0);
-    for (b, &ub) in block_ubs.iter().enumerate() {
-        if ub > 0.0 {
-            let bucket = (ub * inv_max) as usize;
-            let bucket = bucket.min(NUM_BUCKETS - 1);
-            let pos = offsets[bucket] as usize;
-            out[pos] = b as u32;
-            offsets[bucket] += 1;
-        }
-    }
+    out.sort_unstable_by(|&a, &b| {
+        block_ubs[b as usize]
+            .partial_cmp(&block_ubs[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
@@ -739,22 +756,32 @@ fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
 // Compact grid helpers: operate on query-local contiguous grid buffers
 // ============================================================================
 
-/// Compute superblock UBs from compact (query-local) sb_grid.
+/// Compute superblock UBs using integer weights for consistency with integer scoring.
+///
+/// Uses the same u16 query weights and dequantization factor as `score_block_bsearch_int`,
+/// ensuring `sb_ub >= dequantized_score` for any document in the superblock. This avoids
+/// a subtle correctness issue where f32-weighted UBs can be slightly LOWER than
+/// integer-scored thresholds due to u16 quantization rounding.
 ///
 /// `compact_sb_grid` layout: `compact_sb_grid[local_dim * nsb + sb_id]`
-/// `compact_dims[i] = (i, weight)` where `i` is the local dim index.
+/// `int_weights[i] = (local_dim_index, u16_weight)` — parallel to `compact_dims`.
 #[inline]
-fn compute_sb_ubs_compact(
+fn compute_sb_ubs_int(
     compact_sb_grid: &[u8],
     nsb: usize,
-    compact_dims: &[(usize, f32)],
+    int_weights: &[(usize, u16)],
+    dequant: f32,
     out: &mut [f32],
 ) {
     debug_assert!(out.len() >= nsb);
-    out[..nsb].fill(0.0);
-    for &(local_idx, weight) in compact_dims {
-        let row = &compact_sb_grid[local_idx * nsb..local_idx * nsb + nsb];
-        accumulate_u8_weighted(row, weight, &mut out[..nsb]);
+    // Accumulate as u32 to match integer scoring path exactly
+    for sb in 0..nsb {
+        let mut acc: u32 = 0;
+        for &(local_idx, w) in int_weights {
+            let val = compact_sb_grid[local_idx * nsb + sb];
+            acc += w as u32 * val as u32;
+        }
+        out[sb] = acc as f32 * dequant;
     }
 }
 

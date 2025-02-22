@@ -20,8 +20,7 @@ pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub(crate) use reader::BmpIndex;
 pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
 pub(crate) use reader::bmp::{
-    accumulate_u4_weighted, accumulate_u8_weighted, block_term_postings, compute_block_masks_4bit,
-    find_dim_in_block_data,
+    accumulate_u4_weighted, block_term_postings, compute_block_masks_4bit, find_dim_in_block_data,
 };
 pub(crate) use reader::combine_ordinal_results;
 pub use reader::{SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
