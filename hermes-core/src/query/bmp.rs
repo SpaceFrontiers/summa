@@ -487,8 +487,157 @@ fn execute_bmp_inner(
         collector_to_results(collector)
     });
 
-    // Collector already contains real doc_ids and ordinals (deduped at collection time).
+    // Verify: compare pruned results with exhaustive (no-pruning) scoring.
+    // Only runs at DEBUG level. Detects any pruning-induced result divergence.
+    if log::log_enabled!(log::Level::Debug) {
+        let exhaustive = execute_bmp_exhaustive(index, query_terms, k)?;
+        let mut pruned_ids: Vec<(u32, u16)> =
+            result.iter().map(|r| (r.doc_id, r.ordinal)).collect();
+        let mut exhaust_ids: Vec<(u32, u16)> =
+            exhaustive.iter().map(|r| (r.doc_id, r.ordinal)).collect();
+        pruned_ids.sort_unstable();
+        exhaust_ids.sort_unstable();
+        if pruned_ids != exhaust_ids {
+            let missing: Vec<_> = exhaust_ids
+                .iter()
+                .filter(|id| !pruned_ids.contains(id))
+                .collect();
+            let extra: Vec<_> = pruned_ids
+                .iter()
+                .filter(|id| !exhaust_ids.contains(id))
+                .collect();
+            log::warn!(
+                "BMP VERIFY MISMATCH: pruned returned {} results, exhaustive returned {}. \
+                 missing={} (in exhaustive but not pruned), extra={} (in pruned but not exhaustive). \
+                 Top exhaustive scores: {:?}",
+                result.len(),
+                exhaustive.len(),
+                missing.len(),
+                extra.len(),
+                exhaustive
+                    .iter()
+                    .take(5)
+                    .map(|r| (r.doc_id, r.score))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
     Ok(result)
+}
+
+/// Exhaustive BMP execution: score ALL blocks without any pruning.
+///
+/// For debugging: bypasses superblock/block pruning entirely.
+/// Scores every non-empty block and returns top-k results.
+/// Compare with `execute_bmp` to identify pruning-related issues.
+pub fn execute_bmp_exhaustive(
+    index: &BmpIndex,
+    query_terms: &[(u32, f32)],
+    k: usize,
+) -> crate::Result<Vec<ScoredDoc>> {
+    if query_terms.is_empty() || index.num_blocks == 0 {
+        return Ok(Vec::new());
+    }
+
+    let scale = index.max_weight_scale / 255.0;
+    let num_blocks = index.num_blocks as usize;
+    let block_size = index.bmp_block_size as usize;
+    let dims = index.dims();
+
+    let mut query_info: Vec<(u32, f32)> = Vec::with_capacity(query_terms.len());
+    for &(dim_id, weight) in query_terms {
+        if dim_id < dims {
+            query_info.push((dim_id, weight * scale));
+        }
+    }
+    if query_info.is_empty() {
+        return Ok(Vec::new());
+    }
+    query_info.sort_unstable_by_key(|&(dim_id, _)| dim_id);
+
+    let max_scaled = query_info.iter().map(|q| q.1.abs()).fold(0.0f32, f32::max);
+    let (quant_scale, dequant) = if max_scaled > 0.0 {
+        (16383.0 / max_scaled, max_scaled / 16383.0)
+    } else {
+        (0.0, 0.0)
+    };
+    let query_by_dim_u16: Vec<(u32, u16)> = query_info
+        .iter()
+        .map(|&(dim_id, w)| {
+            (
+                dim_id,
+                (w.abs() * quant_scale).round().clamp(0.0, 16383.0) as u16,
+            )
+        })
+        .collect();
+
+    let ordinals_per_doc = if index.num_real_docs() > 0 {
+        (index.num_virtual_docs as f32 / index.num_real_docs() as f32).ceil() as usize
+    } else {
+        1
+    };
+    let collector_k = (k * ordinals_per_doc).min(k * 10).max(k);
+    let mut collector = ScoreCollector::new(collector_k);
+    let mut acc = vec![0u32; block_size];
+    let num_vdocs = index.num_virtual_docs as usize;
+    let mut blocks_scored = 0u32;
+
+    for block_id in 0..num_blocks as u32 {
+        let (num_terms, dim_ptr, ps_ptr, post_ptr) = index.parse_block(block_id);
+        if num_terms == 0 {
+            continue;
+        }
+
+        let mut touched = [0u64; 4];
+        score_block_bsearch_int(
+            num_terms,
+            dim_ptr,
+            ps_ptr,
+            post_ptr,
+            &query_by_dim_u16,
+            u64::MAX, // no mask filtering
+            &mut acc,
+            &mut touched,
+        );
+
+        let base = block_id as usize * block_size;
+        for (word, &touch_word) in touched.iter().enumerate() {
+            let mut scan = touch_word;
+            while scan != 0 {
+                let bit = scan.trailing_zeros() as usize;
+                scan &= scan - 1;
+                let i = word * 64 + bit;
+                let score_u32 = acc[i];
+                acc[i] = 0;
+                if score_u32 == 0 {
+                    continue;
+                }
+                let virtual_id = base + i;
+                if virtual_id >= num_vdocs {
+                    continue;
+                }
+                let (doc_id, ordinal) = index.virtual_to_doc(virtual_id as u32);
+                if doc_id == u32::MAX {
+                    continue;
+                }
+                let score = score_u32 as f32 * dequant;
+                if collector.would_enter(score) {
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
+                }
+            }
+        }
+        blocks_scored += 1;
+    }
+
+    log::debug!(
+        "BMP exhaustive: blocks={}/{}, returned={}",
+        blocks_scored,
+        num_blocks,
+        collector.len(),
+    );
+
+    Ok(collector_to_results(collector))
 }
 
 // ============================================================================
