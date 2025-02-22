@@ -461,11 +461,17 @@ impl SegmentBuilder {
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
                     let has_simhash = entry.simhash;
+                    // Extract config before mutable borrows below
+                    let sparse_cfg = entry.sparse_vector_config.as_ref();
+                    let wt = sparse_cfg.map(|c| c.weight_threshold).unwrap_or(0.0);
+                    let mw = sparse_cfg.and_then(|c| c.max_weight).unwrap_or(5.0);
                     let ordinal = self.next_element_ordinal(field.0);
                     self.index_sparse_vector_field(*field, doc_id, ordinal as u16, entries)?;
                     // V12: compute simhash for every ordinal (not just ordinal 0)
+                    // Uses quantized u8 impacts (matching reorder_bmp_blob) so that
+                    // build-time and reorder-time SimHash are identical.
                     if has_simhash {
-                        let h = simhash::simhash_from_sparse_vector(entries);
+                        let h = simhash::simhash_from_sparse_vector(entries, wt, mw);
                         let is_new_field = !self.ordinal_simhashes.contains_key(&field.0);
                         self.ordinal_simhashes
                             .entry(field.0)

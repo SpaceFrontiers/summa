@@ -289,6 +289,216 @@ pub async fn show_info(index_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub async fn heatmap_bmp_grid(
+    index_path: PathBuf,
+    field_name: Option<String>,
+    width: Option<usize>,
+    height: Option<usize>,
+    segment_idx: usize,
+) -> Result<()> {
+    use hermes_core::{FieldType, Index};
+
+    let dir = FsDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let index = Index::open(dir, config).await?;
+    let schema = index.schema().clone();
+    let segments = index.segment_readers().await?;
+
+    anyhow::ensure!(!segments.is_empty(), "Index has no segments");
+    anyhow::ensure!(
+        segment_idx < segments.len(),
+        "Segment index {} out of range (have {} segments)",
+        segment_idx,
+        segments.len()
+    );
+
+    let segment = &segments[segment_idx];
+
+    // Find BMP field
+    let (field, field_name) = if let Some(name) = &field_name {
+        let f = schema
+            .get_field(name)
+            .ok_or_else(|| anyhow::anyhow!("Field '{}' not found in schema", name))?;
+        (f, name.clone())
+    } else {
+        // Auto-detect first BMP field
+        schema
+            .fields()
+            .find(|(_, entry)| {
+                entry.field_type == FieldType::SparseVector
+                    && entry
+                        .sparse_vector_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.format == hermes_core::structures::SparseFormat::Bmp)
+            })
+            .map(|(f, entry)| (f, entry.name.clone()))
+            .ok_or_else(|| anyhow::anyhow!("No BMP sparse vector field found in schema"))?
+    };
+
+    let bmp = segment.bmp_index(field).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No BMP index for field '{}' in segment {}",
+            field_name,
+            segment_idx
+        )
+    })?;
+
+    let dims = bmp.dims() as usize;
+    let num_blocks = bmp.num_blocks as usize;
+    let packed_row_size = bmp.packed_row_size();
+    let grid = bmp.grid_slice();
+
+    // Get terminal size
+    let (term_cols, term_rows) = terminal_size();
+    let out_cols = width.unwrap_or(term_cols.saturating_sub(8)).max(10);
+    // ×2 for half-block packing (each char row = 2 pixel rows)
+    let out_pixel_rows = height.unwrap_or(term_rows.saturating_sub(6)).max(4) * 2;
+
+    let dim_bin_size = dims.div_ceil(out_pixel_rows).max(1);
+    let block_bin_size = num_blocks.div_ceil(out_cols).max(1);
+    let actual_rows = dims.div_ceil(dim_bin_size);
+    let actual_cols = num_blocks.div_ceil(block_bin_size);
+
+    // Downsample grid via max aggregation
+    let mut heatmap = vec![vec![0u8; actual_cols]; actual_rows];
+    let mut nonzero_cells = 0u64;
+    let mut total_cells = 0u64;
+
+    for d in 0..dims {
+        let row = (d / dim_bin_size).min(actual_rows - 1);
+        let row_base = d * packed_row_size;
+        for b in 0..num_blocks {
+            let col = (b / block_bin_size).min(actual_cols - 1);
+            let byte = grid[row_base + b / 2];
+            let val = if b % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            if val > 0 {
+                nonzero_cells += 1;
+            }
+            total_cells += 1;
+            heatmap[row][col] = heatmap[row][col].max(val);
+        }
+    }
+
+    let sparsity = if total_cells > 0 {
+        100.0 * (1.0 - nonzero_cells as f64 / total_cells as f64)
+    } else {
+        100.0
+    };
+
+    // Print header
+    println!(
+        "BMP Grid Heatmap: field={}, segment={}",
+        field_name, segment_idx
+    );
+    println!(
+        "  dims={}, blocks={}, real_docs={}, total_terms={}, total_postings={}",
+        dims,
+        num_blocks,
+        bmp.num_real_docs(),
+        bmp.total_terms(),
+        bmp.total_postings()
+    );
+    println!(
+        "  grid: {}x{} -> {}x{} (bin: {}d x {}b), sparsity: {:.1}%",
+        dims, num_blocks, actual_rows, actual_cols, dim_bin_size, block_bin_size, sparsity
+    );
+    println!();
+
+    // Render heatmap using Unicode half-blocks
+    for row_pair in (0..actual_rows).step_by(2) {
+        // Dim axis label
+        let dim_start = row_pair * dim_bin_size;
+        print!("{:>6} ", dim_start);
+
+        let top_row = &heatmap[row_pair];
+        let bot_row = if row_pair + 1 < actual_rows {
+            Some(&heatmap[row_pair + 1])
+        } else {
+            None
+        };
+        for (col, &top) in top_row.iter().enumerate() {
+            let bot = bot_row.map_or(0, |r| r[col]);
+            let fg = nibble_to_color(top);
+            let bg = nibble_to_color(bot);
+            print!("\x1b[38;5;{}m\x1b[48;5;{}m\u{2580}", fg, bg);
+        }
+        println!("\x1b[0m");
+    }
+
+    // Block axis labels
+    print!("       ");
+    let label_step = actual_cols / 5;
+    if label_step > 0 {
+        for i in 0..5 {
+            let block_start = i * label_step * block_bin_size;
+            let padding = label_step;
+            print!("{:<width$}", block_start, width = padding);
+        }
+    }
+    println!();
+
+    // Color scale legend
+    print!("       ");
+    for v in 0..=15u8 {
+        let c = nibble_to_color(v);
+        print!("\x1b[38;5;{}m\u{2588}", c);
+    }
+    println!("\x1b[0m  0..............15");
+
+    Ok(())
+}
+
+/// Map a 4-bit nibble value (0-15) to an ANSI 256-color index.
+fn nibble_to_color(val: u8) -> u8 {
+    match val {
+        0 => 232, // near-black
+        1 => 17,  // dark blue
+        2 => 18,
+        3 => 19,
+        4 => 20, // blue
+        5 => 27,
+        6 => 33, // cyan
+        7 => 39,
+        8 => 44,
+        9 => 40, // green
+        10 => 46,
+        11 => 118, // yellow-green
+        12 => 226, // yellow
+        13 => 220,
+        14 => 196, // red
+        _ => 231,  // white
+    }
+}
+
+/// Detect terminal size. Tries `stty size`, then COLUMNS/LINES env vars, falls back to 80x24.
+fn terminal_size() -> (usize, usize) {
+    // Try `stty size` which returns "rows cols"
+    if let Ok(output) = std::process::Command::new("stty")
+        .arg("size")
+        .arg("-F")
+        .arg("/dev/tty")
+        .output()
+        && let Ok(s) = std::str::from_utf8(&output.stdout)
+    {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.len() == 2
+            && let (Ok(rows), Ok(cols)) = (parts[0].parse(), parts[1].parse())
+        {
+            return (cols, rows);
+        }
+    }
+    // Fallback to env vars
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80);
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    (cols, rows)
+}
+
 pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> {
     use hermes_core::{DirectoryWriter, SLICE_CACHE_FILENAME, SliceCachingDirectory};
 

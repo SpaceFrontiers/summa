@@ -1,30 +1,53 @@
-/// Stafford mix13 variant — good avalanche for 32→64 bit expansion.
+/// SplitMix64 finalizer — good avalanche for 32→64 bit expansion.
 /// Used to derive SimHash bit patterns from dimension IDs.
+///
+/// Based on the standard splitmix64 output function (Steele et al.).
+/// Starts from `dim_id + 1` to avoid the fixed point at zero.
 #[inline]
 pub(crate) fn stafford_mix(dim_id: u32) -> u64 {
-    let mut h = dim_id as u64;
-    h = h.wrapping_mul(0x517cc1b727220a95);
-    h ^= h >> 32;
-    h = h.wrapping_mul(0x6c62272e07bb0142);
+    let mut h = dim_id as u64 + 1; // +1 avoids fixed point: stafford_mix(0) != 0
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d049bb133111eb); // odd multiplier — all 64 output bits active
+    h ^= h >> 31;
     h
 }
 
-/// Compute SimHash from a sparse vector's dimension IDs and weights.
+/// Compute SimHash from a sparse vector using quantized u8 impacts.
 ///
-/// Each (dim_id, weight) pair contributes to a 64-bit fingerprint:
-/// - Hash dim_id with Stafford mix13 to get a 64-bit pseudo-random mask
-/// - For each bit, accumulate +weight or -weight based on that bit
+/// This matches exactly what `reorder_bmp_blob` computes from BMP block data,
+/// ensuring build-time and reorder-time SimHash are identical. Entries below
+/// `weight_threshold` or that quantize to zero impact are excluded — same as
+/// what survives into the BMP block postings.
+///
+/// Each surviving (dim_id, impact) pair contributes to a 64-bit fingerprint:
+/// - Hash dim_id with splitmix64 to get a 64-bit pseudo-random mask
+/// - For each bit, accumulate +impact or -impact based on that bit
 /// - Final hash: bit i = 1 iff accumulator[i] > 0
-///
-/// Documents with similar dimension sets produce similar hashes
-/// (small Hamming distance), enabling block-reorder clustering.
 #[inline]
-pub fn simhash_from_sparse_vector(entries: &[(u32, f32)]) -> u64 {
-    let mut acc = [0.0f64; 64];
+pub fn simhash_from_sparse_vector(
+    entries: &[(u32, f32)],
+    weight_threshold: f32,
+    max_weight: f32,
+) -> u64 {
+    let mut acc = [0i32; 64];
     for &(dim, weight) in entries {
+        let abs_w = weight.abs();
+        if abs_w < weight_threshold {
+            continue;
+        }
+        // Same quantization as build_bmp_blob / quantize_weight
+        let impact = if max_weight <= 0.0 {
+            0u8
+        } else {
+            (abs_w / max_weight * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+        if impact == 0 {
+            continue;
+        }
         let h = stafford_mix(dim);
-        let w = weight as f64;
-        // Process 4 bits at a time to reduce loop overhead
+        let w = impact as i32;
         let mut mask = h;
         for chunk in acc.chunks_exact_mut(4) {
             chunk[0] += if mask & 1 != 0 { w } else { -w };
@@ -36,7 +59,7 @@ pub fn simhash_from_sparse_vector(entries: &[(u32, f32)]) -> u64 {
     }
     let mut hash = 0u64;
     for (bit, &a) in acc.iter().enumerate() {
-        if a > 0.0 {
+        if a > 0 {
             hash |= 1u64 << bit;
         }
     }
@@ -76,8 +99,8 @@ mod tests {
     #[test]
     fn test_simhash_identical() {
         let v = vec![(10, 1.0), (20, 0.5), (100, 2.0)];
-        let h1 = simhash_from_sparse_vector(&v);
-        let h2 = simhash_from_sparse_vector(&v);
+        let h1 = simhash_from_sparse_vector(&v, 0.0, 5.0);
+        let h2 = simhash_from_sparse_vector(&v, 0.0, 5.0);
         assert_eq!(h1, h2);
     }
 
@@ -94,9 +117,9 @@ mod tests {
         // Dissimilar: completely different dims
         let dissimilar: Vec<(u32, f32)> = (5000..5100).map(|d| (d, 1.0)).collect();
 
-        let h_base = simhash_from_sparse_vector(&base);
-        let h_similar = simhash_from_sparse_vector(&similar);
-        let h_dissimilar = simhash_from_sparse_vector(&dissimilar);
+        let h_base = simhash_from_sparse_vector(&base, 0.0, 5.0);
+        let h_similar = simhash_from_sparse_vector(&similar, 0.0, 5.0);
+        let h_dissimilar = simhash_from_sparse_vector(&dissimilar, 0.0, 5.0);
 
         let dist_similar = hamming_distance(h_base, h_similar);
         let dist_dissimilar = hamming_distance(h_base, h_dissimilar);
@@ -152,10 +175,10 @@ mod tests {
 
         // Generate 10 vectors from each topic
         let topic_a: Vec<u64> = (0..10)
-            .map(|_| simhash_from_sparse_vector(&make_topic_a(&mut next)))
+            .map(|_| simhash_from_sparse_vector(&make_topic_a(&mut next), 0.0, 5.0))
             .collect();
         let topic_b: Vec<u64> = (0..10)
-            .map(|_| simhash_from_sparse_vector(&make_topic_b(&mut next)))
+            .map(|_| simhash_from_sparse_vector(&make_topic_b(&mut next), 0.0, 5.0))
             .collect();
 
         // Intra-topic distances should be small
@@ -208,9 +231,9 @@ mod tests {
         let mut v3: Vec<(u32, f32)> = (0..50).map(|d| (d, 0.1)).collect();
         v3.push((100, 5.0)); // heavy dim A (same as v1)
 
-        let h1 = simhash_from_sparse_vector(&v1);
-        let h2 = simhash_from_sparse_vector(&v2);
-        let h3 = simhash_from_sparse_vector(&v3);
+        let h1 = simhash_from_sparse_vector(&v1, 0.0, 5.0);
+        let h2 = simhash_from_sparse_vector(&v2, 0.0, 5.0);
+        let h3 = simhash_from_sparse_vector(&v3, 0.0, 5.0);
 
         assert_eq!(h1, h3, "Identical vectors should produce identical hashes");
         assert!(
@@ -222,7 +245,7 @@ mod tests {
     /// Empty vector produces zero hash.
     #[test]
     fn test_simhash_empty() {
-        assert_eq!(simhash_from_sparse_vector(&[]), 0);
+        assert_eq!(simhash_from_sparse_vector(&[], 0.0, 5.0), 0);
     }
 
     /// Majority SimHash: basic correctness.
@@ -256,5 +279,23 @@ mod tests {
         assert_ne!(h0, h1);
         assert_ne!(h1, h2);
         assert_ne!(h0, h2);
+    }
+
+    /// stafford_mix(0) must not be zero (fixed-point bug) and bit 0 must be active.
+    #[test]
+    fn test_stafford_mix_no_fixed_point() {
+        assert_ne!(
+            stafford_mix(0),
+            0,
+            "stafford_mix(0) must not be a fixed point"
+        );
+
+        // Bit 0 should be set for at least some dim_ids (not always zero)
+        let bit0_set = (0..100).filter(|&d| stafford_mix(d) & 1 != 0).count();
+        assert!(
+            bit0_set > 30,
+            "Bit 0 should be set ~50% of the time, got {}/100",
+            bit0_set
+        );
     }
 }

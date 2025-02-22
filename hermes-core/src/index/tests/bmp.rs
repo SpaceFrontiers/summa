@@ -1223,7 +1223,7 @@ async fn test_bmp_reorder_simhash_quality() {
     // Compute SimHash for all docs and compare intra-block vs inter-block distances
     let simhashes: Vec<u64> = all_entries
         .iter()
-        .map(|e| simhash_from_sparse_vector(e))
+        .map(|e| simhash_from_sparse_vector(e, 0.0, 5.0))
         .collect();
 
     // Group by topic and compute avg intra-topic Hamming

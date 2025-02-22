@@ -436,8 +436,8 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V12 num_real_docs={} num_virtual_docs={} num_blocks={} dims={} \
-         total_terms={} total_postings={} grid_entries={} simhash={}",
+        "[bmp_build] V12 vectors={} padded={} blocks={} dims={} \
+         terms={} postings={} grid_entries={} simhash={}",
         num_real_docs,
         num_virtual_docs,
         num_blocks,

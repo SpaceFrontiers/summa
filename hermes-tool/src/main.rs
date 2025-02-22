@@ -207,6 +207,29 @@ enum Commands {
         index: PathBuf,
     },
 
+    /// Visualize BMP grid as a terminal heatmap
+    Heatmap {
+        /// Path to the index directory
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Sparse field name (auto-detects first BMP field if omitted)
+        #[arg(short, long)]
+        field: Option<String>,
+
+        /// Output width in columns (default: terminal width)
+        #[arg(short = 'W', long)]
+        width: Option<usize>,
+
+        /// Output height in rows (default: terminal height - 6)
+        #[arg(short = 'H', long)]
+        height: Option<usize>,
+
+        /// Segment index (0-based, default: 0 = first/largest segment)
+        #[arg(short, long, default_value = "0")]
+        segment: usize,
+    },
+
     /// Search an index with a query string
     Search {
         /// Path to the index directory
@@ -410,6 +433,15 @@ async fn main() -> Result<()> {
         }
         Commands::Info { index } => {
             index_ops::show_info(index).await?;
+        }
+        Commands::Heatmap {
+            index,
+            field,
+            width,
+            height,
+            segment,
+        } => {
+            index_ops::heatmap_bmp_grid(index, field, width, height, segment).await?;
         }
         Commands::Search {
             index,

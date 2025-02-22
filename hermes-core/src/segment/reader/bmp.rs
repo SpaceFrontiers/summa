@@ -474,7 +474,7 @@ impl BmpIndex {
 
     /// Packed row size (bytes per dim row in 4-bit grid).
     #[inline]
-    pub(crate) fn packed_row_size(&self) -> usize {
+    pub fn packed_row_size(&self) -> usize {
         self.packed_row_size as usize
     }
 
@@ -486,9 +486,8 @@ impl BmpIndex {
     }
 
     /// Direct access to mmap-backed block grid (zero-copy, zero allocation).
-    /// Used for large segments where compact grid extraction would be too expensive.
     #[inline]
-    pub(crate) fn grid_slice(&self) -> &[u8] {
+    pub fn grid_slice(&self) -> &[u8] {
         self.grid_bytes.as_slice()
     }
 
