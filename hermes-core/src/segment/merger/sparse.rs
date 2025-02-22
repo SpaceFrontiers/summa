@@ -976,6 +976,11 @@ fn reorder_bmp_blob(
     // using only block_size × 64 × sizeof(i32) = 16 KB of scratch space.
 
     let mut vid_simhash: Vec<u64> = vec![0u64; num_real_docs];
+    // Track the dominant (highest-impact) dimension per vid.
+    // Sorting by (argmax_dim, simhash) concentrates per-dimension postings
+    // in few superblocks, enabling effective superblock pruning.
+    let mut vid_argmax_dim: Vec<u32> = vec![0u32; num_real_docs];
+    let mut vid_max_impact: Vec<u8> = vec![0u8; num_real_docs];
 
     // Per-slot accumulators for one block at a time.
     // acc[slot][bit] accumulates weighted SimHash per bit plane.
@@ -994,7 +999,7 @@ fn reorder_bmp_blob(
             *acc = [0i32; 64];
         }
 
-        // Accumulate weighted SimHash from block postings
+        // Accumulate weighted SimHash from block postings + track argmax dim
         for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
             for p in postings {
                 let slot = p.local_slot as usize;
@@ -1002,6 +1007,11 @@ fn reorder_bmp_blob(
                     continue;
                 }
                 simhash_accumulate(&mut slot_acc[slot], dim_id, p.impact as i32);
+                let vid = block_start_vid + slot;
+                if p.impact > vid_max_impact[vid] {
+                    vid_max_impact[vid] = p.impact;
+                    vid_argmax_dim[vid] = dim_id;
+                }
             }
         }
 
@@ -1010,11 +1020,21 @@ fn reorder_bmp_blob(
             vid_simhash[block_start_vid + slot] = simhash_finalize(acc);
         }
     }
+    drop(vid_max_impact);
 
-    // Build permutation: sort vids by SimHash for clustering.
+    // Build permutation: sort by (argmax_dim, simhash) for clustering.
+    // Primary key = dominant dimension: groups documents sharing the same
+    // highest-impact dimension into contiguous superblocks, concentrating
+    // per-dimension postings for effective superblock pruning.
+    // Secondary key = SimHash: within each dimension group, orders by
+    // overall content similarity for block-level locality.
     // perm[new_vid] = old_vid — forward mapping is all we need.
     let mut perm: Vec<u32> = (0..num_real_docs as u32).collect();
-    perm.sort_unstable_by_key(|&vid| vid_simhash[vid as usize]);
+    perm.sort_unstable_by_key(|&vid| {
+        let vid = vid as usize;
+        (vid_argmax_dim[vid], vid_simhash[vid])
+    });
+    drop(vid_argmax_dim);
 
     log::info!(
         "[reorder_bmp] field {}: Phase 2 — writing reordered blob ({} -> {} blocks)",
