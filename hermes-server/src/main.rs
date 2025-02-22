@@ -124,6 +124,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
 
     let registry = Arc::new(registry::IndexRegistry::new(args.data_dir.clone(), config));
 
+    // Clean up index directories from incomplete deletes (e.g. server crashed mid-delete)
+    registry.cleanup_incomplete_deletes();
+
     if args.doctor {
         registry.doctor_all_indexes().await;
     }

@@ -488,37 +488,75 @@ fn execute_bmp_inner(
     });
 
     // Verify: compare pruned results with exhaustive (no-pruning) scoring.
-    // Only runs at DEBUG level. Detects any pruning-induced result divergence.
+    // Only runs at DEBUG level. Detects pruning-induced result divergence.
+    //
+    // Distinguishes real pruning bugs from harmless tie-breaking:
+    // - If missing docs have score > pruned min → real pruning bug
+    // - If missing docs have score == pruned min → tie-breaking (benign)
     if log::log_enabled!(log::Level::Debug) {
         let exhaustive = execute_bmp_exhaustive(index, query_terms, k)?;
-        let mut pruned_ids: Vec<(u32, u16)> =
-            result.iter().map(|r| (r.doc_id, r.ordinal)).collect();
-        let mut exhaust_ids: Vec<(u32, u16)> =
-            exhaustive.iter().map(|r| (r.doc_id, r.ordinal)).collect();
-        pruned_ids.sort_unstable();
-        exhaust_ids.sort_unstable();
-        if pruned_ids != exhaust_ids {
-            let missing: Vec<_> = exhaust_ids
-                .iter()
-                .filter(|id| !pruned_ids.contains(id))
-                .collect();
-            let extra: Vec<_> = pruned_ids
-                .iter()
-                .filter(|id| !exhaust_ids.contains(id))
-                .collect();
+
+        use std::collections::HashMap;
+        let pruned_map: HashMap<(u32, u16), f32> = result
+            .iter()
+            .map(|r| ((r.doc_id, r.ordinal), r.score))
+            .collect();
+        let exhaust_map: HashMap<(u32, u16), f32> = exhaustive
+            .iter()
+            .map(|r| ((r.doc_id, r.ordinal), r.score))
+            .collect();
+
+        let pruned_min = result.iter().map(|r| r.score).fold(f32::MAX, f32::min);
+        let exhaust_min = exhaustive.iter().map(|r| r.score).fold(f32::MAX, f32::min);
+
+        // Missing = in exhaustive but not pruned
+        let mut missing_above: Vec<(u32, u16, f32)> = Vec::new();
+        let mut missing_tied = 0u32;
+        for (&key, &score) in &exhaust_map {
+            if !pruned_map.contains_key(&key) {
+                if score > pruned_min {
+                    missing_above.push((key.0, key.1, score));
+                } else {
+                    missing_tied += 1;
+                }
+            }
+        }
+        missing_above.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+        // Score differences for docs present in both
+        let mut score_diffs: Vec<(u32, f32, f32)> = Vec::new();
+        for (&key, &p_score) in &pruned_map {
+            if let Some(&e_score) = exhaust_map.get(&key)
+                && (p_score - e_score).abs() > 1e-6
+            {
+                score_diffs.push((key.0, p_score, e_score));
+            }
+        }
+
+        if !missing_above.is_empty() {
             log::warn!(
-                "BMP VERIFY MISMATCH: pruned returned {} results, exhaustive returned {}. \
-                 missing={} (in exhaustive but not pruned), extra={} (in pruned but not exhaustive). \
-                 Top exhaustive scores: {:?}",
-                result.len(),
-                exhaustive.len(),
-                missing.len(),
-                extra.len(),
-                exhaustive
-                    .iter()
-                    .take(5)
-                    .map(|r| (r.doc_id, r.score))
-                    .collect::<Vec<_>>(),
+                "BMP PRUNING BUG: {} docs with score > pruned_min ({:.4}) missing from pruned results! \
+                 Top missing: {:?}. {} tied-score mismatches (benign). {} score diffs in shared docs.",
+                missing_above.len(),
+                pruned_min,
+                &missing_above[..missing_above.len().min(10)],
+                missing_tied,
+                score_diffs.len(),
+            );
+            if !score_diffs.is_empty() {
+                score_diffs
+                    .sort_by(|a, b| (b.1 - b.2).abs().partial_cmp(&(a.1 - a.2).abs()).unwrap());
+                log::warn!(
+                    "BMP SCORE DIFFS (pruned vs exhaustive): {:?}",
+                    &score_diffs[..score_diffs.len().min(10)],
+                );
+            }
+        } else if missing_tied > 0 {
+            log::debug!(
+                "BMP verify: {} tied-score boundary mismatches (benign), pruned_min={:.4}, exhaust_min={:.4}",
+                missing_tied,
+                pruned_min,
+                exhaust_min,
             );
         }
     }

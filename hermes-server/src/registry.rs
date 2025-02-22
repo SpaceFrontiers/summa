@@ -104,7 +104,7 @@ impl IndexRegistry {
 
         // Open from disk
         let index_path = self.data_dir.join(name);
-        if !index_path.exists() {
+        if !index_path.exists() || index_path.join(".deleting").exists() {
             return Err(Status::not_found(format!("Index '{}' not found", name)));
         }
 
@@ -229,6 +229,34 @@ impl IndexRegistry {
         self.handles.write().remove(name)
     }
 
+    /// Remove index directories left over from incomplete deletes.
+    ///
+    /// If the server crashed between placing the `.deleting` marker and
+    /// finishing `remove_dir_all`, the directory is still on disk. This
+    /// method cleans them up at startup.
+    pub fn cleanup_incomplete_deletes(&self) {
+        let entries = match std::fs::read_dir(&self.data_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if path.join(".deleting").exists() {
+                let name = entry.file_name();
+                match std::fs::remove_dir_all(&path) {
+                    Ok(_) => info!("Cleaned up incomplete delete: {:?}", name),
+                    Err(e) => warn!("Failed to clean up {:?}: {}", name, e),
+                }
+            }
+        }
+    }
+
     /// Validate all indexes on disk, removing corrupt segments.
     ///
     /// For each index directory, loads metadata.json, tries to open every
@@ -258,6 +286,11 @@ impl IndexRegistry {
             let Some(name) = entry.file_name().into_string().ok() else {
                 continue;
             };
+            // Skip directories still marked for deletion (cleanup may have
+            // failed if files are locked — will retry next startup)
+            if entry.path().join(".deleting").exists() {
+                continue;
+            }
 
             let index_path = self.data_dir.join(&name);
             let dir = MmapDirectory::new(&index_path);
@@ -355,6 +388,11 @@ impl IndexRegistry {
                 .filter_map(|entry| {
                     let entry = entry.ok()?;
                     if entry.file_type().ok()?.is_dir() {
+                        let path = entry.path();
+                        // Skip indexes that are being deleted
+                        if path.join(".deleting").exists() {
+                            return None;
+                        }
                         entry.file_name().into_string().ok()
                     } else {
                         None

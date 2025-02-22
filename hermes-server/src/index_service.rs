@@ -346,10 +346,18 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<DeleteIndexResponse>, Status> {
         let req = request.into_inner();
 
-        // 1. Evict from registry — prevents new operations from reaching this index.
+        // 1. Place .deleting marker so list_indexes() filters out this index
+        //    immediately, even before the directory is actually removed.
+        let index_path = self.registry.data_dir.join(&req.index_name);
+        let marker = index_path.join(".deleting");
+        if index_path.exists() {
+            let _ = std::fs::File::create(&marker);
+        }
+
+        // 2. Evict from registry — prevents new operations from reaching this index.
         let handle = self.registry.evict(&req.index_name);
 
-        // 2. Stop all background work before deleting files:
+        // 3. Stop all background work before deleting files:
         //    - Abort in-flight merge tasks (they could write new segment files)
         //    - Drop the handle, which joins indexing worker threads (sync)
         //    No commit — we're about to delete everything.
@@ -358,10 +366,9 @@ impl IndexService for IndexServiceImpl {
             drop(handle);
         }
 
-        // 3. Delete directory — safe because:
+        // 4. Delete directory — safe because:
         //    - No new operations can obtain the index (evicted from registry)
         //    - Merge tasks aborted, worker threads joined
-        let index_path = self.registry.data_dir.join(&req.index_name);
         if index_path.exists() {
             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&index_path))
                 .await
