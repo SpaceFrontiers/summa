@@ -36,6 +36,8 @@ pub struct SparseVectorQuery {
     pub min_query_dims: usize,
     /// Multiplier on executor limit for ordinal deduplication (1.0 = no over-fetch)
     pub over_fetch_factor: f32,
+    /// Maximum superblocks to visit (LSP/0 gamma cap). 0 = unlimited.
+    pub max_superblocks: usize,
     /// Cached pruned vector; None = use `vector` as-is (no pruning applied)
     pruned: Option<Vec<(u32, f32)>>,
 }
@@ -72,6 +74,7 @@ impl SparseVectorQuery {
             pruning: None,
             min_query_dims: 4,
             over_fetch_factor: 2.0,
+            max_superblocks: 0,
             pruned: None,
         };
         q.pruned = Some(q.compute_pruned_vector());
@@ -383,6 +386,7 @@ impl SparseVectorQuery {
                 heap_factor: self.heap_factor,
                 combiner: self.combiner,
                 over_fetch_factor: self.over_fetch_factor,
+                max_superblocks: self.max_superblocks,
             })
             .collect()
     }
@@ -642,6 +646,7 @@ impl Query for SparseTermQuery {
             heap_factor: self.heap_factor,
             combiner: self.combiner,
             over_fetch_factor: self.over_fetch_factor,
+            max_superblocks: 0,
         }])
     }
 }

@@ -144,6 +144,8 @@ pub struct SparseTermQueryInfo {
     /// Multiplier on executor limit to compensate for ordinal deduplication
     /// (1.0 = exact, 2.0 = fetch 2x then combine down)
     pub over_fetch_factor: f32,
+    /// Maximum superblocks to visit (LSP/0 gamma cap). 0 = unlimited.
+    pub max_superblocks: usize,
 }
 
 /// Decomposition of a query for MaxScore optimization.

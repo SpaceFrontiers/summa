@@ -216,6 +216,7 @@ pub(crate) fn build_bmp_blob(
             min_doc_freq: 2,
             max_doc_freq: max_doc_freq.max(1),
         };
+        let fwd_start = std::time::Instant::now();
         let fwd = super::graph_bisection::build_forward_index(
             num_real_docs,
             &postings,
@@ -223,6 +224,10 @@ pub(crate) fn build_bmp_blob(
             &bp_params,
         );
         drop(vid_lookup);
+        log::info!(
+            "BP forward index built in {:.1}ms",
+            fwd_start.elapsed().as_secs_f64() * 1000.0,
+        );
 
         if fwd.num_terms > 0 && num_real_docs > bmp_block_size as usize {
             log::info!(
@@ -277,11 +282,19 @@ pub(crate) fn build_bmp_blob(
     // When BP reordering is active, virtual IDs are not monotonic with
     // (doc_id, ordinal) order. Re-sort per-dim postings by virtual_id so the
     // K-way merge's sequential cursor assumption holds.
+    // Parallelized: each dim's sort is independent.
     if bp_perm {
-        for dim_posts in &mut dim_vecs {
+        use rayon::prelude::*;
+        let resort_start = std::time::Instant::now();
+        dim_vecs.par_iter_mut().for_each(|dim_posts| {
             dim_posts
                 .sort_unstable_by_key(|&(doc_id, ordinal, _)| vid_lookup.get((doc_id, ordinal)));
-        }
+        });
+        log::info!(
+            "BP per-dim re-sort completed in {:.1}ms ({} dims)",
+            resort_start.elapsed().as_secs_f64() * 1000.0,
+            dim_vecs.len(),
+        );
     }
 
     // Borrow slices for the merge loop

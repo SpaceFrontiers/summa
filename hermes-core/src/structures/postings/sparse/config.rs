@@ -177,6 +177,10 @@ pub struct SparseQueryConfig {
     /// Default: 4. Set to 0 to always apply pruning/filtering.
     #[serde(default = "default_min_terms")]
     pub min_query_dims: usize,
+    /// Maximum number of superblocks to visit (LSP/0 gamma cap).
+    /// 0 = unlimited (default). Only applies to BMP format.
+    #[serde(default)]
+    pub max_superblocks: usize,
 }
 
 fn default_heap_factor() -> f32 {
@@ -193,6 +197,7 @@ impl Default for SparseQueryConfig {
             max_query_dims: None,
             pruning: None,
             min_query_dims: 4,
+            max_superblocks: 0,
         }
     }
 }
@@ -366,6 +371,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(20), // Process top 20 query dimensions
                 pruning: Some(0.1),       // Keep top 10% of query dims
                 min_query_dims: 4,
+                max_superblocks: 0,
             }),
 
             dims: None,
@@ -399,6 +405,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(20),
                 pruning: Some(0.1),
                 min_query_dims: 4,
+                max_superblocks: 0,
             }),
 
             dims: Some(105879),
@@ -434,6 +441,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(15), // Fewer query dimensions
                 pruning: Some(0.15),      // Keep top 15% of query dims
                 min_query_dims: 4,
+                max_superblocks: 0,
             }),
 
             dims: None,
@@ -492,6 +500,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(50), // Process more dimensions
                 pruning: None,            // No fraction-based pruning
                 min_query_dims: 4,
+                max_superblocks: 0,
             }),
 
             dims: None,

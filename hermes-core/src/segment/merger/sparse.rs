@@ -44,12 +44,12 @@ impl SegmentMerger {
     ) -> Result<usize> {
         let doc_offs = doc_offsets(segments)?;
 
-        // Collect all sparse vector fields from schema
+        // Collect all sparse vector fields from schema (with reorder flag)
         let sparse_fields: Vec<_> = self
             .schema
             .fields()
             .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-            .map(|(field, entry)| (field, entry.sparse_vector_config.clone()))
+            .map(|(field, entry)| (field, entry.sparse_vector_config.clone(), entry.reorder))
             .collect();
 
         if sparse_fields.is_empty() {
@@ -64,7 +64,7 @@ impl SegmentMerger {
         let mut skip_bytes: Vec<u8> = Vec::new();
         let mut skip_count: u32 = 0;
 
-        for (field, sparse_config) in &sparse_fields {
+        for (field, sparse_config, field_reorder) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
@@ -106,16 +106,33 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
-                    // Record-level reorder: when force_reorder is on
-                    // and there's exactly 1 source segment, do a full rebuild
-                    // that shuffles individual ordinals across blocks via BP.
-                    let single_source_count = bmp_indexes.iter().filter(|bi| bi.is_some()).count();
-                    if self.force_reorder
-                        && single_source_count == 1
-                        && let Some(bmp) = bmp_indexes.iter().find_map(|bi| *bi)
-                    {
-                        reorder_bmp_blob(bmp, field.0, quantization, &mut writer, &mut field_tocs)?;
-                        continue;
+                    // Record-level reorder: when the field has `reorder` attribute
+                    // or force_reorder is on, run BP on all sources combined to
+                    // produce an optimally ordered output. Multi-source merges
+                    // benefit from warm-start: already-reordered segments' internal
+                    // clustering is preserved in the initial concatenated order,
+                    // so BP converges faster.
+                    if self.force_reorder || *field_reorder {
+                        let sources: Vec<(&BmpIndex, u32)> = bmp_indexes
+                            .iter()
+                            .copied()
+                            .zip(doc_offs.iter().copied())
+                            .filter_map(|(opt, doc_off)| opt.map(|bmp| (bmp, doc_off)))
+                            .collect();
+                        if !sources.is_empty() {
+                            reorder_bmp_blob(
+                                &sources,
+                                field.0,
+                                quantization,
+                                dims,
+                                bmp_block_size.min(256) as usize,
+                                max_weight_scale,
+                                total_vectors_bmp,
+                                &mut writer,
+                                &mut field_tocs,
+                            )?;
+                            continue;
+                        }
                     }
                     merge_bmp_field(
                         &bmp_indexes,
@@ -439,7 +456,7 @@ fn merge_bmp_field(
 
     // ═══ Sequential block-copy merge ════════════════════════════════════
     // Blocks are self-contained — copy directly from sources in order.
-    // For record-level BP reorder, use `reorder_bmp_blob` on a single segment.
+    // For record-level BP reorder, use `reorder_bmp_blob` (handles 1+ sources).
 
     // ── Phase 1: Stream Section B (block data) — chunked copy ───
     let mut source_byte_offsets: Vec<u64> = Vec::with_capacity(sources.len());
@@ -659,88 +676,112 @@ fn push_bmp_field_toc(
 
 /// Record-level BMP reorder via Recursive Graph Bisection (BP).
 ///
-/// Unlike block-copy merge, this shuffles individual ordinals across blocks so that
-/// ordinals sharing similar dimensions cluster tightly. Requires a full BMP rebuild
-/// (not block-copy) because records move between blocks.
+/// Supports single-source (re-reorder) and multi-source (merge + reorder) modes.
+/// When merging multiple already-reordered segments, the concatenated order
+/// preserves within-segment locality, giving BP a warm start that converges
+/// faster than starting from random order.
 ///
 /// **Two-phase streaming design:**
 ///
-/// Phase 1 — Build forward index from block data, run BP to get permutation.
-/// Phase 2 — Write new blob with records in permuted order (random-read input).
+/// Phase 1 — Build forward index from block data (all sources), run BP to get permutation.
+/// Phase 2 — Write new blob with records in permuted order (random-read from sources).
 ///
 /// Memory: forward index ~200 bytes/doc + permutation, plus one output block
 /// scratch buffer (~4 KB) and grid_entries.
+#[allow(clippy::too_many_arguments)]
 fn reorder_bmp_blob(
-    bmp: &BmpIndex,
+    bmps: &[(&BmpIndex, u32)],
     field_id: u32,
     quantization: crate::structures::WeightQuantization,
+    dims: u32,
+    effective_block_size: usize,
+    max_weight_scale: f32,
+    total_vectors: u32,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
     use crate::segment::builder::bmp::{stream_write_grids, write_v13_footer};
-    use crate::segment::builder::graph_bisection::{build_forward_index_from_bmp, graph_bisection};
+    use crate::segment::builder::graph_bisection::{
+        build_forward_index_from_bmps, graph_bisection,
+    };
 
-    let num_blocks = bmp.num_blocks as usize;
-    let effective_block_size = bmp.bmp_block_size as usize;
-    let dims = bmp.dims();
-    let max_weight_scale = bmp.max_weight_scale;
-    let num_real_docs = bmp.num_real_docs() as usize;
-    let total_vectors = bmp.total_vectors;
+    let num_sources = bmps.len();
+    let bmp_refs: Vec<&BmpIndex> = bmps.iter().map(|&(b, _)| b).collect();
+    let num_real_docs: usize = bmp_refs.iter().map(|b| b.num_real_docs() as usize).sum();
 
-    if num_blocks == 0 || num_real_docs == 0 {
+    if num_real_docs == 0 {
         return Ok(());
     }
 
     log::info!(
-        "[reorder_bmp] field {}: Phase 1 — running BP on {} blocks, {} real docs",
+        "[reorder_bmp] field {}: Phase 1 — running BP on {} sources, {} real docs",
         field_id,
-        num_blocks,
+        num_sources,
         num_real_docs,
     );
 
     // ── Phase 1: Build forward index and run BP ─────────────────────────
+    let bp_start = std::time::Instant::now();
     let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
-    let fwd = build_forward_index_from_bmp(bmp, 128.min(num_real_docs), max_doc_freq.max(1));
+    let min_doc_freq = 128.min(num_real_docs);
+
+    let (fwd, source_doc_counts) =
+        build_forward_index_from_bmps(&bmp_refs, min_doc_freq, max_doc_freq.max(1));
+
+    log::info!(
+        "[reorder_bmp] field {}: forward index built in {:.1}ms ({} terms, {} postings)",
+        field_id,
+        bp_start.elapsed().as_secs_f64() * 1000.0,
+        fwd.num_terms,
+        fwd.total_postings(),
+    );
 
     let perm = if fwd.num_terms > 0 && num_real_docs > effective_block_size {
-        graph_bisection(&fwd, effective_block_size, 20)
+        let bp_start = std::time::Instant::now();
+        let perm = graph_bisection(&fwd, effective_block_size, 20);
+        log::info!(
+            "[reorder_bmp] field {}: BP completed in {:.1}ms",
+            field_id,
+            bp_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        perm
     } else {
         (0..num_real_docs as u32).collect()
     };
     drop(fwd);
 
+    // Pre-compute cumulative doc offsets for multi-source vid resolution
+    let mut cumulative_docs: Vec<usize> = Vec::with_capacity(num_sources + 1);
+    cumulative_docs.push(0);
+    for &count in &source_doc_counts {
+        cumulative_docs.push(cumulative_docs.last().unwrap() + count);
+    }
+
     log::info!(
-        "[reorder_bmp] field {}: Phase 2 — writing reordered blob ({} -> {} blocks)",
+        "[reorder_bmp] field {}: Phase 2 — writing reordered blob ({} blocks)",
         field_id,
-        num_blocks,
-        (num_real_docs.div_ceil(effective_block_size)),
+        num_real_docs.div_ceil(effective_block_size),
     );
 
     // ── Phase 2: Write new blob with records in permuted order ──────────
-    //
-    // New num_blocks may differ from old if num_real_docs is the same (padding changes).
     let new_num_blocks = num_real_docs.div_ceil(effective_block_size);
     let new_num_virtual_docs = new_num_blocks * effective_block_size;
 
-    // For each output block b, the new_vids in [b*bs, (b+1)*bs) map to
-    // old_vids via perm[new_vid] = old_vid.
-
     let blob_start = writer.offset();
     let mut block_data_starts: Vec<u64> = Vec::with_capacity(new_num_blocks + 1);
-    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(bmp.total_terms() as usize);
+    let est_terms: u32 = bmp_refs.iter().map(|b| b.total_terms() as u32).sum();
+    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_terms as usize);
     let mut total_terms: u32 = 0;
     let mut total_postings: u32 = 0;
     let mut cumulative_bytes: u64 = 0;
 
     // Per-block scratch buffers
     let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
-    // Collect per-dim postings: dim_id -> Vec<(new_local_slot, impact)>
     let mut dim_postings: rustc_hash::FxHashMap<u32, Vec<(u8, u8)>> =
         rustc_hash::FxHashMap::default();
-    // Group source slots by old_block: old_block_id -> Vec<(old_slot, new_local_slot)>
-    let mut source_slots: rustc_hash::FxHashMap<usize, Vec<(u8, u8)>> =
+    // Group source slots by (source_idx, old_block) -> Vec<(old_slot, new_local_slot)>
+    let mut source_slots: rustc_hash::FxHashMap<(usize, usize), Vec<(u8, u8)>> =
         rustc_hash::FxHashMap::default();
-    // Fast old_slot -> new_slot lookup (covers u8 range)
     let mut slot_map = [u8::MAX; 256];
 
     for out_block in 0..new_num_blocks {
@@ -750,14 +791,15 @@ fn reorder_bmp_blob(
         let new_vid_end = ((out_block + 1) * effective_block_size).min(num_real_docs);
         let slots_count = new_vid_end - new_vid_start;
 
-        // Group records by source block — each source block parsed only once
+        // Group records by (source, source_block)
         source_slots.clear();
         for new_local_slot in 0..slots_count {
-            let old_vid = perm[new_vid_start + new_local_slot] as usize;
-            let old_block = old_vid / effective_block_size;
-            let old_slot = (old_vid % effective_block_size) as u8;
+            let combined_vid = perm[new_vid_start + new_local_slot] as usize;
+            let (src_idx, local_vid) = resolve_source(combined_vid, &cumulative_docs);
+            let old_block = local_vid / effective_block_size;
+            let old_slot = (local_vid % effective_block_size) as u8;
             source_slots
-                .entry(old_block)
+                .entry((src_idx, old_block))
                 .or_default()
                 .push((old_slot, new_local_slot as u8));
         }
@@ -765,12 +807,12 @@ fn reorder_bmp_blob(
         dim_postings.clear();
 
         // Iterate each source block once, scatter matching slots
-        for (&old_block, mappings) in &source_slots {
-            // Build fast old_slot -> new_slot lookup
+        for (&(src_idx, old_block), mappings) in &source_slots {
             for &(old_s, new_s) in mappings {
                 slot_map[old_s as usize] = new_s;
             }
 
+            let bmp = bmp_refs[src_idx];
             for (dim_id, postings) in bmp.iter_block_terms(old_block as u32) {
                 for p in postings {
                     let new_slot = slot_map[p.local_slot as usize];
@@ -783,7 +825,6 @@ fn reorder_bmp_blob(
                 }
             }
 
-            // Reset slot_map entries (avoid full clear)
             for &(old_s, _) in mappings {
                 slot_map[old_s as usize] = u8::MAX;
             }
@@ -791,22 +832,18 @@ fn reorder_bmp_blob(
 
         // Write this block's data
         if !dim_postings.is_empty() {
-            // Sort dims for deterministic output
             let mut sorted_dims: Vec<u32> = dim_postings.keys().copied().collect();
             sorted_dims.sort_unstable();
 
             blk_buf.clear();
             let nt = sorted_dims.len();
 
-            // num_terms (u16)
             blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
 
-            // term_dim_ids [u32 × nt]
             for &dim_id in &sorted_dims {
                 blk_buf.extend_from_slice(&dim_id.to_le_bytes());
             }
 
-            // posting_starts [u16 × (nt + 1)] — relative cumulative
             let mut cum: u16 = 0;
             for &dim_id in &sorted_dims {
                 blk_buf.extend_from_slice(&cum.to_le_bytes());
@@ -814,7 +851,6 @@ fn reorder_bmp_blob(
             }
             blk_buf.extend_from_slice(&cum.to_le_bytes());
 
-            // postings [(u8, u8) × total]
             for &dim_id in &sorted_dims {
                 let posts = &dim_postings[&dim_id];
                 let mut max_impact: u8 = 0;
@@ -840,12 +876,10 @@ fn reorder_bmp_blob(
         return Ok(());
     }
 
-    // Sort grid entries by (dim_id, block_id) for streaming write
     grid_entries.sort_unstable();
 
     // ── Write remaining sections ────────────────────────────────────────
 
-    // Padding to 8-byte boundary
     let block_data_len = writer.offset() - blob_start;
     let padding = (8 - (block_data_len % 8) as usize) % 8;
     if padding > 0 {
@@ -854,7 +888,7 @@ fn reorder_bmp_blob(
             .map_err(crate::Error::Io)?;
     }
 
-    // Section A: block_data_starts [u64 × (new_num_blocks + 1)]
+    // Section A: block_data_starts
     for &val in &block_data_starts {
         writer
             .write_all(&val.to_le_bytes())
@@ -870,20 +904,33 @@ fn reorder_bmp_blob(
     let sb_grid_offset = grid_offset + packed_bytes;
     drop(grid_entries);
 
-    // Section F: doc_map_ids [u32-LE × new_num_virtual_docs]
+    // Sections F+G: doc_map_ids + doc_map_ordinals [new_num_virtual_docs each]
     let doc_map_offset = writer.offset() - blob_start;
-    let src_ids = bmp.doc_map_ids_slice();
-    let src_ords = bmp.doc_map_ordinals_slice();
 
-    for &old_vid_u32 in perm.iter().take(num_real_docs) {
-        let old_vid = old_vid_u32 as usize;
-        let off = old_vid * 4;
+    // Pre-resolve all permuted vids → (source_idx, local_vid) to avoid
+    // repeated binary searches across Sections F and G.
+    let resolved: Vec<(usize, usize)> = perm
+        .iter()
+        .take(num_real_docs)
+        .map(|&v| resolve_source(v as usize, &cumulative_docs))
+        .collect();
+
+    // Section F: doc_map_ids [u32-LE × new_num_virtual_docs]
+    for &(src_idx, local_vid) in &resolved {
+        let bmp = bmp_refs[src_idx];
+        let doc_offset = bmps[src_idx].1;
+        let src_ids = bmp.doc_map_ids_slice();
+        let off = local_vid * 4;
         let doc_id = u32::from_le_bytes(src_ids[off..off + 4].try_into().unwrap());
+        let adjusted = if doc_id != u32::MAX {
+            doc_id + doc_offset
+        } else {
+            doc_id
+        };
         writer
-            .write_all(&doc_id.to_le_bytes())
+            .write_all(&adjusted.to_le_bytes())
             .map_err(crate::Error::Io)?;
     }
-    // Padding entries for block alignment
     for _ in num_real_docs..new_num_virtual_docs {
         writer
             .write_all(&u32::MAX.to_le_bytes())
@@ -891,9 +938,10 @@ fn reorder_bmp_blob(
     }
 
     // Section G: doc_map_ordinals [u16-LE × new_num_virtual_docs]
-    for &old_vid_u32 in perm.iter().take(num_real_docs) {
-        let old_vid = old_vid_u32 as usize;
-        let off = old_vid * 2;
+    for &(src_idx, local_vid) in &resolved {
+        let bmp = bmp_refs[src_idx];
+        let src_ords = bmp.doc_map_ordinals_slice();
+        let off = local_vid * 2;
         let ordinal = u16::from_le_bytes(src_ords[off..off + 2].try_into().unwrap());
         writer
             .write_all(&ordinal.to_le_bytes())
@@ -914,7 +962,7 @@ fn reorder_bmp_blob(
         sb_grid_offset,
         new_num_blocks as u32,
         dims,
-        bmp.bmp_block_size,
+        effective_block_size as u32,
         new_num_virtual_docs as u32,
         max_weight_scale,
         doc_map_offset,
@@ -933,8 +981,9 @@ fn reorder_bmp_blob(
     );
 
     log::info!(
-        "[reorder_bmp] field {}: done — {} blocks, {} terms, {} postings, {:.2} MB",
+        "[reorder_bmp] field {}: done — {} sources, {} blocks, {} terms, {} postings, {:.2} MB",
         field_id,
+        num_sources,
         new_num_blocks,
         total_terms,
         total_postings,
@@ -942,6 +991,17 @@ fn reorder_bmp_blob(
     );
 
     Ok(())
+}
+
+/// Resolve a combined virtual ID to (source_index, local_vid) using cumulative offsets.
+///
+/// `cumulative_docs` is `[0, n0, n0+n1, ...]` where n_i is the doc count of source i.
+#[inline]
+fn resolve_source(combined_vid: usize, cumulative_docs: &[usize]) -> (usize, usize) {
+    let src_idx = cumulative_docs
+        .partition_point(|&c| c <= combined_vid)
+        .saturating_sub(1);
+    (src_idx, combined_vid - cumulative_docs[src_idx])
 }
 
 /// Copy 4-bit nibbles from a source grid row to a destination row at a column offset.

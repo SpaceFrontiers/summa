@@ -88,10 +88,14 @@ struct BmpScratch {
     // Superblock-level (reused across queries, sized to num_superblocks)
     sb_ubs: Vec<f32>,
     sb_order: Vec<u32>,
+    sb_priorities: Vec<f32>,
+    sb_suffix_max: Vec<f32>,
     // Block-level (reused per superblock, sized to BMP_SUPERBLOCK_SIZE)
     local_block_ubs: Vec<f32>,
     local_block_masks: Vec<u64>,
     local_block_order: Vec<u32>,
+    // Two-phase block scoring: phase1 block UBs (sized to BMP_SUPERBLOCK_SIZE)
+    phase1_local_block_ubs: Vec<f32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
     // Compact grid buffers: query-relevant dim rows copied contiguously for L1 locality.
@@ -109,6 +113,13 @@ impl BmpScratch {
         if self.sb_order.capacity() < num_superblocks {
             self.sb_order.reserve(num_superblocks - self.sb_order.len());
         }
+        if self.sb_priorities.len() < num_superblocks {
+            self.sb_priorities.resize(num_superblocks, 0.0);
+        }
+        // suffix_max needs num_superblocks + 1 for sentinel
+        if self.sb_suffix_max.len() < num_superblocks + 1 {
+            self.sb_suffix_max.resize(num_superblocks + 1, 0.0);
+        }
         if self.local_block_ubs.len() < sb_size {
             self.local_block_ubs.resize(sb_size, 0.0);
         }
@@ -117,6 +128,9 @@ impl BmpScratch {
         }
         if self.local_block_order.len() < sb_size {
             self.local_block_order.resize(sb_size, 0);
+        }
+        if self.phase1_local_block_ubs.len() < sb_size {
+            self.phase1_local_block_ubs.resize(sb_size, 0.0);
         }
         if self.acc.len() < block_size {
             self.acc.resize(block_size, 0);
@@ -330,8 +344,30 @@ fn execute_bmp_inner(
             dequant,
             &mut scratch.sb_ubs,
         );
+
+        // Coverage-biased SB ordering: boost SBs with higher query-dim coverage.
+        // Count how many query dims are active in each SB (non-zero sb_grid value).
+        let nqd = sb_int_weights.len();
+        for sb in 0..num_superblocks_total {
+            let base_ub = scratch.sb_ubs[sb];
+            if base_ub == 0.0 {
+                scratch.sb_priorities[sb] = 0.0;
+                continue;
+            }
+            let mut coverage = 0u32;
+            for &(local_idx, _) in &sb_int_weights {
+                if sb_grid_slice[local_idx * num_superblocks_total + sb] > 0 {
+                    coverage += 1;
+                }
+            }
+            // Boost: high-coverage SBs get +5% priority boost (breaks ties, doesn't
+            // significantly reorder SBs with very different UBs).
+            let cf = coverage as f32 / nqd as f32;
+            scratch.sb_priorities[sb] = base_ub * (1.0 + cf * 0.05);
+        }
+
         sort_sb_desc_into(
-            &scratch.sb_ubs[..num_superblocks_total],
+            &scratch.sb_priorities[..num_superblocks_total],
             &mut scratch.sb_order,
         );
 
@@ -339,7 +375,17 @@ fn execute_bmp_inner(
             return Vec::new();
         }
 
-        // Phase 3: Score superblocks in UB-descending order
+        // Pre-compute suffix-max of ACTUAL UBs for safe early termination.
+        // Because coverage-biased ordering is non-monotonic in UB, we can't `break`
+        // on a single low-UB SB. Instead we `break` when the max UB of ALL remaining
+        // SBs <= threshold — guaranteed correct.
+        compute_suffix_max_ubs(
+            &scratch.sb_ubs,
+            &scratch.sb_order,
+            &mut scratch.sb_suffix_max,
+        );
+
+        // Phase 3: Score superblocks in priority-descending order
         let mut blocks_scored = 0u32;
         let mut sbs_scored = 0u32;
         let mut collector = ScoreCollector::new(collector_k);
@@ -350,10 +396,17 @@ fn execute_bmp_inner(
                 break;
             }
 
-            let sb_ub = scratch.sb_ubs[sb_id as usize];
-            // Threshold pruning still applies within the cap
-            if collector.len() >= collector_k && sb_ub * alpha <= collector.threshold() {
+            // Safe early termination: max UB of ALL remaining SBs <= threshold
+            if collector.len() >= collector_k
+                && scratch.sb_suffix_max[idx] * alpha <= collector.threshold()
+            {
                 break;
+            }
+
+            // Individual SB skip (continue, not break — ordering is non-monotonic in UB)
+            let sb_ub = scratch.sb_ubs[sb_id as usize];
+            if collector.len() >= collector_k && sb_ub * alpha <= collector.threshold() {
+                continue;
             }
 
             let block_start = sb_id as usize * BMP_SUPERBLOCK_SIZE as usize;
@@ -691,27 +744,39 @@ fn sort_local_blocks_desc(local_ubs: &[f32], out: &mut Vec<u32>) {
     });
 }
 
-/// Sort superblock IDs by their upper bounds in strictly descending order, into `out`.
-///
-/// Uses comparison sort for correctness: the `break` in the superblock loop relies
-/// on strict descending order — if a SB with UB <= threshold appears, ALL subsequent
-/// SBs must also have UB <= threshold. Approximate sorts (bucket sort) can violate
-/// this within a bucket, causing the `break` to skip SBs that should be processed.
+/// Sort superblock IDs by values (priorities or UBs) in descending order, into `out`.
 ///
 /// For ~2K superblocks, comparison sort takes ~30μs — negligible vs BMP query time.
 /// Reuses `out` Vec to avoid allocation.
-fn sort_sb_desc_into(block_ubs: &[f32], out: &mut Vec<u32>) {
+fn sort_sb_desc_into(values: &[f32], out: &mut Vec<u32>) {
     out.clear();
-    for (i, &ub) in block_ubs.iter().enumerate() {
-        if ub > 0.0 {
+    for (i, &v) in values.iter().enumerate() {
+        if v > 0.0 {
             out.push(i as u32);
         }
     }
     out.sort_unstable_by(|&a, &b| {
-        block_ubs[b as usize]
-            .partial_cmp(&block_ubs[a as usize])
+        values[b as usize]
+            .partial_cmp(&values[a as usize])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+/// Pre-compute suffix-max of actual UBs over the sorted SB order.
+///
+/// `suffix_max[i]` = max UB among all SBs at positions `i..order.len()`.
+/// This enables safe early termination with non-monotonic ordering:
+/// if `suffix_max[i] * alpha <= threshold`, ALL remaining SBs can be skipped.
+///
+/// O(num_superblocks) pre-computation, then O(1) check per SB in the loop.
+fn compute_suffix_max_ubs(sb_ubs: &[f32], order: &[u32], out: &mut [f32]) {
+    let n = order.len();
+    // Sentinel: suffix_max[n] = 0.0 (no remaining SBs)
+    out[n] = 0.0;
+    for i in (0..n).rev() {
+        let ub = sb_ubs[order[i] as usize];
+        out[i] = ub.max(out[i + 1]);
+    }
 }
 
 fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
