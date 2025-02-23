@@ -49,7 +49,7 @@ impl SegmentMerger {
             .schema
             .fields()
             .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-            .map(|(field, entry)| (field, entry.sparse_vector_config.clone(), entry.reorder))
+            .map(|(field, entry)| (field, entry.sparse_vector_config.clone()))
             .collect();
 
         if sparse_fields.is_empty() {
@@ -64,7 +64,7 @@ impl SegmentMerger {
         let mut skip_bytes: Vec<u8> = Vec::new();
         let mut skip_count: u32 = 0;
 
-        for (field, sparse_config, field_reorder) in &sparse_fields {
+        for (field, sparse_config) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
@@ -106,13 +106,11 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
-                    // Record-level reorder: when the field has `reorder` attribute
-                    // or force_reorder is on, run BP on all sources combined to
-                    // produce an optimally ordered output. Multi-source merges
-                    // benefit from warm-start: already-reordered segments' internal
-                    // clustering is preserved in the initial concatenated order,
-                    // so BP converges faster.
-                    if self.force_reorder || *field_reorder {
+                    // Record-level reorder: only when force_reorder is explicitly
+                    // requested. The `reorder` SDL attribute controls build-time
+                    // BP reorder but does NOT trigger reorder during merge, as
+                    // merge-time BP is expensive and block-copy merge is sufficient.
+                    if self.force_reorder {
                         let sources: Vec<(&BmpIndex, u32)> = bmp_indexes
                             .iter()
                             .copied()
