@@ -43,8 +43,18 @@ pub fn spawn_optimizer(
 
     let semaphore = Arc::new(Semaphore::new(config.threads));
 
+    // Bounded rayon pool for BP computation — prevents optimizer from
+    // saturating all CPU cores. Shared across all concurrent reorder tasks.
+    let rayon_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(config.threads)
+            .thread_name(|idx| format!("optimizer-bp-{}", idx))
+            .build()
+            .expect("failed to create optimizer rayon pool"),
+    );
+
     Some(tokio::spawn(async move {
-        optimizer_loop(registry, semaphore, config.scan_interval).await;
+        optimizer_loop(registry, semaphore, rayon_pool, config.scan_interval).await;
     }))
 }
 
@@ -52,13 +62,14 @@ pub fn spawn_optimizer(
 async fn optimizer_loop(
     registry: Arc<IndexRegistry>,
     semaphore: Arc<Semaphore>,
+    rayon_pool: Arc<rayon::ThreadPool>,
     scan_interval: Duration,
 ) {
     // Initial delay: let the server finish startup before scanning.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     loop {
-        if let Err(e) = scan_and_optimize(&registry, &semaphore).await {
+        if let Err(e) = scan_and_optimize(&registry, &semaphore, &rayon_pool).await {
             warn!("[optimizer] scan failed: {}", e);
         }
 
@@ -70,6 +81,7 @@ async fn optimizer_loop(
 async fn scan_and_optimize(
     registry: &IndexRegistry,
     semaphore: &Arc<Semaphore>,
+    rayon_pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(), tonic::Status> {
     let index_names = registry.list_indexes().await?;
 
@@ -127,12 +139,13 @@ async fn scan_and_optimize(
             let sm = Arc::clone(&segment_manager);
             let idx_name = name.clone();
             let sid = seg_id.clone();
+            let pool = Arc::clone(rayon_pool);
 
             tokio::spawn(async move {
                 let _permit = permit;
                 let start = std::time::Instant::now();
 
-                match sm.reorder_single_segment(&sid).await {
+                match sm.reorder_single_segment(&sid, Some(pool)).await {
                     Ok(true) => {
                         info!(
                             "[optimizer] reordered segment {} in index '{}' ({:.1}s)",

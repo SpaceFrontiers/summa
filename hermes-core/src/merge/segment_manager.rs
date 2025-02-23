@@ -695,7 +695,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         log::info!("[reorder] reordering {} segments", segment_ids.len());
 
         for seg_id in segment_ids {
-            match self.reorder_single_segment(&seg_id).await {
+            match self.reorder_single_segment(&seg_id, None).await {
                 Ok(true) => {}
                 Ok(false) => log::warn!("[reorder] segment {} skipped (in merge)", seg_id),
                 Err(e) => return Err(e),
@@ -725,7 +725,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ///
     /// Non-blocking: uses merge inventory to prevent conflicts with background merges.
     /// Copies unchanged files and rebuilds only the sparse file with reordered BMP data.
-    pub async fn reorder_single_segment(self: &Arc<Self>, seg_id: &str) -> Result<bool> {
+    pub async fn reorder_single_segment(
+        self: &Arc<Self>,
+        seg_id: &str,
+        rayon_pool: Option<Arc<rayon::ThreadPool>>,
+    ) -> Result<bool> {
         let source_id = SegmentId::from_hex(seg_id)
             .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", seg_id)))?;
         let output_id = SegmentId::new();
@@ -747,6 +751,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             output_id,
             self.term_cache_blocks,
             crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+            rayon_pool,
         )
         .await?;
 

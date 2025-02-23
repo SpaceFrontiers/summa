@@ -38,6 +38,7 @@ clap = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 num_cpus = "1.16"
+rayon = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

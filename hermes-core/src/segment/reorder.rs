@@ -28,6 +28,11 @@ pub const DEFAULT_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 /// Creates a new segment with reordered BMP blocks for better pruning.
 /// Non-BMP fields are copied unchanged via streaming file copy.
 ///
+/// `rayon_pool`: optional bounded thread pool for BP computation. When `Some`,
+/// all rayon parallel work (gain computation, recursive bisection) runs on this
+/// pool instead of the global rayon pool. This prevents the optimizer from
+/// saturating all CPU cores.
+///
 /// Returns `(new_segment_hex_id, num_docs)`.
 pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     dir: &D,
@@ -36,6 +41,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     output_id: SegmentId,
     term_cache_blocks: usize,
     memory_budget: usize,
+    rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(String, u32)> {
     let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
     let num_docs = reader.num_docs();
@@ -68,7 +74,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     );
 
     // Rebuild sparse file with reordered BMP data
-    reorder_sparse_file(dir, &reader, &dst_files, schema, memory_budget).await?;
+    reorder_sparse_file(dir, &reader, &dst_files, schema, memory_budget, rayon_pool).await?;
 
     // Write new meta with output segment ID
     let src_meta = reader.meta();
@@ -119,6 +125,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     dst_files: &SegmentFiles,
     schema: &Schema,
     memory_budget: usize,
+    rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<()> {
     let sparse_fields: Vec<_> = schema
         .fields()
@@ -176,18 +183,33 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                     .unwrap_or(bmp_idx.max_weight_scale);
                 let total_vectors = bmp_idx.total_vectors;
 
-                reorder_bmp_field(
-                    bmp_idx,
-                    field.0,
-                    quantization,
-                    dims,
-                    effective_block_size,
-                    max_weight_scale,
-                    total_vectors,
-                    memory_budget,
-                    &mut writer,
-                    &mut field_tocs,
-                )?;
+                // Clone BmpIndex (cheap: Arc ref bumps on OwnedBytes) and move
+                // OffsetWriter + field_tocs into spawn_blocking so the entire
+                // CPU-heavy reorder runs off tokio worker threads.
+                let bmp_clone = bmp_idx.clone();
+                let fid = field.0;
+                let pool = rayon_pool.clone();
+                let (w, ft) = tokio::task::spawn_blocking(move || {
+                    reorder_bmp_field(
+                        &bmp_clone,
+                        fid,
+                        quantization,
+                        dims,
+                        effective_block_size,
+                        max_weight_scale,
+                        total_vectors,
+                        memory_budget,
+                        writer,
+                        field_tocs,
+                        pool,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    crate::Error::Internal(format!("reorder_bmp_field panicked: {}", e))
+                })??;
+                writer = w;
+                field_tocs = ft;
             }
         } else {
             // MaxScore format: identity-copy raw data from source
@@ -309,6 +331,14 @@ async fn copy_maxscore_field(
 ///
 /// Reads block data from the source BmpIndex, builds a forward index,
 /// runs BP to compute a permutation, then writes the reordered blob.
+///
+/// This is a synchronous function called from `spawn_blocking` so the
+/// entire CPU-heavy reorder (forward index build, BP, blob write) runs
+/// off tokio worker threads. The `OffsetWriter` streams directly to disk
+/// — no in-memory buffering of the output blob.
+///
+/// When `rayon_pool` is `Some`, all rayon parallel work runs on that pool
+/// instead of the global pool, bounding optimizer CPU usage.
 #[allow(clippy::too_many_arguments)]
 fn reorder_bmp_field(
     bmp: &crate::segment::BmpIndex,
@@ -319,9 +349,10 @@ fn reorder_bmp_field(
     max_weight_scale: f32,
     total_vectors: u32,
     memory_budget: usize,
-    writer: &mut OffsetWriter,
-    field_tocs: &mut Vec<SparseFieldToc>,
-) -> Result<()> {
+    mut writer: OffsetWriter,
+    mut field_tocs: Vec<SparseFieldToc>,
+    rayon_pool: Option<Arc<rayon::ThreadPool>>,
+) -> Result<(OffsetWriter, Vec<SparseFieldToc>)> {
     use crate::segment::builder::bmp::{stream_write_grids, write_v13_footer};
     use crate::segment::builder::graph_bisection::{
         build_forward_index_from_bmps, graph_bisection,
@@ -329,7 +360,7 @@ fn reorder_bmp_field(
 
     let num_real_docs = bmp.num_real_docs() as usize;
     if num_real_docs == 0 {
-        return Ok(());
+        return Ok((writer, field_tocs));
     }
 
     log::info!(
@@ -357,7 +388,12 @@ fn reorder_bmp_field(
 
     let perm = if fwd.num_terms > 0 && num_real_docs > effective_block_size {
         let bp_start = std::time::Instant::now();
-        let perm = graph_bisection(&fwd, effective_block_size, 20);
+        // Run BP on the bounded rayon pool if provided, otherwise global pool.
+        let perm = if let Some(ref pool) = rayon_pool {
+            pool.install(|| graph_bisection(&fwd, effective_block_size, 20))
+        } else {
+            graph_bisection(&fwd, effective_block_size, 20)
+        };
         log::info!(
             "[reorder_bmp] field {}: BP completed in {:.1}ms",
             field_id,
@@ -365,9 +401,9 @@ fn reorder_bmp_field(
         );
         perm
     } else {
+        drop(fwd);
         (0..num_real_docs as u32).collect()
     };
-    drop(fwd);
 
     log::info!(
         "[reorder_bmp] field {}: writing reordered blob ({} blocks)",
@@ -482,7 +518,7 @@ fn reorder_bmp_field(
     block_data_starts.push(cumulative_bytes);
 
     if total_terms == 0 {
-        return Ok(());
+        return Ok((writer, field_tocs));
     }
 
     grid_entries.sort_unstable();
@@ -508,7 +544,7 @@ fn reorder_bmp_field(
     // Sections D+E: packed grid + sb_grid
     let grid_offset = writer.offset() - blob_start;
     let (packed_bytes, _sb_bytes) =
-        stream_write_grids(&grid_entries, dims as usize, new_num_blocks, writer)
+        stream_write_grids(&grid_entries, dims as usize, new_num_blocks, &mut writer)
             .map_err(crate::Error::Io)?;
     let sb_grid_offset = grid_offset + packed_bytes;
     drop(grid_entries);
@@ -549,7 +585,7 @@ fn reorder_bmp_field(
 
     // V13 footer (64 bytes)
     write_v13_footer(
-        writer,
+        &mut writer,
         total_terms,
         total_postings,
         grid_offset,
@@ -595,5 +631,5 @@ fn reorder_bmp_field(
         blob_len as f64 / (1024.0 * 1024.0),
     );
 
-    Ok(())
+    Ok((writer, field_tocs))
 }

@@ -472,17 +472,20 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
 
-        // Multi-segment: use rayon for true CPU parallelism (sync feature required).
+        // Use rayon + block_in_place for CPU-bound scoring (sync feature required).
+        // Offloads the scoring loop from tokio workers so search doesn't starve
+        // other async tasks. Works for any segment count (rayon degrades gracefully
+        // to inline execution for a single segment).
         // Only works on multi-threaded tokio runtime (block_in_place panics on current_thread).
         #[cfg(feature = "sync")]
-        if self.segments.len() > 1
+        if !self.segments.is_empty()
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
             return self.search_internal_parallel(query, fetch_limit, offset, collect_positions);
         }
 
-        // Single segment or no sync feature: use async path
+        // No segments, no sync feature, or current_thread runtime: use async path
         let futures: Vec<_> = self
             .segments
             .iter()
