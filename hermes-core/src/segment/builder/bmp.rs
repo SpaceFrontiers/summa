@@ -121,7 +121,7 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 ///
 /// BP reorder is NOT done at build time — it's handled by the background
-/// optimizer or explicit `force_reorder` via the merge path.
+/// optimizer or explicit reorder command.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_bmp_blob(
     mut postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,

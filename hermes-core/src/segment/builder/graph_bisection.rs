@@ -45,17 +45,22 @@ impl ForwardIndex {
     }
 }
 
-/// Build forward index from BmpIndex sources (single or multi-source merge reorder).
+/// Build forward index from BmpIndex sources (single or multi-source).
 ///
 /// Virtual IDs are assigned sequentially across sources: source 0 gets 0..n0,
 /// source 1 gets n0..n0+n1, etc. Returns `(forward_index, per_source_doc_counts)`.
 ///
 /// Filters dims with doc_freq outside `[min_doc_freq, max_doc_freq]`.
+/// If the estimated forward index memory exceeds `memory_budget_bytes`, the
+/// highest-frequency dims are dropped to stay within budget. This prevents OOM
+/// for huge segments at the cost of slightly reduced reorder quality.
+///
 /// Remaps term IDs to compact range for flat-array degree tracking.
 pub(crate) fn build_forward_index_from_bmps(
     bmps: &[&crate::segment::reader::bmp::BmpIndex],
     min_doc_freq: usize,
     max_doc_freq: usize,
+    memory_budget_bytes: usize,
 ) -> (ForwardIndex, Vec<usize>) {
     let source_doc_counts: Vec<usize> = bmps.iter().map(|b| b.num_real_docs() as usize).collect();
     let total_docs: usize = source_doc_counts.iter().sum();
@@ -89,14 +94,57 @@ pub(crate) fn build_forward_index_from_bmps(
         }
     }
 
-    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
-    for (&dim_id, &df) in &dim_df {
-        if df >= min_doc_freq && df <= max_doc_freq {
-            let compact_id = term_remap.len() as u32;
-            term_remap.insert(dim_id, compact_id);
+    // Filter dims by [min_doc_freq, max_doc_freq] range
+    let mut eligible: Vec<(u32, usize)> = dim_df
+        .iter()
+        .filter(|&(_, df)| *df >= min_doc_freq && *df <= max_doc_freq)
+        .map(|(&dim_id, &df)| (dim_id, df))
+        .collect();
+    drop(dim_df);
+
+    // Memory budget: estimate forward index + bisection scratch.
+    // Peak ≈ 4*total_postings (terms array) + 28*total_docs (offsets, counts,
+    //   docs, gains, indices, new_left, new_right) + 8*num_terms (degree arrays).
+    let total_postings_est: usize = eligible.iter().map(|(_, df)| *df).sum();
+    let estimated_bytes = total_postings_est * 4 + total_docs * 28 + eligible.len() * 8;
+
+    if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
+        // Sort by df ascending — keep discriminative low-df dims first,
+        // drop highest-df dims which contribute the most postings.
+        eligible.sort_by_key(|&(_, df)| df);
+
+        let target_postings =
+            memory_budget_bytes.saturating_sub(total_docs * 28 + eligible.len() * 8) / 4;
+        let mut cum = 0usize;
+        let mut keep_count = 0;
+        for &(_, df) in &eligible {
+            if cum + df > target_postings {
+                break;
+            }
+            cum += df;
+            keep_count += 1;
         }
+
+        let dropped = eligible.len() - keep_count;
+        eligible.truncate(keep_count);
+
+        log::warn!(
+            "[reorder] memory budget {:.0} MB: estimated {:.0} MB, dropped {} highest-df dims, keeping {} ({} postings)",
+            memory_budget_bytes as f64 / (1024.0 * 1024.0),
+            estimated_bytes as f64 / (1024.0 * 1024.0),
+            dropped,
+            keep_count,
+            cum,
+        );
+    }
+
+    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
+    for &(dim_id, _) in &eligible {
+        let compact_id = term_remap.len() as u32;
+        term_remap.insert(dim_id, compact_id);
     }
     let num_active_terms = term_remap.len();
+    drop(eligible);
 
     // Phase 2: count terms per doc (filtered)
     let mut counts = vec![0u32; total_docs];

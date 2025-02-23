@@ -5,6 +5,8 @@ pub(crate) mod format;
 #[cfg(feature = "native")]
 mod merger;
 mod reader;
+#[cfg(feature = "native")]
+pub(crate) mod reorder;
 mod store;
 #[cfg(feature = "native")]
 mod tracker;

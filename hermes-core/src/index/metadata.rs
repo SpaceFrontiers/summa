@@ -49,7 +49,7 @@ pub struct SegmentMetaInfo {
     pub generation: u32,
     /// Whether this segment has been reordered via Recursive Graph Bisection (BP).
     /// Fresh segments and block-copy merges are not reordered. Only segments that have
-    /// been explicitly reordered (via force_reorder or background optimizer) are marked true.
+    /// been explicitly reordered (via background optimizer or reorder command) are marked true.
     #[serde(default)]
     pub reordered: bool,
 }
