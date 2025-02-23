@@ -362,6 +362,12 @@ impl Schema {
         self.fields.len()
     }
 
+    /// Whether any field has the `reorder` attribute set.
+    /// Used by the background optimizer to determine which indexes need BP reordering.
+    pub fn has_reorder_fields(&self) -> bool {
+        self.fields.iter().any(|e| e.reorder)
+    }
+
     /// Get the default fields for query parsing
     pub fn default_fields(&self) -> &[Field] {
         &self.default_fields

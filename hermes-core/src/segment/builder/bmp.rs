@@ -90,11 +90,6 @@ impl VidLookup {
     pub fn get(&self, key: (crate::DocId, u16)) -> u32 {
         self.map[&key]
     }
-
-    #[inline]
-    pub fn try_get(&self, key: (crate::DocId, u16)) -> Option<u32> {
-        self.map.get(&key).copied()
-    }
 }
 
 use crate::DocId;
@@ -125,9 +120,8 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 ///
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 ///
-/// Uses **Recursive Graph Bisection (BP)** to order documents for optimal
-/// BMP block clustering. BP directly optimizes log-gap cost, clustering
-/// documents that share dimensions into the same blocks.
+/// BP reorder is NOT done at build time — it's handled by the background
+/// optimizer or explicit `force_reorder` via the merge path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_bmp_blob(
     mut postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,
@@ -137,7 +131,6 @@ pub(crate) fn build_bmp_blob(
     dims: u32,
     max_weight: f32,
     min_terms: usize,
-    reorder: bool,
     writer: &mut dyn Write,
 ) -> std::io::Result<u64> {
     if postings.is_empty() {
@@ -200,61 +193,6 @@ pub(crate) fn build_bmp_blob(
     vid_pairs.sort_unstable();
     let num_real_docs = vid_pairs.len();
 
-    // Optionally apply Recursive Graph Bisection (BP) to reorder documents.
-    // BP directly optimizes log-gap cost, clustering documents that share
-    // dimensions into the same blocks for tight upper bounds.
-    let bp_perm = if reorder {
-        let vid_lookup = VidLookup::from_sorted_pairs(&vid_pairs);
-        let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
-        // min_doc_freq=2: include all terms appearing in at least 2 docs.
-        // Rare terms are the most discriminative for clustering — aggressive
-        // filtering (e.g. 128) removes the signal BP needs.
-        let bp_params = super::graph_bisection::BpParams {
-            weight_threshold,
-            max_weight,
-            min_terms,
-            min_doc_freq: 2,
-            max_doc_freq: max_doc_freq.max(1),
-        };
-        let fwd_start = std::time::Instant::now();
-        let fwd = super::graph_bisection::build_forward_index(
-            num_real_docs,
-            &postings,
-            &vid_lookup,
-            &bp_params,
-        );
-        drop(vid_lookup);
-        log::info!(
-            "BP forward index built in {:.1}ms",
-            fwd_start.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        if fwd.num_terms > 0 && num_real_docs > bmp_block_size as usize {
-            log::info!(
-                "BP reorder: {} docs, {} active terms, {} total postings in forward index",
-                num_real_docs,
-                fwd.num_terms,
-                fwd.total_postings(),
-            );
-            let bp_start = std::time::Instant::now();
-            let perm = super::graph_bisection::graph_bisection(&fwd, bmp_block_size as usize, 20);
-            log::info!(
-                "BP reorder completed in {:.1}ms",
-                bp_start.elapsed().as_secs_f64() * 1000.0
-            );
-            drop(fwd);
-            let reordered: Vec<(DocId, u16)> =
-                perm.iter().map(|&i| vid_pairs[i as usize]).collect();
-            vid_pairs = reordered;
-            true
-        } else {
-            drop(fwd);
-            false
-        }
-    } else {
-        false
-    };
-
     // Build O(1) lookup table from (doc_id, ordinal) → virtual_id.
     let vid_lookup = VidLookup::from_sorted_pairs(&vid_pairs);
 
@@ -273,29 +211,11 @@ pub(crate) fn build_bmp_blob(
     //
     // Take ownership of per-dim posting Vecs. This drains the HashMap so
     // its memory can be reclaimed by the allocator during the merge.
-    let mut dim_vecs: Vec<Vec<(DocId, u16, f32)>> = dim_ids
+    let dim_vecs: Vec<Vec<(DocId, u16, f32)>> = dim_ids
         .iter()
         .map(|&d| postings.remove(&d).unwrap_or_default())
         .collect();
     drop(postings); // Free HashMap shell now
-
-    // When BP reordering is active, virtual IDs are not monotonic with
-    // (doc_id, ordinal) order. Re-sort per-dim postings by virtual_id so the
-    // K-way merge's sequential cursor assumption holds.
-    // Parallelized: each dim's sort is independent.
-    if bp_perm {
-        use rayon::prelude::*;
-        let resort_start = std::time::Instant::now();
-        dim_vecs.par_iter_mut().for_each(|dim_posts| {
-            dim_posts
-                .sort_unstable_by_key(|&(doc_id, ordinal, _)| vid_lookup.get((doc_id, ordinal)));
-        });
-        log::info!(
-            "BP per-dim re-sort completed in {:.1}ms ({} dims)",
-            resort_start.elapsed().as_secs_f64() * 1000.0,
-            dim_vecs.len(),
-        );
-    }
 
     // Borrow slices for the merge loop
     let dim_slices: Vec<&[(DocId, u16, f32)]> = dim_vecs.iter().map(|v| v.as_slice()).collect();
@@ -490,7 +410,7 @@ pub(crate) fn build_bmp_blob(
 
     log::info!(
         "[bmp_build] V13 vectors={} padded={} blocks={} dims={} \
-         terms={} postings={} grid_entries={} bp_reorder={}",
+         terms={} postings={} grid_entries={}",
         num_real_docs,
         num_virtual_docs,
         num_blocks,
@@ -498,7 +418,6 @@ pub(crate) fn build_bmp_blob(
         total_terms,
         total_postings,
         grid_entries.len(),
-        bp_perm,
     );
 
     // Free K-way merge inputs — reclaims per-dim posting Vecs and vid lookup.
@@ -724,8 +643,7 @@ mod tests {
     fn test_build_bmp_blob_empty() {
         let postings = FxHashMap::default();
         let mut buf = Vec::new();
-        let size =
-            build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, false, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert_eq!(size, 0);
         assert!(buf.is_empty());
     }
@@ -739,8 +657,7 @@ mod tests {
         postings.insert(1, vec![(0, 0, 0.8)]);
 
         let mut buf = Vec::new();
-        let size =
-            build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, false, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
@@ -757,8 +674,7 @@ mod tests {
         postings.insert(0u32, vec![(0u32, 0u16, 1.0f32), (0, 1, 0.8), (1, 0, 0.5)]);
 
         let mut buf = Vec::new();
-        let size =
-            build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, false, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
         // Verify V13 footer: num_virtual_docs should be 64 (padded to block_size)
@@ -783,8 +699,7 @@ mod tests {
         // impact(2.0) = round(2.0/5.0*255) = round(102) = 102
         // impact(1.0) = round(1.0/5.0*255) = round(51) = 51
         let mut buf = Vec::new();
-        let size =
-            build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, false, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
         // Verify max_weight_scale in V13 footer (bytes 40-43)
@@ -809,7 +724,7 @@ mod tests {
 
         // Fixed max_weight=5.0: same scale
         let mut buf_a = Vec::new();
-        build_bmp_blob(postings_a, 64, 0.0, None, 105879, 5.0, 4, false, &mut buf_a).unwrap();
+        build_bmp_blob(postings_a, 64, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
         let scale_a = f32::from_le_bytes(
             buf_a[buf_a.len() - 64 + 40..buf_a.len() - 64 + 44]
                 .try_into()
@@ -817,7 +732,7 @@ mod tests {
         );
 
         let mut buf_b = Vec::new();
-        build_bmp_blob(postings_b, 64, 0.0, None, 105879, 5.0, 4, false, &mut buf_b).unwrap();
+        build_bmp_blob(postings_b, 64, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
         let scale_b = f32::from_le_bytes(
             buf_b[buf_b.len() - 64 + 40..buf_b.len() - 64 + 44]
                 .try_into()

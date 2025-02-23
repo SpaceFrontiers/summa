@@ -3,6 +3,7 @@
 mod converters;
 mod error;
 mod index_service;
+mod optimizer;
 mod registry;
 mod search_service;
 
@@ -62,6 +63,14 @@ struct Args {
     /// Validate all indexes on startup, remove corrupt segments
     #[arg(long)]
     doctor: bool,
+
+    /// Number of background optimizer threads for BP reordering (0 = disabled)
+    #[arg(long, default_value = "0")]
+    optimizer_threads: usize,
+
+    /// Interval in seconds between optimizer scans for unreordered segments
+    #[arg(long, default_value = "60")]
+    optimizer_scan_interval_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -139,6 +148,15 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         registry: Arc::clone(&registry),
     };
 
+    // Spawn background optimizer
+    let _optimizer_handle = optimizer::spawn_optimizer(
+        Arc::clone(&registry),
+        optimizer::OptimizerConfig {
+            threads: args.optimizer_threads,
+            scan_interval: Duration::from_secs(args.optimizer_scan_interval_secs),
+        },
+    );
+
     info!("Hermes server v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting Hermes server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
@@ -146,6 +164,12 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Indexing threads: {}", num_indexing_threads);
     info!("Worker threads: {}", worker_threads);
     info!("Reload interval: {} ms", args.reload_interval_ms);
+    if args.optimizer_threads > 0 {
+        info!(
+            "Optimizer: {} threads, {}s scan interval",
+            args.optimizer_threads, args.optimizer_scan_interval_secs,
+        );
+    }
 
     // Separate message size limits for search vs index services
     const SEARCH_MAX_DECODE: usize = 4 * 1024 * 1024; // 4 MB (queries are small)

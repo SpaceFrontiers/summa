@@ -44,7 +44,7 @@ impl SegmentMerger {
     ) -> Result<usize> {
         let doc_offs = doc_offsets(segments)?;
 
-        // Collect all sparse vector fields from schema (with reorder flag)
+        // Collect all sparse vector fields from schema
         let sparse_fields: Vec<_> = self
             .schema
             .fields()

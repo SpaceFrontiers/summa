@@ -428,7 +428,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             match result {
                 Ok((new_id, doc_count)) => {
-                    if let Err(e) = sm.replace_segments(&ids, new_id, doc_count).await {
+                    if let Err(e) = sm.replace_segments(&ids, new_id, doc_count, false).await {
                         log::error!("[merge] Failed to replace segments after merge: {:?}", e);
                     }
                 }
@@ -450,11 +450,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Atomically replace old segments with a new merged segment.
     /// Computes merge generation as max(parent gens) + 1 and records ancestors.
+    /// `reordered` marks whether the new segment was BP-reordered.
     async fn replace_segments(
         &self,
         old_ids: &[String],
         new_id: String,
         doc_count: u32,
+        reordered: bool,
     ) -> Result<()> {
         self.tracker.register(&new_id);
 
@@ -473,7 +475,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 st.metadata.remove_segment(id);
             }
             st.metadata
-                .add_merged_segment(new_id, doc_count, ancestors, parent_gen + 1);
+                .add_merged_segment(new_id, doc_count, ancestors, parent_gen + 1, reordered);
             // Mutation + persist must be atomic — keep under lock
             st.metadata.save(self.directory.as_ref()).await?;
         }
@@ -673,7 +675,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )
             .await?;
 
-            self.replace_segments(&batch, new_segment_id, total_docs)
+            self.replace_segments(&batch, new_segment_id, total_docs, false)
                 .await?;
 
             // _guard drops here → segments unregistered from inventory
@@ -725,11 +727,60 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )
             .await?;
 
-            self.replace_segments(&[seg_id], new_id, total_docs).await?;
+            self.replace_segments(&[seg_id], new_id, total_docs, true)
+                .await?;
         }
 
         log::info!("[reorder] all segments reordered");
         Ok(())
+    }
+
+    /// Get segment IDs that have not been reordered yet.
+    ///
+    /// Used by background optimizer to find segments that need BP reordering.
+    pub async fn unreordered_segment_ids(&self) -> Vec<String> {
+        let st = self.state.lock().await;
+        st.metadata
+            .segment_metas
+            .iter()
+            .filter(|(_, info)| !info.reordered)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Reorder a single segment via BP. Returns Ok(true) if reordered, Ok(false) if skipped.
+    ///
+    /// Non-blocking: uses merge inventory to prevent conflicts with background merges.
+    /// Does NOT wait for in-flight merges — cooperates with them instead.
+    pub async fn reorder_single_segment(self: &Arc<Self>, seg_id: &str) -> Result<bool> {
+        let output_id = SegmentId::new();
+        let output_hex = output_id.to_hex();
+
+        let all_ids = vec![seg_id.to_string(), output_hex];
+        let _guard = match self.merge_inventory.try_register(all_ids) {
+            Some(g) => g,
+            None => {
+                log::debug!("[optimizer] segment {} in active merge, skipping", seg_id);
+                return Ok(false);
+            }
+        };
+
+        let trained_snap = self.trained();
+        let (new_id, total_docs) = Self::do_merge(
+            self.directory.as_ref(),
+            &self.schema,
+            std::slice::from_ref(&seg_id.to_string()),
+            output_id,
+            self.term_cache_blocks,
+            trained_snap.as_deref(),
+            true, // force_reorder
+        )
+        .await?;
+
+        self.replace_segments(&[seg_id.to_string()], new_id, total_docs, true)
+            .await?;
+
+        Ok(true)
     }
 
     /// Clean up orphan segment files not registered in metadata.

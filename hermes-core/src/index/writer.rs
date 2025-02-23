@@ -677,6 +677,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.reorder_segments().await
     }
 
+    /// Get the segment manager (for background optimizer access).
+    pub fn segment_manager(&self) -> &Arc<crate::merge::SegmentManager<D>> {
+        &self.segment_manager
+    }
+
     /// Resume workers with a fresh channel. Called after commit or abort.
     ///
     /// Workers are already alive — just give them a new channel and wake them.

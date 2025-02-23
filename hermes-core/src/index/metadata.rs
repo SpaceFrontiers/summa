@@ -47,6 +47,11 @@ pub struct SegmentMetaInfo {
     pub ancestors: Vec<String>,
     /// Merge generation: 0 for fresh segments, max(parent generations) + 1 for merged segments
     pub generation: u32,
+    /// Whether this segment has been reordered via Recursive Graph Bisection (BP).
+    /// Fresh segments and block-copy merges are not reordered. Only segments that have
+    /// been explicitly reordered (via force_reorder or background optimizer) are marked true.
+    #[serde(default)]
+    pub reordered: bool,
 }
 
 /// Per-field vector index metadata
@@ -104,7 +109,7 @@ impl IndexMetadata {
         ids
     }
 
-    /// Add a fresh segment (gen=0, no ancestors)
+    /// Add a fresh segment (gen=0, no ancestors, not reordered)
     pub fn add_segment(&mut self, segment_id: String, num_docs: u32) {
         self.segment_metas.insert(
             segment_id,
@@ -112,6 +117,7 @@ impl IndexMetadata {
                 num_docs,
                 ancestors: Vec::new(),
                 generation: 0,
+                reordered: false,
             },
         );
     }
@@ -123,6 +129,7 @@ impl IndexMetadata {
         num_docs: u32,
         ancestors: Vec<String>,
         generation: u32,
+        reordered: bool,
     ) {
         self.segment_metas.insert(
             segment_id,
@@ -130,6 +137,7 @@ impl IndexMetadata {
                 num_docs,
                 ancestors,
                 generation,
+                reordered,
             },
         );
     }
@@ -516,6 +524,7 @@ mod tests {
             125,
             vec!["a".to_string(), "b".to_string()],
             1,
+            false,
         );
         assert_eq!(meta.segment_metas["c"].generation, 1);
         assert_eq!(meta.segment_metas["c"].ancestors, vec!["a", "b"]);
@@ -528,6 +537,7 @@ mod tests {
             155,
             vec!["c".to_string(), "d".to_string()],
             2,
+            false,
         );
         assert_eq!(meta.segment_metas["e"].generation, 2);
     }

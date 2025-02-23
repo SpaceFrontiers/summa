@@ -106,11 +106,6 @@ pub(super) fn build_sparse_streaming(
         let min_terms = sparse_config.map(|c| c.min_terms).unwrap_or(4);
         let total_vectors = builder.total_vectors;
 
-        let reorder = schema
-            .get_field_entry(field)
-            .map(|e| e.reorder)
-            .unwrap_or(false);
-
         match format {
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
@@ -126,7 +121,6 @@ pub(super) fn build_sparse_streaming(
                     dims,
                     max_weight,
                     min_terms,
-                    reorder,
                     writer,
                 )
                 .map_err(crate::Error::Io)?;

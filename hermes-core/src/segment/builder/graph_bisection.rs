@@ -11,10 +11,6 @@
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::DocId;
-
-use super::bmp::VidLookup;
-
 // ── Forward index (CSR) ──────────────────────────────────────────────────
 
 /// Forward index in CSR format: doc `d`'s terms are `terms[offsets[d]..offsets[d+1]]`.
@@ -46,119 +42,6 @@ impl ForwardIndex {
     /// Total postings in the forward index.
     pub fn total_postings(&self) -> u32 {
         self.offsets.last().copied().unwrap_or(0)
-    }
-}
-
-// ── BP configuration ─────────────────────────────────────────────────────
-
-/// Parameters for building a forward index from inverted postings.
-pub(crate) struct BpParams {
-    pub weight_threshold: f32,
-    pub max_weight: f32,
-    pub min_terms: usize,
-    pub min_doc_freq: usize,
-    pub max_doc_freq: usize,
-}
-
-// ── Build forward index from inverted postings (builder path) ────────────
-
-/// Build forward index from BMP postings (inverted → forward).
-///
-/// Filters dims with doc_freq outside `[min_doc_freq, max_doc_freq]`.
-/// Remaps term IDs to compact range `0..num_active_terms` for flat-array degree tracking.
-/// `vid_lookup` maps `(doc_id, ordinal)` → virtual_id.
-pub(crate) fn build_forward_index(
-    num_docs: usize,
-    postings: &FxHashMap<u32, Vec<(DocId, u16, f32)>>,
-    vid_lookup: &VidLookup,
-    params: &BpParams,
-) -> ForwardIndex {
-    let BpParams {
-        weight_threshold,
-        max_weight,
-        min_terms,
-        min_doc_freq,
-        max_doc_freq,
-    } = *params;
-
-    // Phase 1: Assign compact term IDs to active dimensions
-    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
-    for (&dim_id, dim_posts) in postings {
-        let df = dim_posts.len();
-        if df >= min_doc_freq && df <= max_doc_freq {
-            let compact_id = term_remap.len() as u32;
-            term_remap.insert(dim_id, compact_id);
-        }
-    }
-    let num_active_terms = term_remap.len();
-
-    // Phase 2: count terms per doc
-    let mut counts = vec![0u32; num_docs];
-
-    for (&dim_id, dim_posts) in postings {
-        let Some(&_compact) = term_remap.get(&dim_id) else {
-            continue;
-        };
-        let skip_wt = dim_posts.len() < min_terms;
-        for &(doc_id, ordinal, weight) in dim_posts {
-            let abs_w = weight.abs();
-            if !skip_wt && abs_w < weight_threshold {
-                continue;
-            }
-            let impact = quantize_weight_for_bp(abs_w, max_weight);
-            if impact == 0 {
-                continue;
-            }
-            if let Some(vid) = vid_lookup
-                .try_get((doc_id, ordinal))
-                .filter(|&v| (v as usize) < num_docs)
-            {
-                counts[vid as usize] += 1;
-            }
-        }
-    }
-
-    // Phase 3: build CSR offsets
-    let mut offsets = Vec::with_capacity(num_docs + 1);
-    offsets.push(0u32);
-    for &c in &counts {
-        offsets.push(offsets.last().unwrap() + c);
-    }
-    let total = *offsets.last().unwrap() as usize;
-
-    // Phase 4: fill terms (using compact IDs)
-    let mut terms = vec![0u32; total];
-    counts.fill(0);
-
-    for (&dim_id, dim_posts) in postings {
-        let Some(&compact) = term_remap.get(&dim_id) else {
-            continue;
-        };
-        let skip_wt = dim_posts.len() < min_terms;
-        for &(doc_id, ordinal, weight) in dim_posts {
-            let abs_w = weight.abs();
-            if !skip_wt && abs_w < weight_threshold {
-                continue;
-            }
-            let impact = quantize_weight_for_bp(abs_w, max_weight);
-            if impact == 0 {
-                continue;
-            }
-            if let Some(vid) = vid_lookup.try_get((doc_id, ordinal)) {
-                let vid = vid as usize;
-                if vid < num_docs {
-                    let pos = offsets[vid] as usize + counts[vid] as usize;
-                    terms[pos] = compact;
-                    counts[vid] += 1;
-                }
-            }
-        }
-    }
-
-    ForwardIndex {
-        terms,
-        offsets,
-        num_terms: num_active_terms,
     }
 }
 
@@ -507,16 +390,6 @@ fn compute_gains(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Quantize weight to u8 for BP forward index (same scale as BMP builder).
-#[inline]
-fn quantize_weight_for_bp(weight: f32, max_scale: f32) -> u8 {
-    if max_scale <= 0.0 {
-        return 0;
-    }
-    let normalized = (weight / max_scale * 255.0).round();
-    normalized.clamp(0.0, 255.0) as u8
-}
 
 /// Build precomputed log2 table for values 0..size.
 fn build_log_table(size: usize) -> Vec<f32> {
