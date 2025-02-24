@@ -60,9 +60,12 @@ impl SegmentMerger {
 
         // Accumulated per-field data for TOC
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
-        // Skip entries serialized as contiguous bytes (24B each)
-        let mut skip_bytes: Vec<u8> = Vec::new();
+        // Skip entries written to a temp file to avoid unbounded memory usage.
+        // For large indexes (200M+ docs) the skip section can exceed 3 GB.
+        let skip_tmp = files.sparse.with_extension("skip.tmp");
+        let mut skip_writer = dir.streaming_writer(&skip_tmp).await?;
         let mut skip_count: u32 = 0;
+        let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
         for (field, sparse_config) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
@@ -208,8 +211,9 @@ impl SegmentMerger {
                     #[cfg(feature = "diagnostics")]
                     super::diagnostics::validate_merge_source(dim_id, src_idx, raw)?;
 
-                    // Serialize adjusted skip entries to byte buffer
+                    // Serialize adjusted skip entries to temp file (batched write)
                     for entry in &raw.skip_entries {
+                        skip_entry_buf.clear();
                         SparseSkipEntry::new(
                             entry.first_doc + doc_offset,
                             entry.last_doc + doc_offset,
@@ -217,7 +221,10 @@ impl SegmentMerger {
                             entry.length,
                             entry.max_weight,
                         )
-                        .write_to_vec(&mut skip_bytes);
+                        .write_to_vec(&mut skip_entry_buf);
+                        skip_writer
+                            .write_all(&skip_entry_buf)
+                            .map_err(crate::Error::Io)?;
                         skip_count += 1;
                     }
                     // Advance cumulative offset by this source's total block data size
@@ -269,16 +276,32 @@ impl SegmentMerger {
             }
         }
 
+        // Finalize the skip temp file so it can be read back
+        skip_writer.finish().map_err(crate::Error::Io)?;
+
         if field_tocs.is_empty() {
             drop(writer);
             let _ = dir.delete(&files.sparse).await;
+            let _ = dir.delete(&skip_tmp).await;
             return Ok(0);
         }
 
-        // Phase 2: Write skip section (dump serialized bytes)
+        // Phase 2: Stream-copy skip entries from temp file to main writer (4 MB chunks)
         let skip_offset = writer.offset();
-        writer.write_all(&skip_bytes).map_err(crate::Error::Io)?;
-        drop(skip_bytes);
+        let skip_size = skip_count as u64 * SparseSkipEntry::SIZE as u64;
+        const SKIP_COPY_CHUNK: u64 = 4 * 1024 * 1024;
+        {
+            let mut pos = 0u64;
+            while pos < skip_size {
+                let end = (pos + SKIP_COPY_CHUNK).min(skip_size);
+                let chunk = dir.read_range(&skip_tmp, pos..end).await?;
+                writer
+                    .write_all(chunk.as_slice())
+                    .map_err(crate::Error::Io)?;
+                pos = end;
+            }
+        }
+        dir.delete(&skip_tmp).await.map_err(crate::Error::Io)?;
 
         // Phase 3 + 4: Write TOC + footer
         let toc_offset = writer.offset();

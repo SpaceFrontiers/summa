@@ -617,6 +617,152 @@ pub(crate) fn stream_write_grids(
     Ok((packed_bytes, sb_bytes))
 }
 
+/// Size of a single grid entry on disk: dim_id(4) + block_id(4) + impact(1) = 9 bytes.
+const GRID_ENTRY_DISK_SIZE: usize = 9;
+
+/// Reader for a sorted grid entry run file.
+///
+/// Each run file contains `(dim_id, block_id, max_impact)` triples sorted by
+/// `(dim_id, block_id)`. Entries are 9 bytes each on disk.
+pub(crate) struct GridRunReader {
+    reader: std::io::BufReader<std::fs::File>,
+    /// Peeked current entry (None when exhausted).
+    pub current: Option<(u32, u32, u8)>,
+}
+
+impl GridRunReader {
+    /// Open a run file and read the first entry.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let current = Self::read_entry(&mut reader)?;
+        Ok(Self { reader, current })
+    }
+
+    /// Read the next entry from the underlying file.
+    fn read_entry(
+        reader: &mut std::io::BufReader<std::fs::File>,
+    ) -> std::io::Result<Option<(u32, u32, u8)>> {
+        use std::io::Read;
+        let mut buf = [0u8; GRID_ENTRY_DISK_SIZE];
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {
+                let dim_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                let block_id = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                let impact = buf[8];
+                Ok(Some((dim_id, block_id, impact)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Advance to the next entry.
+    pub fn advance(&mut self) -> std::io::Result<()> {
+        self.current = Self::read_entry(&mut self.reader)?;
+        Ok(())
+    }
+
+    /// Seek back to the beginning and re-read the first entry.
+    pub fn reset(&mut self) -> std::io::Result<()> {
+        use std::io::Seek;
+        self.reader.seek(std::io::SeekFrom::Start(0))?;
+        self.current = Self::read_entry(&mut self.reader)?;
+        Ok(())
+    }
+}
+
+/// Write sorted grid entries to a run file on disk.
+///
+/// Entries must already be sorted by `(dim_id, block_id)`.
+pub(crate) fn write_grid_run(
+    entries: &[(u32, u32, u8)],
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::BufWriter;
+    let file = std::fs::File::create(path)?;
+    let mut w = BufWriter::with_capacity(256 * 1024, file);
+    let mut buf = [0u8; GRID_ENTRY_DISK_SIZE];
+    for &(dim_id, block_id, impact) in entries {
+        buf[0..4].copy_from_slice(&dim_id.to_le_bytes());
+        buf[4..8].copy_from_slice(&block_id.to_le_bytes());
+        buf[8] = impact;
+        w.write_all(&buf)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Stream-write grids from multiple sorted run files (external merge sort).
+///
+/// Two-pass approach: first pass writes Section D (packed 4-bit grid),
+/// then resets all readers and second pass writes Section E (superblock grid).
+///
+/// Within each run, entries are sorted by `(dim_id, block_id)`, so for each dim
+/// we drain matching entries from all readers. No heap needed.
+///
+/// Returns `(packed_grid_bytes, sb_grid_bytes)`.
+pub(crate) fn stream_write_grids_merged(
+    run_readers: &mut [GridRunReader],
+    num_dims: usize,
+    num_blocks: usize,
+    writer: &mut dyn Write,
+) -> std::io::Result<(u64, u64)> {
+    let packed_row_size = num_blocks.div_ceil(2);
+    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
+
+    let mut row_buf = vec![0u8; packed_row_size];
+    let mut sb_row = vec![0u8; num_superblocks];
+
+    // Pass 1: Section D — packed 4-bit grid, one dim row at a time
+    for dim_id in 0..num_dims as u32 {
+        row_buf.fill(0);
+        for reader in run_readers.iter_mut() {
+            while let Some((d, block_id, impact)) = reader.current {
+                if d != dim_id {
+                    break;
+                }
+                let b = block_id as usize;
+                let q4 = quantize_u8_to_u4_ceil(impact);
+                if b.is_multiple_of(2) {
+                    row_buf[b / 2] |= q4;
+                } else {
+                    row_buf[b / 2] |= q4 << 4;
+                }
+                reader.advance()?;
+            }
+        }
+        writer.write_all(&row_buf)?;
+    }
+    let packed_bytes = (num_dims * packed_row_size) as u64;
+
+    // Reset all readers for pass 2
+    for reader in run_readers.iter_mut() {
+        reader.reset()?;
+    }
+
+    // Pass 2: Section E — 8-bit superblock grid, one dim row at a time
+    for dim_id in 0..num_dims as u32 {
+        sb_row.fill(0);
+        for reader in run_readers.iter_mut() {
+            while let Some((d, block_id, impact)) = reader.current {
+                if d != dim_id {
+                    break;
+                }
+                let sb = block_id as usize / BMP_SUPERBLOCK_SIZE as usize;
+                if impact > sb_row[sb] {
+                    sb_row[sb] = impact;
+                }
+                reader.advance()?;
+            }
+        }
+        writer.write_all(&sb_row)?;
+    }
+    let sb_bytes = (num_dims * num_superblocks) as u64;
+
+    Ok((packed_bytes, sb_bytes))
+}
+
 /// Quantize a weight to u8 (0-255) given the global max scale.
 #[inline]
 fn quantize_weight(weight: f32, max_scale: f32) -> u8 {

@@ -353,7 +353,10 @@ fn reorder_bmp_field(
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>)> {
-    use crate::segment::builder::bmp::{stream_write_grids, write_v13_footer};
+    use crate::segment::builder::bmp::{
+        GridRunReader, stream_write_grids, stream_write_grids_merged, write_grid_run,
+        write_v13_footer,
+    };
     use crate::segment::builder::graph_bisection::{
         build_forward_index_from_bmps, graph_bisection,
     };
@@ -417,11 +420,20 @@ fn reorder_bmp_field(
 
     let blob_start = writer.offset();
     let mut block_data_starts: Vec<u64> = Vec::with_capacity(new_num_blocks + 1);
-    let est_terms: u32 = bmp.total_terms() as u32;
-    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_terms as usize);
     let mut total_terms: u32 = 0;
     let mut total_postings: u32 = 0;
     let mut cumulative_bytes: u64 = 0;
+
+    // Grid entries with external merge sort: accumulate in memory up to budget,
+    // spill sorted runs to temp files when exceeded. 12 bytes per entry in memory.
+    const GRID_ENTRIES_BUDGET: usize = 512 * 1024 * 1024; // 512 MB
+    const GRID_ENTRY_MEM_SIZE: usize = std::mem::size_of::<(u32, u32, u8)>(); // 12 bytes
+    let max_entries_in_memory = GRID_ENTRIES_BUDGET / GRID_ENTRY_MEM_SIZE;
+
+    let est_entries = (bmp.total_terms() as usize).min(max_entries_in_memory);
+    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_entries);
+    let mut run_files: Vec<std::path::PathBuf> = Vec::new();
+    let run_prefix = format!("hermes_grid_run_{}_{}", std::process::id(), field_id);
 
     // Per-block scratch buffers
     let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -512,15 +524,35 @@ fn reorder_bmp_field(
             writer.write_all(&blk_buf).map_err(crate::Error::Io)?;
             cumulative_bytes += blk_buf.len() as u64;
         }
+
+        // Spill grid entries to disk when memory budget exceeded
+        if grid_entries.len() >= max_entries_in_memory {
+            grid_entries.sort_unstable();
+            let run_path =
+                std::env::temp_dir().join(format!("{}_{}.tmp", run_prefix, run_files.len()));
+            write_grid_run(&grid_entries, &run_path).map_err(crate::Error::Io)?;
+            run_files.push(run_path);
+            grid_entries.clear();
+            log::debug!(
+                "[reorder_bmp] field {}: spilled grid run {} to disk",
+                field_id,
+                run_files.len(),
+            );
+        }
     }
 
     // Sentinel
     block_data_starts.push(cumulative_bytes);
 
     if total_terms == 0 {
+        // Clean up any run files
+        for path in &run_files {
+            let _ = std::fs::remove_file(path);
+        }
         return Ok((writer, field_tocs));
     }
 
+    // Sort remaining in-memory entries
     grid_entries.sort_unstable();
 
     // ── Write remaining sections ────────────────────────────────────────
@@ -543,11 +575,41 @@ fn reorder_bmp_field(
 
     // Sections D+E: packed grid + sb_grid
     let grid_offset = writer.offset() - blob_start;
-    let (packed_bytes, _sb_bytes) =
-        stream_write_grids(&grid_entries, dims as usize, new_num_blocks, &mut writer)
+    let (packed_bytes, _sb_bytes) = if run_files.is_empty() {
+        // Fast path: all entries fit in memory, use existing function
+        let result = stream_write_grids(&grid_entries, dims as usize, new_num_blocks, &mut writer)
             .map_err(crate::Error::Io)?;
+        drop(grid_entries);
+        result
+    } else {
+        // Flush remaining in-memory entries as the final run if non-empty
+        if !grid_entries.is_empty() {
+            let run_path =
+                std::env::temp_dir().join(format!("{}_{}.tmp", run_prefix, run_files.len()));
+            write_grid_run(&grid_entries, &run_path).map_err(crate::Error::Io)?;
+            run_files.push(run_path);
+        }
+        drop(grid_entries);
+
+        // Open run readers for K-way merge
+        let mut run_readers: Vec<GridRunReader> = Vec::with_capacity(run_files.len());
+        for path in &run_files {
+            run_readers.push(GridRunReader::open(path).map_err(crate::Error::Io)?);
+        }
+
+        let result =
+            stream_write_grids_merged(&mut run_readers, dims as usize, new_num_blocks, &mut writer)
+                .map_err(crate::Error::Io)?;
+
+        // Clean up run files
+        drop(run_readers);
+        for path in &run_files {
+            let _ = std::fs::remove_file(path);
+        }
+
+        result
+    };
     let sb_grid_offset = grid_offset + packed_bytes;
-    drop(grid_entries);
 
     // Sections F+G: doc_map [new_num_virtual_docs each]
     let doc_map_offset = writer.offset() - blob_start;
