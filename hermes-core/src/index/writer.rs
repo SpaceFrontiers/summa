@@ -296,6 +296,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// keys are iterated (incremental). Falls back to a full rebuild when no
     /// cache exists.
     ///
+    /// Only loads fast-field data (text dictionaries) per segment — NOT full
+    /// `SegmentReader`s — to avoid duplicating dense/sparse index memory.
+    ///
     /// The CPU-intensive bloom build is offloaded via `spawn_blocking` so it
     /// does not block the tokio runtime.
     ///
@@ -327,56 +330,72 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             Err(_) => None,
         };
 
-        // Open all segment readers concurrently (needed for committed-key lookups
-        // regardless of whether we use the cached bloom).
-        let open_futures: Vec<_> = current_seg_ids
+        // Load lightweight fast-field data for all segments concurrently.
+        let load_futures: Vec<_> = current_seg_ids
             .iter()
             .map(|seg_id_str| {
                 let seg_id_str = seg_id_str.clone();
                 let dir = self.directory.as_ref();
                 let schema = Arc::clone(&self.schema);
-                let cache_blocks = self.config.term_cache_blocks;
-                async move {
-                    let seg_id =
-                        crate::segment::SegmentId::from_hex(&seg_id_str).ok_or_else(|| {
-                            Error::Internal(format!("Invalid segment id: {}", seg_id_str))
-                        })?;
-                    let reader =
-                        crate::segment::SegmentReader::open(dir, seg_id, schema, cache_blocks)
-                            .await?;
-                    Ok::<_, Error>(Arc::new(reader))
-                }
+                async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
             })
             .collect();
-        let readers = futures::future::try_join_all(open_futures).await?;
+        let all_data = futures::future::try_join_all(load_futures).await?;
 
         if let Some((persisted_seg_ids, bloom)) = cached {
-            // Find readers for segments not covered by the persisted bloom.
-            let new_readers: Vec<Arc<crate::segment::SegmentReader>> = current_seg_ids
-                .iter()
-                .zip(readers.iter())
-                .filter(|(id, _)| !persisted_seg_ids.contains(*id))
-                .map(|(_, r)| Arc::clone(r))
-                .collect();
+            // Partition: old segments (covered by bloom) first, new segments at end.
+            let mut pk_data = Vec::with_capacity(all_data.len());
+            let mut new_data = Vec::new();
+            for d in all_data {
+                if persisted_seg_ids.contains(&d.segment_id) {
+                    pk_data.push(d);
+                } else {
+                    new_data.push(d);
+                }
+            }
+            let needs_persist = !new_data.is_empty();
+            let new_start = pk_data.len();
+            pk_data.extend(new_data);
 
-            let needs_persist = !new_readers.is_empty();
-            let pk_index = if new_readers.is_empty() {
+            let pk_index = if new_start == pk_data.len() {
                 // Fast path: all segments covered by cache.
                 super::primary_key::PrimaryKeyIndex::from_persisted(
                     field,
                     bloom,
-                    readers,
+                    pk_data,
                     &[],
                     snapshot,
                 )
             } else {
                 // Incremental: only iterate new segments' keys.
                 tokio::task::spawn_blocking(move || {
+                    // Insert new segments' keys into the bloom, then construct
+                    // PrimaryKeyIndex with the pre-populated bloom.
+                    let mut bloom = bloom;
+                    let mut added = 0usize;
+                    let num_new = pk_data.len() - new_start;
+                    for data in &pk_data[new_start..] {
+                        if let Some(ff) = data.fast_fields.get(&field.0)
+                            && let Some(dict) = ff.text_dict()
+                        {
+                            for key in dict.iter() {
+                                bloom.insert(key.as_bytes());
+                                added += 1;
+                            }
+                        }
+                    }
+                    if added > 0 {
+                        log::info!(
+                            "[primary_key] bloom: added {} keys from {} new segment(s)",
+                            added,
+                            num_new,
+                        );
+                    }
                     super::primary_key::PrimaryKeyIndex::from_persisted(
                         field,
                         bloom,
-                        readers,
-                        &new_readers,
+                        pk_data,
+                        &[],
                         snapshot,
                     )
                 })
@@ -392,7 +411,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         } else {
             // No cache — full rebuild, offloaded to blocking thread.
             let pk_index = tokio::task::spawn_blocking(move || {
-                super::primary_key::PrimaryKeyIndex::new(field, readers, snapshot)
+                super::primary_key::PrimaryKeyIndex::new(field, all_data, snapshot)
             })
             .await
             .map_err(|e| Error::Internal(format!("spawn_blocking failed: {}", e)))?;
@@ -854,27 +873,28 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
 
         self.writer.segment_manager.commit(segments).await?;
 
-        // Refresh primary key index with new committed readers (parallel open)
+        // Refresh primary key index: only load fast fields for NEW segments.
         if let Some(ref mut pk_index) = self.writer.primary_key_index {
             let snapshot = self.writer.segment_manager.acquire_snapshot().await;
-            let open_futures: Vec<_> = snapshot
+            let existing_ids: std::collections::HashSet<&str> =
+                pk_index.committed_segment_ids().collect();
+
+            // Only load fast fields for segments not already held.
+            let load_futures: Vec<_> = snapshot
                 .segment_ids()
                 .iter()
-                .filter_map(|seg_id_str| {
-                    let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)?;
+                .filter(|id| !existing_ids.contains(id.as_str()))
+                .map(|seg_id_str| {
+                    let seg_id_str = seg_id_str.clone();
                     let dir = self.writer.directory.as_ref();
                     let schema = Arc::clone(&self.writer.schema);
-                    let cache_blocks = self.writer.config.term_cache_blocks;
-                    Some(async move {
-                        crate::segment::SegmentReader::open(dir, seg_id, schema, cache_blocks)
-                            .await
-                            .map(Arc::new)
-                    })
+                    async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
                 })
                 .collect();
-            let readers = futures::future::try_join_all(open_futures).await?;
+            let new_data = futures::future::try_join_all(load_futures).await?;
+
             let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
-            pk_index.refresh(readers, snapshot);
+            pk_index.refresh_incremental(new_data, snapshot);
 
             // Persist bloom cache (extract bytes to avoid borrow conflict).
             let bloom_bytes = pk_index.bloom_to_bytes();
@@ -920,4 +940,21 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
             self.writer.resume_workers();
         }
     }
+}
+
+/// Load only fast-field data for a segment (lightweight alternative to full SegmentReader).
+async fn load_pk_segment_data<D: crate::directories::Directory>(
+    dir: &D,
+    seg_id_str: &str,
+    schema: &Arc<crate::dsl::Schema>,
+) -> Result<super::primary_key::PkSegmentData> {
+    let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)
+        .ok_or_else(|| Error::Internal(format!("Invalid segment id: {}", seg_id_str)))?;
+    let files = crate::segment::SegmentFiles::new(seg_id.0);
+    let fast_fields =
+        crate::segment::reader::loader::load_fast_fields_file(dir, &files, schema).await?;
+    Ok(super::primary_key::PkSegmentData {
+        segment_id: seg_id_str.to_string(),
+        fast_fields,
+    })
 }

@@ -9,14 +9,13 @@
 //! appeared since the last persist are iterated.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dsl::Field;
 use crate::error::{Error, Result};
-use crate::segment::{SegmentReader, SegmentSnapshot};
+use crate::segment::SegmentSnapshot;
 use crate::structures::BloomFilter;
 
 /// Bloom filter sizing: 10 bits/key ≈ 1% false positive rate.
@@ -31,20 +30,29 @@ pub const PK_BLOOM_FILE: &str = "pk_bloom.bin";
 /// Magic bytes for the persisted bloom file.
 const PK_BLOOM_MAGIC: u32 = 0x504B424C; // "PKBL"
 
+/// Lightweight per-segment data for primary key lookups.
+///
+/// Only holds fast-field readers (text dictionaries), not full `SegmentReader`s.
+/// This avoids loading DimensionTables, SSTable FSTs, bloom filters, etc.
+pub struct PkSegmentData {
+    pub segment_id: String,
+    pub fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+}
+
 /// Thread-safe primary key deduplication index.
 ///
 /// Sync dedup in the hot path: `BloomFilter::may_contain()`,
 /// `FxHashSet::contains()`, and `TextDictReader::ordinal()` are all sync.
 ///
 /// Interior mutability for the mutable state (bloom + uncommitted set) is
-/// behind `parking_lot::Mutex`. The committed readers are only mutated via
-/// `&mut self` methods (commit/abort path), so no lock is needed for them.
+/// behind `parking_lot::Mutex`. The committed data is only mutated via
+/// `&mut self` methods (commit/abort path), so no lock is needed for it.
 pub struct PrimaryKeyIndex {
     field: Field,
     state: parking_lot::Mutex<PrimaryKeyState>,
-    /// Segment readers for checking committed keys.
+    /// Lightweight per-segment fast-field data for checking committed keys.
     /// Only mutated by `&mut self` methods (refresh/clear) — no lock needed.
-    committed_readers: Vec<Arc<SegmentReader>>,
+    committed_data: Vec<PkSegmentData>,
     /// Holds ref counts so segments aren't deleted while we hold readers.
     _snapshot: Option<SegmentSnapshot>,
 }
@@ -57,16 +65,16 @@ struct PrimaryKeyState {
 impl PrimaryKeyIndex {
     /// Create a new PrimaryKeyIndex by scanning committed segments.
     ///
-    /// Iterates each reader's fast-field text dictionary to populate the bloom
+    /// Iterates each segment's fast-field text dictionary to populate the bloom
     /// filter with all existing primary key values. The snapshot keeps ref counts
-    /// alive so segments aren't deleted while we hold readers.
+    /// alive so segments aren't deleted while we hold data.
     ///
     /// **CPU-intensive** — call from `spawn_blocking`, not the async runtime.
-    pub fn new(field: Field, readers: Vec<Arc<SegmentReader>>, snapshot: SegmentSnapshot) -> Self {
+    pub fn new(field: Field, pk_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) -> Self {
         // Count total unique keys across all segments for bloom sizing.
         let mut total_keys: usize = 0;
-        for reader in &readers {
-            if let Some(ff) = reader.fast_field(field.0)
+        for data in &pk_data {
+            if let Some(ff) = data.fast_fields.get(&field.0)
                 && let Some(dict) = ff.text_dict()
             {
                 total_keys += dict.len() as usize;
@@ -76,8 +84,8 @@ impl PrimaryKeyIndex {
         let mut bloom = BloomFilter::new(total_keys + BLOOM_HEADROOM, BLOOM_BITS_PER_KEY);
 
         // Insert all committed keys into the bloom filter.
-        for reader in &readers {
-            if let Some(ff) = reader.fast_field(field.0)
+        for data in &pk_data {
+            if let Some(ff) = data.fast_fields.get(&field.0)
                 && let Some(dict) = ff.text_dict()
             {
                 for key in dict.iter() {
@@ -99,7 +107,7 @@ impl PrimaryKeyIndex {
                 bloom,
                 uncommitted: FxHashSet::default(),
             }),
-            committed_readers: readers,
+            committed_data: pk_data,
             _snapshot: Some(snapshot),
         }
     }
@@ -107,18 +115,20 @@ impl PrimaryKeyIndex {
     /// Create from a pre-loaded bloom filter (loaded from `pk_bloom.bin`).
     ///
     /// Skips dictionary iteration entirely when the persisted bloom covers
-    /// all current segments. If `new_readers` is non-empty, their keys are
-    /// inserted into the bloom before returning (incremental update).
+    /// all current segments. `pk_data` contains data for ALL current segments.
+    /// If `new_data` is non-empty, their keys are inserted into the bloom
+    /// before returning (incremental update). `new_data` is a borrowed slice
+    /// pointing to the subset of segments not covered by the persisted bloom.
     pub fn from_persisted(
         field: Field,
         mut bloom: BloomFilter,
-        readers: Vec<Arc<SegmentReader>>,
-        new_readers: &[Arc<SegmentReader>],
+        pk_data: Vec<PkSegmentData>,
+        new_data: &[PkSegmentData],
         snapshot: SegmentSnapshot,
     ) -> Self {
         let mut added = 0usize;
-        for reader in new_readers {
-            if let Some(ff) = reader.fast_field(field.0)
+        for data in new_data {
+            if let Some(ff) = data.fast_fields.get(&field.0)
                 && let Some(dict) = ff.text_dict()
             {
                 for key in dict.iter() {
@@ -135,7 +145,7 @@ impl PrimaryKeyIndex {
                 format!(
                     ", added {} keys from {} new segment(s)",
                     added,
-                    new_readers.len()
+                    new_data.len()
                 )
             } else {
                 String::new()
@@ -148,7 +158,7 @@ impl PrimaryKeyIndex {
                 bloom,
                 uncommitted: FxHashSet::default(),
             }),
-            committed_readers: readers,
+            committed_data: pk_data,
             _snapshot: Some(snapshot),
         }
     }
@@ -198,9 +208,9 @@ impl PrimaryKeyIndex {
             }
         }
         // Lock released — check committed segments without holding mutex.
-        // committed_readers is immutable (only changed via &mut self methods).
-        for reader in &self.committed_readers {
-            if let Some(ff) = reader.fast_field(self.field.0)
+        // committed_data is immutable (only changed via &mut self methods).
+        for data in &self.committed_data {
+            if let Some(ff) = data.fast_fields.get(&self.field.0)
                 && let Some(dict) = ff.text_dict()
                 && dict.ordinal(key).is_some()
             {
@@ -221,18 +231,44 @@ impl PrimaryKeyIndex {
         Ok(())
     }
 
-    /// Refresh after commit: replace committed readers and clear uncommitted set.
+    /// Refresh after commit: merge new segment data, prune removed segments,
+    /// insert new keys into bloom, and clear uncommitted set.
     ///
-    /// The new readers include the just-committed segments, so their text
-    /// dictionaries already contain the previously-uncommitted keys.
-    /// The snapshot keeps ref counts alive so segments aren't deleted while
-    /// we hold readers to them.
-    pub fn refresh(&mut self, new_readers: Vec<Arc<SegmentReader>>, snapshot: SegmentSnapshot) {
-        self.committed_readers = new_readers;
-        self._snapshot = Some(snapshot);
+    /// Only `new_data` (segments not already held) need to be loaded by the
+    /// caller. Existing data for segments still in `snapshot` is retained.
+    /// The snapshot keeps ref counts alive so segments aren't deleted.
+    pub fn refresh_incremental(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
+        let new_seg_ids: HashSet<&str> =
+            snapshot.segment_ids().iter().map(|s| s.as_str()).collect();
+
+        // Insert new segments' keys into bloom (these were uncommitted before).
         // get_mut() bypasses the mutex — safe because we have &mut self.
         let state = self.state.get_mut();
+        for data in &new_data {
+            if let Some(ff) = data.fast_fields.get(&self.field.0)
+                && let Some(dict) = ff.text_dict()
+            {
+                for key in dict.iter() {
+                    state.bloom.insert(key.as_bytes());
+                }
+            }
+        }
         state.uncommitted.clear();
+
+        // Keep existing data for segments still in the snapshot
+        let mut kept: Vec<PkSegmentData> = self
+            .committed_data
+            .drain(..)
+            .filter(|d| new_seg_ids.contains(d.segment_id.as_str()))
+            .collect();
+        kept.extend(new_data);
+        self.committed_data = kept;
+        self._snapshot = Some(snapshot);
+    }
+
+    /// Iterator over segment IDs already held in this PK index.
+    pub fn committed_segment_ids(&self) -> impl Iterator<Item = &str> {
+        self.committed_data.iter().map(|d| d.segment_id.as_str())
     }
 
     /// Roll back an uncommitted key registration (e.g. when channel send fails
@@ -301,6 +337,8 @@ pub fn deserialize_pk_bloom(data: &[u8]) -> Option<(HashSet<String>, BloomFilter
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::dsl::{Document, Field};
     use crate::segment::SegmentTracker;
@@ -421,11 +459,11 @@ mod tests {
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_ok());
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_err());
 
-        // Refresh with empty readers (simulates commit where segment readers
+        // Refresh with empty data (simulates commit where segments
         // don't have fast fields — edge case)
-        pk.refresh(vec![], empty_snapshot());
+        pk.refresh_incremental(vec![], empty_snapshot());
 
-        // After refresh, uncommitted is cleared and no committed readers have
+        // After refresh, uncommitted is cleared and no committed data has
         // the key, so it should be accepted again
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_ok());
     }

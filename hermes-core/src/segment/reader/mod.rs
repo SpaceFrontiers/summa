@@ -1,7 +1,7 @@
 //! Async segment reader with lazy loading
 
 pub(crate) mod bmp;
-mod loader;
+pub(crate) mod loader;
 mod types;
 
 pub use bmp::BmpIndex;

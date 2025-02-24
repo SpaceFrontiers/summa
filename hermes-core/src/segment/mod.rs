@@ -4,7 +4,7 @@ mod builder;
 pub(crate) mod format;
 #[cfg(feature = "native")]
 mod merger;
-mod reader;
+pub(crate) mod reader;
 #[cfg(feature = "native")]
 pub(crate) mod reorder;
 mod store;
