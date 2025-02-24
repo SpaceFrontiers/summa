@@ -3,9 +3,15 @@
 //! Uses a bloom filter + `FxHashSet` for uncommitted keys to reject duplicates
 //! at `add_document()` time. Committed keys are checked via fast-field
 //! `TextDictReader::ordinal()` (binary search, O(log n)).
+//!
+//! The bloom filter is persisted to `pk_bloom.bin` so that restarts don't need
+//! to re-iterate every committed key. On load, only keys from segments that
+//! appeared since the last persist are iterated.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use byteorder::{LittleEndian, WriteBytesExt};
 use rustc_hash::FxHashSet;
 
 use crate::dsl::Field;
@@ -18,6 +24,12 @@ const BLOOM_BITS_PER_KEY: usize = 10;
 
 /// Extra capacity added to bloom filter beyond known keys.
 const BLOOM_HEADROOM: usize = 100_000;
+
+/// File name for the persisted primary-key bloom filter.
+pub const PK_BLOOM_FILE: &str = "pk_bloom.bin";
+
+/// Magic bytes for the persisted bloom file.
+const PK_BLOOM_MAGIC: u32 = 0x504B424C; // "PKBL"
 
 /// Thread-safe primary key deduplication index.
 ///
@@ -48,6 +60,8 @@ impl PrimaryKeyIndex {
     /// Iterates each reader's fast-field text dictionary to populate the bloom
     /// filter with all existing primary key values. The snapshot keeps ref counts
     /// alive so segments aren't deleted while we hold readers.
+    ///
+    /// **CPU-intensive** — call from `spawn_blocking`, not the async runtime.
     pub fn new(field: Field, readers: Vec<Arc<SegmentReader>>, snapshot: SegmentSnapshot) -> Self {
         // Count total unique keys across all segments for bloom sizing.
         let mut total_keys: usize = 0;
@@ -88,6 +102,60 @@ impl PrimaryKeyIndex {
             committed_readers: readers,
             _snapshot: Some(snapshot),
         }
+    }
+
+    /// Create from a pre-loaded bloom filter (loaded from `pk_bloom.bin`).
+    ///
+    /// Skips dictionary iteration entirely when the persisted bloom covers
+    /// all current segments. If `new_readers` is non-empty, their keys are
+    /// inserted into the bloom before returning (incremental update).
+    pub fn from_persisted(
+        field: Field,
+        mut bloom: BloomFilter,
+        readers: Vec<Arc<SegmentReader>>,
+        new_readers: &[Arc<SegmentReader>],
+        snapshot: SegmentSnapshot,
+    ) -> Self {
+        let mut added = 0usize;
+        for reader in new_readers {
+            if let Some(ff) = reader.fast_field(field.0)
+                && let Some(dict) = ff.text_dict()
+            {
+                for key in dict.iter() {
+                    bloom.insert(key.as_bytes());
+                    added += 1;
+                }
+            }
+        }
+
+        log::info!(
+            "[primary_key] bloom filter loaded from cache: {:.2} MB{}",
+            bloom.size_bytes() as f64 / (1024.0 * 1024.0),
+            if added > 0 {
+                format!(
+                    ", added {} keys from {} new segment(s)",
+                    added,
+                    new_readers.len()
+                )
+            } else {
+                String::new()
+            },
+        );
+
+        Self {
+            field,
+            state: parking_lot::Mutex::new(PrimaryKeyState {
+                bloom,
+                uncommitted: FxHashSet::default(),
+            }),
+            committed_readers: readers,
+            _snapshot: Some(snapshot),
+        }
+    }
+
+    /// Serialize the bloom filter for persistence to `pk_bloom.bin`.
+    pub fn bloom_to_bytes(&self) -> Vec<u8> {
+        self.state.lock().bloom.to_bytes()
     }
 
     /// Memory used by the bloom filter and uncommitted set.
@@ -184,6 +252,51 @@ impl PrimaryKeyIndex {
     pub fn clear_uncommitted(&mut self) {
         self.state.get_mut().uncommitted.clear();
     }
+}
+
+/// Serialize a bloom filter with the segment IDs it covers into `pk_bloom.bin` format.
+///
+/// Layout: `[magic:u32][num_segs:u32][seg_id_hex × 32 bytes each...][bloom_bytes...]`
+pub fn serialize_pk_bloom(segment_ids: &[String], bloom_bytes: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + segment_ids.len() * 32 + bloom_bytes.len());
+    data.write_u32::<LittleEndian>(PK_BLOOM_MAGIC).unwrap();
+    data.write_u32::<LittleEndian>(segment_ids.len() as u32)
+        .unwrap();
+    for seg_id in segment_ids {
+        let bytes = seg_id.as_bytes();
+        data.extend_from_slice(bytes);
+        // Pad to 32 bytes (segment IDs are 32-char hex strings)
+        data.extend(std::iter::repeat_n(0u8, 32 - bytes.len()));
+    }
+    data.extend_from_slice(bloom_bytes);
+    data
+}
+
+/// Deserialize `pk_bloom.bin`. Returns the set of covered segment IDs and the bloom filter,
+/// or `None` if the data is corrupt / wrong magic.
+pub fn deserialize_pk_bloom(data: &[u8]) -> Option<(HashSet<String>, BloomFilter)> {
+    if data.len() < 8 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != PK_BLOOM_MAGIC {
+        return None;
+    }
+    let num_segments = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let header_end = 8 + num_segments * 32;
+    if data.len() < header_end + 12 {
+        return None;
+    }
+    let mut segment_ids = HashSet::with_capacity(num_segments);
+    for i in 0..num_segments {
+        let start = 8 + i * 32;
+        let raw = &data[start..start + 32];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(32);
+        let hex = std::str::from_utf8(&raw[..end]).ok()?;
+        segment_ids.insert(hex.to_string());
+    }
+    let bloom = BloomFilter::from_bytes_mutable(&data[header_end..]).ok()?;
+    Some((segment_ids, bloom))
 }
 
 #[cfg(test)]
@@ -315,6 +428,45 @@ mod tests {
         // After refresh, uncommitted is cleared and no committed readers have
         // the key, so it should be accepted again
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_ok());
+    }
+
+    #[test]
+    fn test_pk_bloom_serialize_roundtrip() {
+        let field = Field(0);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
+        for i in 0..100 {
+            pk.check_and_insert(&make_doc(field, &format!("key_{}", i)))
+                .unwrap();
+        }
+
+        let seg_ids = vec![
+            "00000000000000000000000000000001".to_string(),
+            "00000000000000000000000000000002".to_string(),
+        ];
+        let bloom_bytes = pk.bloom_to_bytes();
+        let data = serialize_pk_bloom(&seg_ids, &bloom_bytes);
+        let (got_ids, got_bloom) = deserialize_pk_bloom(&data).expect("deserialize failed");
+
+        assert_eq!(got_ids.len(), 2);
+        assert!(got_ids.contains(&seg_ids[0]));
+        assert!(got_ids.contains(&seg_ids[1]));
+
+        // Verify the loaded bloom recognizes previously inserted keys.
+        for i in 0..100 {
+            let key = format!("key_{}", i);
+            assert!(
+                got_bloom.may_contain(key.as_bytes()),
+                "bloom miss for {}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_pk_bloom_deserialize_bad_data() {
+        assert!(deserialize_pk_bloom(&[]).is_none());
+        assert!(deserialize_pk_bloom(&[0; 7]).is_none());
+        assert!(deserialize_pk_bloom(&[0; 8]).is_none()); // wrong magic
     }
 
     #[test]

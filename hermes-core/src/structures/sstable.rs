@@ -122,6 +122,40 @@ impl BloomFilter {
         }
     }
 
+    /// Create from serialized bytes into a mutable Vec (for building/mutation).
+    /// Unlike `from_owned_bytes`, this copies data into a `Vec<u64>` so that
+    /// `insert()` works. Used by the primary-key bloom cache.
+    pub fn from_bytes_mutable(data: &[u8]) -> io::Result<Self> {
+        if data.len() < 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Bloom filter data too short",
+            ));
+        }
+        let num_bits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let num_hashes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let num_words = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+
+        if data.len() < 12 + num_words * 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Bloom filter data truncated",
+            ));
+        }
+
+        let mut vec = vec![0u64; num_words];
+        for (i, v) in vec.iter_mut().enumerate() {
+            let off = 12 + i * 8;
+            *v = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        }
+
+        Ok(Self {
+            bits: BloomBits::Vec(vec),
+            num_bits,
+            num_hashes,
+        })
+    }
+
     /// Create from serialized OwnedBytes (zero-copy for mmap)
     pub fn from_owned_bytes(data: OwnedBytes) -> io::Result<Self> {
         if data.len() < 12 {

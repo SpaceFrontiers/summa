@@ -290,19 +290,46 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Initialize primary key deduplication from committed segments.
     ///
-    /// Reads existing primary key values from fast-field text dictionaries and
-    /// builds a bloom filter for O(1) negative lookups. Must be called before
-    /// `add_document` for dedup to take effect. No-op if schema has no primary field.
+    /// Tries to load a cached bloom filter from `pk_bloom.bin` first. If the
+    /// cache covers all current segments, the bloom is reused directly (fast
+    /// path). If new segments appeared since the cache was written, only their
+    /// keys are iterated (incremental). Falls back to a full rebuild when no
+    /// cache exists.
+    ///
+    /// The CPU-intensive bloom build is offloaded via `spawn_blocking` so it
+    /// does not block the tokio runtime.
+    ///
+    /// No-op if schema has no primary field.
     pub async fn init_primary_key_dedup(&mut self) -> Result<()> {
+        use super::primary_key::{PK_BLOOM_FILE, deserialize_pk_bloom};
+
         let field = match self.schema.primary_field() {
             Some(f) => f,
             None => return Ok(()),
         };
 
         let snapshot = self.segment_manager.acquire_snapshot().await;
-        // Open all segment readers concurrently for faster PK init
-        let open_futures: Vec<_> = snapshot
-            .segment_ids()
+        let current_seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
+
+        // Try to load persisted bloom filter.
+        let cached = match self
+            .directory
+            .open_read(std::path::Path::new(PK_BLOOM_FILE))
+            .await
+        {
+            Ok(handle) => {
+                let data = handle.read_bytes_range(0..handle.len()).await;
+                match data {
+                    Ok(bytes) => deserialize_pk_bloom(bytes.as_slice()),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
+
+        // Open all segment readers concurrently (needed for committed-key lookups
+        // regardless of whether we use the cached bloom).
+        let open_futures: Vec<_> = current_seg_ids
             .iter()
             .map(|seg_id_str| {
                 let seg_id_str = seg_id_str.clone();
@@ -323,10 +350,78 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .collect();
         let readers = futures::future::try_join_all(open_futures).await?;
 
-        self.primary_key_index = Some(super::primary_key::PrimaryKeyIndex::new(
-            field, readers, snapshot,
-        ));
+        if let Some((persisted_seg_ids, bloom)) = cached {
+            // Find readers for segments not covered by the persisted bloom.
+            let new_readers: Vec<Arc<crate::segment::SegmentReader>> = current_seg_ids
+                .iter()
+                .zip(readers.iter())
+                .filter(|(id, _)| !persisted_seg_ids.contains(*id))
+                .map(|(_, r)| Arc::clone(r))
+                .collect();
+
+            let needs_persist = !new_readers.is_empty();
+            let pk_index = if new_readers.is_empty() {
+                // Fast path: all segments covered by cache.
+                super::primary_key::PrimaryKeyIndex::from_persisted(
+                    field,
+                    bloom,
+                    readers,
+                    &[],
+                    snapshot,
+                )
+            } else {
+                // Incremental: only iterate new segments' keys.
+                tokio::task::spawn_blocking(move || {
+                    super::primary_key::PrimaryKeyIndex::from_persisted(
+                        field,
+                        bloom,
+                        readers,
+                        &new_readers,
+                        snapshot,
+                    )
+                })
+                .await
+                .map_err(|e| Error::Internal(format!("spawn_blocking failed: {}", e)))?
+            };
+
+            if needs_persist {
+                self.persist_pk_bloom(&pk_index, &current_seg_ids).await;
+            }
+
+            self.primary_key_index = Some(pk_index);
+        } else {
+            // No cache — full rebuild, offloaded to blocking thread.
+            let pk_index = tokio::task::spawn_blocking(move || {
+                super::primary_key::PrimaryKeyIndex::new(field, readers, snapshot)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("spawn_blocking failed: {}", e)))?;
+
+            self.persist_pk_bloom(&pk_index, &current_seg_ids).await;
+            self.primary_key_index = Some(pk_index);
+        }
+
         Ok(())
+    }
+
+    /// Persist the primary-key bloom filter to `pk_bloom.bin`.
+    /// Best-effort: errors are logged but not propagated.
+    async fn persist_pk_bloom(
+        &self,
+        pk_index: &super::primary_key::PrimaryKeyIndex,
+        segment_ids: &[String],
+    ) {
+        use super::primary_key::{PK_BLOOM_FILE, serialize_pk_bloom};
+
+        let bloom_bytes = pk_index.bloom_to_bytes();
+        let data = serialize_pk_bloom(segment_ids, &bloom_bytes);
+        if let Err(e) = self
+            .directory
+            .write(std::path::Path::new(PK_BLOOM_FILE), &data)
+            .await
+        {
+            log::warn!("[primary_key] failed to persist bloom cache: {}", e);
+        }
     }
 
     /// Add a document to the indexing queue (sync, O(1), lock-free).
@@ -778,7 +873,23 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
                 })
                 .collect();
             let readers = futures::future::try_join_all(open_futures).await?;
+            let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
             pk_index.refresh(readers, snapshot);
+
+            // Persist bloom cache (extract bytes to avoid borrow conflict).
+            let bloom_bytes = pk_index.bloom_to_bytes();
+            let data = super::primary_key::serialize_pk_bloom(&seg_ids, &bloom_bytes);
+            if let Err(e) = self
+                .writer
+                .directory
+                .write(
+                    std::path::Path::new(super::primary_key::PK_BLOOM_FILE),
+                    &data,
+                )
+                .await
+            {
+                log::warn!("[primary_key] failed to persist bloom cache: {}", e);
+            }
         }
 
         self.writer.segment_manager.maybe_merge().await;
