@@ -36,6 +36,12 @@ pub trait MergePolicy: Send + Sync + Debug {
 
     /// Clone the policy into a boxed trait object
     fn clone_box(&self) -> Box<dyn MergePolicy>;
+
+    /// Maximum number of documents a single segment should contain.
+    /// Returns `None` for no limit (force_merge merges everything into one).
+    fn max_segment_docs(&self) -> Option<u32> {
+        None
+    }
 }
 
 impl Clone for Box<dyn MergePolicy> {
@@ -105,6 +111,9 @@ pub struct TieredMergePolicy {
     /// Use Lucene-style skew scoring to pick the most balanced merge candidate
     /// instead of greedily taking the first valid group. (default: false)
     pub scored_selection: bool,
+    /// Absolute maximum number of documents in a single segment.
+    /// Respected by both automatic merging and `force_merge`. (default: 10_000_000)
+    pub max_segment_docs: u32,
 }
 
 impl Default for TieredMergePolicy {
@@ -120,6 +129,7 @@ impl Default for TieredMergePolicy {
             min_growth_ratio: 0.0,
             budget_trigger: false,
             scored_selection: false,
+            max_segment_docs: 10_000_000,
         }
     }
 }
@@ -142,6 +152,7 @@ impl TieredMergePolicy {
             tier_factor: 10.0,
             tier_floor: 500,
             max_merged_docs: 10_000_000,
+            max_segment_docs: 10_000_000,
             ..Default::default()
         }
     }
@@ -165,6 +176,7 @@ impl TieredMergePolicy {
             min_growth_ratio: 0.5,
             budget_trigger: true,
             scored_selection: true,
+            max_segment_docs: 20_000_000,
         }
     }
 
@@ -184,11 +196,18 @@ impl TieredMergePolicy {
             min_growth_ratio: 0.75,
             budget_trigger: true,
             scored_selection: true,
+            max_segment_docs: 50_000_000,
         }
     }
 }
 
 impl TieredMergePolicy {
+    /// Effective maximum docs for a merged segment, considering both
+    /// `max_merged_docs` and `max_segment_docs`.
+    fn effective_max_docs(&self) -> u32 {
+        self.max_merged_docs.min(self.max_segment_docs)
+    }
+
     /// Compute the ideal segment count for the given total document count.
     /// Based on Lucene's budget model: segments arrange in tiers of `tier_factor`
     /// width, with up to `segments_per_tier` segments per tier.
@@ -247,6 +266,7 @@ impl TieredMergePolicy {
         let mut candidates = Vec::new();
         let mut used = vec![false; sorted.len()];
         let max_ratio = self.tier_factor as u64;
+        let effective_max = self.effective_max_docs() as u64;
 
         let mut start = 0;
         loop {
@@ -268,7 +288,7 @@ impl TieredMergePolicy {
                     break;
                 }
                 let next_docs = sorted[j].num_docs as u64;
-                if total_docs + next_docs > self.max_merged_docs as u64 {
+                if total_docs + next_docs > effective_max {
                     break;
                 }
                 if next_docs > total_docs.max(1) * max_ratio {
@@ -300,6 +320,7 @@ impl TieredMergePolicy {
     /// most balanced ones using skew scoring.
     fn find_merges_scored(&self, sorted: &[&SegmentInfo]) -> Vec<MergeCandidate> {
         let max_ratio = self.tier_factor as u64;
+        let effective_max = self.effective_max_docs() as u64;
 
         // Build all valid merge groups with their scores
         let mut scored_groups: Vec<(f64, Vec<usize>)> = Vec::new();
@@ -313,7 +334,7 @@ impl TieredMergePolicy {
                     break;
                 }
                 let next_docs = sorted[j].num_docs as u64;
-                if total_docs + next_docs > self.max_merged_docs as u64 {
+                if total_docs + next_docs > effective_max {
                     break;
                 }
                 if next_docs > total_docs.max(1) * max_ratio {
@@ -363,7 +384,8 @@ impl MergePolicy for TieredMergePolicy {
         }
 
         // Phase 1: Filter oversized segments
-        let oversized_limit = (self.max_merged_docs as f64 * self.oversized_threshold) as u64;
+        let effective_max = self.effective_max_docs();
+        let oversized_limit = (effective_max as f64 * self.oversized_threshold) as u64;
         let eligible: Vec<&SegmentInfo> = segments
             .iter()
             .filter(|s| (s.num_docs as u64) <= oversized_limit || oversized_limit == 0)
@@ -396,6 +418,10 @@ impl MergePolicy for TieredMergePolicy {
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
         Box::new(self.clone())
+    }
+
+    fn max_segment_docs(&self) -> Option<u32> {
+        Some(self.max_segment_docs)
     }
 }
 
@@ -895,6 +921,7 @@ mod tests {
         let p = TieredMergePolicy::large_scale();
         assert_eq!(p.tier_floor, 50_000);
         assert_eq!(p.max_merged_docs, 20_000_000);
+        assert_eq!(p.max_segment_docs, 20_000_000);
         assert_eq!(p.floor_segment_docs, 50_000);
         assert!(p.budget_trigger);
         assert!(p.scored_selection);
@@ -910,9 +937,51 @@ mod tests {
         assert_eq!(p.max_merge_at_once, 20);
         assert_eq!(p.tier_floor, 100_000);
         assert_eq!(p.max_merged_docs, 50_000_000);
+        assert_eq!(p.max_segment_docs, 50_000_000);
         assert_eq!(p.floor_segment_docs, 100_000);
         assert!(p.budget_trigger);
         assert!(p.scored_selection);
         assert!((p.min_growth_ratio - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_default_max_segment_docs() {
+        let p = TieredMergePolicy::default();
+        assert_eq!(p.max_segment_docs, 10_000_000);
+        assert_eq!(p.max_segment_docs().unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn test_max_segment_docs_caps_merge_output() {
+        // max_merged_docs=50M but max_segment_docs=5M → effective max is 5M
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            max_merge_at_once: 100,
+            max_merged_docs: 50_000_000,
+            max_segment_docs: 5_000_000,
+            ..Default::default()
+        };
+
+        // 10 segments of 1M each — total would be 10M but max_segment_docs=5M
+        let segments: Vec<_> = (0..10)
+            .map(|i| SegmentInfo {
+                id: format!("seg_{}", i),
+                num_docs: 1_000_000,
+            })
+            .collect();
+
+        let candidates = policy.find_merges(&segments);
+        for c in &candidates {
+            let total: u64 = c
+                .segment_ids
+                .iter()
+                .map(|id| segments.iter().find(|s| s.id == *id).unwrap().num_docs as u64)
+                .sum();
+            assert!(
+                total <= 5_000_000,
+                "merge total {} exceeds max_segment_docs 5M",
+                total
+            );
+        }
     }
 }

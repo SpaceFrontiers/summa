@@ -623,26 +623,69 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Force merge all segments into one. Iterates in batches until ≤1 segment remains.
+    /// Force merge segments into the fewest possible segments, respecting
+    /// `max_segment_docs` from the merge policy.
+    ///
+    /// If the policy defines a max segment size, segments are merged in batches
+    /// that stay within that limit. Otherwise, all segments are merged into one.
     ///
     /// Each batch is registered in `merge_inventory` via `MergeGuard` to prevent
     /// `maybe_merge` from spawning a conflicting background merge.
     pub async fn force_merge(self: &Arc<Self>) -> Result<()> {
         const FORCE_MERGE_BATCH: usize = 64;
 
+        let max_segment_docs = {
+            let st = self.state.lock().await;
+            st.merge_policy.max_segment_docs()
+        };
+
         // Wait for all in-flight background merges (including cascading)
         // before starting forced merges to avoid try_register conflicts.
         self.wait_for_all_merges().await;
 
         loop {
-            let ids_to_merge = self.get_segment_ids().await;
-            if ids_to_merge.len() < 2 {
+            // Get segment IDs with their doc counts, sorted ascending by size
+            let mut segments: Vec<(String, u32)> = {
+                let st = self.state.lock().await;
+                st.metadata
+                    .segment_metas
+                    .iter()
+                    .map(|(id, info)| (id.clone(), info.num_docs))
+                    .collect()
+            };
+
+            if segments.len() < 2 {
                 return Ok(());
             }
 
-            let batch: Vec<String> = ids_to_merge.into_iter().take(FORCE_MERGE_BATCH).collect();
+            segments.sort_by_key(|(_, docs)| *docs);
 
-            log::info!("[force_merge] merging batch of {} segments", batch.len());
+            // Build a batch respecting max_segment_docs
+            let max_docs = max_segment_docs.map(|m| m as u64).unwrap_or(u64::MAX);
+            let mut batch = Vec::new();
+            let mut batch_docs = 0u64;
+
+            for (id, docs) in &segments {
+                if batch.len() >= FORCE_MERGE_BATCH {
+                    break;
+                }
+                let next_total = batch_docs + *docs as u64;
+                if next_total > max_docs && !batch.is_empty() {
+                    break;
+                }
+                batch.push(id.clone());
+                batch_docs += *docs as u64;
+            }
+
+            if batch.len() < 2 {
+                return Ok(());
+            }
+
+            log::info!(
+                "[force_merge] merging batch of {} segments ({} docs)",
+                batch.len(),
+                batch_docs
+            );
 
             let output_id = SegmentId::new();
             let output_hex = output_id.to_hex();
