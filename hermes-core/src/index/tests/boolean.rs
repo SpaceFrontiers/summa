@@ -386,8 +386,11 @@ async fn create_pruning_test_index() -> (
     let embedding = sb.add_sparse_vector_field("embedding", true, true);
     let schema = sb.build();
 
+    // Use a large enough memory budget so all 200 docs fit in a single segment.
+    // This preserves doc_id == insertion order, which the tests rely on for
+    // verifying which group each doc belongs to.
     let config = IndexConfig {
-        max_indexing_memory_bytes: 8192,
+        max_indexing_memory_bytes: 50 * 1024 * 1024,
         ..Default::default()
     };
 
@@ -409,7 +412,6 @@ async fn create_pruning_test_index() -> (
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
-    writer.force_merge().await.unwrap();
 
     let index = Index::open(dir, config).await.unwrap();
     assert_eq!(index.num_docs().await.unwrap(), 200);
