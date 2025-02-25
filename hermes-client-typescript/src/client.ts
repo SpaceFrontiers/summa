@@ -386,10 +386,13 @@ function buildQuery(q: Query): PbQuery {
       },
     };
   }
+  if ("prefix" in q) {
+    return { prefix: { field: q.prefix.field, prefix: q.prefix.prefix } };
+  }
   if ("all" in q) {
     return { all: {} };
   }
-  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "boost", "range", "all"];
+  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "boost", "range", "prefix", "all"];
   const keys = Object.keys(q);
   throw new Error(
     `Unrecognized query key(s): ${keys.join(", ")}. Valid keys: ${validKeys.join(", ")}`

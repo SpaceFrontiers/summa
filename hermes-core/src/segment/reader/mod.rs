@@ -415,6 +415,41 @@ impl SegmentReader {
         Ok(Some(block_list))
     }
 
+    /// Get all posting lists for terms that start with `prefix` in the given field.
+    pub async fn get_prefix_postings(
+        &self,
+        field: Field,
+        prefix: &[u8],
+    ) -> Result<Vec<BlockPostingList>> {
+        // Build composite key prefix: field_id ++ prefix
+        let mut key_prefix = Vec::with_capacity(4 + prefix.len());
+        key_prefix.extend_from_slice(&field.0.to_le_bytes());
+        key_prefix.extend_from_slice(prefix);
+
+        let entries = self.term_dict.prefix_scan(&key_prefix).await?;
+        let mut results = Vec::with_capacity(entries.len());
+
+        for (_key, term_info) in entries {
+            if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
+                let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
+                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                    posting_list.push(doc_id, tf);
+                }
+                results.push(BlockPostingList::from_posting_list(&posting_list)?);
+            } else if let Some((posting_offset, posting_len)) = term_info.external_info() {
+                let start = posting_offset;
+                let end = start + posting_len;
+                if end > self.postings_handle.len() {
+                    continue;
+                }
+                let posting_bytes = self.postings_handle.read_bytes_range(start..end).await?;
+                results.push(BlockPostingList::deserialize_zero_copy(posting_bytes)?);
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Get document by local doc_id (async - loads on demand).
     ///
     /// Dense vector fields are hydrated from LazyFlatVectorData (not stored in .store).
@@ -1003,6 +1038,40 @@ impl SegmentReader {
         let block_list = BlockPostingList::deserialize_zero_copy(posting_bytes)?;
 
         Ok(Some(block_list))
+    }
+
+    /// Synchronous prefix posting list lookup — requires Inline (mmap/RAM) file handles.
+    pub fn get_prefix_postings_sync(
+        &self,
+        field: Field,
+        prefix: &[u8],
+    ) -> Result<Vec<BlockPostingList>> {
+        let mut key_prefix = Vec::with_capacity(4 + prefix.len());
+        key_prefix.extend_from_slice(&field.0.to_le_bytes());
+        key_prefix.extend_from_slice(prefix);
+
+        let entries = self.term_dict.prefix_scan_sync(&key_prefix)?;
+        let mut results = Vec::with_capacity(entries.len());
+
+        for (_key, term_info) in entries {
+            if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
+                let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
+                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                    posting_list.push(doc_id, tf);
+                }
+                results.push(BlockPostingList::from_posting_list(&posting_list)?);
+            } else if let Some((posting_offset, posting_len)) = term_info.external_info() {
+                let start = posting_offset;
+                let end = start + posting_len;
+                if end > self.postings_handle.len() {
+                    continue;
+                }
+                let posting_bytes = self.postings_handle.read_bytes_range_sync(start..end)?;
+                results.push(BlockPostingList::deserialize_zero_copy(posting_bytes)?);
+            }
+        }
+
+        Ok(results)
     }
 
     /// Synchronous position list lookup — requires Inline (mmap/RAM) file handles.

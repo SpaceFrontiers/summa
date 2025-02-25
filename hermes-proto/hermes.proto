@@ -55,6 +55,7 @@ message Query {
     DenseVectorQuery dense_vector = 6;
     MatchQuery match = 7;
     RangeQuery range = 8;
+    PrefixQuery prefix = 9;
   }
 }
 
@@ -131,6 +132,13 @@ message RangeQuery {
 message MatchQuery {
   string field = 1;
   string text = 2;
+}
+
+// Prefix query - matches all documents containing any term starting with prefix
+// Score is always 1.0 (filter-style). Efficient as a MUST clause in BooleanQuery.
+message PrefixQuery {
+  string field = 1;
+  string prefix = 2;
 }
 
 // L2 reranker: rerank L1 candidates by exact dense vector distance

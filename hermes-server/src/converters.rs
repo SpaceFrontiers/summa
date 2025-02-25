@@ -8,8 +8,8 @@ use hermes_core::query::{
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
 use hermes_core::{
-    BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
-    TokenizerRegistry,
+    BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, PrefixQuery, Query, Schema,
+    TermQuery, TokenizerRegistry,
 };
 use log::{debug, warn};
 
@@ -63,6 +63,11 @@ pub fn convert_query(
             let field = schema
                 .get_field(&match_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", match_query.field))?;
+
+            // Trailing `*` → PrefixQuery (no tokenization, raw lowercased prefix)
+            if let Some(prefix) = match_query.text.strip_suffix('*') {
+                return Ok(Box::new(PrefixQuery::text(field, prefix)));
+            }
 
             // Get the field's configured tokenizer (or default)
             let tokenizer_name = schema
@@ -329,6 +334,12 @@ pub fn convert_query(
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::Range(range_query)) => convert_range_query(range_query, schema),
+        Some(ProtoQueryType::Prefix(prefix_query)) => {
+            let field = schema
+                .get_field(&prefix_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", prefix_query.field))?;
+            Ok(Box::new(PrefixQuery::text(field, &prefix_query.prefix)))
+        }
         None => Err("Query type is required".to_string()),
     }
 }

@@ -751,6 +751,10 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
             kwargs["max_f64"] = float(rq["max_f64"])
         return pb.Query(range=pb.RangeQuery(**kwargs))
 
+    if "prefix" in q:
+        p = q["prefix"]
+        return pb.Query(prefix=pb.PrefixQuery(field=p["field"], prefix=p["prefix"]))
+
     if "all" in q:
         return pb.Query(all=pb.AllQuery())
 
@@ -763,6 +767,7 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
         "dense_vector",
         "boost",
         "range",
+        "prefix",
         "all",
     ]
     raise ValueError(

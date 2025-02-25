@@ -76,6 +76,7 @@ export interface Query {
   denseVector?: DenseVectorQuery | undefined;
   match?: MatchQuery | undefined;
   range?: RangeQuery | undefined;
+  prefix?: PrefixQuery | undefined;
 }
 
 /**
@@ -166,6 +167,15 @@ export interface RangeQuery {
 export interface MatchQuery {
   field: string;
   text: string;
+}
+
+/**
+ * Prefix query - matches all documents containing any term starting with prefix
+ * Score is always 1.0 (filter-style). Efficient as a MUST clause in BooleanQuery.
+ */
+export interface PrefixQuery {
+  field: string;
+  prefix: string;
 }
 
 /** L2 reranker: rerank L1 candidates by exact dense vector distance */
@@ -473,6 +483,7 @@ function createBaseQuery(): Query {
     denseVector: undefined,
     match: undefined,
     range: undefined,
+    prefix: undefined,
   };
 }
 
@@ -501,6 +512,9 @@ export const Query: MessageFns<Query> = {
     }
     if (message.range !== undefined) {
       RangeQuery.encode(message.range, writer.uint32(66).fork()).join();
+    }
+    if (message.prefix !== undefined) {
+      PrefixQuery.encode(message.prefix, writer.uint32(74).fork()).join();
     }
     return writer;
   },
@@ -576,6 +590,14 @@ export const Query: MessageFns<Query> = {
           message.range = RangeQuery.decode(reader, reader.uint32());
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.prefix = PrefixQuery.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -603,6 +625,7 @@ export const Query: MessageFns<Query> = {
         : undefined,
       match: isSet(object.match) ? MatchQuery.fromJSON(object.match) : undefined,
       range: isSet(object.range) ? RangeQuery.fromJSON(object.range) : undefined,
+      prefix: isSet(object.prefix) ? PrefixQuery.fromJSON(object.prefix) : undefined,
     };
   },
 
@@ -632,6 +655,9 @@ export const Query: MessageFns<Query> = {
     if (message.range !== undefined) {
       obj.range = RangeQuery.toJSON(message.range);
     }
+    if (message.prefix !== undefined) {
+      obj.prefix = PrefixQuery.toJSON(message.prefix);
+    }
     return obj;
   },
 
@@ -659,6 +685,9 @@ export const Query: MessageFns<Query> = {
       : undefined;
     message.range = (object.range !== undefined && object.range !== null)
       ? RangeQuery.fromPartial(object.range)
+      : undefined;
+    message.prefix = (object.prefix !== undefined && object.prefix !== null)
+      ? PrefixQuery.fromPartial(object.prefix)
       : undefined;
     return message;
   },
@@ -1721,6 +1750,82 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     const message = createBaseMatchQuery();
     message.field = object.field ?? "";
     message.text = object.text ?? "";
+    return message;
+  },
+};
+
+function createBasePrefixQuery(): PrefixQuery {
+  return { field: "", prefix: "" };
+}
+
+export const PrefixQuery: MessageFns<PrefixQuery> = {
+  encode(message: PrefixQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.prefix !== "") {
+      writer.uint32(18).string(message.prefix);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrefixQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrefixQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.prefix = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrefixQuery {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      prefix: isSet(object.prefix) ? globalThis.String(object.prefix) : "",
+    };
+  },
+
+  toJSON(message: PrefixQuery): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.prefix !== "") {
+      obj.prefix = message.prefix;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrefixQuery>): PrefixQuery {
+    return PrefixQuery.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrefixQuery>): PrefixQuery {
+    const message = createBasePrefixQuery();
+    message.field = object.field ?? "";
+    message.prefix = object.prefix ?? "";
     return message;
   },
 };

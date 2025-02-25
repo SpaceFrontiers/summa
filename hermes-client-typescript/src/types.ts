@@ -147,6 +147,11 @@ export interface RangeQuery {
   maxF64?: number;
 }
 
+export interface PrefixQuery {
+  field: string;
+  prefix: string;
+}
+
 /** Discriminated union matching proto Query oneof. Exactly one key must be set. */
 export type Query =
   | { term: TermQuery }
@@ -156,7 +161,8 @@ export type Query =
   | { denseVector: DenseVectorQuery }
   | { boost: BoostQuery }
   | { all: AllQuery }
-  | { range: RangeQuery };
+  | { range: RangeQuery }
+  | { prefix: PrefixQuery };
 
 // =============================================================================
 // Reranker (mirrors proto Reranker)

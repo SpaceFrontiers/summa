@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use super::query_field_router::{QueryFieldRouter, RoutingMode};
 use super::schema::{Field, Schema};
-use crate::query::{BooleanQuery, Query, TermQuery};
+use crate::query::{BooleanQuery, PrefixQuery, Query, TermQuery};
 use crate::tokenizer::{BoxedTokenizer, TokenizerRegistry};
 
 #[derive(Parser)]
@@ -30,6 +30,11 @@ pub enum ParsedQuery {
     Phrase {
         field: Option<String>,
         phrase: String,
+    },
+    /// Prefix query — matches terms starting with a given prefix
+    Prefix {
+        field: Option<String>,
+        prefix: String,
     },
     /// Dense vector ANN query
     Ann {
@@ -269,6 +274,9 @@ impl QueryLanguageParser {
                 Rule::phrase_query => {
                     inner_query = Some(self.parse_phrase_query(inner)?);
                 }
+                Rule::prefix_query => {
+                    inner_query = Some(self.parse_prefix_query(inner)?);
+                }
                 Rule::term_query => {
                     inner_query = Some(self.parse_term_query(inner)?);
                 }
@@ -302,6 +310,25 @@ impl QueryLanguageParser {
         }
 
         Ok(ParsedQuery::Term { field, term })
+    }
+
+    fn parse_prefix_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
+        let mut field = None;
+        let mut prefix = String::new();
+
+        for inner in pair.into_inner() {
+            match inner.as_rule() {
+                Rule::field_spec => {
+                    field = Some(inner.into_inner().next().unwrap().as_str().to_string());
+                }
+                Rule::prefix_value => {
+                    prefix = inner.as_str().to_string();
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ParsedQuery::Prefix { field, prefix })
     }
 
     fn parse_phrase_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
@@ -413,6 +440,9 @@ impl QueryLanguageParser {
             ParsedQuery::Phrase { field, phrase } => {
                 self.build_phrase_query(field.as_deref(), phrase)
             }
+            ParsedQuery::Prefix { field, prefix } => {
+                self.build_prefix_query(field.as_deref(), prefix)
+            }
             ParsedQuery::Ann {
                 field,
                 vector,
@@ -516,6 +546,29 @@ impl QueryLanguageParser {
                 for &field_id in &self.default_fields {
                     bool_query = bool_query.should(TermQuery::text(field_id, token));
                 }
+            }
+            Ok(Box::new(bool_query))
+        } else {
+            Err("No field specified and no default fields configured".to_string())
+        }
+    }
+
+    fn build_prefix_query(
+        &self,
+        field: Option<&str>,
+        prefix: &str,
+    ) -> Result<Box<dyn Query>, String> {
+        if let Some(field_name) = field {
+            let field_id = self
+                .schema
+                .get_field(field_name)
+                .ok_or_else(|| format!("Unknown field: {}", field_name))?;
+            Ok(Box::new(PrefixQuery::text(field_id, prefix)))
+        } else if !self.default_fields.is_empty() {
+            // Unqualified prefix: OR across default fields
+            let mut bool_query = BooleanQuery::new();
+            for &field_id in &self.default_fields {
+                bool_query = bool_query.should(PrefixQuery::text(field_id, prefix));
             }
             Ok(Box::new(bool_query))
         } else {
@@ -820,6 +873,134 @@ mod tests {
             assert_eq!(vector, vec![(1, 0.5), (5, 0.3)]);
         } else {
             panic!("Expected Sparse query, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_parse_prefix_simple() {
+        let (schema, default_fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, default_fields, tokenizers);
+
+        // Simple prefix: title:abc*
+        let result = parser.parse_query_string("title:abc*");
+        assert!(result.is_ok(), "Failed to parse prefix query: {:?}", result);
+        if let Ok(ParsedQuery::Prefix { field, prefix }) = result {
+            assert_eq!(field, Some("title".to_string()));
+            assert_eq!(prefix, "abc");
+        } else {
+            panic!("Expected Prefix query, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_parse_prefix_url() {
+        let mut builder = SchemaBuilder::default();
+        let _site = builder.add_text_field("site", true, true);
+        let schema = Arc::new(builder.build());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let parser = QueryLanguageParser::new(schema, vec![], tokenizers);
+
+        // URL prefix: site:https://reddit.com/r/Transhumanism*
+        let result = parser.parse_query_string("site:https://reddit.com/r/Transhumanism*");
+        assert!(
+            result.is_ok(),
+            "Failed to parse URL prefix query: {:?}",
+            result
+        );
+        if let Ok(ParsedQuery::Prefix { field, prefix }) = result {
+            assert_eq!(field, Some("site".to_string()));
+            assert_eq!(prefix, "https://reddit.com/r/Transhumanism");
+        } else {
+            panic!("Expected Prefix query, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_parse_prefix_unqualified() {
+        let (schema, default_fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, default_fields, tokenizers);
+
+        // Unqualified prefix: transhuman*
+        let result = parser.parse_query_string("transhuman*");
+        assert!(
+            result.is_ok(),
+            "Failed to parse unqualified prefix: {:?}",
+            result
+        );
+        if let Ok(ParsedQuery::Prefix { field, prefix }) = result {
+            assert_eq!(field, None);
+            assert_eq!(prefix, "transhuman");
+        } else {
+            panic!("Expected Prefix query, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_prefix_query_builds() {
+        let (schema, default_fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, default_fields, tokenizers);
+
+        // Should build without error
+        let _query = parser.parse("title:abc*").unwrap();
+    }
+
+    #[test]
+    fn test_prefix_in_boolean() {
+        let (schema, default_fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, default_fields, tokenizers);
+
+        // Prefix in boolean: rust AND title:abc*
+        let _query = parser.parse("rust AND title:abc*").unwrap();
+    }
+
+    #[test]
+    fn test_prefix_mixed_with_terms() {
+        let mut builder = SchemaBuilder::default();
+        let title = builder.add_text_field("title", true, true);
+        let _site = builder.add_text_field("site", true, true);
+        let schema = Arc::new(builder.build());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let parser = QueryLanguageParser::new(schema, vec![title], tokenizers);
+
+        // Mixed: prefix + free-text terms (implicit OR)
+        let result =
+            parser.parse_query_string("site:https://reddit.com/r/Transhumanism* longevity drugs");
+        assert!(
+            result.is_ok(),
+            "Failed to parse mixed prefix+terms: {:?}",
+            result
+        );
+        // Should be Or([Prefix, Term, Term])
+        if let Ok(ParsedQuery::Or(parts)) = &result {
+            assert_eq!(parts.len(), 3, "Expected 3 parts, got: {:?}", parts);
+            assert!(
+                matches!(&parts[0], ParsedQuery::And(v) if v.len() == 1 && matches!(&v[0], ParsedQuery::Prefix { .. }))
+                    || matches!(&parts[0], ParsedQuery::Prefix { .. }),
+                "First part should be prefix: {:?}",
+                parts[0]
+            );
+        } else {
+            panic!("Expected Or query, got: {:?}", result);
+        }
+
+        // Should also build into a Query without error
+        let _query = parser
+            .parse("site:https://reddit.com/r/Transhumanism* longevity drugs")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_implicit_or_plain_terms() {
+        let (schema, default_fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, default_fields, tokenizers);
+
+        // Space-separated terms: implicit OR
+        let result = parser.parse_query_string("hello world");
+        assert!(result.is_ok(), "Failed to parse implicit OR: {:?}", result);
+        if let Ok(ParsedQuery::Or(parts)) = &result {
+            assert_eq!(parts.len(), 2);
+        } else {
+            panic!("Expected Or query, got: {:?}", result);
         }
     }
 }

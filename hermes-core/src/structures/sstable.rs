@@ -1518,6 +1518,102 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         Ok(results)
     }
+
+    /// Scan all entries whose key starts with `prefix`.
+    ///
+    /// Uses the block index to locate the starting block, then iterates
+    /// forward collecting matching entries. Early-terminates once keys
+    /// exceed the prefix range (keys are sorted).
+    pub async fn prefix_scan(&self, prefix: &[u8]) -> io::Result<Vec<(Vec<u8>, V)>> {
+        if self.block_index.is_empty() || prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start_block = match self.block_index.locate(prefix) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut results = Vec::new();
+
+        for block_idx in start_block..self.block_index.len() {
+            let block_data = self.load_block(block_idx).await?;
+            let mut reader = &block_data[..];
+            let mut current_key = Vec::new();
+
+            while !reader.is_empty() {
+                let common_prefix_len = read_vint(&mut reader)? as usize;
+                let suffix_len = read_vint(&mut reader)? as usize;
+
+                if suffix_len > reader.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSTable block suffix truncated",
+                    ));
+                }
+                current_key.truncate(common_prefix_len);
+                current_key.extend_from_slice(&reader[..suffix_len]);
+                reader = &reader[suffix_len..];
+
+                let value = V::deserialize(&mut reader)?;
+
+                if current_key.starts_with(prefix) {
+                    results.push((current_key.clone(), value));
+                } else if current_key.as_slice() > prefix {
+                    // Keys are sorted — past the prefix range, done
+                    return Ok(results);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Synchronous prefix scan — requires Inline (mmap/RAM) file handles.
+    #[cfg(feature = "sync")]
+    pub fn prefix_scan_sync(&self, prefix: &[u8]) -> io::Result<Vec<(Vec<u8>, V)>> {
+        if self.block_index.is_empty() || prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start_block = match self.block_index.locate(prefix) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut results = Vec::new();
+
+        for block_idx in start_block..self.block_index.len() {
+            let block_data = self.load_block_sync(block_idx)?;
+            let mut reader = &block_data[..];
+            let mut current_key = Vec::new();
+
+            while !reader.is_empty() {
+                let common_prefix_len = read_vint(&mut reader)? as usize;
+                let suffix_len = read_vint(&mut reader)? as usize;
+
+                if suffix_len > reader.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSTable block suffix truncated",
+                    ));
+                }
+                current_key.truncate(common_prefix_len);
+                current_key.extend_from_slice(&reader[..suffix_len]);
+                reader = &reader[suffix_len..];
+
+                let value = V::deserialize(&mut reader)?;
+
+                if current_key.starts_with(prefix) {
+                    results.push((current_key.clone(), value));
+                } else if current_key.as_slice() > prefix {
+                    return Ok(results);
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 /// Async iterator over SSTable entries
