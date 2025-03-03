@@ -636,6 +636,8 @@ def _from_field_value(fv: pb.FieldValue) -> Any:
         }
     elif which == "dense_vector":
         return list(fv.dense_vector.values)
+    elif which == "binary_dense_vector":
+        return bytes(fv.binary_dense_vector)
     return None
 
 
@@ -725,6 +727,19 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
             )
         )
 
+    if "binary_dense_vector" in q:
+        bv = q["binary_dense_vector"]
+        return pb.Query(
+            binary_dense_vector=pb.BinaryDenseVectorQuery(
+                field=bv["field"],
+                vector=bv["vector"],
+                combiner=_combiner_to_proto(bv.get("combiner")),
+                combiner_temperature=bv.get("combiner_temperature", 0),
+                combiner_top_k=bv.get("combiner_top_k", 0),
+                combiner_decay=bv.get("combiner_decay", 0),
+            )
+        )
+
     if "boost" in q:
         bq = q["boost"]
         return pb.Query(
@@ -765,6 +780,7 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
         "boolean",
         "sparse_vector",
         "dense_vector",
+        "binary_dense_vector",
         "boost",
         "range",
         "prefix",
@@ -780,11 +796,12 @@ def _build_reranker(r: dict[str, Any]) -> pb.Reranker:
     """Convert a Reranker dict to protobuf Reranker."""
     return pb.Reranker(
         field=r["field"],
-        vector=r["vector"],
+        vector=r.get("vector", []),
         limit=r.get("limit", 0),
         combiner=_combiner_to_proto(r.get("combiner")),
         combiner_temperature=r.get("combiner_temperature", 0),
         combiner_top_k=r.get("combiner_top_k", 0),
         combiner_decay=r.get("combiner_decay", 0),
         matryoshka_dims=r.get("matryoshka_dims", 0),
+        binary_vector=r.get("binary_vector", b""),
     )

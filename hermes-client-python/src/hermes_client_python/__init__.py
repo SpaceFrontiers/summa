@@ -3,6 +3,7 @@
 from .client import HermesClient
 from .types import (
     AllQuery,
+    BinaryDenseVectorQuery,
     BooleanQuery,
     BoostQuery,
     Combiner,
@@ -25,6 +26,7 @@ from .types import (
 __all__ = [
     "HermesClient",
     "AllQuery",
+    "BinaryDenseVectorQuery",
     "BooleanQuery",
     "BoostQuery",
     "Combiner",

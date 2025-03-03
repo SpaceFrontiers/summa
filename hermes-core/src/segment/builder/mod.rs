@@ -37,7 +37,7 @@ use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::tokenizer::BoxedTokenizer;
 use crate::{DocId, Result};
 
-use dense::DenseVectorBuilder;
+use dense::{BinaryDenseVectorBuilder, DenseVectorBuilder};
 use postings::{CompactPosting, PositionPostingListBuilder, PostingListBuilder, TermKey};
 use sparse::SparseVectorBuilder;
 
@@ -106,6 +106,9 @@ pub struct SegmentBuilder {
     /// Dense vector storage per field: field -> (doc_ids, vectors)
     /// Vectors are stored as flat f32 arrays for efficient RaBitQ indexing
     dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
+
+    /// Binary dense vector storage per field: field -> packed-bit vectors
+    binary_dense_vectors: FxHashMap<u32, BinaryDenseVectorBuilder>,
 
     /// Sparse vector storage per field: field -> SparseVectorBuilder
     /// Uses proper BlockSparsePostingList with configurable quantization
@@ -219,6 +222,7 @@ impl SegmentBuilder {
             numeric_buffer: String::with_capacity(32),
             config,
             dense_vectors: FxHashMap::default(),
+            binary_dense_vectors: FxHashMap::default(),
             sparse_vectors: FxHashMap::default(),
             position_index: HashMap::new(),
             position_enabled_fields,
@@ -310,6 +314,13 @@ impl SegmentBuilder {
                 + 2 * vec_overhead; // Two Vecs
             dense_vector_count += b.doc_ids.len();
         }
+        // Binary dense vectors
+        for b in self.binary_dense_vectors.values() {
+            dense_vectors_bytes += b.vectors.capacity()
+                + b.doc_ids.capacity() * doc_id_ordinal_size
+                + 2 * vec_overhead;
+            dense_vector_count += b.doc_ids.len();
+        }
 
         // Local buffers
         let local_tf_entry_size = spur_size + size_of::<u32>() + fxhashmap_entry_overhead;
@@ -395,9 +406,13 @@ impl SegmentBuilder {
                 continue;
             };
 
-            // Dense vectors are written to .vectors when indexed || stored
+            // Dense/binary vectors are written to .vectors when indexed || stored
             // Other field types require indexed or fast
-            if !matches!(&entry.field_type, FieldType::DenseVector) && !entry.indexed && !entry.fast
+            if !matches!(
+                &entry.field_type,
+                FieldType::DenseVector | FieldType::BinaryDenseVector
+            ) && !entry.indexed
+                && !entry.fast
             {
                 continue;
             }
@@ -454,6 +469,12 @@ impl SegmentBuilder {
                 {
                     let ordinal = self.next_element_ordinal(field.0);
                     self.index_dense_vector_field(*field, doc_id, ordinal as u16, vec)?;
+                }
+                (FieldType::BinaryDenseVector, FieldValue::BinaryDenseVector(bytes))
+                    if entry.indexed || entry.stored =>
+                {
+                    let ordinal = self.next_element_ordinal(field.0);
+                    self.index_binary_dense_vector_field(*field, doc_id, ordinal as u16, bytes)?;
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
                     let ordinal = self.next_element_ordinal(field.0);
@@ -686,6 +707,44 @@ impl SegmentBuilder {
         Ok(())
     }
 
+    /// Index a binary dense vector field with ordinal tracking
+    fn index_binary_dense_vector_field(
+        &mut self,
+        field: Field,
+        doc_id: DocId,
+        ordinal: u16,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let dim_bits = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|e| e.binary_dense_vector_config.as_ref())
+            .map(|c| c.dim)
+            .ok_or_else(|| {
+                crate::Error::Schema("BinaryDenseVector field missing config".to_string())
+            })?;
+
+        let expected_byte_len = dim_bits.div_ceil(8);
+        if bytes.len() != expected_byte_len {
+            return Err(crate::Error::Schema(format!(
+                "Binary vector byte length mismatch: expected {} (dim={}), got {}",
+                expected_byte_len,
+                dim_bits,
+                bytes.len()
+            )));
+        }
+
+        let builder = self
+            .binary_dense_vectors
+            .entry(field.0)
+            .or_insert_with(|| BinaryDenseVectorBuilder::new(dim_bits));
+
+        builder.add(doc_id, ordinal, bytes);
+        self.estimated_memory += bytes.len() + size_of::<(DocId, u16)>();
+
+        Ok(())
+    }
+
     /// Index a sparse vector field using dedicated sparse posting lists
     ///
     /// Collects (doc_id, ordinal, weight) postings per dimension. During commit, these are
@@ -784,6 +843,7 @@ impl SegmentBuilder {
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
+        let binary_dense_vectors = std::mem::take(&mut self.binary_dense_vectors);
         let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
         let schema = &self.schema;
 
@@ -794,7 +854,7 @@ impl SegmentBuilder {
         let mut postings_writer =
             super::OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
         let mut store_writer = super::OffsetWriter::new(dir.streaming_writer(&files.store).await?);
-        let mut vectors_writer = if !dense_vectors.is_empty() {
+        let mut vectors_writer = if !dense_vectors.is_empty() || !binary_dense_vectors.is_empty() {
             Some(super::OffsetWriter::new(
                 dir.streaming_writer(&files.vectors).await?,
             ))
@@ -850,6 +910,7 @@ impl SegmentBuilder {
                                     if let Some(ref mut w) = vectors_writer {
                                         dense::build_vectors_streaming(
                                             dense_vectors,
+                                            binary_dense_vectors,
                                             schema,
                                             trained,
                                             w,

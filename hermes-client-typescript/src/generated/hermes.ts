@@ -77,6 +77,7 @@ export interface Query {
   match?: MatchQuery | undefined;
   range?: RangeQuery | undefined;
   prefix?: PrefixQuery | undefined;
+  binaryDenseVector?: BinaryDenseVectorQuery | undefined;
 }
 
 /**
@@ -124,6 +125,18 @@ export interface DenseVectorQuery {
   /** K for WeightedTopK (default: 5) */
   combinerTopK: number;
   /** Decay for WeightedTopK (default: 0.7) */
+  combinerDecay: number;
+}
+
+/** Binary dense vector query for Hamming distance search */
+export interface BinaryDenseVectorQuery {
+  field: string;
+  /** Packed-bit query vector (ceil(dim/8) bytes) */
+  vector: Uint8Array;
+  /** How to combine scores for multi-value fields */
+  combiner: MultiValueCombiner;
+  combinerTemperature: number;
+  combinerTopK: number;
   combinerDecay: number;
 }
 
@@ -178,11 +191,14 @@ export interface PrefixQuery {
   prefix: string;
 }
 
-/** L2 reranker: rerank L1 candidates by exact dense vector distance */
+/**
+ * L2 reranker: rerank L1 candidates by exact vector distance
+ * For dense vectors: set `vector` (f32). For binary dense vectors: set `binary_vector` (bytes).
+ */
 export interface Reranker {
-  /** Dense vector field (must be stored) */
+  /** Vector field (dense or binary dense) */
   field: string;
-  /** Query vector */
+  /** Query vector (f32, for dense fields) */
   vector: number[];
   /** L1 candidate count (0 = 10x final limit) */
   limit: number;
@@ -192,6 +208,8 @@ export interface Reranker {
   combinerDecay: number;
   /** Matryoshka pre-filter dims (0 = disabled) */
   matryoshkaDims: number;
+  /** Query vector (packed bits, for binary dense fields) */
+  binaryVector: Uint8Array;
 }
 
 /** Search request/response */
@@ -250,7 +268,11 @@ export interface FieldValue {
     | DenseVector
     | undefined;
   /** JSON serialized as string */
-  jsonValue?: string | undefined;
+  jsonValue?:
+    | string
+    | undefined;
+  /** Packed-bit binary vector */
+  binaryDenseVector?: Uint8Array | undefined;
 }
 
 /** Sparse vector with term indices and weights */
@@ -484,6 +506,7 @@ function createBaseQuery(): Query {
     match: undefined,
     range: undefined,
     prefix: undefined,
+    binaryDenseVector: undefined,
   };
 }
 
@@ -515,6 +538,9 @@ export const Query: MessageFns<Query> = {
     }
     if (message.prefix !== undefined) {
       PrefixQuery.encode(message.prefix, writer.uint32(74).fork()).join();
+    }
+    if (message.binaryDenseVector !== undefined) {
+      BinaryDenseVectorQuery.encode(message.binaryDenseVector, writer.uint32(82).fork()).join();
     }
     return writer;
   },
@@ -598,6 +624,14 @@ export const Query: MessageFns<Query> = {
           message.prefix = PrefixQuery.decode(reader, reader.uint32());
           continue;
         }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.binaryDenseVector = BinaryDenseVectorQuery.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -626,6 +660,11 @@ export const Query: MessageFns<Query> = {
       match: isSet(object.match) ? MatchQuery.fromJSON(object.match) : undefined,
       range: isSet(object.range) ? RangeQuery.fromJSON(object.range) : undefined,
       prefix: isSet(object.prefix) ? PrefixQuery.fromJSON(object.prefix) : undefined,
+      binaryDenseVector: isSet(object.binaryDenseVector)
+        ? BinaryDenseVectorQuery.fromJSON(object.binaryDenseVector)
+        : isSet(object.binary_dense_vector)
+        ? BinaryDenseVectorQuery.fromJSON(object.binary_dense_vector)
+        : undefined,
     };
   },
 
@@ -658,6 +697,9 @@ export const Query: MessageFns<Query> = {
     if (message.prefix !== undefined) {
       obj.prefix = PrefixQuery.toJSON(message.prefix);
     }
+    if (message.binaryDenseVector !== undefined) {
+      obj.binaryDenseVector = BinaryDenseVectorQuery.toJSON(message.binaryDenseVector);
+    }
     return obj;
   },
 
@@ -688,6 +730,9 @@ export const Query: MessageFns<Query> = {
       : undefined;
     message.prefix = (object.prefix !== undefined && object.prefix !== null)
       ? PrefixQuery.fromPartial(object.prefix)
+      : undefined;
+    message.binaryDenseVector = (object.binaryDenseVector !== undefined && object.binaryDenseVector !== null)
+      ? BinaryDenseVectorQuery.fromPartial(object.binaryDenseVector)
       : undefined;
     return message;
   },
@@ -1191,6 +1236,165 @@ export const DenseVectorQuery: MessageFns<DenseVectorQuery> = {
     message.vector = object.vector?.map((e) => e) || [];
     message.nprobe = object.nprobe ?? 0;
     message.rerankFactor = object.rerankFactor ?? 0;
+    message.combiner = object.combiner ?? 0;
+    message.combinerTemperature = object.combinerTemperature ?? 0;
+    message.combinerTopK = object.combinerTopK ?? 0;
+    message.combinerDecay = object.combinerDecay ?? 0;
+    return message;
+  },
+};
+
+function createBaseBinaryDenseVectorQuery(): BinaryDenseVectorQuery {
+  return {
+    field: "",
+    vector: new Uint8Array(0),
+    combiner: 0,
+    combinerTemperature: 0,
+    combinerTopK: 0,
+    combinerDecay: 0,
+  };
+}
+
+export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
+  encode(message: BinaryDenseVectorQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.vector.length !== 0) {
+      writer.uint32(18).bytes(message.vector);
+    }
+    if (message.combiner !== 0) {
+      writer.uint32(24).int32(message.combiner);
+    }
+    if (message.combinerTemperature !== 0) {
+      writer.uint32(37).float(message.combinerTemperature);
+    }
+    if (message.combinerTopK !== 0) {
+      writer.uint32(40).uint32(message.combinerTopK);
+    }
+    if (message.combinerDecay !== 0) {
+      writer.uint32(53).float(message.combinerDecay);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BinaryDenseVectorQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBinaryDenseVectorQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.vector = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.combiner = reader.int32() as any;
+          continue;
+        }
+        case 4: {
+          if (tag !== 37) {
+            break;
+          }
+
+          message.combinerTemperature = reader.float();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.combinerTopK = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 53) {
+            break;
+          }
+
+          message.combinerDecay = reader.float();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BinaryDenseVectorQuery {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      vector: isSet(object.vector) ? bytesFromBase64(object.vector) : new Uint8Array(0),
+      combiner: isSet(object.combiner) ? multiValueCombinerFromJSON(object.combiner) : 0,
+      combinerTemperature: isSet(object.combinerTemperature)
+        ? globalThis.Number(object.combinerTemperature)
+        : isSet(object.combiner_temperature)
+        ? globalThis.Number(object.combiner_temperature)
+        : 0,
+      combinerTopK: isSet(object.combinerTopK)
+        ? globalThis.Number(object.combinerTopK)
+        : isSet(object.combiner_top_k)
+        ? globalThis.Number(object.combiner_top_k)
+        : 0,
+      combinerDecay: isSet(object.combinerDecay)
+        ? globalThis.Number(object.combinerDecay)
+        : isSet(object.combiner_decay)
+        ? globalThis.Number(object.combiner_decay)
+        : 0,
+    };
+  },
+
+  toJSON(message: BinaryDenseVectorQuery): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.vector.length !== 0) {
+      obj.vector = base64FromBytes(message.vector);
+    }
+    if (message.combiner !== 0) {
+      obj.combiner = multiValueCombinerToJSON(message.combiner);
+    }
+    if (message.combinerTemperature !== 0) {
+      obj.combinerTemperature = message.combinerTemperature;
+    }
+    if (message.combinerTopK !== 0) {
+      obj.combinerTopK = Math.round(message.combinerTopK);
+    }
+    if (message.combinerDecay !== 0) {
+      obj.combinerDecay = message.combinerDecay;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BinaryDenseVectorQuery>): BinaryDenseVectorQuery {
+    return BinaryDenseVectorQuery.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BinaryDenseVectorQuery>): BinaryDenseVectorQuery {
+    const message = createBaseBinaryDenseVectorQuery();
+    message.field = object.field ?? "";
+    message.vector = object.vector ?? new Uint8Array(0);
     message.combiner = object.combiner ?? 0;
     message.combinerTemperature = object.combinerTemperature ?? 0;
     message.combinerTopK = object.combinerTopK ?? 0;
@@ -1840,6 +2044,7 @@ function createBaseReranker(): Reranker {
     combinerTopK: 0,
     combinerDecay: 0,
     matryoshkaDims: 0,
+    binaryVector: new Uint8Array(0),
   };
 }
 
@@ -1870,6 +2075,9 @@ export const Reranker: MessageFns<Reranker> = {
     }
     if (message.matryoshkaDims !== 0) {
       writer.uint32(64).uint32(message.matryoshkaDims);
+    }
+    if (message.binaryVector.length !== 0) {
+      writer.uint32(74).bytes(message.binaryVector);
     }
     return writer;
   },
@@ -1955,6 +2163,14 @@ export const Reranker: MessageFns<Reranker> = {
           message.matryoshkaDims = reader.uint32();
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.binaryVector = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1990,6 +2206,11 @@ export const Reranker: MessageFns<Reranker> = {
         : isSet(object.matryoshka_dims)
         ? globalThis.Number(object.matryoshka_dims)
         : 0,
+      binaryVector: isSet(object.binaryVector)
+        ? bytesFromBase64(object.binaryVector)
+        : isSet(object.binary_vector)
+        ? bytesFromBase64(object.binary_vector)
+        : new Uint8Array(0),
     };
   },
 
@@ -2019,6 +2240,9 @@ export const Reranker: MessageFns<Reranker> = {
     if (message.matryoshkaDims !== 0) {
       obj.matryoshkaDims = Math.round(message.matryoshkaDims);
     }
+    if (message.binaryVector.length !== 0) {
+      obj.binaryVector = base64FromBytes(message.binaryVector);
+    }
     return obj;
   },
 
@@ -2035,6 +2259,7 @@ export const Reranker: MessageFns<Reranker> = {
     message.combinerTopK = object.combinerTopK ?? 0;
     message.combinerDecay = object.combinerDecay ?? 0;
     message.matryoshkaDims = object.matryoshkaDims ?? 0;
+    message.binaryVector = object.binaryVector ?? new Uint8Array(0);
     return message;
   },
 };
@@ -2636,6 +2861,7 @@ function createBaseFieldValue(): FieldValue {
     sparseVector: undefined,
     denseVector: undefined,
     jsonValue: undefined,
+    binaryDenseVector: undefined,
   };
 }
 
@@ -2664,6 +2890,9 @@ export const FieldValue: MessageFns<FieldValue> = {
     }
     if (message.jsonValue !== undefined) {
       writer.uint32(66).string(message.jsonValue);
+    }
+    if (message.binaryDenseVector !== undefined) {
+      writer.uint32(74).bytes(message.binaryDenseVector);
     }
     return writer;
   },
@@ -2739,6 +2968,14 @@ export const FieldValue: MessageFns<FieldValue> = {
           message.jsonValue = reader.string();
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.binaryDenseVector = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2774,6 +3011,11 @@ export const FieldValue: MessageFns<FieldValue> = {
         : isSet(object.json_value)
         ? globalThis.String(object.json_value)
         : undefined,
+      binaryDenseVector: isSet(object.binaryDenseVector)
+        ? bytesFromBase64(object.binaryDenseVector)
+        : isSet(object.binary_dense_vector)
+        ? bytesFromBase64(object.binary_dense_vector)
+        : undefined,
     };
   },
 
@@ -2803,6 +3045,9 @@ export const FieldValue: MessageFns<FieldValue> = {
     if (message.jsonValue !== undefined) {
       obj.jsonValue = message.jsonValue;
     }
+    if (message.binaryDenseVector !== undefined) {
+      obj.binaryDenseVector = base64FromBytes(message.binaryDenseVector);
+    }
     return obj;
   },
 
@@ -2823,6 +3068,7 @@ export const FieldValue: MessageFns<FieldValue> = {
       ? DenseVector.fromPartial(object.denseVector)
       : undefined;
     message.jsonValue = object.jsonValue ?? undefined;
+    message.binaryDenseVector = object.binaryDenseVector ?? undefined;
     return message;
   },
 };

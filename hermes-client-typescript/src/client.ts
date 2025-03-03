@@ -369,6 +369,19 @@ function buildQuery(q: Query): PbQuery {
       },
     };
   }
+  if ("binaryDenseVector" in q) {
+    const bv = q.binaryDenseVector;
+    return {
+      binaryDenseVector: {
+        field: bv.field,
+        vector: bv.vector,
+        combiner: combinerToProto(bv.combiner),
+        combinerTemperature: bv.combinerTemperature ?? 0,
+        combinerTopK: bv.combinerTopK ?? 0,
+        combinerDecay: bv.combinerDecay ?? 0,
+      },
+    };
+  }
   if ("boost" in q) {
     return { boost: { query: buildQuery(q.boost.query), boost: q.boost.boost } };
   }
@@ -392,7 +405,7 @@ function buildQuery(q: Query): PbQuery {
   if ("all" in q) {
     return { all: {} };
   }
-  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "boost", "range", "prefix", "all"];
+  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "binaryDenseVector", "boost", "range", "prefix", "all"];
   const keys = Object.keys(q);
   throw new Error(
     `Unrecognized query key(s): ${keys.join(", ")}. Valid keys: ${validKeys.join(", ")}`
@@ -402,13 +415,14 @@ function buildQuery(q: Query): PbQuery {
 function buildReranker(r: Reranker): any {
   return {
     field: r.field,
-    vector: r.vector,
+    vector: r.vector ?? [],
     limit: r.limit ?? 0,
     combiner: combinerToProto(r.combiner),
     combinerTemperature: r.combinerTemperature ?? 0,
     combinerTopK: r.combinerTopK ?? 0,
     combinerDecay: r.combinerDecay ?? 0,
     matryoshkaDims: r.matryoshkaDims ?? 0,
+    binaryVector: r.binaryVector ?? new Uint8Array(0),
   };
 }
 
@@ -528,6 +542,9 @@ function fromFieldValue(fv: PbFieldValue): any {
   }
   if (fv.denseVector !== undefined) {
     return Array.from(fv.denseVector.values);
+  }
+  if (fv.binaryDenseVector !== undefined) {
+    return fv.binaryDenseVector;
   }
   return null;
 }

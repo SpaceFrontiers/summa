@@ -94,8 +94,11 @@ pub fn serialize_document_into(
 
     // Two-pass approach avoids allocating a Vec just to count + iterate stored fields.
     let is_stored = |field: &crate::dsl::Field, value: &FieldValue| -> bool {
-        // Dense vectors live in .vectors (LazyFlatVectorData), not in .store
-        if matches!(value, FieldValue::DenseVector(_)) {
+        // Dense/binary vectors live in .vectors (LazyFlatVectorData), not in .store
+        if matches!(
+            value,
+            FieldValue::DenseVector(_) | FieldValue::BinaryDenseVector(_)
+        ) {
             return false;
         }
         schema.get_field_entry(*field).is_some_and(|e| e.stored)
@@ -158,6 +161,11 @@ pub fn serialize_document_into(
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 buf.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
                 buf.extend_from_slice(&json_bytes);
+            }
+            FieldValue::BinaryDenseVector(b) => {
+                buf.push(8);
+                buf.write_u32::<LittleEndian>(b.len() as u32)?;
+                buf.extend_from_slice(b);
             }
         }
     }
@@ -875,6 +883,20 @@ fn deserialize_document_inner(
                     let v: serde_json::Value = serde_json::from_slice(&reader[..len])
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     doc.add_json(Field(field_id as u32), v);
+                }
+                reader = &reader[len..];
+            }
+            8 => {
+                // BinaryDenseVector
+                let len = reader.read_u32::<LittleEndian>()? as usize;
+                if len > reader.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "binary dense vector truncated",
+                    ));
+                }
+                if wanted {
+                    doc.add_binary_dense_vector(Field(field_id as u32), reader[..len].to_vec());
                 }
                 reader = &reader[len..];
             }

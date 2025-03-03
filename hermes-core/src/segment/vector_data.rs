@@ -49,6 +49,13 @@ pub fn dequantize_raw(
                 out[i] = u8_to_f32(b);
             }
         }
+        DenseVectorQuantization::Binary => {
+            // Binary vectors are packed bits — dequantization to f32 is not meaningful.
+            // Fill with raw byte values as f32 for debug/display purposes only.
+            for (i, &b) in raw.iter().enumerate().take(num_floats) {
+                out[i] = b as f32;
+            }
+        }
     }
 }
 
@@ -87,9 +94,11 @@ impl FlatVectorData {
         num_vectors: usize,
         quant: DenseVectorQuantization,
     ) -> usize {
-        FLAT_BINARY_HEADER_SIZE
-            + num_vectors * dim * quant.element_size()
-            + num_vectors * DOC_ID_ENTRY_SIZE
+        let bytes_per_vector = match quant {
+            DenseVectorQuantization::Binary => dim.div_ceil(8),
+            _ => dim * quant.element_size(),
+        };
+        FLAT_BINARY_HEADER_SIZE + num_vectors * bytes_per_vector + num_vectors * DOC_ID_ENTRY_SIZE
     }
 
     /// Stream from flat f32 storage to a writer, quantizing on write.
@@ -132,7 +141,41 @@ impl FlatVectorData {
                     writer.write_all(&buf)?;
                 }
             }
+            DenseVectorQuantization::Binary => {
+                // Binary vectors use serialize_binary_from_bits_streaming(), not this path
+                unreachable!("Binary quantization should use serialize_binary_from_bits_streaming");
+            }
         }
+
+        for &(doc_id, ordinal) in doc_ids {
+            writer.write_all(&doc_id.to_le_bytes())?;
+            writer.write_all(&ordinal.to_le_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    /// Stream packed binary vectors (pre-packed bytes) to a writer.
+    ///
+    /// `packed_vectors` is contiguous storage of num_vectors * byte_len bytes.
+    /// `dim_bits` is the number of bits (dimensions).
+    pub fn serialize_binary_from_bits_streaming(
+        dim_bits: usize,
+        packed_vectors: &[u8],
+        doc_ids: &[(u32, u16)],
+        writer: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        let num_vectors = doc_ids.len();
+        let byte_len = dim_bits.div_ceil(8);
+        debug_assert_eq!(packed_vectors.len(), num_vectors * byte_len);
+
+        Self::write_binary_header(
+            dim_bits,
+            num_vectors,
+            DenseVectorQuantization::Binary,
+            writer,
+        )?;
+        writer.write_all(packed_vectors)?;
 
         for &(doc_id, ordinal) in doc_ids {
             writer.write_all(&doc_id.to_le_bytes())?;
@@ -178,8 +221,8 @@ pub struct LazyFlatVectorData {
     handle: FileHandle,
     /// Byte offset within handle where raw vector data starts (after header)
     vectors_offset: u64,
-    /// Bytes per vector element (cached from quantization.element_size())
-    element_size: usize,
+    /// Bytes per vector in storage (cached: Binary = ceil(dim/8), else dim * element_size)
+    vbs: usize,
 }
 
 impl LazyFlatVectorData {
@@ -210,10 +253,13 @@ impl LazyFlatVectorData {
                 format!("Unknown quantization tag: {}", hdr[12]),
             )
         })?;
-        let element_size = quantization.element_size();
-
         // Read doc_ids section as zero-copy OwnedBytes (6 bytes per vector)
-        let vectors_byte_len = num_vectors * dim * element_size;
+        let vbs = if quantization == DenseVectorQuantization::Binary {
+            dim.div_ceil(8)
+        } else {
+            dim * quantization.element_size()
+        };
+        let vectors_byte_len = num_vectors * vbs;
         let doc_ids_start = (FLAT_BINARY_HEADER_SIZE + vectors_byte_len) as u64;
         let doc_ids_byte_len = (num_vectors * DOC_ID_ENTRY_SIZE) as u64;
 
@@ -228,7 +274,7 @@ impl LazyFlatVectorData {
             doc_ids_bytes,
             handle,
             vectors_offset: FLAT_BINARY_HEADER_SIZE as u64,
-            element_size,
+            vbs,
         })
     }
 
@@ -238,11 +284,11 @@ impl LazyFlatVectorData {
     /// Used for ANN training and doc() hydration where f32 is needed.
     pub async fn read_vector_into(&self, idx: usize, out: &mut [f32]) -> io::Result<()> {
         debug_assert!(out.len() >= self.dim);
-        let vec_byte_len = self.dim * self.element_size;
-        let byte_offset = self.vectors_offset + (idx * vec_byte_len) as u64;
+        let vbs = self.vector_byte_size();
+        let byte_offset = self.vectors_offset + (idx * vbs) as u64;
         let bytes = self
             .handle
-            .read_bytes_range(byte_offset..byte_offset + vec_byte_len as u64)
+            .read_bytes_range(byte_offset..byte_offset + vbs as u64)
             .await?;
         let raw = bytes.as_slice();
 
@@ -284,9 +330,9 @@ impl LazyFlatVectorData {
         count: usize,
     ) -> io::Result<OwnedBytes> {
         debug_assert!(start_idx + count <= self.num_vectors);
-        let vec_byte_len = self.dim * self.element_size;
-        let byte_offset = self.vectors_offset + (start_idx * vec_byte_len) as u64;
-        let byte_len = (count * vec_byte_len) as u64;
+        let vbs = self.vector_byte_size();
+        let byte_offset = self.vectors_offset + (start_idx * vbs) as u64;
+        let byte_len = (count * vbs) as u64;
         self.handle
             .read_bytes_range(byte_offset..byte_offset + byte_len)
             .await
@@ -313,9 +359,9 @@ impl LazyFlatVectorData {
         count: usize,
     ) -> io::Result<OwnedBytes> {
         debug_assert!(start_idx + count <= self.num_vectors);
-        let vec_byte_len = self.dim * self.element_size;
-        let byte_offset = self.vectors_offset + (start_idx * vec_byte_len) as u64;
-        let byte_len = (count * vec_byte_len) as u64;
+        let vbs = self.vector_byte_size();
+        let byte_offset = self.vectors_offset + (start_idx * vbs) as u64;
+        let byte_len = (count * vbs) as u64;
         self.handle
             .read_bytes_range_sync(byte_offset..byte_offset + byte_len)
     }
@@ -403,10 +449,10 @@ impl LazyFlatVectorData {
         (doc_id, ordinal)
     }
 
-    /// Bytes per vector in storage.
+    /// Bytes per vector in storage (cached).
     #[inline]
     pub fn vector_byte_size(&self) -> usize {
-        self.dim * self.element_size
+        self.vbs
     }
 
     /// Total byte length of raw vector data (for chunked merger streaming).

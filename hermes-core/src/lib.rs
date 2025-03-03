@@ -23,8 +23,8 @@ pub mod tokenizer;
 
 // Re-exports from dsl
 pub use dsl::{
-    Document, Field, FieldDef, FieldEntry, FieldType, FieldValue, IndexDef, QueryLanguageParser,
-    Schema, SchemaBuilder, SdlParser, parse_sdl, parse_single_index,
+    BinaryDenseVectorConfig, Document, Field, FieldDef, FieldEntry, FieldType, FieldValue,
+    IndexDef, QueryLanguageParser, Schema, SchemaBuilder, SdlParser, parse_sdl, parse_single_index,
 };
 
 // Re-exports from structures
@@ -56,8 +56,8 @@ pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 
 // Re-exports from query
 pub use query::{
-    Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, PrefixQuery, Query, ScoredDoc, Scorer,
-    SearchHit, SearchResponse, SearchResult, TermQuery, TopKCollector,
+    BinaryDenseVectorQuery, Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, PrefixQuery,
+    Query, ScoredDoc, Scorer, SearchHit, SearchResponse, SearchResult, TermQuery, TopKCollector,
 };
 
 // Re-exports from tokenizer

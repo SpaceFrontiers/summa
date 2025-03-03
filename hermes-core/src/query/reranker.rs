@@ -72,27 +72,31 @@ fn score_batch_precomp(
         (DenseVectorQuantization::UInt8, true) => {
             simd::batch_dot_scores_u8_precomp(query, raw, dim, scores, inv_norm_q);
         }
+        (DenseVectorQuantization::Binary, _) => {
+            unreachable!("Binary quantization should not reach score_batch_precomp");
+        }
     }
 }
 
-/// Configuration for L2 dense vector reranking
+/// Configuration for L2 dense/binary vector reranking
 #[derive(Debug, Clone)]
 pub struct RerankerConfig {
-    /// Dense vector field (must be stored)
+    /// Vector field (dense or binary dense)
     pub field: Field,
-    /// Query vector
+    /// Query vector (f32, for dense fields)
     pub vector: Vec<f32>,
+    /// Query vector (packed bits, for binary dense fields).
+    /// When non-empty, Hamming distance scoring is used instead of cosine.
+    pub binary_vector: Vec<u8>,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
     /// Whether stored vectors are pre-normalized to unit L2 norm.
     /// When true, scoring uses dot-product only (skips per-vector norm — ~40% faster).
+    /// Ignored for binary fields.
     pub unit_norm: bool,
     /// Matryoshka pre-filter: number of leading dimensions to use for cheap
     /// approximate scoring before full-dimension exact reranking.
-    /// When set, scores all candidates on the first `matryoshka_dims` dimensions,
-    /// keeps the top `final_limit × 2` candidates, then does full-dimension
-    /// exact scoring on survivors only. Skips ~50-70% of full cosine computations.
-    /// Set to `None` to disable (default: score all candidates at full dimension).
+    /// Ignored for binary fields.
     pub matryoshka_dims: Option<usize>,
 }
 
@@ -149,6 +153,11 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     config: &RerankerConfig,
     final_limit: usize,
 ) -> crate::error::Result<Vec<SearchResult>> {
+    // Dispatch: binary vector → Hamming, f32 vector → cosine/dot
+    if !config.binary_vector.is_empty() {
+        return rerank_binary(searcher, candidates, config, final_limit).await;
+    }
+
     if config.vector.is_empty() || candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -484,6 +493,136 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     Ok(scored)
 }
 
+/// Rerank L1 candidates by exact Hamming distance on stored binary vectors.
+async fn rerank_binary<D: crate::directories::Directory + 'static>(
+    searcher: &crate::index::Searcher<D>,
+    candidates: &[SearchResult],
+    config: &RerankerConfig,
+    final_limit: usize,
+) -> crate::error::Result<Vec<SearchResult>> {
+    if config.binary_vector.is_empty() || candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let field_id = config.field.0;
+    let query = &config.binary_vector;
+    let byte_len = query.len();
+    let segments = searcher.segment_readers();
+    let seg_by_id = searcher.segment_map();
+
+    // Group candidates by segment
+    let mut segment_groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for (ci, cand) in candidates.iter().enumerate() {
+        if let Some(&seg_idx) = seg_by_id.get(&cand.segment_id) {
+            let reader = &segments[seg_idx];
+            if reader.flat_vectors().contains_key(&field_id) {
+                segment_groups.entry(seg_idx).or_default().push(ci);
+            }
+        }
+    }
+
+    // Resolve and score per segment
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+
+    for (seg_idx, cand_indices) in &segment_groups {
+        let reader = &segments[*seg_idx];
+        let lazy_flat = match reader.flat_vectors().get(&field_id) {
+            Some(f) => f,
+            None => continue,
+        };
+        let vbs = lazy_flat.vector_byte_size();
+        if vbs != byte_len {
+            continue;
+        }
+
+        // Resolve flat indexes and read raw bytes
+        let mut resolved: Vec<(usize, usize)> = Vec::new(); // (cand_idx, flat_idx)
+        for &ci in cand_indices {
+            let doc_id = candidates[ci].doc_id;
+            let (start, count) = lazy_flat.flat_indexes_for_doc_range(doc_id);
+            for j in 0..count {
+                resolved.push((ci, start + j));
+            }
+        }
+
+        if resolved.is_empty() {
+            continue;
+        }
+
+        resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
+
+        let n = resolved.len();
+        let first_idx = resolved[0].1;
+        let last_idx = resolved[n - 1].1;
+        let span = last_idx - first_idx + 1;
+
+        let mut raw_buf = vec![0u8; n * vbs];
+
+        if span <= n * 4 {
+            // Clustered: single range read
+            let range_bytes = lazy_flat
+                .read_vectors_batch(first_idx, span)
+                .await
+                .map_err(crate::error::Error::Io)?;
+            let rb = range_bytes.as_slice();
+            for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                let rel = flat_idx - first_idx;
+                raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs]
+                    .copy_from_slice(&rb[rel * vbs..(rel + 1) * vbs]);
+            }
+        } else {
+            // Scattered: per-vector reads
+            for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                lazy_flat
+                    .read_vector_raw_into(
+                        flat_idx,
+                        &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
+                    )
+                    .await
+                    .map_err(crate::error::Error::Io)?;
+            }
+        }
+
+        // Batch Hamming scoring
+        let dim_bits = lazy_flat.dim;
+        let mut scores_buf = vec![0f32; resolved.len()];
+        crate::structures::simd::batch_hamming_scores(
+            query,
+            &raw_buf,
+            byte_len,
+            dim_bits,
+            &mut scores_buf,
+        );
+
+        // Group scores by candidate, apply combiner
+        let mut cand_ordinal_scores: FxHashMap<usize, Vec<(u32, f32)>> = FxHashMap::default();
+        for (buf_idx, &(ci, flat_idx)) in resolved.iter().enumerate() {
+            let (_, ordinal) = lazy_flat.get_doc_id(flat_idx);
+            cand_ordinal_scores
+                .entry(ci)
+                .or_default()
+                .push((ordinal as u32, scores_buf[buf_idx]));
+        }
+
+        for (ci, ordinal_scores) in cand_ordinal_scores {
+            let combined = config.combiner.combine(&ordinal_scores);
+            let mut result = candidates[ci].clone();
+            result.score = combined;
+            let positions: Vec<ScoredPosition> = ordinal_scores
+                .iter()
+                .map(|&(ord, s)| ScoredPosition::new(ord, s))
+                .collect();
+            result.positions = vec![(field_id, positions)];
+            scored.push(result);
+        }
+    }
+
+    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    scored.truncate(final_limit);
+
+    Ok(scored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +632,7 @@ mod tests {
         RerankerConfig {
             field: Field(0),
             vector,
+            binary_vector: Vec::new(),
             combiner,
             unit_norm: false,
             matryoshka_dims: None,

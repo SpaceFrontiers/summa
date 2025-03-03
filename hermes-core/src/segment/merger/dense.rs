@@ -183,8 +183,10 @@ impl SegmentMerger {
         let mut fields_to_write: Vec<FieldInfo> = Vec::new();
 
         for (field, entry) in self.schema.fields() {
-            if !matches!(entry.field_type, FieldType::DenseVector)
-                || !(entry.indexed || entry.stored)
+            if !matches!(
+                entry.field_type,
+                FieldType::DenseVector | FieldType::BinaryDenseVector
+            ) || !(entry.indexed || entry.stored)
             {
                 continue;
             }
@@ -206,16 +208,20 @@ impl SegmentMerger {
                 continue;
             }
 
-            let quantization = entry
-                .dense_vector_config
-                .as_ref()
-                .map(|c| c.quantization)
-                .or_else(|| {
-                    segments
-                        .iter()
-                        .find_map(|s| s.flat_vectors().get(&field.0).map(|f| f.quantization))
-                })
-                .unwrap_or(DenseVectorQuantization::F32);
+            let quantization = if entry.field_type == FieldType::BinaryDenseVector {
+                DenseVectorQuantization::Binary
+            } else {
+                entry
+                    .dense_vector_config
+                    .as_ref()
+                    .map(|c| c.quantization)
+                    .or_else(|| {
+                        segments
+                            .iter()
+                            .find_map(|s| s.flat_vectors().get(&field.0).map(|f| f.quantization))
+                    })
+                    .unwrap_or(DenseVectorQuantization::F32)
+            };
 
             fields_to_write.push(FieldInfo {
                 field,
@@ -239,9 +245,13 @@ impl SegmentMerger {
             let config = entry.dense_vector_config.as_ref();
 
             // ── ANN entry (written first, index_type < FLAT_TYPE) ────────
-            let ann_blob = self
-                .try_build_ann(field, config, segments, &doc_offs, trained)
-                .await?;
+            // Skip ANN for binary dense vectors (always brute-force)
+            let ann_blob = if entry.field_type == FieldType::BinaryDenseVector {
+                None
+            } else {
+                self.try_build_ann(field, config, segments, &doc_offs, trained)
+                    .await?
+            };
 
             if let Some((index_type, bytes)) = ann_blob {
                 let data_offset = writer.offset();

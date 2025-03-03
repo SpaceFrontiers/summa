@@ -45,7 +45,7 @@ use rustc_hash::FxHashMap;
 
 use super::vector_data::LazyFlatVectorData;
 use crate::directories::{Directory, FileHandle};
-use crate::dsl::{Document, Field, Schema};
+use crate::dsl::{DenseVectorQuantization, Document, Field, Schema};
 use crate::structures::{
     AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFPQIndex, IVFRaBitQIndex, PQCodebook,
     RaBitQIndex, SSTableStats, TermInfo,
@@ -497,15 +497,29 @@ impl SegmentReader {
                 continue;
             }
 
+            let is_binary = lazy_flat.quantization == DenseVectorQuantization::Binary;
             let (start, entries) = lazy_flat.flat_indexes_for_doc(local_doc_id);
             for (j, &(_doc_id, _ordinal)) in entries.iter().enumerate() {
                 let flat_idx = start + j;
-                match lazy_flat.get_vector(flat_idx).await {
-                    Ok(vec) => {
-                        doc.add_dense_vector(Field(field_id), vec);
+                if is_binary {
+                    let vbs = lazy_flat.vector_byte_size();
+                    let mut raw = vec![0u8; vbs];
+                    match lazy_flat.read_vector_raw_into(flat_idx, &mut raw).await {
+                        Ok(()) => {
+                            doc.add_binary_dense_vector(Field(field_id), raw);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to hydrate binary vector field {}: {}", field_id, e);
+                        }
                     }
-                    Err(e) => {
-                        log::warn!("Failed to hydrate vector field {}: {}", field_id, e);
+                } else {
+                    match lazy_flat.get_vector(flat_idx).await {
+                        Ok(vec) => {
+                            doc.add_dense_vector(Field(field_id), vec);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to hydrate vector field {}: {}", field_id, e);
+                        }
                     }
                 }
             }
@@ -667,6 +681,10 @@ impl SegmentReader {
             }
             (DenseVectorQuantization::UInt8, true) => {
                 simd::batch_dot_scores_u8(query, raw, dim, scores);
+            }
+            (DenseVectorQuantization::Binary, _) => {
+                // Binary vectors use search_binary_dense_vector(), not search_dense_vector()
+                unreachable!("Binary quantization should not reach score_quantized_batch");
             }
         }
     }
@@ -887,6 +905,69 @@ impl SegmentReader {
                 t_rerank.elapsed().as_secs_f64() * 1000.0
             );
         }
+
+        Ok(combine_ordinal_results(results, combiner, k))
+    }
+
+    /// Search binary dense vectors using brute-force Hamming distance.
+    ///
+    /// Always flat brute-force (no ANN). Returns VectorSearchResult with ordinal tracking.
+    pub async fn search_binary_dense_vector(
+        &self,
+        field: Field,
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let lazy_flat = match self.flat_vectors.get(&field.0) {
+            Some(f) => f,
+            None => return Ok(Vec::new()),
+        };
+
+        const BRUTE_FORCE_BATCH: usize = 8192; // Binary vectors are tiny, use larger batches
+
+        let dim_bits = lazy_flat.dim;
+        let byte_len = lazy_flat.vector_byte_size();
+        let n = lazy_flat.num_vectors;
+
+        if byte_len != query.len() {
+            return Err(Error::Schema(format!(
+                "Binary query vector byte length {} != field byte length {}",
+                query.len(),
+                byte_len
+            )));
+        }
+
+        let mut collector = crate::query::ScoreCollector::new(k);
+        let mut scores = vec![0f32; BRUTE_FORCE_BATCH];
+
+        for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
+            let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
+            let batch_bytes = lazy_flat
+                .read_vectors_batch(batch_start, batch_count)
+                .await
+                .map_err(crate::Error::Io)?;
+            let raw = batch_bytes.as_slice();
+
+            crate::structures::simd::batch_hamming_scores(
+                query,
+                raw,
+                byte_len,
+                dim_bits,
+                &mut scores[..batch_count],
+            );
+
+            for (i, &score) in scores.iter().enumerate().take(batch_count) {
+                let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                collector.insert_with_ordinal(doc_id, score, ordinal);
+            }
+        }
+
+        let results: Vec<(u32, u16, f32)> = collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
+            .collect();
 
         Ok(combine_ordinal_results(results, combiner, k))
     }

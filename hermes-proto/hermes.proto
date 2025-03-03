@@ -56,6 +56,7 @@ message Query {
     MatchQuery match = 7;
     RangeQuery range = 8;
     PrefixQuery prefix = 9;
+    BinaryDenseVectorQuery binary_dense_vector = 10;
   }
 }
 
@@ -95,6 +96,16 @@ message DenseVectorQuery {
   float combiner_temperature = 6;   // Temperature for LogSumExp (default: 1.5)
   uint32 combiner_top_k = 7;        // K for WeightedTopK (default: 5)
   float combiner_decay = 8;         // Decay for WeightedTopK (default: 0.7)
+}
+
+// Binary dense vector query for Hamming distance search
+message BinaryDenseVectorQuery {
+  string field = 1;
+  bytes vector = 2;                        // Packed-bit query vector (ceil(dim/8) bytes)
+  MultiValueCombiner combiner = 3;         // How to combine scores for multi-value fields
+  float combiner_temperature = 4;
+  uint32 combiner_top_k = 5;
+  float combiner_decay = 6;
 }
 
 message TermQuery {
@@ -141,16 +152,18 @@ message PrefixQuery {
   string prefix = 2;
 }
 
-// L2 reranker: rerank L1 candidates by exact dense vector distance
+// L2 reranker: rerank L1 candidates by exact vector distance
+// For dense vectors: set `vector` (f32). For binary dense vectors: set `binary_vector` (bytes).
 message Reranker {
-  string field = 1;                    // Dense vector field (must be stored)
-  repeated float vector = 2;           // Query vector
+  string field = 1;                    // Vector field (dense or binary dense)
+  repeated float vector = 2;           // Query vector (f32, for dense fields)
   uint32 limit = 3;                    // L1 candidate count (0 = 10x final limit)
   MultiValueCombiner combiner = 4;
   float combiner_temperature = 5;
   uint32 combiner_top_k = 6;
   float combiner_decay = 7;
   uint32 matryoshka_dims = 8;          // Matryoshka pre-filter dims (0 = disabled)
+  bytes binary_vector = 9;             // Query vector (packed bits, for binary dense fields)
 }
 
 // Search request/response
@@ -197,6 +210,7 @@ message FieldValue {
     SparseVector sparse_vector = 6;
     DenseVector dense_vector = 7;
     string json_value = 8;  // JSON serialized as string
+    bytes binary_dense_vector = 9;  // Packed-bit binary vector
   }
 }
 

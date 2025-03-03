@@ -3513,6 +3513,68 @@ pub fn batch_squared_euclidean_distances(
     }
 }
 
+// ============================================================================
+// Hamming distance for binary dense vectors
+// ============================================================================
+
+/// Compute Hamming distance between two packed-bit vectors.
+/// Returns the number of differing bits.
+#[inline]
+pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len();
+
+    // Process in u64 chunks for maximum popcount throughput
+    let chunks = len / 8;
+    let remainder = len % 8;
+    let mut total = 0u32;
+
+    // Use read_unaligned — byte slices from mmap are not guaranteed 8-byte aligned
+    for i in 0..chunks {
+        let off = i * 8;
+        let va = unsafe { std::ptr::read_unaligned(a.as_ptr().add(off) as *const u64) };
+        let vb = unsafe { std::ptr::read_unaligned(b.as_ptr().add(off) as *const u64) };
+        total += (va ^ vb).count_ones();
+    }
+
+    // Handle remaining bytes
+    let base = chunks * 8;
+    for i in 0..remainder {
+        total += (a[base + i] ^ b[base + i]).count_ones();
+    }
+
+    total
+}
+
+/// Batch Hamming scoring: compute similarity scores for multiple binary vectors.
+///
+/// `query` and each vector in `db` are packed-bit vectors of `byte_len` bytes each.
+/// `dim_bits` is the number of bits (dimensions) for normalization.
+/// Score = 1.0 - hamming_distance / dim_bits (range [0.0, 1.0]).
+pub fn batch_hamming_scores(
+    query: &[u8],
+    db: &[u8],
+    byte_len: usize,
+    dim_bits: usize,
+    scores: &mut [f32],
+) {
+    let n = scores.len();
+    debug_assert_eq!(query.len(), byte_len);
+    debug_assert!(db.len() >= n * byte_len);
+
+    if byte_len == 0 || n == 0 || dim_bits == 0 {
+        return;
+    }
+
+    let inv_dim = 1.0 / dim_bits as f32;
+
+    for i in 0..n {
+        let vec = &db[i * byte_len..(i + 1) * byte_len];
+        let dist = hamming_distance(query, vec);
+        scores[i] = 1.0 - dist as f32 * inv_dim;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

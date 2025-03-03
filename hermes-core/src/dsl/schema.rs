@@ -34,6 +34,9 @@ pub enum FieldType {
     /// JSON field - arbitrary JSON data, stored but not indexed
     #[serde(rename = "json")]
     Json,
+    /// Binary dense vector field - packed-bit storage with Hamming distance scoring
+    #[serde(rename = "binary_dense_vector")]
+    BinaryDenseVector,
 }
 
 /// Field options
@@ -57,6 +60,9 @@ pub struct FieldEntry {
     /// Configuration for dense vector fields (dimension, quantization)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dense_vector_config: Option<DenseVectorConfig>,
+    /// Configuration for binary dense vector fields (dimension in bits)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_dense_vector_config: Option<BinaryDenseVectorConfig>,
     /// Whether this field has columnar fast-field storage for O(1) doc→value access.
     /// Valid for u64, i64, f64, and text fields.
     #[serde(default)]
@@ -128,15 +134,20 @@ pub enum DenseVectorQuantization {
     F16,
     /// 8-bit unsigned scalar quantization (1 byte/dim) — maps [-1,1] → [0,255]
     UInt8,
+    /// Binary packed-bit storage (1 bit per dimension, ceil(dim/8) bytes per vector).
+    /// Used internally by BinaryDenseVector fields. Not selectable for DenseVector fields.
+    Binary,
 }
 
 impl DenseVectorQuantization {
-    /// Bytes per element for this quantization type
+    /// Bytes per element for this quantization type.
+    /// For Binary, returns 1 (but actual byte size is ceil(dim/8), not dim*1).
     pub fn element_size(self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
             Self::UInt8 => 1,
+            Self::Binary => 1, // Packed bits: actual size = ceil(dim/8)
         }
     }
 
@@ -146,6 +157,7 @@ impl DenseVectorQuantization {
             Self::F32 => 0,
             Self::F16 => 1,
             Self::UInt8 => 2,
+            Self::Binary => 3,
         }
     }
 
@@ -155,6 +167,7 @@ impl DenseVectorQuantization {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
             2 => Some(Self::UInt8),
+            3 => Some(Self::Binary),
             _ => None,
         }
     }
@@ -316,6 +329,32 @@ impl DenseVectorConfig {
             let optimal = (num_vectors as f64).sqrt() as usize;
             optimal.clamp(16, 4096)
         })
+    }
+}
+
+/// Configuration for binary dense vector fields
+///
+/// Binary dense vectors store packed bits (1 bit per dimension) and use
+/// Hamming distance for scoring. Always uses brute-force flat search
+/// (Hamming popcount is ~10ns/vec for 768-bit, ANN indexes don't help).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BinaryDenseVectorConfig {
+    /// Number of bits (dimensions). Storage is ceil(dim/8) bytes per vector.
+    pub dim: usize,
+}
+
+impl BinaryDenseVectorConfig {
+    pub fn new(dim: usize) -> Self {
+        assert!(
+            dim.is_multiple_of(8),
+            "BinaryDenseVector dimension must be a multiple of 8, got {dim}"
+        );
+        Self { dim }
+    }
+
+    /// Number of bytes needed to store one vector
+    pub fn byte_len(&self) -> usize {
+        self.dim.div_ceil(8)
     }
 }
 
@@ -492,6 +531,7 @@ impl SchemaBuilder {
             positions: None,
             sparse_vector_config: Some(config),
             dense_vector_config: None,
+            binary_dense_vector_config: None,
             fast: false,
             primary_key: false,
             reorder: false,
@@ -543,6 +583,53 @@ impl SchemaBuilder {
             positions: None,
             sparse_vector_config: None,
             dense_vector_config: Some(config),
+            binary_dense_vector_config: None,
+            fast: false,
+            primary_key: false,
+            reorder: false,
+        });
+        field
+    }
+
+    /// Add a binary dense vector field
+    ///
+    /// Binary dense vectors use packed-bit storage (1 bit per dimension)
+    /// and Hamming distance scoring. Always brute-force flat search.
+    pub fn add_binary_dense_vector_field(
+        &mut self,
+        name: &str,
+        dim: usize,
+        indexed: bool,
+        stored: bool,
+    ) -> Field {
+        self.add_binary_dense_vector_field_with_config(
+            name,
+            indexed,
+            stored,
+            BinaryDenseVectorConfig::new(dim),
+        )
+    }
+
+    /// Add a binary dense vector field with custom configuration
+    pub fn add_binary_dense_vector_field_with_config(
+        &mut self,
+        name: &str,
+        indexed: bool,
+        stored: bool,
+        config: BinaryDenseVectorConfig,
+    ) -> Field {
+        let field = Field(self.fields.len() as u32);
+        self.fields.push(FieldEntry {
+            name: name.to_string(),
+            field_type: FieldType::BinaryDenseVector,
+            indexed,
+            stored,
+            tokenizer: None,
+            multi: false,
+            positions: None,
+            sparse_vector_config: None,
+            dense_vector_config: None,
+            binary_dense_vector_config: Some(config),
             fast: false,
             primary_key: false,
             reorder: false,
@@ -591,6 +678,7 @@ impl SchemaBuilder {
             positions: None,
             sparse_vector_config: None,
             dense_vector_config: None,
+            binary_dense_vector_config: None,
             fast: false,
             primary_key: false,
             reorder: false,
@@ -688,6 +776,9 @@ pub enum FieldValue {
     /// Arbitrary JSON value
     #[serde(rename = "json")]
     Json(serde_json::Value),
+    /// Binary dense vector: packed bits (ceil(dim/8) bytes)
+    #[serde(rename = "binary_dense_vector")]
+    BinaryDenseVector(Vec<u8>),
 }
 
 impl FieldValue {
@@ -746,6 +837,13 @@ impl FieldValue {
             _ => None,
         }
     }
+
+    pub fn as_binary_dense_vector(&self) -> Option<&[u8]> {
+        match self {
+            FieldValue::BinaryDenseVector(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// A document to be indexed
@@ -792,6 +890,11 @@ impl Document {
 
     pub fn add_json(&mut self, field: Field, value: serde_json::Value) {
         self.field_values.push((field, FieldValue::Json(value)));
+    }
+
+    pub fn add_binary_dense_vector(&mut self, field: Field, values: Vec<u8>) {
+        self.field_values
+            .push((field, FieldValue::BinaryDenseVector(values)));
     }
 
     pub fn get_first(&self, field: Field) -> Option<&FieldValue> {
@@ -865,6 +968,12 @@ impl Document {
                         serde_json::json!(values)
                     }
                     FieldValue::Json(v) => v.clone(),
+                    FieldValue::BinaryDenseVector(b) => {
+                        use base64::Engine;
+                        serde_json::Value::String(
+                            base64::engine::general_purpose::STANDARD.encode(b),
+                        )
+                    }
                 };
                 field_values_map
                     .entry(*field)

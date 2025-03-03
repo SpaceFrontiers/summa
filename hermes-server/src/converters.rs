@@ -3,7 +3,8 @@
 use std::sync::LazyLock;
 
 use hermes_core::query::{
-    DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, RerankerConfig, SparseVectorQuery,
+    BinaryDenseVectorQuery, DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, RerankerConfig,
+    SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
@@ -333,6 +334,20 @@ pub fn convert_query(
             query = query.with_combiner(combiner);
             Ok(Box::new(query))
         }
+        Some(ProtoQueryType::BinaryDenseVector(bv_query)) => {
+            let field = schema
+                .get_field(&bv_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", bv_query.field))?;
+            let mut query = BinaryDenseVectorQuery::new(field, bv_query.vector.clone());
+            let combiner = convert_combiner(
+                bv_query.combiner,
+                bv_query.combiner_temperature,
+                bv_query.combiner_top_k,
+                bv_query.combiner_decay,
+            );
+            query = query.with_combiner(combiner);
+            Ok(Box::new(query))
+        }
         Some(ProtoQueryType::Range(range_query)) => convert_range_query(range_query, schema),
         Some(ProtoQueryType::Prefix(prefix_query)) => {
             let field = schema
@@ -440,6 +455,7 @@ pub fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
         CoreFieldValue::Json(json_val) => {
             Value::JsonValue(serde_json::to_string(json_val).unwrap_or_default())
         }
+        CoreFieldValue::BinaryDenseVector(b) => Value::BinaryDenseVector(b.clone()),
     };
     proto::FieldValue { value: Some(v) }
 }
@@ -464,6 +480,7 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             FieldType::Json => "json".to_string(),
             FieldType::SparseVector => "sparse_vector".to_string(),
             FieldType::DenseVector => "dense_vector".to_string(),
+            FieldType::BinaryDenseVector => "binary_dense_vector".to_string(),
         };
 
         // Text tokenizer: text<en_stem>
@@ -488,8 +505,14 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 DenseVectorQuantization::F32 => String::new(),
                 DenseVectorQuantization::F16 => ", f16".to_string(),
                 DenseVectorQuantization::UInt8 => ", uint8".to_string(),
+                DenseVectorQuantization::Binary => String::new(), // binary uses BinaryDenseVector field type
             };
             type_part.push_str(&format!("<{}{}>", cfg.dim, quant_suffix));
+        }
+
+        // Binary dense vector type config: binary_dense_vector<128>
+        if let Some(ref cfg) = entry.binary_dense_vector_config {
+            type_part.push_str(&format!("<{}>", cfg.dim));
         }
 
         // --- attributes: [indexed<...>, stored<multi>, fast] ---
@@ -632,29 +655,49 @@ pub fn convert_reranker(
         .get_field_entry(field)
         .ok_or_else(|| format!("Field entry for '{}' not found", reranker.field))?;
 
-    if entry.field_type != hermes_core::FieldType::DenseVector {
+    let is_binary = entry.field_type == hermes_core::FieldType::BinaryDenseVector;
+
+    if entry.field_type != hermes_core::FieldType::DenseVector && !is_binary {
         return Err(format!(
-            "Reranker field '{}' must be a dense_vector, got {:?}",
+            "Reranker field '{}' must be dense_vector or binary_dense_vector, got {:?}",
             reranker.field, entry.field_type
         ));
     }
 
-    // Dense vectors are always available via lazy flat files (.vectors),
-    // no need to check entry.stored — reranking reads from flat data, not store.
-
-    if reranker.vector.is_empty() {
-        return Err("Reranker query vector must not be empty".to_string());
-    }
-
-    if let Some(ref dv_config) = entry.dense_vector_config
-        && reranker.vector.len() != dv_config.dim
-    {
-        return Err(format!(
-            "Reranker query vector dimension {} does not match field '{}' dimension {}",
-            reranker.vector.len(),
-            reranker.field,
-            dv_config.dim
-        ));
+    // Validate query vector
+    if is_binary {
+        if reranker.binary_vector.is_empty() {
+            return Err(
+                "Reranker binary_vector must not be empty for binary_dense_vector field"
+                    .to_string(),
+            );
+        }
+        if let Some(ref bv_config) = entry.binary_dense_vector_config {
+            let expected_bytes = bv_config.byte_len();
+            if reranker.binary_vector.len() != expected_bytes {
+                return Err(format!(
+                    "Reranker binary_vector byte length {} does not match field '{}' expected {} (dim={})",
+                    reranker.binary_vector.len(),
+                    reranker.field,
+                    expected_bytes,
+                    bv_config.dim
+                ));
+            }
+        }
+    } else {
+        if reranker.vector.is_empty() {
+            return Err("Reranker query vector must not be empty".to_string());
+        }
+        if let Some(ref dv_config) = entry.dense_vector_config
+            && reranker.vector.len() != dv_config.dim
+        {
+            return Err(format!(
+                "Reranker query vector dimension {} does not match field '{}' dimension {}",
+                reranker.vector.len(),
+                reranker.field,
+                dv_config.dim
+            ));
+        }
     }
 
     // Default reranker combiner to WeightedTopK(k=3, decay=0.7) — decaying
@@ -687,6 +730,7 @@ pub fn convert_reranker(
     Ok(RerankerConfig {
         field,
         vector: reranker.vector.clone(),
+        binary_vector: reranker.binary_vector.clone(),
         combiner,
         unit_norm,
         matryoshka_dims,
@@ -739,7 +783,14 @@ pub fn convert_proto_to_document(
             (Some(Value::F64(n)), FieldType::I64) => doc.add_i64(field, *n as i64),
 
             // ── Non-numeric types: no coercion needed ──
+            // bytes_value coerced to binary_dense_vector when schema says so
+            (Some(Value::BytesValue(b)), FieldType::BinaryDenseVector) => {
+                doc.add_binary_dense_vector(field, b.clone());
+            }
             (Some(Value::BytesValue(b)), _) => doc.add_bytes(field, b.clone()),
+            (Some(Value::BinaryDenseVector(b)), _) => {
+                doc.add_binary_dense_vector(field, b.clone());
+            }
             (Some(Value::SparseVector(sv)), _) => {
                 let entries: Vec<(u32, f32)> = sv
                     .indices

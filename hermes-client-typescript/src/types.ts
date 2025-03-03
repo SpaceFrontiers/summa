@@ -134,6 +134,16 @@ export interface DenseVectorQuery {
   combinerDecay?: number;
 }
 
+export interface BinaryDenseVectorQuery {
+  field: string;
+  /** Packed-bit query vector (ceil(dim/8) bytes) */
+  vector: Uint8Array;
+  combiner?: Combiner;
+  combinerTemperature?: number;
+  combinerTopK?: number;
+  combinerDecay?: number;
+}
+
 export interface RangeQuery {
   field: string;
   /** u64 bounds (inclusive) */
@@ -159,6 +169,7 @@ export type Query =
   | { boolean: BooleanQuery }
   | { sparseVector: SparseVectorQuery }
   | { denseVector: DenseVectorQuery }
+  | { binaryDenseVector: BinaryDenseVectorQuery }
   | { boost: BoostQuery }
   | { all: AllQuery }
   | { range: RangeQuery }
@@ -170,7 +181,8 @@ export type Query =
 
 export interface Reranker {
   field: string;
-  vector: number[];
+  /** Query vector (f32, for dense fields) */
+  vector?: number[];
   /** L1 candidate count (0 = 10x final limit) */
   limit?: number;
   combiner?: Combiner;
@@ -179,6 +191,8 @@ export interface Reranker {
   combinerDecay?: number;
   /** Matryoshka pre-filter dims (0 = disabled) */
   matryoshkaDims?: number;
+  /** Query vector (packed bits, for binary dense fields) */
+  binaryVector?: Uint8Array;
 }
 
 // =============================================================================

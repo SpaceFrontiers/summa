@@ -69,6 +69,15 @@ class DenseVectorQuery(TypedDict, total=False):
     combiner_decay: float
 
 
+class BinaryDenseVectorQuery(TypedDict, total=False):
+    field: str  # required but total=False for optional fields
+    vector: bytes  # packed-bit query vector (ceil(dim/8) bytes)
+    combiner: Combiner
+    combiner_temperature: float
+    combiner_top_k: int
+    combiner_decay: float
+
+
 class RangeQuery(TypedDict, total=False):
     field: str  # required but total=False for optional fields
     min_u64: int
@@ -80,7 +89,7 @@ class RangeQuery(TypedDict, total=False):
 
 
 # Query is a dict with exactly one key: "term", "match", "boolean",
-# "sparse_vector", "dense_vector", "boost", "range", or "all".
+# "sparse_vector", "dense_vector", "binary_dense_vector", "boost", "range", or "all".
 Query = dict[str, Any]
 
 # =============================================================================
@@ -97,6 +106,7 @@ class Reranker(TypedDict, total=False):
     combiner_top_k: int
     combiner_decay: float
     matryoshka_dims: int
+    binary_vector: bytes  # packed-bit query vector (for binary dense fields)
 
 
 # =============================================================================

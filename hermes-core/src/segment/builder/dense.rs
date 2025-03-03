@@ -48,12 +48,57 @@ impl DenseVectorBuilder {
     }
 }
 
-/// Stream dense vectors directly to disk (zero-buffer for vector data).
+/// Builder for binary dense vector index
+///
+/// Collects packed-bit vectors with ordinal tracking for multi-valued fields.
+pub(super) struct BinaryDenseVectorBuilder {
+    /// Number of bits (dimensions)
+    pub dim_bits: usize,
+    /// Bytes per vector: ceil(dim_bits/8)
+    pub byte_len: usize,
+    /// Document IDs with ordinals: (doc_id, ordinal)
+    pub doc_ids: Vec<(DocId, u16)>,
+    /// Flat packed-bit storage (doc_ids.len() * byte_len bytes)
+    pub vectors: Vec<u8>,
+}
+
+impl BinaryDenseVectorBuilder {
+    pub fn new(dim_bits: usize) -> Self {
+        let byte_len = dim_bits.div_ceil(8);
+        Self {
+            dim_bits,
+            byte_len,
+            doc_ids: Vec::with_capacity(16),
+            vectors: Vec::with_capacity(16 * byte_len),
+        }
+    }
+
+    pub fn add(&mut self, doc_id: DocId, ordinal: u16, packed_bytes: &[u8]) {
+        debug_assert_eq!(
+            packed_bytes.len(),
+            self.byte_len,
+            "Binary vector byte length mismatch: expected {}, got {}",
+            self.byte_len,
+            packed_bytes.len()
+        );
+        self.doc_ids.push((doc_id, ordinal));
+        self.vectors.extend_from_slice(packed_bytes);
+    }
+
+    pub fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+}
+
+/// Stream dense and binary dense vectors directly to disk (zero-buffer for vector data).
 ///
 /// Computes sizes deterministically (no trial serialization needed), writes
-/// a small header, then streams each field's raw f32 data directly to the writer.
+/// a small header, then streams each field's raw data directly to the writer.
+/// Both dense (f32/f16/u8) and binary dense (packed bits) vectors share a single
+/// TOC + footer to avoid the double-footer bug.
 pub(super) fn build_vectors_streaming(
     dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
+    binary_vectors: FxHashMap<u32, BinaryDenseVectorBuilder>,
     schema: &Schema,
     trained: Option<&super::super::TrainedVectorStructures>,
     writer: &mut dyn Write,
@@ -64,7 +109,13 @@ pub(super) fn build_vectors_streaming(
         .collect();
     fields.sort_by_key(|(id, _)| *id);
 
-    if fields.is_empty() {
+    let mut binary_fields: Vec<(u32, BinaryDenseVectorBuilder)> = binary_vectors
+        .into_iter()
+        .filter(|(_, b)| b.len() > 0)
+        .collect();
+    binary_fields.sort_by_key(|(id, _)| *id);
+
+    if fields.is_empty() && binary_fields.is_empty() {
         return Ok(());
     }
 
@@ -200,6 +251,38 @@ pub(super) fn build_vectors_streaming(
             offset: data_offset,
             size: blob_len,
         });
+        let pad = (8 - (current_offset % 8)) % 8;
+        if pad > 0 {
+            writer.write_all(&[0u8; 8][..pad as usize])?;
+            current_offset += pad;
+        }
+    }
+
+    // Stream binary dense vector fields (packed bits, Hamming distance)
+    for (field_id, builder) in binary_fields.into_iter() {
+        let data_offset = current_offset;
+        let byte_len = builder.byte_len;
+        let num_vectors = builder.len();
+        let data_size = crate::segment::format::FLAT_BINARY_HEADER_SIZE
+            + num_vectors * byte_len
+            + num_vectors * crate::segment::format::DOC_ID_ENTRY_SIZE;
+
+        FlatVectorData::serialize_binary_from_bits_streaming(
+            builder.dim_bits,
+            &builder.vectors,
+            &builder.doc_ids,
+            writer,
+        )
+        .map_err(crate::Error::Io)?;
+
+        current_offset += data_size as u64;
+        toc.push(DenseVectorTocEntry {
+            field_id,
+            index_type: super::super::ann_build::FLAT_TYPE,
+            offset: data_offset,
+            size: data_size as u64,
+        });
+
         let pad = (8 - (current_offset % 8)) % 8;
         if pad > 0 {
             writer.write_all(&[0u8; 8][..pad as usize])?;

@@ -50,14 +50,19 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 //   field embedding: dense_vector<768> [indexed<rabitq>]
 //   field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>]
 //   field embedding: dense_vector<768> [indexed<flat>]  # brute-force, no ANN index
-field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (sparse_vector_config | dense_vector_config | tokenizer_spec)? ~ attributes? }
+// Note: dense_vector_config matches before binary_dense_vector_config (both match `<N>`).
+// The Rust parser remaps based on field_type when needed.
+field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (sparse_vector_config | dense_vector_config | binary_dense_vector_config | tokenizer_spec)? ~ attributes? }
 
 // Field types
+// Note: "binary_dense_vector"/"binary_vector" must precede "binary" (bytes alias)
+// to avoid PEG prefix-matching ambiguity
 field_type = {
     "text" | "string" | "str" |
     "u64" | "uint" | "unsigned" |
     "i64" | "int" | "integer" |
     "f64" | "float" | "double" |
+    "binary_dense_vector" | "binary_vector" |
     "bytes" | "binary" | "blob" |
     "json" |
     "sparse_vector" |
@@ -97,6 +102,12 @@ dense_vector_positional_params = { dimension_spec ~ ("," ~ quant_type_spec)? }
 
 dimension_spec = @{ ASCII_DIGIT+ }
 quant_type_spec = { "f32" | "f16" | "uint8" | "u8" }
+
+// Binary dense vector configuration - just dimension (number of bits)
+// Examples:
+//   field hash: binary_dense_vector<768> [indexed]
+//   field hash: binary_vector<1024> [indexed, stored]
+binary_dense_vector_config = { "<" ~ dimension_spec ~ ">" }
 
 // Tokenizer specification: <tokenizer_name>
 tokenizer_spec = { "<" ~ identifier ~ ">" }

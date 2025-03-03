@@ -54,7 +54,7 @@ use crate::error::Error;
 #[grammar = "dsl/sdl/sdl.pest"]
 pub struct SdlParser;
 
-use super::schema::DenseVectorConfig;
+use super::schema::{BinaryDenseVectorConfig, DenseVectorConfig};
 use crate::structures::{
     IndexSize, QueryWeighting, SparseFormat, SparseQueryConfig, SparseVectorConfig,
     WeightQuantization,
@@ -77,6 +77,8 @@ pub struct FieldDef {
     pub sparse_vector_config: Option<SparseVectorConfig>,
     /// Configuration for dense vector fields
     pub dense_vector_config: Option<DenseVectorConfig>,
+    /// Configuration for binary dense vector fields
+    pub binary_dense_vector_config: Option<BinaryDenseVectorConfig>,
     /// Whether this field has columnar fast-field storage
     pub fast: bool,
     /// Whether this field is a primary key (unique constraint)
@@ -141,6 +143,18 @@ impl IndexDef {
                         config.clone(),
                     )
                 }
+                FieldType::BinaryDenseVector => {
+                    let config = field
+                        .binary_dense_vector_config
+                        .as_ref()
+                        .expect("BinaryDenseVector field requires dimension to be specified");
+                    builder.add_binary_dense_vector_field_with_config(
+                        &field.name,
+                        field.indexed,
+                        field.stored,
+                        config.clone(),
+                    )
+                }
             };
             if field.multi {
                 builder.set_multi(f, true);
@@ -160,7 +174,9 @@ impl IndexDef {
                 if field.multi
                     && matches!(
                         field.field_type,
-                        FieldType::SparseVector | FieldType::DenseVector
+                        FieldType::SparseVector
+                            | FieldType::DenseVector
+                            | FieldType::BinaryDenseVector
                     )
                 {
                     Some(super::schema::PositionMode::Ordinal)
@@ -212,6 +228,7 @@ fn parse_field_type(type_str: &str) -> Result<FieldType> {
         "json" => Ok(FieldType::Json),
         "sparse_vector" => Ok(FieldType::SparseVector),
         "dense_vector" | "vector" => Ok(FieldType::DenseVector),
+        "binary_dense_vector" | "binary_vector" => Ok(FieldType::BinaryDenseVector),
         _ => Err(Error::Schema(format!("Unknown field type: {}", type_str))),
     }
 }
@@ -589,6 +606,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut tokenizer = None;
     let mut sparse_vector_config = None;
     let mut dense_vector_config = None;
+    let mut binary_dense_vector_config = None;
     let mut indexed = true;
     let mut stored = true;
     let mut multi = false;
@@ -613,6 +631,15 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 // Parse dense_vector_params (keyword or positional) - only dims
                 dense_vector_config = Some(parse_dense_vector_config(item));
             }
+            Rule::binary_dense_vector_config => {
+                // Parse binary dense vector config - just dimension (number of bits)
+                let dim: usize = item
+                    .into_inner()
+                    .next()
+                    .map(|d| d.as_str().parse().unwrap_or(0))
+                    .unwrap_or(0);
+                binary_dense_vector_config = Some(BinaryDenseVectorConfig::new(dim));
+            }
             Rule::attributes => {
                 let attrs = parse_attributes(item);
                 indexed = attrs.indexed;
@@ -625,6 +652,17 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
             }
             _ => {}
         }
+    }
+
+    // PEG grammar ambiguity: both dense_vector_config and binary_dense_vector_config
+    // match `<N>`, and dense_vector_config comes first in the ordered choice. When the
+    // field_type is BinaryDenseVector, remap the matched dense_vector_config.
+    if field_type == FieldType::BinaryDenseVector
+        && binary_dense_vector_config.is_none()
+        && let Some(ref dv_config) = dense_vector_config
+    {
+        binary_dense_vector_config = Some(BinaryDenseVectorConfig::new(dv_config.dim));
+        dense_vector_config = None;
     }
 
     // Primary key implies fast + indexed (needed for dedup lookups)
@@ -656,6 +694,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         positions,
         sparse_vector_config,
         dense_vector_config,
+        binary_dense_vector_config,
         fast,
         primary,
         reorder,
