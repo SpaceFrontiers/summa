@@ -373,6 +373,166 @@ async fn test_needle_dense_vector_flat() {
     );
 }
 
+/// Binary dense vector needle-in-haystack + reranking via Hamming distance.
+///
+/// L1: BinaryDenseVectorQuery retrieves candidates.
+/// L2: RerankerConfig with binary_vector reranks by exact Hamming distance.
+#[tokio::test]
+async fn test_binary_dense_vector_rerank() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::query::{BinaryDenseVectorQuery, RerankerConfig};
+
+    let dim_bits = 64; // 64 bits = 8 bytes per vector
+    let byte_len = dim_bits / 8;
+
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let bvec = sb.add_binary_dense_vector_field_with_config(
+        "bvec",
+        true,
+        true,
+        BinaryDenseVectorConfig::new(dim_bits),
+    );
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Needle: all 1s
+    let needle_vec = vec![0xFF_u8; byte_len];
+    let mut needle = Document::new();
+    needle.add_text(title, "Needle binary document");
+    needle.add_binary_dense_vector(bvec, needle_vec.clone());
+    writer.add_document(needle).unwrap();
+
+    // 50 hay documents: various patterns, none all-1s
+    for i in 0u8..50 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("Hay binary doc {}", i));
+        // Each hay vector: repeating byte pattern (low hamming similarity to all-1s)
+        let v: Vec<u8> = (0..byte_len)
+            .map(|d| i.wrapping_add(d as u8) & 0x55)
+            .collect();
+        doc.add_binary_dense_vector(bvec, v);
+        writer.add_document(doc).unwrap();
+    }
+
+    // Near-needle: 63 of 64 bits match (one bit flipped)
+    let mut near_vec = vec![0xFF_u8; byte_len];
+    near_vec[0] = 0xFE; // flip lowest bit
+    let mut near = Document::new();
+    near.add_text(title, "Near-needle binary document");
+    near.add_binary_dense_vector(bvec, near_vec.clone());
+    writer.add_document(near).unwrap();
+
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), 52);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // --- L1 search only: needle should be top result ---
+    let query = BinaryDenseVectorQuery::new(bvec, needle_vec.clone());
+    let results = searcher.search(&query, 5).await.unwrap();
+    assert!(!results.is_empty());
+
+    let top_doc = searcher
+        .doc(results[0].segment_id, results[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        top_doc.get_first(title).unwrap().as_text().unwrap(),
+        "Needle binary document",
+        "L1: exact match should be top result"
+    );
+    // Score = 1.0 - hamming/dim_bits = 1.0 (exact match)
+    assert!(
+        (results[0].score - 1.0).abs() < 1e-6,
+        "Exact match score should be 1.0, got {}",
+        results[0].score
+    );
+
+    // Near-needle should be second
+    assert!(results.len() >= 2);
+    let second_doc = searcher
+        .doc(results[1].segment_id, results[1].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second_doc.get_first(title).unwrap().as_text().unwrap(),
+        "Near-needle binary document",
+        "L1: near-needle should be second"
+    );
+    // Score = 1.0 - 1/64 = 0.984375
+    let expected_near = 1.0 - 1.0 / dim_bits as f32;
+    assert!(
+        (results[1].score - expected_near).abs() < 1e-6,
+        "Near-needle score should be {}, got {}",
+        expected_near,
+        results[1].score
+    );
+
+    // --- L2 rerank: retrieve more candidates, rerank by binary Hamming ---
+    let reranker_config = RerankerConfig {
+        field: bvec,
+        vector: Vec::new(),
+        binary_vector: needle_vec.clone(),
+        combiner: crate::query::MultiValueCombiner::Max,
+        unit_norm: false,
+        matryoshka_dims: None,
+    };
+
+    let query = BinaryDenseVectorQuery::new(bvec, needle_vec);
+    let (reranked, _total) = searcher
+        .search_and_rerank(&query, 52, 5, &reranker_config)
+        .await
+        .unwrap();
+
+    assert!(!reranked.is_empty(), "Reranker should return results");
+
+    let top_doc = searcher
+        .doc(reranked[0].segment_id, reranked[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        top_doc.get_first(title).unwrap().as_text().unwrap(),
+        "Needle binary document",
+        "Reranked: exact match should still be top"
+    );
+    assert!(
+        (reranked[0].score - 1.0).abs() < 1e-6,
+        "Reranked exact match score should be 1.0, got {}",
+        reranked[0].score
+    );
+
+    // Near-needle should be second after reranking too
+    assert!(reranked.len() >= 2);
+    let second_doc = searcher
+        .doc(reranked[1].segment_id, reranked[1].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second_doc.get_first(title).unwrap().as_text().unwrap(),
+        "Near-needle binary document",
+        "Reranked: near-needle should be second"
+    );
+    assert!(
+        (reranked[1].score - expected_near).abs() < 1e-6,
+        "Reranked near-needle score should be {}, got {}",
+        expected_near,
+        reranked[1].score
+    );
+}
+
 /// Combined: full-text + sparse + dense in the same index.
 /// Verifies all three retrieval paths work independently on the same dataset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

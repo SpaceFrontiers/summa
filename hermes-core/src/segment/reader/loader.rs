@@ -52,10 +52,10 @@ pub async fn load_vectors_file<D: Directory>(
         flat_vectors: FxHashMap::default(),
     };
 
-    // Skip loading vectors file if schema has no dense vector fields
-    let has_dense_vectors = schema
-        .fields()
-        .any(|(_, entry)| entry.dense_vector_config.is_some());
+    // Skip loading vectors file if schema has no dense/binary dense vector fields
+    let has_dense_vectors = schema.fields().any(|(_, entry)| {
+        entry.dense_vector_config.is_some() || entry.binary_dense_vector_config.is_some()
+    });
     if !has_dense_vectors {
         return Ok(empty());
     }

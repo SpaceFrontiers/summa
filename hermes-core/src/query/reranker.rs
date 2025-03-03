@@ -504,6 +504,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
         return Ok(Vec::new());
     }
 
+    let t0 = std::time::Instant::now();
     let field_id = config.field.0;
     let query = &config.binary_vector;
     let byte_len = query.len();
@@ -619,7 +620,8 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
         }
     }
 
-    let mut scored: Vec<SearchResult> = Vec::with_capacity(cand_ordinal_scores.len());
+    let total_vectors = cand_ordinal_scores.len();
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(total_vectors);
     for (ci, ordinal_scores) in cand_ordinal_scores {
         let combined = config.combiner.combine(&ordinal_scores);
         let mut result = candidates[ci].clone();
@@ -634,6 +636,16 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
 
     scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
     scored.truncate(final_limit);
+
+    log::debug!(
+        "[reranker-binary] field {}: {} candidates -> {} results ({} docs scored, {} bytes/vec): {:.1}ms",
+        field_id,
+        candidates.len(),
+        scored.len(),
+        total_vectors,
+        byte_len,
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
 
     Ok(scored)
 }
