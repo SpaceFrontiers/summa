@@ -310,6 +310,42 @@ mod neon {
         }
     }
 
+    /// NEON Hamming distance: XOR + byte popcount + horizontal sum.
+    /// Processes 16 bytes per iteration (vs 8 for scalar u64 path).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
+        let len = a.len();
+        let chunks16 = len / 16;
+        let mut total = 0u32;
+
+        // Process 16 bytes at a time, flush u8 accumulators every 31 iters
+        // (vcntq_u8 returns 0-8 per lane; 31 * 8 = 248 ≤ 255, avoiding u8 overflow)
+        let mut i = 0;
+        while i < chunks16 {
+            let batch_end = (i + 31).min(chunks16);
+            let mut acc = vdupq_n_u8(0);
+            for j in i..batch_end {
+                let off = j * 16;
+                let va = vld1q_u8(a.as_ptr().add(off));
+                let vb = vld1q_u8(b.as_ptr().add(off));
+                let popcnt = vcntq_u8(veorq_u8(va, vb));
+                acc = vaddq_u8(acc, popcnt);
+            }
+            // Widen u8 -> u16 -> u32 -> u64 and horizontal sum
+            let sum64 = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(acc)));
+            total += vgetq_lane_u64(sum64, 0) as u32 + vgetq_lane_u64(sum64, 1) as u32;
+            i = batch_end;
+        }
+
+        // Remainder bytes (< 16)
+        let base = chunks16 * 16;
+        for k in base..len {
+            total += (a[k] ^ b[k]).count_ones();
+        }
+
+        total
+    }
+
     /// Check if NEON is available (always true on aarch64)
     #[inline]
     pub fn is_available() -> bool {
@@ -861,6 +897,58 @@ mod avx2 {
             scalar_carry = scalar_carry.wrapping_add(delta).wrapping_add(1);
             output[base + j + 1] = scalar_carry;
         }
+    }
+
+    /// AVX2 Hamming distance using VPSHUFB-based popcount (Muła algorithm).
+    /// Processes 32 bytes per iteration with a nibble lookup table.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
+        let len = a.len();
+        let chunks32 = len / 32;
+        let low_mask = _mm256_set1_epi8(0x0f);
+        // Nibble popcount lookup table: popcount(0..15)
+        let lookup = _mm256_setr_epi8(
+            0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2,
+            3, 3, 4,
+        );
+        let mut total = 0u64;
+
+        let mut i = 0;
+        while i < chunks32 {
+            // Accumulate in u8 lanes, flush every 31 iters to avoid overflow
+            // (nibble popcount gives 0-8 per lane; 31 * 8 = 248 ≤ 255)
+            let batch_end = (i + 31).min(chunks32);
+            let mut acc = _mm256_setzero_si256();
+            for j in i..batch_end {
+                let off = j * 32;
+                let va = _mm256_loadu_si256(a.as_ptr().add(off) as *const __m256i);
+                let vb = _mm256_loadu_si256(b.as_ptr().add(off) as *const __m256i);
+                let xored = _mm256_xor_si256(va, vb);
+                // VPSHUFB popcount: count bits per byte via nibble lookup
+                let lo = _mm256_and_si256(xored, low_mask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(xored, 4), low_mask);
+                let popcnt = _mm256_add_epi8(
+                    _mm256_shuffle_epi8(lookup, lo),
+                    _mm256_shuffle_epi8(lookup, hi),
+                );
+                acc = _mm256_add_epi8(acc, popcnt);
+            }
+            // Horizontal sum: u8 -> u64 via SAD against zero
+            let sad = _mm256_sad_epu8(acc, _mm256_setzero_si256());
+            total += _mm256_extract_epi64(sad, 0) as u64
+                + _mm256_extract_epi64(sad, 1) as u64
+                + _mm256_extract_epi64(sad, 2) as u64
+                + _mm256_extract_epi64(sad, 3) as u64;
+            i = batch_end;
+        }
+
+        // Remainder bytes (< 32)
+        let base = chunks32 * 32;
+        for k in base..len {
+            total += (a[k] ^ b[k]).count_ones() as u64;
+        }
+
+        total as u32
     }
 
     /// Check if AVX2 is available at runtime
@@ -3519,17 +3607,39 @@ pub fn batch_squared_euclidean_distances(
 
 /// Compute Hamming distance between two packed-bit vectors.
 /// Returns the number of differing bits.
+///
+/// Uses NEON intrinsics on aarch64, POPCNT on x86_64, scalar fallback otherwise.
 #[inline]
 pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
     debug_assert_eq!(a.len(), b.len());
-    let len = a.len();
 
-    // Process in u64 chunks for maximum popcount throughput
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        neon::hamming_distance(a, b)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2::is_available() {
+            return unsafe { avx2::hamming_distance(a, b) };
+        }
+        return hamming_distance_scalar(a, b);
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    hamming_distance_scalar(a, b)
+}
+
+/// Scalar Hamming distance using u64 chunks + count_ones().
+/// On x86_64, count_ones() compiles to POPCNT when target-cpu supports it.
+#[inline]
+#[allow(dead_code)]
+fn hamming_distance_scalar(a: &[u8], b: &[u8]) -> u32 {
+    let len = a.len();
     let chunks = len / 8;
     let remainder = len % 8;
     let mut total = 0u32;
 
-    // Use read_unaligned — byte slices from mmap are not guaranteed 8-byte aligned
     for i in 0..chunks {
         let off = i * 8;
         let va = unsafe { std::ptr::read_unaligned(a.as_ptr().add(off) as *const u64) };
@@ -3537,7 +3647,6 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
         total += (va ^ vb).count_ones();
     }
 
-    // Handle remaining bytes
     let base = chunks * 8;
     for i in 0..remainder {
         total += (a[base + i] ^ b[base + i]).count_ones();
@@ -4175,6 +4284,142 @@ mod tests {
         assert!((scores[0] - 1.0).abs() < 0.01, "self-sim: {}", scores[0]);
         // High similarity with scaled version
         assert!(scores[1] > 0.99, "scaled-sim: {}", scores[1]);
+    }
+
+    // ================================================================
+    // Hamming distance tests
+    // ================================================================
+
+    #[test]
+    fn test_hamming_distance_identical() {
+        let a = vec![0xAA; 64];
+        assert_eq!(hamming_distance(&a, &a), 0);
+    }
+
+    #[test]
+    fn test_hamming_distance_opposite() {
+        let a = vec![0xFF; 32];
+        let b = vec![0x00; 32];
+        assert_eq!(hamming_distance(&a, &b), 256);
+    }
+
+    #[test]
+    fn test_hamming_distance_known() {
+        // Single byte: 0b10101010 vs 0b01010101 = 8 bits differ
+        let a = vec![0xAA];
+        let b = vec![0x55];
+        assert_eq!(hamming_distance(&a, &b), 8);
+
+        // Two bytes
+        let a = vec![0xFF, 0x00];
+        let b = vec![0x00, 0x00];
+        assert_eq!(hamming_distance(&a, &b), 8);
+    }
+
+    #[test]
+    fn test_hamming_distance_single_bit() {
+        let a = vec![0x00; 16];
+        let mut b = vec![0x00; 16];
+        b[7] = 0x01; // flip one bit
+        assert_eq!(hamming_distance(&a, &b), 1);
+    }
+
+    #[test]
+    fn test_hamming_distance_empty() {
+        let a: Vec<u8> = vec![];
+        assert_eq!(hamming_distance(&a, &a), 0);
+    }
+
+    #[test]
+    fn test_hamming_distance_remainder_path() {
+        // 17 bytes: not aligned to 16 (NEON) or 32 (AVX2)
+        let a = vec![0xFF; 17];
+        let b = vec![0x00; 17];
+        assert_eq!(hamming_distance(&a, &b), 136); // 17 * 8
+
+        // 33 bytes: tests 32-byte chunk + 1 remainder for AVX2
+        let a = vec![0xFF; 33];
+        let b = vec![0x00; 33];
+        assert_eq!(hamming_distance(&a, &b), 264); // 33 * 8
+    }
+
+    #[test]
+    fn test_hamming_distance_large() {
+        // 4096 bytes = 32768 bits, all differing
+        let a = vec![0xFF; 4096];
+        let b = vec![0x00; 4096];
+        assert_eq!(hamming_distance(&a, &b), 32768);
+    }
+
+    #[test]
+    fn test_hamming_distance_scalar_matches() {
+        // Verify SIMD path matches scalar for various sizes
+        for size in [1, 7, 8, 15, 16, 31, 32, 63, 64, 100, 128, 255, 256] {
+            let a: Vec<u8> = (0..size).map(|i| (i * 37 + 13) as u8).collect();
+            let b: Vec<u8> = (0..size).map(|i| (i * 53 + 7) as u8).collect();
+            let expected = hamming_distance_scalar(&a, &b);
+            let got = hamming_distance(&a, &b);
+            assert_eq!(got, expected, "mismatch at size {size}");
+        }
+    }
+
+    // ================================================================
+    // Batch Hamming scoring tests
+    // ================================================================
+
+    #[test]
+    fn test_batch_hamming_scores_identical() {
+        let query = vec![0xAA; 16];
+        let db = vec![0xAA; 16]; // one vector, identical
+        let mut scores = vec![0f32; 1];
+        batch_hamming_scores(&query, &db, 16, 128, &mut scores);
+        assert!((scores[0] - 1.0).abs() < 1e-6, "identical: {}", scores[0]);
+    }
+
+    #[test]
+    fn test_batch_hamming_scores_opposite() {
+        let query = vec![0xFF; 16];
+        let db = vec![0x00; 16];
+        let mut scores = vec![0f32; 1];
+        batch_hamming_scores(&query, &db, 16, 128, &mut scores);
+        assert!((scores[0] - 0.0).abs() < 1e-6, "opposite: {}", scores[0]);
+    }
+
+    #[test]
+    fn test_batch_hamming_scores_multiple() {
+        let byte_len = 8;
+        let dim_bits = 64;
+        let query = vec![0xFF; byte_len];
+        let mut db = Vec::new();
+        db.extend_from_slice(&vec![0xFF; byte_len]); // identical → 1.0
+        db.extend_from_slice(&vec![0x00; byte_len]); // opposite → 0.0
+        db.extend_from_slice(&vec![0x0F; byte_len]); // half bits differ → 0.5
+
+        let mut scores = vec![0f32; 3];
+        batch_hamming_scores(&query, &db, byte_len, dim_bits, &mut scores);
+
+        assert!((scores[0] - 1.0).abs() < 1e-6, "identical: {}", scores[0]);
+        assert!((scores[1] - 0.0).abs() < 1e-6, "opposite: {}", scores[1]);
+        assert!((scores[2] - 0.5).abs() < 1e-6, "half: {}", scores[2]);
+    }
+
+    #[test]
+    fn test_batch_hamming_scores_empty() {
+        let query = vec![0xFF; 8];
+        let db: Vec<u8> = vec![];
+        let mut scores: Vec<f32> = vec![];
+        batch_hamming_scores(&query, &db, 8, 64, &mut scores);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn test_batch_hamming_scores_zero_byte_len() {
+        let query: Vec<u8> = vec![];
+        let db: Vec<u8> = vec![];
+        let mut scores = vec![0f32; 1];
+        batch_hamming_scores(&query, &db, 0, 0, &mut scores);
+        // Should return early without modifying scores
+        assert_eq!(scores[0], 0.0);
     }
 }
 

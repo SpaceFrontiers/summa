@@ -957,9 +957,12 @@ impl SegmentReader {
                 &mut scores[..batch_count],
             );
 
+            let threshold = collector.threshold();
             for (i, &score) in scores.iter().enumerate().take(batch_count) {
-                let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                collector.insert_with_ordinal(doc_id, score, ordinal);
+                if score > threshold {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
+                }
             }
         }
 

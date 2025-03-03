@@ -50,11 +50,7 @@ pub fn dequantize_raw(
             }
         }
         DenseVectorQuantization::Binary => {
-            // Binary vectors are packed bits — dequantization to f32 is not meaningful.
-            // Fill with raw byte values as f32 for debug/display purposes only.
-            for (i, &b) in raw.iter().enumerate().take(num_floats) {
-                out[i] = b as f32;
-            }
+            unreachable!("Binary vectors use raw bytes, not f32 dequantization");
         }
     }
 }

@@ -638,6 +638,11 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                     .next()
                     .map(|d| d.as_str().parse().unwrap_or(0))
                     .unwrap_or(0);
+                if dim == 0 || !dim.is_multiple_of(8) {
+                    return Err(Error::Schema(format!(
+                        "BinaryDenseVector dimension must be a positive multiple of 8, got {dim}"
+                    )));
+                }
                 binary_dense_vector_config = Some(BinaryDenseVectorConfig::new(dim));
             }
             Rule::attributes => {
@@ -661,7 +666,13 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         && binary_dense_vector_config.is_none()
         && let Some(ref dv_config) = dense_vector_config
     {
-        binary_dense_vector_config = Some(BinaryDenseVectorConfig::new(dv_config.dim));
+        let dim = dv_config.dim;
+        if dim == 0 || !dim.is_multiple_of(8) {
+            return Err(Error::Schema(format!(
+                "BinaryDenseVector dimension must be a positive multiple of 8, got {dim}"
+            )));
+        }
+        binary_dense_vector_config = Some(BinaryDenseVectorConfig::new(dim));
         dense_vector_config = None;
     }
 

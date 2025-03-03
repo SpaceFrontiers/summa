@@ -140,14 +140,14 @@ pub enum DenseVectorQuantization {
 }
 
 impl DenseVectorQuantization {
-    /// Bytes per element for this quantization type.
-    /// For Binary, returns 1 (but actual byte size is ceil(dim/8), not dim*1).
+    /// Bytes per element for non-binary quantization types.
+    /// Panics for Binary — use `dim.div_ceil(8)` for binary vector byte size.
     pub fn element_size(self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
             Self::UInt8 => 1,
-            Self::Binary => 1, // Packed bits: actual size = ceil(dim/8)
+            Self::Binary => panic!("element_size() not valid for Binary; use dim.div_ceil(8)"),
         }
     }
 

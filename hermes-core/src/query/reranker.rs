@@ -521,100 +521,115 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
         }
     }
 
-    // Resolve and score per segment
-    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+    // Concurrent per-segment scoring (same pattern as dense reranker)
+    let segment_futs: Vec<_> = segment_groups
+        .into_iter()
+        .map(|(seg_idx, cand_indices)| {
+            #[allow(clippy::redundant_locals)]
+            let segments = &segments;
+            #[allow(clippy::redundant_locals)]
+            let candidates = candidates;
+            async move {
+                let mut scores: Vec<(usize, u32, f32)> = Vec::new();
 
-    for (seg_idx, cand_indices) in &segment_groups {
-        let reader = &segments[*seg_idx];
-        let lazy_flat = match reader.flat_vectors().get(&field_id) {
-            Some(f) => f,
-            None => continue,
-        };
-        let vbs = lazy_flat.vector_byte_size();
-        if vbs != byte_len {
-            continue;
-        }
+                let Some(lazy_flat) = segments[seg_idx].flat_vectors().get(&field_id) else {
+                    return Ok::<_, crate::error::Error>(scores);
+                };
+                let vbs = lazy_flat.vector_byte_size();
+                if vbs != byte_len {
+                    return Ok(scores);
+                }
 
-        // Resolve flat indexes and read raw bytes
-        let mut resolved: Vec<(usize, usize)> = Vec::new(); // (cand_idx, flat_idx)
-        for &ci in cand_indices {
-            let doc_id = candidates[ci].doc_id;
-            let (start, count) = lazy_flat.flat_indexes_for_doc_range(doc_id);
-            for j in 0..count {
-                resolved.push((ci, start + j));
+                // Resolve flat indexes
+                let mut resolved: Vec<(usize, usize)> = Vec::new();
+                for &ci in &cand_indices {
+                    let doc_id = candidates[ci].doc_id;
+                    let (start, count) = lazy_flat.flat_indexes_for_doc_range(doc_id);
+                    for j in 0..count {
+                        resolved.push((ci, start + j));
+                    }
+                }
+                if resolved.is_empty() {
+                    return Ok(scores);
+                }
+
+                resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
+
+                let n = resolved.len();
+                let first_idx = resolved[0].1;
+                let last_idx = resolved[n - 1].1;
+                let span = last_idx - first_idx + 1;
+
+                let mut raw_buf = vec![0u8; n * vbs];
+
+                if span <= n * 4 {
+                    let range_bytes = lazy_flat
+                        .read_vectors_batch(first_idx, span)
+                        .await
+                        .map_err(crate::error::Error::Io)?;
+                    let rb = range_bytes.as_slice();
+                    for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                        let rel = flat_idx - first_idx;
+                        raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs]
+                            .copy_from_slice(&rb[rel * vbs..(rel + 1) * vbs]);
+                    }
+                } else {
+                    for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                        lazy_flat
+                            .read_vector_raw_into(
+                                flat_idx,
+                                &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
+                            )
+                            .await
+                            .map_err(crate::error::Error::Io)?;
+                    }
+                }
+
+                // Batch Hamming scoring
+                let dim_bits = lazy_flat.dim;
+                let mut scores_buf = vec![0f32; n];
+                crate::structures::simd::batch_hamming_scores(
+                    query,
+                    &raw_buf,
+                    byte_len,
+                    dim_bits,
+                    &mut scores_buf,
+                );
+
+                for (buf_idx, &(ci, flat_idx)) in resolved.iter().enumerate() {
+                    let (_, ordinal) = lazy_flat.get_doc_id(flat_idx);
+                    scores.push((ci, ordinal as u32, scores_buf[buf_idx]));
+                }
+
+                Ok(scores)
             }
-        }
+        })
+        .collect();
 
-        if resolved.is_empty() {
-            continue;
-        }
+    let results = futures::future::join_all(segment_futs).await;
 
-        resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
-
-        let n = resolved.len();
-        let first_idx = resolved[0].1;
-        let last_idx = resolved[n - 1].1;
-        let span = last_idx - first_idx + 1;
-
-        let mut raw_buf = vec![0u8; n * vbs];
-
-        if span <= n * 4 {
-            // Clustered: single range read
-            let range_bytes = lazy_flat
-                .read_vectors_batch(first_idx, span)
-                .await
-                .map_err(crate::error::Error::Io)?;
-            let rb = range_bytes.as_slice();
-            for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
-                let rel = flat_idx - first_idx;
-                raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs]
-                    .copy_from_slice(&rb[rel * vbs..(rel + 1) * vbs]);
-            }
-        } else {
-            // Scattered: per-vector reads
-            for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
-                lazy_flat
-                    .read_vector_raw_into(
-                        flat_idx,
-                        &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
-                    )
-                    .await
-                    .map_err(crate::error::Error::Io)?;
-            }
-        }
-
-        // Batch Hamming scoring
-        let dim_bits = lazy_flat.dim;
-        let mut scores_buf = vec![0f32; resolved.len()];
-        crate::structures::simd::batch_hamming_scores(
-            query,
-            &raw_buf,
-            byte_len,
-            dim_bits,
-            &mut scores_buf,
-        );
-
-        // Group scores by candidate, apply combiner
-        let mut cand_ordinal_scores: FxHashMap<usize, Vec<(u32, f32)>> = FxHashMap::default();
-        for (buf_idx, &(ci, flat_idx)) in resolved.iter().enumerate() {
-            let (_, ordinal) = lazy_flat.get_doc_id(flat_idx);
+    // Combine ordinal scores per candidate and apply combiner
+    let mut cand_ordinal_scores: FxHashMap<usize, Vec<(u32, f32)>> = FxHashMap::default();
+    for result in results {
+        for (ci, ordinal, score) in result? {
             cand_ordinal_scores
                 .entry(ci)
                 .or_default()
-                .push((ordinal as u32, scores_buf[buf_idx]));
+                .push((ordinal, score));
         }
+    }
 
-        for (ci, ordinal_scores) in cand_ordinal_scores {
-            let combined = config.combiner.combine(&ordinal_scores);
-            let mut result = candidates[ci].clone();
-            result.score = combined;
-            let positions: Vec<ScoredPosition> = ordinal_scores
-                .iter()
-                .map(|&(ord, s)| ScoredPosition::new(ord, s))
-                .collect();
-            result.positions = vec![(field_id, positions)];
-            scored.push(result);
-        }
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(cand_ordinal_scores.len());
+    for (ci, ordinal_scores) in cand_ordinal_scores {
+        let combined = config.combiner.combine(&ordinal_scores);
+        let mut result = candidates[ci].clone();
+        result.score = combined;
+        let positions: Vec<ScoredPosition> = ordinal_scores
+            .iter()
+            .map(|&(ord, s)| ScoredPosition::new(ord, s))
+            .collect();
+        result.positions = vec![(field_id, positions)];
+        scored.push(result);
     }
 
     scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
