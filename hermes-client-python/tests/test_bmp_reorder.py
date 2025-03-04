@@ -132,9 +132,9 @@ async def test_build_search_merge_reorder(client):
     indexed2, errors2, errs2 = await client.index_documents(
         INDEX_NAME, DOCUMENTS[half:]
     )
-    assert (
-        indexed2 == NUM_DOCS - half
-    ), f"Expected {NUM_DOCS - half}, got {indexed2}, errors: {errs2}"
+    assert indexed2 == NUM_DOCS - half, (
+        f"Expected {NUM_DOCS - half}, got {indexed2}, errors: {errs2}"
+    )
     num_docs = await client.commit(INDEX_NAME)
     assert num_docs == NUM_DOCS
 
@@ -143,9 +143,9 @@ async def test_build_search_merge_reorder(client):
     for probe_idx in [0, 42, 100, 249, 499]:
         hits = await _search_unique_dim(client, probe_idx)
         doc_ids = [h.fields["doc_id"] for h in hits]
-        assert (
-            probe_idx in doc_ids
-        ), f"Doc {probe_idx} not found before merge. Got doc_ids={doc_ids}"
+        assert probe_idx in doc_ids, (
+            f"Doc {probe_idx} not found before merge. Got doc_ids={doc_ids}"
+        )
 
     # Topic search: should find docs from the same topic
     hits = await _search_topic(client, topic=3)
@@ -160,17 +160,17 @@ async def test_build_search_merge_reorder(client):
     assert num_segments_before >= 1
 
     num_segments = await client.force_merge(INDEX_NAME)
-    assert (
-        num_segments <= num_segments_before
-    ), f"Merge should reduce segments: before={num_segments_before}, after={num_segments}"
+    assert num_segments <= num_segments_before, (
+        f"Merge should reduce segments: before={num_segments_before}, after={num_segments}"
+    )
 
     # -- Phase 2b: Search after merge --
     for probe_idx in [0, 42, 100, 249, 499]:
         hits = await _search_unique_dim(client, probe_idx)
         doc_ids = [h.fields["doc_id"] for h in hits]
-        assert (
-            probe_idx in doc_ids
-        ), f"Doc {probe_idx} not found after merge. Got doc_ids={doc_ids}"
+        assert probe_idx in doc_ids, (
+            f"Doc {probe_idx} not found after merge. Got doc_ids={doc_ids}"
+        )
 
     hits = await _search_topic(client, topic=7)
     topic7_ids = {h.fields["doc_id"] for h in hits}
@@ -186,9 +186,9 @@ async def test_build_search_merge_reorder(client):
     for probe_idx in [0, 1, 42, 99, 100, 200, 249, 300, 498, 499]:
         hits = await _search_unique_dim(client, probe_idx)
         doc_ids = [h.fields["doc_id"] for h in hits]
-        assert (
-            probe_idx in doc_ids
-        ), f"Doc {probe_idx} not found after reorder. Got doc_ids={doc_ids}"
+        assert probe_idx in doc_ids, (
+            f"Doc {probe_idx} not found after reorder. Got doc_ids={doc_ids}"
+        )
 
     # Topic search after reorder
     for topic in range(10):
@@ -200,9 +200,9 @@ async def test_build_search_merge_reorder(client):
 
     # Verify total doc count unchanged
     info_after = await client.get_index_info(INDEX_NAME)
-    assert (
-        info_after.num_docs == NUM_DOCS
-    ), f"Doc count changed after reorder: {info_after.num_docs} != {NUM_DOCS}"
+    assert info_after.num_docs == NUM_DOCS, (
+        f"Doc count changed after reorder: {info_after.num_docs} != {NUM_DOCS}"
+    )
 
 
 @pytest.mark.asyncio
@@ -222,9 +222,9 @@ async def test_reorder_idempotent(client):
     for probe_idx in [0, 42, 249, 499]:
         hits = await _search_unique_dim(client, probe_idx)
         doc_ids = [h.fields["doc_id"] for h in hits]
-        assert (
-            probe_idx in doc_ids
-        ), f"Doc {probe_idx} not found after double reorder. Got doc_ids={doc_ids}"
+        assert probe_idx in doc_ids, (
+            f"Doc {probe_idx} not found after double reorder. Got doc_ids={doc_ids}"
+        )
 
     info = await client.get_index_info(INDEX_NAME)
     assert info.num_docs == NUM_DOCS
