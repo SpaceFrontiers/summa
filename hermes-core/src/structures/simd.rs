@@ -3623,7 +3623,7 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
         if avx2::is_available() {
             return unsafe { avx2::hamming_distance(a, b) };
         }
-        return hamming_distance_scalar(a, b);
+        hamming_distance_scalar(a, b)
     }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
