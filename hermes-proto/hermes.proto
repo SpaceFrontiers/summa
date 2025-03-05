@@ -164,6 +164,7 @@ message Reranker {
   float combiner_decay = 7;
   uint32 matryoshka_dims = 8;          // Matryoshka pre-filter dims (0 = disabled)
   bytes binary_vector = 9;             // Query vector (packed bits, for binary dense fields)
+  float rrf_k = 10;                    // Reciprocal Rank Fusion k (0 = disabled, typical: 60)
 }
 
 // Search request/response

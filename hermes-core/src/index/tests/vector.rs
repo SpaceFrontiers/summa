@@ -505,6 +505,7 @@ async fn test_binary_dense_vector_rerank() {
         combiner: crate::query::MultiValueCombiner::Max,
         unit_norm: false,
         matryoshka_dims: None,
+        rrf_k: 0.0,
     };
 
     let query = BinaryDenseVectorQuery::new(bvec, needle_vec.clone());

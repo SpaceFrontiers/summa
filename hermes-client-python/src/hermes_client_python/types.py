@@ -107,6 +107,7 @@ class Reranker(TypedDict, total=False):
     combiner_decay: float
     matryoshka_dims: int
     binary_vector: bytes  # packed-bit query vector (for binary dense fields)
+    rrf_k: float  # Reciprocal Rank Fusion k (0 = disabled, typical: 60)
 
 
 # =============================================================================

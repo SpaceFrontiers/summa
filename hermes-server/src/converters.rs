@@ -734,6 +734,7 @@ pub fn convert_reranker(
         combiner,
         unit_norm,
         matryoshka_dims,
+        rrf_k: reranker.rrf_k,
     })
 }
 

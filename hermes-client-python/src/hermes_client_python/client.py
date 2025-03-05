@@ -804,4 +804,5 @@ def _build_reranker(r: dict[str, Any]) -> pb.Reranker:
         combiner_decay=r.get("combiner_decay", 0),
         matryoshka_dims=r.get("matryoshka_dims", 0),
         binary_vector=r.get("binary_vector", b""),
+        rrf_k=r.get("rrf_k", 0),
     )

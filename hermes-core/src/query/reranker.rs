@@ -98,6 +98,10 @@ pub struct RerankerConfig {
     /// approximate scoring before full-dimension exact reranking.
     /// Ignored for binary fields.
     pub matryoshka_dims: Option<usize>,
+    /// Reciprocal Rank Fusion k parameter. When > 0, fuses L1 (first-stage) and
+    /// L2 (reranker) rankings: `score(d) = 1/(k + rank_L1) + 1/(k + rank_L2)`.
+    /// Typical value: 60. When 0, RRF is disabled and only L2 scores are used.
+    pub rrf_k: f32,
 }
 
 /// Score a single document against the query vector (used by tests).
@@ -136,6 +140,42 @@ fn score_document(
         .collect();
 
     Some((combined, positions))
+}
+
+/// Apply Reciprocal Rank Fusion to combine L1 and L2 rankings.
+///
+/// `candidates` is sorted by L1 score descending (first-stage query output).
+/// `scored` is sorted by L2 score descending (reranker output).
+/// Replaces each result's score with the RRF fused score, re-sorts, and truncates.
+///
+/// Formula (Cormack, Clarke, Buettcher 2009):
+///   `RRF(d) = 1/(k + rank_L1(d)) + 1/(k + rank_L2(d))`
+/// where ranks are 1-based.
+fn apply_rrf(
+    candidates: &[SearchResult],
+    scored: &mut Vec<SearchResult>,
+    k: f32,
+    final_limit: usize,
+) {
+    // Build L1 rank map: (segment_id, doc_id) → 1-based rank
+    let l1_ranks: FxHashMap<(u128, u32), usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| ((c.segment_id, c.doc_id), idx + 1))
+        .collect();
+
+    // scored is sorted by L2 score desc → enumerate index + 1 = L2 rank
+    for (l2_idx, result) in scored.iter_mut().enumerate() {
+        let l1_rank = l1_ranks
+            .get(&(result.segment_id, result.doc_id))
+            .copied()
+            .unwrap_or(candidates.len() + 1) as f32;
+        let l2_rank = (l2_idx + 1) as f32;
+        result.score = 1.0 / (k + l1_rank) + 1.0 / (k + l2_rank);
+    }
+
+    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    scored.truncate(final_limit);
 }
 
 /// Rerank L1 candidates by exact dense vector distance.
@@ -471,21 +511,23 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         });
     }
 
-    scored.sort_unstable_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(final_limit);
+    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+
+    if config.rrf_k > 0.0 {
+        apply_rrf(candidates, &mut scored, config.rrf_k, final_limit);
+    } else {
+        scored.truncate(final_limit);
+    }
 
     log::debug!(
-        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors, unit_norm={}): read+score={:.1}ms total={:.1}ms",
+        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors, unit_norm={}, rrf_k={}): read+score={:.1}ms total={:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),
         skipped,
         total_vectors,
         config.unit_norm,
+        config.rrf_k,
         read_score_elapsed.as_secs_f64() * 1000.0,
         t0.elapsed().as_secs_f64() * 1000.0,
     );
@@ -624,26 +666,34 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
     let mut scored: Vec<SearchResult> = Vec::with_capacity(total_vectors);
     for (ci, ordinal_scores) in cand_ordinal_scores {
         let combined = config.combiner.combine(&ordinal_scores);
-        let mut result = candidates[ci].clone();
-        result.score = combined;
         let positions: Vec<ScoredPosition> = ordinal_scores
             .iter()
             .map(|&(ord, s)| ScoredPosition::new(ord, s))
             .collect();
-        result.positions = vec![(field_id, positions)];
-        scored.push(result);
+        scored.push(SearchResult {
+            doc_id: candidates[ci].doc_id,
+            score: combined,
+            segment_id: candidates[ci].segment_id,
+            positions: vec![(field_id, positions)],
+        });
     }
 
     scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-    scored.truncate(final_limit);
+
+    if config.rrf_k > 0.0 {
+        apply_rrf(candidates, &mut scored, config.rrf_k, final_limit);
+    } else {
+        scored.truncate(final_limit);
+    }
 
     log::debug!(
-        "[reranker-binary] field {}: {} candidates -> {} results ({} docs scored, {} bytes/vec): {:.1}ms",
+        "[reranker-binary] field {}: {} candidates -> {} results ({} docs scored, {} bytes/vec, rrf_k={}): {:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),
         total_vectors,
         byte_len,
+        config.rrf_k,
         t0.elapsed().as_secs_f64() * 1000.0,
     );
 
@@ -663,6 +713,7 @@ mod tests {
             combiner,
             unit_norm: false,
             matryoshka_dims: None,
+            rrf_k: 0.0,
         }
     }
 
@@ -753,5 +804,142 @@ mod tests {
         let config = make_config(vec![], MultiValueCombiner::Max);
         // Empty query can't match any stored vector (dimension mismatch)
         assert!(score_document(&doc, &config).is_none());
+    }
+
+    fn make_result(doc_id: u32, score: f32, segment_id: u128) -> SearchResult {
+        SearchResult {
+            doc_id,
+            score,
+            segment_id,
+            positions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_rrf_basic_fusion() {
+        // L1 ranking: doc A(rank 1), B(rank 2), C(rank 3)
+        let candidates = vec![
+            make_result(1, 10.0, 1), // A: L1 rank 1
+            make_result(2, 8.0, 1),  // B: L1 rank 2
+            make_result(3, 5.0, 1),  // C: L1 rank 3
+        ];
+
+        // L2 ranking (reversed): C(rank 1), B(rank 2), A(rank 3)
+        let mut scored = vec![
+            make_result(3, 0.9, 1), // C: L2 rank 1
+            make_result(2, 0.7, 1), // B: L2 rank 2
+            make_result(1, 0.3, 1), // A: L2 rank 3
+        ];
+
+        let k = 60.0;
+        apply_rrf(&candidates, &mut scored, k, 10);
+
+        // B should win: rank 2 in both → 2/(k+2) vs split ranks for A and C
+        // A: 1/(61) + 1/(63) = 0.01639 + 0.01587 = 0.03226
+        // B: 1/(62) + 1/(62) = 0.01613 + 0.01613 = 0.03226
+        // C: 1/(63) + 1/(61) = 0.01587 + 0.01639 = 0.03226
+        // All equal! (symmetric: rank sum = 4 for each)
+        // Actually: A: 1/61 + 1/63, B: 1/62 + 1/62, C: 1/63 + 1/61
+        // A = C by symmetry, B is slightly different
+        // 1/61 + 1/63 = (63+61)/(61*63) = 124/3843 = 0.032267
+        // 1/62 + 1/62 = 2/62 = 1/31 = 0.032258
+        // So A = C > B (very slightly). Top result should be doc 3 (C) or doc 1 (A)
+        // since they have the same RRF score but C appeared first in scored.
+
+        assert_eq!(scored.len(), 3);
+        // All three should have very similar RRF scores
+        let spread = scored[0].score - scored[2].score;
+        assert!(
+            spread < 0.001,
+            "All docs have near-equal RRF scores, spread={spread}"
+        );
+    }
+
+    #[test]
+    fn test_rrf_clear_winner() {
+        // Doc X is rank 1 in both L1 and L2 → should clearly win
+        let candidates = vec![
+            make_result(1, 10.0, 1), // X: L1 rank 1
+            make_result(2, 8.0, 1),  // Y: L1 rank 2
+            make_result(3, 5.0, 1),  // Z: L1 rank 3
+        ];
+
+        // L2 ranking: X still rank 1
+        let mut scored = vec![
+            make_result(1, 0.95, 1), // X: L2 rank 1
+            make_result(3, 0.50, 1), // Z: L2 rank 2
+            make_result(2, 0.30, 1), // Y: L2 rank 3
+        ];
+
+        let k = 60.0;
+        apply_rrf(&candidates, &mut scored, k, 10);
+
+        // X: 1/(61) + 1/(61) = 2/61 = 0.03279 (best)
+        // Y: 1/(62) + 1/(63) = 0.03200 (worst)
+        // Z: 1/(63) + 1/(62) = 0.03200 (same as Y by symmetry)
+        assert_eq!(scored[0].doc_id, 1, "Doc 1 (rank 1 in both) should be top");
+        assert!(scored[0].score > scored[1].score);
+    }
+
+    #[test]
+    fn test_rrf_truncation() {
+        let candidates = vec![
+            make_result(1, 10.0, 1),
+            make_result(2, 8.0, 1),
+            make_result(3, 5.0, 1),
+            make_result(4, 3.0, 1),
+            make_result(5, 1.0, 1),
+        ];
+
+        let mut scored = vec![
+            make_result(5, 0.9, 1),
+            make_result(4, 0.8, 1),
+            make_result(3, 0.7, 1),
+            make_result(2, 0.6, 1),
+            make_result(1, 0.5, 1),
+        ];
+
+        apply_rrf(&candidates, &mut scored, 60.0, 3);
+        assert_eq!(scored.len(), 3, "Should truncate to final_limit=3");
+    }
+
+    #[test]
+    fn test_rrf_missing_l1_candidate() {
+        // L1 has docs 1, 2. L2 scored doc 3 which wasn't in L1 candidates.
+        let candidates = vec![make_result(1, 10.0, 1), make_result(2, 8.0, 1)];
+
+        let mut scored = vec![
+            make_result(3, 0.9, 1), // not in L1 → gets worst L1 rank
+            make_result(1, 0.5, 1),
+        ];
+
+        apply_rrf(&candidates, &mut scored, 60.0, 10);
+
+        // Doc 1: L1 rank 1 → 1/61, L2 rank 2 → 1/62  = 0.03252
+        // Doc 3: L1 rank 3 (fallback) → 1/63, L2 rank 1 → 1/61 = 0.03226
+        // Doc 1 should win because it has a better L1 rank
+        assert_eq!(scored[0].doc_id, 1);
+    }
+
+    #[test]
+    fn test_rrf_small_k() {
+        // With small k, rank differences matter more
+        let candidates = vec![make_result(1, 10.0, 1), make_result(2, 8.0, 1)];
+
+        let mut scored = vec![
+            make_result(2, 0.9, 1), // L2 rank 1
+            make_result(1, 0.5, 1), // L2 rank 2
+        ];
+
+        apply_rrf(&candidates, &mut scored, 1.0, 10);
+
+        // k=1: Doc 1: 1/(1+1) + 1/(1+2) = 0.5 + 0.333 = 0.833
+        //       Doc 2: 1/(1+2) + 1/(1+1) = 0.333 + 0.5 = 0.833
+        // With k=1 and symmetric ranks, scores are equal
+        let diff = (scored[0].score - scored[1].score).abs();
+        assert!(
+            diff < 1e-6,
+            "Symmetric ranks should produce equal RRF scores"
+        );
     }
 }

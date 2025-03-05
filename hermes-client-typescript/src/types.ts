@@ -193,6 +193,8 @@ export interface Reranker {
   matryoshkaDims?: number;
   /** Query vector (packed bits, for binary dense fields) */
   binaryVector?: Uint8Array;
+  /** Reciprocal Rank Fusion k (0 = disabled, typical: 60) */
+  rrfK?: number;
 }
 
 // =============================================================================

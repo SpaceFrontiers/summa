@@ -423,6 +423,7 @@ function buildReranker(r: Reranker): any {
     combinerDecay: r.combinerDecay ?? 0,
     matryoshkaDims: r.matryoshkaDims ?? 0,
     binaryVector: r.binaryVector ?? new Uint8Array(0),
+    rrfK: r.rrfK ?? 0,
   };
 }
 
