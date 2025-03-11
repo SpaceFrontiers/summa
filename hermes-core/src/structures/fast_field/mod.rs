@@ -1977,6 +1977,106 @@ mod tests {
         assert_ne!(reader.get_u64(2), wiki_ord, "apple doc must NOT match wiki");
     }
 
+    /// Regression: issued_at timestamps stored via add_i64 with gaps
+    /// should roundtrip correctly through FastFieldWriter → FastFieldReader.
+    #[test]
+    fn test_i64_timestamps_with_missing_roundtrip() {
+        let base_ts = 1724630400i64; // 2024-08-26 epoch seconds
+        let mut writer = FastFieldWriter::new_numeric(FastFieldColumnType::I64);
+
+        // 100 docs, every 5th has no issued_at
+        let mut expected_values: Vec<Option<i64>> = Vec::new();
+        for i in 0..100u32 {
+            if i % 5 == 0 {
+                expected_values.push(None); // missing
+            } else {
+                let ts = base_ts - (i as i64 * 86400);
+                writer.add_i64(i, ts);
+                expected_values.push(Some(ts));
+            }
+        }
+        writer.pad_to(100);
+
+        let mut buf = Vec::new();
+        let (toc, _) = writer.serialize(&mut buf, 0).unwrap();
+        let ob = owned(buf);
+        let reader = FastFieldReader::open(&ob, &toc).unwrap();
+
+        for (i, expected) in expected_values.iter().enumerate() {
+            let raw = reader.get_u64(i as u32);
+            match expected {
+                None => {
+                    assert_eq!(
+                        raw, FAST_FIELD_MISSING,
+                        "doc {}: expected MISSING, got raw {}",
+                        i, raw
+                    );
+                }
+                Some(ts) => {
+                    assert_ne!(
+                        raw, FAST_FIELD_MISSING,
+                        "doc {}: expected timestamp {}, got MISSING",
+                        i, ts
+                    );
+                    let decoded = zigzag_decode(raw);
+                    assert_eq!(
+                        decoded,
+                        *ts,
+                        "doc {}: expected i64 {}, got i64 {} (raw zigzag: {}, expected zigzag: {})",
+                        i,
+                        ts,
+                        decoded,
+                        raw,
+                        zigzag_encode(*ts)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression: specific value 1724630400 that was corrupted in production.
+    /// Test with varying column sizes to exercise different codec selections.
+    #[test]
+    fn test_issued_at_1724630400_various_sizes() {
+        let target_ts = 1724630400i64;
+        let target_zigzag = zigzag_encode(target_ts);
+
+        for num_docs in [2, 5, 10, 50, 100, 500, 1000, 2000] {
+            let mut writer = FastFieldWriter::new_numeric(FastFieldColumnType::I64);
+            let target_doc = num_docs / 3;
+
+            for i in 0..num_docs as u32 {
+                if i == target_doc as u32 {
+                    writer.add_i64(i, target_ts);
+                } else if i % 3 == 0 {
+                    // missing
+                } else {
+                    let ts = 1700000000i64 + (i as i64 * 86400);
+                    writer.add_i64(i, ts);
+                }
+            }
+            writer.pad_to(num_docs as u32);
+
+            let mut buf = Vec::new();
+            let (toc, _) = writer.serialize(&mut buf, 0).unwrap();
+            let ob = owned(buf);
+            let reader = FastFieldReader::open(&ob, &toc).unwrap();
+
+            let raw = reader.get_u64(target_doc as u32);
+            assert_eq!(
+                raw,
+                target_zigzag,
+                "num_docs={}: doc {} expected zigzag {} (ts {}), got {} (decoded i64: {})",
+                num_docs,
+                target_doc,
+                target_zigzag,
+                target_ts,
+                raw,
+                zigzag_decode(raw)
+            );
+        }
+    }
+
     #[test]
     fn test_multi_block_multi_value_numeric() {
         // Block A: doc0=[1,2], doc1=[3]

@@ -179,6 +179,11 @@ pub fn bitpacked_read(data: &[u8], index: usize) -> u64 {
 ///
 /// Estimation uses O(1) memory by tracking value extremes during collection and
 /// computing worst-case residual bounds in `finalize()`.
+///
+/// **Limitation**: the per-column offset is stored as i64 (8 bytes). When values
+/// span nearly the full u64 range (e.g. `FAST_FIELD_MISSING` mixed with small
+/// values), residuals can exceed i64 bounds.  The estimator returns `None` in
+/// that case so the auto-selector falls back to bitpacked.
 #[derive(Default)]
 pub struct LinearEstimator {
     count: usize,
@@ -189,6 +194,8 @@ pub struct LinearEstimator {
     min_residual: i64,
     max_residual: i64,
     values_collected: bool,
+    /// Set by `finalize()` when residuals exceed i64 range.
+    overflow: bool,
 }
 
 impl CodecEstimator for LinearEstimator {
@@ -221,12 +228,18 @@ impl CodecEstimator for LinearEstimator {
         let pred_max = self.first.max(self.last) as i128;
         let min_res = self.min_val as i128 - pred_max;
         let max_res = self.max_val as i128 - pred_min;
-        self.min_residual = min_res.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-        self.max_residual = max_res.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        // The offset is stored as i64 on disk.  If residuals exceed i64 range,
+        // this codec cannot represent the data — mark as overflow.
+        if min_res < i64::MIN as i128 || max_res > i64::MAX as i128 {
+            self.overflow = true;
+            return;
+        }
+        self.min_residual = min_res as i64;
+        self.max_residual = max_res as i64;
     }
 
     fn estimate(&self) -> Option<u64> {
-        if self.count < 2 {
+        if self.count < 2 || self.overflow {
             return None;
         }
         // Check for overflow: if the range doesn't fit u64, this codec is not viable
@@ -257,6 +270,15 @@ impl CodecEstimator for LinearEstimator {
             min_residual = min_residual.min(residual);
         }
 
+        // The offset field is i64 on disk — reject data that doesn't fit.
+        if min_residual < i64::MIN as i128 || min_residual > i64::MAX as i128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "linear codec: residual offset exceeds i64 range",
+            ));
+        }
+        let min_residual_i64 = min_residual as i64;
+
         // Shift residuals to non-negative
         let shifted: Vec<u64> = values
             .iter()
@@ -269,8 +291,6 @@ impl CodecEstimator for LinearEstimator {
             .collect();
         let max_shifted = shifted.iter().copied().max().unwrap_or(0);
         let bpv = bits_needed_u64(max_shifted);
-
-        let min_residual_i64 = min_residual.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
         writer.write_u8(CodecType::Linear as u8)?;
         writer.write_u64::<LittleEndian>(first)?;
         writer.write_u64::<LittleEndian>(last)?;
@@ -374,6 +394,11 @@ impl CodecEstimator for BlockwiseLinearEstimator {
                 min_res = min_res.min(res);
                 max_res = max_res.max(res);
             }
+            // Per-block offset is stored as i64 — if any block's residuals
+            // exceed i64 range, this codec cannot represent the data.
+            if min_res < i64::MIN as i128 || max_res > i64::MAX as i128 {
+                return None;
+            }
             let range = (max_res - min_res) as u64;
             let bpv = bits_needed_u64(range) as u64;
             let data_bits = block_len as u64 * bpv;
@@ -433,7 +458,14 @@ impl CodecEstimator for BlockwiseLinearEstimator {
             let max_shifted = shifted.iter().copied().max().unwrap_or(0);
             let bpv = bits_needed_u64(max_shifted);
 
-            let min_res_i64 = min_residual.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            // Per-block offset is stored as i64 — reject data that doesn't fit.
+            if min_residual < i64::MIN as i128 || min_residual > i64::MAX as i128 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "blockwise linear codec: per-block residual offset exceeds i64 range",
+                ));
+            }
+            let min_res_i64 = min_residual as i64;
             writer.write_u64::<LittleEndian>(first)?;
             writer.write_u64::<LittleEndian>(last)?;
             writer.write_i64::<LittleEndian>(min_res_i64)?;
@@ -805,5 +837,317 @@ mod tests {
             });
         }
         roundtrip_batch(&values);
+    }
+
+    /// Regression: zigzag-encoded i64 timestamps mixed with FAST_FIELD_MISSING (u64::MAX).
+    /// The linear codec's min_residual clamping to i64 corrupts data when values
+    /// span nearly the full u64 range.
+    #[test]
+    fn test_zigzag_timestamps_with_missing() {
+        use super::super::{FAST_FIELD_MISSING, zigzag_encode};
+
+        // Simulate issued_at column: most docs have timestamps, some are missing
+        let timestamps: Vec<i64> = vec![
+            1724630400, // 2024-08-26
+            1724716800, // 2024-08-27
+            1724803200, // 2024-08-28
+            1700000000, // 2023-11-14
+            1680000000, // 2023-03-28
+            1724630400, // duplicate
+        ];
+
+        // Build values array: zigzag-encoded timestamps + some FAST_FIELD_MISSING gaps
+        let mut values = Vec::new();
+        for (i, &ts) in timestamps.iter().enumerate() {
+            values.push(zigzag_encode(ts));
+            // Insert a missing value after every 2nd doc
+            if i % 2 == 1 {
+                values.push(FAST_FIELD_MISSING);
+            }
+        }
+
+        let result = roundtrip(&values);
+        assert_eq!(
+            result, values,
+            "zigzag timestamps + missing roundtrip failed"
+        );
+    }
+
+    /// Test each codec individually with zigzag-encoded values + FAST_FIELD_MISSING
+    #[test]
+    fn test_codecs_individually_with_zigzag_and_missing() {
+        use super::super::{FAST_FIELD_MISSING, zigzag_encode};
+
+        let values: Vec<u64> = vec![
+            zigzag_encode(1724630400), // 3449260800
+            zigzag_encode(1700000000), // 3400000000
+            FAST_FIELD_MISSING,
+            zigzag_encode(1680000000), // 3360000000
+            zigzag_encode(1724716800), // 3449433600
+            FAST_FIELD_MISSING,
+            zigzag_encode(1724630400), // 3449260800
+            zigzag_encode(0),          // 0
+        ];
+
+        // Test bitpacked directly
+        {
+            let mut est = BitpackedEstimator::default();
+            for &v in &values {
+                est.collect(v);
+            }
+            est.finalize();
+            if est.estimate().is_some() {
+                let mut buf = Vec::new();
+                est.serialize(&values, &mut buf).unwrap();
+                for (i, &expected) in values.iter().enumerate() {
+                    let got = auto_read(&buf, i);
+                    assert_eq!(
+                        got, expected,
+                        "bitpacked: index {} expected {} got {}",
+                        i, expected, got
+                    );
+                }
+            }
+        }
+
+        // Test linear directly (needs ≥ 2 values)
+        {
+            let mut est = LinearEstimator::default();
+            for &v in &values {
+                est.collect(v);
+            }
+            est.finalize();
+            if est.estimate().is_some() {
+                let mut buf = Vec::new();
+                est.serialize(&values, &mut buf).unwrap();
+                for (i, &expected) in values.iter().enumerate() {
+                    let got = auto_read(&buf, i);
+                    assert_eq!(
+                        got, expected,
+                        "linear: index {} expected {} got {}",
+                        i, expected, got
+                    );
+                }
+            }
+        }
+
+        // Test auto (whichever is selected)
+        let result = roundtrip(&values);
+        assert_eq!(result, values, "auto codec roundtrip failed");
+    }
+
+    /// Regression: value that the user observed corrupted in production
+    #[test]
+    fn test_specific_issued_at_roundtrip() {
+        use super::super::{FAST_FIELD_MISSING, zigzag_encode};
+
+        // Reproduce exact scenario: 100 docs, mix of timestamps and missing
+        let mut values = Vec::new();
+        let base_ts = 1724630400i64; // 2024-08-26 epoch
+        for i in 0..100u64 {
+            if i % 5 == 0 {
+                // Every 5th doc has no issued_at
+                values.push(FAST_FIELD_MISSING);
+            } else {
+                // Varying timestamps
+                let ts = base_ts - (i as i64 * 86400); // one day apart
+                values.push(zigzag_encode(ts));
+            }
+        }
+
+        let result = roundtrip(&values);
+        for (i, (&expected, &got)) in values.iter().zip(result.iter()).enumerate() {
+            assert_eq!(
+                got,
+                expected,
+                "doc {}: expected {} (zigzag of {}), got {}",
+                i,
+                expected,
+                if expected == FAST_FIELD_MISSING {
+                    -1 // placeholder
+                } else {
+                    super::super::zigzag_decode(expected)
+                },
+                got
+            );
+        }
+    }
+
+    /// Large-scale test: exercise blockwise linear codec with realistic timestamp data.
+    /// Tests 10K, 50K, 100K docs to catch codec edge cases.
+    #[test]
+    fn test_large_scale_timestamp_roundtrip() {
+        use super::super::{FAST_FIELD_MISSING, zigzag_encode};
+
+        for num_docs in [10_000, 50_000, 100_000] {
+            let mut values = Vec::with_capacity(num_docs);
+            let base_ts = 1724630400i64;
+
+            for i in 0..num_docs {
+                if i % 7 == 0 {
+                    values.push(FAST_FIELD_MISSING);
+                } else {
+                    // Timestamps spanning ~5 years, with some jitter
+                    let ts = base_ts - (i as i64 * 3600) + ((i as i64 * 37) % 1000);
+                    values.push(zigzag_encode(ts));
+                }
+            }
+
+            // Check which codec is selected
+            let mut buf = Vec::new();
+            serialize_auto(&values, &mut buf).unwrap();
+            let codec_id = buf[0];
+            let codec_name = match CodecType::from_u8(codec_id) {
+                Some(CodecType::Constant) => "constant",
+                Some(CodecType::Bitpacked) => "bitpacked",
+                Some(CodecType::Linear) => "linear",
+                Some(CodecType::BlockwiseLinear) => "blockwise_linear",
+                None => "unknown",
+            };
+
+            // Verify roundtrip
+            let mut failures = Vec::new();
+            for (i, &expected) in values.iter().enumerate() {
+                let got = auto_read(&buf, i);
+                if got != expected {
+                    failures.push((i, expected, got));
+                    if failures.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+
+            assert!(
+                failures.is_empty(),
+                "num_docs={}, codec={}: {} failures. First 5: {:?}",
+                num_docs,
+                codec_name,
+                failures.len(),
+                failures
+            );
+        }
+    }
+
+    /// Regression: blockwise linear codec selected for column where most blocks
+    /// are efficient (sorted timestamps only) but a few blocks contain
+    /// FAST_FIELD_MISSING, causing min_residual clamping corruption.
+    #[test]
+    fn test_blockwise_linear_with_clustered_missing() {
+        use super::super::{FAST_FIELD_MISSING, zigzag_encode};
+
+        // 3000 values: first 512 are all FAST_FIELD_MISSING,
+        // remaining 2488 are sorted timestamps (efficient linear blocks).
+        // This should trigger blockwise linear selection overall,
+        // but the first block has a mix that triggers the bug.
+        let mut values = Vec::new();
+
+        // Block 0 (indices 0-511): mix of MISSING and timestamps
+        // — first 100 are MISSING, rest are timestamps
+        for i in 0..512 {
+            if i < 100 {
+                values.push(FAST_FIELD_MISSING);
+            } else {
+                let ts = 1724630400i64 + (i as i64 * 100);
+                values.push(zigzag_encode(ts));
+            }
+        }
+
+        // Blocks 1-5 (indices 512-3071): sorted timestamps only
+        for i in 512..3072 {
+            let ts = 1724630400i64 + (i as i64 * 100);
+            values.push(zigzag_encode(ts));
+        }
+
+        let result = roundtrip(&values);
+        let mut failures = Vec::new();
+        for (i, (&expected, &got)) in values.iter().zip(result.iter()).enumerate() {
+            if got != expected {
+                failures.push((i, expected, got));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "blockwise linear with clustered missing: {} failures. First 5: {:?}",
+            failures.len(),
+            &failures[..failures.len().min(5)]
+        );
+    }
+
+    /// Test each codec FORCED with zigzag timestamps + FAST_FIELD_MISSING.
+    /// This catches bugs that only manifest when a specific codec is forced.
+    #[test]
+    fn test_forced_codecs_with_timestamps_and_missing() {
+        use super::super::{FAST_FIELD_MISSING, zigzag_encode};
+
+        let mut values = Vec::new();
+        let base_ts = 1724630400i64;
+        for i in 0..200 {
+            if i % 5 == 0 {
+                values.push(FAST_FIELD_MISSING);
+            } else {
+                let ts = base_ts - (i as i64 * 86400);
+                values.push(zigzag_encode(ts));
+            }
+        }
+
+        // Force bitpacked
+        {
+            let est = BitpackedEstimator::default();
+            let mut buf = Vec::new();
+            est.serialize(&values, &mut buf).unwrap();
+            for (i, &expected) in values.iter().enumerate() {
+                let got = bitpacked_read(&buf[1..], i); // skip codec_id byte
+                assert_eq!(got, expected, "forced bitpacked: index {} failed", i);
+            }
+        }
+
+        // Force linear — should error because FAST_FIELD_MISSING + timestamps
+        // produce residuals exceeding i64 range
+        {
+            let est = LinearEstimator::default();
+            let mut buf = Vec::new();
+            let result = est.serialize(&values, &mut buf);
+            assert!(
+                result.is_err(),
+                "linear codec should reject data with residuals exceeding i64"
+            );
+        }
+
+        // Force linear with values that DO fit in i64 (no FAST_FIELD_MISSING)
+        {
+            let safe_values: Vec<u64> = values
+                .iter()
+                .filter(|&&v| v != FAST_FIELD_MISSING)
+                .copied()
+                .collect();
+            let est = LinearEstimator::default();
+            let mut buf = Vec::new();
+            est.serialize(&safe_values, &mut buf).unwrap();
+            for (i, &expected) in safe_values.iter().enumerate() {
+                let got = linear_read(&buf[1..], i);
+                assert_eq!(got, expected, "forced linear (safe): index {} failed", i);
+            }
+        }
+
+        // Blockwise linear estimator should return None for data with FAST_FIELD_MISSING
+        {
+            let mut large_values = Vec::new();
+            for i in 0..2000 {
+                if i % 5 == 0 {
+                    large_values.push(FAST_FIELD_MISSING);
+                } else {
+                    let ts = base_ts - (i as i64 * 86400);
+                    large_values.push(zigzag_encode(ts));
+                }
+            }
+            let mut est = BlockwiseLinearEstimator::default();
+            for &v in &large_values {
+                est.collect(v);
+            }
+            assert!(
+                est.estimate().is_none(),
+                "blockwise linear should reject data with per-block residuals exceeding i64"
+            );
+        }
     }
 }
