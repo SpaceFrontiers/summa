@@ -624,12 +624,14 @@ const GRID_ENTRY_DISK_SIZE: usize = 9;
 ///
 /// Each run file contains `(dim_id, block_id, max_impact)` triples sorted by
 /// `(dim_id, block_id)`. Entries are 9 bytes each on disk.
+#[cfg(feature = "native")]
 pub(crate) struct GridRunReader {
     reader: std::io::BufReader<std::fs::File>,
     /// Peeked current entry (None when exhausted).
     pub current: Option<(u32, u32, u8)>,
 }
 
+#[cfg(feature = "native")]
 impl GridRunReader {
     /// Open a run file and read the first entry.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
@@ -675,6 +677,7 @@ impl GridRunReader {
 /// Write sorted grid entries to a run file on disk.
 ///
 /// Entries must already be sorted by `(dim_id, block_id)`.
+#[cfg(feature = "native")]
 pub(crate) fn write_grid_run(
     entries: &[(u32, u32, u8)],
     path: &std::path::Path,
@@ -702,6 +705,7 @@ pub(crate) fn write_grid_run(
 /// we drain matching entries from all readers. No heap needed.
 ///
 /// Returns `(packed_grid_bytes, sb_grid_bytes)`.
+#[cfg(feature = "native")]
 pub(crate) fn stream_write_grids_merged(
     run_readers: &mut [GridRunReader],
     num_dims: usize,

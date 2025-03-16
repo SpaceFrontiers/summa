@@ -51,7 +51,7 @@ pub type DefaultDirectory = MmapDirectory;
 
 // Re-exports from segment
 pub use segment::{AsyncStoreReader, FieldStats, SegmentId, SegmentMeta, SegmentReader};
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 
 // Re-exports from query

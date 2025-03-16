@@ -8,6 +8,7 @@
 //!
 //! Memory: forward index ~200 bytes/doc (temporary) + degree arrays ~840 KB.
 
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -386,10 +387,16 @@ fn bisect(
     drop(new_right);
 
     let (left, right) = docs.split_at_mut(mid);
+    #[cfg(feature = "native")]
     rayon::join(
         || bisect(left, fwd, min_partition_size, max_iters, log_table),
         || bisect(right, fwd, min_partition_size, max_iters, log_table),
     );
+    #[cfg(not(feature = "native"))]
+    {
+        bisect(left, fwd, min_partition_size, max_iters, log_table);
+        bisect(right, fwd, min_partition_size, max_iters, log_table);
+    }
 }
 
 /// Compute gains for all documents, parallelized via rayon for large partitions.
@@ -425,12 +432,21 @@ fn compute_gains(
         g
     };
 
-    if docs.len() > 4096 {
-        gains
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, gain)| *gain = gain_for_doc(i));
-    } else {
+    #[cfg(feature = "native")]
+    {
+        if docs.len() > 4096 {
+            gains
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, gain)| *gain = gain_for_doc(i));
+        } else {
+            for (i, gain) in gains.iter_mut().enumerate().take(docs.len()) {
+                *gain = gain_for_doc(i);
+            }
+        }
+    }
+    #[cfg(not(feature = "native"))]
+    {
         for (i, gain) in gains.iter_mut().enumerate().take(docs.len()) {
             *gain = gain_for_doc(i);
         }

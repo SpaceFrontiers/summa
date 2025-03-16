@@ -8,9 +8,15 @@ use std::io::Write;
 use std::mem::size_of;
 
 use hashbrown::HashMap;
-use lasso::{Rodeo, Spur};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+
+#[cfg(not(feature = "native"))]
+use super::simple_interner::{Rodeo, Spur};
+#[cfg(feature = "native")]
+use lasso::{Rodeo, Spur};
+
+#[cfg(feature = "native")]
+use rayon::prelude::*;
 
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
 use crate::{DocId, Result};
@@ -132,47 +138,59 @@ pub(super) fn build_postings_streaming(
 
     drop(term_interner);
 
+    #[cfg(feature = "native")]
     term_entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    #[cfg(not(feature = "native"))]
+    term_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    // Phase 2: Parallel serialization
+    // Phase 2: Parallel serialization (native: rayon, WASM: sequential)
     // For inline-eligible terms (no positions, few postings), extract doc_ids/tfs
     // directly from CompactPosting without creating an intermediate PostingList.
+    let serialize_fn = |(key, posting_builder): (Vec<u8>, PostingListBuilder)| -> Result<(Vec<u8>, SerializedPosting)> {
+        let has_positions = position_offsets.contains_key(&key);
+
+        // Fast path: try inline first (avoids PostingList + BlockPostingList allocs)
+        // Uses try_inline_iter to avoid allocating two Vec<u32> per term.
+        if !has_positions
+            && let Some(inline) = TermInfo::try_inline_iter(
+                posting_builder.postings.len(),
+                posting_builder
+                    .postings
+                    .iter()
+                    .map(|p| (p.doc_id, p.term_freq as u32)),
+            )
+        {
+            return Ok((key, SerializedPosting::Inline(inline)));
+        }
+
+        // Slow path: build full PostingList → BlockPostingList → serialize
+        let mut full_postings = PostingList::with_capacity(posting_builder.len());
+        for p in &posting_builder.postings {
+            full_postings.push(p.doc_id, p.term_freq as u32);
+        }
+
+        let mut posting_bytes = Vec::new();
+        let block_list =
+            crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
+        block_list.serialize(&mut posting_bytes)?;
+        let result = SerializedPosting::External {
+            bytes: posting_bytes,
+            doc_count: full_postings.doc_count(),
+        };
+
+        Ok((key, result))
+    };
+
+    #[cfg(feature = "native")]
     let serialized: Vec<(Vec<u8>, SerializedPosting)> = term_entries
         .into_par_iter()
-        .map(|(key, posting_builder)| {
-            let has_positions = position_offsets.contains_key(&key);
+        .map(serialize_fn)
+        .collect::<Result<Vec<_>>>()?;
 
-            // Fast path: try inline first (avoids PostingList + BlockPostingList allocs)
-            // Uses try_inline_iter to avoid allocating two Vec<u32> per term.
-            if !has_positions
-                && let Some(inline) = TermInfo::try_inline_iter(
-                    posting_builder.postings.len(),
-                    posting_builder
-                        .postings
-                        .iter()
-                        .map(|p| (p.doc_id, p.term_freq as u32)),
-                )
-            {
-                return Ok((key, SerializedPosting::Inline(inline)));
-            }
-
-            // Slow path: build full PostingList → BlockPostingList → serialize
-            let mut full_postings = PostingList::with_capacity(posting_builder.len());
-            for p in &posting_builder.postings {
-                full_postings.push(p.doc_id, p.term_freq as u32);
-            }
-
-            let mut posting_bytes = Vec::new();
-            let block_list =
-                crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
-            block_list.serialize(&mut posting_bytes)?;
-            let result = SerializedPosting::External {
-                bytes: posting_bytes,
-                doc_count: full_postings.doc_count(),
-            };
-
-            Ok((key, result))
-        })
+    #[cfg(not(feature = "native"))]
+    let serialized: Vec<(Vec<u8>, SerializedPosting)> = term_entries
+        .into_iter()
+        .map(serialize_fn)
         .collect::<Result<Vec<_>>>()?;
 
     // Phase 3: Stream directly to writers (no intermediate Vec<u8> accumulation)

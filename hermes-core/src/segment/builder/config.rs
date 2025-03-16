@@ -62,9 +62,15 @@ pub struct SegmentBuilderConfig {
 impl Default for SegmentBuilderConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "native")]
             temp_dir: std::env::temp_dir(),
+            #[cfg(not(feature = "native"))]
+            temp_dir: PathBuf::from("/tmp"),
             compression_level: CompressionLevel(3),
+            #[cfg(feature = "native")]
             num_compression_threads: crate::default_compression_threads(),
+            #[cfg(not(feature = "native"))]
+            num_compression_threads: 1,
             interner_capacity: 1_000_000,
             posting_map_capacity: 500_000,
         }

@@ -5,6 +5,7 @@
 
 use std::io::Write;
 
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -146,12 +147,11 @@ pub(super) fn build_vectors_streaming(
     let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(fields.len() * 2);
     let mut current_offset = 0u64;
 
-    // Pre-build ANN indexes in parallel across fields.
+    // Pre-build ANN indexes across fields (native: parallel via rayon, WASM: sequential).
     // Each field's ANN build is independent (different vectors, different centroids).
     let ann_blobs: Vec<(u32, u8, Vec<u8>)> = if let Some(trained) = trained {
-        fields
-            .par_iter()
-            .filter_map(|(field_id, builder)| {
+        let ann_blob_fn =
+            |(field_id, builder): &(u32, DenseVectorBuilder)| -> Option<(u32, u8, Vec<u8>)> {
                 let config = schema
                     .get_field_entry(Field(*field_id))
                     .and_then(|e| e.dense_vector_config.as_ref())?;
@@ -206,8 +206,16 @@ pub(super) fn build_vectors_streaming(
                         None
                     }
                 }
-            })
-            .collect()
+            };
+
+        #[cfg(feature = "native")]
+        {
+            fields.par_iter().filter_map(ann_blob_fn).collect()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            fields.iter().filter_map(ann_blob_fn).collect()
+        }
     } else {
         Vec::new()
     };

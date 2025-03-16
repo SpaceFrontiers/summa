@@ -1,5 +1,5 @@
 pub(crate) mod ann_build;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 mod builder;
 pub(crate) mod format;
 #[cfg(feature = "native")]
@@ -13,7 +13,7 @@ mod tracker;
 mod types;
 mod vector_data;
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
@@ -33,7 +33,7 @@ pub use vector_data::{
 };
 
 /// Format byte count as human-readable string
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 pub(crate) fn format_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -50,13 +50,13 @@ pub(crate) fn format_bytes(bytes: usize) -> String {
 ///
 /// Concrete type so it works with generic `serialize<W: Write>` functions
 /// (unlike `dyn StreamingWriter` which isn't `Sized`).
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 pub(crate) struct OffsetWriter {
     inner: Box<dyn crate::directories::StreamingWriter>,
     offset: u64,
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 impl OffsetWriter {
     pub(crate) fn new(inner: Box<dyn crate::directories::StreamingWriter>) -> Self {
         Self { inner, offset: 0 }
@@ -73,7 +73,7 @@ impl OffsetWriter {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 impl std::io::Write for OffsetWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;

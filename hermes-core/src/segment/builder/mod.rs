@@ -20,14 +20,68 @@ mod store;
 
 pub use config::{MemoryBreakdown, SegmentBuilderConfig, SegmentBuilderStats};
 
+#[cfg(feature = "native")]
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+#[cfg(feature = "native")]
+use std::io::BufWriter;
+use std::io::Write;
 use std::mem::size_of;
+#[cfg(feature = "native")]
 use std::path::PathBuf;
 
 use hashbrown::HashMap;
-use lasso::{Rodeo, Spur};
 use rustc_hash::FxHashMap;
+
+// String interning: lasso on native (fast arena), HashMap on WASM (no C deps)
+#[cfg(feature = "native")]
+use lasso::{Rodeo, Spur};
+
+#[cfg(not(feature = "native"))]
+pub(crate) mod simple_interner {
+    use hashbrown::HashMap;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Spur(u32);
+
+    pub struct Rodeo {
+        map: HashMap<String, u32>,
+        strings: Vec<String>,
+    }
+
+    impl Rodeo {
+        pub fn new() -> Self {
+            Self {
+                map: HashMap::new(),
+                strings: Vec::new(),
+            }
+        }
+
+        pub fn get(&self, key: &str) -> Option<Spur> {
+            self.map.get(key).map(|&id| Spur(id))
+        }
+
+        pub fn get_or_intern(&mut self, key: &str) -> Spur {
+            if let Some(&id) = self.map.get(key) {
+                return Spur(id);
+            }
+            let id = self.strings.len() as u32;
+            self.strings.push(key.to_string());
+            self.map.insert(key.to_string(), id);
+            Spur(id)
+        }
+
+        pub fn resolve(&self, spur: &Spur) -> &str {
+            &self.strings[spur.0 as usize]
+        }
+
+        pub fn len(&self) -> usize {
+            self.strings.len()
+        }
+    }
+}
+
+#[cfg(not(feature = "native"))]
+use simple_interner::{Rodeo, Spur};
 
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use std::sync::Arc;
@@ -72,9 +126,13 @@ pub struct SegmentBuilder {
     /// Inverted index: term key -> posting list
     inverted_index: HashMap<TermKey, PostingListBuilder>,
 
-    /// Streaming document store writer
+    /// Streaming document store writer (native: temp file on disk, WASM: in-memory buffer)
+    #[cfg(feature = "native")]
     store_file: BufWriter<File>,
+    #[cfg(feature = "native")]
     store_path: PathBuf,
+    #[cfg(not(feature = "native"))]
+    store_buffer: Vec<u8>,
 
     /// Document count
     next_doc_id: DocId,
@@ -137,19 +195,22 @@ pub struct SegmentBuilder {
 impl SegmentBuilder {
     /// Create a new segment builder
     pub fn new(schema: Arc<Schema>, config: SegmentBuilderConfig) -> Result<Self> {
-        let segment_id = uuid::Uuid::new_v4();
-        let store_path = config
-            .temp_dir
-            .join(format!("hermes_store_{}.tmp", segment_id));
-
-        let store_file = BufWriter::with_capacity(
-            STORE_BUFFER_SIZE,
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&store_path)?,
-        );
+        #[cfg(feature = "native")]
+        let (store_file, store_path) = {
+            let segment_id = uuid::Uuid::new_v4();
+            let store_path = config
+                .temp_dir
+                .join(format!("hermes_store_{}.tmp", segment_id));
+            let store_file = BufWriter::with_capacity(
+                STORE_BUFFER_SIZE,
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&store_path)?,
+            );
+            (store_file, store_path)
+        };
 
         // Count indexed fields, track positions, and auto-configure tokenizers
         let registry = crate::tokenizer::TokenizerRegistry::new();
@@ -209,8 +270,12 @@ impl SegmentBuilder {
             tokenizers,
             term_interner: Rodeo::new(),
             inverted_index: HashMap::with_capacity(config.posting_map_capacity),
+            #[cfg(feature = "native")]
             store_file,
+            #[cfg(feature = "native")]
             store_path,
+            #[cfg(not(feature = "native"))]
+            store_buffer: Vec::with_capacity(STORE_BUFFER_SIZE),
             next_doc_id: 0,
             field_stats: FxHashMap::default(),
             doc_field_lengths: Vec::new(),
@@ -272,7 +337,7 @@ impl SegmentBuilder {
         let vec_overhead = size_of::<Vec<u8>>(); // Vec header: ptr + len + cap = 24 bytes on 64-bit
         let term_key_size = size_of::<TermKey>();
         let posting_builder_size = size_of::<PostingListBuilder>();
-        let spur_size = size_of::<lasso::Spur>();
+        let spur_size = size_of::<Spur>();
         let sparse_entry_size = size_of::<(DocId, u16, f32)>();
 
         // hashbrown HashMap entry overhead: key + value + 1 byte control + padding
@@ -797,9 +862,18 @@ impl SegmentBuilder {
 
         super::store::serialize_document_into(doc, &self.schema, &mut self.doc_serialize_buffer)?;
 
-        self.store_file
-            .write_u32::<LittleEndian>(self.doc_serialize_buffer.len() as u32)?;
-        self.store_file.write_all(&self.doc_serialize_buffer)?;
+        #[cfg(feature = "native")]
+        {
+            self.store_file
+                .write_u32::<LittleEndian>(self.doc_serialize_buffer.len() as u32)?;
+            self.store_file.write_all(&self.doc_serialize_buffer)?;
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.store_buffer
+                .write_u32::<LittleEndian>(self.doc_serialize_buffer.len() as u32)?;
+            self.store_buffer.write_all(&self.doc_serialize_buffer)?;
+        }
 
         Ok(())
     }
@@ -816,6 +890,7 @@ impl SegmentBuilder {
         trained: Option<&super::TrainedVectorStructures>,
     ) -> Result<SegmentMeta> {
         // Flush any buffered data
+        #[cfg(feature = "native")]
         self.store_file.flush()?;
 
         let files = SegmentFiles::new(segment_id.0);
@@ -839,7 +914,9 @@ impl SegmentBuilder {
         // These are fully independent: different source data, different output files.
         let inverted_index = std::mem::take(&mut self.inverted_index);
         let term_interner = std::mem::replace(&mut self.term_interner, Rodeo::new());
+        #[cfg(feature = "native")]
         let store_path = self.store_path.clone();
+        #[cfg(feature = "native")]
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
@@ -878,72 +955,107 @@ impl SegmentBuilder {
             None
         };
 
-        let ((postings_result, store_result), ((vectors_result, sparse_result), fast_result)) =
-            rayon::join(
-                || {
-                    rayon::join(
-                        || {
-                            postings::build_postings_streaming(
-                                inverted_index,
-                                term_interner,
-                                &position_offsets,
-                                &mut term_dict_writer,
-                                &mut postings_writer,
-                            )
-                        },
-                        || {
-                            store::build_store_streaming(
-                                &store_path,
-                                num_compression_threads,
-                                compression_level,
-                                &mut store_writer,
-                                num_docs,
-                            )
-                        },
-                    )
-                },
-                || {
-                    rayon::join(
-                        || {
-                            rayon::join(
-                                || -> Result<()> {
-                                    if let Some(ref mut w) = vectors_writer {
-                                        dense::build_vectors_streaming(
-                                            dense_vectors,
-                                            binary_dense_vectors,
-                                            schema,
-                                            trained,
-                                            w,
-                                        )?;
-                                    }
-                                    Ok(())
-                                },
-                                || -> Result<()> {
-                                    if let Some(ref mut w) = sparse_writer {
-                                        sparse::build_sparse_streaming(
-                                            &mut sparse_vectors,
-                                            schema,
-                                            w,
-                                        )?;
-                                    }
-                                    Ok(())
-                                },
-                            )
-                        },
-                        || -> Result<()> {
-                            if let Some(ref mut w) = fast_writer {
-                                build_fast_fields_streaming(&mut fast_fields, num_docs, w)?;
-                            }
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        postings_result?;
-        store_result?;
-        vectors_result?;
-        sparse_result?;
-        fast_result?;
+        #[cfg(feature = "native")]
+        {
+            let ((postings_result, store_result), ((vectors_result, sparse_result), fast_result)) =
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || {
+                                postings::build_postings_streaming(
+                                    inverted_index,
+                                    term_interner,
+                                    &position_offsets,
+                                    &mut term_dict_writer,
+                                    &mut postings_writer,
+                                )
+                            },
+                            || {
+                                store::build_store_streaming(
+                                    &store_path,
+                                    num_compression_threads,
+                                    compression_level,
+                                    &mut store_writer,
+                                    num_docs,
+                                )
+                            },
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                rayon::join(
+                                    || -> Result<()> {
+                                        if let Some(ref mut w) = vectors_writer {
+                                            dense::build_vectors_streaming(
+                                                dense_vectors,
+                                                binary_dense_vectors,
+                                                schema,
+                                                trained,
+                                                w,
+                                            )?;
+                                        }
+                                        Ok(())
+                                    },
+                                    || -> Result<()> {
+                                        if let Some(ref mut w) = sparse_writer {
+                                            sparse::build_sparse_streaming(
+                                                &mut sparse_vectors,
+                                                schema,
+                                                w,
+                                            )?;
+                                        }
+                                        Ok(())
+                                    },
+                                )
+                            },
+                            || -> Result<()> {
+                                if let Some(ref mut w) = fast_writer {
+                                    build_fast_fields_streaming(&mut fast_fields, num_docs, w)?;
+                                }
+                                Ok(())
+                            },
+                        )
+                    },
+                );
+            postings_result?;
+            store_result?;
+            vectors_result?;
+            sparse_result?;
+            fast_result?;
+        }
+
+        #[cfg(not(feature = "native"))]
+        {
+            postings::build_postings_streaming(
+                inverted_index,
+                term_interner,
+                &position_offsets,
+                &mut term_dict_writer,
+                &mut postings_writer,
+            )?;
+            store::build_store_streaming_from_buffer(
+                &self.store_buffer,
+                compression_level,
+                &mut store_writer,
+                num_docs,
+            )?;
+            if let Some(ref mut w) = vectors_writer {
+                dense::build_vectors_streaming(
+                    dense_vectors,
+                    binary_dense_vectors,
+                    schema,
+                    trained,
+                    w,
+                )?;
+            }
+            if let Some(ref mut w) = sparse_writer {
+                sparse::build_sparse_streaming(&mut sparse_vectors, schema, w)?;
+            }
+            if let Some(ref mut w) = fast_writer {
+                build_fast_fields_streaming(&mut fast_fields, num_docs, w)?;
+            }
+        }
 
         let term_dict_bytes = term_dict_writer.offset() as usize;
         let postings_bytes = postings_writer.offset() as usize;
@@ -987,7 +1099,10 @@ impl SegmentBuilder {
         dir.write(&files.meta, &meta.serialize()?).await?;
 
         // Cleanup temp files
-        let _ = std::fs::remove_file(&self.store_path);
+        #[cfg(feature = "native")]
+        {
+            let _ = std::fs::remove_file(&self.store_path);
+        }
 
         Ok(meta)
     }
@@ -1029,6 +1144,7 @@ fn build_fast_fields_streaming(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 impl Drop for SegmentBuilder {
     fn drop(&mut self) {
         // Cleanup temp files on drop

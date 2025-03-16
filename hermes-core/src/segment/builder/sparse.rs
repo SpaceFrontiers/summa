@@ -9,6 +9,7 @@
 
 use std::io::Write;
 
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -203,61 +204,71 @@ fn build_maxscore_field(
     all_skip_entries: &mut Vec<SparseSkipEntry>,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    // Parallel: sort + prune + serialize each dimension independently
+    // Sort + prune + serialize each dimension independently
+    // (native: parallel via rayon, WASM: sequential)
     let mut dims: Vec<_> = std::mem::take(&mut builder.postings).into_iter().collect();
     dims.sort_unstable_by_key(|(id, _)| *id);
 
+    let serialize_dim = |(dim_id, mut postings): (u32, Vec<(DocId, u16, f32)>)| -> Result<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> {
+        // Filter by weight threshold (same as BMP path)
+        // Skip filtering when the dimension has fewer than min_terms postings
+        if weight_threshold > 0.0 && postings.len() >= min_terms {
+            postings.retain(|(_, _, w)| w.abs() >= weight_threshold);
+        }
+        if postings.is_empty() {
+            return Ok((dim_id, 0, Vec::new(), Vec::new()));
+        }
+
+        let pruned = if let Some(fraction) = pruning_fraction
+            && postings.len() >= min_terms
+            && fraction < 1.0
+        {
+            let original_len = postings.len();
+            postings.sort_unstable_by(|a, b| {
+                b.2.abs()
+                    .partial_cmp(&a.2.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
+            postings.truncate(keep);
+            true
+        } else {
+            false
+        };
+        // Postings arrive in (doc_id, ordinal) order from sequential indexing;
+        // only re-sort if pruning destroyed that order.
+        if pruned {
+            postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
+        }
+
+        let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
+        let partition = optimal_partition(&weights);
+        let block_list = BlockSparsePostingList::from_postings_with_partition(
+            &postings,
+            quantization,
+            &partition,
+        )
+        .map_err(crate::Error::Io)?;
+
+        let doc_count = block_list.doc_count;
+        let (block_data, skip_entries) = block_list.serialize().map_err(crate::Error::Io)?;
+
+        #[cfg(feature = "diagnostics")]
+        super::diagnostics::validate_serialized_blocks(dim_id, &block_data, &skip_entries)?;
+
+        Ok((dim_id, doc_count, block_data, skip_entries))
+    };
+
+    #[cfg(feature = "native")]
     let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
         .into_par_iter()
-        .map(|(dim_id, mut postings)| {
-            // Filter by weight threshold (same as BMP path)
-            // Skip filtering when the dimension has fewer than min_terms postings
-            if weight_threshold > 0.0 && postings.len() >= min_terms {
-                postings.retain(|(_, _, w)| w.abs() >= weight_threshold);
-            }
-            if postings.is_empty() {
-                return Ok((dim_id, 0, Vec::new(), Vec::new()));
-            }
+        .map(serialize_dim)
+        .collect::<Result<Vec<_>>>()?;
 
-            let pruned = if let Some(fraction) = pruning_fraction
-                && postings.len() >= min_terms
-                && fraction < 1.0
-            {
-                let original_len = postings.len();
-                postings.sort_unstable_by(|a, b| {
-                    b.2.abs()
-                        .partial_cmp(&a.2.abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
-                postings.truncate(keep);
-                true
-            } else {
-                false
-            };
-            // Postings arrive in (doc_id, ordinal) order from sequential indexing;
-            // only re-sort if pruning destroyed that order.
-            if pruned {
-                postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
-            }
-
-            let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
-            let partition = optimal_partition(&weights);
-            let block_list = BlockSparsePostingList::from_postings_with_partition(
-                &postings,
-                quantization,
-                &partition,
-            )
-            .map_err(crate::Error::Io)?;
-
-            let doc_count = block_list.doc_count;
-            let (block_data, skip_entries) = block_list.serialize().map_err(crate::Error::Io)?;
-
-            #[cfg(feature = "diagnostics")]
-            super::diagnostics::validate_serialized_blocks(dim_id, &block_data, &skip_entries)?;
-
-            Ok((dim_id, doc_count, block_data, skip_entries))
-        })
+    #[cfg(not(feature = "native"))]
+    let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
+        .into_iter()
+        .map(serialize_dim)
         .collect::<Result<Vec<_>>>()?;
 
     // Phase 1: Write block data sequentially, accumulate skip entries
