@@ -6,10 +6,12 @@
 use std::sync::Arc;
 
 use hermes_core::directories::RamDirectory;
-use hermes_core::dsl::Schema;
-use hermes_core::{IndexConfig, IndexMetadata, Searcher, WasmIndexWriter};
+use hermes_core::{IndexConfig, Searcher, WasmIndexWriter};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
+
+/// Default term cache blocks for WASM searcher.
+const WASM_TERM_CACHE_BLOCKS: usize = 32;
 
 /// In-browser local index — create, index documents, search, all in WASM.
 ///
@@ -23,8 +25,6 @@ use wasm_bindgen::prelude::*;
 pub struct LocalIndex {
     writer: Option<WasmIndexWriter<RamDirectory>>,
     searcher: Option<Searcher<RamDirectory>>,
-    directory: Arc<RamDirectory>,
-    schema: Arc<Schema>,
 }
 
 #[wasm_bindgen]
@@ -44,13 +44,11 @@ impl LocalIndex {
             ..IndexConfig::default()
         };
 
-        let writer = WasmIndexWriter::create(dir.clone(), schema.clone(), config)
+        let writer = WasmIndexWriter::create(dir, schema, config)
             .await
             .map_err(|e| JsValue::from_str(&format!("Create error: {}", e)))?;
 
         Ok(LocalIndex {
-            schema: Arc::new(schema),
-            directory: Arc::new(dir),
             writer: Some(writer),
             searcher: None,
         })
@@ -67,8 +65,8 @@ impl LocalIndex {
         let json_value: serde_json::Value = serde_wasm_bindgen::from_value(doc_json)
             .map_err(|e| JsValue::from_str(&format!("JSON parse error: {}", e)))?;
 
-        let doc = json_to_document(&json_value, &self.schema)
-            .map_err(|e| JsValue::from_str(&format!("Document error: {}", e)))?;
+        let doc = hermes_core::Document::from_json(&json_value, writer.schema())
+            .ok_or_else(|| JsValue::from_str("Failed to parse document from JSON"))?;
 
         writer
             .add_document(doc)
@@ -87,10 +85,11 @@ impl LocalIndex {
         let json_array: Vec<serde_json::Value> = serde_wasm_bindgen::from_value(docs_json)
             .map_err(|e| JsValue::from_str(&format!("JSON parse error: {}", e)))?;
 
+        let schema = writer.schema().clone();
         let mut count = 0u32;
         for json_value in &json_array {
-            let doc = json_to_document(json_value, &self.schema)
-                .map_err(|e| JsValue::from_str(&format!("Document error: {}", e)))?;
+            let doc = hermes_core::Document::from_json(json_value, &schema)
+                .ok_or_else(|| JsValue::from_str("Failed to parse document from JSON"))?;
             writer
                 .add_document(doc)
                 .await
@@ -116,7 +115,6 @@ impl LocalIndex {
             .map_err(|e| JsValue::from_str(&format!("Commit error: {}", e)))?;
 
         if committed {
-            // Refresh searcher to pick up new segments
             self.refresh_searcher().await?;
         }
 
@@ -196,23 +194,30 @@ impl LocalIndex {
     /// Get field names from the schema.
     #[wasm_bindgen(js_name = "fieldNames")]
     pub fn field_names(&self) -> JsValue {
-        let names: Vec<String> = self.schema.fields().map(|(_, f)| f.name.clone()).collect();
+        let names: Vec<String> = self
+            .writer
+            .as_ref()
+            .map(|w| w.schema().fields().map(|(_, f)| f.name.clone()).collect())
+            .unwrap_or_default();
         serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
     }
 
     /// Refresh the internal searcher to reflect committed segments.
     async fn refresh_searcher(&mut self) -> Result<(), JsValue> {
-        let metadata = IndexMetadata::load(self.directory.as_ref())
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Metadata load error: {}", e)))?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not writable"))?;
 
+        let metadata = writer.metadata();
         let segment_ids = metadata.segment_ids();
+        let schema = Arc::new(writer.schema().clone());
 
         let searcher = Searcher::open(
-            Arc::clone(&self.directory),
-            Arc::clone(&self.schema),
+            writer.directory().clone(),
+            schema,
             &segment_ids,
-            32,
+            WASM_TERM_CACHE_BLOCKS,
         )
         .await
         .map_err(|e| JsValue::from_str(&format!("Searcher open error: {}", e)))?;
@@ -220,55 +225,4 @@ impl LocalIndex {
         self.searcher = Some(searcher);
         Ok(())
     }
-}
-
-/// Convert a JSON value to a hermes Document using the schema.
-fn json_to_document(
-    json: &serde_json::Value,
-    schema: &Schema,
-) -> std::result::Result<hermes_core::Document, String> {
-    let obj = json.as_object().ok_or("Document must be a JSON object")?;
-
-    let mut doc = hermes_core::Document::new();
-
-    for (key, value) in obj {
-        let field = schema
-            .get_field(key)
-            .ok_or_else(|| format!("Unknown field: {}", key))?;
-        let entry = schema
-            .get_field_entry(field)
-            .ok_or_else(|| format!("No field entry for: {}", key))?;
-
-        match entry.field_type {
-            hermes_core::FieldType::Text => {
-                if let Some(text) = value.as_str() {
-                    doc.add_text(field, text);
-                } else if let Some(arr) = value.as_array() {
-                    for v in arr {
-                        if let Some(text) = v.as_str() {
-                            doc.add_text(field, text);
-                        }
-                    }
-                }
-            }
-            hermes_core::FieldType::U64 => {
-                if let Some(n) = value.as_u64() {
-                    doc.add_u64(field, n);
-                }
-            }
-            hermes_core::FieldType::I64 => {
-                if let Some(n) = value.as_i64() {
-                    doc.add_i64(field, n);
-                }
-            }
-            hermes_core::FieldType::F64 => {
-                if let Some(n) = value.as_f64() {
-                    doc.add_f64(field, n);
-                }
-            }
-            _ => {} // Skip unsupported types for now
-        }
-    }
-
-    Ok(doc)
 }

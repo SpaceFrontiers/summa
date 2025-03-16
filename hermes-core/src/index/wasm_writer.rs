@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 
 use crate::directories::DirectoryWriter;
 use crate::dsl::{Document, Field, FieldType, Schema};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::IndexMetadata;
 use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
 use crate::tokenizer::BoxedTokenizer;
@@ -29,6 +29,9 @@ use super::IndexConfig;
 /// Default memory budget for WASM (32 MB — conservative for browser).
 const DEFAULT_WASM_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
 
+/// Minimum docs before auto-flush (avoids tiny segments).
+const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
+
 /// Single-threaded IndexWriter for WASM targets.
 ///
 /// Documents are buffered in a `SegmentBuilder` and flushed to segments
@@ -36,10 +39,11 @@ const DEFAULT_WASM_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
 pub struct IndexWriter<D: DirectoryWriter + 'static> {
     directory: Arc<D>,
     schema: Arc<Schema>,
-    config: IndexConfig,
     builder_config: SegmentBuilderConfig,
     builder: Option<SegmentBuilder>,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
+    /// In-memory metadata — avoids reload from directory on commit.
+    metadata: IndexMetadata,
     /// Segments built but not yet committed to metadata
     pending_segments: Vec<(String, u32)>,
     /// Memory budget per builder (bytes)
@@ -69,6 +73,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             schema,
             config,
             builder_config,
+            metadata,
         ))
     }
 
@@ -84,14 +89,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
         let directory = Arc::new(directory);
-        let _metadata = IndexMetadata::load(directory.as_ref()).await?;
-        let schema = Arc::new(_metadata.schema.clone());
+        let metadata = IndexMetadata::load(directory.as_ref()).await?;
+        let schema = Arc::new(metadata.schema.clone());
 
         Ok(Self::new_with_parts(
             directory,
             schema,
             config,
             builder_config,
+            metadata,
         ))
     }
 
@@ -100,6 +106,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         schema: Arc<Schema>,
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
+        metadata: IndexMetadata,
     ) -> Self {
         let registry = crate::tokenizer::TokenizerRegistry::new();
         let mut tokenizers = FxHashMap::default();
@@ -119,10 +126,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Self {
             directory,
             schema,
-            config,
             builder_config,
             builder: None,
             tokenizers,
+            metadata,
             pending_segments: Vec::new(),
             memory_budget,
         }
@@ -131,6 +138,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Get the schema.
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Get the in-memory metadata (reflects latest commit).
+    pub fn metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
+
+    /// Get the directory.
+    pub fn directory(&self) -> &Arc<D> {
+        &self.directory
     }
 
     /// Set tokenizer for a field.
@@ -157,7 +174,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         // Check memory budget (with 20% headroom for build overhead)
         let effective_budget = self.memory_budget * 4 / 5;
-        if b.estimated_memory_bytes() >= effective_budget && b.num_docs() >= 100 {
+        if b.estimated_memory_bytes() >= effective_budget && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH {
             self.flush_builder().await?;
         }
 
@@ -201,31 +218,19 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///
     /// Returns `true` if new segments were committed.
     pub async fn commit(&mut self) -> Result<bool> {
-        // Flush current builder
         self.flush_builder().await?;
 
         if self.pending_segments.is_empty() {
             return Ok(false);
         }
 
-        // Load current metadata, add new segments, save
-        let mut metadata = IndexMetadata::load(self.directory.as_ref()).await?;
+        // Update in-memory metadata and save to directory
         for (seg_hex, num_docs) in self.pending_segments.drain(..) {
-            metadata.add_segment(seg_hex, num_docs);
+            self.metadata.add_segment(seg_hex, num_docs);
         }
-        metadata.save(self.directory.as_ref()).await?;
+        self.metadata.save(self.directory.as_ref()).await?;
 
         Ok(true)
-    }
-
-    /// Get the directory (for creating a Searcher after commit).
-    pub fn directory(&self) -> &Arc<D> {
-        &self.directory
-    }
-
-    /// Get the config.
-    pub fn config(&self) -> &IndexConfig {
-        &self.config
     }
 
     /// Number of documents in the current (uncommitted) builder.

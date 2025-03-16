@@ -43,16 +43,21 @@ pub(crate) mod simple_interner {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Spur(u32);
 
+    /// Simple string interner for WASM (replaces lasso::Rodeo).
+    /// Stores each string once in a Vec; HashMap maps &str → index.
     pub struct Rodeo {
-        map: HashMap<String, u32>,
-        strings: Vec<String>,
+        /// Canonical storage — each string lives here exactly once.
+        strings: Vec<Box<str>>,
+        /// Maps borrowed string slices (pointing into `strings`) to their index.
+        /// Safety: entries are never removed and Box<str> has a stable address.
+        map: HashMap<&'static str, u32>,
     }
 
     impl Rodeo {
         pub fn new() -> Self {
             Self {
-                map: HashMap::new(),
                 strings: Vec::new(),
+                map: HashMap::new(),
             }
         }
 
@@ -65,8 +70,12 @@ pub(crate) mod simple_interner {
                 return Spur(id);
             }
             let id = self.strings.len() as u32;
-            self.strings.push(key.to_string());
-            self.map.insert(key.to_string(), id);
+            let boxed: Box<str> = key.into();
+            // Safety: the Box<str> is stored in self.strings (append-only Vec)
+            // and never moved or freed while the Rodeo is alive.
+            let static_ref: &'static str = unsafe { &*(boxed.as_ref() as *const str) };
+            self.strings.push(boxed);
+            self.map.insert(static_ref, id);
             Spur(id)
         }
 
