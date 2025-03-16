@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hermes WASM — In-Browser Search Engine</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; color: #333; }
+        h1 { margin-bottom: 8px; }
+        .subtitle { color: #666; margin-bottom: 24px; }
+        .section { margin: 24px 0; }
+        label { display: block; font-weight: 600; margin-bottom: 4px; }
+        input, textarea { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: inherit; font-size: 14px; }
+        textarea { height: 80px; resize: vertical; }
+        button { padding: 8px 16px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 4px 4px 4px 0; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #94a3b8; cursor: not-allowed; }
+        button.secondary { background: #64748b; }
+        button.danger { background: #dc2626; }
+        .stats { display: flex; gap: 24px; margin: 12px 0; font-size: 14px; color: #555; }
+        .stats span { font-weight: 600; color: #111; }
+        .results { margin-top: 16px; }
+        .hit { padding: 12px; margin: 8px 0; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; }
+        .hit .title { font-weight: 600; color: #1e40af; }
+        .hit .body { font-size: 13px; color: #475569; margin-top: 4px; }
+        .hit .meta { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+        .log { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; background: #dbeafe; color: #1e40af; }
+        .badge.persisted { background: #dcfce7; color: #166534; }
+    </style>
+</head>
+<body>
+    <h1>Hermes WASM</h1>
+    <p class="subtitle">Full-text search engine running entirely in your browser</p>
+
+    <div class="section">
+        <label>Index Name</label>
+        <input id="indexName" value="demo" placeholder="Name for IndexedDB persistence">
+        <div style="margin-top: 8px;">
+            <button onclick="createIndex()">Create New</button>
+            <button class="secondary" onclick="openIndex()">Open Existing</button>
+            <button class="danger" onclick="deleteIndex()">Delete</button>
+        </div>
+        <div id="indexStatus" style="margin-top: 8px;"></div>
+    </div>
+
+    <div class="section">
+        <label>Add Document (JSON)</label>
+        <textarea id="docInput">{"title": "Introduction to Rust", "body": "Rust is a systems programming language focused on safety and performance.", "category": "programming", "views": 1500}</textarea>
+        <div style="margin-top: 8px;">
+            <button onclick="addDoc()">Add Document</button>
+            <button onclick="addSampleDocs()">Add Sample Dataset</button>
+            <button onclick="commitIndex()">Commit</button>
+        </div>
+        <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="section">
+        <label>Search</label>
+        <input id="searchInput" placeholder='Try: "rust", "title:search", "machine AND learning"' oninput="doSearch()">
+        <div class="results" id="results"></div>
+    </div>
+
+    <div class="section">
+        <label>Log</label>
+        <div class="log" id="log"></div>
+    </div>
+
+    <script type="module">
+        import init, { LocalIndex } from './hermes_wasm.js';
+
+        let index = null;
+
+        const logEl = document.getElementById('log');
+        function log(msg) { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+        await init();
+        log('WASM initialized');
+
+        const SCHEMA = `index articles {
+            field title: text<en_stem> [indexed, stored]
+            field body: text<en_stem> [indexed, stored]
+            field category: text [indexed, stored]
+            field views: u64 [indexed, stored]
+        }`;
+
+        const SAMPLE_DOCS = [
+            { title: "Introduction to Rust", body: "Rust is a systems programming language focused on safety, speed, and concurrency.", category: "programming", views: 2500 },
+            { title: "Search Engine Architecture", body: "Modern search engines use inverted indexes, BM25 ranking, and query optimization techniques like WAND and MaxScore.", category: "technology", views: 1800 },
+            { title: "WebAssembly in Production", body: "WASM enables running compiled code in browsers at near-native speed, with use cases from gaming to data processing.", category: "technology", views: 2100 },
+            { title: "Building REST APIs with Actix", body: "Actix Web is a powerful Rust framework for building high-performance HTTP servers and REST APIs.", category: "programming", views: 900 },
+            { title: "Machine Learning Fundamentals", body: "Deep learning uses neural networks with multiple layers to learn hierarchical representations from data.", category: "ai", views: 3200 },
+            { title: "Database Storage Engines", body: "B-trees and LSM trees are the two dominant approaches to building database storage engines.", category: "technology", views: 1500 },
+            { title: "Concurrent Programming in Rust", body: "Rust's ownership model prevents data races at compile time, making concurrent programming safer.", category: "programming", views: 1200 },
+            { title: "Natural Language Processing", body: "NLP combines computational linguistics with machine learning to process and understand human language.", category: "ai", views: 2800 },
+            { title: "Cloud Native Architecture", body: "Microservices, containers, and Kubernetes form the foundation of cloud-native application design.", category: "infrastructure", views: 2000 },
+            { title: "Cryptography and Security", body: "Modern encryption uses algorithms like AES and RSA alongside protocols like TLS to secure communications.", category: "security", views: 1100 },
+            { title: "Graph Databases Explained", body: "Graph databases like Neo4j store relationships as first-class citizens, enabling efficient traversal queries.", category: "technology", views: 750 },
+            { title: "Distributed Consensus", body: "Raft and Paxos are consensus algorithms that ensure data consistency across distributed systems.", category: "infrastructure", views: 950 },
+        ];
+
+        function updateStats() {
+            if (!index) { document.getElementById('stats').innerHTML = ''; return; }
+            document.getElementById('stats').innerHTML = `
+                Committed: <span>${index.numDocs()}</span> docs &nbsp;|&nbsp;
+                Pending: <span>${index.pendingDocs()}</span> docs &nbsp;|&nbsp;
+                Fields: <span>${JSON.stringify(index.fieldNames())}</span>
+            `;
+        }
+
+        window.createIndex = async function() {
+            try {
+                const name = document.getElementById('indexName').value.trim();
+                if (name) {
+                    index = await LocalIndex.createPersistent(name, SCHEMA);
+                    document.getElementById('indexStatus').innerHTML = `<span class="badge persisted">Created: ${name} (persistent)</span>`;
+                } else {
+                    index = await LocalIndex.create(SCHEMA);
+                    document.getElementById('indexStatus').innerHTML = `<span class="badge">Created (in-memory)</span>`;
+                }
+                log(`Index created`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.openIndex = async function() {
+            try {
+                const name = document.getElementById('indexName').value.trim();
+                if (!name) { log('Enter a name to open'); return; }
+                index = await LocalIndex.open(name);
+                document.getElementById('indexStatus').innerHTML = `<span class="badge persisted">Opened: ${name} (${index.numDocs()} docs)</span>`;
+                log(`Opened index "${name}" with ${index.numDocs()} docs`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.deleteIndex = async function() {
+            try {
+                const name = document.getElementById('indexName').value.trim();
+                if (!name) { log('Enter a name to delete'); return; }
+                await LocalIndex.deleteIndex(name);
+                index = null;
+                document.getElementById('indexStatus').innerHTML = '';
+                log(`Deleted index "${name}"`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.addDoc = async function() {
+            if (!index) { log('Create an index first'); return; }
+            try {
+                const json = JSON.parse(document.getElementById('docInput').value);
+                await index.addDocument(json);
+                log(`Added: ${json.title || '(untitled)'}`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.addSampleDocs = async function() {
+            if (!index) { log('Create an index first'); return; }
+            try {
+                const count = await index.addDocuments(SAMPLE_DOCS);
+                log(`Added ${count} sample documents`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.commitIndex = async function() {
+            if (!index) return;
+            try {
+                const t0 = performance.now();
+                const committed = await index.commit();
+                const ms = (performance.now() - t0).toFixed(1);
+                log(committed ? `Committed in ${ms}ms` : `Nothing to commit`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.doSearch = async function() {
+            if (!index || index.numDocs() === 0) return;
+            const query = document.getElementById('searchInput').value.trim();
+            if (!query) { document.getElementById('results').innerHTML = ''; return; }
+            try {
+                const t0 = performance.now();
+                const res = await index.search(query, 10);
+                const ms = (performance.now() - t0).toFixed(1);
+
+                if (res.hits.length === 0) {
+                    document.getElementById('results').innerHTML = `<p style="color:#666">No results (${ms}ms)</p>`;
+                    return;
+                }
+
+                // Fetch documents for display
+                let html = `<p style="font-size:13px;color:#666">${res.total_hits} results in ${ms}ms</p>`;
+                for (const hit of res.hits) {
+                    const doc = await index.getDocument(hit.address.segment_id, hit.address.doc_id);
+                    html += `<div class="hit">
+                        <div class="title">${doc?.title || '(no title)'}</div>
+                        <div class="body">${doc?.body || ''}</div>
+                        <div class="meta">score: ${hit.score.toFixed(3)} · category: ${doc?.category || '-'} · views: ${doc?.views ?? '-'}</div>
+                    </div>`;
+                }
+                document.getElementById('results').innerHTML = html;
+            } catch (e) { log(`Search error: ${e}`); }
+        };
+    </script>
+</body>
+</html>

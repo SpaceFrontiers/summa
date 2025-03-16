@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workflow Rules
+
+- When asked to "commit", "commit and push", or "push" — do it immediately. Do NOT continue making additional changes, running tests, or doing further work unless explicitly asked.
+- When asked to "publish" or "trigger publish", run `gh workflow run publish.yml` and stop.
+- Do not refactor, rename, or "improve" code beyond what was explicitly requested.
+- When fixing a bug, write a failing test first if one doesn't exist, then fix.
+
 ## Project Overview
 
 Hermes is a high-performance, embeddable full-text search engine written in Rust. It's a monorepo containing:
@@ -9,7 +16,7 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-core**: Core search engine library (async, BM25 ranking, WAND optimization)
 - **hermes-tool**: CLI for index management and data processing pipelines
 - **hermes-server**: gRPC server for remote search operations
-- **hermes-wasm**: WebAssembly bindings for browsers
+- **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
 - **hermes-llm**: LLM training framework (Candle ML, separate module)
 - **hermes-client-python**: Python gRPC client
 - **hermes-web**: Vue.js web UI
@@ -27,8 +34,8 @@ cargo test --all-features
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Build WASM
-cd hermes-wasm && wasm-pack build --release --target web
+# Build WASM (requires Homebrew LLVM for zstd cross-compilation)
+cd hermes-wasm && bash build.sh
 
 # Build Python wheel
 cd hermes-core-python && maturin build --release
@@ -76,6 +83,33 @@ Pipeline example: `zstdcat dump.zst | hermes-tool simhash -f title -o hash | her
 - `IndexRegistry` for multi-index management
 - Default port: 50051
 
+### WASM (hermes-wasm)
+
+Browser-compatible search engine with both remote search and local indexing:
+
+- **RemoteIndex** — loads pre-built indexes over HTTP with slice caching + IndexedDB persistence
+- **IpfsIndex** — same as RemoteIndex but with JS fetch callbacks for IPFS
+- **LocalIndex** — full in-browser indexing: create from SDL, add documents, commit, search
+- **IndexRegistry** — manages multiple named indexes
+
+The WASM build uses `hermes-core` with features `["wasm", "http"]`. The `wasm` feature enables:
+
+- `fst-index` — FST block index for reading native-built indexes
+- `tokenizers` — HuggingFace tokenizers (pure Rust via `fancy-regex`)
+- Sequential fallbacks for all `rayon` parallel operations
+- In-memory `Vec<u8>` buffer instead of temp files for document store
+- `simple_interner` HashMap-based string interner instead of `lasso`
+
+Key constraint: WASM has no threads, no filesystem, no `SystemTime`. All native-only code is behind `#[cfg(feature = "native")]`.
+
+### hermes-core Feature Flags
+
+- **`native`** (default via `sync`): Full native build — tokio, rayon, threads, mmap, lasso, uuid, etc.
+- **`fst-index`**: FST block index support (included in both `native` and `wasm`)
+- **`wasm`**: WASM-compatible build — sequential builders, in-memory store, simple interner
+- **`http`**: HTTP directory with reqwest (works on both native and WASM)
+- **`sync`**: Alias for `native`
+
 ### Schema Definition Language (SDL)
 
 ```sdl
@@ -116,8 +150,6 @@ gh run list --workflow=ci.yml --limit=5
 
 - **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python lint, TypeScript build, cargo audit.
 - **publish.yml**: Manual trigger (`workflow_dispatch`). Bumps version, publishes to crates.io, NPM (WASM + TS client), PyPI, and GHCR Docker.
-
-When the user says "publish" or "trigger publish", run `gh workflow run publish.yml`.
 
 ## Key Dependencies
 

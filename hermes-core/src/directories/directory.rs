@@ -555,6 +555,33 @@ impl RamDirectory {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Synchronous file listing (for serialization).
+    pub fn list_files_sync(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
+        let files = self.files.read();
+        Ok(files
+            .keys()
+            .filter(|p| p.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    /// Synchronous file read (for serialization).
+    pub fn read_file_sync(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let files = self.files.read();
+        files
+            .get(path)
+            .map(|data| data.as_ref().clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))
+    }
+
+    /// Synchronous file write (for deserialization).
+    pub fn write_sync(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.files
+            .write()
+            .insert(path.to_path_buf(), Arc::new(data.to_vec()));
+        Ok(())
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

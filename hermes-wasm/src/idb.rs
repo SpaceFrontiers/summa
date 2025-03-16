@@ -4,7 +4,9 @@ use wasm_bindgen::prelude::*;
 
 pub(crate) const IDB_NAME: &str = "hermes-cache";
 pub(crate) const IDB_STORE: &str = "slices";
-pub(crate) const IDB_VERSION: u32 = 1;
+/// Object store for persisted indexes
+pub(crate) const IDB_INDEX_STORE: &str = "indexes";
+pub(crate) const IDB_VERSION: u32 = 2;
 
 /// Generate a cache key from a URL
 pub(crate) fn cache_key(url: &str) -> String {
@@ -31,6 +33,9 @@ pub(crate) async fn open_idb() -> Result<web_sys::IdbDatabase, JsValue> {
 
             if !db.object_store_names().contains(IDB_STORE) {
                 db.create_object_store(IDB_STORE).unwrap();
+            }
+            if !db.object_store_names().contains(IDB_INDEX_STORE) {
+                db.create_object_store(IDB_INDEX_STORE).unwrap();
             }
         });
     open_request.set_onupgradeneeded(Some(onupgradeneeded.as_ref().unchecked_ref()));
@@ -133,6 +138,109 @@ pub(crate) async fn idb_delete(key: &str) -> Result<(), JsValue> {
     let db = open_idb().await?;
     let tx = db.transaction_with_str_and_mode(IDB_STORE, web_sys::IdbTransactionMode::Readwrite)?;
     let store = tx.object_store(IDB_STORE)?;
+
+    store.delete(&JsValue::from_str(key))?;
+
+    let (tx_done, rx_done) = futures_channel::oneshot::channel();
+    let tx_done = std::cell::RefCell::new(Some(tx_done));
+
+    let oncomplete = wasm_bindgen::closure::Closure::once(move |_event: web_sys::Event| {
+        if let Some(tx) = tx_done.borrow_mut().take() {
+            let _ = tx.send(());
+        }
+    });
+    tx.set_oncomplete(Some(oncomplete.as_ref().unchecked_ref()));
+    oncomplete.forget();
+
+    rx_done
+        .await
+        .map_err(|_| JsValue::from_str("IndexedDB delete cancelled"))?;
+    Ok(())
+}
+
+// ── Generic store-aware helpers ──
+
+/// Store data in a specific IDB object store.
+pub(crate) async fn idb_put_to_store(
+    store_name: &str,
+    key: &str,
+    data: &[u8],
+) -> Result<(), JsValue> {
+    use wasm_bindgen::JsCast;
+
+    let db = open_idb().await?;
+    let tx =
+        db.transaction_with_str_and_mode(store_name, web_sys::IdbTransactionMode::Readwrite)?;
+    let store = tx.object_store(store_name)?;
+
+    let js_data = js_sys::Uint8Array::from(data);
+    store.put_with_key(&js_data, &JsValue::from_str(key))?;
+
+    let (tx_done, rx_done) = futures_channel::oneshot::channel();
+    let tx_done = std::cell::RefCell::new(Some(tx_done));
+
+    let oncomplete = wasm_bindgen::closure::Closure::once(move |_event: web_sys::Event| {
+        if let Some(tx) = tx_done.borrow_mut().take() {
+            let _ = tx.send(());
+        }
+    });
+    tx.set_oncomplete(Some(oncomplete.as_ref().unchecked_ref()));
+    oncomplete.forget();
+
+    rx_done
+        .await
+        .map_err(|_| JsValue::from_str("IndexedDB put cancelled"))?;
+    Ok(())
+}
+
+/// Get data from a specific IDB object store.
+pub(crate) async fn idb_get_from_store(
+    store_name: &str,
+    key: &str,
+) -> Result<Option<Vec<u8>>, JsValue> {
+    use wasm_bindgen::JsCast;
+
+    let db = open_idb().await?;
+    let tx = db.transaction_with_str(store_name)?;
+    let store = tx.object_store(store_name)?;
+
+    let request = store.get(&JsValue::from_str(key))?;
+
+    let (tx_done, rx_done) = futures_channel::oneshot::channel();
+    let tx_done = std::cell::RefCell::new(Some(tx_done));
+
+    let onsuccess = wasm_bindgen::closure::Closure::once(move |event: web_sys::Event| {
+        let target = event.target().unwrap();
+        let request: web_sys::IdbRequest = target.dyn_into().unwrap();
+        let result = request.result().unwrap();
+
+        let data = if result.is_undefined() || result.is_null() {
+            None
+        } else {
+            let array: js_sys::Uint8Array = result.dyn_into().unwrap();
+            Some(array.to_vec())
+        };
+
+        if let Some(tx) = tx_done.borrow_mut().take() {
+            let _ = tx.send(data);
+        }
+    });
+    request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
+    onsuccess.forget();
+
+    rx_done
+        .await
+        .map_err(|_| JsValue::from_str("IndexedDB get cancelled"))
+}
+
+/// Delete data from a specific IDB object store.
+pub(crate) async fn idb_delete_from_store(store_name: &str, key: &str) -> Result<(), JsValue> {
+    use wasm_bindgen::JsCast;
+
+    let db = open_idb().await?;
+    let tx =
+        db.transaction_with_str_and_mode(store_name, web_sys::IdbTransactionMode::Readwrite)?;
+    let store = tx.object_store(store_name)?;
 
     store.delete(&JsValue::from_str(key))?;
 
