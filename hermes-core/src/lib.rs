@@ -71,6 +71,8 @@ pub use tokenizer::{
 pub use directories::SLICE_CACHE_EXTENSION;
 pub use error::{Error, Result};
 pub use index::Searcher;
+#[cfg(all(feature = "wasm", not(feature = "native")))]
+pub use index::WasmIndexWriter;
 #[cfg(feature = "native")]
 pub use index::{Index, IndexReader, IndexWriter};
 pub use index::{IndexConfig, IndexMetadata, SLICE_CACHE_FILENAME};

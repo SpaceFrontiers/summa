@@ -147,8 +147,8 @@ pub(super) fn build_vectors_streaming(
     let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(fields.len() * 2);
     let mut current_offset = 0u64;
 
-    // Pre-build ANN indexes across fields (native: parallel via rayon, WASM: sequential).
-    // Each field's ANN build is independent (different vectors, different centroids).
+    // Pre-build ANN indexes across fields (native only — requires trained structures).
+    #[cfg(feature = "native")]
     let ann_blobs: Vec<(u32, u8, Vec<u8>)> = if let Some(trained) = trained {
         let ann_blob_fn =
             |(field_id, builder): &(u32, DenseVectorBuilder)| -> Option<(u32, u8, Vec<u8>)> {
@@ -208,15 +208,14 @@ pub(super) fn build_vectors_streaming(
                 }
             };
 
-        #[cfg(feature = "native")]
-        {
-            fields.par_iter().filter_map(ann_blob_fn).collect()
-        }
-        #[cfg(not(feature = "native"))]
-        {
-            fields.iter().filter_map(ann_blob_fn).collect()
-        }
+        fields.par_iter().filter_map(ann_blob_fn).collect()
     } else {
+        Vec::new()
+    };
+    // WASM: no ANN index building (requires trained structures from SegmentManager)
+    #[cfg(not(feature = "native"))]
+    let ann_blobs: Vec<(u32, u8, Vec<u8>)> = {
+        let _ = trained; // suppress unused warning
         Vec::new()
     };
 

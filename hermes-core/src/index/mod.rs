@@ -23,12 +23,16 @@ mod primary_key;
 mod reader;
 #[cfg(feature = "native")]
 mod vector_builder;
+#[cfg(all(feature = "wasm", not(feature = "native")))]
+mod wasm_writer;
 #[cfg(feature = "native")]
 mod writer;
 #[cfg(feature = "native")]
 pub use primary_key::PrimaryKeyIndex;
 #[cfg(feature = "native")]
 pub use reader::IndexReader;
+#[cfg(all(feature = "wasm", not(feature = "native")))]
+pub use wasm_writer::IndexWriter as WasmIndexWriter;
 #[cfg(feature = "native")]
 pub use writer::{IndexWriter, PreparedCommit};
 

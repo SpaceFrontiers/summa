@@ -43,7 +43,6 @@ pub const DENSE_TOC_ENTRY_SIZE: u64 = 4 + 1 + 8 + 8; // 21
 ///
 /// Called after all field data has been written. `toc_offset` is the
 /// current file position (byte offset where the TOC starts).
-#[cfg(feature = "native")]
 pub fn write_dense_toc_and_footer(
     writer: &mut (impl std::io::Write + ?Sized),
     toc_offset: u64,
@@ -108,7 +107,6 @@ pub const BMP_BLOB_FOOTER_SIZE_V13: usize = 64;
 pub const SPARSE_FOOTER_SIZE: u64 = 24;
 
 /// Per-dim TOC entry accumulated during V3 sparse build/merge.
-#[cfg(feature = "native")]
 pub struct SparseDimTocEntry {
     pub dim_id: u32,
     /// Absolute byte offset in file where block data starts for this dim
@@ -124,7 +122,6 @@ pub struct SparseDimTocEntry {
 }
 
 /// Per-field TOC entry accumulated during V3 sparse build/merge.
-#[cfg(feature = "native")]
 pub struct SparseFieldToc {
     pub field_id: u32,
     pub quantization: u8,
@@ -143,7 +140,6 @@ pub struct SparseFieldToc {
 /// [TOC: per-field header(13B) + per-dim entries(28B each)]
 /// [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)]
 /// ```
-#[cfg(feature = "native")]
 pub fn write_sparse_toc_and_footer(
     writer: &mut (impl std::io::Write + ?Sized),
     skip_offset: u64,

@@ -10,6 +10,7 @@
 
 mod idb;
 mod ipfs_index;
+mod local_index;
 mod registry;
 mod remote_index;
 
@@ -17,6 +18,7 @@ use wasm_bindgen::prelude::*;
 
 // Re-export public types
 pub use ipfs_index::IpfsIndex;
+pub use local_index::LocalIndex;
 pub use registry::IndexRegistry;
 pub use remote_index::RemoteIndex;
 

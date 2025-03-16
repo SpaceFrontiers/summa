@@ -30,13 +30,17 @@ pub struct SegmentId(pub u128);
 
 impl SegmentId {
     pub fn new() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         // UUID7-like: 48 bits timestamp (ms) + 80 bits random
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        #[cfg(not(target_arch = "wasm32"))]
+        let timestamp_ms = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let timestamp_ms = (instant::now() * 1000.0) as u128;
 
         let random_bits: u128 =
             ((rand::random::<u64>() as u128) << 16) | (rand::random::<u16>() as u128);
