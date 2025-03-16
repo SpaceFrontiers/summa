@@ -206,8 +206,8 @@ Full SDL reference: [docs/schema.md](docs/schema.md)
 # Build all Rust packages
 cargo build --release
 
-# Build WASM
-cd hermes-wasm && wasm-pack build --release --target web
+# Build WASM (requires Homebrew LLVM on macOS for zstd cross-compilation)
+cd hermes-wasm && bash build.sh
 
 # Build Python wheel
 cd hermes-core-python && maturin build --release
