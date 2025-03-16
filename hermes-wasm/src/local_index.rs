@@ -7,6 +7,7 @@
 //! Persistent storage uses per-file IDB records: each segment file gets its
 //! own key, so commits only write new/changed files (not the whole index).
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -40,8 +41,8 @@ pub struct LocalIndex {
     searcher: Option<Searcher<RamDirectory>>,
     /// Name for IDB persistence (None = in-memory only)
     persist_name: Option<String>,
-    /// File paths written in previous commits (for tracking what needs IDB sync)
-    persisted_files: Vec<String>,
+    /// File paths already in IDB (for incremental sync)
+    persisted_files: HashSet<String>,
 }
 
 #[wasm_bindgen]
@@ -102,7 +103,7 @@ impl LocalIndex {
             .await
             .map_err(|e| JsValue::from_str(&format!("Open error: {}", e)))?;
 
-        let persisted_files: Vec<String> = file_paths.iter().map(|s| s.to_string()).collect();
+        let persisted_files: HashSet<String> = file_paths.iter().map(|s| s.to_string()).collect();
 
         let mut index = LocalIndex {
             writer: Some(writer),
@@ -317,7 +318,7 @@ impl LocalIndex {
             writer: Some(writer),
             searcher: None,
             persist_name,
-            persisted_files: Vec::new(),
+            persisted_files: HashSet::new(),
         })
     }
 
@@ -344,9 +345,9 @@ impl LocalIndex {
         Ok(())
     }
 
-    /// Sync only new/changed files to IDB. Writes each file as its own
-    /// IDB record keyed by `index:{name}:file:{path}`, then updates the
-    /// manifest (list of all file paths).
+    /// Sync new/changed files to IDB. Each file gets its own IDB record
+    /// keyed by `index:{name}:{path}`. Only files not in `persisted_files`
+    /// are written (plus metadata.json which changes every commit).
     async fn sync_to_idb(&mut self) -> Result<(), JsValue> {
         let writer = self.writer.as_ref().unwrap();
         let name = self.persist_name.as_ref().unwrap();
@@ -356,19 +357,15 @@ impl LocalIndex {
             .list_files_sync(Path::new(""))
             .map_err(|e| JsValue::from_str(&format!("List files error: {}", e)))?;
 
-        let current_set: std::collections::HashSet<String> = current_files
+        let current_set: HashSet<String> = current_files
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        let old_set: std::collections::HashSet<&str> =
-            self.persisted_files.iter().map(|s| s.as_str()).collect();
-
-        // Write new/changed files
+        // Write new files (not yet in IDB) and metadata.json (always changes)
         for path in &current_files {
-            let path_str = path.to_string_lossy().to_string();
-            if !old_set.contains(path_str.as_str()) {
-                // New file — write to IDB
+            let path_str = path.to_string_lossy();
+            if !self.persisted_files.contains(path_str.as_ref()) || path_str == "metadata.json" {
                 let data = dir
                     .read_file_sync(path)
                     .map_err(|e| JsValue::from_str(&format!("Read error: {}", e)))?;
@@ -377,31 +374,20 @@ impl LocalIndex {
             }
         }
 
-        // Always write metadata.json (it changes on every commit)
-        let metadata_path = Path::new("metadata.json");
-        if let Ok(data) = dir.read_file_sync(metadata_path) {
-            let key = idb_key(name, "metadata.json");
-            idb::idb_put_to_store(IDB_INDEX_STORE, &key, &data).await?;
-        }
-
-        // Delete removed files from IDB
+        // Delete removed files from IDB (e.g. after merge)
         for old_path in &self.persisted_files {
-            if !current_set.contains(old_path.as_str()) {
+            if !current_set.contains(old_path) {
                 let key = idb_key(name, old_path);
                 idb::idb_delete_from_store(IDB_INDEX_STORE, &key).await?;
             }
         }
 
         // Update manifest
-        let manifest = current_files
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let manifest = current_set.iter().cloned().collect::<Vec<_>>().join("\n");
         let manifest_key = idb_key(name, "__manifest");
         idb::idb_put_to_store(IDB_INDEX_STORE, &manifest_key, manifest.as_bytes()).await?;
 
-        self.persisted_files = current_set.into_iter().collect();
+        self.persisted_files = current_set;
         Ok(())
     }
 }
