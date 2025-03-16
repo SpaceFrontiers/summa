@@ -67,6 +67,11 @@ default-features = false
 features = ["fancy-regex"]
 optional = true
 
+# getrandom needs wasm_js backend for WASM (pulled transitively by tokenizers, rand, etc.)
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
 tempfile = { workspace = true }
@@ -78,10 +83,11 @@ tokio = { workspace = true }
 
 [features]
 default = ["sync"]
-native = ["dep:tokio", "dep:async-channel", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:libc", "dep:uuid", "dep:kentro", "dep:ndarray", "dep:nalgebra", "dep:tokenizers", "dep:fst", "dep:hf-hub"]
+native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:libc", "dep:uuid", "dep:kentro", "dep:ndarray", "dep:nalgebra", "dep:tokenizers", "dep:hf-hub"]
 sync = ["native"]
 diagnostics = []
-wasm = ["dep:tokenizers"]
+fst-index = ["dep:fst"]
+wasm = ["fst-index", "dep:tokenizers"]
 http = ["dep:reqwest", "dep:instant"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.reqwest]

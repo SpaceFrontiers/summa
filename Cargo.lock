@@ -1823,6 +1823,7 @@ dependencies = [
  "crossbeam-channel",
  "fst",
  "futures",
+ "getrandom 0.3.4",
  "half",
  "hashbrown 0.15.5",
  "hf-hub",

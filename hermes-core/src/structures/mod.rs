@@ -158,6 +158,6 @@ pub use sstable::{
 };
 
 // Re-export sstable_index
-#[cfg(feature = "native")]
+#[cfg(feature = "fst-index")]
 pub use sstable_index::FstBlockIndex;
 pub use sstable_index::{BlockAddr, BlockAddrStore, BlockIndex, MmapBlockIndex};

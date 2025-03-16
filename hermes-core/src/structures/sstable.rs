@@ -24,7 +24,7 @@ use rustc_hash::FxHashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-#[cfg(feature = "native")]
+#[cfg(feature = "fst-index")]
 use super::sstable_index::FstBlockIndex;
 use super::sstable_index::{BlockAddr, BlockIndex, MmapBlockIndex};
 use crate::compression::{CompressionDict, CompressionLevel};
@@ -1099,13 +1099,13 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         let index_data = index_bytes.slice(4..4 + index_len);
 
-        // Try FST first (native), fall back to mmap
-        #[cfg(feature = "native")]
+        // Try FST first (when fst-index feature available), fall back to mmap
+        #[cfg(feature = "fst-index")]
         let block_index = match FstBlockIndex::load(index_data.clone()) {
             Ok(fst_idx) => BlockIndex::Fst(fst_idx),
             Err(_) => BlockIndex::Mmap(MmapBlockIndex::load(index_data)?),
         };
-        #[cfg(not(feature = "native"))]
+        #[cfg(not(feature = "fst-index"))]
         let block_index = BlockIndex::Mmap(MmapBlockIndex::load(index_data)?);
 
         // Load bloom filter if present

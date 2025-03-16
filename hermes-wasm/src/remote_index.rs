@@ -212,7 +212,9 @@ impl RemoteIndex {
     ///
     /// Accepts both query language syntax (field:term, AND, OR, NOT, grouping)
     /// and simple text (tokenized and searched across default fields).
-    /// Returns document addresses (segment_id + doc_id) without document content.
+    ///
+    /// Returns `{ hits: [{ address: { segment_id: string, doc_id: number }, score: number }], total_hits: number }`.
+    /// Use `get_document(hit.address.segment_id, hit.address.doc_id)` to fetch document content.
     #[wasm_bindgen]
     pub async fn search(&self, query_str: String, limit: usize) -> Result<JsValue, JsValue> {
         self.search_offset(query_str, limit, 0).await

@@ -174,13 +174,13 @@ impl BlockAddrStore {
 ///
 /// Maps keys to block ordinals using an FST. The FST bytes can be mmap'd
 /// directly without any parsing or heap allocation.
-#[cfg(feature = "native")]
+#[cfg(feature = "fst-index")]
 pub struct FstBlockIndex {
     fst: fst::Map<OwnedBytes>,
     block_addrs: BlockAddrStore,
 }
 
-#[cfg(feature = "native")]
+#[cfg(feature = "fst-index")]
 impl FstBlockIndex {
     /// Build FST index from keys and block addresses
     pub fn build(entries: &[(Vec<u8>, BlockAddr)]) -> io::Result<Vec<u8>> {
@@ -580,7 +580,7 @@ impl MmapBlockIndex {
 
 /// Unified block index that can use either FST or mmap'd raw index
 pub enum BlockIndex {
-    #[cfg(feature = "native")]
+    #[cfg(feature = "fst-index")]
     Fst(FstBlockIndex),
     Mmap(MmapBlockIndex),
 }
@@ -589,7 +589,7 @@ impl BlockIndex {
     /// Locate the block that could contain the key
     pub fn locate(&self, key: &[u8]) -> Option<usize> {
         match self {
-            #[cfg(feature = "native")]
+            #[cfg(feature = "fst-index")]
             BlockIndex::Fst(idx) => idx.locate(key),
             BlockIndex::Mmap(idx) => idx.locate(key),
         }
@@ -598,7 +598,7 @@ impl BlockIndex {
     /// Get block address by ordinal
     pub fn get_addr(&self, ordinal: usize) -> Option<BlockAddr> {
         match self {
-            #[cfg(feature = "native")]
+            #[cfg(feature = "fst-index")]
             BlockIndex::Fst(idx) => idx.get_addr(ordinal),
             BlockIndex::Mmap(idx) => idx.get_addr(ordinal),
         }
@@ -607,7 +607,7 @@ impl BlockIndex {
     /// Number of blocks
     pub fn len(&self) -> usize {
         match self {
-            #[cfg(feature = "native")]
+            #[cfg(feature = "fst-index")]
             BlockIndex::Fst(idx) => idx.len(),
             BlockIndex::Mmap(idx) => idx.len(),
         }
@@ -621,7 +621,7 @@ impl BlockIndex {
     /// Get all block addresses
     pub fn all_addrs(&self) -> Vec<BlockAddr> {
         match self {
-            #[cfg(feature = "native")]
+            #[cfg(feature = "fst-index")]
             BlockIndex::Fst(idx) => idx.all_addrs(),
             BlockIndex::Mmap(idx) => idx.all_addrs(),
         }
@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(index.locate(b"000"), None); // Before all keys
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(feature = "fst-index")]
     #[test]
     fn test_fst_block_index_roundtrip() {
         let entries = vec![
