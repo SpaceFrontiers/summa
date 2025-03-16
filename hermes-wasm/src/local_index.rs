@@ -3,10 +3,14 @@
 //! Supports two storage modes:
 //! - **In-memory** (`LocalIndex.create`) — fast, lost on page refresh
 //! - **Persistent** (`LocalIndex.createPersistent` / `LocalIndex.open`) — backed by IndexedDB
+//!
+//! Persistent storage uses per-file IDB records: each segment file gets its
+//! own key, so commits only write new/changed files (not the whole index).
 
+use std::path::Path;
 use std::sync::Arc;
 
-use hermes_core::directories::{Directory, RamDirectory};
+use hermes_core::directories::RamDirectory;
 use hermes_core::{IndexConfig, Searcher, WasmIndexWriter};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -16,7 +20,7 @@ use crate::idb;
 /// Default term cache blocks for WASM searcher.
 const WASM_TERM_CACHE_BLOCKS: usize = 32;
 
-/// IDB object store for persisted indexes.
+/// IDB object store for persisted index files.
 const IDB_INDEX_STORE: &str = "indexes";
 
 /// In-browser local index — create, index documents, search, all in WASM.
@@ -36,6 +40,8 @@ pub struct LocalIndex {
     searcher: Option<Searcher<RamDirectory>>,
     /// Name for IDB persistence (None = in-memory only)
     persist_name: Option<String>,
+    /// File paths written in previous commits (for tracking what needs IDB sync)
+    persisted_files: Vec<String>,
 }
 
 #[wasm_bindgen]
@@ -50,7 +56,8 @@ impl LocalIndex {
 
     /// Create a new persistent index backed by IndexedDB.
     ///
-    /// The index is automatically saved to IndexedDB on each `commit()`.
+    /// Each file in the index gets its own IDB record — commits only write
+    /// new/changed files, not the entire index.
     /// Use `LocalIndex.open(name)` to reopen it after page refresh.
     #[wasm_bindgen(js_name = "createPersistent")]
     pub async fn create_persistent(
@@ -62,18 +69,29 @@ impl LocalIndex {
 
     /// Open an existing persistent index from IndexedDB.
     ///
-    /// Returns an error if the index doesn't exist. Use `createPersistent()` to create one first.
+    /// Loads the file manifest and all index files into a RamDirectory.
     #[wasm_bindgen]
     pub async fn open(name: String) -> Result<LocalIndex, JsValue> {
-        let idb_key = format!("index:{}", name);
-        let data = idb::idb_get_from_store(IDB_INDEX_STORE, &idb_key)
+        let manifest_key = idb_key(&name, "__manifest");
+        let manifest_data = idb::idb_get_from_store(IDB_INDEX_STORE, &manifest_key)
             .await?
             .ok_or_else(|| {
                 JsValue::from_str(&format!("Index '{}' not found in IndexedDB", name))
             })?;
 
-        let dir = deserialize_ram_directory(&data)
-            .map_err(|e| JsValue::from_str(&format!("Deserialize error: {}", e)))?;
+        let manifest_str = String::from_utf8(manifest_data)
+            .map_err(|e| JsValue::from_str(&format!("Manifest decode error: {}", e)))?;
+        let file_paths: Vec<&str> = manifest_str.lines().filter(|l| !l.is_empty()).collect();
+
+        // Load each file from IDB into RamDirectory
+        let dir = RamDirectory::new();
+        for path_str in &file_paths {
+            let key = idb_key(&name, path_str);
+            if let Some(data) = idb::idb_get_from_store(IDB_INDEX_STORE, &key).await? {
+                dir.write_sync(Path::new(path_str), &data)
+                    .map_err(|e| JsValue::from_str(&format!("Write error: {}", e)))?;
+            }
+        }
 
         let config = IndexConfig {
             max_indexing_memory_bytes: 32 * 1024 * 1024,
@@ -84,10 +102,13 @@ impl LocalIndex {
             .await
             .map_err(|e| JsValue::from_str(&format!("Open error: {}", e)))?;
 
+        let persisted_files: Vec<String> = file_paths.iter().map(|s| s.to_string()).collect();
+
         let mut index = LocalIndex {
             writer: Some(writer),
             searcher: None,
             persist_name: Some(name),
+            persisted_files,
         };
         index.refresh_searcher().await?;
         Ok(index)
@@ -96,15 +117,25 @@ impl LocalIndex {
     /// Delete a persistent index from IndexedDB.
     #[wasm_bindgen(js_name = "deleteIndex")]
     pub async fn delete_index(name: String) -> Result<(), JsValue> {
-        let idb_key = format!("index:{}", name);
-        idb::idb_delete_from_store(IDB_INDEX_STORE, &idb_key).await
+        // Load manifest to find all file keys
+        let manifest_key = idb_key(&name, "__manifest");
+        if let Some(manifest_data) = idb::idb_get_from_store(IDB_INDEX_STORE, &manifest_key).await?
+        {
+            if let Ok(manifest_str) = String::from_utf8(manifest_data) {
+                for path_str in manifest_str.lines().filter(|l| !l.is_empty()) {
+                    let key = idb_key(&name, path_str);
+                    idb::idb_delete_from_store(IDB_INDEX_STORE, &key).await?;
+                }
+            }
+        }
+        idb::idb_delete_from_store(IDB_INDEX_STORE, &manifest_key).await
     }
 
     /// Check if a persistent index exists in IndexedDB.
     #[wasm_bindgen]
     pub async fn exists(name: String) -> Result<bool, JsValue> {
-        let idb_key = format!("index:{}", name);
-        let data = idb::idb_get_from_store(IDB_INDEX_STORE, &idb_key).await?;
+        let manifest_key = idb_key(&name, "__manifest");
+        let data = idb::idb_get_from_store(IDB_INDEX_STORE, &manifest_key).await?;
         Ok(data.is_some())
     }
 
@@ -156,8 +187,7 @@ impl LocalIndex {
 
     /// Commit pending documents — builds segments and updates metadata.
     ///
-    /// For persistent indexes, also saves to IndexedDB automatically.
-    /// Must be called before search() will return the new documents.
+    /// For persistent indexes, only writes new/changed files to IndexedDB.
     #[wasm_bindgen]
     pub async fn commit(&mut self) -> Result<bool, JsValue> {
         let writer = self
@@ -173,9 +203,9 @@ impl LocalIndex {
         if committed {
             self.refresh_searcher().await?;
 
-            // Auto-save to IDB for persistent indexes
+            // Sync only new/changed files to IDB
             if self.persist_name.is_some() {
-                self.save_to_idb().await?;
+                self.sync_to_idb().await?;
             }
         }
 
@@ -287,6 +317,7 @@ impl LocalIndex {
             writer: Some(writer),
             searcher: None,
             persist_name,
+            persisted_files: Vec::new(),
         })
     }
 
@@ -313,86 +344,69 @@ impl LocalIndex {
         Ok(())
     }
 
-    async fn save_to_idb(&self) -> Result<(), JsValue> {
+    /// Sync only new/changed files to IDB. Writes each file as its own
+    /// IDB record keyed by `index:{name}:file:{path}`, then updates the
+    /// manifest (list of all file paths).
+    async fn sync_to_idb(&mut self) -> Result<(), JsValue> {
         let writer = self.writer.as_ref().unwrap();
         let name = self.persist_name.as_ref().unwrap();
-        let idb_key = format!("index:{}", name);
+        let dir = writer.directory();
 
-        let data = serialize_ram_directory(writer.directory())
-            .map_err(|e| JsValue::from_str(&format!("Serialize error: {}", e)))?;
+        let current_files = dir
+            .list_files_sync(Path::new(""))
+            .map_err(|e| JsValue::from_str(&format!("List files error: {}", e)))?;
 
-        idb::idb_put_to_store(IDB_INDEX_STORE, &idb_key, &data).await
+        let current_set: std::collections::HashSet<String> = current_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        let old_set: std::collections::HashSet<&str> =
+            self.persisted_files.iter().map(|s| s.as_str()).collect();
+
+        // Write new/changed files
+        for path in &current_files {
+            let path_str = path.to_string_lossy().to_string();
+            if !old_set.contains(path_str.as_str()) {
+                // New file — write to IDB
+                let data = dir
+                    .read_file_sync(path)
+                    .map_err(|e| JsValue::from_str(&format!("Read error: {}", e)))?;
+                let key = idb_key(name, &path_str);
+                idb::idb_put_to_store(IDB_INDEX_STORE, &key, &data).await?;
+            }
+        }
+
+        // Always write metadata.json (it changes on every commit)
+        let metadata_path = Path::new("metadata.json");
+        if let Ok(data) = dir.read_file_sync(metadata_path) {
+            let key = idb_key(name, "metadata.json");
+            idb::idb_put_to_store(IDB_INDEX_STORE, &key, &data).await?;
+        }
+
+        // Delete removed files from IDB
+        for old_path in &self.persisted_files {
+            if !current_set.contains(old_path.as_str()) {
+                let key = idb_key(name, old_path);
+                idb::idb_delete_from_store(IDB_INDEX_STORE, &key).await?;
+            }
+        }
+
+        // Update manifest
+        let manifest = current_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let manifest_key = idb_key(name, "__manifest");
+        idb::idb_put_to_store(IDB_INDEX_STORE, &manifest_key, manifest.as_bytes()).await?;
+
+        self.persisted_files = current_set.into_iter().collect();
+        Ok(())
     }
 }
 
-// ── RamDirectory serialization ──
-// Simple format: [num_files: u32] [path_len: u32, path_bytes, data_len: u32, data_bytes] ...
-
-fn serialize_ram_directory(dir: &RamDirectory) -> Result<Vec<u8>, String> {
-    use std::path::Path;
-
-    let files = dir
-        .list_files_sync(Path::new(""))
-        .map_err(|e| e.to_string())?;
-
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&(files.len() as u32).to_le_bytes());
-
-    for path in &files {
-        let path_str = path.to_string_lossy();
-        let path_bytes = path_str.as_bytes();
-        buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(path_bytes);
-
-        let data = dir.read_file_sync(path).map_err(|e| e.to_string())?;
-        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&data);
-    }
-
-    Ok(buf)
-}
-
-fn deserialize_ram_directory(data: &[u8]) -> Result<RamDirectory, String> {
-    use std::path::PathBuf;
-
-    let dir = RamDirectory::new();
-
-    if data.len() < 4 {
-        return Err("Data too short".into());
-    }
-    let num_files = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut offset = 4;
-
-    for _ in 0..num_files {
-        if offset + 4 > data.len() {
-            return Err("Truncated path length".into());
-        }
-        let path_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-
-        if offset + path_len > data.len() {
-            return Err("Truncated path".into());
-        }
-        let path_str =
-            std::str::from_utf8(&data[offset..offset + path_len]).map_err(|e| e.to_string())?;
-        offset += path_len;
-        let path = PathBuf::from(path_str);
-
-        if offset + 4 > data.len() {
-            return Err("Truncated data length".into());
-        }
-        let data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-
-        if offset + data_len > data.len() {
-            return Err("Truncated file data".into());
-        }
-        let file_data = &data[offset..offset + data_len];
-        offset += data_len;
-
-        dir.write_sync(&path, file_data)
-            .map_err(|e| e.to_string())?;
-    }
-
-    Ok(dir)
+/// Build an IDB key for a named index file.
+fn idb_key(index_name: &str, file_path: &str) -> String {
+    format!("index:{}:{}", index_name, file_path)
 }
