@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hermes WASM — Encrypted Storage Example</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; color: #333; }
+        h1 { margin-bottom: 8px; }
+        .subtitle { color: #666; margin-bottom: 24px; }
+        .section { margin: 24px 0; }
+        label { display: block; font-weight: 600; margin-bottom: 4px; }
+        input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        button { padding: 8px 16px; background: #7c3aed; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 4px 4px 4px 0; }
+        button:hover { background: #6d28d9; }
+        .results { margin-top: 16px; }
+        .hit { padding: 12px; margin: 8px 0; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; }
+        .hit .title { font-weight: 600; color: #6d28d9; }
+        .hit .body { font-size: 13px; color: #475569; margin-top: 4px; }
+        .hit .meta { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+        .log { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; }
+        .info { background: #faf5ff; border: 1px solid #e9d5ff; padding: 12px; border-radius: 6px; font-size: 13px; margin: 12px 0; }
+        .stats { font-size: 14px; color: #555; margin: 8px 0; }
+        .stats span { font-weight: 600; color: #111; }
+    </style>
+</head>
+<body>
+    <h1>Hermes WASM — Encrypted Storage</h1>
+    <p class="subtitle">Full-text search with AES-GCM encrypted IndexedDB persistence</p>
+
+    <div class="info">
+        All index files (segments, metadata) are encrypted with AES-256-GCM before
+        being stored in IndexedDB. The encryption key is derived from your passphrase
+        using PBKDF2 (100k iterations). Data at rest is never plaintext.
+    </div>
+
+    <div class="section">
+        <label>Passphrase</label>
+        <input id="passphrase" type="password" value="my-secret-passphrase" placeholder="Encryption passphrase">
+        <div style="margin-top: 8px;">
+            <button onclick="createIndex()">Create / Open Encrypted Index</button>
+            <button onclick="addSampleDocs()" style="background:#64748b">Add Sample Data</button>
+            <button onclick="commitIndex()" style="background:#059669">Commit</button>
+        </div>
+        <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="section">
+        <label>Search</label>
+        <input id="searchInput" placeholder='Try: "rust", "machine learning", "title:database"' oninput="doSearch()">
+        <div class="results" id="results"></div>
+    </div>
+
+    <div class="section">
+        <label>Log</label>
+        <div class="log" id="log"></div>
+    </div>
+
+    <script type="module">
+        import init, { LocalIndex } from './hermes_wasm.js';
+
+        let index = null;
+        const logEl = document.getElementById('log');
+        function log(msg) { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+        await init();
+        log('WASM initialized');
+
+        // ═══════════════════════════════════════════════════════════════
+        // Encrypted IFilesStorage — AES-256-GCM + PBKDF2 key derivation
+        // ═══════════════════════════════════════════════════════════════
+
+        async function createEncryptedStorage(passphrase, indexName) {
+            const enc = new TextEncoder();
+            const dbName = `hermes-encrypted-${indexName}`;
+            const storeName = 'files';
+
+            // Derive AES-256 key from passphrase via PBKDF2
+            const keyMaterial = await crypto.subtle.importKey(
+                'raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveKey']
+            );
+            const salt = enc.encode(`hermes-salt-${indexName}`); // deterministic salt per index
+            const cryptoKey = await crypto.subtle.deriveKey(
+                { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+                keyMaterial,
+                { name: 'AES-GCM', length: 256 },
+                false,
+                ['encrypt', 'decrypt']
+            );
+
+            async function encrypt(data) {
+                const iv = crypto.getRandomValues(new Uint8Array(12));
+                const ciphertext = await crypto.subtle.encrypt(
+                    { name: 'AES-GCM', iv }, cryptoKey, data
+                );
+                // Prepend IV to ciphertext: [12-byte IV][ciphertext]
+                const result = new Uint8Array(12 + ciphertext.byteLength);
+                result.set(iv);
+                result.set(new Uint8Array(ciphertext), 12);
+                return result.buffer;
+            }
+
+            async function decrypt(data) {
+                const bytes = new Uint8Array(data);
+                const iv = bytes.slice(0, 12);
+                const ciphertext = bytes.slice(12);
+                return crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv }, cryptoKey, ciphertext
+                );
+            }
+
+            // IDB helpers
+            function openDb() {
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open(dbName, 1);
+                    req.onupgradeneeded = () => {
+                        if (!req.result.objectStoreNames.contains(storeName))
+                            req.result.createObjectStore(storeName);
+                    };
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => reject(req.error);
+                });
+            }
+
+            // Return IFilesStorage interface
+            return {
+                async write(name, buffer) {
+                    const encrypted = await encrypt(buffer);
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readwrite');
+                    tx.objectStore(storeName).put(new Uint8Array(encrypted), name);
+                    await new Promise(r => { tx.oncomplete = r; });
+                },
+
+                async get(name) {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readonly');
+                    const req = tx.objectStore(storeName).get(name);
+                    const raw = await new Promise(r => { req.onsuccess = () => r(req.result); });
+                    if (!raw) return null;
+                    return decrypt(raw.buffer);
+                },
+
+                async delete(names) {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readwrite');
+                    const store = tx.objectStore(storeName);
+                    for (const n of names) store.delete(n);
+                    await new Promise(r => { tx.oncomplete = r; });
+                },
+
+                async list() {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readonly');
+                    const req = tx.objectStore(storeName).getAllKeys();
+                    return new Promise(r => { req.onsuccess = () => r(req.result); });
+                }
+            };
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+
+        const SCHEMA = `index articles {
+            field title: text<en_stem> [indexed, stored]
+            field body: text<en_stem> [indexed, stored]
+            field category: text [indexed, stored]
+            field views: u64 [indexed, stored]
+        }`;
+
+        const SAMPLE_DOCS = [
+            { title: "Introduction to Rust", body: "Rust is a systems programming language focused on safety and performance.", category: "programming", views: 2500 },
+            { title: "Search Engine Architecture", body: "Modern search engines use inverted indexes and BM25 ranking.", category: "technology", views: 1800 },
+            { title: "Machine Learning Fundamentals", body: "Deep learning uses neural networks to learn from data.", category: "ai", views: 3200 },
+            { title: "Database Storage Engines", body: "B-trees and LSM trees are fundamental database structures.", category: "technology", views: 1500 },
+            { title: "Concurrent Programming", body: "Rust ownership model prevents data races at compile time.", category: "programming", views: 1200 },
+            { title: "Cloud Native Architecture", body: "Microservices and Kubernetes form the foundation of cloud-native design.", category: "infrastructure", views: 2000 },
+        ];
+
+        function updateStats() {
+            if (!index) { document.getElementById('stats').innerHTML = ''; return; }
+            document.getElementById('stats').innerHTML =
+                `Committed: <span>${index.numDocs()}</span> docs | Pending: <span>${index.pendingDocs()}</span>`;
+        }
+
+        window.createIndex = async function() {
+            try {
+                const passphrase = document.getElementById('passphrase').value;
+                if (!passphrase) { log('Enter a passphrase'); return; }
+                const storage = await createEncryptedStorage(passphrase, 'demo');
+                index = await LocalIndex.withStorage(storage, SCHEMA);
+                const docs = index.numDocs();
+                log(docs > 0
+                    ? `Opened encrypted index (${docs} docs) — data decrypted with passphrase`
+                    : 'Created new encrypted index');
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.addSampleDocs = async function() {
+            if (!index) { log('Create index first'); return; }
+            try {
+                const count = await index.addDocuments(SAMPLE_DOCS);
+                log(`Added ${count} documents`);
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.commitIndex = async function() {
+            if (!index) return;
+            try {
+                const t0 = performance.now();
+                const committed = await index.commit();
+                log(committed
+                    ? `Committed + encrypted in ${(performance.now() - t0).toFixed(1)}ms`
+                    : 'Nothing to commit');
+                updateStats();
+            } catch (e) { log(`Error: ${e}`); }
+        };
+
+        window.doSearch = async function() {
+            if (!index || index.numDocs() === 0) return;
+            const query = document.getElementById('searchInput').value.trim();
+            if (!query) { document.getElementById('results').innerHTML = ''; return; }
+            try {
+                const t0 = performance.now();
+                const res = await index.search(query, 10);
+                const ms = (performance.now() - t0).toFixed(1);
+                if (res.hits.length === 0) {
+                    document.getElementById('results').innerHTML = `<p style="color:#666">No results (${ms}ms)</p>`;
+                    return;
+                }
+                let html = `<p style="font-size:13px;color:#666">${res.total_hits} results in ${ms}ms</p>`;
+                for (const hit of res.hits) {
+                    const doc = await index.getDocument(hit.address.segment_id, hit.address.doc_id);
+                    html += `<div class="hit">
+                        <div class="title">${doc?.title || '(no title)'}</div>
+                        <div class="body">${doc?.body || ''}</div>
+                        <div class="meta">score: ${hit.score.toFixed(3)} · ${doc?.category || '-'} · views: ${doc?.views ?? '-'}</div>
+                    </div>`;
+                }
+                document.getElementById('results').innerHTML = html;
+            } catch (e) { log(`Search error: ${e}`); }
+        };
+    </script>
+</body>
+</html>

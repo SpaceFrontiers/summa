@@ -89,7 +89,7 @@ Browser-compatible search engine with both remote search and local indexing:
 
 - **RemoteIndex** — loads pre-built indexes over HTTP with slice caching + IndexedDB persistence
 - **IpfsIndex** — same as RemoteIndex but with JS fetch callbacks for IPFS
-- **LocalIndex** — full in-browser indexing: create from SDL, add documents, commit, search
+- **LocalIndex** — full in-browser indexing: create from SDL, add documents, commit, search. Pluggable `IFilesStorage` for persistence (IDB, encrypted, OPFS)
 - **IndexRegistry** — manages multiple named indexes
 
 The WASM build uses `hermes-core` with features `["wasm", "http"]`. The `wasm` feature enables:

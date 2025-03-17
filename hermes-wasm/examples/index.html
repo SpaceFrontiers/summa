@@ -18,7 +18,7 @@
         button:disabled { background: #94a3b8; cursor: not-allowed; }
         button.secondary { background: #64748b; }
         button.danger { background: #dc2626; }
-        .stats { display: flex; gap: 24px; margin: 12px 0; font-size: 14px; color: #555; }
+        .stats { display: flex; gap: 24px; flex-wrap: wrap; margin: 12px 0; font-size: 14px; color: #555; }
         .stats span { font-weight: 600; color: #111; }
         .results { margin-top: 16px; }
         .hit { padding: 12px; margin: 8px 0; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; }
@@ -26,8 +26,10 @@
         .hit .body { font-size: 13px; color: #475569; margin-top: 4px; }
         .hit .meta { font-size: 12px; color: #94a3b8; margin-top: 4px; }
         .log { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; background: #dbeafe; color: #1e40af; }
-        .badge.persisted { background: #dcfce7; color: #166534; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+        .badge.mem { background: #dbeafe; color: #1e40af; }
+        .badge.idb { background: #dcfce7; color: #166534; }
+        select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
     </style>
 </head>
 <body>
@@ -35,12 +37,13 @@
     <p class="subtitle">Full-text search engine running entirely in your browser</p>
 
     <div class="section">
-        <label>Index Name</label>
-        <input id="indexName" value="demo" placeholder="Name for IndexedDB persistence">
+        <label>Storage</label>
+        <select id="storageMode">
+            <option value="memory">In-Memory (ephemeral)</option>
+            <option value="idb">IndexedDB (persistent)</option>
+        </select>
         <div style="margin-top: 8px;">
-            <button onclick="createIndex()">Create New</button>
-            <button class="secondary" onclick="openIndex()">Open Existing</button>
-            <button class="danger" onclick="deleteIndex()">Delete</button>
+            <button onclick="createIndex()">Create / Open Index</button>
         </div>
         <div id="indexStatus" style="margin-top: 8px;"></div>
     </div>
@@ -100,6 +103,52 @@
             { title: "Distributed Consensus", body: "Raft and Paxos are consensus algorithms that ensure data consistency across distributed systems.", category: "infrastructure", views: 950 },
         ];
 
+        // ── Simple IDB-based IFilesStorage implementation ──
+        function createIdbStorage(indexName) {
+            const dbName = `hermes-index-${indexName}`;
+            const storeName = 'files';
+
+            function openDb() {
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open(dbName, 1);
+                    req.onupgradeneeded = () => {
+                        if (!req.result.objectStoreNames.contains(storeName))
+                            req.result.createObjectStore(storeName);
+                    };
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => reject(req.error);
+                });
+            }
+
+            return {
+                async write(name, buffer) {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readwrite');
+                    tx.objectStore(storeName).put(new Uint8Array(buffer), name);
+                    await new Promise(r => { tx.oncomplete = r; });
+                },
+                async get(name) {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readonly');
+                    const req = tx.objectStore(storeName).get(name);
+                    return new Promise(r => { req.onsuccess = () => r(req.result?.buffer ?? null); });
+                },
+                async delete(names) {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readwrite');
+                    const store = tx.objectStore(storeName);
+                    for (const n of names) store.delete(n);
+                    await new Promise(r => { tx.oncomplete = r; });
+                },
+                async list() {
+                    const db = await openDb();
+                    const tx = db.transaction(storeName, 'readonly');
+                    const req = tx.objectStore(storeName).getAllKeys();
+                    return new Promise(r => { req.onsuccess = () => r(req.result); });
+                }
+            };
+        }
+
         function updateStats() {
             if (!index) { document.getElementById('stats').innerHTML = ''; return; }
             document.getElementById('stats').innerHTML = `
@@ -111,38 +160,17 @@
 
         window.createIndex = async function() {
             try {
-                const name = document.getElementById('indexName').value.trim();
-                if (name) {
-                    index = await LocalIndex.createPersistent(name, SCHEMA);
-                    document.getElementById('indexStatus').innerHTML = `<span class="badge persisted">Created: ${name} (persistent)</span>`;
+                const mode = document.getElementById('storageMode').value;
+                if (mode === 'idb') {
+                    const storage = createIdbStorage('demo');
+                    index = await LocalIndex.withStorage(storage, SCHEMA);
+                    const badge = index.numDocs() > 0 ? `Reopened (${index.numDocs()} docs)` : 'Created';
+                    document.getElementById('indexStatus').innerHTML = `<span class="badge idb">${badge} — IndexedDB</span>`;
                 } else {
                     index = await LocalIndex.create(SCHEMA);
-                    document.getElementById('indexStatus').innerHTML = `<span class="badge">Created (in-memory)</span>`;
+                    document.getElementById('indexStatus').innerHTML = `<span class="badge mem">Created — in-memory</span>`;
                 }
-                log(`Index created`);
-                updateStats();
-            } catch (e) { log(`Error: ${e}`); }
-        };
-
-        window.openIndex = async function() {
-            try {
-                const name = document.getElementById('indexName').value.trim();
-                if (!name) { log('Enter a name to open'); return; }
-                index = await LocalIndex.open(name);
-                document.getElementById('indexStatus').innerHTML = `<span class="badge persisted">Opened: ${name} (${index.numDocs()} docs)</span>`;
-                log(`Opened index "${name}" with ${index.numDocs()} docs`);
-                updateStats();
-            } catch (e) { log(`Error: ${e}`); }
-        };
-
-        window.deleteIndex = async function() {
-            try {
-                const name = document.getElementById('indexName').value.trim();
-                if (!name) { log('Enter a name to delete'); return; }
-                await LocalIndex.deleteIndex(name);
-                index = null;
-                document.getElementById('indexStatus').innerHTML = '';
-                log(`Deleted index "${name}"`);
+                log(`Index ready (${mode})`);
                 updateStats();
             } catch (e) { log(`Error: ${e}`); }
         };
@@ -191,7 +219,6 @@
                     return;
                 }
 
-                // Fetch documents for display
                 let html = `<p style="font-size:13px;color:#666">${res.total_hits} results in ${ms}ms</p>`;
                 for (const hit of res.hits) {
                     const doc = await index.getDocument(hit.address.segment_id, hit.address.doc_id);

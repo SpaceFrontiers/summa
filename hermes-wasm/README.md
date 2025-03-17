@@ -5,7 +5,7 @@ WebAssembly bindings for the [Hermes](https://github.com/SpaceFrontiers/hermes) 
 ## Features
 
 - **Local indexing** — create indexes, add documents, commit, and search entirely in WASM
-- **IndexedDB persistence** — indexes survive page refreshes via per-file IDB records
+- **Pluggable persistence** — bring your own storage (IDB, encrypted, OPFS) via simple JS interface
 - **Remote search** — load pre-built indexes over HTTP with slice caching
 - **IPFS support** — load indexes from IPFS via JavaScript fetch callbacks
 - **15+ language stemmers** — English, German, French, Spanish, Russian, Arabic, and more
@@ -59,21 +59,53 @@ const doc = await index.getDocument(
 // { title: "Rust Programming", body: "Rust is a systems language.", views: 1500 }
 ```
 
-### Persistent Index (IndexedDB)
+### Persistent Index (Custom Storage)
+
+Bring your own storage backend — IndexedDB, encrypted storage, OPFS, or anything async:
+
+```ts
+// Your storage must implement this interface:
+interface IFilesStorage {
+  write(name: string, buffer: ArrayBuffer): Promise<void>;
+  get(name: string): Promise<ArrayBuffer | null>;
+  delete(names: string[]): Promise<void>;
+  list(): Promise<string[]>;
+}
+```
 
 ```js
-// Create — auto-saves changed files to IDB on each commit
-const index = await LocalIndex.createPersistent("my-index", schema);
+// Create with custom storage — auto-saves changed files on each commit
+const index = await LocalIndex.withStorage(myStorage, schema);
 await index.addDocuments(docs);
-await index.commit(); // only new segment files written to IDB
+await index.commit(); // only new segment files written to storage
 
-// Later, on page reload:
-const index = await LocalIndex.open("my-index");
+// Later (page reload) — same call reopens if storage has files
+const index = await LocalIndex.withStorage(myStorage, schema);
 const results = await index.search("rust", 10); // works immediately
+```
 
-// Management
-await LocalIndex.exists("my-index"); // true
-await LocalIndex.deleteIndex("my-index");
+A simple IndexedDB implementation:
+
+```js
+class IdbStorage {
+  constructor(name) {
+    this.prefix = `idx:${name}:`;
+  }
+  async write(name, buffer) {
+    /* idb put this.prefix + name → buffer */
+  }
+  async get(name) {
+    /* idb get this.prefix + name */
+  }
+  async delete(names) {
+    /* idb delete each this.prefix + name */
+  }
+  async list() {
+    /* idb getAllKeys matching this.prefix, strip prefix */
+  }
+}
+
+const index = await LocalIndex.withStorage(new IdbStorage("articles"), schema);
 ```
 
 ### Remote Index (HTTP)
@@ -99,22 +131,19 @@ const doc = await index.get_document(
 
 ### `LocalIndex`
 
-| Method                                     | Description                             |
-| ------------------------------------------ | --------------------------------------- |
-| `LocalIndex.create(sdl)`                   | Create in-memory index from SDL schema  |
-| `LocalIndex.createPersistent(name, sdl)`   | Create IndexedDB-backed index           |
-| `LocalIndex.open(name)`                    | Open existing persistent index from IDB |
-| `LocalIndex.deleteIndex(name)`             | Delete persistent index from IDB        |
-| `LocalIndex.exists(name)`                  | Check if persistent index exists in IDB |
-| `index.addDocument(json)`                  | Add a single document                   |
-| `index.addDocuments(jsonArray)`            | Add multiple documents, returns count   |
-| `index.commit()`                           | Commit pending docs (builds segments)   |
-| `index.search(query, limit)`               | Search with BM25 ranking                |
-| `index.searchOffset(query, limit, offset)` | Search with pagination                  |
-| `index.getDocument(segmentId, docId)`      | Retrieve stored document                |
-| `index.numDocs()`                          | Count of committed documents            |
-| `index.pendingDocs()`                      | Count of uncommitted documents          |
-| `index.fieldNames()`                       | List of field names                     |
+| Method                                     | Description                                        |
+| ------------------------------------------ | -------------------------------------------------- |
+| `LocalIndex.create(sdl)`                   | Create in-memory index from SDL schema             |
+| `LocalIndex.withStorage(storage, sdl)`     | Create or open index with pluggable storage        |
+| `index.addDocument(json)`                  | Add a single document                              |
+| `index.addDocuments(jsonArray)`            | Add multiple documents, returns count              |
+| `index.commit()`                           | Commit pending docs, sync to storage if configured |
+| `index.search(query, limit)`               | Search with BM25 ranking                           |
+| `index.searchOffset(query, limit, offset)` | Search with pagination                             |
+| `index.getDocument(segmentId, docId)`      | Retrieve stored document                           |
+| `index.numDocs()`                          | Count of committed documents                       |
+| `index.pendingDocs()`                      | Count of uncommitted documents                     |
+| `index.fieldNames()`                       | List of field names                                |
 
 ### `RemoteIndex`
 
@@ -223,7 +252,8 @@ Browser JS
     ├── LocalIndex (create/index/search in WASM)
     │       └── WasmIndexWriter → SegmentBuilder → RamDirectory
     │                                                   │
-    │                                         [per-file IndexedDB records]
+    │                                         [pluggable IFilesStorage]
+    │                                         (IDB, encrypted, OPFS, ...)
     │
     ├── RemoteIndex (HTTP range requests)
     │       └── Searcher → SliceCachingDirectory → HttpDirectory

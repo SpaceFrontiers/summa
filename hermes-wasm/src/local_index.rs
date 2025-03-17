@@ -1,11 +1,18 @@
 //! In-browser index with create, index, search capabilities.
 //!
-//! Supports two storage modes:
+//! Supports two modes:
 //! - **In-memory** (`LocalIndex.create`) — fast, lost on page refresh
-//! - **Persistent** (`LocalIndex.createPersistent` / `LocalIndex.open`) — backed by IndexedDB
+//! - **Persistent** (`LocalIndex.withStorage`) — pluggable storage backend
 //!
-//! Persistent storage uses per-file IDB records: each segment file gets its
-//! own key, so commits only write new/changed files (not the whole index).
+//! Storage implements a simple JS interface:
+//! ```ts
+//! interface IFilesStorage {
+//!     write(name: string, buffer: ArrayBuffer): Promise<void>;
+//!     get(name: string): Promise<ArrayBuffer | null>;
+//!     delete(names: string[]): Promise<void>;
+//!     list(): Promise<string[]>;
+//! }
+//! ```
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,34 +21,108 @@ use std::sync::Arc;
 use hermes_core::directories::RamDirectory;
 use hermes_core::{IndexConfig, Searcher, WasmIndexWriter};
 use serde::Serialize;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-
-use crate::idb;
+use wasm_bindgen_futures::JsFuture;
 
 /// Default term cache blocks for WASM searcher.
 const WASM_TERM_CACHE_BLOCKS: usize = 32;
 
-/// IDB object store for persisted index files.
-const IDB_INDEX_STORE: &str = "indexes";
+/// Wraps a JS object implementing `IFilesStorage`.
+struct JsStorageAdapter {
+    write_fn: js_sys::Function,
+    get_fn: js_sys::Function,
+    delete_fn: js_sys::Function,
+    list_fn: js_sys::Function,
+}
+
+impl JsStorageAdapter {
+    fn from_js(storage: &JsValue) -> Result<Self, JsValue> {
+        let write_fn = js_sys::Reflect::get(storage, &"write".into())?
+            .dyn_into::<js_sys::Function>()
+            .map_err(|_| JsValue::from_str("storage.write must be a function"))?;
+        let get_fn = js_sys::Reflect::get(storage, &"get".into())?
+            .dyn_into::<js_sys::Function>()
+            .map_err(|_| JsValue::from_str("storage.get must be a function"))?;
+        let delete_fn = js_sys::Reflect::get(storage, &"delete".into())?
+            .dyn_into::<js_sys::Function>()
+            .map_err(|_| JsValue::from_str("storage.delete must be a function"))?;
+        let list_fn = js_sys::Reflect::get(storage, &"list".into())?
+            .dyn_into::<js_sys::Function>()
+            .map_err(|_| JsValue::from_str("storage.list must be a function"))?;
+        Ok(Self {
+            write_fn,
+            get_fn,
+            delete_fn,
+            list_fn,
+        })
+    }
+
+    async fn write(&self, name: &str, data: &[u8]) -> Result<(), JsValue> {
+        let this = JsValue::NULL;
+        let js_name = JsValue::from_str(name);
+        let js_buffer = js_sys::Uint8Array::from(data).buffer();
+        let promise = self.write_fn.call2(&this, &js_name, &js_buffer)?;
+        JsFuture::from(js_sys::Promise::from(promise)).await?;
+        Ok(())
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, JsValue> {
+        let this = JsValue::NULL;
+        let js_name = JsValue::from_str(name);
+        let promise = self.get_fn.call1(&this, &js_name)?;
+        let result = JsFuture::from(js_sys::Promise::from(promise)).await?;
+        if result.is_null() || result.is_undefined() {
+            return Ok(None);
+        }
+        let array = js_sys::Uint8Array::new(&result);
+        Ok(Some(array.to_vec()))
+    }
+
+    async fn delete(&self, names: &[String]) -> Result<(), JsValue> {
+        let this = JsValue::NULL;
+        let js_array = js_sys::Array::new();
+        for name in names {
+            js_array.push(&JsValue::from_str(name));
+        }
+        let promise = self.delete_fn.call1(&this, &js_array)?;
+        JsFuture::from(js_sys::Promise::from(promise)).await?;
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<String>, JsValue> {
+        let this = JsValue::NULL;
+        let promise = self.list_fn.call0(&this)?;
+        let result = JsFuture::from(js_sys::Promise::from(promise)).await?;
+        let array: js_sys::Array = result
+            .dyn_into()
+            .map_err(|_| JsValue::from_str("storage.list() must return an array of strings"))?;
+        let mut files = Vec::with_capacity(array.length() as usize);
+        for i in 0..array.length() {
+            if let Some(s) = array.get(i).as_string() {
+                files.push(s);
+            }
+        }
+        Ok(files)
+    }
+}
 
 /// In-browser local index — create, index documents, search, all in WASM.
 ///
 /// ```js
 /// // In-memory (ephemeral)
-/// const index = await LocalIndex.create("index articles { field title: text<en_stem> [indexed, stored] }");
+/// const index = await LocalIndex.create("index articles { ... }");
 ///
-/// // Persistent (IndexedDB-backed)
-/// const index = await LocalIndex.createPersistent("my-index", "index articles { ... }");
-/// // ... later, on page reload:
-/// const index = await LocalIndex.open("my-index");
+/// // With pluggable storage (IDB, encrypted, remote, etc.)
+/// const index = await LocalIndex.withStorage(myStorage, "index articles { ... }");
 /// ```
 #[wasm_bindgen]
 pub struct LocalIndex {
     writer: Option<WasmIndexWriter<RamDirectory>>,
     searcher: Option<Searcher<RamDirectory>>,
-    /// Name for IDB persistence (None = in-memory only)
-    persist_name: Option<String>,
-    /// File paths already in IDB (for incremental sync)
+    /// JS storage adapter (None = in-memory only)
+    storage: Option<JsStorageAdapter>,
+    /// File paths already persisted (for incremental sync)
     persisted_files: HashSet<String>,
 }
 
@@ -49,95 +130,75 @@ pub struct LocalIndex {
 impl LocalIndex {
     /// Create a new in-memory index from an SDL schema string.
     ///
-    /// Data is lost on page refresh. Use `createPersistent()` for IndexedDB-backed storage.
+    /// Data is lost on page refresh. Use `withStorage()` for persistence.
     #[wasm_bindgen]
     pub async fn create(schema_sdl: String) -> Result<LocalIndex, JsValue> {
-        Self::create_inner(schema_sdl, None).await
-    }
-
-    /// Create a new persistent index backed by IndexedDB.
-    ///
-    /// Each file in the index gets its own IDB record — commits only write
-    /// new/changed files, not the entire index.
-    /// Use `LocalIndex.open(name)` to reopen it after page refresh.
-    #[wasm_bindgen(js_name = "createPersistent")]
-    pub async fn create_persistent(
-        name: String,
-        schema_sdl: String,
-    ) -> Result<LocalIndex, JsValue> {
-        Self::create_inner(schema_sdl, Some(name)).await
-    }
-
-    /// Open an existing persistent index from IndexedDB.
-    ///
-    /// Loads the file manifest and all index files into a RamDirectory.
-    #[wasm_bindgen]
-    pub async fn open(name: String) -> Result<LocalIndex, JsValue> {
-        let manifest_key = idb_key(&name, "__manifest");
-        let manifest_data = idb::idb_get_from_store(IDB_INDEX_STORE, &manifest_key)
-            .await?
-            .ok_or_else(|| {
-                JsValue::from_str(&format!("Index '{}' not found in IndexedDB", name))
-            })?;
-
-        let manifest_str = String::from_utf8(manifest_data)
-            .map_err(|e| JsValue::from_str(&format!("Manifest decode error: {}", e)))?;
-        let file_paths: Vec<&str> = manifest_str.lines().filter(|l| !l.is_empty()).collect();
-
-        // Load each file from IDB into RamDirectory
-        let dir = RamDirectory::new();
-        for path_str in &file_paths {
-            let key = idb_key(&name, path_str);
-            if let Some(data) = idb::idb_get_from_store(IDB_INDEX_STORE, &key).await? {
-                dir.write_sync(Path::new(path_str), &data)
-                    .map_err(|e| JsValue::from_str(&format!("Write error: {}", e)))?;
-            }
-        }
-
-        let config = IndexConfig {
-            max_indexing_memory_bytes: 32 * 1024 * 1024,
-            ..IndexConfig::default()
-        };
-
-        let writer = WasmIndexWriter::open(dir.clone(), config)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Open error: {}", e)))?;
-
-        let persisted_files: HashSet<String> = file_paths.iter().map(|s| s.to_string()).collect();
-
-        let mut index = LocalIndex {
+        let writer = Self::make_writer(&schema_sdl).await?;
+        Ok(LocalIndex {
             writer: Some(writer),
             searcher: None,
-            persist_name: Some(name),
-            persisted_files,
-        };
-        index.refresh_searcher().await?;
-        Ok(index)
+            storage: None,
+            persisted_files: HashSet::new(),
+        })
     }
 
-    /// Delete a persistent index from IndexedDB.
-    #[wasm_bindgen(js_name = "deleteIndex")]
-    pub async fn delete_index(name: String) -> Result<(), JsValue> {
-        // Load manifest to find all file keys
-        let manifest_key = idb_key(&name, "__manifest");
-        if let Some(manifest_data) = idb::idb_get_from_store(IDB_INDEX_STORE, &manifest_key).await?
-        {
-            if let Ok(manifest_str) = String::from_utf8(manifest_data) {
-                for path_str in manifest_str.lines().filter(|l| !l.is_empty()) {
-                    let key = idb_key(&name, path_str);
-                    idb::idb_delete_from_store(IDB_INDEX_STORE, &key).await?;
+    /// Create or open an index with a pluggable storage backend.
+    ///
+    /// If the storage already contains index files, the index is reopened.
+    /// Otherwise a new index is created from the SDL schema.
+    ///
+    /// The storage object must implement:
+    /// ```ts
+    /// interface IFilesStorage {
+    ///     write(name: string, buffer: ArrayBuffer): Promise<void>;
+    ///     get(name: string): Promise<ArrayBuffer | null>;
+    ///     delete(names: string[]): Promise<void>;
+    ///     list(): Promise<string[]>;
+    /// }
+    /// ```
+    #[wasm_bindgen(js_name = "withStorage")]
+    pub async fn with_storage(storage: JsValue, schema_sdl: String) -> Result<LocalIndex, JsValue> {
+        let adapter = JsStorageAdapter::from_js(&storage)?;
+        let existing_files = adapter.list().await?;
+
+        if existing_files.is_empty() {
+            // New index
+            let writer = Self::make_writer(&schema_sdl).await?;
+            Ok(LocalIndex {
+                writer: Some(writer),
+                searcher: None,
+                storage: Some(adapter),
+                persisted_files: HashSet::new(),
+            })
+        } else {
+            // Reopen from storage
+            let dir = RamDirectory::new();
+            for file_name in &existing_files {
+                if let Some(data) = adapter.get(file_name).await? {
+                    dir.write_sync(Path::new(file_name), &data)
+                        .map_err(|e| JsValue::from_str(&format!("Write error: {}", e)))?;
                 }
             }
-        }
-        idb::idb_delete_from_store(IDB_INDEX_STORE, &manifest_key).await
-    }
 
-    /// Check if a persistent index exists in IndexedDB.
-    #[wasm_bindgen]
-    pub async fn exists(name: String) -> Result<bool, JsValue> {
-        let manifest_key = idb_key(&name, "__manifest");
-        let data = idb::idb_get_from_store(IDB_INDEX_STORE, &manifest_key).await?;
-        Ok(data.is_some())
+            let config = IndexConfig {
+                max_indexing_memory_bytes: 32 * 1024 * 1024,
+                ..IndexConfig::default()
+            };
+            let writer = WasmIndexWriter::open(dir.clone(), config)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Open error: {}", e)))?;
+
+            let persisted_files: HashSet<String> = existing_files.into_iter().collect();
+
+            let mut index = LocalIndex {
+                writer: Some(writer),
+                searcher: None,
+                storage: Some(adapter),
+                persisted_files,
+            };
+            index.refresh_searcher().await?;
+            Ok(index)
+        }
     }
 
     /// Add a single document (JSON object with field names matching the schema).
@@ -188,7 +249,7 @@ impl LocalIndex {
 
     /// Commit pending documents — builds segments and updates metadata.
     ///
-    /// For persistent indexes, only writes new/changed files to IndexedDB.
+    /// For persistent indexes, only writes new/changed files to storage.
     #[wasm_bindgen]
     pub async fn commit(&mut self) -> Result<bool, JsValue> {
         let writer = self
@@ -203,11 +264,7 @@ impl LocalIndex {
 
         if committed {
             self.refresh_searcher().await?;
-
-            // Sync only new/changed files to IDB
-            if self.persist_name.is_some() {
-                self.sync_to_idb().await?;
-            }
+            self.sync_to_storage().await?;
         }
 
         Ok(committed)
@@ -296,30 +353,18 @@ impl LocalIndex {
 
     // ── Internal helpers ──
 
-    async fn create_inner(
-        schema_sdl: String,
-        persist_name: Option<String>,
-    ) -> Result<LocalIndex, JsValue> {
-        let index_def = hermes_core::parse_single_index(&schema_sdl)
+    async fn make_writer(schema_sdl: &str) -> Result<WasmIndexWriter<RamDirectory>, JsValue> {
+        let index_def = hermes_core::parse_single_index(schema_sdl)
             .map_err(|e| JsValue::from_str(&format!("Schema parse error: {}", e)))?;
-
         let schema = index_def.to_schema();
         let dir = RamDirectory::new();
         let config = IndexConfig {
             max_indexing_memory_bytes: 32 * 1024 * 1024,
             ..IndexConfig::default()
         };
-
-        let writer = WasmIndexWriter::create(dir, schema, config)
+        WasmIndexWriter::create(dir, schema, config)
             .await
-            .map_err(|e| JsValue::from_str(&format!("Create error: {}", e)))?;
-
-        Ok(LocalIndex {
-            writer: Some(writer),
-            searcher: None,
-            persist_name,
-            persisted_files: HashSet::new(),
-        })
+            .map_err(|e| JsValue::from_str(&format!("Create error: {}", e)))
     }
 
     async fn refresh_searcher(&mut self) -> Result<(), JsValue> {
@@ -345,12 +390,14 @@ impl LocalIndex {
         Ok(())
     }
 
-    /// Sync new/changed files to IDB. Each file gets its own IDB record
-    /// keyed by `index:{name}:{path}`. Only files not in `persisted_files`
-    /// are written (plus metadata.json which changes every commit).
-    async fn sync_to_idb(&mut self) -> Result<(), JsValue> {
+    /// Sync new/changed files to storage (if any).
+    async fn sync_to_storage(&mut self) -> Result<(), JsValue> {
+        let adapter = match &self.storage {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+
         let writer = self.writer.as_ref().unwrap();
-        let name = self.persist_name.as_ref().unwrap();
         let dir = writer.directory();
 
         let current_files = dir
@@ -362,37 +409,29 @@ impl LocalIndex {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        // Write new files (not yet in IDB) and metadata.json (always changes)
+        // Write new files and metadata.json (always changes on commit)
         for path in &current_files {
             let path_str = path.to_string_lossy();
             if !self.persisted_files.contains(path_str.as_ref()) || path_str == "metadata.json" {
                 let data = dir
                     .read_file_sync(path)
                     .map_err(|e| JsValue::from_str(&format!("Read error: {}", e)))?;
-                let key = idb_key(name, &path_str);
-                idb::idb_put_to_store(IDB_INDEX_STORE, &key, &data).await?;
+                adapter.write(&path_str, &data).await?;
             }
         }
 
-        // Delete removed files from IDB (e.g. after merge)
-        for old_path in &self.persisted_files {
-            if !current_set.contains(old_path) {
-                let key = idb_key(name, old_path);
-                idb::idb_delete_from_store(IDB_INDEX_STORE, &key).await?;
-            }
+        // Delete removed files (e.g. after merge)
+        let removed: Vec<String> = self
+            .persisted_files
+            .iter()
+            .filter(|p| !current_set.contains(p.as_str()))
+            .cloned()
+            .collect();
+        if !removed.is_empty() {
+            adapter.delete(&removed).await?;
         }
-
-        // Update manifest
-        let manifest = current_set.iter().cloned().collect::<Vec<_>>().join("\n");
-        let manifest_key = idb_key(name, "__manifest");
-        idb::idb_put_to_store(IDB_INDEX_STORE, &manifest_key, manifest.as_bytes()).await?;
 
         self.persisted_files = current_set;
         Ok(())
     }
-}
-
-/// Build an IDB key for a named index file.
-fn idb_key(index_name: &str, file_path: &str) -> String {
-    format!("index:{}:{}", index_name, file_path)
 }
