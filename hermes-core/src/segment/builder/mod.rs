@@ -8,11 +8,13 @@
 //! - **Parallel posting serialization**: Rayon parallel sort + serialize
 //! - **Inline posting fast path**: Small terms skip PostingList/BlockPostingList entirely
 
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) mod bmp;
 mod config;
 mod dense;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) mod graph_bisection;
 mod postings;
 mod sparse;

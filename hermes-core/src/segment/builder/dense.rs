@@ -10,7 +10,9 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::Result;
-use crate::dsl::{DenseVectorQuantization, Field, Schema, VectorIndexType};
+#[cfg(feature = "native")]
+use crate::dsl::VectorIndexType;
+use crate::dsl::{DenseVectorQuantization, Field, Schema};
 use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
 use crate::segment::vector_data::FlatVectorData;
 
