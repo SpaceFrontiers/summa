@@ -91,6 +91,21 @@ jobs:
       - name: Build WASM
         run: cd hermes-wasm && wasm-pack build --release --target web
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: hermes-wasm/package-lock.json
+
+      - name: Install dependencies
+        working-directory: hermes-wasm
+        run: npm ci
+
+      - name: Run tests
+        working-directory: hermes-wasm
+        run: npm test
+
   # Python lint - fast, no compilation
   python:
     name: Python Lint

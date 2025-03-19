@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  cargo-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command: cargo build --release
+    volumes:
+      - .:/app
+      - rustuser-home:/home/rustuser
+
+  build-hermes-wasm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app/hermes-wasm
+    command: bash build.sh
+    volumes:
+      - .:/app
+      - rustuser-home:/home/rustuser
+
+volumes:
+  rustuser-home:

@@ -213,6 +213,13 @@ cd hermes-wasm && bash build.sh
 cd hermes-core-python && maturin build --release
 ```
 
+Alternatively you may build everything in docker via `docker compose`.
+
+Examples:
+
+- `docker compose run --rm cargo-build`
+- `docker compose run --rm build-hermes-wasm`
+
 ### Testing
 
 ```bash

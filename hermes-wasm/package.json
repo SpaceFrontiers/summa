@@ -1,0 +1,17 @@
+{
+  "name": "hermes-wasm",
+  "version": "1.0.0",
+  "description": "WebAssembly bindings for the [Hermes](https://github.com/SpaceFrontiers/hermes) search engine. Run a full-text search engine entirely in the browser — including indexing, BM25 ranking, and document storage.",
+  "main": "index.js",
+  "directories": {
+    "example": "examples"
+  },
+  "scripts": {
+    "test": "vitest"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  }
+}
