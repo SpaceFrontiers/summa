@@ -89,7 +89,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM
-        run: cd hermes-wasm && wasm-pack build --release --target web
+        run: cd hermes-wasm && bash build.sh
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
