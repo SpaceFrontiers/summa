@@ -149,12 +149,32 @@ impl ScoreCollector {
         self.heap.is_empty()
     }
 
-    /// Convert to sorted top-k results (descending by score)
+    /// Seed the threshold from a cross-segment shared value.
+    ///
+    /// Pre-fills the heap with `k` dummy entries at the given score so that
+    /// pruning kicks in immediately. Only has effect if called before any
+    /// real inserts and `initial_threshold > 0.0`.
+    pub fn seed_threshold(&mut self, initial_threshold: f32) {
+        if initial_threshold > 0.0 && self.heap.is_empty() {
+            for _ in 0..self.k {
+                self.heap.push(HeapEntry {
+                    doc_id: u32::MAX,
+                    score: initial_threshold,
+                    ordinal: 0,
+                });
+            }
+            self.update_threshold();
+        }
+    }
+
+    /// Convert to sorted top-k results (descending by score).
+    /// Filters out sentinel entries (doc_id == u32::MAX) from threshold seeding.
     pub fn into_sorted_results(self) -> Vec<(DocId, f32, u16)> {
         let mut results: Vec<(DocId, f32, u16)> = self
             .heap
             .into_vec()
             .into_iter()
+            .filter(|e| e.doc_id != u32::MAX)
             .map(|e| (e.doc_id, e.score, e.ordinal))
             .collect();
 
@@ -188,7 +208,7 @@ pub struct MaxScoreExecutor<'a> {
     cursors: Vec<TermCursor<'a>>,
     prefix_sums: Vec<f32>,
     collector: ScoreCollector,
-    heap_factor: f32,
+    inv_heap_factor: f32,
     predicate: Option<super::DocPredicate<'a>>,
 }
 
@@ -228,11 +248,16 @@ enum CursorVariant<'a> {
     Text {
         list: crate::structures::BlockPostingList,
         idf: f32,
-        /// Precomputed: BM25_B / max(avg_field_len, 1.0)
-        b_over_avgfl: f32,
-        /// Precomputed: 1.0 - BM25_B
-        one_minus_b: f32,
-        tfs: Vec<u32>, // temp decode buffer, converted to scores
+        /// Precomputed: idf * (BM25_K1 + 1.0) — numerator scale factor
+        idf_times_k1_plus_1: f32,
+        /// Precomputed: 1.0 + BM25_K1 * (BM25_B / avg_field_len) — denominator tf coefficient
+        denom_tf_coeff: f32,
+        /// Precomputed: BM25_K1 * (1.0 - BM25_B) — denominator constant
+        denom_const: f32,
+        tfs: Vec<u32>,
+        /// Deferred TF decode state: (block_offset, tf_start, count).
+        /// Set when doc_ids are decoded but TFs/scores are not yet computed.
+        deferred_tf: Option<(usize, usize, usize)>,
     },
     /// Sparse vector — mmap'd SparseIndex (skip entries + block data)
     Sparse {
@@ -258,26 +283,12 @@ macro_rules! cursor_ensure_block {
         match &mut $self.variant {
             CursorVariant::Text {
                 list,
-                idf,
-                b_over_avgfl,
-                one_minus_b,
-                tfs,
+                deferred_tf,
+                ..
             } => {
-                if list.decode_block_into($self.block_idx, &mut $self.doc_ids, tfs) {
-                    let idf_val = *idf;
-                    let b_avg = *b_over_avgfl;
-                    let one_b = *one_minus_b;
+                if let Some(state) = list.decode_block_doc_ids_only($self.block_idx, &mut $self.doc_ids) {
+                    *deferred_tf = Some(state);
                     $self.scores.clear();
-                    $self.scores.reserve(tfs.len());
-                    // Precomputed BM25: length_norm = one_minus_b + b_over_avgfl * tf
-                    // (tf is used as both term frequency and doc length — a known approx)
-                    for &tf in tfs.iter() {
-                        let tf = tf as f32;
-                        let length_norm = one_b + b_avg * tf;
-                        let tf_norm = (tf * (super::BM25_K1 + 1.0))
-                            / (tf + super::BM25_K1 * length_norm);
-                        $self.scores.push(idf_val * tf_norm);
-                    }
                     $self.pos = 0;
                     $self.block_loaded = true;
                     Ok(true)
@@ -377,9 +388,11 @@ impl<'a> TermCursor<'a> {
             variant: CursorVariant::Text {
                 list: posting_list,
                 idf,
-                b_over_avgfl: super::BM25_B / safe_avg,
-                one_minus_b: 1.0 - super::BM25_B,
+                idf_times_k1_plus_1: idf * (super::BM25_K1 + 1.0),
+                denom_tf_coeff: 1.0 + super::BM25_K1 * (super::BM25_B / safe_avg),
+                denom_const: super::BM25_K1 * (1.0 - super::BM25_B),
                 tfs: Vec::with_capacity(128),
+                deferred_tf: None,
             },
         }
     }
@@ -497,6 +510,18 @@ impl<'a> TermCursor<'a> {
         unsafe { *self.scores.get_unchecked(self.pos) }
     }
 
+    /// Ensure BM25 scores are computed for the current block (lazy TF decode).
+    ///
+    /// For text cursors, TF unpacking and BM25 scoring are deferred from block
+    /// loading until this method is called, saving work for blocks skipped by
+    /// block-max or conjunction pruning. No-op for sparse cursors.
+    #[inline]
+    pub fn ensure_scores(&mut self) {
+        if self.block_loaded && self.scores.is_empty() {
+            self.compute_deferred_scores();
+        }
+    }
+
     #[inline]
     pub fn current_block_max_score(&self) -> f32 {
         if self.exhausted {
@@ -543,6 +568,36 @@ impl<'a> TermCursor<'a> {
             }
         }
         self.doc()
+    }
+
+    /// Compute BM25 scores from deferred TF data (lazy decode for text cursors).
+    #[inline(never)]
+    fn compute_deferred_scores(&mut self) {
+        if let CursorVariant::Text {
+            list,
+            idf_times_k1_plus_1,
+            denom_tf_coeff,
+            denom_const,
+            tfs,
+            deferred_tf,
+            ..
+        } = &mut self.variant
+            && let Some((block_offset, tf_start, count)) = deferred_tf.take()
+        {
+            list.decode_block_tfs_deferred(block_offset, tf_start, count, tfs);
+            let num_scale = *idf_times_k1_plus_1;
+            let d_tf = *denom_tf_coeff;
+            let d_const = *denom_const;
+            self.scores.clear();
+            self.scores.resize(count, 0.0);
+            for i in 0..count {
+                let tf = unsafe { *tfs.get_unchecked(i) } as f32;
+                let score = (num_scale * tf) / (d_tf * tf + d_const);
+                unsafe {
+                    *self.scores.get_unchecked_mut(i) = score;
+                }
+            }
+        }
     }
 
     // ── Block loading / advance / seek ─────────────────────────────────
@@ -676,6 +731,9 @@ macro_rules! bms_execute_loop {
         let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
         let _bms_start = std::time::Instant::now();
 
+        let inv_heap_factor = $self.inv_heap_factor;
+        let mut adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
+
         loop {
             let partition = $self.find_partition();
             if partition >= n {
@@ -709,11 +767,6 @@ macro_rules! bms_execute_loop {
             } else {
                 0.0
             };
-            // Approximate retrieval: alpha < 1.0 raises the effective threshold,
-            // pruning more aggressively. Matches BMP alpha parameter semantics.
-            // Division: threshold / alpha > threshold when alpha < 1.0.
-            // Small epsilon guards against FP rounding in score accumulation.
-            let adjusted_threshold = $self.collector.threshold() / $self.heap_factor - 1e-6;
 
             // --- Conjunction optimization ---
             if $self.collector.len() >= $self.collector.k {
@@ -782,6 +835,7 @@ macro_rules! bms_execute_loop {
                 while mask != 0 {
                     let i = mask.trailing_zeros() as usize;
                     $self.cursors[i].$ensure() $($aw)* ?;
+                    $self.cursors[i].ensure_scores();
                     while $self.cursors[i].doc() == min_doc {
                         let ord = $self.cursors[i].ordinal_mut();
                         let sc = $self.cursors[i].score();
@@ -811,6 +865,7 @@ macro_rules! bms_execute_loop {
 
                 let doc = $self.cursors[i].$seek(min_doc) $($aw)* ?;
                 if doc == min_doc {
+                    $self.cursors[i].ensure_scores();
                     while $self.cursors[i].doc() == min_doc {
                         let s = $self.cursors[i].score();
                         running_total += s;
@@ -827,6 +882,7 @@ macro_rules! bms_execute_loop {
                 let (ord, score) = ordinal_scores[0];
                 if $self.collector.insert_with_ordinal(min_doc, score, ord) {
                     docs_scored += 1;
+                    adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
                 } else {
                     docs_skipped += 1;
                 }
@@ -849,6 +905,7 @@ macro_rules! bms_execute_loop {
                         .insert_with_ordinal(min_doc, score, current_ord)
                     {
                         docs_scored += 1;
+                        adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
                     } else {
                         docs_skipped += 1;
                     }
@@ -923,19 +980,21 @@ impl<'a> MaxScoreExecutor<'a> {
             prefix_sums.push(cumsum);
         }
 
+        let clamped_heap_factor = heap_factor.clamp(0.01, 1.0);
+
         debug!(
             "Creating MaxScoreExecutor: num_cursors={}, k={}, total_upper={:.4}, heap_factor={:.2}",
             cursors.len(),
             k,
             cumsum,
-            heap_factor
+            clamped_heap_factor
         );
 
         Self {
             cursors,
             prefix_sums,
             collector: ScoreCollector::new(k),
-            heap_factor: heap_factor.clamp(0.01, 1.0),
+            inv_heap_factor: 1.0 / clamped_heap_factor,
             predicate: None,
         }
     }
@@ -986,7 +1045,8 @@ impl<'a> MaxScoreExecutor<'a> {
     fn find_partition(&self) -> usize {
         // Alpha < 1.0 raises the effective threshold → more terms become
         // non-essential → more aggressive pruning (approximate retrieval).
-        let threshold = self.collector.threshold() / self.heap_factor;
+        // Use multiplication by reciprocal (cheaper than division).
+        let threshold = self.collector.threshold() * self.inv_heap_factor;
         self.prefix_sums.partition_point(|&sum| sum <= threshold)
     }
 
@@ -998,6 +1058,11 @@ impl<'a> MaxScoreExecutor<'a> {
     pub fn with_predicate(mut self, predicate: super::DocPredicate<'a>) -> Self {
         self.predicate = Some(predicate);
         self
+    }
+
+    /// Seed the collector with an initial threshold for tighter early pruning.
+    pub fn seed_threshold(&mut self, initial_threshold: f32) {
+        self.collector.seed_threshold(initial_threshold);
     }
 
     /// Execute Block-Max MaxScore and return top-k results (async).

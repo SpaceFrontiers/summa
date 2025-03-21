@@ -137,6 +137,17 @@ pub struct SegmentBuilder {
     /// Inverted index: term key -> posting list
     inverted_index: HashMap<TermKey, PostingListBuilder>,
 
+    /// Spill file for high-frequency posting lists (lazily created on first spill).
+    #[cfg(feature = "native")]
+    posting_spill_file: Option<BufWriter<File>>,
+    #[cfg(feature = "native")]
+    posting_spill_path: PathBuf,
+    /// Tracks spilled ranges per term key: (file_offset, posting_count).
+    #[cfg(feature = "native")]
+    posting_spill_index: HashMap<TermKey, Vec<(u64, u32)>>,
+    #[cfg(feature = "native")]
+    posting_spill_offset: u64,
+
     /// Streaming document store writer (native: temp file on disk, WASM: in-memory buffer)
     #[cfg(feature = "native")]
     store_file: BufWriter<File>,
@@ -207,7 +218,7 @@ impl SegmentBuilder {
     /// Create a new segment builder
     pub fn new(schema: Arc<Schema>, config: SegmentBuilderConfig) -> Result<Self> {
         #[cfg(feature = "native")]
-        let (store_file, store_path) = {
+        let (store_file, store_path, spill_path) = {
             let segment_id = uuid::Uuid::new_v4();
             let store_path = config
                 .temp_dir
@@ -220,7 +231,10 @@ impl SegmentBuilder {
                     .truncate(true)
                     .open(&store_path)?,
             );
-            (store_file, store_path)
+            let spill_path = config
+                .temp_dir
+                .join(format!("hermes_spill_{}.tmp", segment_id));
+            (store_file, store_path, spill_path)
         };
 
         // Count indexed fields, track positions, and auto-configure tokenizers
@@ -281,6 +295,14 @@ impl SegmentBuilder {
             tokenizers,
             term_interner: Rodeo::new(),
             inverted_index: HashMap::with_capacity(config.posting_map_capacity),
+            #[cfg(feature = "native")]
+            posting_spill_file: None,
+            #[cfg(feature = "native")]
+            posting_spill_path: spill_path,
+            #[cfg(feature = "native")]
+            posting_spill_index: HashMap::new(),
+            #[cfg(feature = "native")]
+            posting_spill_offset: 0,
             #[cfg(feature = "native")]
             store_file,
             #[cfg(feature = "native")]
@@ -684,6 +706,44 @@ impl SegmentBuilder {
                 hashbrown::hash_map::Entry::Occupied(mut o) => {
                     o.get_mut().add(doc_id, tf);
                     self.estimated_memory += size_of::<CompactPosting>();
+                    // Spill large posting lists to disk to reduce peak memory
+                    #[cfg(feature = "native")]
+                    if o.get().should_spill() {
+                        use byteorder::{LittleEndian, WriteBytesExt};
+
+                        let builder = o.get_mut();
+                        let count = builder.postings.len() as u32;
+                        let offset = self.posting_spill_offset;
+
+                        // Lazily create the spill file on first spill
+                        let spill_file = if let Some(ref mut f) = self.posting_spill_file {
+                            f
+                        } else {
+                            self.posting_spill_file = Some(BufWriter::with_capacity(
+                                256 * 1024,
+                                OpenOptions::new()
+                                    .create(true)
+                                    .write(true)
+                                    .truncate(true)
+                                    .open(&self.posting_spill_path)?,
+                            ));
+                            self.posting_spill_file.as_mut().unwrap()
+                        };
+                        for p in &builder.postings {
+                            spill_file.write_u32::<LittleEndian>(p.doc_id)?;
+                            spill_file.write_u16::<LittleEndian>(p.term_freq)?;
+                        }
+                        self.posting_spill_offset += count as u64 * 6;
+                        self.posting_spill_index
+                            .entry(term_key)
+                            .or_default()
+                            .push((offset, count));
+
+                        let freed = builder.postings.len() * size_of::<CompactPosting>();
+                        builder.spilled_count += count;
+                        builder.postings.clear();
+                        self.estimated_memory -= freed;
+                    }
                 }
                 hashbrown::hash_map::Entry::Vacant(v) => {
                     let mut posting = PostingListBuilder::new();
@@ -968,17 +1028,35 @@ impl SegmentBuilder {
 
         #[cfg(feature = "native")]
         {
+            if let Some(ref mut f) = self.posting_spill_file {
+                f.flush()?;
+            }
+            let posting_spill_index = std::mem::take(&mut self.posting_spill_index);
+            let mut spill_reader_opt = if !posting_spill_index.is_empty() {
+                let spill_file = std::fs::File::open(&self.posting_spill_path)?;
+                Some((std::io::BufReader::new(spill_file), posting_spill_index))
+            } else {
+                None
+            };
+
             let ((postings_result, store_result), ((vectors_result, sparse_result), fast_result)) =
                 rayon::join(
                     || {
                         rayon::join(
                             || {
+                                let spill_arg = spill_reader_opt.as_mut().map(|(r, idx)| {
+                                    (
+                                        r as &mut std::io::BufReader<std::fs::File>,
+                                        idx as &postings::SpillIndex,
+                                    )
+                                });
                                 postings::build_postings_streaming(
                                     inverted_index,
                                     term_interner,
                                     &position_offsets,
                                     &mut term_dict_writer,
                                     &mut postings_writer,
+                                    spill_arg,
                                 )
                             },
                             || {
@@ -1158,7 +1236,9 @@ fn build_fast_fields_streaming(
 #[cfg(feature = "native")]
 impl Drop for SegmentBuilder {
     fn drop(&mut self) {
-        // Cleanup temp files on drop
         let _ = std::fs::remove_file(&self.store_path);
+        if self.posting_spill_file.is_some() {
+            let _ = std::fs::remove_file(&self.posting_spill_path);
+        }
     }
 }

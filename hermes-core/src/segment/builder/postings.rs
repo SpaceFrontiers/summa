@@ -39,16 +39,31 @@ pub(super) struct CompactPosting {
     pub term_freq: u16,
 }
 
-/// In-memory posting list for a term
+/// Threshold for spilling posting lists to disk (postings per term).
+/// High-frequency terms exceeding this are spilled to a temp file to reduce
+/// peak memory. 16384 postings × 6 bytes = ~96KB per term before spill.
+#[cfg(feature = "native")]
+const SPILL_THRESHOLD: usize = 16384;
+
+/// In-memory posting list for a term, with optional spill-to-disk for large lists.
+///
+/// High-frequency terms (>SPILL_THRESHOLD postings) spill their accumulated
+/// postings to a temp file and continue accumulating in memory. During build,
+/// spilled and in-memory postings are merged.
 pub(super) struct PostingListBuilder {
-    /// In-memory postings
+    /// In-memory postings (tail — most recent docs)
     pub postings: Vec<CompactPosting>,
+    /// Number of postings spilled to disk (0 if no spill)
+    #[cfg(feature = "native")]
+    pub spilled_count: u32,
 }
 
 impl PostingListBuilder {
     pub fn new() -> Self {
         Self {
             postings: Vec::with_capacity(4),
+            #[cfg(feature = "native")]
+            spilled_count: 0,
         }
     }
 
@@ -68,8 +83,23 @@ impl PostingListBuilder {
         });
     }
 
+    /// Total posting count (in-memory + spilled)
     pub fn len(&self) -> usize {
-        self.postings.len()
+        #[cfg(feature = "native")]
+        {
+            self.spilled_count as usize + self.postings.len()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.postings.len()
+        }
+    }
+
+    /// Check if this posting list should be spilled to disk
+    #[cfg(feature = "native")]
+    #[inline]
+    pub fn should_spill(&self) -> bool {
+        self.postings.len() >= SPILL_THRESHOLD
     }
 }
 
@@ -113,17 +143,73 @@ pub(super) enum SerializedPosting {
 // Streaming build functions
 // ============================================================================
 
+/// Spill index entry: maps term keys to their spilled ranges on disk
+#[cfg(feature = "native")]
+pub(super) type SpillIndex = HashMap<TermKey, Vec<(u64, u32)>>;
+
 /// Stream postings directly to disk.
 ///
 /// Parallel serialization of posting lists, then sequential streaming of
 /// term dict and postings data directly to writers (no Vec<u8> accumulation).
+///
+/// When `spill_reader` is provided, large posting lists that were spilled to
+/// disk during indexing are loaded and merged with their in-memory tails.
 pub(super) fn build_postings_streaming(
     inverted_index: HashMap<TermKey, PostingListBuilder>,
     term_interner: Rodeo,
     position_offsets: &FxHashMap<Vec<u8>, (u64, u64)>,
     term_dict_writer: &mut dyn Write,
     postings_writer: &mut dyn Write,
+    #[cfg(feature = "native")] spill_reader: Option<(
+        &mut std::io::BufReader<std::fs::File>,
+        &SpillIndex,
+    )>,
 ) -> Result<()> {
+    // Phase 0 (native only): Load spilled postings back into PostingListBuilders.
+    // Spilled data (sorted by doc_id) is prepended before in-memory tail.
+    #[cfg(feature = "native")]
+    let inverted_index = {
+        let mut index = inverted_index;
+        if let Some((reader, spill_index)) = spill_reader {
+            use byteorder::{LittleEndian, ReadBytesExt};
+            use std::io::{Seek, SeekFrom};
+
+            // Flatten and sort by file offset for sequential I/O
+            let mut all_ranges: Vec<(TermKey, u64, u32)> = Vec::new();
+            for (term_key, ranges) in spill_index {
+                for &(offset, count) in ranges {
+                    all_ranges.push((*term_key, offset, count));
+                }
+            }
+            all_ranges.sort_unstable_by_key(|&(_, offset, _)| offset);
+
+            // Read sequentially, accumulate per-term
+            let mut per_term: HashMap<TermKey, Vec<CompactPosting>> = HashMap::new();
+            for (term_key, offset, count) in all_ranges {
+                reader.seek(SeekFrom::Start(offset))?;
+                let buf = per_term.entry(term_key).or_default();
+                for _ in 0..count {
+                    let doc_id = reader.read_u32::<LittleEndian>()?;
+                    let tf = reader.read_u16::<LittleEndian>()?;
+                    buf.push(CompactPosting {
+                        doc_id,
+                        term_freq: tf,
+                    });
+                }
+            }
+
+            // Prepend spilled postings before in-memory tails
+            for (term_key, mut spilled) in per_term {
+                if let Some(builder) = index.get_mut(&term_key) {
+                    spilled.append(&mut builder.postings);
+                    builder.postings = spilled;
+                    builder.spilled_count = 0;
+                }
+            }
+        }
+        index
+    };
+
     // Phase 1: Consume HashMap into sorted Vec (frees HashMap overhead)
     let mut term_entries: Vec<(Vec<u8>, PostingListBuilder)> = inverted_index
         .into_iter()

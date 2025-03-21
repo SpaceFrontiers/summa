@@ -204,7 +204,7 @@ macro_rules! boolean_plan {
                         posting_lists.push((pl, idf));
                     }
                 }
-                return finish_text_maxscore(posting_lists, avg_field_len, limit);
+                return finish_text_maxscore(posting_lists, avg_field_len, limit, reader);
             }
 
             // 2b. Sparse (single-field, all sparse term queries)
@@ -244,6 +244,7 @@ macro_rules! boolean_plan {
                             posting_lists,
                             *avg_field_len,
                             grouping.per_field_limit,
+                            reader,
                         )?);
                     }
                 }

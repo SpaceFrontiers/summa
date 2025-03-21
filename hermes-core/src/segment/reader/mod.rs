@@ -150,6 +150,10 @@ pub struct SegmentReader {
     positions_handle: Option<FileHandle>,
     /// Fast-field columnar readers per field_id
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+    /// Per-segment MaxScore threshold (f32 stored as AtomicU32 bits).
+    /// Allows per-field MaxScore groups within a single query to share thresholds:
+    /// field A's result seeds field B's pruning on the same segment.
+    shared_threshold: std::sync::atomic::AtomicU32,
 }
 
 impl SegmentReader {
@@ -243,7 +247,43 @@ impl SegmentReader {
             bmp_indexes,
             positions_handle,
             fast_fields,
+            shared_threshold: std::sync::atomic::AtomicU32::new(0),
         })
+    }
+
+    /// Reset the per-segment threshold (call before each new search).
+    #[inline]
+    pub fn reset_shared_threshold(&self) {
+        self.shared_threshold
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the per-segment MaxScore threshold.
+    #[inline]
+    pub fn shared_threshold_f32(&self) -> f32 {
+        f32::from_bits(
+            self.shared_threshold
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Update the threshold if new value is higher (monotonic max).
+    #[inline]
+    pub fn update_shared_threshold(&self, new_threshold: f32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let new_bits = new_threshold.to_bits();
+        let mut current_bits = self.shared_threshold.load(Relaxed);
+        while new_threshold > f32::from_bits(current_bits) {
+            match self.shared_threshold.compare_exchange_weak(
+                current_bits,
+                new_bits,
+                Relaxed,
+                Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current_bits = actual,
+            }
+        }
     }
 
     pub fn meta(&self) -> &SegmentMeta {

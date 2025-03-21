@@ -684,8 +684,26 @@ impl BlockPostingList {
         doc_ids: &mut Vec<u32>,
         tfs: &mut Vec<u32>,
     ) -> bool {
+        if let Some((offset, tf_start, count)) = self.decode_block_doc_ids_only(block_idx, doc_ids)
+        {
+            self.decode_block_tfs_deferred(offset, tf_start, count, tfs);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Decode only doc IDs from a block (no TF decoding).
+    ///
+    /// Returns `(block_data_offset, tf_start_within_block, count)` for deferred TF decode,
+    /// or `None` if block_idx is out of range.
+    pub fn decode_block_doc_ids_only(
+        &self,
+        block_idx: usize,
+        doc_ids: &mut Vec<u32>,
+    ) -> Option<(usize, usize, usize)> {
         if block_idx >= self.l0_count {
-            return false;
+            return None;
         }
 
         let (_, _, offset, _) = self.read_l0_entry(block_idx);
@@ -697,9 +715,7 @@ impl BlockPostingList {
         let count = u16::from_le_bytes(block_data[0..2].try_into().unwrap()) as usize;
         let first_doc = u32::from_le_bytes(block_data[2..6].try_into().unwrap());
         let doc_id_bits = block_data[6];
-        let tf_bits = block_data[7];
 
-        // Decode doc IDs: unpack deltas + prefix sum
         doc_ids.clear();
         doc_ids.resize(count, 0);
         doc_ids[0] = first_doc;
@@ -723,19 +739,33 @@ impl BlockPostingList {
             }
         }
 
-        // Decode TFs
+        let tfs_start = 8 + deltas_bytes;
+        Some((pos, tfs_start, count))
+    }
+
+    /// Decode TFs from a previously loaded block (deferred decode).
+    ///
+    /// `block_offset` and `tf_start` are returned by `decode_block_doc_ids_only`.
+    pub fn decode_block_tfs_deferred(
+        &self,
+        block_offset: usize,
+        tf_start: usize,
+        count: usize,
+        tfs: &mut Vec<u32>,
+    ) {
+        let blk_size = block_data_size(&self.stream, block_offset);
+        let block_data = &self.stream[block_offset..block_offset + blk_size];
+        let tf_bits = block_data[7];
+        let tf_rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+
         tfs.clear();
         tfs.resize(count, 0);
-        let tf_rounded = simd::RoundedBitWidth::from_u8(tf_bits);
-        let tfs_start = 8 + deltas_bytes;
         simd::unpack_rounded(
-            &block_data[tfs_start..tfs_start + count * tf_rounded.bytes_per_value()],
+            &block_data[tf_start..tf_start + count * tf_rounded.bytes_per_value()],
             tf_rounded,
             tfs,
             count,
         );
-
-        true
     }
 
     /// First doc_id of a block (from L0 skip entry). Returns `None` if out of range.

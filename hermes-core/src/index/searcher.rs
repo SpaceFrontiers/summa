@@ -472,6 +472,11 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
 
+        // Reset per-segment MaxScore thresholds from prior searches
+        for seg in &self.segments {
+            seg.reset_shared_threshold();
+        }
+
         // Use rayon + block_in_place for CPU-bound scoring (sync feature required).
         // Offloads the scoring loop from tokio workers so search doesn't starve
         // other async tasks. Works for any segment count (rayon degrades gracefully
