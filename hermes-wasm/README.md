@@ -131,43 +131,47 @@ const doc = await index.get_document(
 
 ### `LocalIndex`
 
-| Method                                     | Description                                        |
-| ------------------------------------------ | -------------------------------------------------- |
-| `LocalIndex.create(sdl)`                   | Create in-memory index from SDL schema             |
-| `LocalIndex.withStorage(storage, sdl)`     | Create or open index with pluggable storage        |
-| `index.addDocument(json)`                  | Add a single document                              |
-| `index.addDocuments(jsonArray)`            | Add multiple documents, returns count              |
-| `index.commit()`                           | Commit pending docs, sync to storage if configured |
-| `index.search(query, limit)`               | Search with BM25 ranking                           |
-| `index.searchOffset(query, limit, offset)` | Search with pagination                             |
-| `index.getDocument(segmentId, docId)`      | Retrieve stored document                           |
-| `index.numDocs()`                          | Count of committed documents                       |
-| `index.pendingDocs()`                      | Count of uncommitted documents                     |
-| `index.fieldNames()`                       | List of field names                                |
+| Method                                                  | Description                                        |
+| ------------------------------------------------------- | -------------------------------------------------- |
+| `LocalIndex.create(sdl)`                                | Create in-memory index from SDL schema             |
+| `LocalIndex.withStorage(storage, sdl)`                  | Create or open index with pluggable storage        |
+| `index.addDocument(json)`                               | Add a single document                              |
+| `index.addDocuments(jsonArray)`                         | Add multiple documents, returns count              |
+| `index.commit()`                                        | Commit pending docs, sync to storage if configured |
+| `index.search(query, limit)`                            | Search with BM25 ranking                           |
+| `index.searchOffset(query, limit, offset)`              | Search with pagination                             |
+| `index.searchStructured(request)`                       | Structured query with inline doc retrieval         |
+| `index.getDocument(segmentId, docId)`                   | Retrieve stored document                           |
+| `index.getDocumentWithFields(segmentId, docId, fields)` | Retrieve only specified fields                     |
+| `index.numDocs()`                                       | Count of committed documents                       |
+| `index.pendingDocs()`                                   | Count of uncommitted documents                     |
+| `index.fieldNames()`                                    | List of field names                                |
 
 ### `RemoteIndex`
 
-| Method                                      | Description                         |
-| ------------------------------------------- | ----------------------------------- |
-| `new RemoteIndex(url)`                      | Create remote index pointing to URL |
-| `RemoteIndex.with_cache_size(url, bytes)`   | Create with custom cache size       |
-| `index.load()`                              | Load index metadata and segments    |
-| `index.load_with_idb_cache()`               | Load with IndexedDB cache pre-fill  |
-| `index.search(query, limit)`                | Search                              |
-| `index.search_offset(query, limit, offset)` | Search with pagination              |
-| `index.get_document(segmentId, docId)`      | Retrieve document                   |
-| `index.num_docs()`                          | Document count                      |
-| `index.num_segments()`                      | Segment count                       |
-| `index.field_names()`                       | Field names                         |
-| `index.default_fields()`                    | Default search fields               |
-| `index.export_cache()`                      | Export slice cache as `Uint8Array`  |
-| `index.import_cache(data)`                  | Import previously exported cache    |
-| `index.save_cache_to_idb()`                 | Persist slice cache to IndexedDB    |
-| `index.load_cache_from_idb()`               | Restore cache from IndexedDB        |
-| `index.clear_idb_cache()`                   | Remove persisted cache              |
-| `index.cache_stats()`                       | Cache utilization info              |
-| `index.network_stats()`                     | HTTP request statistics             |
-| `index.reset_network_stats()`               | Clear network statistics            |
+| Method                                                     | Description                         |
+| ---------------------------------------------------------- | ----------------------------------- |
+| `new RemoteIndex(url)`                                     | Create remote index pointing to URL |
+| `RemoteIndex.with_cache_size(url, bytes)`                  | Create with custom cache size       |
+| `index.load()`                                             | Load index metadata and segments    |
+| `index.load_with_idb_cache()`                              | Load with IndexedDB cache pre-fill  |
+| `index.search(query, limit)`                               | Search                              |
+| `index.search_offset(query, limit, offset)`                | Search with pagination              |
+| `index.searchStructured(request)`                          | Structured query with inline docs   |
+| `index.get_document(segmentId, docId)`                     | Retrieve document                   |
+| `index.get_document_with_fields(segmentId, docId, fields)` | Retrieve only specified fields      |
+| `index.num_docs()`                                         | Document count                      |
+| `index.num_segments()`                                     | Segment count                       |
+| `index.field_names()`                                      | Field names                         |
+| `index.default_fields()`                                   | Default search fields               |
+| `index.export_cache()`                                     | Export slice cache as `Uint8Array`  |
+| `index.import_cache(data)`                                 | Import previously exported cache    |
+| `index.save_cache_to_idb()`                                | Persist slice cache to IndexedDB    |
+| `index.load_cache_from_idb()`                              | Restore cache from IndexedDB        |
+| `index.clear_idb_cache()`                                  | Remove persisted cache              |
+| `index.cache_stats()`                                      | Cache utilization info              |
+| `index.network_stats()`                                    | HTTP request statistics             |
+| `index.reset_network_stats()`                              | Clear network statistics            |
 
 ### `IpfsIndex`
 
@@ -184,6 +188,16 @@ Same API as `RemoteIndex` but loaded via JavaScript callbacks instead of HTTP:
 `sizeFn`: `(path: string) => Promise<number>`
 
 All other methods (`search`, `get_document`, `cache_stats`, etc.) are identical to `RemoteIndex`.
+
+### Logging
+
+Debug output is off by default (level: `warn`). Enable verbose logging for diagnostics:
+
+```js
+import { set_log_level } from "hermes-wasm";
+
+set_log_level("debug"); // "error" | "warn" | "info" | "debug" | "trace"
+```
 
 ### `IndexRegistry`
 
@@ -222,6 +236,46 @@ index <name> {
 | NOT    | `rust NOT unsafe`      | Exclude term                |
 | Group  | `(rust OR go) AND web` | Grouping                    |
 | Phrase | `"search engine"`      | Exact phrase                |
+
+### Structured Query API
+
+`searchStructured()` accepts a query object and returns hits with documents inline:
+
+```js
+const results = await index.searchStructured({
+  query: { term: { field: "title", value: "rust" } },
+  limit: 10,
+  offset: 0,
+  fieldsToLoad: ["title", "body"],
+});
+// { hits: [{ address, score, doc: { title: "...", body: "..." } }], total_hits }
+```
+
+**Query types:**
+
+```js
+// Term query (tokenized with field's stemmer)
+{ term: { field: "title", value: "rust" } }
+
+// Match query (tokenized, OR across tokens)
+{ match: { field: "body", text: "search engine" } }
+
+// Boolean query (recursive composition)
+{ boolean: {
+    must: [{ term: { field: "title", value: "rust" } }],
+    should: [{ match: { field: "body", text: "fast" } }],
+    mustNot: [{ term: { field: "title", value: "python" } }],
+} }
+
+// Prefix query
+{ prefix: { field: "title", value: "rus" } }
+
+// Sparse vector query (pre-tokenized)
+{ sparseVector: { field: "emb", indices: [1, 5, 10], values: [0.5, 0.3, 0.2] } }
+
+// Dense vector query (ANN)
+{ denseVector: { field: "emb", vector: [0.1, 0.2, 0.3], nprobe: 32 } }
+```
 
 ## Building
 

@@ -101,7 +101,7 @@ impl RemoteIndex {
         let mut idb_restored = false;
         if let Ok(Some(idb_data)) = idb_get(&idb_key).await {
             if cached_dir.deserialize(&idb_data).is_ok() {
-                web_sys::console::log_1(&"Restored slice cache from IndexedDB".into());
+                log::debug!("Restored slice cache from IndexedDB");
                 idb_restored = true;
             }
         }
@@ -228,25 +228,23 @@ impl RemoteIndex {
         limit: usize,
         offset: usize,
     ) -> Result<JsValue, JsValue> {
-        web_sys::console::log_1(
-            &format!("=== SEARCH START: '{}' offset={} ===", query_str, offset).into(),
-        );
-
         let searcher = self
             .searcher
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        // Log segment info
-        for (i, seg) in searcher.segment_readers().iter().enumerate() {
-            let stats = seg.term_dict_stats();
-            web_sys::console::log_1(
-                &format!(
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("=== SEARCH START: '{}' offset={} ===", query_str, offset);
+            for (i, seg) in searcher.segment_readers().iter().enumerate() {
+                let stats = seg.term_dict_stats();
+                log::debug!(
                     "  Segment {}: {} blocks, {} sparse entries, {} terms",
-                    i, stats.num_blocks, stats.num_sparse_entries, stats.num_entries
-                )
-                .into(),
-            );
+                    i,
+                    stats.num_blocks,
+                    stats.num_sparse_entries,
+                    stats.num_entries
+                );
+            }
         }
 
         // Reset network stats before search to see only this query's I/O
@@ -259,24 +257,23 @@ impl RemoteIndex {
             .await
             .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
 
-        // Log network stats after search
-        if let Some(directory) = &self.directory {
-            let stats = directory.inner().http_stats();
-            web_sys::console::log_1(
-                &format!(
+        if log::log_enabled!(log::Level::Debug) {
+            if let Some(directory) = &self.directory {
+                let stats = directory.inner().http_stats();
+                log::debug!(
                     "=== SEARCH END: {} requests, {} bytes ===",
-                    stats.total_requests, stats.total_bytes
-                )
-                .into(),
-            );
-            for op in &stats.operations {
-                web_sys::console::log_1(
-                    &format!(
-                        "  HTTP: {} bytes, {}ms, range={:?}, url={}",
-                        op.bytes, op.duration_ms, op.range, op.url
-                    )
-                    .into(),
+                    stats.total_requests,
+                    stats.total_bytes
                 );
+                for op in &stats.operations {
+                    log::debug!(
+                        "  HTTP: {} bytes, {}ms, range={:?}, url={}",
+                        op.bytes,
+                        op.duration_ms,
+                        op.range,
+                        op.url
+                    );
+                }
             }
         }
 
@@ -286,11 +283,51 @@ impl RemoteIndex {
             .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 
+    /// Structured search: accepts a query object instead of a query string.
+    #[wasm_bindgen(js_name = "searchStructured")]
+    pub async fn search_structured(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+        crate::query::execute_structured_search(searcher, request).await
+    }
+
     /// Get a document by its address (segment_id + doc_id)
     ///
     /// Returns the document as a JSON object, or null if not found.
     #[wasm_bindgen]
     pub async fn get_document(&self, segment_id: String, doc_id: u32) -> Result<JsValue, JsValue> {
+        self.get_document_inner(segment_id, doc_id, None).await
+    }
+
+    /// Get a document by its address, loading only the specified fields.
+    ///
+    /// `fields_to_load` is a JS array of field name strings, e.g. `["title", "body"]`.
+    /// Only the requested fields are returned (skips expensive reads for dense vectors).
+    #[wasm_bindgen(js_name = "getDocumentWithFields")]
+    pub async fn get_document_with_fields(
+        &self,
+        segment_id: String,
+        doc_id: u32,
+        fields_to_load: Vec<String>,
+    ) -> Result<JsValue, JsValue> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+
+        let field_ids = crate::resolve_field_ids(searcher.schema(), &fields_to_load)?;
+        self.get_document_inner(segment_id, doc_id, Some(field_ids))
+            .await
+    }
+
+    async fn get_document_inner(
+        &self,
+        segment_id: String,
+        doc_id: u32,
+        fields: Option<rustc_hash::FxHashSet<u32>>,
+    ) -> Result<JsValue, JsValue> {
         let searcher = self
             .searcher
             .as_ref()
@@ -301,7 +338,7 @@ impl RemoteIndex {
         let address = hermes_core::query::DocAddress::new(segment_id_u128, doc_id);
 
         let doc = searcher
-            .get_document(&address)
+            .get_document_with_fields(&address, fields.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
 

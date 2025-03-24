@@ -58,7 +58,31 @@ pub fn convert_query(
                     term_query.field, e.field_type
                 ));
             }
-            Ok(Box::new(TermQuery::text(field, &term_query.term)))
+            // Tokenize the term using the field's configured tokenizer so that
+            // stemmers (e.g. ru_stem) are applied, matching the indexing path.
+            let tokenizer_name = entry
+                .and_then(|e| e.tokenizer.as_deref())
+                .unwrap_or("simple");
+            let tokenizer = TOKENIZER_REGISTRY
+                .get(tokenizer_name)
+                .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
+            let tokens: Vec<String> = tokenizer
+                .tokenize(&term_query.term)
+                .into_iter()
+                .map(|t| t.text)
+                .collect();
+            if tokens.is_empty() {
+                return Err(format!("No tokens in term '{}'", term_query.term));
+            }
+            if tokens.len() == 1 {
+                Ok(Box::new(TermQuery::text(field, &tokens[0])))
+            } else {
+                let mut query = BooleanQuery::new();
+                for token in tokens {
+                    query = query.must(TermQuery::text(field, &token));
+                }
+                Ok(Box::new(query))
+            }
         }
         Some(ProtoQueryType::Match(match_query)) => {
             let field = schema

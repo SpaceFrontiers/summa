@@ -366,7 +366,7 @@ impl IpfsIndex {
         let mut idb_restored = false;
         if let Ok(Some(idb_data)) = idb_get(&idb_key).await {
             if cached_dir.deserialize(&idb_data).is_ok() {
-                web_sys::console::log_1(&"Restored slice cache from IndexedDB".into());
+                log::debug!("Restored slice cache from IndexedDB");
                 idb_restored = true;
             }
         }
@@ -517,9 +517,46 @@ impl IpfsIndex {
             .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 
+    /// Structured search: accepts a query object instead of a query string.
+    #[wasm_bindgen(js_name = "searchStructured")]
+    pub async fn search_structured(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+        crate::query::execute_structured_search(searcher, request).await
+    }
+
     /// Get a document by address
     #[wasm_bindgen]
     pub async fn get_document(&self, segment_id: String, doc_id: u32) -> Result<JsValue, JsValue> {
+        self.get_document_inner(segment_id, doc_id, None).await
+    }
+
+    /// Get a document by address, loading only the specified fields.
+    #[wasm_bindgen(js_name = "getDocumentWithFields")]
+    pub async fn get_document_with_fields(
+        &self,
+        segment_id: String,
+        doc_id: u32,
+        fields_to_load: Vec<String>,
+    ) -> Result<JsValue, JsValue> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+
+        let field_ids = crate::resolve_field_ids(searcher.schema(), &fields_to_load)?;
+        self.get_document_inner(segment_id, doc_id, Some(field_ids))
+            .await
+    }
+
+    async fn get_document_inner(
+        &self,
+        segment_id: String,
+        doc_id: u32,
+        fields: Option<rustc_hash::FxHashSet<u32>>,
+    ) -> Result<JsValue, JsValue> {
         let searcher = self
             .searcher
             .as_ref()
@@ -530,7 +567,7 @@ impl IpfsIndex {
         let address = hermes_core::query::DocAddress::new(segment_id_u128, doc_id);
 
         let doc = searcher
-            .get_document(&address)
+            .get_document_with_fields(&address, fields.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
 

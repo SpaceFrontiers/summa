@@ -403,3 +403,53 @@ async fn test_many_needles_all_found() {
         hay_per_batch * 4
     );
 }
+
+/// Test that Russian stemmer works end-to-end: indexing + search via query string.
+/// Regression test for https://github.com/SpaceFrontiers/hermes/issues/9
+#[tokio::test]
+async fn test_russian_stemmer_search() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field_with_tokenizer("title", true, true, "ru_stem");
+    let schema = schema_builder.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    let mut doc = Document::new();
+    doc.add_text(title, "бегущие собаки");
+    writer.add_document(doc).unwrap();
+
+    let mut doc = Document::new();
+    doc.add_text(title, "маленькая собака");
+    writer.add_document(doc).unwrap();
+
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+
+    // Exact word should match (stemmer maps "собаки" -> "собак")
+    let results = index.query("собаки", 10).await.unwrap();
+    assert!(
+        !results.hits.is_empty(),
+        "Russian stemmer: 'собаки' should match documents"
+    );
+
+    // Different inflection of same root should also match
+    let results = index.query("собака", 10).await.unwrap();
+    assert!(
+        !results.hits.is_empty(),
+        "Russian stemmer: 'собака' should match (same stem as 'собаки')"
+    );
+
+    // Field-qualified search should also work
+    let results = index.query("title:бегущие", 10).await.unwrap();
+    assert_eq!(
+        results.hits.len(),
+        1,
+        "Russian stemmer: field-qualified search should find 1 doc"
+    );
+}

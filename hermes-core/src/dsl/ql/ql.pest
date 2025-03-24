@@ -3,7 +3,7 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 // Basic tokens
-term = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+term = @{ (LETTER | NUMBER | "_" | "-")+ }
 quoted_string = @{ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }

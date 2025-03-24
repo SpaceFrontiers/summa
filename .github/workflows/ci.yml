@@ -85,8 +85,10 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install LLVM and wasm-pack
+        run: |
+          sudo apt-get update && sudo apt-get install -y llvm clang
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM
         run: cd hermes-wasm && bash build.sh

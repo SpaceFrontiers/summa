@@ -29,6 +29,7 @@ log = "0.4"
 console_log = "1.0"
 getrandom = { workspace = true }
 parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
 futures-channel = "0.3"
 
 [package.metadata.wasm-pack.profile.release]

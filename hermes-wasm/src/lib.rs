@@ -11,6 +11,7 @@
 mod idb;
 mod ipfs_index;
 mod local_index;
+mod query;
 mod registry;
 mod remote_index;
 
@@ -25,18 +26,42 @@ pub use remote_index::RemoteIndex;
 /// Default cache size: 10MB
 pub(crate) const DEFAULT_CACHE_SIZE: usize = 10 * 1024 * 1024;
 
-/// Initialize panic hook and logging
+/// Initialize panic hook and logging (defaults to Warn level)
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Debug).ok();
+    console_log::init_with_level(log::Level::Warn).ok();
 }
 
 /// Setup logging to browser console (can be called explicitly)
 #[wasm_bindgen]
 pub fn setup_logging() {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Debug).ok();
+    console_log::init_with_level(log::Level::Warn).ok();
+}
+
+/// Set log level: "error", "warn", "info", "debug", "trace", "off"
+#[wasm_bindgen]
+pub fn set_log_level(level: &str) {
+    let filter = level
+        .parse::<log::LevelFilter>()
+        .unwrap_or(log::LevelFilter::Warn);
+    log::set_max_level(filter);
+}
+
+/// Resolve field name strings to a set of field IDs.
+pub(crate) fn resolve_field_ids(
+    schema: &hermes_core::Schema,
+    names: &[String],
+) -> Result<rustc_hash::FxHashSet<u32>, JsValue> {
+    let mut ids = rustc_hash::FxHashSet::default();
+    for name in names {
+        let field = schema
+            .get_field(name)
+            .ok_or_else(|| JsValue::from_str(&format!("Unknown field: '{}'", name)))?;
+        ids.insert(field.0);
+    }
+    Ok(ids)
 }
 
 /// Fetch bytes from a URL using the Fetch API

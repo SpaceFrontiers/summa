@@ -301,9 +301,57 @@ impl LocalIndex {
             .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 
+    /// Structured search: accepts a query object instead of a query string.
+    ///
+    /// ```js
+    /// const results = await index.searchStructured({
+    ///   query: { boolean: { must: [{ term: { field: "title", value: "rust" } }] } },
+    ///   limit: 10,
+    ///   offset: 0,
+    ///   fieldsToLoad: ["title"],
+    /// });
+    /// ```
+    #[wasm_bindgen(js_name = "searchStructured")]
+    pub async fn search_structured(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("No committed data — call commit() first"))?;
+        crate::query::execute_structured_search(searcher, request).await
+    }
+
     /// Get a document by its address.
     #[wasm_bindgen(js_name = "getDocument")]
     pub async fn get_document(&self, segment_id: String, doc_id: u32) -> Result<JsValue, JsValue> {
+        self.get_document_inner(segment_id, doc_id, None).await
+    }
+
+    /// Get a document by its address, loading only the specified fields.
+    ///
+    /// `fields_to_load` is a JS array of field name strings, e.g. `["title", "body"]`.
+    #[wasm_bindgen(js_name = "getDocumentWithFields")]
+    pub async fn get_document_with_fields(
+        &self,
+        segment_id: String,
+        doc_id: u32,
+        fields_to_load: Vec<String>,
+    ) -> Result<JsValue, JsValue> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("No committed data"))?;
+
+        let field_ids = crate::resolve_field_ids(searcher.schema(), &fields_to_load)?;
+        self.get_document_inner(segment_id, doc_id, Some(field_ids))
+            .await
+    }
+
+    async fn get_document_inner(
+        &self,
+        segment_id: String,
+        doc_id: u32,
+        fields: Option<rustc_hash::FxHashSet<u32>>,
+    ) -> Result<JsValue, JsValue> {
         let searcher = self
             .searcher
             .as_ref()
@@ -314,7 +362,7 @@ impl LocalIndex {
         let address = hermes_core::query::DocAddress::new(segment_id_u128, doc_id);
 
         let doc = searcher
-            .get_document(&address)
+            .get_document_with_fields(&address, fields.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
 
