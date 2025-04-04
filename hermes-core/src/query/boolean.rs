@@ -257,13 +257,33 @@ macro_rules! boolean_plan {
 
         // ── 3. Filter push-down (MUST + SHOULD) ─────────────────────────
         if !should.is_empty() && !must.is_empty() && limit < usize::MAX / 4 {
+            // Pre-check: is SHOULD all-sparse? This determines whether we can
+            // use bitset fallback for MUST clauses that lack fast-field predicates.
+            // For sparse SHOULD, the predicate is pushed into BMP/MaxScore traversal
+            // so all qualifying docs are found. For text SHOULD, we must NOT convert
+            // MUST to a predicate (PredicatedScorer would drop MUST-only docs that
+            // don't match SHOULD), so those go to verifier → BooleanScorer.
+            let should_is_sparse = extract_all_sparse_infos(should).is_some();
+
             // 3a. Compile MUST → predicates (O(1)) vs verifier scorers (seek)
+            //
+            // Priority: as_doc_predicate (fast-field O(1)) > as_doc_bitset
+            // (posting-list materialization, O(1) lookup, sparse-SHOULD only)
+            // > verifier scorer (seek).
             let mut predicates: Vec<super::DocPredicate<'_>> = Vec::new();
             let mut must_verifiers: Vec<Box<dyn super::Scorer + '_>> = Vec::new();
             for q in must {
                 if let Some(pred) = q.as_doc_predicate(reader) {
                     log::debug!("BooleanQuery planner 3a: MUST clause → predicate ({})", q);
                     predicates.push(pred);
+                } else if should_is_sparse {
+                    if let Some(bitset) = q.as_doc_bitset(reader) {
+                        log::debug!("BooleanQuery planner 3a: MUST clause → bitset predicate ({})", q);
+                        predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
+                    } else {
+                        log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
+                        must_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+                    }
                 } else {
                     log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
                     must_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
@@ -276,6 +296,13 @@ macro_rules! boolean_plan {
                     let negated: super::DocPredicate<'_> =
                         Box::new(move |doc_id| !pred(doc_id));
                     predicates.push(negated);
+                } else if should_is_sparse {
+                    if let Some(bitset) = q.as_doc_bitset(reader) {
+                        log::debug!("BooleanQuery planner 3a: MUST_NOT clause → bitset predicate ({})", q);
+                        predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
+                    } else {
+                        must_not_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+                    }
                 } else {
                     must_not_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
                 }
@@ -328,10 +355,13 @@ macro_rules! boolean_plan {
                     }
                     // predicates consumed — cannot fall through; rebuild them
                     // (this path only triggers if neither sparse index exists)
+                    // should_is_sparse is true here (we're inside extract_all_sparse_infos)
                     predicates = Vec::new();
                     for q in must {
                         if let Some(pred) = q.as_doc_predicate(reader) {
                             predicates.push(pred);
+                        } else if let Some(bitset) = q.as_doc_bitset(reader) {
+                            predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
                         }
                     }
                     for q in must_not {
@@ -339,6 +369,8 @@ macro_rules! boolean_plan {
                             let negated: super::DocPredicate<'_> =
                                 Box::new(move |doc_id| !pred(doc_id));
                             predicates.push(negated);
+                        } else if let Some(bitset) = q.as_doc_bitset(reader) {
+                            predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
                         }
                     }
                 }

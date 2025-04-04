@@ -867,3 +867,32 @@ async fn test_must_prefix_should_sparse_no_result_loss() {
         results5.hits.len()
     );
 }
+
+/// Regression: boolean(should=[sparse], must=[term on non-fast field]) must push
+/// the filter into MaxScore traversal, not post-filter a finite top-k set.
+///
+/// TermQuery on a non-fast field has no `as_doc_predicate()` (needs fast field)
+/// but DOES have `as_doc_bitset()` (posting list). The planner must use the
+/// bitset fallback to create an inline predicate for MaxScore/BMP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_must_term_non_fast_should_sparse_bitset_fallback() {
+    // The shared test index has content field (text, not fast) and sparse embedding.
+    // content "doc25" is a unique term matching exactly 1 doc.
+    // Sparse dim 0 matches all 100 docs.
+    // Without the bitset fallback, TermQuery on non-fast content falls to verifier,
+    // and with limit=5 the sparse scorer returns 5 docs, likely none being doc25.
+    let (index, content, _ts, embedding) = create_boolean_test_index().await;
+
+    let bool_q = BooleanQuery::new()
+        .should(SparseVectorQuery::new(embedding, vec![(0, 1.0)]))
+        .must(TermQuery::text(content, "doc25"));
+
+    let results = index.search(&bool_q, 5).await.unwrap();
+    assert_eq!(
+        results.hits.len(),
+        1,
+        "should find doc25 (the only match), got {}",
+        results.hits.len()
+    );
+    assert_eq!(results.hits[0].address.doc_id, 25);
+}
