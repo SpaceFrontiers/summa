@@ -95,6 +95,32 @@ impl Query for PrefixQuery {
     fn is_filter(&self) -> bool {
         true
     }
+
+    #[cfg(feature = "sync")]
+    fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
+        let bitset = self.as_doc_bitset(reader)?;
+        Some(Box::new(move |doc_id: DocId| bitset.contains(doc_id)))
+    }
+
+    #[cfg(feature = "sync")]
+    fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        let postings = reader
+            .get_prefix_postings_sync(self.field, &self.prefix)
+            .ok()?;
+        let mut bitset = super::DocBitset::new(reader.num_docs());
+        for posting in &postings {
+            let mut iter = posting.iterator();
+            loop {
+                let d = iter.doc();
+                if d == TERMINATED {
+                    break;
+                }
+                bitset.set(d);
+                iter.advance();
+            }
+        }
+        Some(bitset)
+    }
 }
 
 // ── PrefixScorer ────────────────────────────────────────────────────────

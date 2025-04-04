@@ -1,9 +1,13 @@
 //! Comprehensive BooleanQuery tests covering MUST, SHOULD, MUST_NOT combinations
 //! with text TermQuery, RangeQuery, SparseVectorQuery, and SparseTermQuery.
 
+use std::collections::HashSet;
+
 use crate::dsl::{Document, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
-use crate::query::{BooleanQuery, RangeQuery, SparseTermQuery, SparseVectorQuery, TermQuery};
+use crate::query::{
+    BooleanQuery, PrefixQuery, RangeQuery, SparseTermQuery, SparseVectorQuery, TermQuery,
+};
 
 /// Shared test index: 100 docs with text, timestamp(u64 fast), sparse embedding.
 /// - Doc i: text="document_{i}", timestamp=1000+i*100, sparse dims: {0:0.5, 1:0.3, i:0.8}
@@ -801,5 +805,65 @@ async fn test_multi_field_text_should() {
         "Doc 1 (rust in both fields) should score higher than doc 2 (python in body only): {} vs {}",
         doc1_score,
         doc2_score
+    );
+}
+
+// ── MUST PrefixQuery + SHOULD sparse ─────────────────────────────────────
+
+/// Regression: boolean(should=[sparse], must=[prefix]) must not lose results.
+///
+/// Before the fix, PrefixQuery had no `as_doc_predicate()`/`as_doc_bitset()`,
+/// so the planner fell to PredicatedScorer with zero over-fetch, filtering a
+/// finite top-k set and losing most qualifying documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_must_prefix_should_sparse_no_result_loss() {
+    let (index, content, _ts, embedding) = create_boolean_test_index().await;
+
+    // Existing test data: doc_i has text "doc{i}" in content field.
+    // Prefix "doc" matches all 100 docs. Prefix "doc1" matches doc1,doc10..19 = 11 docs.
+    // Sparse dim 0 (weight 0.5) exists in all 100 docs.
+
+    // Verify prefix query alone works: "doc1" prefix matches 11 docs
+    let prefix_q = PrefixQuery::text(content, "doc1");
+    let prefix_results = index.search(&prefix_q, 100).await.unwrap();
+    assert!(
+        prefix_results.hits.len() == 11,
+        "prefix 'doc1' should match 11 docs (doc1, doc10-doc19), got {}",
+        prefix_results.hits.len()
+    );
+
+    // Boolean: should=[sparse(dim0)], must=[prefix("doc1")]
+    // Sparse dim 0 matches all 100 docs, prefix "doc1" matches 11.
+    // Result should be exactly 11 docs (the intersection).
+    let bool_q = BooleanQuery::new()
+        .should(SparseVectorQuery::new(embedding, vec![(0, 1.0)]))
+        .must(PrefixQuery::text(content, "doc1"));
+
+    let bool_results = index.search(&bool_q, 100).await.unwrap();
+    assert_eq!(
+        bool_results.hits.len(),
+        11,
+        "boolean(should=sparse, must=prefix) should return all 11 matching docs, got {}",
+        bool_results.hits.len()
+    );
+
+    // Verify correct doc IDs: doc1, doc10..doc19
+    let expected: HashSet<u32> = [1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        .into_iter()
+        .collect();
+    let actual: HashSet<u32> = bool_results.hits.iter().map(|h| h.address.doc_id).collect();
+    assert_eq!(actual, expected, "wrong doc IDs returned");
+
+    // Smaller limit: should return exactly 5 docs
+    let bool_q5 = BooleanQuery::new()
+        .should(SparseVectorQuery::new(embedding, vec![(0, 1.0)]))
+        .must(PrefixQuery::text(content, "doc1"));
+
+    let results5 = index.search(&bool_q5, 5).await.unwrap();
+    assert_eq!(
+        results5.hits.len(),
+        5,
+        "should return exactly 5 docs with limit=5, got {}",
+        results5.hits.len()
     );
 }

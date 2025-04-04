@@ -344,8 +344,11 @@ macro_rules! boolean_plan {
                 }
             }
 
-            // 3c. PredicatedScorer fallback (over-fetch 4x when predicates present)
-            let should_limit = if !predicates.is_empty() { limit * 4 } else { limit };
+            // 3c. PredicatedScorer fallback (over-fetch 4x when any filter is present)
+            let has_filters = !predicates.is_empty()
+                || !must_verifiers.is_empty()
+                || !must_not_verifiers.is_empty();
+            let should_limit = if has_filters { limit * 4 } else { limit };
             let should_scorer = if should.len() == 1 {
                 should[0].$scorer_fn(reader, should_limit) $(. $aw)* ?
             } else {
