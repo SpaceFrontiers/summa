@@ -1094,6 +1094,7 @@ pub fn unpack_32bit(input: &[u8], output: &mut [u32], count: usize) {
             unsafe {
                 neon::unpack_32bit(input, output, count);
             }
+            return;
         }
     }
 
@@ -1104,18 +1105,17 @@ pub fn unpack_32bit(input: &[u8], output: &mut [u32], count: usize) {
             unsafe {
                 avx2::unpack_32bit(input, output, count);
             }
-        } else {
-            // SSE2 is always available on x86_64
+            return;
+        }
+        if sse::is_available() {
             unsafe {
                 sse::unpack_32bit(input, output, count);
             }
+            return;
         }
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        scalar::unpack_32bit(input, output, count);
-    }
+    scalar::unpack_32bit(input, output, count);
 }
 
 /// Delta decode with SIMD acceleration
@@ -1159,6 +1159,7 @@ pub fn add_one(values: &mut [u32], count: usize) {
             unsafe {
                 neon::add_one(values, count);
             }
+            return;
         }
     }
 
@@ -1169,18 +1170,17 @@ pub fn add_one(values: &mut [u32], count: usize) {
             unsafe {
                 avx2::add_one(values, count);
             }
-        } else {
-            // SSE2 is always available on x86_64
+            return;
+        }
+        if sse::is_available() {
             unsafe {
                 sse::add_one(values, count);
             }
+            return;
         }
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        scalar::add_one(values, count);
-    }
+    scalar::add_one(values, count);
 }
 
 /// Compute the number of bits needed to represent a value
@@ -1938,97 +1938,6 @@ unsafe fn fused_dot_norm_avx512(a: &[f32], b: &[f32], count: usize) -> (f32, f32
     }
 
     (dot, norm)
-}
-
-/// Find maximum value in f32 array with SIMD acceleration
-#[inline]
-pub fn max_f32(values: &[f32], count: usize) -> f32 {
-    if count == 0 {
-        return f32::NEG_INFINITY;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            return unsafe { max_f32_neon(values, count) };
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            return unsafe { max_f32_sse(values, count) };
-        }
-    }
-
-    // Scalar fallback
-    values[..count]
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn max_f32_neon(values: &[f32], count: usize) -> f32 {
-    use std::arch::aarch64::*;
-
-    let chunks = count / 4;
-    let remainder = count % 4;
-
-    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
-
-    for chunk in 0..chunks {
-        let base = chunk * 4;
-        let v = vld1q_f32(values.as_ptr().add(base));
-        max_v = vmaxq_f32(max_v, v);
-    }
-
-    // Horizontal max
-    let mut max_val = vmaxvq_f32(max_v);
-
-    // Handle remainder
-    let base = chunks * 4;
-    for i in 0..remainder {
-        max_val = max_val.max(values[base + i]);
-    }
-
-    max_val
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn max_f32_sse(values: &[f32], count: usize) -> f32 {
-    use std::arch::x86_64::*;
-
-    let chunks = count / 4;
-    let remainder = count % 4;
-
-    let mut max_v = _mm_set1_ps(f32::NEG_INFINITY);
-
-    for chunk in 0..chunks {
-        let base = chunk * 4;
-        let v = _mm_loadu_ps(values.as_ptr().add(base));
-        max_v = _mm_max_ps(max_v, v);
-    }
-
-    // Horizontal max: [a, b, c, d] -> max(a, b, c, d)
-    let shuf = _mm_shuffle_ps(max_v, max_v, 0b10_11_00_01); // [b, a, d, c]
-    let max1 = _mm_max_ps(max_v, shuf); // [max(a,b), max(a,b), max(c,d), max(c,d)]
-    let shuf2 = _mm_movehl_ps(max1, max1); // [max(c,d), max(c,d), ?, ?]
-    let final_max = _mm_max_ss(max1, shuf2); // [max(a,b,c,d), ?, ?, ?]
-
-    let mut max_val = _mm_cvtss_f32(final_max);
-
-    // Handle remainder
-    let base = chunks * 4;
-    for i in 0..remainder {
-        max_val = max_val.max(values[base + i]);
-    }
-
-    max_val
 }
 
 // ============================================================================
@@ -3349,258 +3258,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / denom
 }
 
-/// Compute squared Euclidean distance between two f32 vectors with SIMD acceleration
-///
-/// Returns sum((a[i] - b[i])^2) for all i
-#[inline]
-pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let count = a.len();
-
-    if count == 0 {
-        return 0.0;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            return unsafe { squared_euclidean_neon(a, b, count) };
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2::is_available() && is_x86_feature_detected!("fma") {
-            return unsafe { squared_euclidean_avx2(a, b, count) };
-        }
-        if sse::is_available() {
-            return unsafe { squared_euclidean_sse(a, b, count) };
-        }
-    }
-
-    // Scalar fallback
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn squared_euclidean_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
-    use std::arch::aarch64::*;
-
-    let chunks16 = count / 16;
-    let remainder = count % 16;
-
-    // 4 independent accumulators to hide FMA latency
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-
-    for c in 0..chunks16 {
-        let base = c * 16;
-        let va0 = vld1q_f32(a.as_ptr().add(base));
-        let vb0 = vld1q_f32(b.as_ptr().add(base));
-        let d0 = vsubq_f32(va0, vb0);
-        acc0 = vfmaq_f32(acc0, d0, d0);
-
-        let va1 = vld1q_f32(a.as_ptr().add(base + 4));
-        let vb1 = vld1q_f32(b.as_ptr().add(base + 4));
-        let d1 = vsubq_f32(va1, vb1);
-        acc1 = vfmaq_f32(acc1, d1, d1);
-
-        let va2 = vld1q_f32(a.as_ptr().add(base + 8));
-        let vb2 = vld1q_f32(b.as_ptr().add(base + 8));
-        let d2 = vsubq_f32(va2, vb2);
-        acc2 = vfmaq_f32(acc2, d2, d2);
-
-        let va3 = vld1q_f32(a.as_ptr().add(base + 12));
-        let vb3 = vld1q_f32(b.as_ptr().add(base + 12));
-        let d3 = vsubq_f32(va3, vb3);
-        acc3 = vfmaq_f32(acc3, d3, d3);
-    }
-
-    // Combine accumulators and horizontal sum
-    let combined = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-    let mut sum = vaddvq_f32(combined);
-
-    // Handle remainder
-    let base = chunks16 * 16;
-    for i in 0..remainder {
-        let d = a[base + i] - b[base + i];
-        sum += d * d;
-    }
-
-    sum
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn squared_euclidean_sse(a: &[f32], b: &[f32], count: usize) -> f32 {
-    use std::arch::x86_64::*;
-
-    let chunks16 = count / 16;
-    let remainder = count % 16;
-
-    // 4 independent accumulators to hide multiply latency
-    let mut acc0 = _mm_setzero_ps();
-    let mut acc1 = _mm_setzero_ps();
-    let mut acc2 = _mm_setzero_ps();
-    let mut acc3 = _mm_setzero_ps();
-
-    for c in 0..chunks16 {
-        let base = c * 16;
-
-        let d0 = _mm_sub_ps(
-            _mm_loadu_ps(a.as_ptr().add(base)),
-            _mm_loadu_ps(b.as_ptr().add(base)),
-        );
-        acc0 = _mm_add_ps(acc0, _mm_mul_ps(d0, d0));
-
-        let d1 = _mm_sub_ps(
-            _mm_loadu_ps(a.as_ptr().add(base + 4)),
-            _mm_loadu_ps(b.as_ptr().add(base + 4)),
-        );
-        acc1 = _mm_add_ps(acc1, _mm_mul_ps(d1, d1));
-
-        let d2 = _mm_sub_ps(
-            _mm_loadu_ps(a.as_ptr().add(base + 8)),
-            _mm_loadu_ps(b.as_ptr().add(base + 8)),
-        );
-        acc2 = _mm_add_ps(acc2, _mm_mul_ps(d2, d2));
-
-        let d3 = _mm_sub_ps(
-            _mm_loadu_ps(a.as_ptr().add(base + 12)),
-            _mm_loadu_ps(b.as_ptr().add(base + 12)),
-        );
-        acc3 = _mm_add_ps(acc3, _mm_mul_ps(d3, d3));
-    }
-
-    // Combine accumulators
-    let combined = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
-
-    // Horizontal sum: [a, b, c, d] -> a + b + c + d
-    let shuf = _mm_shuffle_ps(combined, combined, 0b10_11_00_01);
-    let sums = _mm_add_ps(combined, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let final_sum = _mm_add_ss(sums, shuf2);
-
-    let mut sum = _mm_cvtss_f32(final_sum);
-
-    // Handle remainder
-    let base = chunks16 * 16;
-    for i in 0..remainder {
-        let d = a[base + i] - b[base + i];
-        sum += d * d;
-    }
-
-    sum
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn squared_euclidean_avx2(a: &[f32], b: &[f32], count: usize) -> f32 {
-    use std::arch::x86_64::*;
-
-    let chunks32 = count / 32;
-    let remainder = count % 32;
-
-    // 4 independent accumulators to hide FMA latency
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
-
-    for c in 0..chunks32 {
-        let base = c * 32;
-
-        let d0 = _mm256_sub_ps(
-            _mm256_loadu_ps(a.as_ptr().add(base)),
-            _mm256_loadu_ps(b.as_ptr().add(base)),
-        );
-        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
-
-        let d1 = _mm256_sub_ps(
-            _mm256_loadu_ps(a.as_ptr().add(base + 8)),
-            _mm256_loadu_ps(b.as_ptr().add(base + 8)),
-        );
-        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
-
-        let d2 = _mm256_sub_ps(
-            _mm256_loadu_ps(a.as_ptr().add(base + 16)),
-            _mm256_loadu_ps(b.as_ptr().add(base + 16)),
-        );
-        acc2 = _mm256_fmadd_ps(d2, d2, acc2);
-
-        let d3 = _mm256_sub_ps(
-            _mm256_loadu_ps(a.as_ptr().add(base + 24)),
-            _mm256_loadu_ps(b.as_ptr().add(base + 24)),
-        );
-        acc3 = _mm256_fmadd_ps(d3, d3, acc3);
-    }
-
-    // Combine accumulators
-    let combined = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-
-    // Horizontal sum of 8 floats
-    let high = _mm256_extractf128_ps(combined, 1);
-    let low = _mm256_castps256_ps128(combined);
-    let sum128 = _mm_add_ps(low, high);
-
-    let shuf = _mm_shuffle_ps(sum128, sum128, 0b10_11_00_01);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let final_sum = _mm_add_ss(sums, shuf2);
-
-    let mut sum = _mm_cvtss_f32(final_sum);
-
-    // Handle remainder
-    let base = chunks32 * 32;
-    for i in 0..remainder {
-        let d = a[base + i] - b[base + i];
-        sum += d * d;
-    }
-
-    sum
-}
-
-/// Batch compute squared Euclidean distances from one query to multiple vectors
-///
-/// Returns distances[i] = squared_euclidean_distance(query, vectors[i])
-/// This is more efficient than calling squared_euclidean_distance in a loop
-/// because we can keep the query in registers.
-#[inline]
-pub fn batch_squared_euclidean_distances(
-    query: &[f32],
-    vectors: &[Vec<f32>],
-    distances: &mut [f32],
-) {
-    debug_assert_eq!(vectors.len(), distances.len());
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2::is_available() && is_x86_feature_detected!("fma") {
-            for (i, vec) in vectors.iter().enumerate() {
-                distances[i] = unsafe { squared_euclidean_avx2(query, vec, query.len()) };
-            }
-            return;
-        }
-    }
-
-    // Fallback to individual calls
-    for (i, vec) in vectors.iter().enumerate() {
-        distances[i] = squared_euclidean_distance(query, vec);
-    }
-}
-
 // ============================================================================
 // Hamming distance for binary dense vectors
 // ============================================================================
@@ -3981,37 +3638,6 @@ mod tests {
     }
 
     #[test]
-    fn test_max_f32() {
-        let values = vec![1.0f32, 5.0, 3.0, 9.0, 2.0, 7.0];
-        let result = max_f32(&values, 6);
-        assert!((result - 9.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_max_f32_large() {
-        // Test with 128 values, max at position 77
-        let mut values: Vec<f32> = (0..128).map(|i| i as f32).collect();
-        values[77] = 1000.0;
-
-        let result = max_f32(&values, 128);
-        assert!((result - 1000.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_max_f32_negative() {
-        let values = vec![-5.0f32, -2.0, -10.0, -1.0, -3.0];
-        let result = max_f32(&values, 5);
-        assert!((result - (-1.0)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_max_f32_empty() {
-        let values: Vec<f32> = vec![];
-        let result = max_f32(&values, 0);
-        assert_eq!(result, f32::NEG_INFINITY);
-    }
-
-    #[test]
     fn test_fused_dot_norm() {
         let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b = vec![2.0f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
@@ -4120,34 +3746,6 @@ mod tests {
         batch_cosine_scores(&query, &vectors, 3, &mut scores);
         assert_eq!(scores[0], 0.0);
         assert_eq!(scores[1], 0.0);
-    }
-
-    #[test]
-    fn test_squared_euclidean_distance() {
-        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let b = vec![2.0f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
-        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
-        let result = squared_euclidean_distance(&a, &b);
-        assert!(
-            (result - expected).abs() < 1e-5,
-            "expected {}, got {}",
-            expected,
-            result
-        );
-    }
-
-    #[test]
-    fn test_squared_euclidean_distance_large() {
-        let a: Vec<f32> = (0..128).map(|i| i as f32 * 0.1).collect();
-        let b: Vec<f32> = (0..128).map(|i| (i as f32 * 0.1) + 0.5).collect();
-        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
-        let result = squared_euclidean_distance(&a, &b);
-        assert!(
-            (result - expected).abs() < 1e-3,
-            "expected {}, got {}",
-            expected,
-            result
-        );
     }
 
     // ================================================================
