@@ -267,6 +267,20 @@ field e: dense_vector<768, f16> [indexed<flat>]                              # b
 field e: dense_vector<768> [stored]                                          # stored, not indexed
 ```
 
+### SOAR (higher recall for IVF indexes)
+
+IVF-based indexes (`ivf_rabitq`, `scann`) support SOAR — spilling each vector
+into a secondary cluster with an orthogonality-amplified residual. This
+improves recall at the same `nprobe` in exchange for larger cluster storage
+(~1.2-2x assignments):
+
+```
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: selective>]  # spill boundary vectors (recommended)
+field e: dense_vector<768, f16> [indexed<scann, soar: full>]            # spill every vector once
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: aggressive>] # spill every vector twice
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: off>]        # no spilling (default)
+```
+
 ### Example
 
 ```

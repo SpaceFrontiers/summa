@@ -632,6 +632,14 @@ fn merge_bmp_field(
         blob_len,
     );
 
+    // The merge flipped source regions to MADV_SEQUENTIAL; sources keep
+    // serving queries until the merged segment is swapped in — restore the
+    // scattered-access advice set at open.
+    #[cfg(feature = "native")]
+    for &(bmp, _) in &sources {
+        bmp.madvise_random_query();
+    }
+
     Ok(())
 }
 

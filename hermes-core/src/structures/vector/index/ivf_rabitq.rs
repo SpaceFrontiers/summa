@@ -168,12 +168,9 @@ impl IVFRaBitQIndex {
             }
         }
 
-        // Partial sort: O(n + k log k) instead of O(n log n)
-        if candidates.len() > k {
-            candidates.select_nth_unstable_by(k, |a, b| a.2.partial_cmp(&b.2).unwrap());
-            candidates.truncate(k);
-        }
-        candidates.sort_unstable_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        // With SOAR, a spilled vector appears once per probed cluster it
+        // lives in — finalize dedups to the best estimate before top-k.
+        super::finalize_candidates(&mut candidates, k, coarse_centroids.soar_config.is_some());
         candidates
     }
 
@@ -311,6 +308,50 @@ mod tests {
         for i in 1..results.len() {
             assert!(results[i].2 >= results[i - 1].2);
         }
+    }
+
+    #[test]
+    fn test_ivf_rabitq_soar_no_duplicate_results() {
+        use crate::structures::vector::ivf::SoarConfig;
+
+        let dim = 32;
+        let n = 300;
+        let num_clusters = 8;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+
+        // Full spilling: every vector lives in 2 clusters
+        let coarse_config = CoarseConfig::new(dim, num_clusters).with_soar(SoarConfig::full());
+        let coarse_centroids = CoarseCentroids::train(&coarse_config, &vectors);
+        assert!(coarse_centroids.soar_config.is_some());
+
+        let rabitq_config = RaBitQConfig::new(dim);
+        let codebook = RaBitQCodebook::new(rabitq_config);
+
+        let config = IVFRaBitQConfig::new(dim);
+        let index = IVFRaBitQIndex::build(config, &coarse_centroids, &codebook, &vectors, None);
+
+        // Spilled assignments: more stored codes than vectors
+        assert!(index.len() > n, "SOAR should spill into secondary clusters");
+
+        // Probe ALL clusters so every spilled duplicate would surface
+        let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+        let results = index.search(&coarse_centroids, &codebook, &query, n, Some(num_clusters));
+
+        let mut seen = std::collections::HashSet::new();
+        for &(doc_id, ordinal, _) in &results {
+            assert!(
+                seen.insert((doc_id, ordinal)),
+                "duplicate (doc_id={}, ordinal={}) in SOAR search results",
+                doc_id,
+                ordinal
+            );
+        }
+        // All n unique vectors are reachable
+        assert_eq!(results.len(), n);
     }
 
     #[test]

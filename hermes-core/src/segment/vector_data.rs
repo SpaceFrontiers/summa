@@ -274,6 +274,53 @@ impl LazyFlatVectorData {
         })
     }
 
+    /// Advise the kernel that vector data will be accessed at random offsets.
+    ///
+    /// Disables kernel readahead for the raw vector region. Rerank reads
+    /// scattered ~vbs-sized records; default readahead pulls in 128KB per
+    /// fault, evicting useful pages in memory-bound environments.
+    /// No-op for non-mmap (RAM, HTTP) backing.
+    #[cfg(feature = "native")]
+    pub fn advise_random_access(&self) {
+        let data_len = (self.num_vectors * self.vbs) as u64;
+        self.handle.madvise_range(
+            self.vectors_offset..self.vectors_offset + data_len,
+            libc::MADV_RANDOM,
+        );
+    }
+
+    /// Prefetch the pages backing a sorted set of vector indexes (`MADV_WILLNEED`).
+    ///
+    /// Coalesces adjacent candidates into ranges so the kernel can overlap
+    /// the page-ins instead of taking one synchronous major fault per vector
+    /// during the rerank read loop. Indexes must be yielded in ascending order.
+    /// No-op for non-mmap backing.
+    #[cfg(feature = "native")]
+    pub fn prefetch_vectors(&self, sorted_flat_indexes: impl IntoIterator<Item = usize>) {
+        /// Gap (in bytes) below which two candidate ranges are merged into one advice call.
+        const COALESCE_GAP: u64 = 64 * 1024;
+        let vbs = self.vbs as u64;
+        let mut iter = sorted_flat_indexes.into_iter();
+        let Some(first) = iter.next() else {
+            return;
+        };
+        let mut run_start = self.vectors_offset + first as u64 * vbs;
+        let mut run_end = run_start + vbs;
+        for idx in iter {
+            let start = self.vectors_offset + idx as u64 * vbs;
+            if start <= run_end + COALESCE_GAP {
+                run_end = start + vbs;
+            } else {
+                self.handle
+                    .madvise_range(run_start..run_end, libc::MADV_WILLNEED);
+                run_start = start;
+                run_end = start + vbs;
+            }
+        }
+        self.handle
+            .madvise_range(run_start..run_end, libc::MADV_WILLNEED);
+    }
+
     /// Read a single vector by index, dequantized to f32.
     ///
     /// `out` must have length >= `self.dim`. Returns `Ok(())` on success.

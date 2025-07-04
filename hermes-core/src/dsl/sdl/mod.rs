@@ -240,6 +240,7 @@ struct IndexConfig {
     num_clusters: Option<usize>,
     nprobe: Option<usize>,
     build_threshold: Option<usize>,
+    soar: Option<crate::structures::SoarConfig>,
     // Sparse vector index params
     sparse_format: Option<SparseFormat>,
     quantization: Option<WeightQuantization>,
@@ -400,6 +401,18 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                     log::warn!("Invalid nprobe value '{}', using default 32", n.as_str());
                     32
                 }));
+            }
+        }
+        Rule::soar_kwarg => {
+            // soar_kwarg = { "soar" ~ ":" ~ soar_spec }
+            if let Some(s) = p.into_inner().next() {
+                use crate::structures::SoarConfig;
+                config.soar = match s.as_str() {
+                    "selective" => Some(SoarConfig::new()),
+                    "full" => Some(SoarConfig::full()),
+                    "aggressive" => Some(SoarConfig::aggressive()),
+                    _ => None, // "off"
+                };
             }
         }
         Rule::quantization_kwarg => {
@@ -732,6 +745,19 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
     // Apply build_threshold if specified
     if idx_cfg.build_threshold.is_some() {
         config.build_threshold = idx_cfg.build_threshold;
+    }
+
+    // Apply SOAR spilling if specified (IVF-based indexes only)
+    if idx_cfg.soar.is_some() {
+        if config.uses_ivf() {
+            config.soar = idx_cfg.soar;
+        } else {
+            log::warn!(
+                "'soar' requires an IVF-based index (ivf_rabitq, scann); \
+                 ignoring for index type {:?}",
+                config.index_type
+            );
+        }
     }
 }
 
@@ -1563,6 +1589,44 @@ mod tests {
         assert_eq!(config.dim, 768);
         assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 32); // default
+    }
+
+    #[test]
+    fn test_dense_vector_with_soar() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, soar: selective>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        let soar = config.soar.as_ref().expect("soar should be enabled");
+        assert_eq!(soar.num_secondary, 1);
+        assert!(soar.selective);
+
+        // aggressive preset: 2 secondary clusters, no selectivity
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<scann, soar: aggressive>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        let soar = config.soar.as_ref().expect("soar should be enabled");
+        assert_eq!(soar.num_secondary, 2);
+        assert!(!soar.selective);
+
+        // off keeps soar disabled
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, soar: off>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        assert!(config.soar.is_none());
     }
 
     #[test]

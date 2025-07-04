@@ -169,9 +169,9 @@ fn apply_rrf(
         let l1_rank = l1_ranks
             .get(&(result.segment_id, result.doc_id))
             .copied()
-            .unwrap_or(candidates.len() + 1) as f32;
-        let l2_rank = (l2_idx + 1) as f32;
-        result.score = 1.0 / (k + l1_rank) + 1.0 / (k + l2_rank);
+            .unwrap_or(candidates.len() + 1);
+        result.score = super::fusion::rrf_contribution(k, l1_rank)
+            + super::fusion::rrf_contribution(k, l2_idx + 1);
     }
 
     scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
@@ -318,6 +318,12 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                         raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs].copy_from_slice(src);
                     }
                 } else {
+                    // Scattered reads: batch-prefetch candidate pages so
+                    // page-ins overlap instead of one major fault per vector
+                    // (same treatment as the ANN rerank path).
+                    #[cfg(feature = "native")]
+                    lazy_flat.prefetch_vectors(resolved.iter().map(|&(_, flat_idx, _)| flat_idx));
+
                     for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
                         lazy_flat
                             .read_vector_raw_into(

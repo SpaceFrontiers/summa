@@ -639,6 +639,33 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok((results, total_seen))
     }
 
+    /// Hybrid search: run several queries independently and fuse their
+    /// ranked lists (union) into a single top-`limit` result.
+    ///
+    /// Unlike [`Self::search_and_rerank`] — which can only re-score
+    /// documents the first-stage query already found — fusion keeps
+    /// documents found by *any* of the queries. Typical use is sparse
+    /// (BM25/SPLADE) + dense vector hybrid retrieval with
+    /// `FusionMethod::Rrf { k: 60.0 }`.
+    ///
+    /// Each query is paired with a weight scaling its contribution.
+    /// `fetch_limit` is the per-query candidate depth; a common choice is
+    /// `2 * limit` or more for better fusion quality.
+    pub async fn search_fused(
+        &self,
+        queries: &[(&dyn crate::query::Query, f32)],
+        fetch_limit: usize,
+        limit: usize,
+        method: crate::query::FusionMethod,
+    ) -> Result<Vec<crate::query::SearchResult>> {
+        let mut lists = Vec::with_capacity(queries.len());
+        for &(query, weight) in queries {
+            let (results, _) = self.search_with_count(query, fetch_limit).await?;
+            lists.push((results, weight));
+        }
+        Ok(crate::query::fuse_ranked_lists(lists, method, limit))
+    }
+
     /// Two-stage search: L1 retrieval + L2 dense vector reranking
     ///
     /// Runs the query to get `l1_limit` candidates, then reranks by exact

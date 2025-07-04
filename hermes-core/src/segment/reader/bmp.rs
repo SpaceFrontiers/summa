@@ -238,6 +238,19 @@ impl BmpIndex {
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
+        // Query-time access to block data and the doc map is scattered (only
+        // blocks surviving UB pruning are touched, top-k docs are resolved by
+        // random virtual id). Default kernel readahead pulls in 128KB per
+        // fault around each touched record, which evicts hot pages under
+        // memory pressure. Grid rows are read contiguously per query dim, so
+        // they keep default readahead.
+        #[cfg(feature = "native")]
+        {
+            block_data_bytes.madvise(libc::MADV_RANDOM);
+            doc_map_ids_bytes.madvise(libc::MADV_RANDOM);
+            doc_map_ordinals_bytes.madvise(libc::MADV_RANDOM);
+        }
+
         log::debug!(
             "BMP V13 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
@@ -529,6 +542,16 @@ impl BmpIndex {
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_DONTNEED);
     }
 
+    /// Restore query-pattern advice (same as set at `parse`) after a merge
+    /// flipped these regions to `MADV_SEQUENTIAL`. Source segments keep
+    /// serving queries while and after being merged, until swapped out.
+    #[cfg(feature = "native")]
+    pub fn madvise_random_query(&self) {
+        Self::madvise_owned(&self.block_data_bytes, libc::MADV_RANDOM);
+        Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_RANDOM);
+        Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_RANDOM);
+    }
+
     /// Release grid pages after Phase 3+4 complete.
     #[cfg(feature = "native")]
     pub fn madvise_dontneed_grids(&self) {
@@ -544,22 +567,7 @@ impl BmpIndex {
     /// pointer` crashes in CI where tests use RamDirectory (Vec-backed).
     #[cfg(feature = "native")]
     fn madvise_owned(bytes: &crate::directories::OwnedBytes, advice: i32) {
-        if !bytes.is_mmap() {
-            return;
-        }
-        let slice = bytes.as_slice();
-        if slice.is_empty() {
-            return;
-        }
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-        // Align down to page boundary
-        let page_size = 4096usize;
-        let aligned_ptr = (ptr as usize) & !(page_size - 1);
-        let aligned_len = len + (ptr as usize - aligned_ptr);
-        unsafe {
-            libc::madvise(aligned_ptr as *mut libc::c_void, aligned_len, advice);
-        }
+        bytes.madvise(advice);
     }
 }
 

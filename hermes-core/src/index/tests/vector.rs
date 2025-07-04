@@ -21,6 +21,7 @@ async fn test_vector_index_threshold_switch() {
             nprobe: 2,
             build_threshold: Some(50), // Build when we have 50+ vectors
             unit_norm: false,
+            soar: None,
         },
     );
     let schema = schema_builder.build();
@@ -314,6 +315,7 @@ async fn test_needle_dense_vector_flat() {
             nprobe: 0,
             build_threshold: None,
             unit_norm: false,
+            soar: None,
         },
     );
     let schema = sb.build();
@@ -674,6 +676,7 @@ async fn test_needle_combined_all_modalities() {
             nprobe: 0,
             build_threshold: None,
             unit_norm: false,
+            soar: None,
         },
     );
     let schema = sb.build();
@@ -794,4 +797,101 @@ async fn test_needle_combined_all_modalities() {
         sp_doc_id, dn_doc_id,
         "Sparse and dense should find same doc"
     );
+}
+
+#[tokio::test]
+async fn test_search_fused_hybrid_union() {
+    use crate::dsl::{DenseVectorConfig, VectorIndexType};
+    use crate::query::{DenseVectorQuery, FusionMethod, TermQuery};
+
+    let dim = 8;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let embedding = sb.add_dense_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        DenseVectorConfig {
+            dim,
+            index_type: VectorIndexType::Flat,
+            quantization: crate::dsl::DenseVectorQuantization::F32,
+            num_clusters: None,
+            nprobe: 0,
+            build_threshold: None,
+            unit_norm: false,
+            soar: None,
+        },
+    );
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Doc 0: matches text only (orthogonal vector)
+    let mut d = Document::new();
+    d.add_text(title, "zebra quantum");
+    d.add_dense_vector(embedding, vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(d).unwrap();
+
+    // Doc 1: matches vector only
+    let mut d = Document::new();
+    d.add_text(title, "unrelated words here");
+    d.add_dense_vector(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(d).unwrap();
+
+    // Doc 2: matches both (strongest text match via tf=2, near-exact vector)
+    let mut d = Document::new();
+    d.add_text(title, "zebra zebra habitat");
+    d.add_dense_vector(embedding, vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(d).unwrap();
+
+    // Hay
+    for i in 0..20 {
+        let mut d = Document::new();
+        d.add_text(title, format!("filler document number {}", i));
+        d.add_dense_vector(embedding, vec![0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]);
+        writer.add_document(d).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let text_query = TermQuery::text(title, "zebra");
+    let dense_query =
+        DenseVectorQuery::new(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+    let fused = searcher
+        .search_fused(
+            &[(&text_query, 1.0), (&dense_query, 1.0)],
+            10,
+            10,
+            FusionMethod::default(),
+        )
+        .await
+        .unwrap();
+
+    // Union semantics: text-only, dense-only, and both-match docs all present
+    assert!(fused.len() >= 3, "expected at least 3 fused results");
+    assert_eq!(
+        fused[0].doc_id, 2,
+        "doc matching both retrievers should rank first"
+    );
+    let ids: Vec<u32> = fused.iter().map(|r| r.doc_id).collect();
+    assert!(
+        ids.contains(&0),
+        "text-only doc must survive fusion (union)"
+    );
+    assert!(
+        ids.contains(&1),
+        "dense-only doc must survive fusion (union)"
+    );
+
+    // Sanity: neither single retriever alone surfaces all three
+    let text_only = searcher.search(&text_query, 10).await.unwrap();
+    assert!(!text_only.iter().any(|r| r.doc_id == 1));
 }

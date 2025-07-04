@@ -287,8 +287,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         match config.index_type {
             VectorIndexType::IvfRaBitQ => {
-                self.train_ivf_rabitq(field_id, dim, num_clusters, vectors, &centroids_filename)
-                    .await?;
+                self.train_ivf_rabitq(
+                    field_id,
+                    dim,
+                    num_clusters,
+                    config.soar.clone(),
+                    vectors,
+                    &centroids_filename,
+                )
+                .await?;
             }
             VectorIndexType::ScaNN => {
                 codebook_filename = Some(format!("field_{}_codebook.bin", field_id));
@@ -296,6 +303,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     field_id,
                     dim,
                     num_clusters,
+                    config.soar.clone(),
                     vectors,
                     &centroids_filename,
                     codebook_filename.as_ref().unwrap(),
@@ -346,33 +354,43 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         field_id: u32,
         dim: usize,
         num_clusters: usize,
+        soar: Option<crate::structures::SoarConfig>,
         vectors: &[Vec<f32>],
         centroids_filename: &str,
     ) -> Result<()> {
-        let coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
+        let mut coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
+        if let Some(soar) = soar {
+            coarse_config = coarse_config.with_soar(soar);
+        }
         let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
         self.save_trained_artifact(&centroids, centroids_filename)
             .await?;
 
         log::info!(
-            "Saved IVF-RaBitQ centroids for field {} ({} clusters)",
+            "Saved IVF-RaBitQ centroids for field {} ({} clusters, soar={})",
             field_id,
-            centroids.num_clusters
+            centroids.num_clusters,
+            centroids.soar_config.is_some()
         );
         Ok(())
     }
 
     /// Train ScaNN (IVF-PQ) centroids and codebook
+    #[allow(clippy::too_many_arguments)]
     async fn train_scann(
         &self,
         field_id: u32,
         dim: usize,
         num_clusters: usize,
+        soar: Option<crate::structures::SoarConfig>,
         vectors: &[Vec<f32>],
         centroids_filename: &str,
         codebook_filename: &str,
     ) -> Result<()> {
-        let coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
+        let mut coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
+        if let Some(soar) = soar {
+            coarse_config = coarse_config.with_soar(soar);
+        }
         let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
         self.save_trained_artifact(&centroids, centroids_filename)
             .await?;

@@ -209,6 +209,12 @@ pub struct DenseVectorConfig {
     /// Default: true (most embedding models produce L2-normalized vectors).
     #[serde(default = "default_unit_norm")]
     pub unit_norm: bool,
+    /// SOAR spilled cluster assignments for IVF-based indexes (IVF-RaBitQ, ScaNN).
+    /// Assigns vectors to a secondary cluster with an orthogonality-amplified
+    /// residual, improving recall at the same nprobe for ~1.2-2x assignment storage.
+    /// Default: None (disabled). Ignored for Flat/RaBitQ index types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soar: Option<crate::structures::SoarConfig>,
 }
 
 fn default_nprobe() -> usize {
@@ -229,6 +235,7 @@ impl DenseVectorConfig {
             nprobe: 32,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
         }
     }
 
@@ -242,6 +249,7 @@ impl DenseVectorConfig {
             nprobe,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
         }
     }
 
@@ -255,6 +263,7 @@ impl DenseVectorConfig {
             nprobe,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
         }
     }
 
@@ -268,6 +277,7 @@ impl DenseVectorConfig {
             nprobe: 0,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
         }
     }
 
@@ -292,6 +302,12 @@ impl DenseVectorConfig {
     /// Set number of IVF clusters
     pub fn with_num_clusters(mut self, num_clusters: usize) -> Self {
         self.num_clusters = Some(num_clusters);
+        self
+    }
+
+    /// Enable SOAR spilled secondary cluster assignments (IVF-based indexes only)
+    pub fn with_soar(mut self, soar: crate::structures::SoarConfig) -> Self {
+        self.soar = Some(soar);
         self
     }
 

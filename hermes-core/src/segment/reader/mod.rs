@@ -188,6 +188,17 @@ impl SegmentReader {
         let vector_indexes = vectors_data.indexes;
         let flat_vectors = vectors_data.flat_vectors;
 
+        // Fields served by an ANN index only touch flat vectors for scattered
+        // rerank reads — disable readahead for them once at open. Flat-only
+        // fields keep default advice: brute-force scans them sequentially.
+        // Advice is sticky on the mapping, so per-query re-advising is wasted.
+        #[cfg(feature = "native")]
+        for (field_id, lazy_flat) in &flat_vectors {
+            if vector_indexes.contains_key(field_id) {
+                lazy_flat.advise_random_access();
+            }
+        }
+
         // Load sparse vector indexes from .sparse file (MaxScore + BMP)
         let sparse_data = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
         let sparse_indexes = sparse_data.maxscore_indexes;
@@ -895,6 +906,13 @@ impl SegmentReader {
             if !resolved.is_empty() {
                 // Sort by flat_idx for sequential mmap access (better page locality)
                 resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
+
+                // Under memory pressure the candidate pages are likely evicted;
+                // batch-prefetch them so page-ins overlap instead of serializing
+                // as one major fault per vector. (MADV_RANDOM for this region is
+                // set once at segment open.)
+                #[cfg(feature = "native")]
+                lazy_flat.prefetch_vectors(resolved.iter().map(|&(_, flat_idx)| flat_idx));
 
                 // Batch-read raw quantized bytes into contiguous buffer
                 let t_read = std::time::Instant::now();

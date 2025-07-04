@@ -174,6 +174,23 @@ impl FileHandle {
         }
     }
 
+    /// Advise the kernel about the access pattern for a byte range of this handle.
+    ///
+    /// Only effective for Inline handles backed by mmap; no-op for Lazy
+    /// handles (HTTP, filesystem callbacks) and heap-backed data.
+    #[cfg(feature = "native")]
+    pub fn madvise_range(&self, range: Range<u64>, advice: libc::c_int) {
+        if let FileHandleInner::Inline { data, offset, len } = &self.inner {
+            let end = range.end.min(*len);
+            if range.start >= end {
+                return;
+            }
+            let start = (*offset + range.start) as usize;
+            let end = (*offset + end) as usize;
+            data.madvise_range(start..end, advice);
+        }
+    }
+
     /// Async range read — works for both Inline and Lazy.
     pub async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
         match &self.inner {
@@ -354,6 +371,40 @@ impl OwnedBytes {
     #[inline]
     pub fn is_mmap(&self) -> bool {
         matches!(self.data, SharedBytes::Mmap(_))
+    }
+
+    /// Advise the kernel about the access pattern for these bytes.
+    ///
+    /// No-op unless the backing store is mmap (heap memory must never be
+    /// madvised: `MADV_DONTNEED` on heap zeroes pages and corrupts allocator
+    /// metadata) or the range is empty.
+    #[cfg(feature = "native")]
+    pub fn madvise(&self, advice: libc::c_int) {
+        self.madvise_range(0..self.len(), advice);
+    }
+
+    /// Advise the kernel about the access pattern for a sub-range.
+    ///
+    /// The range is relative to these bytes. Same mmap-only guard as
+    /// [`Self::madvise`]. The pointer is aligned down to a page boundary
+    /// as required by `madvise`.
+    #[cfg(feature = "native")]
+    pub fn madvise_range(&self, range: Range<usize>, advice: libc::c_int) {
+        if !self.is_mmap() {
+            return;
+        }
+        let slice = &self.as_slice()[range];
+        if slice.is_empty() {
+            return;
+        }
+        let ptr = slice.as_ptr();
+        let len = slice.len();
+        let page_size = 4096usize;
+        let aligned_ptr = (ptr as usize) & !(page_size - 1);
+        let aligned_len = len + (ptr as usize - aligned_ptr);
+        unsafe {
+            libc::madvise(aligned_ptr as *mut libc::c_void, aligned_len, advice);
+        }
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
