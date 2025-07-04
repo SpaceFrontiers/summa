@@ -57,7 +57,32 @@ message Query {
     RangeQuery range = 8;
     PrefixQuery prefix = 9;
     BinaryDenseVectorQuery binary_dense_vector = 10;
+    FusionQuery fusion = 11;  // Top-level only (cannot be nested)
   }
+}
+
+// Method for fusing sub-query result lists
+enum FusionMethod {
+  FUSION_RRF = 0;                      // Reciprocal Rank Fusion (rank-based, default)
+  FUSION_NORMALIZED_WEIGHTED_SUM = 1;  // Min-max normalized weighted score sum
+}
+
+// Weighted sub-query for hybrid fusion
+message WeightedQuery {
+  Query query = 1;
+  float weight = 2;  // Contribution scale; 0 or unset = 1.0
+}
+
+// Union fusion of independently-executed sub-queries (e.g. sparse + dense
+// hybrid retrieval). Unlike the reranker (which can only re-score documents
+// the first-stage query found), fusion keeps documents found by ANY
+// sub-query. Only valid at the top level of SearchRequest.query; composes
+// with SearchRequest.reranker (the fused list becomes the L1 candidates).
+message FusionQuery {
+  repeated WeightedQuery queries = 1;
+  FusionMethod method = 2;
+  float rrf_k = 3;         // RRF rank constant; 0 = default 60
+  uint32 fetch_limit = 4;  // Per-sub-query candidate depth; 0 = 2x limit
 }
 
 // How to combine scores for multi-valued documents

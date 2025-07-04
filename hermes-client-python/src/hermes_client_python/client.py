@@ -341,7 +341,11 @@ class HermesClient:
         Args:
             index_name: Name of the index
             query: Query dict with one key: "term", "match", "boolean",
-                "sparse_vector", "dense_vector", "boost", or "all".
+                "sparse_vector", "dense_vector", "boost", "all", or "fusion".
+                Fusion (hybrid union of sub-queries, top-level only):
+                {"fusion": {"queries": [{"query": {...}, "weight": 1.0}, ...],
+                "method": "rrf" | "normalized_weighted_sum",
+                "rrf_k": 60, "fetch_limit": 100}}
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
@@ -773,6 +777,33 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
     if "all" in q:
         return pb.Query(all=pb.AllQuery())
 
+    if "fusion" in q:
+        f = q["fusion"]
+        method = f.get("method", "rrf")
+        if method == "rrf":
+            pb_method = pb.FusionMethod.FUSION_RRF
+        elif method == "normalized_weighted_sum":
+            pb_method = pb.FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
+        else:
+            raise ValueError(
+                f"Unknown fusion method {method!r}: "
+                "expected 'rrf' or 'normalized_weighted_sum'"
+            )
+        return pb.Query(
+            fusion=pb.FusionQuery(
+                queries=[
+                    pb.WeightedQuery(
+                        query=_build_query(wq["query"]),
+                        weight=wq.get("weight", 1.0),
+                    )
+                    for wq in f["queries"]
+                ],
+                method=pb_method,
+                rrf_k=f.get("rrf_k", 0),
+                fetch_limit=f.get("fetch_limit", 0),
+            )
+        )
+
     # No recognized query key found
     valid_keys = [
         "term",
@@ -785,6 +816,7 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
         "range",
         "prefix",
         "all",
+        "fusion",
     ]
     raise ValueError(
         f"Unrecognized query key(s): {set(q.keys()) - set(valid_keys)}. "

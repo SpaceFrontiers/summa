@@ -379,6 +379,9 @@ pub fn convert_query(
                 .ok_or_else(|| format!("Field '{}' not found", prefix_query.field))?;
             Ok(Box::new(PrefixQuery::text(field, &prefix_query.prefix)))
         }
+        Some(ProtoQueryType::Fusion(_)) => {
+            Err("FusionQuery is only supported at the top level of SearchRequest.query".to_string())
+        }
         None => Err("Query type is required".to_string()),
     }
 }

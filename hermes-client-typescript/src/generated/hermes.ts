@@ -9,6 +9,42 @@ import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 
 export const protobufPackage = "hermes";
 
+/** Method for fusing sub-query result lists */
+export enum FusionMethod {
+  /** FUSION_RRF - Reciprocal Rank Fusion (rank-based, default) */
+  FUSION_RRF = 0,
+  /** FUSION_NORMALIZED_WEIGHTED_SUM - Min-max normalized weighted score sum */
+  FUSION_NORMALIZED_WEIGHTED_SUM = 1,
+  UNRECOGNIZED = -1,
+}
+
+export function fusionMethodFromJSON(object: any): FusionMethod {
+  switch (object) {
+    case 0:
+    case "FUSION_RRF":
+      return FusionMethod.FUSION_RRF;
+    case 1:
+    case "FUSION_NORMALIZED_WEIGHTED_SUM":
+      return FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return FusionMethod.UNRECOGNIZED;
+  }
+}
+
+export function fusionMethodToJSON(object: FusionMethod): string {
+  switch (object) {
+    case FusionMethod.FUSION_RRF:
+      return "FUSION_RRF";
+    case FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM:
+      return "FUSION_NORMALIZED_WEIGHTED_SUM";
+    case FusionMethod.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** How to combine scores for multi-valued documents */
 export enum MultiValueCombiner {
   /** COMBINER_LOG_SUM_EXP - Log-sum-exp smooth maximum (default) */
@@ -77,7 +113,36 @@ export interface Query {
   match?: MatchQuery | undefined;
   range?: RangeQuery | undefined;
   prefix?: PrefixQuery | undefined;
-  binaryDenseVector?: BinaryDenseVectorQuery | undefined;
+  binaryDenseVector?:
+    | BinaryDenseVectorQuery
+    | undefined;
+  /** Top-level only (cannot be nested) */
+  fusion?: FusionQuery | undefined;
+}
+
+/** Weighted sub-query for hybrid fusion */
+export interface WeightedQuery {
+  query:
+    | Query
+    | undefined;
+  /** Contribution scale; 0 or unset = 1.0 */
+  weight: number;
+}
+
+/**
+ * Union fusion of independently-executed sub-queries (e.g. sparse + dense
+ * hybrid retrieval). Unlike the reranker (which can only re-score documents
+ * the first-stage query found), fusion keeps documents found by ANY
+ * sub-query. Only valid at the top level of SearchRequest.query; composes
+ * with SearchRequest.reranker (the fused list becomes the L1 candidates).
+ */
+export interface FusionQuery {
+  queries: WeightedQuery[];
+  method: FusionMethod;
+  /** RRF rank constant; 0 = default 60 */
+  rrfK: number;
+  /** Per-sub-query candidate depth; 0 = 2x limit */
+  fetchLimit: number;
 }
 
 /**
@@ -210,6 +275,8 @@ export interface Reranker {
   matryoshkaDims: number;
   /** Query vector (packed bits, for binary dense fields) */
   binaryVector: Uint8Array;
+  /** Reciprocal Rank Fusion k (0 = disabled, typical: 60) */
+  rrfK: number;
 }
 
 /** Search request/response */
@@ -507,6 +574,7 @@ function createBaseQuery(): Query {
     range: undefined,
     prefix: undefined,
     binaryDenseVector: undefined,
+    fusion: undefined,
   };
 }
 
@@ -541,6 +609,9 @@ export const Query: MessageFns<Query> = {
     }
     if (message.binaryDenseVector !== undefined) {
       BinaryDenseVectorQuery.encode(message.binaryDenseVector, writer.uint32(82).fork()).join();
+    }
+    if (message.fusion !== undefined) {
+      FusionQuery.encode(message.fusion, writer.uint32(90).fork()).join();
     }
     return writer;
   },
@@ -632,6 +703,14 @@ export const Query: MessageFns<Query> = {
           message.binaryDenseVector = BinaryDenseVectorQuery.decode(reader, reader.uint32());
           continue;
         }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.fusion = FusionQuery.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -665,6 +744,7 @@ export const Query: MessageFns<Query> = {
         : isSet(object.binary_dense_vector)
         ? BinaryDenseVectorQuery.fromJSON(object.binary_dense_vector)
         : undefined,
+      fusion: isSet(object.fusion) ? FusionQuery.fromJSON(object.fusion) : undefined,
     };
   },
 
@@ -700,6 +780,9 @@ export const Query: MessageFns<Query> = {
     if (message.binaryDenseVector !== undefined) {
       obj.binaryDenseVector = BinaryDenseVectorQuery.toJSON(message.binaryDenseVector);
     }
+    if (message.fusion !== undefined) {
+      obj.fusion = FusionQuery.toJSON(message.fusion);
+    }
     return obj;
   },
 
@@ -734,6 +817,203 @@ export const Query: MessageFns<Query> = {
     message.binaryDenseVector = (object.binaryDenseVector !== undefined && object.binaryDenseVector !== null)
       ? BinaryDenseVectorQuery.fromPartial(object.binaryDenseVector)
       : undefined;
+    message.fusion = (object.fusion !== undefined && object.fusion !== null)
+      ? FusionQuery.fromPartial(object.fusion)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseWeightedQuery(): WeightedQuery {
+  return { query: undefined, weight: 0 };
+}
+
+export const WeightedQuery: MessageFns<WeightedQuery> = {
+  encode(message: WeightedQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.query !== undefined) {
+      Query.encode(message.query, writer.uint32(10).fork()).join();
+    }
+    if (message.weight !== 0) {
+      writer.uint32(21).float(message.weight);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WeightedQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseWeightedQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.query = Query.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 21) {
+            break;
+          }
+
+          message.weight = reader.float();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): WeightedQuery {
+    return {
+      query: isSet(object.query) ? Query.fromJSON(object.query) : undefined,
+      weight: isSet(object.weight) ? globalThis.Number(object.weight) : 0,
+    };
+  },
+
+  toJSON(message: WeightedQuery): unknown {
+    const obj: any = {};
+    if (message.query !== undefined) {
+      obj.query = Query.toJSON(message.query);
+    }
+    if (message.weight !== 0) {
+      obj.weight = message.weight;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<WeightedQuery>): WeightedQuery {
+    return WeightedQuery.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<WeightedQuery>): WeightedQuery {
+    const message = createBaseWeightedQuery();
+    message.query = (object.query !== undefined && object.query !== null) ? Query.fromPartial(object.query) : undefined;
+    message.weight = object.weight ?? 0;
+    return message;
+  },
+};
+
+function createBaseFusionQuery(): FusionQuery {
+  return { queries: [], method: 0, rrfK: 0, fetchLimit: 0 };
+}
+
+export const FusionQuery: MessageFns<FusionQuery> = {
+  encode(message: FusionQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.queries) {
+      WeightedQuery.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.method !== 0) {
+      writer.uint32(16).int32(message.method);
+    }
+    if (message.rrfK !== 0) {
+      writer.uint32(29).float(message.rrfK);
+    }
+    if (message.fetchLimit !== 0) {
+      writer.uint32(32).uint32(message.fetchLimit);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FusionQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFusionQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.queries.push(WeightedQuery.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.method = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 29) {
+            break;
+          }
+
+          message.rrfK = reader.float();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.fetchLimit = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FusionQuery {
+    return {
+      queries: globalThis.Array.isArray(object?.queries)
+        ? object.queries.map((e: any) => WeightedQuery.fromJSON(e))
+        : [],
+      method: isSet(object.method) ? fusionMethodFromJSON(object.method) : 0,
+      rrfK: isSet(object.rrfK)
+        ? globalThis.Number(object.rrfK)
+        : isSet(object.rrf_k)
+        ? globalThis.Number(object.rrf_k)
+        : 0,
+      fetchLimit: isSet(object.fetchLimit)
+        ? globalThis.Number(object.fetchLimit)
+        : isSet(object.fetch_limit)
+        ? globalThis.Number(object.fetch_limit)
+        : 0,
+    };
+  },
+
+  toJSON(message: FusionQuery): unknown {
+    const obj: any = {};
+    if (message.queries?.length) {
+      obj.queries = message.queries.map((e) => WeightedQuery.toJSON(e));
+    }
+    if (message.method !== 0) {
+      obj.method = fusionMethodToJSON(message.method);
+    }
+    if (message.rrfK !== 0) {
+      obj.rrfK = message.rrfK;
+    }
+    if (message.fetchLimit !== 0) {
+      obj.fetchLimit = Math.round(message.fetchLimit);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<FusionQuery>): FusionQuery {
+    return FusionQuery.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<FusionQuery>): FusionQuery {
+    const message = createBaseFusionQuery();
+    message.queries = object.queries?.map((e) => WeightedQuery.fromPartial(e)) || [];
+    message.method = object.method ?? 0;
+    message.rrfK = object.rrfK ?? 0;
+    message.fetchLimit = object.fetchLimit ?? 0;
     return message;
   },
 };
@@ -2045,6 +2325,7 @@ function createBaseReranker(): Reranker {
     combinerDecay: 0,
     matryoshkaDims: 0,
     binaryVector: new Uint8Array(0),
+    rrfK: 0,
   };
 }
 
@@ -2078,6 +2359,9 @@ export const Reranker: MessageFns<Reranker> = {
     }
     if (message.binaryVector.length !== 0) {
       writer.uint32(74).bytes(message.binaryVector);
+    }
+    if (message.rrfK !== 0) {
+      writer.uint32(85).float(message.rrfK);
     }
     return writer;
   },
@@ -2171,6 +2455,14 @@ export const Reranker: MessageFns<Reranker> = {
           message.binaryVector = reader.bytes();
           continue;
         }
+        case 10: {
+          if (tag !== 85) {
+            break;
+          }
+
+          message.rrfK = reader.float();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2211,6 +2503,11 @@ export const Reranker: MessageFns<Reranker> = {
         : isSet(object.binary_vector)
         ? bytesFromBase64(object.binary_vector)
         : new Uint8Array(0),
+      rrfK: isSet(object.rrfK)
+        ? globalThis.Number(object.rrfK)
+        : isSet(object.rrf_k)
+        ? globalThis.Number(object.rrf_k)
+        : 0,
     };
   },
 
@@ -2243,6 +2540,9 @@ export const Reranker: MessageFns<Reranker> = {
     if (message.binaryVector.length !== 0) {
       obj.binaryVector = base64FromBytes(message.binaryVector);
     }
+    if (message.rrfK !== 0) {
+      obj.rrfK = message.rrfK;
+    }
     return obj;
   },
 
@@ -2260,6 +2560,7 @@ export const Reranker: MessageFns<Reranker> = {
     message.combinerDecay = object.combinerDecay ?? 0;
     message.matryoshkaDims = object.matryoshkaDims ?? 0;
     message.binaryVector = object.binaryVector ?? new Uint8Array(0);
+    message.rrfK = object.rrfK ?? 0;
     return message;
   },
 };

@@ -18,6 +18,18 @@
 //!
 //! // Dense vector query
 //! { denseVector: { field: "emb", vector: [0.1, 0.2, 0.3] } }
+//!
+//! // Hybrid fusion (top-level only): union of sub-query results,
+//! // combined with Reciprocal Rank Fusion or normalized weighted sum
+//! { fusion: {
+//!     queries: [
+//!       { query: { match: { field: "body", text: "rust engine" } }, weight: 1.0 },
+//!       { query: { denseVector: { field: "emb", vector: [...] } }, weight: 1.0 },
+//!     ],
+//!     method: "rrf",        // or "normalizedWeightedSum" (default: "rrf")
+//!     rrfK: 60,             // optional RRF rank constant
+//!     fetchLimit: 100,      // optional per-sub-query candidate depth
+//! } }
 //! ```
 
 use hermes_core::query::{
@@ -44,6 +56,8 @@ pub(crate) struct JsQuery {
     sparse_vector: Option<JsSparseVectorQuery>,
     #[serde(default)]
     dense_vector: Option<JsDenseVectorQuery>,
+    #[serde(default)]
+    fusion: Option<JsFusionQuery>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +110,26 @@ pub(crate) struct JsDenseVectorQuery {
     rerank_factor: Option<f32>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JsFusionQuery {
+    queries: Vec<JsWeightedQuery>,
+    /// "rrf" (default) or "normalizedWeightedSum"
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    rrf_k: Option<f32>,
+    #[serde(default)]
+    fetch_limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct JsWeightedQuery {
+    query: JsQuery,
+    #[serde(default)]
+    weight: Option<f32>,
+}
+
 /// Search request with optional parameters.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,18 +175,62 @@ pub(crate) async fn execute_structured_search<D: Directory>(
     let req: JsSearchRequest = serde_wasm_bindgen::from_value(request)
         .map_err(|e| JsValue::from_str(&format!("Invalid search request: {}", e)))?;
 
-    let query = convert_query(&req.query, searcher.schema(), searcher.tokenizers())?;
-
     let field_ids = req
         .fields_to_load
         .as_ref()
         .map(|names| crate::resolve_field_ids(searcher.schema(), names))
         .transpose()?;
 
-    let (results, _) = searcher
-        .search_with_offset_and_count(query.as_ref(), req.limit, req.offset)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
+    // Fusion: run each sub-query independently and fuse the ranked lists
+    // (union). Handled here because fusion is a searcher-level operation.
+    let results = if let Some(ref fusion) = req.query.fusion {
+        let mut sub_queries = Vec::with_capacity(fusion.queries.len());
+        for weighted in &fusion.queries {
+            if weighted.query.fusion.is_some() {
+                return Err(JsValue::from_str("fusion queries cannot be nested"));
+            }
+            let sub = convert_query(&weighted.query, searcher.schema(), searcher.tokenizers())?;
+            sub_queries.push((sub, weighted.weight.unwrap_or(1.0)));
+        }
+        if sub_queries.is_empty() {
+            return Err(JsValue::from_str("fusion requires at least one sub-query"));
+        }
+
+        let method = match fusion.method.as_deref() {
+            None | Some("rrf") => hermes_core::query::FusionMethod::Rrf {
+                k: fusion.rrf_k.unwrap_or(hermes_core::query::DEFAULT_RRF_K),
+            },
+            Some("normalizedWeightedSum") => {
+                hermes_core::query::FusionMethod::NormalizedWeightedSum
+            }
+            Some(other) => {
+                return Err(JsValue::from_str(&format!(
+                    "Unknown fusion method '{}': expected 'rrf' or 'normalizedWeightedSum'",
+                    other
+                )));
+            }
+        };
+
+        let fused_limit = req.limit + req.offset;
+        let fetch_limit = fusion.fetch_limit.unwrap_or(fused_limit * 2);
+        let refs: Vec<(&dyn Query, f32)> =
+            sub_queries.iter().map(|(q, w)| (q.as_ref(), *w)).collect();
+        let mut fused = searcher
+            .search_fused(&refs, fetch_limit, fused_limit, method)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
+        if req.offset > 0 {
+            fused.drain(..req.offset.min(fused.len()));
+        }
+        fused
+    } else {
+        let query = convert_query(&req.query, searcher.schema(), searcher.tokenizers())?;
+        let (results, _) = searcher
+            .search_with_offset_and_count(query.as_ref(), req.limit, req.offset)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
+        results
+    };
 
     let mut hits = Vec::with_capacity(results.len());
     for result in &results {
@@ -292,7 +370,13 @@ pub(crate) fn convert_query(
         return Ok(Box::new(query));
     }
 
+    if js.fusion.is_some() {
+        return Err(JsValue::from_str(
+            "fusion is only supported at the top level of a search request",
+        ));
+    }
+
     Err(JsValue::from_str(
-        "Invalid query: must contain exactly one of: term, match, boolean, prefix, sparseVector, denseVector",
+        "Invalid query: must contain exactly one of: term, match, boolean, prefix, sparseVector, denseVector, fusion",
     ))
 }

@@ -16,6 +16,7 @@ import {
   FieldEntry as PbFieldEntry,
   Query as PbQuery,
   MultiValueCombiner,
+  FusionMethod as PbFusionMethod,
 } from "./generated/hermes";
 
 import type {
@@ -405,7 +406,24 @@ function buildQuery(q: Query): PbQuery {
   if ("all" in q) {
     return { all: {} };
   }
-  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "binaryDenseVector", "boost", "range", "prefix", "all"];
+  if ("fusion" in q) {
+    const f = q.fusion;
+    return {
+      fusion: {
+        queries: f.queries.map((wq) => ({
+          query: buildQuery(wq.query),
+          weight: wq.weight ?? 1.0,
+        })),
+        method:
+          f.method === "normalized_weighted_sum"
+            ? PbFusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
+            : PbFusionMethod.FUSION_RRF,
+        rrfK: f.rrfK ?? 0,
+        fetchLimit: f.fetchLimit ?? 0,
+      },
+    };
+  }
+  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "binaryDenseVector", "boost", "range", "prefix", "all", "fusion"];
   const keys = Object.keys(q);
   throw new Error(
     `Unrecognized query key(s): ${keys.join(", ")}. Valid keys: ${validKeys.join(", ")}`

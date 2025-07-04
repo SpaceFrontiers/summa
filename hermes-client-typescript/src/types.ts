@@ -162,6 +162,28 @@ export interface PrefixQuery {
   prefix: string;
 }
 
+/** Weighted sub-query for hybrid fusion */
+export interface WeightedQuery {
+  query: Query;
+  /** Contribution scale (default: 1.0) */
+  weight?: number;
+}
+
+/**
+ * Union fusion of independently-executed sub-queries (e.g. sparse + dense).
+ * Unlike the reranker, keeps documents found by ANY sub-query.
+ * Only valid at the top level of a search request.
+ */
+export interface FusionQuery {
+  queries: WeightedQuery[];
+  /** Fusion method (default: "rrf") */
+  method?: "rrf" | "normalized_weighted_sum";
+  /** RRF rank constant (default: 60) */
+  rrfK?: number;
+  /** Per-sub-query candidate depth (default: 2x limit) */
+  fetchLimit?: number;
+}
+
 /** Discriminated union matching proto Query oneof. Exactly one key must be set. */
 export type Query =
   | { term: TermQuery }
@@ -173,7 +195,8 @@ export type Query =
   | { boost: BoostQuery }
   | { all: AllQuery }
   | { range: RangeQuery }
-  | { prefix: PrefixQuery };
+  | { prefix: PrefixQuery }
+  | { fusion: FusionQuery };
 
 // =============================================================================
 // Reranker (mirrors proto Reranker)
