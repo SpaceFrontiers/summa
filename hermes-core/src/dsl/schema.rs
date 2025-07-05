@@ -209,6 +209,13 @@ pub struct DenseVectorConfig {
     /// Default: true (most embedding models produce L2-normalized vectors).
     #[serde(default = "default_unit_norm")]
     pub unit_norm: bool,
+    /// Total RaBitQ bits per dimension for IVF-RaBitQ indexes.
+    /// 1 = classic binary RaBitQ (default). 2-8 = extended multi-bit codes
+    /// with much tighter distance estimates — allows lowering rerank_factor
+    /// (fewer raw-vector reads) at the same recall. Recommended: 4-5 for
+    /// disk-resident indexes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq_bits: Option<u8>,
     /// SOAR spilled cluster assignments for IVF-based indexes (IVF-RaBitQ, ScaNN).
     /// Assigns vectors to a secondary cluster with an orthogonality-amplified
     /// residual, improving recall at the same nprobe for ~1.2-2x assignment storage.
@@ -236,6 +243,7 @@ impl DenseVectorConfig {
             build_threshold: None,
             unit_norm: true,
             soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -250,6 +258,7 @@ impl DenseVectorConfig {
             build_threshold: None,
             unit_norm: true,
             soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -264,6 +273,7 @@ impl DenseVectorConfig {
             build_threshold: None,
             unit_norm: true,
             soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -278,6 +288,7 @@ impl DenseVectorConfig {
             build_threshold: None,
             unit_norm: true,
             soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -302,6 +313,12 @@ impl DenseVectorConfig {
     /// Set number of IVF clusters
     pub fn with_num_clusters(mut self, num_clusters: usize) -> Self {
         self.num_clusters = Some(num_clusters);
+        self
+    }
+
+    /// Set RaBitQ total bits per dimension (1 = classic, 2-8 = extended)
+    pub fn with_rabitq_bits(mut self, bits: u8) -> Self {
+        self.rabitq_bits = Some(bits.clamp(1, 8));
         self
     }
 
@@ -357,6 +374,32 @@ impl DenseVectorConfig {
 pub struct BinaryDenseVectorConfig {
     /// Number of bits (dimensions). Storage is ceil(dim/8) bytes per vector.
     pub dim: usize,
+    /// ANN index type: Flat (brute-force SIMD Hamming, default) or Ivf
+    /// (k-majority Hamming clusters — probe `nprobe` clusters at query time).
+    /// IVF pays off for segments past a few million vectors.
+    #[serde(default)]
+    pub index_type: BinaryIndexType,
+    /// Number of IVF clusters (default: sqrt(n) capped at 4096)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_clusters: Option<usize>,
+    /// Clusters to probe during search (default: 32)
+    #[serde(default = "default_nprobe")]
+    pub nprobe: usize,
+    /// Minimum vectors before building the IVF index (default: 100_000 —
+    /// below that brute-force SIMD Hamming is faster than probing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_threshold: Option<usize>,
+}
+
+/// ANN index type for binary dense vector fields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryIndexType {
+    /// Brute-force SIMD Hamming scan (default)
+    #[default]
+    Flat,
+    /// IVF with k-majority Hamming clustering
+    Ivf,
 }
 
 impl BinaryDenseVectorConfig {
@@ -365,7 +408,40 @@ impl BinaryDenseVectorConfig {
             dim.is_multiple_of(8),
             "BinaryDenseVector dimension must be a multiple of 8, got {dim}"
         );
-        Self { dim }
+        Self {
+            dim,
+            index_type: BinaryIndexType::Flat,
+            num_clusters: None,
+            nprobe: 32,
+            build_threshold: None,
+        }
+    }
+
+    /// Enable the IVF index (builder pattern)
+    pub fn with_ivf(mut self, num_clusters: Option<usize>, nprobe: usize) -> Self {
+        self.index_type = BinaryIndexType::Ivf;
+        self.num_clusters = num_clusters;
+        self.nprobe = nprobe;
+        self
+    }
+
+    /// Set the build threshold (builder pattern)
+    pub fn with_build_threshold(mut self, threshold: usize) -> Self {
+        self.build_threshold = Some(threshold);
+        self
+    }
+
+    /// Default build threshold: brute-force wins below ~100K vectors.
+    pub fn default_build_threshold(&self) -> usize {
+        self.build_threshold.unwrap_or(100_000)
+    }
+
+    /// Optimal cluster count for a given vector count (sqrt(n), capped)
+    pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
+        self.num_clusters.unwrap_or_else(|| {
+            let optimal = (num_vectors as f64).sqrt() as usize;
+            optimal.clamp(16, 4096)
+        })
     }
 
     /// Number of bytes needed to store one vector

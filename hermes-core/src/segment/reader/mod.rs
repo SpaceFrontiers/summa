@@ -823,6 +823,10 @@ impl SegmentReader {
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
+                VectorIndex::BinaryIvf(_) => {
+                    // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
+                    Vec::new()
+                }
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force from lazy flat vectors (native-precision SIMD scoring)
@@ -967,6 +971,15 @@ impl SegmentReader {
         Ok(combine_ordinal_results(results, combiner, k))
     }
 
+    /// Query-time nprobe for a binary field from its schema config (None = index default).
+    fn binary_ivf_nprobe(&self, field: Field) -> Option<usize> {
+        self.schema
+            .get_field_entry(field)
+            .and_then(|e| e.binary_dense_vector_config.as_ref())
+            .map(|c| c.nprobe)
+            .filter(|&n| n > 0)
+    }
+
     /// Search binary dense vectors using brute-force Hamming distance.
     ///
     /// Always flat brute-force (no ANN). Returns VectorSearchResult with ordinal tracking.
@@ -977,6 +990,16 @@ impl SegmentReader {
         k: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
+        // Binary IVF index: probe nprobe nearest Hamming clusters (exact
+        // distances within probed clusters — no rerank needed).
+        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
+            && let Some(ivf) = lazy.get()
+        {
+            let nprobe = self.binary_ivf_nprobe(field);
+            let results = ivf.search(query, k, nprobe);
+            return Ok(combine_ordinal_results(results, combiner, k));
+        }
+
         let lazy_flat = match self.flat_vectors.get(&field.0) {
             Some(f) => f,
             None => return Ok(Vec::new()),
@@ -1324,6 +1347,10 @@ impl SegmentReader {
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
+                VectorIndex::BinaryIvf(_) => {
+                    // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
+                    Vec::new()
+                }
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force (sync mmap reads)
@@ -1408,6 +1435,83 @@ impl SegmentReader {
             }
             results.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
         }
+
+        Ok(combine_ordinal_results(results, combiner, k))
+    }
+
+    /// Synchronous binary dense vector search (mmap/RAM only).
+    ///
+    /// Mirrors [`Self::search_binary_dense_vector`] for the rayon-parallel
+    /// sync scorer path used by multi-threaded runtimes.
+    #[cfg(feature = "sync")]
+    pub fn search_binary_dense_vector_sync(
+        &self,
+        field: Field,
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<VectorSearchResult>> {
+        // Binary IVF index: probe nprobe nearest Hamming clusters (exact
+        // distances within probed clusters — no rerank needed).
+        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
+            && let Some(ivf) = lazy.get()
+        {
+            let nprobe = self.binary_ivf_nprobe(field);
+            let results = ivf.search(query, k, nprobe);
+            return Ok(combine_ordinal_results(results, combiner, k));
+        }
+
+        let lazy_flat = match self.flat_vectors.get(&field.0) {
+            Some(f) => f,
+            None => return Ok(Vec::new()),
+        };
+
+        const BRUTE_FORCE_BATCH: usize = 8192; // Binary vectors are tiny, use larger batches
+
+        let dim_bits = lazy_flat.dim;
+        let byte_len = lazy_flat.vector_byte_size();
+        let n = lazy_flat.num_vectors;
+
+        if byte_len != query.len() {
+            return Err(Error::Schema(format!(
+                "Binary query vector byte length {} != field byte length {}",
+                query.len(),
+                byte_len
+            )));
+        }
+
+        let mut collector = crate::query::ScoreCollector::new(k);
+        let mut scores = vec![0f32; BRUTE_FORCE_BATCH];
+
+        for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
+            let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
+            let batch_bytes = lazy_flat
+                .read_vectors_batch_sync(batch_start, batch_count)
+                .map_err(crate::Error::Io)?;
+            let raw = batch_bytes.as_slice();
+
+            crate::structures::simd::batch_hamming_scores(
+                query,
+                raw,
+                byte_len,
+                dim_bits,
+                &mut scores[..batch_count],
+            );
+
+            let threshold = collector.threshold();
+            for (i, &score) in scores.iter().enumerate().take(batch_count) {
+                if score > threshold {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
+                }
+            }
+        }
+
+        let results: Vec<(u32, u16, f32)> = collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
+            .collect();
 
         Ok(combine_ordinal_results(results, combiner, k))
     }

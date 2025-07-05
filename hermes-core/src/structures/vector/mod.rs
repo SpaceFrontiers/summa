@@ -42,4 +42,7 @@ pub use quantization::{
 };
 
 // Indexes
-pub use index::{IVFPQConfig, IVFPQIndex, IVFRaBitQConfig, IVFRaBitQIndex, RaBitQIndex};
+pub use index::{
+    BinaryIvfConfig, BinaryIvfIndex, IVFPQConfig, IVFPQIndex, IVFRaBitQConfig, IVFRaBitQIndex,
+    RaBitQIndex,
+};

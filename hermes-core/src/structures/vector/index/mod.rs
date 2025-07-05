@@ -5,10 +5,12 @@
 //! - `IVFRaBitQIndex` - IVF with RaBitQ binary quantization
 //! - `IVFPQIndex` - IVF with Product Quantization (ScaNN-style)
 
+mod binary_ivf;
 mod ivf_pq;
 mod ivf_rabitq;
 mod rabitq;
 
+pub use binary_ivf::{BinaryIvfConfig, BinaryIvfIndex};
 pub use ivf_pq::{IVFPQConfig, IVFPQIndex};
 pub use ivf_rabitq::{IVFRaBitQConfig, IVFRaBitQIndex};
 pub use rabitq::RaBitQIndex;

@@ -414,6 +414,8 @@ export interface VectorFieldStats {
   totalVectors: number;
   /** dim for dense, num_dimensions for sparse */
   dimension: number;
+  /** sparse only: avg postings per vector (0 for dense) */
+  avgTermsPerVector: number;
 }
 
 /** Memory usage statistics */
@@ -4260,7 +4262,7 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
 };
 
 function createBaseVectorFieldStats(): VectorFieldStats {
-  return { fieldName: "", vectorType: "", totalVectors: 0, dimension: 0 };
+  return { fieldName: "", vectorType: "", totalVectors: 0, dimension: 0, avgTermsPerVector: 0 };
 }
 
 export const VectorFieldStats: MessageFns<VectorFieldStats> = {
@@ -4276,6 +4278,9 @@ export const VectorFieldStats: MessageFns<VectorFieldStats> = {
     }
     if (message.dimension !== 0) {
       writer.uint32(32).uint32(message.dimension);
+    }
+    if (message.avgTermsPerVector !== 0) {
+      writer.uint32(45).float(message.avgTermsPerVector);
     }
     return writer;
   },
@@ -4319,6 +4324,14 @@ export const VectorFieldStats: MessageFns<VectorFieldStats> = {
           message.dimension = reader.uint32();
           continue;
         }
+        case 5: {
+          if (tag !== 45) {
+            break;
+          }
+
+          message.avgTermsPerVector = reader.float();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4346,6 +4359,11 @@ export const VectorFieldStats: MessageFns<VectorFieldStats> = {
         ? globalThis.Number(object.total_vectors)
         : 0,
       dimension: isSet(object.dimension) ? globalThis.Number(object.dimension) : 0,
+      avgTermsPerVector: isSet(object.avgTermsPerVector)
+        ? globalThis.Number(object.avgTermsPerVector)
+        : isSet(object.avg_terms_per_vector)
+        ? globalThis.Number(object.avg_terms_per_vector)
+        : 0,
     };
   },
 
@@ -4363,6 +4381,9 @@ export const VectorFieldStats: MessageFns<VectorFieldStats> = {
     if (message.dimension !== 0) {
       obj.dimension = Math.round(message.dimension);
     }
+    if (message.avgTermsPerVector !== 0) {
+      obj.avgTermsPerVector = message.avgTermsPerVector;
+    }
     return obj;
   },
 
@@ -4375,6 +4396,7 @@ export const VectorFieldStats: MessageFns<VectorFieldStats> = {
     message.vectorType = object.vectorType ?? "";
     message.totalVectors = object.totalVectors ?? 0;
     message.dimension = object.dimension ?? 0;
+    message.avgTermsPerVector = object.avgTermsPerVector ?? 0;
     return message;
   },
 };

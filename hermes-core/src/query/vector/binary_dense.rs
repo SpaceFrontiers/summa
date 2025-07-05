@@ -60,6 +60,21 @@ impl Query for BinaryDenseVectorQuery {
         })
     }
 
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let results = reader.search_binary_dense_vector_sync(
+            self.field,
+            &self.vector,
+            limit,
+            self.combiner,
+        )?;
+        Ok(Box::new(VectorResultScorer::new(results, self.field.0)) as Box<dyn Scorer>)
+    }
+
     fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
         Box::pin(async move { Ok(u32::MAX) })
     }

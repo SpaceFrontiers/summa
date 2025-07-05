@@ -267,6 +267,21 @@ field e: dense_vector<768, f16> [indexed<flat>]                              # b
 field e: dense_vector<768> [stored]                                          # stored, not indexed
 ```
 
+### Extended RaBitQ (multi-bit codes for disk-resident indexes)
+
+IVF-RaBitQ supports extended multi-bit codes (`bits: 2-8`, default 1 = classic
+binary RaBitQ). Extra magnitude bits per dimension give much tighter distance
+estimates — with `bits: 4-5` the exact-rerank pool (`rerank_factor`) can be
+shrunk 2-3x at the same recall, which cuts raw-vector reads on memory-bound /
+disk-resident indexes:
+
+```
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, bits: 5>]
+```
+
+Segments built with different `bits` are not merge-compatible (the codebook
+version differs) — pick the value before building.
+
 ### SOAR (higher recall for IVF indexes)
 
 IVF-based indexes (`ivf_rabitq`, `scann`) support SOAR — spilling each vector
@@ -291,6 +306,22 @@ index documents {
 }
 ```
 
+### Binary Vector IVF
+
+Binary dense vector fields default to brute-force SIMD Hamming scan (fast up
+to a few million vectors per segment). For larger segments, enable the IVF
+index — k-majority Hamming clustering with exact in-cluster distances (the
+only approximation is which clusters get probed):
+
+```
+field hash: binary_dense_vector<512> [indexed<ivf, num_clusters: 1024, nprobe: 32>]
+field hash: binary_dense_vector<512> [indexed<ivf, build_threshold: 500000>]
+```
+
+The index is built at commit once the segment crosses `build_threshold`
+(default 100000 vectors) and rebuilt on merge with fresh sample-trained
+centroids.
+
 ## Sparse Vectors
 
 Sparse vector fields store learned sparse representations (SPLADE, uniCOIL, etc.) using an inverted index with quantized weights. They support the same Block-Max MaxScore query pipeline as BM25 text fields.
@@ -303,6 +334,22 @@ field sparse_emb: sparse_vector [indexed, stored]
 ```
 
 Sparse vectors are indexed as posting lists with float weights. At query time, you can provide raw `(indices, values)` pairs or raw text (tokenized server-side if a HuggingFace tokenizer is configured).
+
+### Document Mass Cropping
+
+`doc_mass` crops the excessive low-weight tail of each document's sparse vector
+at indexing time: entries are ranked by |weight| and only the head covering the
+given fraction of the vector's total |weight| mass is kept. SPLADE-style vectors
+concentrate importance in a few head terms, so `doc_mass: 0.9` typically drops
+20-40% of postings with <1% nDCG loss. Vectors with at most `min_terms` entries
+are never cropped.
+
+```
+field emb: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
+```
+
+Use `hermes-tool info <index>` to inspect the resulting average sparse vector
+length (`avg terms/vector`).
 
 ### Quantization and Pruning
 

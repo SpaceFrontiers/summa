@@ -26,6 +26,47 @@ pub enum VectorIndex {
     IVF(Arc<LazyIVF>),
     /// ScaNN (IVF-PQ) - lazy deserialization on first access
     ScaNN(Arc<LazyScaNN>),
+    /// Binary IVF (Hamming) - lazy deserialization on first access
+    BinaryIvf(Arc<LazyBinaryIvf>),
+}
+
+/// Lazy binary IVF index — defers bincode deserialization to first access
+///
+/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
+/// The mmap pages are only paged into physical RAM when deserialization happens.
+pub struct LazyBinaryIvf {
+    raw: OwnedBytes,
+    resolved: OnceLock<Option<Arc<crate::structures::BinaryIvfIndex>>>,
+}
+
+impl LazyBinaryIvf {
+    pub fn new(raw: OwnedBytes) -> Self {
+        Self {
+            raw,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Option<&Arc<crate::structures::BinaryIvfIndex>> {
+        self.resolved
+            .get_or_init(|| {
+                match crate::structures::BinaryIvfIndex::from_bytes(self.raw.as_slice()) {
+                    Ok(idx) => Some(Arc::new(idx)),
+                    Err(e) => {
+                        log::warn!("[lazy_binary_ivf] deserialization failed: {}", e);
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        match self.resolved.get() {
+            Some(Some(idx)) => idx.estimated_memory_bytes(),
+            _ => self.raw.len(),
+        }
+    }
 }
 
 /// Lazy RaBitQ index — defers serde_json deserialization to first access
@@ -158,6 +199,7 @@ impl VectorIndex {
             VectorIndex::RaBitQ(lazy) => lazy.estimated_memory_bytes(),
             VectorIndex::IVF(lazy) => lazy.estimated_memory_bytes(),
             VectorIndex::ScaNN(lazy) => lazy.estimated_memory_bytes(),
+            VectorIndex::BinaryIvf(lazy) => lazy.estimated_memory_bytes(),
         }
     }
 }
@@ -301,6 +343,12 @@ pub struct SparseIndex {
 }
 
 impl SparseIndex {
+    /// Total postings across all dimensions (sum of per-dimension doc counts).
+    /// With multi-valued fields each (doc, ordinal, dim) entry counts once.
+    pub fn total_postings(&self) -> u64 {
+        self.dims.doc_counts.iter().map(|&c| c as u64).sum()
+    }
+
     /// Create a new V3 sparse index with SoA dimension table and zero-copy skip section
     pub fn new(
         handle: FileHandle,

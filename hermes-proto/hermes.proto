@@ -31,7 +31,7 @@ service IndexService {
   // Force merge segments
   rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
 
-  // Reorder BMP blocks by SimHash similarity
+  // Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning
   rpc Reorder(ReorderRequest) returns (ReorderResponse);
 
   // Delete an index
@@ -299,6 +299,7 @@ message VectorFieldStats {
   string vector_type = 2;  // "dense" or "sparse"
   uint64 total_vectors = 3;
   uint32 dimension = 4;    // dim for dense, num_dimensions for sparse
+  float avg_terms_per_vector = 5;  // sparse only: avg postings per vector (0 for dense)
 }
 
 // Memory usage statistics

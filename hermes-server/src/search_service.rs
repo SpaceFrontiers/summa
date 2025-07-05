@@ -408,6 +408,7 @@ impl SearchService for SearchServiceImpl {
         let schema = index.schema();
         let mut dense_totals: HashMap<u32, u64> = HashMap::new();
         let mut sparse_totals: HashMap<u32, u64> = HashMap::new();
+        let mut sparse_postings: HashMap<u32, u64> = HashMap::new();
         let mut dense_dims: HashMap<u32, u32> = HashMap::new();
         let mut sparse_dims: HashMap<u32, u32> = HashMap::new();
 
@@ -418,12 +419,14 @@ impl SearchService for SearchServiceImpl {
             }
             for (&field_id, sparse_idx) in segment.sparse_indexes() {
                 *sparse_totals.entry(field_id).or_default() += sparse_idx.total_vectors as u64;
+                *sparse_postings.entry(field_id).or_default() += sparse_idx.total_postings();
                 sparse_dims
                     .entry(field_id)
                     .or_insert(sparse_idx.num_dimensions() as u32);
             }
             for (&field_id, bmp_idx) in segment.bmp_indexes() {
                 *sparse_totals.entry(field_id).or_default() += bmp_idx.total_vectors as u64;
+                *sparse_postings.entry(field_id).or_default() += bmp_idx.total_postings();
                 sparse_dims.entry(field_id).or_insert(bmp_idx.dims());
             }
         }
@@ -439,6 +442,7 @@ impl SearchService for SearchServiceImpl {
                 vector_type: "dense".to_string(),
                 total_vectors: *total,
                 dimension: dense_dims.get(field_id).copied().unwrap_or(0),
+                avg_terms_per_vector: 0.0,
             });
         }
         for (field_id, total) in &sparse_totals {
@@ -446,11 +450,18 @@ impl SearchService for SearchServiceImpl {
                 .get_field_name(hermes_core::dsl::Field(*field_id))
                 .unwrap_or("unknown")
                 .to_string();
+            let postings = sparse_postings.get(field_id).copied().unwrap_or(0);
+            let avg_terms_per_vector = if *total > 0 {
+                postings as f32 / *total as f32
+            } else {
+                0.0
+            };
             vector_stats.push(VectorFieldStats {
                 field_name: name,
                 vector_type: "sparse".to_string(),
                 total_vectors: *total,
                 dimension: sparse_dims.get(field_id).copied().unwrap_or(0),
+                avg_terms_per_vector,
             });
         }
         vector_stats.sort_by(|a, b| a.field_name.cmp(&b.field_name));

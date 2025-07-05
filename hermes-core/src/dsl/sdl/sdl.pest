@@ -138,14 +138,14 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | soar_kwarg | query_config_block | positions_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | doc_mass_kwarg | soar_kwarg | bits_kwarg | query_config_block | positions_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
 //   token_position - only token position within text for phrase queries
 positions_kwarg = { "positions" | "ordinal" | "token_position" }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
-index_type_spec = { "flat" | "scann" | "ivf_rabitq" | "rabitq" }
+index_type_spec = { "flat" | "scann" | "ivf_rabitq" | "ivf" | "rabitq" }
 num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
 num_clusters_spec = @{ ASCII_DIGIT+ }
 build_threshold_kwarg = { "build_threshold" ~ ":" ~ build_threshold_spec }
@@ -165,6 +165,14 @@ sparse_dims_kwarg = { "dims" ~ ":" ~ sparse_dims_spec }
 sparse_dims_spec = @{ ASCII_DIGIT+ }
 sparse_max_weight_kwarg = { "max_weight" ~ ":" ~ sparse_max_weight_spec }
 sparse_max_weight_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+// RaBitQ bits per dimension for IVF-RaBitQ dense indexes:
+//   bits: 1  # classic binary RaBitQ (default)
+//   bits: 4  # extended multi-bit codes (tighter estimates, smaller rerank pool)
+bits_kwarg = { "bits" ~ ":" ~ bits_spec }
+bits_spec = @{ ASCII_DIGIT }
+// Document-side mass cropping for sparse vectors:
+//   doc_mass: 0.9  # keep top-weight entries covering 90% of each vector's mass
+doc_mass_kwarg = { "doc_mass" ~ ":" ~ pruning_spec }
 // SOAR spilled secondary cluster assignments for IVF-based dense indexes:
 //   soar: selective  # spill only vectors near cluster boundaries (recommended)
 //   soar: full       # spill every vector to 1 secondary cluster

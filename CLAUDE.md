@@ -9,6 +9,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Do not refactor, rename, or "improve" code beyond what was explicitly requested.
 - When fixing a bug, write a failing test first if one doesn't exist, then fix.
 
+## Development & Testing Rules
+
+- **Fail loud, never silent.** Config/schema misuse must error or `log::warn!` at
+  load time with an actionable message — never silently ignore an option, match
+  zero items, or return empty results due to capability mismatch. A feature that
+  ends up disabled at runtime must say so loudly.
+- **Regression tests are named for the behavior they pin** (e.g.
+  `test_binary_dense_search_multi_thread_runtime`), reproduce the failure first,
+  and encode the scenario end-to-end — not just the unit.
+- **Format/wire compatibility is designed, not accidental.** New serialized
+  fields use `#[serde(default)]` (+ `skip_serializing_if` for emitters); formats
+  carry version gates that loudly refuse data too new to read; incompatible
+  builds must fail merge via version checks (see RaBitQ codebook `version`).
+  When a change claims "no behavioral change," verify byte-identical output.
+- **Hot-path allocation hygiene.** Per-query buffers come from reusable /
+  thread-local scratch (see `BmpScratch`), `Vec::with_capacity` over realloc
+  chains, sort+dedup in place over hash maps where possible. New per-query
+  allocations on the search path need justification.
+- **Every fallback or drop is observable.** Silent truncation, silently skipped
+  candidates, or degraded modes need a counter, log line, or stats field.
+- **Perf claims are measured.** Quote numbers (before/after, dataset, arch) in
+  the PR/commit; validate cross-arch (x86 AVX2 + aarch64 NEON) before changing
+  defaults. SIMD kernels always ship with a scalar fallback and dispatch safely.
+- **Substantial features get a short design doc** under `docs/` before
+  implementation (format changes, new index structures, protocol additions).
+
 ## Project Overview
 
 Hermes is a high-performance, embeddable full-text search engine written in Rust. It's a monorepo containing:

@@ -121,6 +121,8 @@ pub use postings::{
 
 // Re-export vector
 pub use vector::{
+    BinaryIvfConfig,
+    BinaryIvfIndex,
     // IVF core
     ClusterData,
     ClusterStorage,

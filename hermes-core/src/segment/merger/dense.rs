@@ -244,10 +244,10 @@ impl SegmentMerger {
             let entry = self.schema.get_field_entry(field).unwrap();
             let config = entry.dense_vector_config.as_ref();
 
-            // ── ANN entry (written first, index_type < FLAT_TYPE) ────────
-            // Skip ANN for binary dense vectors (always brute-force)
+            // ── ANN entry (written first, index_type != FLAT_TYPE) ───────
             let ann_blob = if entry.field_type == FieldType::BinaryDenseVector {
-                None
+                self.try_build_binary_ivf(field, entry, segments, &doc_offs, fi.total_vectors)
+                    .await?
             } else {
                 self.try_build_ann(field, config, segments, &doc_offs, trained)
                     .await?
@@ -316,6 +316,72 @@ impl SegmentMerger {
     /// or None if no ANN path is available.
     ///
     /// Tries in order: O(1) ScaNN merge → O(1) IVF merge → rebuild from trained.
+    /// Rebuild the binary IVF index for a merged binary dense vector field.
+    ///
+    /// Reads all packed codes from the source segments' flat storage and
+    /// rebuilds with fresh k-majority centroids (training is sample-bounded
+    /// via `max_train_samples`; assignment covers all vectors). Codes are the
+    /// exact vectors, so the rebuild is lossless.
+    async fn try_build_binary_ivf(
+        &self,
+        field: crate::dsl::Field,
+        entry: &crate::dsl::FieldEntry,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        total_vectors: usize,
+    ) -> Result<Option<(u8, Vec<u8>)>> {
+        let Some(cfg) = entry.binary_dense_vector_config.as_ref() else {
+            return Ok(None);
+        };
+        if cfg.index_type != crate::dsl::BinaryIndexType::Ivf
+            || total_vectors < cfg.default_build_threshold()
+        {
+            return Ok(None);
+        }
+
+        let byte_len = cfg.dim.div_ceil(8);
+        let mut codes: Vec<u8> = Vec::with_capacity(total_vectors * byte_len);
+        let mut labels: Vec<(u32, u16)> = Vec::with_capacity(total_vectors);
+
+        const CODE_BATCH: usize = 65536;
+        for (seg_idx, segment) in segments.iter().enumerate() {
+            let Some(lazy_flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            let offset = doc_offs[seg_idx];
+            let n = lazy_flat.num_vectors;
+            for batch_start in (0..n).step_by(CODE_BATCH) {
+                let batch_count = CODE_BATCH.min(n - batch_start);
+                let bytes = lazy_flat
+                    .read_vectors_batch(batch_start, batch_count)
+                    .await
+                    .map_err(crate::Error::Io)?;
+                codes.extend_from_slice(bytes.as_slice());
+                for i in 0..batch_count {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    labels.push((doc_id + offset, ordinal));
+                }
+            }
+        }
+
+        if labels.is_empty() {
+            return Ok(None);
+        }
+
+        let num_clusters = cfg.optimal_num_clusters(labels.len());
+        let ivf_config = crate::structures::BinaryIvfConfig::new(cfg.dim, num_clusters);
+        let index = crate::structures::BinaryIvfIndex::build(ivf_config, &codes, &labels);
+        let bytes = index.to_bytes().map_err(crate::Error::Io)?;
+        log::debug!(
+            "[merge_vectors] field {}: binary IVF rebuilt ({} vectors, {} clusters, {} bytes)",
+            field.0,
+            labels.len(),
+            num_clusters,
+            bytes.len(),
+        );
+        Ok(Some((crate::segment::ann_build::BINARY_IVF_TYPE, bytes)))
+    }
+
     async fn try_build_ann(
         &self,
         field: crate::dsl::Field,
@@ -445,8 +511,9 @@ impl SegmentMerger {
             VectorIndexType::Flat | VectorIndexType::RaBitQ => unreachable!(),
             VectorIndexType::IvfRaBitQ => {
                 let centroids = &trained.centroids[&field.0];
+                let bits = config.and_then(|c| c.rabitq_bits).unwrap_or(1);
                 let (mut index, codebook) =
-                    crate::segment::ann_build::new_ivf_rabitq(dim, centroids);
+                    crate::segment::ann_build::new_ivf_rabitq(dim, centroids, bits);
 
                 for (seg_idx, segment) in segments.iter().enumerate() {
                     let offset = doc_offs[seg_idx];
