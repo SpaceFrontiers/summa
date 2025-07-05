@@ -141,8 +141,15 @@ export interface FusionQuery {
   method: FusionMethod;
   /** RRF rank constant; 0 = default 60 */
   rrfK: number;
-  /** Per-sub-query candidate depth; 0 = 2x limit */
+  /** Per-sub-query candidate depth; 0 = max(4x limit, 50) */
   fetchLimit: number;
+  /**
+   * Combiner for fused per-chunk (ordinal) scores into a document score.
+   * Fusion runs at chunk granularity: same-chunk hits across sub-queries
+   * compound, and results carry per-chunk ordinal_scores.
+   * Unset (0) = MAX (recommended; LogSumExp is unsuitable at RRF magnitudes).
+   */
+  combiner: MultiValueCombiner;
 }
 
 /**
@@ -903,7 +910,7 @@ export const WeightedQuery: MessageFns<WeightedQuery> = {
 };
 
 function createBaseFusionQuery(): FusionQuery {
-  return { queries: [], method: 0, rrfK: 0, fetchLimit: 0 };
+  return { queries: [], method: 0, rrfK: 0, fetchLimit: 0, combiner: 0 };
 }
 
 export const FusionQuery: MessageFns<FusionQuery> = {
@@ -919,6 +926,9 @@ export const FusionQuery: MessageFns<FusionQuery> = {
     }
     if (message.fetchLimit !== 0) {
       writer.uint32(32).uint32(message.fetchLimit);
+    }
+    if (message.combiner !== 0) {
+      writer.uint32(40).int32(message.combiner);
     }
     return writer;
   },
@@ -962,6 +972,14 @@ export const FusionQuery: MessageFns<FusionQuery> = {
           message.fetchLimit = reader.uint32();
           continue;
         }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.combiner = reader.int32() as any;
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -987,6 +1005,7 @@ export const FusionQuery: MessageFns<FusionQuery> = {
         : isSet(object.fetch_limit)
         ? globalThis.Number(object.fetch_limit)
         : 0,
+      combiner: isSet(object.combiner) ? multiValueCombinerFromJSON(object.combiner) : 0,
     };
   },
 
@@ -1004,6 +1023,9 @@ export const FusionQuery: MessageFns<FusionQuery> = {
     if (message.fetchLimit !== 0) {
       obj.fetchLimit = Math.round(message.fetchLimit);
     }
+    if (message.combiner !== 0) {
+      obj.combiner = multiValueCombinerToJSON(message.combiner);
+    }
     return obj;
   },
 
@@ -1016,6 +1038,7 @@ export const FusionQuery: MessageFns<FusionQuery> = {
     message.method = object.method ?? 0;
     message.rrfK = object.rrfK ?? 0;
     message.fetchLimit = object.fetchLimit ?? 0;
+    message.combiner = object.combiner ?? 0;
     return message;
   },
 };
@@ -6457,7 +6480,7 @@ export const IndexServiceDefinition = {
       responseStream: false,
       options: {},
     },
-    /** Reorder BMP blocks by SimHash similarity */
+    /** Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning */
     reorder: {
       name: "Reorder",
       requestType: ReorderRequest,

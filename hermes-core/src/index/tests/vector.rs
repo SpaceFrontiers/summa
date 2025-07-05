@@ -875,6 +875,7 @@ async fn test_search_fused_hybrid_union() {
             10,
             10,
             FusionMethod::default(),
+            crate::query::MultiValueCombiner::Max,
         )
         .await
         .unwrap();

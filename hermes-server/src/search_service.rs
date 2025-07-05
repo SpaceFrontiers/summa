@@ -117,7 +117,14 @@ impl SearchService for SearchServiceImpl {
                 let fetch_limit = if fusion.fetch_limit > 0 {
                     fusion.fetch_limit as usize
                 } else {
-                    fused_limit * 2
+                    (fused_limit * 4).max(50)
+                };
+
+                // Chunk combiner for fused per-ordinal scores. Unset (0) maps
+                // to Max — LogSumExp is unsuitable at RRF score magnitudes.
+                let combiner = match fusion.combiner {
+                    0 => hermes_core::query::MultiValueCombiner::Max,
+                    c => crate::converters::convert_fusion_combiner(c),
                 };
 
                 query_desc = format!(
@@ -137,13 +144,18 @@ impl SearchService for SearchServiceImpl {
                 let mut seen: u32 = 0;
                 for (sub, weight) in &sub_queries {
                     let (sub_results, sub_seen) = searcher
-                        .search_with_count(sub.as_ref(), fetch_limit)
+                        .search_with_positions(sub.as_ref(), fetch_limit)
                         .await
                         .map_err(crate::error::hermes_error_to_status)?;
                     seen = seen.saturating_add(sub_seen);
                     lists.push((sub_results, *weight));
                 }
-                let fused = hermes_core::query::fuse_ranked_lists(lists, method, fused_limit);
+                let fused = hermes_core::query::fuse_ranked_lists_chunked(
+                    lists,
+                    method,
+                    combiner,
+                    fused_limit,
+                );
                 let rerank_config = rerank_setup.map(|(config, _)| (config, limit));
                 (fused, seen, rerank_config)
             } else {

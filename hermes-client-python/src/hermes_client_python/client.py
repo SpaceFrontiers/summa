@@ -801,6 +801,8 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
                 method=pb_method,
                 rrf_k=f.get("rrf_k", 0),
                 fetch_limit=f.get("fetch_limit", 0),
+                # Chunk combiner; unset -> MAX server-side (chunk-level fusion)
+                combiner=_combiner_to_proto(f.get("combiner")),
             )
         )
 

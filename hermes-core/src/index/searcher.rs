@@ -648,22 +648,32 @@ impl<D: Directory + 'static> Searcher<D> {
     /// (BM25/SPLADE) + dense vector hybrid retrieval with
     /// `FusionMethod::Rrf { k: 60.0 }`.
     ///
+    /// Fusion happens at **chunk granularity**: per-ordinal scores are
+    /// collected from each sub-query, fused per `(doc, ordinal)` key, then
+    /// combined into a doc score with `combiner`
+    /// (`MultiValueCombiner::Max` recommended — same-chunk corroboration
+    /// across verticals compounds, scattered noise does not). Fused results
+    /// carry per-chunk `positions`.
+    ///
     /// Each query is paired with a weight scaling its contribution.
     /// `fetch_limit` is the per-query candidate depth; a common choice is
-    /// `2 * limit` or more for better fusion quality.
+    /// `4 * limit` (min 50) for good rank resolution.
     pub async fn search_fused(
         &self,
         queries: &[(&dyn crate::query::Query, f32)],
         fetch_limit: usize,
         limit: usize,
         method: crate::query::FusionMethod,
+        combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<crate::query::SearchResult>> {
         let mut lists = Vec::with_capacity(queries.len());
         for &(query, weight) in queries {
-            let (results, _) = self.search_with_count(query, fetch_limit).await?;
+            let (results, _) = self.search_with_positions(query, fetch_limit).await?;
             lists.push((results, weight));
         }
-        Ok(crate::query::fuse_ranked_lists(lists, method, limit))
+        Ok(crate::query::fuse_ranked_lists_chunked(
+            lists, method, combiner, limit,
+        ))
     }
 
     /// Two-stage search: L1 retrieval + L2 dense vector reranking

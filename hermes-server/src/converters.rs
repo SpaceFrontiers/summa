@@ -38,6 +38,12 @@ fn convert_combiner(combiner: i32, temperature: f32, top_k: u32, decay: f32) -> 
     }
 }
 
+/// Convert a non-zero proto combiner value for fusion chunk combination.
+/// (0/unset is handled by the caller: fusion defaults to Max, not LogSumExp.)
+pub fn convert_fusion_combiner(combiner: i32) -> MultiValueCombiner {
+    convert_combiner(combiner, 0.0, 0, 0.0)
+}
+
 pub fn convert_query(
     query: &proto::Query,
     schema: &Schema,

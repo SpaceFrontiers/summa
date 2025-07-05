@@ -82,7 +82,12 @@ message FusionQuery {
   repeated WeightedQuery queries = 1;
   FusionMethod method = 2;
   float rrf_k = 3;         // RRF rank constant; 0 = default 60
-  uint32 fetch_limit = 4;  // Per-sub-query candidate depth; 0 = 2x limit
+  uint32 fetch_limit = 4;  // Per-sub-query candidate depth; 0 = max(4x limit, 50)
+  // Combiner for fused per-chunk (ordinal) scores into a document score.
+  // Fusion runs at chunk granularity: same-chunk hits across sub-queries
+  // compound, and results carry per-chunk ordinal_scores.
+  // Unset (0) = MAX (recommended; LogSumExp is unsuitable at RRF magnitudes).
+  MultiValueCombiner combiner = 5;
 }
 
 // How to combine scores for multi-valued documents

@@ -420,6 +420,7 @@ function buildQuery(q: Query): PbQuery {
             : PbFusionMethod.FUSION_RRF,
         rrfK: f.rrfK ?? 0,
         fetchLimit: f.fetchLimit ?? 0,
+        combiner: combinerToProto(f.combiner),
       },
     };
   }

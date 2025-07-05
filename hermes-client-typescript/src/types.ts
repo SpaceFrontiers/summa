@@ -180,8 +180,14 @@ export interface FusionQuery {
   method?: "rrf" | "normalized_weighted_sum";
   /** RRF rank constant (default: 60) */
   rrfK?: number;
-  /** Per-sub-query candidate depth (default: 2x limit) */
+  /** Per-sub-query candidate depth (default: max(4x limit, 50)) */
   fetchLimit?: number;
+  /**
+   * Combiner for fused per-chunk (ordinal) scores into a document score.
+   * Fusion runs at chunk granularity: same-chunk hits across sub-queries
+   * compound. Default: "max" (recommended for RRF score magnitudes).
+   */
+  combiner?: Combiner;
 }
 
 /** Discriminated union matching proto Query oneof. Exactly one key must be set. */
