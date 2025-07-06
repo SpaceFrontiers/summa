@@ -14,7 +14,9 @@ mod types;
 mod vector_data;
 
 #[cfg(any(feature = "native", feature = "wasm"))]
-pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
+pub use builder::{
+    BpBudget, MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats,
+};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub(crate) use reader::BmpIndex;

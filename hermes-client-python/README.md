@@ -206,3 +206,15 @@ python generate_proto.py
 ## License
 
 MIT
+
+## Timeouts / deadlines
+
+Every RPC accepts an optional `timeout` (seconds) which sets a gRPC deadline;
+a client-wide default can be set in the constructor. On expiry the call
+raises `grpc.aio.AioRpcError` with `DEADLINE_EXCEEDED`.
+
+```python
+client = HermesClient("localhost:50051", default_timeout=5.0)
+results = await client.search("articles", query={...}, timeout=0.5)  # per-call override
+await client.force_merge("articles", timeout=3600)  # long op, long deadline
+```

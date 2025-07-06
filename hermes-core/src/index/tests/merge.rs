@@ -1164,3 +1164,50 @@ async fn test_large_scale_merge_policy() {
         segments.len()
     );
 }
+
+/// Cold-IO merge path (docs/cold-io.md): merge outputs on filesystem
+/// directories always go through the page-cache-dropping writer. The merged
+/// segment must be byte-valid: correct doc count, every doc retrievable via
+/// search after force_merge on a real filesystem directory.
+#[tokio::test]
+async fn test_merge_with_cold_io_produces_valid_segment() {
+    use crate::directories::MmapDirectory;
+    use crate::query::TermQuery;
+
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let schema = sb.build();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = MmapDirectory::new(tmp.path());
+    let config = IndexConfig::default();
+
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    // Two segments; enough data to cross the cold writer's internal buffer
+    for seg in 0..2 {
+        for i in 0..500 {
+            let mut doc = Document::new();
+            doc.add_text(
+                title,
+                format!("doc{} filler{}", seg * 500 + i, "x".repeat(1000)),
+            );
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    assert_eq!(index.num_docs().await.unwrap(), 1000);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for probe in [0u32, 499, 500, 999] {
+        let q = TermQuery::text(title, &format!("doc{}", probe));
+        let results = searcher.search(&q, 3).await.unwrap();
+        assert_eq!(results.len(), 1, "doc{} lost after cold-IO merge", probe);
+    }
+}

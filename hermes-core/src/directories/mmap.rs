@@ -160,6 +160,15 @@ impl DirectoryWriter for MmapDirectory {
         let file = std::fs::File::create(&full_path)?;
         Ok(Box::new(FileStreamingWriter::new(file)))
     }
+
+    async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        let full_path = self.resolve(path);
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = std::fs::File::create(&full_path)?;
+        Ok(Box::new(super::ColdStreamingWriter::new(file)))
+    }
 }
 
 #[cfg(test)]

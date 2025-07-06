@@ -16,6 +16,7 @@ mod dense;
 mod diagnostics;
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) mod graph_bisection;
+pub use graph_bisection::BpBudget;
 mod postings;
 mod sparse;
 mod store;

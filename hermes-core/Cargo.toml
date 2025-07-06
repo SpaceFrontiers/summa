@@ -35,6 +35,7 @@ pest_derive = { workspace = true }
 base64 = { workspace = true }
 regex = { workspace = true }
 rand = { workspace = true }
+metrics = { version = "0.24", optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }
 instant = { version = "0.1", features = ["wasm-bindgen"], optional = true }
 lasso = { workspace = true, optional = true }
@@ -71,6 +72,7 @@ features = ["wasm_js"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
+metrics-util = "0.20"
 tempfile = { workspace = true }
 rand = { workspace = true }
 
@@ -83,6 +85,7 @@ default = ["sync"]
 native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:num_cpus", "dep:rayon", "dep:lasso", "dep:memmap2", "dep:libc", "dep:uuid", "dep:kentro", "dep:ndarray", "dep:nalgebra", "dep:tokenizers", "dep:hf-hub"]
 sync = ["native"]
 diagnostics = []
+metrics = ["dep:metrics"]
 fst-index = ["dep:fst"]
 wasm = ["fst-index", "dep:tokenizers"]
 http = ["dep:reqwest", "dep:instant"]

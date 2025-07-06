@@ -1686,3 +1686,134 @@ async fn test_bmp_multi_ordinal_clustering() {
         results_cross.len()
     );
 }
+
+/// Metrics emission: a BMP search must record the Prometheus metrics
+/// documented in docs/metrics.md, including the doc-map indirection counters.
+/// Only compiled with the `metrics` feature (cargo test --features metrics).
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn test_bmp_query_emits_prometheus_metrics() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // Global install: first (and only) metrics test in the process.
+    recorder.install().expect("install debugging recorder");
+
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for i in 0..200u32 {
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, vec![(i, 1.0), (9999, 0.1)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let query = SparseVectorQuery::new(sparse, vec![(9999, 1.0), (5, 0.5)]);
+    let results = searcher.search(&query, 10).await.unwrap();
+    assert!(!results.is_empty());
+
+    let names: std::collections::HashSet<String> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(key, _, _, _)| key.key().name().to_string())
+        .collect();
+    for expected in [
+        "hermes_bmp_query_duration_seconds",
+        "hermes_bmp_blocks_scored_total",
+        "hermes_bmp_superblocks_visited_total",
+        "hermes_bmp_docmap_lookups_total",
+        "hermes_bmp_docmap_lookups_per_query",
+    ] {
+        assert!(
+            names.contains(expected),
+            "metric '{}' not emitted; got: {:?}",
+            expected,
+            names
+        );
+    }
+}
+
+/// Budgeted (partial) reorder: a zero wall-clock BP budget must still produce
+/// a valid, fully searchable segment, mark it `bp_converged = false` in the
+/// index metadata (so the optimizer can deepen it later), and a follow-up
+/// full-budget pass must converge.
+#[tokio::test]
+async fn test_budgeted_reorder_marks_unconverged_and_stays_searchable() {
+    use crate::segment::BpBudget;
+
+    let (schema, title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    const NUM_DOCS: usize = 300;
+    for i in 0..NUM_DOCS {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc{}", i));
+        let topic_dim = 10000 + (i % 2) as u32 * 10;
+        doc.add_sparse_vector(sparse, vec![(i as u32, 1.0), (topic_dim, 0.5)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let seg_id = index.segment_readers().await.unwrap()[0].meta().id;
+    let sm = std::sync::Arc::clone(index.segment_manager());
+
+    // Pass 1: zero time budget → valid output, unconverged
+    let budget = BpBudget {
+        min_partition_docs: None,
+        time_budget: Some(std::time::Duration::ZERO),
+    };
+    let reordered = sm
+        .reorder_single_segment(&format!("{:032x}", seg_id), None, budget)
+        .await
+        .unwrap();
+    assert!(reordered);
+
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(metadata.segment_metas.len(), 1);
+    let info = metadata.segment_metas.values().next().unwrap();
+    assert!(info.reordered, "budgeted pass must mark segment reordered");
+    assert!(
+        !info.bp_converged,
+        "zero-budget pass must be marked unconverged for the optimizer to deepen"
+    );
+
+    // All docs still searchable after the partial pass
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 63, 150, NUM_DOCS - 1] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(results.len(), 1, "dim {} lost after budgeted reorder", i);
+    }
+
+    // Pass 2: full budget → warm-started pass converges
+    let new_seg_id = metadata.segment_ids()[0].clone();
+    let sm = std::sync::Arc::clone(index.segment_manager());
+    let reordered = sm
+        .reorder_single_segment(&new_seg_id, None, BpBudget::full())
+        .await
+        .unwrap();
+    assert!(reordered);
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let info = metadata.segment_metas.values().next().unwrap();
+    assert!(
+        info.bp_converged,
+        "full-budget follow-up pass must converge"
+    );
+}

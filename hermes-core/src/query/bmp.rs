@@ -165,12 +165,21 @@ thread_local! {
 /// Based on Mallia et al. (SIGIR 2024) and Carlson et al. (arXiv 2602.02883).
 pub fn execute_bmp(
     index: &BmpIndex,
+    field_id: u32,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
     max_superblocks: usize,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    execute_bmp_inner(index, query_terms, k, heap_factor, max_superblocks, None)
+    execute_bmp_inner(
+        index,
+        field_id,
+        query_terms,
+        k,
+        heap_factor,
+        max_superblocks,
+        None,
+    )
 }
 
 /// Execute a BMP query with a document predicate filter.
@@ -180,6 +189,7 @@ pub fn execute_bmp(
 /// only contains valid documents and the threshold evolves correctly.
 pub fn execute_bmp_filtered(
     index: &BmpIndex,
+    field_id: u32,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -188,6 +198,7 @@ pub fn execute_bmp_filtered(
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
         index,
+        field_id,
         query_terms,
         k,
         heap_factor,
@@ -198,6 +209,7 @@ pub fn execute_bmp_filtered(
 
 fn execute_bmp_inner(
     index: &BmpIndex,
+    field_id: u32,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -417,6 +429,7 @@ fn execute_bmp_inner(
 
         // Phase 3: Score superblocks in priority-descending order
         let mut blocks_scored = 0u32;
+        let mut docmap_lookups = 0u32;
         let mut sbs_scored = 0u32;
         let mut collector = ScoreCollector::new(collector_k);
 
@@ -539,6 +552,7 @@ fn execute_bmp_inner(
                 &predicate,
                 &mut collector,
                 &mut blocks_scored,
+                &mut docmap_lookups,
                 &mut scratch.acc,
                 phase1_mask,
                 if two_phase_active {
@@ -565,6 +579,15 @@ fn execute_bmp_inner(
 
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let threshold = collector.threshold();
+        crate::observe::bmp_query(
+            field_id,
+            t_start.elapsed().as_secs_f64(),
+            sbs_scored as usize,
+            num_superblocks_total,
+            blocks_scored as usize,
+            num_blocks,
+            docmap_lookups as usize,
+        );
         if elapsed_ms > 500.0 {
             log::warn!(
                 "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}, alpha={:.2}",
@@ -708,6 +731,7 @@ fn score_superblock_blocks(
     predicate: &Option<&dyn Fn(crate::DocId) -> bool>,
     collector: &mut ScoreCollector,
     blocks_scored: &mut u32,
+    docmap_lookups: &mut u32,
     acc: &mut [u32],
     phase1_mask: u64,
     phase1_local_ubs: Option<&[f32]>,
@@ -867,6 +891,11 @@ fn score_superblock_blocks(
                 if virtual_id >= num_vdocs {
                     continue;
                 }
+                // Doc-map indirection: BMP reorder permutes only BMP-internal
+                // record order, so every candidate pays a scattered lookup
+                // into the doc-id map here. Counted per query (metered as
+                // hermes_bmp_docmap_lookups_*).
+                *docmap_lookups += 1;
                 let (doc_id, ordinal) = index.virtual_to_doc(virtual_id as u32);
                 if doc_id == u32::MAX {
                     continue;

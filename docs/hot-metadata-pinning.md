@@ -68,7 +68,7 @@ Suggested starting budget: 150–700 MB/segment depending on host RAM —
 enough for offsets + skips + doc maps everywhere, plus `sb_grid` on hosts
 that can afford it.
 
-## Phase 2 (deferred): direct-I/O cold path
+## Phase 2 (implemented): cold-IO merge writes — see `docs/cold-io.md`
 
 Bulk reads that bypass the page cache entirely (merges, cold posting/vector
 scans) so they can never evict warm pages. Requires a direct-I/O read variant

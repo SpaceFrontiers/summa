@@ -71,6 +71,28 @@ struct Args {
     /// Interval in seconds between optimizer scans for unreordered segments
     #[arg(long, default_value = "60")]
     optimizer_scan_interval_secs: u64,
+
+    /// Segments with at least this many docs get budgeted (partial) BP passes
+    #[arg(long, default_value = "5000000")]
+    optimizer_large_segment_docs: u32,
+
+    /// Wall-clock budget in seconds per BP pass on large segments
+    #[arg(long, default_value = "600")]
+    optimizer_time_budget_secs: u64,
+
+    /// Depth cap for large-segment BP: stop at partitions of this many docs
+    /// (4096 = superblock granularity, keeps most of the pruning win)
+    #[arg(long, default_value = "4096")]
+    optimizer_partial_min_partition_docs: usize,
+
+    /// Cooldown in seconds between deepening passes on budget-truncated segments
+    #[arg(long, default_value = "1800")]
+    optimizer_unconverged_cooldown_secs: u64,
+
+    /// Address for the Prometheus /metrics HTTP endpoint.
+    /// Set to "off" to disable the exporter.
+    #[arg(long, default_value = "0.0.0.0:9184")]
+    metrics_addr: String,
 }
 
 fn main() -> Result<()> {
@@ -114,6 +136,29 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         info!("HuggingFace cache directory: {:?}", cache_dir);
     }
 
+    // Prometheus exporter: query-path metrics from hermes-core (BMP pruning,
+    // rerank phases, doc-map indirection, ...) + RPC-level metrics. Fail loud:
+    // a bad address or bind failure aborts startup rather than silently
+    // serving without metrics.
+    if args.metrics_addr != "off" {
+        let metrics_addr: SocketAddr = args.metrics_addr.parse().map_err(|e| {
+            anyhow::anyhow!("invalid --metrics-addr '{}': {}", args.metrics_addr, e)
+        })?;
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(metrics_addr)
+            .install()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to start metrics exporter on {}: {}",
+                    metrics_addr,
+                    e
+                )
+            })?;
+        info!("Prometheus metrics on http://{}/metrics", metrics_addr);
+    } else {
+        warn!("Prometheus metrics exporter disabled (--metrics-addr off)");
+    }
+
     // Create data directory if needed
     std::fs::create_dir_all(&args.data_dir)?;
 
@@ -154,6 +199,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         optimizer::OptimizerConfig {
             threads: args.optimizer_threads,
             scan_interval: Duration::from_secs(args.optimizer_scan_interval_secs),
+            large_segment_docs: args.optimizer_large_segment_docs,
+            time_budget: Duration::from_secs(args.optimizer_time_budget_secs),
+            partial_min_partition_docs: args.optimizer_partial_min_partition_docs,
+            unconverged_cooldown: Duration::from_secs(args.optimizer_unconverged_cooldown_secs),
         },
     );
 

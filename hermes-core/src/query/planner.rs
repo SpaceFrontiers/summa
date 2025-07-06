@@ -209,6 +209,7 @@ pub(crate) fn build_sparse_bmp_results(
     let max_sb = infos[0].max_superblocks;
     match super::bmp::execute_bmp(
         bmp,
+        field.0,
         &query_terms,
         executor_limit,
         infos[0].heap_factor,
@@ -245,6 +246,7 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     let max_sb = infos[0].max_superblocks;
     match super::bmp::execute_bmp_filtered(
         bmp,
+        field.0,
         &query_terms,
         executor_limit,
         infos[0].heap_factor,

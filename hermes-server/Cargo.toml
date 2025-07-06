@@ -24,7 +24,9 @@ name = "test-doc-retrieval"
 path = "src/bin/test_doc_retrieval.rs"
 
 [dependencies]
-hermes-core = { workspace = true, features = ["native", "sync"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+hermes-core = { workspace = true, features = ["native", "sync", "metrics"] }
 tokio = { workspace = true, features = ["macros", "signal"] }
 tonic = { workspace = true, features = ["gzip", "zstd"] }
 tonic-prost = "0.14"

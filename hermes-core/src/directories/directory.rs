@@ -218,7 +218,15 @@ impl FileHandle {
                 }
                 let abs_start = offset + range.start;
                 let abs_end = offset + range.end;
-                (read_fn)(abs_start..abs_end).await
+                // Real IO (HTTP / custom read_fn) — mmap-backed Inline handles
+                // above are zero-copy slices whose latency materializes as
+                // page faults inside the query-phase histograms instead.
+                let t = crate::observe::Timer::start();
+                let result = (read_fn)(abs_start..abs_end).await;
+                if let Ok(bytes) = &result {
+                    crate::observe::directory_read("lazy_range", t.secs(), bytes.len());
+                }
+                result
             }
         }
     }
@@ -607,6 +615,16 @@ pub trait DirectoryWriter: Directory {
     /// Create a streaming writer for incremental file writes.
     /// Call finish() on the returned writer to finalize.
     async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>>;
+
+    /// Streaming writer for **bulk one-shot data** (merge/reorder outputs).
+    ///
+    /// Filesystem directories return a page-cache-dropping writer (see
+    /// `docs/cold-io.md`) so multi-GB merge writes cannot evict the serving
+    /// segments' warm pages. Output is byte-identical to the buffered
+    /// writer. Default impl delegates to [`Self::streaming_writer`].
+    async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        self.streaming_writer(path).await
+    }
 }
 
 /// In-memory directory for testing and small indexes
@@ -886,6 +904,15 @@ impl DirectoryWriter for FsDirectory {
         }
         let file = std::fs::File::create(&full_path)?;
         Ok(Box::new(FileStreamingWriter::new(file)))
+    }
+
+    async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        let full_path = self.resolve(path);
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = std::fs::File::create(&full_path)?;
+        Ok(Box::new(super::ColdStreamingWriter::new(file)))
     }
 }
 

@@ -134,11 +134,11 @@ impl SegmentMerger {
         // ── Stage 1: text + store + fast fields ─────────────────────────
         let postings_fut = async {
             let mut postings_writer =
-                OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
+                OffsetWriter::new(dir.streaming_writer_cold(&files.postings).await?);
             let mut positions_writer =
-                OffsetWriter::new(dir.streaming_writer(&files.positions).await?);
+                OffsetWriter::new(dir.streaming_writer_cold(&files.positions).await?);
             let mut term_dict_writer =
-                OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
+                OffsetWriter::new(dir.streaming_writer_cold(&files.term_dict).await?);
 
             let terms_processed = self
                 .merge_postings(
@@ -176,7 +176,8 @@ impl SegmentMerger {
         };
 
         let store_fut = async {
-            let mut store_writer = OffsetWriter::new(dir.streaming_writer(&files.store).await?);
+            let mut store_writer =
+                OffsetWriter::new(dir.streaming_writer_cold(&files.store).await?);
             let store_num_docs = self.merge_store(segments, &mut store_writer).await?;
             let bytes = store_writer.offset() as usize;
             store_writer.finish()?;

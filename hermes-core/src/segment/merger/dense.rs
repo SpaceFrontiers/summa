@@ -236,7 +236,7 @@ impl SegmentMerger {
         }
 
         let write_start = std::time::Instant::now();
-        let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
+        let mut writer = OffsetWriter::new(dir.streaming_writer_cold(&files.vectors).await?);
         let mut toc: Vec<DenseVectorTocEntry> = Vec::new();
 
         for fi in &fields_to_write {

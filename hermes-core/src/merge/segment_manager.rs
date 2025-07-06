@@ -442,7 +442,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             match result {
                 Ok((new_id, doc_count)) => {
                     if let Err(e) = sm
-                        .replace_segments(&ids, new_id, doc_count, sm.reorder_on_merge)
+                        .replace_segments(&ids, new_id, doc_count, sm.reorder_on_merge, true)
                         .await
                     {
                         log::error!("[merge] Failed to replace segments after merge: {:?}", e);
@@ -473,6 +473,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         new_id: String,
         doc_count: u32,
         reordered: bool,
+        bp_converged: bool,
     ) -> Result<()> {
         self.tracker.register(&new_id);
 
@@ -490,8 +491,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             for id in old_ids {
                 st.metadata.remove_segment(id);
             }
-            st.metadata
-                .add_merged_segment(new_id, doc_count, ancestors, parent_gen + 1, reordered);
+            st.metadata.add_merged_segment(
+                new_id,
+                doc_count,
+                ancestors,
+                parent_gen + 1,
+                reordered,
+                bp_converged,
+            );
             // Mutation + persist must be atomic — keep under lock
             st.metadata.save(self.directory.as_ref()).await?;
         }
@@ -732,8 +739,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )
             .await?;
 
-            self.replace_segments(&batch, new_segment_id, total_docs, self.reorder_on_merge)
-                .await?;
+            self.replace_segments(
+                &batch,
+                new_segment_id,
+                total_docs,
+                self.reorder_on_merge,
+                true,
+            )
+            .await?;
 
             // _guard drops here → segments unregistered from inventory
         }
@@ -757,7 +770,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         log::info!("[reorder] reordering {} segments", segment_ids.len());
 
         for seg_id in segment_ids {
-            match self.reorder_single_segment(&seg_id, None).await {
+            match self
+                .reorder_single_segment(&seg_id, None, crate::segment::BpBudget::full())
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => log::warn!("[reorder] segment {} skipped (in merge)", seg_id),
                 Err(e) => return Err(e),
@@ -783,6 +799,33 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .collect()
     }
 
+    /// Segments never reordered, with doc counts — for the optimizer to pick
+    /// a size-appropriate BP budget.
+    pub async fn unreordered_segments(&self) -> Vec<(String, u32)> {
+        let st = self.state.lock().await;
+        let in_merge = self.merge_inventory.snapshot();
+        st.metadata
+            .segment_metas
+            .iter()
+            .filter(|(id, info)| !info.reordered && !in_merge.contains(*id))
+            .map(|(id, info)| (id.clone(), info.num_docs))
+            .collect()
+    }
+
+    /// Segments whose last BP pass hit its wall-clock budget before finishing
+    /// (`bp_converged == false`). A warm-started follow-up pass deepens the
+    /// ordering; the optimizer revisits these at low priority.
+    pub async fn unconverged_segments(&self) -> Vec<(String, u32)> {
+        let st = self.state.lock().await;
+        let in_merge = self.merge_inventory.snapshot();
+        st.metadata
+            .segment_metas
+            .iter()
+            .filter(|(id, info)| info.reordered && !info.bp_converged && !in_merge.contains(*id))
+            .map(|(id, info)| (id.clone(), info.num_docs))
+            .collect()
+    }
+
     /// Reorder a single segment via BP. Returns Ok(true) if reordered, Ok(false) if skipped.
     ///
     /// Non-blocking: uses merge inventory to prevent conflicts with background merges.
@@ -791,6 +834,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self: &Arc<Self>,
         seg_id: &str,
         rayon_pool: Option<Arc<rayon::ThreadPool>>,
+        bp_budget: crate::segment::BpBudget,
     ) -> Result<bool> {
         let source_id = SegmentId::from_hex(seg_id)
             .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", seg_id)))?;
@@ -806,19 +850,26 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
         };
 
-        let (new_id, total_docs) = crate::segment::reorder::reorder_segment(
+        let (new_id, total_docs, bp_converged) = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),
             &self.schema,
             source_id,
             output_id,
             self.term_cache_blocks,
             crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+            bp_budget,
             rayon_pool,
         )
         .await?;
 
-        self.replace_segments(&[seg_id.to_string()], new_id, total_docs, true)
-            .await?;
+        self.replace_segments(
+            &[seg_id.to_string()],
+            new_id,
+            total_docs,
+            true,
+            bp_converged,
+        )
+        .await?;
 
         Ok(true)
     }

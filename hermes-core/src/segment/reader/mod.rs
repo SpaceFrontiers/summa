@@ -959,6 +959,16 @@ impl SegmentReader {
             return Ok(Vec::new());
         };
         let l1_elapsed = t0.elapsed();
+        {
+            let kind = match ann_index {
+                Some(VectorIndex::RaBitQ(_)) => "rabitq",
+                Some(VectorIndex::IVF(_)) => "ivf_rabitq",
+                Some(VectorIndex::ScaNN(_)) => "scann",
+                Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
+                None => "flat",
+            };
+            crate::observe::dense_l1(field.0, kind, l1_elapsed.as_secs_f64(), results.len());
+        }
         log::debug!(
             "[search_dense] field {}: L1 returned {} candidates in {:.1}ms",
             field.0,
@@ -1026,6 +1036,13 @@ impl SegmentReader {
                     results[ri].2 = scores[buf_idx];
                 }
 
+                crate::observe::dense_rerank(
+                    field.0,
+                    t_rerank.elapsed().as_secs_f64(),
+                    t_resolve.as_secs_f64(),
+                    read_elapsed.as_secs_f64(),
+                    resolved.len(),
+                );
                 log::debug!(
                     "[search_dense] field {}: rerank {} vectors (dim={}, quant={:?}, {}B/vec): resolve={:.1}ms read={:.1}ms score={:.1}ms",
                     field.0,

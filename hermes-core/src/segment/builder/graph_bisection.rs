@@ -259,7 +259,35 @@ pub(crate) fn build_forward_index_from_bmps(
 
 // ── Recursive Graph Bisection ────────────────────────────────────────────
 
-/// Recursive graph bisection. Returns permutation: `perm[new_pos] = old_index`.
+/// CPU/depth budget for a BP pass. BP is an anytime algorithm: stopping at
+/// any depth or deadline still yields a valid permutation, and because the
+/// output layout becomes the next pass's input order, repeated budgeted
+/// passes warm-start and deepen (top levels converge in ~0 swaps, the budget
+/// flows to deeper levels).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BpBudget {
+    /// Stop recursion at partitions of at most this many docs instead of
+    /// descending to block granularity. `None` = full depth. Capping at
+    /// superblock granularity (superblock_size × block_size docs) keeps most
+    /// of the superblock-pruning win at ~⅓ less depth.
+    pub min_partition_docs: Option<usize>,
+    /// Wall-clock cap for the whole BP computation. The pass ends cleanly at
+    /// the deadline with whatever depth it reached (`converged = false`).
+    /// Ignored on wasm (no monotonic clock).
+    pub time_budget: Option<std::time::Duration>,
+}
+
+impl BpBudget {
+    /// Unbudgeted: full depth, no deadline.
+    pub fn full() -> Self {
+        Self::default()
+    }
+}
+
+/// Recursive graph bisection. Returns `(perm, converged)` where
+/// `perm[new_pos] = old_index` and `converged` is false iff the wall-clock
+/// budget ended the pass before it finished (a depth cap alone is a chosen
+/// target, not an interruption — it reports converged).
 ///
 /// `min_partition_size` should be the BMP block_size (64).
 /// `max_iters` controls convergence (20 is standard).
@@ -270,31 +298,75 @@ pub(crate) fn graph_bisection(
     fwd: &ForwardIndex,
     min_partition_size: usize,
     max_iters: usize,
-) -> Vec<u32> {
+    budget: BpBudget,
+) -> (Vec<u32>, bool) {
     let n = fwd.num_docs();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
+    let effective_min_partition = budget
+        .min_partition_docs
+        .unwrap_or(0)
+        .max(min_partition_size);
+
     let mut docs: Vec<u32> = (0..n as u32).collect();
-    let depth = if min_partition_size > 0 {
-        ((n as f64) / (min_partition_size as f64)).log2().ceil() as usize
+    let depth = if effective_min_partition > 0 {
+        ((n as f64) / (effective_min_partition as f64))
+            .log2()
+            .ceil() as usize
     } else {
         0
     };
     let log_table = build_log_table(4096);
 
     log::debug!(
-        "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}",
+        "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}, time_budget={:?}",
         n,
-        min_partition_size,
+        effective_min_partition,
         max_iters,
         depth,
+        budget.time_budget,
     );
 
-    bisect(&mut docs, fwd, min_partition_size, max_iters, &log_table);
+    #[cfg(feature = "native")]
+    let deadline = budget.time_budget.map(|d| std::time::Instant::now() + d);
+    #[cfg(not(feature = "native"))]
+    let deadline: Option<()> = None;
+    #[cfg(not(feature = "native"))]
+    let _ = deadline;
 
-    docs
+    let exhausted = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(feature = "native")]
+    bisect(
+        &mut docs,
+        fwd,
+        effective_min_partition,
+        max_iters,
+        &log_table,
+        deadline,
+        &exhausted,
+    );
+    #[cfg(not(feature = "native"))]
+    bisect(
+        &mut docs,
+        fwd,
+        effective_min_partition,
+        max_iters,
+        &log_table,
+        None,
+        &exhausted,
+    );
+
+    let converged = !exhausted.load(std::sync::atomic::Ordering::Relaxed);
+    if !converged {
+        log::info!(
+            "BP graph_bisection: wall-clock budget {:?} exhausted at n={} — emitting partial (still valid) permutation",
+            budget.time_budget,
+            n,
+        );
+    }
+    (docs, converged)
 }
 
 /// Recursive bisection of a document slice.
@@ -311,11 +383,27 @@ fn bisect(
     min_partition_size: usize,
     max_iters: usize,
     log_table: &[f32],
+    #[cfg(feature = "native")] deadline: Option<std::time::Instant>,
+    #[cfg(not(feature = "native"))] deadline: Option<()>,
+    exhausted: &std::sync::atomic::AtomicBool,
 ) {
     let n = docs.len();
     if n <= min_partition_size {
         return;
     }
+    // Anytime cutoff: leave this subtree in its current (valid) order.
+    if exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(feature = "native")]
+    if let Some(dl) = deadline
+        && std::time::Instant::now() >= dl
+    {
+        exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    #[cfg(not(feature = "native"))]
+    let _ = deadline;
 
     let mid = n / 2;
     let nt = fwd.num_terms;
@@ -353,16 +441,24 @@ fn bisect(
     let mut new_right: Vec<u32> = Vec::with_capacity(n - mid);
 
     for iter in 0..effective_iters {
+        // Anytime cutoff between refinement passes: keep the current split.
+        #[cfg(feature = "native")]
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
         // Compute gain for each document (approx_1 from Dhulipala et al.)
         // Parallelized for large partitions where per-doc work dominates.
         compute_gains(docs, fwd, mid, &left_deg, &right_deg, log_table, &mut gains);
 
-        // Partition: top `mid` by gain go to left
+        // Partition: the `mid` LOWEST keys (strongest left affinity) go left
         indices.clear();
         indices.extend(0..n);
         indices.select_nth_unstable_by(mid, |&a, &b| {
-            gains[b]
-                .partial_cmp(&gains[a])
+            gains[a]
+                .partial_cmp(&gains[b])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -429,13 +525,49 @@ fn bisect(
     let (left, right) = docs.split_at_mut(mid);
     #[cfg(feature = "native")]
     rayon::join(
-        || bisect(left, fwd, min_partition_size, max_iters, log_table),
-        || bisect(right, fwd, min_partition_size, max_iters, log_table),
+        || {
+            bisect(
+                left,
+                fwd,
+                min_partition_size,
+                max_iters,
+                log_table,
+                deadline,
+                exhausted,
+            )
+        },
+        || {
+            bisect(
+                right,
+                fwd,
+                min_partition_size,
+                max_iters,
+                log_table,
+                deadline,
+                exhausted,
+            )
+        },
     );
     #[cfg(not(feature = "native"))]
     {
-        bisect(left, fwd, min_partition_size, max_iters, log_table);
-        bisect(right, fwd, min_partition_size, max_iters, log_table);
+        bisect(
+            left,
+            fwd,
+            min_partition_size,
+            max_iters,
+            log_table,
+            deadline,
+            exhausted,
+        );
+        bisect(
+            right,
+            fwd,
+            min_partition_size,
+            max_iters,
+            log_table,
+            deadline,
+            exhausted,
+        );
     }
 }
 
@@ -454,20 +586,29 @@ fn compute_gains(
     log_table: &[f32],
     gains: &mut [f32],
 ) {
+    // Single coherent key: HIGH = belongs in the RIGHT half.
+    // Left docs get +approx_one(from=left, to=right) — a misplaced left doc
+    // (terms concentrated right) scores high. Right docs get
+    // -approx_one(from=right, to=left) — a misplaced right doc scores low.
+    // This matches the reference two-sided formulation (compute_gains_left /
+    // compute_gains_right with negation); ranking both halves by raw
+    // "move gain" instead made both sides' misplaced docs rank identically,
+    // so the partition step could never exchange them.
     let gain_for_doc = |i: usize| -> f32 {
         let doc = docs[i] as usize;
         let in_left = i < mid;
         let mut g = 0.0f32;
         for &term in fwd.doc_terms(doc) {
             let t = term as usize;
-            let (same, other) = if in_left {
+            let (from, to) = if in_left {
                 (left_deg[t], right_deg[t])
             } else {
                 (right_deg[t], left_deg[t])
             };
-            g += fast_log2_lookup(other as usize + 2, log_table)
-                - fast_log2_lookup(same as usize, log_table)
-                - std::f32::consts::LOG2_E / (1.0 + other as f32);
+            let move_gain = fast_log2_lookup(to as usize + 2, log_table)
+                - fast_log2_lookup(from as usize, log_table)
+                - std::f32::consts::LOG2_E / (1.0 + to as f32);
+            g += if in_left { move_gain } else { -move_gain };
         }
         g
     };
@@ -542,7 +683,7 @@ mod tests {
             offsets: Vec::new(),
             num_terms: 0,
         };
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
         assert!(perm.is_empty());
     }
 
@@ -550,7 +691,7 @@ mod tests {
     fn test_bp_small() {
         // 4 docs, min_partition_size=4 → no bisection, identity
         let fwd = make_fwd(&[&[0, 1], &[0, 2], &[1, 3], &[2, 3]], 4);
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
         assert_eq!(perm.len(), 4);
         // All docs present
         let mut sorted = perm.clone();
@@ -576,7 +717,7 @@ mod tests {
             ],
             4,
         );
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
         assert_eq!(perm.len(), 8);
 
         // After bisection, docs from same cluster should be in same half
@@ -599,7 +740,7 @@ mod tests {
         let docs: Vec<Vec<u32>> = (0..16).map(|i| vec![i / 4, 10 + i / 2]).collect();
         let doc_refs: Vec<&[u32]> = docs.iter().map(|v| v.as_slice()).collect();
         let fwd = make_fwd(&doc_refs, 18); // max term = 10 + 15/2 = 17, so need 18
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
 
         assert_eq!(perm.len(), 16);
         // Must be a valid permutation
@@ -607,6 +748,71 @@ mod tests {
         sorted.sort();
         let expected: Vec<u32> = (0..16).collect();
         assert_eq!(sorted, expected);
+    }
+
+    /// Depth-capped BP: with min_partition_docs above the cluster size, only
+    /// the top-level split happens — clusters still separate (coarse
+    /// clustering), the permutation stays valid, and the pass converges
+    /// (a depth cap is a chosen target, not an interruption).
+    #[test]
+    fn test_bp_depth_cap_separates_clusters_and_converges() {
+        // Mostly-separated clusters with one misplaced doc per half — the
+        // top-level swap pass must exchange docs 3 and 4.
+        let fwd = make_fwd(
+            &[
+                &[0, 1],
+                &[0, 1],
+                &[0, 1],
+                &[2, 3],
+                &[0, 1],
+                &[2, 3],
+                &[2, 3],
+                &[2, 3],
+            ],
+            4,
+        );
+        let budget = BpBudget {
+            min_partition_docs: Some(4),
+            time_budget: None,
+        };
+        let (perm, converged) = graph_bisection(&fwd, 2, 20, budget);
+        assert!(converged, "depth cap must report converged");
+        assert_eq!(perm.len(), 8);
+        let mut sorted = perm.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            (0..8).collect::<Vec<u32>>(),
+            "must stay a valid permutation"
+        );
+        // Top-level split separates the clusters (docs {0,1,2,4} share terms
+        // 0/1; docs {3,5,6,7} share terms 2/3)
+        let cluster_a = [0u32, 1, 2, 4];
+        let a_in_left = perm[..4].iter().filter(|d| cluster_a.contains(d)).count();
+        assert!(
+            a_in_left == 4 || a_in_left == 0,
+            "clusters should separate at the top level: {:?}",
+            perm
+        );
+    }
+
+    /// Zero wall-clock budget: the pass ends immediately, reports
+    /// converged=false, and still emits a valid (identity) permutation.
+    #[test]
+    fn test_bp_zero_time_budget_emits_valid_partial_permutation() {
+        let docs: Vec<Vec<u32>> = (0..64).map(|i| vec![i % 4]).collect();
+        let doc_refs: Vec<&[u32]> = docs.iter().map(|v| v.as_slice()).collect();
+        let fwd = make_fwd(&doc_refs, 4);
+        let budget = BpBudget {
+            min_partition_docs: None,
+            time_budget: Some(std::time::Duration::ZERO),
+        };
+        let (perm, converged) = graph_bisection(&fwd, 4, 20, budget);
+        assert!(!converged, "zero budget must report unconverged");
+        assert_eq!(perm.len(), 64);
+        let mut sorted = perm.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..64).collect::<Vec<u32>>());
     }
 
     #[test]

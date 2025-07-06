@@ -16,6 +16,7 @@ pub mod dsl;
 pub mod error;
 pub mod index;
 pub mod merge;
+pub(crate) mod observe;
 pub mod query;
 pub mod segment;
 pub mod structures;

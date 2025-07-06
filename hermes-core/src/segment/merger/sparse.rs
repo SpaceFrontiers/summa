@@ -56,14 +56,14 @@ impl SegmentMerger {
             return Ok(0);
         }
 
-        let mut writer = OffsetWriter::new(dir.streaming_writer(&files.sparse).await?);
+        let mut writer = OffsetWriter::new(dir.streaming_writer_cold(&files.sparse).await?);
 
         // Accumulated per-field data for TOC
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
         // Skip entries written to a temp file to avoid unbounded memory usage.
         // For large indexes (200M+ docs) the skip section can exceed 3 GB.
         let skip_tmp = files.sparse.with_extension("skip.tmp");
-        let mut skip_writer = dir.streaming_writer(&skip_tmp).await?;
+        let mut skip_writer = dir.streaming_writer_cold(&skip_tmp).await?;
         let mut skip_count: u32 = 0;
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
@@ -141,7 +141,7 @@ impl SegmentMerger {
                             fid,
                             sources.len(),
                         );
-                        let (w, ft) = tokio::task::spawn_blocking(move || {
+                        let (w, ft, _converged) = tokio::task::spawn_blocking(move || {
                             crate::segment::reorder::reorder_bmp_field(
                                 &sources,
                                 fid,
@@ -151,6 +151,9 @@ impl SegmentMerger {
                                 max_weight_scale,
                                 total_vectors_bmp,
                                 crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+                                // Merge-time reorder is unbudgeted: the merge
+                                // already pays the rewrite and warm-starts BP.
+                                crate::segment::BpBudget::full(),
                                 writer,
                                 field_tocs,
                                 None,

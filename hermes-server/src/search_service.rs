@@ -23,6 +23,9 @@ impl SearchService for SearchServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
+        let index_name = req.index_name.clone();
+        let t = std::time::Instant::now();
+        let result = async {
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let reader = index
@@ -323,6 +326,22 @@ impl SearchService for SearchServiceImpl {
                 total_us,
             }),
         }))
+            }
+        .await;
+        let status = if result.is_ok() { "ok" } else { "error" };
+        metrics::histogram!(
+            "hermes_search_duration_seconds",
+            "index" => index_name.clone(),
+            "status" => status,
+        )
+        .record(t.elapsed().as_secs_f64());
+        metrics::counter!(
+            "hermes_search_requests_total",
+            "index" => index_name,
+            "status" => status,
+        )
+        .increment(1);
+        result
     }
 
     async fn get_document(

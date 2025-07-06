@@ -1070,7 +1070,12 @@ impl<'a> MaxScoreExecutor<'a> {
         if self.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await)
+        let t = crate::observe::Timer::start();
+        let results = bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await);
+        if let Ok(r) = &results {
+            crate::observe::maxscore_query(t.secs(), r.len());
+        }
+        results
     }
 
     /// Synchronous execution — works when all cursors are text or mmap-backed sparse.
@@ -1078,7 +1083,12 @@ impl<'a> MaxScoreExecutor<'a> {
         if self.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
+        let t = crate::observe::Timer::start();
+        let results = bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,);
+        if let Ok(r) = &results {
+            crate::observe::maxscore_query(t.secs(), r.len());
+        }
+        results
     }
 }
 

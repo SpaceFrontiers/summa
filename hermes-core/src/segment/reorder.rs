@@ -33,7 +33,11 @@ pub const DEFAULT_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 /// pool instead of the global rayon pool. This prevents the optimizer from
 /// saturating all CPU cores.
 ///
-/// Returns `(new_segment_hex_id, num_docs)`.
+/// Returns `(new_segment_hex_id, num_docs, bp_converged)`. `bp_converged` is
+/// false iff the BP wall-clock budget ended a field's pass early (the output
+/// is still valid and better-ordered than the input; a later pass warm-starts
+/// from it and deepens).
+#[allow(clippy::too_many_arguments)]
 pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     dir: &D,
     schema: &Arc<Schema>,
@@ -41,8 +45,9 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     output_id: SegmentId,
     term_cache_blocks: usize,
     memory_budget: usize,
+    bp_budget: crate::segment::BpBudget,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
-) -> Result<(String, u32)> {
+) -> Result<(String, u32, bool)> {
     let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
     let num_docs = reader.num_docs();
 
@@ -74,7 +79,16 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     );
 
     // Rebuild sparse file with reordered BMP data
-    reorder_sparse_file(dir, &reader, &dst_files, schema, memory_budget, rayon_pool).await?;
+    let bp_converged = reorder_sparse_file(
+        dir,
+        &reader,
+        &dst_files,
+        schema,
+        memory_budget,
+        bp_budget,
+        rayon_pool,
+    )
+    .await?;
 
     // Write new meta with output segment ID
     let src_meta = reader.meta();
@@ -85,7 +99,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     };
     dir.write(&dst_files.meta, &meta.serialize()?).await?;
 
-    Ok((output_id.to_hex(), num_docs))
+    Ok((output_id.to_hex(), num_docs, bp_converged))
 }
 
 /// Copy a segment file via streaming I/O (4 MB chunks).
@@ -104,10 +118,18 @@ async fn copy_segment_file<D: Directory + DirectoryWriter>(
     let data = handle.read_bytes().await.map_err(crate::Error::Io)?;
     let slice = data.as_slice();
 
-    let mut writer = dir.streaming_writer(dst).await.map_err(crate::Error::Io)?;
+    let mut writer = dir
+        .streaming_writer_cold(dst)
+        .await
+        .map_err(crate::Error::Io)?;
     const CHUNK: usize = 4 * 1024 * 1024;
-    for chunk in slice.chunks(CHUNK) {
+    for (i, chunk) in slice.chunks(CHUNK).enumerate() {
         writer.write_all(chunk).map_err(crate::Error::Io)?;
+        // Drop source pages behind the copy cursor — a whole-file copy must
+        // not fault the entire source into the page cache and leave it
+        // resident (see docs/cold-io.md).
+        #[cfg(feature = "native")]
+        data.madvise_range(i * CHUNK..i * CHUNK + chunk.len(), libc::MADV_DONTNEED);
     }
     writer.finish().map_err(crate::Error::Io)?;
 
@@ -125,8 +147,9 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     dst_files: &SegmentFiles,
     schema: &Schema,
     memory_budget: usize,
+    bp_budget: crate::segment::BpBudget,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
-) -> Result<()> {
+) -> Result<bool> {
     let sparse_fields: Vec<_> = schema
         .fields()
         .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
@@ -134,7 +157,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
         .collect();
 
     if sparse_fields.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     // Check if there's any BMP data to reorder. Per-field gate: only fields
@@ -153,11 +176,12 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
         );
         let src_files = SegmentFiles::new(reader.meta().id);
         copy_segment_file(dir, &src_files.sparse, &dst_files.sparse).await?;
-        return Ok(());
+        return Ok(true);
     }
 
+    let mut all_converged = true;
     let mut writer = OffsetWriter::new(
-        dir.streaming_writer(&dst_files.sparse)
+        dir.streaming_writer_cold(&dst_files.sparse)
             .await
             .map_err(crate::Error::Io)?,
     );
@@ -211,7 +235,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 let bmp_sources = vec![(bmp_idx.clone(), 0u32)];
                 let fid = field.0;
                 let pool = rayon_pool.clone();
-                let (w, ft) = tokio::task::spawn_blocking(move || {
+                let (w, ft, converged) = tokio::task::spawn_blocking(move || {
                     reorder_bmp_field(
                         &bmp_sources,
                         fid,
@@ -221,6 +245,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                         max_weight_scale,
                         total_vectors,
                         memory_budget,
+                        bp_budget,
                         writer,
                         field_tocs,
                         pool,
@@ -232,6 +257,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 })??;
                 writer = w;
                 field_tocs = ft;
+                all_converged &= converged;
             }
         } else {
             // MaxScore format: identity-copy raw data from source
@@ -253,7 +279,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     if field_tocs.is_empty() {
         drop(writer);
         let _ = dir.delete(&dst_files.sparse).await;
-        return Ok(());
+        return Ok(all_converged);
     }
 
     // Write skip section (MaxScore fields only)
@@ -274,13 +300,14 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
 
     let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
     log::info!(
-        "[reorder] sparse file written: {} fields, {} dims, {} skip entries",
+        "[reorder] sparse file written: {} fields, {} dims, {} skip entries (bp_converged={})",
         field_tocs.len(),
         total_dims,
         skip_count,
+        all_converged,
     );
 
-    Ok(())
+    Ok(all_converged)
 }
 
 /// Identity-copy a BMP field's raw blob (fields whose `reorder` schema
@@ -421,10 +448,11 @@ pub(crate) fn reorder_bmp_field(
     max_weight_scale: f32,
     total_vectors: u32,
     memory_budget: usize,
+    bp_budget: crate::segment::BpBudget,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
-) -> Result<(OffsetWriter, Vec<SparseFieldToc>)> {
+) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
     use crate::segment::builder::bmp::{
         GridRunReader, stream_write_grids, stream_write_grids_merged, write_grid_run,
         write_v13_footer,
@@ -434,7 +462,7 @@ pub(crate) fn reorder_bmp_field(
     };
 
     if sources.is_empty() {
-        return Ok((writer, field_tocs));
+        return Ok((writer, field_tocs, true));
     }
 
     // ── Phase 1: Build forward index and run BP ─────────────────────────
@@ -453,7 +481,7 @@ pub(crate) fn reorder_bmp_field(
         .collect();
     let num_real_docs = *real_base.last().unwrap();
     if num_real_docs == 0 {
-        return Ok((writer, field_tocs));
+        return Ok((writer, field_tocs, true));
     }
 
     log::info!(
@@ -477,23 +505,24 @@ pub(crate) fn reorder_bmp_field(
         fwd.total_postings(),
     );
 
-    let perm = if fwd.num_terms > 0 && num_real_docs > effective_block_size {
+    let (perm, converged) = if fwd.num_terms > 0 && num_real_docs > effective_block_size {
         let bp_start = std::time::Instant::now();
         // Run BP on the bounded rayon pool if provided, otherwise global pool.
-        let perm = if let Some(ref pool) = rayon_pool {
-            pool.install(|| graph_bisection(&fwd, effective_block_size, 20))
+        let (perm, converged) = if let Some(ref pool) = rayon_pool {
+            pool.install(|| graph_bisection(&fwd, effective_block_size, 20, bp_budget))
         } else {
-            graph_bisection(&fwd, effective_block_size, 20)
+            graph_bisection(&fwd, effective_block_size, 20, bp_budget)
         };
         log::info!(
-            "[reorder_bmp] field {}: BP completed in {:.1}ms",
+            "[reorder_bmp] field {}: BP completed in {:.1}ms (converged={})",
             field_id,
             bp_start.elapsed().as_secs_f64() * 1000.0,
+            converged,
         );
-        perm
+        (perm, converged)
     } else {
         drop(fwd);
-        (0..num_real_docs as u32).collect()
+        ((0..num_real_docs as u32).collect(), true)
     };
 
     log::info!(
@@ -642,7 +671,7 @@ pub(crate) fn reorder_bmp_field(
         for path in &run_files {
             let _ = std::fs::remove_file(path);
         }
-        return Ok((writer, field_tocs));
+        return Ok((writer, field_tocs, converged));
     }
 
     // Sort remaining in-memory entries
@@ -798,5 +827,5 @@ pub(crate) fn reorder_bmp_field(
         blob_len as f64 / (1024.0 * 1024.0),
     );
 
-    Ok((writer, field_tocs))
+    Ok((writer, field_tocs, converged))
 }
