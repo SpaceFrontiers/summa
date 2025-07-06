@@ -111,6 +111,18 @@ mod imp {
     pub fn cold_write(bytes: usize) {
         metrics::counter!("hermes_cold_write_bytes_total").increment(bytes as u64);
     }
+
+    /// One reorder granularity decision was made (Auto or explicit).
+    pub fn reorder_granularity(field: u32, granularity: &'static str, coherence: f32) {
+        let field = field.to_string();
+        metrics::counter!(
+            "hermes_reorder_granularity_total",
+            "field" => field.clone(),
+            "granularity" => granularity,
+        )
+        .increment(1);
+        metrics::histogram!("hermes_reorder_coherence", "field" => field).record(coherence as f64);
+    }
 }
 
 #[cfg(not(all(feature = "metrics", feature = "native")))]
@@ -144,6 +156,8 @@ mod imp {
     pub fn store_get(_: f64) {}
     #[inline(always)]
     pub fn cold_write(_: usize) {}
+    #[inline(always)]
+    pub fn reorder_granularity(_: u32, _: &'static str, _: f32) {}
 }
 
 pub(crate) use imp::*;

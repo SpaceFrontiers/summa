@@ -739,13 +739,127 @@
       }
     },
     {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Reorder granularity decisions",
+      "description": "Per-pass Auto decisions (docs/block-level-reorder.md). Steady-state cascade should be mostly `blocks` (cheap superblock-locality recovery); persistent `records` on merged segments means sources are losing coherence.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (granularity, field) (increase(hermes_reorder_granularity_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__interval]))",
+          "legendFormat": "{{granularity}} field {{field}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Block coherence d at reorder",
+      "description": "Measured d = postings/terms per (block,dim) \u2014 the Auto threshold input (default 4.0). Bimodal distribution with the threshold in the valley = well-tuned; mass near 3\u20136 = revisit BLOCKWISE_COHERENCE_THRESHOLD.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, field) (rate(hermes_reorder_coherence_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "p50 field {{field}}",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_reorder_coherence_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "p95 field {{field}}",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 15,
       "type": "row",
       "title": "Dense vectors & reranking",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 42,
         "w": 24,
         "h": 1
       },
@@ -762,7 +876,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 35,
+        "y": 43,
         "w": 8,
         "h": 8
       },
@@ -814,7 +928,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 35,
+        "y": 43,
         "w": 8,
         "h": 8
       },
@@ -886,7 +1000,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 35,
+        "y": 43,
         "w": 8,
         "h": 8
       },
@@ -944,7 +1058,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 43,
+        "y": 51,
         "w": 24,
         "h": 1
       },
@@ -961,7 +1075,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 52,
         "w": 8,
         "h": 8
       },
@@ -1033,7 +1147,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 44,
+        "y": 52,
         "w": 8,
         "h": 8
       },
@@ -1095,7 +1209,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 44,
+        "y": 52,
         "w": 8,
         "h": 8
       },
@@ -1143,7 +1257,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 52,
+        "y": 60,
         "w": 24,
         "h": 1
       },
@@ -1160,7 +1274,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 53,
+        "y": 61,
         "w": 8,
         "h": 8
       },
@@ -1232,7 +1346,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 53,
+        "y": 61,
         "w": 8,
         "h": 8
       },
@@ -1304,7 +1418,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 53,
+        "y": 61,
         "w": 8,
         "h": 8
       },
@@ -1366,7 +1480,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 61,
+        "y": 69,
         "w": 8,
         "h": 8
       },
@@ -1420,7 +1534,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 61,
+        "y": 69,
         "w": 8,
         "h": 8
       },
@@ -1474,7 +1588,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 61,
+        "y": 69,
         "w": 8,
         "h": 8
       },

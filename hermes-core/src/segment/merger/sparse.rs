@@ -154,6 +154,9 @@ impl SegmentMerger {
                                 // Merge-time reorder is unbudgeted: the merge
                                 // already pays the rewrite and warm-starts BP.
                                 crate::segment::BpBudget::full(),
+                                // Auto: coherent sources (already-reordered
+                                // segments) get the near-free blockwise pass.
+                                crate::segment::reorder::BpGranularity::Auto,
                                 writer,
                                 field_tocs,
                                 None,

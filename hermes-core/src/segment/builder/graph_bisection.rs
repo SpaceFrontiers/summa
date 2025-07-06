@@ -257,6 +257,115 @@ pub(crate) fn build_forward_index_from_bmps(
     )
 }
 
+/// Build a forward index over BLOCKS (one entity per block, its terms = the
+/// block's header dim list). Used by block-level reorder: BP over blocks is
+/// ~block_size× cheaper than over records and only needs to decide superblock
+/// assignment. Blocks are numbered globally across sources in source order.
+///
+/// Dims appearing in fewer than 2 blocks carry no clustering signal and are
+/// dropped; the memory budget applies as in the record-level builder.
+pub(crate) fn build_forward_index_from_blocks(
+    bmps: &[&crate::segment::reader::bmp::BmpIndex],
+    memory_budget_bytes: usize,
+) -> ForwardIndex {
+    let total_blocks: usize = bmps.iter().map(|b| b.num_blocks as usize).sum();
+    if total_blocks == 0 {
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+        };
+    }
+
+    // Phase 1: dim → number of blocks containing it (block-level df)
+    let mut dim_bf: FxHashMap<u32, usize> = FxHashMap::default();
+    for bmp in bmps {
+        for block_id in 0..bmp.num_blocks {
+            for (dim_id, _) in bmp.iter_block_terms(block_id) {
+                *dim_bf.entry(dim_id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let max_bf = (total_blocks as f64 * 0.9) as usize;
+    let mut eligible: Vec<(u32, usize)> = dim_bf
+        .iter()
+        .filter(|&(_, bf)| *bf >= 2 && *bf <= max_bf.max(2))
+        .map(|(&dim_id, &bf)| (dim_id, bf))
+        .collect();
+    drop(dim_bf);
+
+    let total_postings_est: usize = eligible.iter().map(|(_, bf)| *bf).sum();
+    let estimated_bytes = total_postings_est * 4 + total_blocks * 28 + eligible.len() * 8;
+    if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
+        eligible.sort_by_key(|&(_, bf)| bf);
+        let target = memory_budget_bytes.saturating_sub(total_blocks * 28 + eligible.len() * 8) / 4;
+        let mut cum = 0usize;
+        let mut keep = 0;
+        for &(_, bf) in &eligible {
+            if cum + bf > target {
+                break;
+            }
+            cum += bf;
+            keep += 1;
+        }
+        log::warn!(
+            "[reorder] block-level fwd index over budget — dropped {} highest-bf dims",
+            eligible.len() - keep,
+        );
+        eligible.truncate(keep);
+    }
+
+    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
+    for &(dim_id, _) in &eligible {
+        let compact = term_remap.len() as u32;
+        term_remap.insert(dim_id, compact);
+    }
+    let num_terms = term_remap.len();
+    drop(eligible);
+
+    // Phase 2+3: counts and CSR fill
+    let mut counts = vec![0u32; total_blocks];
+    let mut gb = 0usize;
+    for bmp in bmps {
+        for block_id in 0..bmp.num_blocks {
+            for (dim_id, _) in bmp.iter_block_terms(block_id) {
+                if term_remap.contains_key(&dim_id) {
+                    counts[gb] += 1;
+                }
+            }
+            gb += 1;
+        }
+    }
+    let mut offsets = Vec::with_capacity(total_blocks + 1);
+    offsets.push(0u32);
+    for &c in &counts {
+        offsets.push(offsets.last().unwrap() + c);
+    }
+    let total = *offsets.last().unwrap() as usize;
+    let mut terms = vec![0u32; total];
+    counts.fill(0);
+    gb = 0;
+    for bmp in bmps {
+        for block_id in 0..bmp.num_blocks {
+            for (dim_id, _) in bmp.iter_block_terms(block_id) {
+                if let Some(&compact) = term_remap.get(&dim_id) {
+                    let pos = offsets[gb] as usize + counts[gb] as usize;
+                    terms[pos] = compact;
+                    counts[gb] += 1;
+                }
+            }
+            gb += 1;
+        }
+    }
+
+    ForwardIndex {
+        terms,
+        offsets,
+        num_terms,
+    }
+}
+
 // ── Recursive Graph Bisection ────────────────────────────────────────────
 
 /// CPU/depth budget for a BP pass. BP is an anytime algorithm: stopping at

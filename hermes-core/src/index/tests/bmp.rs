@@ -1817,3 +1817,179 @@ async fn test_budgeted_reorder_marks_unconverged_and_stays_searchable() {
         "full-budget follow-up pass must converge"
     );
 }
+
+/// Small-segment reorder must still cluster: with a fixed min_doc_freq=128,
+/// topic dims on a small segment (df below 128) were filtered out of the BP
+/// forward index and reorder degenerated to identity. The df floor now
+/// scales with segment size.
+#[tokio::test]
+async fn test_bmp_reorder_small_segment_clusters_low_df_topics() {
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // 200 docs, interleaved topics with df=100 — below the old fixed floor
+    // of 128, above the scaled floor (200/5000 → clamped to 2).
+    const NUM_DOCS: usize = 200;
+    for i in 0..NUM_DOCS {
+        let mut doc = Document::new();
+        let topic_dim = 10000 + (i % 2) as u32 * 10;
+        doc.add_sparse_vector(sparse, vec![(i as u32, 1.0), (topic_dim, 0.5)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let doc_map_before: Vec<u8> = index.segment_readers().await.unwrap()[0]
+        .bmp_indexes()
+        .get(&sparse.0)
+        .unwrap()
+        .doc_map_ids_slice()
+        .to_vec();
+    drop(index);
+
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let doc_map_after: Vec<u8> = index.segment_readers().await.unwrap()[0]
+        .bmp_indexes()
+        .get(&sparse.0)
+        .unwrap()
+        .doc_map_ids_slice()
+        .to_vec();
+
+    assert_ne!(
+        doc_map_before, doc_map_after,
+        "small-segment reorder must cluster low-df topic dims, not degenerate to identity"
+    );
+
+    // All docs remain searchable
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 99, NUM_DOCS - 1] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "dim {} lost after small-segment reorder",
+            i
+        );
+    }
+}
+
+/// Auto granularity: reordering a block-copy merge of two ALREADY-REORDERED
+/// segments must pick the blockwise path — the doc map afterwards consists of
+/// the same 64-entry block chunks as before, only permuted (blocks moved as
+/// units, records untouched) — and every doc stays searchable.
+#[tokio::test]
+async fn test_auto_reorder_uses_blockwise_for_coherent_merged_segments() {
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // Two segments, 4096 docs each (multiple of block_size=64 → no padding,
+    // so block chunks compare cleanly; 128 blocks total = 2 superblocks so
+    // block-level BP has an assignment decision to make). 4 topics with
+    // heavy shared vocab (32 shared dims/topic) → coherent blocks after
+    // record-level reorder.
+    const DOCS_PER_SEGMENT: usize = 4096;
+    for seg in 0..2 {
+        for i in 0..DOCS_PER_SEGMENT {
+            let global = seg * DOCS_PER_SEGMENT + i;
+            // Asymmetric topic mix per source (A: 40/30/20/10, B reversed) —
+            // a symmetric mix makes every block-move gain tie and identity
+            // becomes a stable optimum with nothing to exchange.
+            let frac = i * 100 / DOCS_PER_SEGMENT;
+            let topic: u32 = if seg == 0 {
+                match frac {
+                    0..=39 => 0,
+                    40..=69 => 1,
+                    70..=89 => 2,
+                    _ => 3,
+                }
+            } else {
+                match frac {
+                    0..=39 => 3,
+                    40..=69 => 2,
+                    70..=89 => 1,
+                    _ => 0,
+                }
+            };
+            let mut entries: Vec<(u32, f32)> =
+                (0..32).map(|t| (50000 + topic * 100 + t, 0.5)).collect();
+            entries.push((global as u32, 1.0));
+            let mut doc = Document::new();
+            doc.add_sparse_vector(sparse, entries);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    // Record-level reorder both segments (fresh segments are incoherent →
+    // Auto picks Records here), then block-copy merge scrambles block order.
+    writer.reorder().await.unwrap();
+    writer.force_merge().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    // Merged-from-reordered sources must be coherent enough for blockwise
+    let d = bmp.total_postings() as f32 / bmp.total_terms() as f32;
+    assert!(
+        d >= 4.0,
+        "test setup: expected coherent blocks after record reorder + merge, got d={:.2}",
+        d
+    );
+    let ids_before = bmp.doc_map_ids_slice().to_vec();
+    drop(readers);
+    drop(index);
+
+    // Reorder the merged segment: Auto must take the blockwise path
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    let ids_after = bmp.doc_map_ids_slice().to_vec();
+
+    // Blockwise ⇒ the multiset of 64-entry id chunks is preserved, order permuted
+    const CHUNK_BYTES: usize = 64 * 4;
+    let chunks = |v: &[u8]| -> Vec<Vec<u8>> {
+        let mut c: Vec<Vec<u8>> = v.chunks(CHUNK_BYTES).map(|x| x.to_vec()).collect();
+        c.sort();
+        c
+    };
+    assert_eq!(
+        chunks(&ids_before),
+        chunks(&ids_after),
+        "blockwise reorder must move blocks as intact units"
+    );
+    assert_ne!(
+        ids_before, ids_after,
+        "blockwise reorder should actually permute block order"
+    );
+
+    // Every doc still searchable via its unique dim
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 4095, 4096, 8191] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(results.len(), 1, "dim {} lost after blockwise reorder", i);
+    }
+}

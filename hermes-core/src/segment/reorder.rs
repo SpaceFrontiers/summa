@@ -23,6 +23,39 @@ use crate::structures::SparseFormat;
 /// Default memory budget for forward index during BP (2 GB).
 pub const DEFAULT_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 
+/// Reorder granularity (see docs/block-level-reorder.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BpGranularity {
+    /// Decide per field from footer stats: coherent blocks → `Blocks`,
+    /// scrambled blocks → `Records`. The decision and its inputs are logged.
+    #[default]
+    Auto,
+    /// Record-level BP: full quality (tight block UBs + superblock
+    /// locality), scatter rewrite. Compacts interior padding.
+    Records,
+    /// Block-level BP: permute whole blocks to recover superblock locality
+    /// at ~1/block_size of the BP cost and a memcpy-class rewrite. Block
+    /// composition (and therefore block UBs) unchanged.
+    Blocks,
+}
+
+/// `Auto` picks block-level reorder when the average number of records
+/// sharing a (block, dim) pair — `total_postings / total_terms` — is at
+/// least this. Conservative default; measured values are logged per pass
+/// for tuning.
+pub const BLOCKWISE_COHERENCE_THRESHOLD: f32 = 4.0;
+
+/// Average records per (block, dim) pair across sources: ≈1 when blocks are
+/// scrambled, grows toward block_size as blocks become internally coherent.
+fn block_coherence(sources: &[(crate::segment::BmpIndex, u32)]) -> f32 {
+    let postings: u64 = sources.iter().map(|(b, _)| b.total_postings()).sum();
+    let terms: u64 = sources.iter().map(|(b, _)| b.total_terms()).sum();
+    if terms == 0 {
+        return 0.0;
+    }
+    postings as f32 / terms as f32
+}
+
 /// Reorder a single segment's BMP data via Recursive Graph Bisection (BP).
 ///
 /// Creates a new segment with reordered BMP blocks for better pruning.
@@ -246,6 +279,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                         total_vectors,
                         memory_budget,
                         bp_budget,
+                        BpGranularity::Auto,
                         writer,
                         field_tocs,
                         pool,
@@ -308,6 +342,234 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     );
 
     Ok(all_converged)
+}
+
+/// Block-level reorder: permute whole blocks so similar blocks share
+/// superblocks — a permuted block copy, no record unpacking. See
+/// docs/block-level-reorder.md. Interior padding is preserved (blocks are
+/// copied verbatim); block UBs are unchanged by construction.
+#[allow(clippy::too_many_arguments)]
+fn reorder_bmp_field_blockwise(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    field_id: u32,
+    quantization: crate::structures::WeightQuantization,
+    dims: u32,
+    effective_block_size: usize,
+    max_weight_scale: f32,
+    total_vectors: u32,
+    memory_budget: usize,
+    bp_budget: crate::segment::BpBudget,
+    mut writer: OffsetWriter,
+    mut field_tocs: Vec<SparseFieldToc>,
+    rayon_pool: Option<Arc<rayon::ThreadPool>>,
+) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
+    use crate::segment::builder::bmp::write_v13_footer;
+    use crate::segment::builder::graph_bisection::{
+        build_forward_index_from_blocks, graph_bisection,
+    };
+    use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
+
+    let bmp_refs: Vec<&crate::segment::BmpIndex> = sources.iter().map(|(b, _)| b).collect();
+    let num_blocks_total: usize = bmp_refs.iter().map(|b| b.num_blocks as usize).sum();
+    if num_blocks_total == 0 {
+        return Ok((writer, field_tocs, true));
+    }
+
+    // Global block idx → source: prefix sums.
+    let block_base: Vec<usize> = std::iter::once(0)
+        .chain(bmp_refs.iter().scan(0usize, |acc, b| {
+            *acc += b.num_blocks as usize;
+            Some(*acc)
+        }))
+        .collect();
+    let resolve = |global: usize| -> (usize, usize) {
+        let src = block_base.partition_point(|&b| b <= global) - 1;
+        (src, global - block_base[src])
+    };
+
+    // ── BP over blocks, down to superblock granularity ──────────────────
+    let bp_start = std::time::Instant::now();
+    let fwd = build_forward_index_from_blocks(&bmp_refs, memory_budget);
+    let sb = BMP_SUPERBLOCK_SIZE as usize;
+    let (perm, converged) = if fwd.num_terms > 0 && num_blocks_total > sb {
+        let (perm, converged) = if let Some(ref pool) = rayon_pool {
+            pool.install(|| graph_bisection(&fwd, sb, 20, bp_budget))
+        } else {
+            graph_bisection(&fwd, sb, 20, bp_budget)
+        };
+        (perm, converged)
+    } else {
+        ((0..num_blocks_total as u32).collect(), true)
+    };
+    log::info!(
+        "[reorder_bmp] field {}: blockwise BP over {} blocks in {:.1}ms (converged={})",
+        field_id,
+        num_blocks_total,
+        bp_start.elapsed().as_secs_f64() * 1000.0,
+        converged,
+    );
+
+    // ── Write blob: permuted block copy ─────────────────────────────────
+    let blob_start = writer.offset();
+
+    // Section B: block data verbatim, in permuted order
+    let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks_total + 1);
+    let mut cumulative: u64 = 0;
+    let mut total_terms: u64 = 0;
+    let mut total_postings: u64 = 0;
+    for b in &bmp_refs {
+        total_terms += b.total_terms();
+        total_postings += b.total_postings();
+    }
+    for &new_pos in perm.iter() {
+        let (src, lb) = resolve(new_pos as usize);
+        let bmp = bmp_refs[src];
+        let start = bmp.block_data_start(lb as u32) as usize;
+        let end = if (lb as u32) + 1 < bmp.num_blocks {
+            bmp.block_data_start(lb as u32 + 1) as usize
+        } else {
+            bmp.block_data_sentinel() as usize
+        };
+        block_data_starts.push(cumulative);
+        let bytes = &bmp.block_data_slice()[start..end];
+        writer.write_all(bytes).map_err(crate::Error::Io)?;
+        cumulative += bytes.len() as u64;
+    }
+    block_data_starts.push(cumulative);
+
+    // Padding + Section A: block_data_starts
+    let block_data_len = writer.offset() - blob_start;
+    let padding = (8 - (block_data_len % 8) as usize) % 8;
+    if padding > 0 {
+        writer
+            .write_all(&[0u8; 8][..padding])
+            .map_err(crate::Error::Io)?;
+    }
+    for &v in &block_data_starts {
+        writer
+            .write_all(&v.to_le_bytes())
+            .map_err(crate::Error::Io)?;
+    }
+    drop(block_data_starts);
+
+    // Sections D + E: permuted grid rows + recomputed sb_grid, streamed per dim
+    let grid_offset = writer.offset() - blob_start;
+    let packed_row_size = num_blocks_total.div_ceil(2);
+    let num_superblocks = num_blocks_total.div_ceil(sb);
+    let mut out_row = vec![0u8; packed_row_size];
+    let mut sb_rows: Vec<Vec<u8>> = vec![vec![0u8; num_superblocks]; dims as usize];
+
+    for (dim, sb_row) in sb_rows.iter_mut().enumerate() {
+        out_row.fill(0);
+        for (new_pos, &old_global) in perm.iter().enumerate() {
+            let (src, lb) = resolve(old_global as usize);
+            let bmp = bmp_refs[src];
+            let prs = bmp.packed_row_size();
+            let row = &bmp.grid_slice()[dim * prs..dim * prs + prs];
+            let nib = if lb % 2 == 0 {
+                row[lb / 2] & 0x0F
+            } else {
+                row[lb / 2] >> 4
+            };
+            if nib == 0 {
+                continue;
+            }
+            if new_pos % 2 == 0 {
+                out_row[new_pos / 2] |= nib;
+            } else {
+                out_row[new_pos / 2] |= nib << 4;
+            }
+            let slot = &mut sb_row[new_pos / sb];
+            if nib > *slot {
+                *slot = nib;
+            }
+        }
+        writer.write_all(&out_row).map_err(crate::Error::Io)?;
+    }
+    drop(out_row);
+
+    let sb_grid_offset = writer.offset() - blob_start;
+    for sb_row in &sb_rows {
+        writer.write_all(sb_row).map_err(crate::Error::Io)?;
+    }
+    drop(sb_rows);
+
+    // Sections F + G: doc maps copied per block chunk, ids offset-patched
+    let doc_map_offset = writer.offset() - blob_start;
+    let bs = effective_block_size;
+    let mut num_real_docs: u32 = 0;
+    for b in &bmp_refs {
+        num_real_docs += b.num_real_docs();
+    }
+    let mut id_chunk = vec![0u8; bs * 4];
+    for &old_global in perm.iter() {
+        let (src, lb) = resolve(old_global as usize);
+        let (bmp, doc_offset) = (&sources[src].0, sources[src].1);
+        let ids = bmp.doc_map_ids_slice();
+        id_chunk.copy_from_slice(&ids[lb * bs * 4..(lb + 1) * bs * 4]);
+        if doc_offset != 0 {
+            let (chunks, _) = id_chunk.as_chunks_mut::<4>();
+            for e in chunks {
+                let doc_id = u32::from_le_bytes(*e);
+                if doc_id != u32::MAX {
+                    *e = (doc_id + doc_offset).to_le_bytes();
+                }
+            }
+        }
+        writer.write_all(&id_chunk).map_err(crate::Error::Io)?;
+    }
+    for &old_global in perm.iter() {
+        let (src, lb) = resolve(old_global as usize);
+        let ords = bmp_refs[src].doc_map_ordinals_slice();
+        writer
+            .write_all(&ords[lb * bs * 2..(lb + 1) * bs * 2])
+            .map_err(crate::Error::Io)?;
+    }
+
+    // Footer
+    write_v13_footer(
+        &mut writer,
+        total_terms as u32,
+        total_postings as u32,
+        grid_offset,
+        sb_grid_offset,
+        num_blocks_total as u32,
+        dims,
+        effective_block_size as u32,
+        (num_blocks_total * bs) as u32,
+        max_weight_scale,
+        doc_map_offset,
+        num_real_docs,
+    )
+    .map_err(crate::Error::Io)?;
+
+    let blob_len = writer.offset() - blob_start;
+    let mut config_for_byte =
+        crate::structures::SparseVectorConfig::from_byte(quantization as u8).unwrap_or_default();
+    config_for_byte.format = SparseFormat::Bmp;
+    config_for_byte.weight_quantization = quantization;
+    field_tocs.push(SparseFieldToc {
+        field_id,
+        quantization: config_for_byte.to_byte(),
+        total_vectors,
+        dims: vec![crate::segment::format::SparseDimTocEntry {
+            dim_id: 0xFFFFFFFF,
+            block_data_offset: blob_start,
+            skip_start: (blob_len & 0xFFFFFFFF) as u32,
+            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
+            doc_count: 0,
+            max_weight: 0.0,
+        }],
+    });
+
+    log::info!(
+        "[reorder_bmp] field {}: blockwise reorder done — {} blocks, {:.2} MB",
+        field_id,
+        num_blocks_total,
+        blob_len as f64 / (1024.0 * 1024.0),
+    );
+
+    Ok((writer, field_tocs, converged))
 }
 
 /// Identity-copy a BMP field's raw blob (fields whose `reorder` schema
@@ -449,6 +711,7 @@ pub(crate) fn reorder_bmp_field(
     total_vectors: u32,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    granularity: BpGranularity,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
@@ -463,6 +726,52 @@ pub(crate) fn reorder_bmp_field(
 
     if sources.is_empty() {
         return Ok((writer, field_tocs, true));
+    }
+
+    // ── Granularity decision (docs/block-level-reorder.md) ──────────────
+    let coherence = block_coherence(sources);
+    let effective_granularity = match granularity {
+        BpGranularity::Auto => {
+            let chosen = if coherence >= BLOCKWISE_COHERENCE_THRESHOLD {
+                BpGranularity::Blocks
+            } else {
+                BpGranularity::Records
+            };
+            log::info!(
+                "[reorder_bmp] field {}: coherence d={:.2} (threshold {:.1}) → {:?} granularity",
+                field_id,
+                coherence,
+                BLOCKWISE_COHERENCE_THRESHOLD,
+                chosen,
+            );
+            chosen
+        }
+        explicit => explicit,
+    };
+    crate::observe::reorder_granularity(
+        field_id,
+        match effective_granularity {
+            BpGranularity::Blocks => "blocks",
+            _ => "records",
+        },
+        coherence,
+    );
+
+    if effective_granularity == BpGranularity::Blocks {
+        return reorder_bmp_field_blockwise(
+            sources,
+            field_id,
+            quantization,
+            dims,
+            effective_block_size,
+            max_weight_scale,
+            total_vectors,
+            memory_budget,
+            bp_budget,
+            writer,
+            field_tocs,
+            rayon_pool,
+        );
     }
 
     // ── Phase 1: Build forward index and run BP ─────────────────────────
@@ -492,7 +801,12 @@ pub(crate) fn reorder_bmp_field(
     );
 
     let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
-    let min_doc_freq = 128.min(num_real_docs);
+    // Scale the df floor with segment size: a fixed 128 keeps only dims in
+    // >=2.5% of docs on a 5k-doc segment — exactly the discriminative
+    // mid-frequency dims BP needs — making reorder a near-no-op on small
+    // segments. Rare dims are cheap (few postings), and the memory budget
+    // already drops the highest-df dims when the forward index overflows.
+    let min_doc_freq = (num_real_docs / 5000).clamp(2, 128);
 
     let (fwd, _source_doc_counts) =
         build_forward_index_from_bmps(&bmp_refs, min_doc_freq, max_doc_freq.max(1), memory_budget);
