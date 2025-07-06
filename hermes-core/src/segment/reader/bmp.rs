@@ -330,6 +330,67 @@ impl BmpIndex {
         }
     }
 
+    /// Pin the block-offset table (priority 1: every scored block does an
+    /// offset lookup through it).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_block_starts(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.block_data_starts_bytes,
+            "bmp block_data_starts",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
+    /// Pin the virtual-doc → (doc_id, ordinal) maps (priority 3: every
+    /// top-k resolution touches them).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_doc_maps(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.doc_map_ids_bytes,
+            "bmp doc_map_ids",
+            mode,
+            remaining,
+            report,
+        );
+        crate::segment::pin::pin_section(
+            &mut self.doc_map_ordinals_bytes,
+            "bmp doc_map_ordinals",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
+    /// Pin the superblock grid (priority 4: every query dim reads a row).
+    /// The 4-bit block grid is deliberately never pinned (data-sized).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_sb_grid(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.sb_grid_bytes,
+            "bmp sb_grid",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
     /// Page-level prefetch (`MADV_WILLNEED`) of a block-data byte range.
     ///
     /// Used by the BMP executor to batch-prefetch the surviving blocks of a

@@ -26,6 +26,11 @@ pub struct SegmentMemoryStats {
     pub dense_index_bytes: usize,
     /// Bloom filter bytes
     pub bloom_filter_bytes: usize,
+    /// Hot metadata bytes actually pinned (mlock/heap-copy) at open
+    pub pinned_metadata_bytes: u64,
+    /// Hot metadata bytes eligible for pinning (gap vs pinned = budget
+    /// exhausted or mlock failures — operator-visible)
+    pub pin_intended_bytes: u64,
 }
 
 impl SegmentMemoryStats {
@@ -154,6 +159,9 @@ pub struct SegmentReader {
     /// Allows per-field MaxScore groups within a single query to share thresholds:
     /// field A's result seeds field B's pruning on the same segment.
     shared_threshold: std::sync::atomic::AtomicU32,
+    /// Hot-metadata pin accounting (see `segment::pin`)
+    #[cfg(feature = "native")]
+    pin_report: crate::segment::pin::PinReport,
 }
 
 impl SegmentReader {
@@ -245,7 +253,8 @@ impl SegmentReader {
             log::debug!("{}", parts.join(", "));
         }
 
-        Ok(Self {
+        #[allow(unused_mut)]
+        let mut reader = Self {
             meta,
             term_dict: Arc::new(term_dict),
             postings_handle,
@@ -259,7 +268,73 @@ impl SegmentReader {
             positions_handle,
             fast_fields,
             shared_threshold: std::sync::atomic::AtomicU32::new(0),
-        })
+            #[cfg(feature = "native")]
+            pin_report: Default::default(),
+        };
+
+        // Pin hot metadata per the process-wide policy (no-op when disabled)
+        #[cfg(feature = "native")]
+        reader.apply_pin_policy(&crate::segment::pin::pin_policy().to_owned());
+
+        Ok(reader)
+    }
+
+    /// Pin per-query-mandatory metadata sections in priority order until the
+    /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
+    ///
+    /// Priority: BMP block-offset tables → sparse skip sections → doc-id maps
+    /// → BMP superblock grids. Bulk data (4-bit grid, block data, raw vectors)
+    /// is never pinned. Fail-loud: budget exhaustion and mlock failures are
+    /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
+    /// pinned_metadata_bytes}`.
+    #[cfg(feature = "native")]
+    pub(crate) fn apply_pin_policy(&mut self, policy: &crate::segment::pin::PinPolicy) {
+        use crate::segment::pin::PinReport;
+
+        if !policy.is_enabled() {
+            return;
+        }
+        let mut remaining = policy.budget_bytes;
+        let mut report = PinReport::default();
+
+        // Priority 1: BMP block-offset tables
+        for bmp in self.bmp_indexes.values_mut() {
+            bmp.pin_block_starts(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 2: sparse skip sections
+        for sparse in self.sparse_indexes.values_mut() {
+            sparse.pin_skip_section(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 3: doc-id maps
+        for flat in self.flat_vectors.values_mut() {
+            flat.pin_doc_ids(policy.mode, &mut remaining, &mut report);
+        }
+        for bmp in self.bmp_indexes.values_mut() {
+            bmp.pin_doc_maps(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 4: BMP superblock grids
+        for bmp in self.bmp_indexes.values_mut() {
+            bmp.pin_sb_grid(policy.mode, &mut remaining, &mut report);
+        }
+
+        if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
+            log::warn!(
+                "[pin] segment {:016x}: pinned {}/{} bytes (budget skipped {}, mlock failed {}) —                  raise HERMES_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
+                self.meta.id,
+                report.pinned_bytes,
+                report.intended_bytes,
+                report.skipped_budget_bytes,
+                report.failed_bytes,
+            );
+        } else if report.pinned_bytes > 0 {
+            log::info!(
+                "[pin] segment {:016x}: pinned {} bytes of hot metadata ({:?})",
+                self.meta.id,
+                report.pinned_bytes,
+                policy.mode,
+            );
+        }
+        self.pin_report = report;
     }
 
     /// Reset the per-segment threshold (call before each new search).
@@ -392,6 +467,12 @@ impl SegmentReader {
             .map(|v| v.estimated_memory_bytes())
             .sum();
 
+        #[cfg(feature = "native")]
+        let (pinned_metadata_bytes, pin_intended_bytes) =
+            (self.pin_report.pinned_bytes, self.pin_report.intended_bytes);
+        #[cfg(not(feature = "native"))]
+        let (pinned_metadata_bytes, pin_intended_bytes) = (0u64, 0u64);
+
         SegmentMemoryStats {
             segment_id: self.meta.id,
             num_docs: self.meta.num_docs,
@@ -400,6 +481,8 @@ impl SegmentReader {
             sparse_index_bytes,
             dense_index_bytes,
             bloom_filter_bytes: term_dict_stats.bloom_filter_size,
+            pinned_metadata_bytes,
+            pin_intended_bytes,
         }
     }
 

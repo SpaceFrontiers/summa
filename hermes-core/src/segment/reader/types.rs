@@ -343,6 +343,25 @@ pub struct SparseIndex {
 }
 
 impl SparseIndex {
+    /// Pin the skip section (priority 2: every posting traversal reads it).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_skip_section(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        let mut bytes = (*self.skip_bytes).clone();
+        crate::segment::pin::pin_section(
+            &mut bytes,
+            "sparse skip_section",
+            mode,
+            remaining,
+            report,
+        );
+        self.skip_bytes = Arc::new(bytes);
+    }
+
     /// Total postings across all dimensions (sum of per-dimension doc counts).
     /// With multi-valued fields each (doc, ordinal, dim) entry counts once.
     pub fn total_postings(&self) -> u64 {

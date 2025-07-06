@@ -23,6 +23,8 @@ pub(crate) use reader::bmp::{
     accumulate_u4_weighted, block_term_postings, compute_block_masks_4bit, find_dim_in_block_data,
 };
 pub(crate) use reader::combine_ordinal_results;
+#[cfg(feature = "native")]
+pub mod pin;
 pub use reader::{SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;
 #[cfg(feature = "native")]

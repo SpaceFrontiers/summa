@@ -274,6 +274,24 @@ impl LazyFlatVectorData {
         })
     }
 
+    /// Pin the doc-id map (priority 3: every rerank / top-k resolution
+    /// binary-searches it).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_doc_ids(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.doc_ids_bytes,
+            "flat doc_ids",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
     /// Advise the kernel that vector data will be accessed at random offsets.
     ///
     /// Disables kernel readahead for the raw vector region. Rerank reads

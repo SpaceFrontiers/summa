@@ -383,6 +383,27 @@ impl OwnedBytes {
         self.madvise_range(0..self.len(), advice);
     }
 
+    /// Pin these bytes in physical memory (`mlock`). mmap-backed only —
+    /// heap memory is not evictable by the page cache. Returns whether the
+    /// lock succeeded; failure (e.g. RLIMIT_MEMLOCK) is not fatal.
+    /// Locks are released automatically when the mapping is unmapped.
+    #[cfg(feature = "native")]
+    pub fn mlock(&self) -> bool {
+        if !self.is_mmap() {
+            return false;
+        }
+        let slice = self.as_slice();
+        if slice.is_empty() {
+            return true;
+        }
+        let ptr = slice.as_ptr();
+        let len = slice.len();
+        let page_size = 4096usize;
+        let aligned_ptr = (ptr as usize) & !(page_size - 1);
+        let aligned_len = len + (ptr as usize - aligned_ptr);
+        unsafe { libc::mlock(aligned_ptr as *const libc::c_void, aligned_len) == 0 }
+    }
+
     /// Advise the kernel about the access pattern for a sub-range.
     ///
     /// The range is relative to these bytes. Same mmap-only guard as
