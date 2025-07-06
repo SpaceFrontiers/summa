@@ -4,7 +4,13 @@
 file = { SOI ~ index_def+ ~ EOI }
 
 // Index definition
-index_def = { "index" ~ identifier ~ "{" ~ (field_def | default_fields_def | query_router_def)* ~ "}" }
+index_def = { "index" ~ identifier ~ "{" ~ (field_def | default_fields_def | query_router_def | reorder_on_merge_def)* ~ "}" }
+
+// Index-level option: BP-reorder `reorder`-attributed BMP fields inside merges.
+// Absent = disabled (merges block-copy).
+//   reorder_on_merge: true
+reorder_on_merge_def = { "reorder_on_merge" ~ ":" ~ bool_lit }
+bool_lit = { "true" | "false" }
 
 // Default fields definition
 default_fields_def = { "default_fields" ~ ":" ~ "[" ~ identifier ~ ("," ~ identifier)* ~ "]" }

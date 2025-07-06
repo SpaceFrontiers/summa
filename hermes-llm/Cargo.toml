@@ -39,20 +39,18 @@ tracing-subscriber = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 
 # Utilities
 rand = { workspace = true }
-rayon = { workspace = true }
 
 # Progress bar
 indicatif = "0.18"
 
 # Signal handling for graceful shutdown (pin to 3.4.x - 3.5.x has dispatch2/objc2 that fails on Linux CI)
-ctrlc = "~3.4"
+ctrlc = "3.5"
 
 # HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 
 # Compression support
 flate2 = "1.1"
@@ -73,3 +71,7 @@ nccl = ["cuda", "dep:cudarc"]
 [[bin]]
 name = "hermes-llm"
 path = "src/main.rs"
+
+[package.metadata.cargo-machete]
+# candle-transformers is referenced by the cuda/metal/accelerate feature definitions
+ignored = ["candle-transformers"]

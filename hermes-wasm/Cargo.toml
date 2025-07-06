@@ -34,3 +34,8 @@ futures-channel = "0.3"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-O4", "--enable-bulk-memory"]
+
+[package.metadata.cargo-machete]
+# getrandom is a feature-activation dep: enables the wasm_js backend for
+# transitive getrandom users (uuid, rand) on wasm32
+ignored = ["getrandom"]

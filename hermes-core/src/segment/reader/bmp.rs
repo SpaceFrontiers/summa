@@ -122,6 +122,13 @@ pub struct BmpIndex {
     doc_map_ids_bytes: OwnedBytes,
     /// doc_map_ordinals[virtual_id] = original ordinal — zero-copy OwnedBytes
     doc_map_ordinals_bytes: OwnedBytes,
+
+    // ── Raw blob source (identity copies) ─────────────────────────────
+    /// Source file handle + blob range, kept so reorder can copy the blob
+    /// byte-identically for fields whose `reorder` schema attribute is unset.
+    source: FileHandle,
+    blob_offset: u64,
+    blob_len: u64,
 }
 
 // SAFETY: All raw pointer access is derived from OwnedBytes which are Send+Sync
@@ -200,6 +207,9 @@ impl BmpIndex {
                 num_superblocks: 0,
                 doc_map_ids_bytes: OwnedBytes::empty(),
                 doc_map_ordinals_bytes: OwnedBytes::empty(),
+                source: handle,
+                blob_offset,
+                blob_len,
             });
         }
 
@@ -286,7 +296,19 @@ impl BmpIndex {
             num_superblocks,
             doc_map_ids_bytes,
             doc_map_ordinals_bytes,
+            source: handle,
+            blob_offset,
+            blob_len,
         })
+    }
+
+    /// Read the entire raw V13 blob (including footer) from the source file.
+    ///
+    /// Used by reorder paths to copy a field byte-identically when its
+    /// `reorder` schema attribute is unset.
+    pub(crate) fn read_raw_blob(&self) -> std::io::Result<OwnedBytes> {
+        self.source
+            .read_bytes_range_sync(self.blob_offset..self.blob_offset + self.blob_len)
     }
 
     /// Convert a compact virtual_id to (doc_id, ordinal) via table lookup.

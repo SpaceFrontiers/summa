@@ -138,7 +138,7 @@ pub(crate) fn build_bmp_blob(
     }
 
     // Phase 0: Prune per-dimension (skip dims with fewer than min_terms postings)
-    for (_dim_id, dim_postings) in postings.iter_mut() {
+    for dim_postings in postings.values_mut() {
         if let Some(fraction) = pruning_fraction
             && dim_postings.len() >= min_terms
             && fraction < 1.0

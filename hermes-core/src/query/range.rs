@@ -201,6 +201,25 @@ impl Query for RangeQuery {
         let pred = self.as_doc_predicate(reader)?;
         Some(super::DocBitset::from_predicate(reader.num_docs(), &*pred))
     }
+
+    fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
+        // Sampled: probe ~1k evenly spaced docs with the fast-field predicate.
+        // Works for every encoding (incl. i64 zigzag, where min/max
+        // interpolation would mis-order). Rounded up so a rare-but-present
+        // range never estimates to zero.
+        let pred = self.as_doc_predicate(reader)?;
+        let n = reader.num_docs();
+        if n == 0 {
+            return Some(0);
+        }
+        const SAMPLES: u32 = 1024;
+        if n <= SAMPLES {
+            return Some((0..n).filter(|&d| pred(d)).count() as u64);
+        }
+        let step = n / SAMPLES;
+        let hits = (0..SAMPLES).filter(|&i| pred(i * step)).count() as u64;
+        Some(((hits * n as u64) / SAMPLES as u64).max(1))
+    }
 }
 
 // ── RangeScorer ──────────────────────────────────────────────────────────

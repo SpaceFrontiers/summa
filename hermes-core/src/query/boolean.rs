@@ -529,11 +529,9 @@ impl Query for BooleanQuery {
         // MUST_NOT clauses: subtract bitsets (ANDNOT)
         if let Some(ref mut acc) = result {
             for q in &self.must_not {
-                if let Some(bs) = q.as_doc_bitset(reader) {
+                {
+                    let bs = q.as_doc_bitset(reader)?;
                     acc.subtract(&bs);
-                } else {
-                    // Can't build bitset for this MUST_NOT clause — bail
-                    return None;
                 }
             }
         }

@@ -463,6 +463,12 @@ pub struct Schema {
     /// Query router rules for routing queries to specific fields based on regex patterns
     #[serde(default)]
     query_routers: Vec<QueryRouterRule>,
+    /// Run BP (graph bisection) reordering of `reorder`-attributed BMP fields
+    /// inside segment merges. SDL: `reorder_on_merge: true` at index level.
+    /// Absent = disabled (merges block-copy; the standalone reorder pass
+    /// handles ordering).
+    #[serde(default)]
+    reorder_on_merge: bool,
 }
 
 impl Schema {
@@ -497,6 +503,12 @@ impl Schema {
     /// Used by the background optimizer to determine which indexes need BP reordering.
     pub fn has_reorder_fields(&self) -> bool {
         self.fields.iter().any(|e| e.reorder)
+    }
+
+    /// Whether merges BP-reorder `reorder`-attributed BMP fields while writing
+    /// the merged segment (index-level SDL option `reorder_on_merge: true`).
+    pub fn reorder_on_merge(&self) -> bool {
+        self.reorder_on_merge
     }
 
     /// Get the default fields for query parsing
@@ -535,6 +547,7 @@ pub struct SchemaBuilder {
     fields: Vec<FieldEntry>,
     default_fields: Vec<String>,
     query_routers: Vec<QueryRouterRule>,
+    reorder_on_merge: bool,
 }
 
 impl SchemaBuilder {
@@ -807,6 +820,12 @@ impl SchemaBuilder {
         }
     }
 
+    /// Enable BP reordering of `reorder`-attributed BMP fields inside merges
+    /// (index-level; SDL `reorder_on_merge: true`). Default: disabled.
+    pub fn set_reorder_on_merge(&mut self, on: bool) {
+        self.reorder_on_merge = on;
+    }
+
     /// Set position tracking mode for phrase queries and multi-field element tracking
     pub fn set_positions(&mut self, field: Field, mode: PositionMode) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
@@ -842,6 +861,7 @@ impl SchemaBuilder {
             name_to_field,
             default_fields,
             query_routers: self.query_routers,
+            reorder_on_merge: self.reorder_on_merge,
         }
     }
 }

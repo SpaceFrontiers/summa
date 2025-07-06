@@ -95,6 +95,9 @@ pub struct IndexDef {
     pub default_fields: Vec<String>,
     /// Query router rules for routing queries to specific fields
     pub query_routers: Vec<QueryRouterRule>,
+    /// BP-reorder `reorder`-attributed BMP fields inside merges
+    /// (index-level `reorder_on_merge: true`). Absent = disabled.
+    pub reorder_on_merge: bool,
 }
 
 impl IndexDef {
@@ -197,6 +200,20 @@ impl IndexDef {
         // Set query routers if specified
         if !self.query_routers.is_empty() {
             builder.set_query_routers(self.query_routers.clone());
+        }
+
+        if self.reorder_on_merge {
+            if self.fields.iter().any(|f| f.reorder) {
+                builder.set_reorder_on_merge(true);
+            } else {
+                // Fail loud: the option would silently do nothing without at
+                // least one `reorder`-attributed field.
+                log::warn!(
+                    "index '{}': reorder_on_merge is set but no field has the `reorder` attribute — merges will not reorder anything",
+                    self.name,
+                );
+                builder.set_reorder_on_merge(true);
+            }
         }
 
         builder.build()
@@ -1109,6 +1126,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
     let mut fields = Vec::new();
     let mut default_fields = Vec::new();
     let mut query_routers = Vec::new();
+    let mut reorder_on_merge = false;
 
     for item in inner {
         match item.as_rule() {
@@ -1120,6 +1138,14 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
             }
             Rule::query_router_def => {
                 query_routers.push(parse_query_router_def(item)?);
+            }
+            Rule::reorder_on_merge_def => {
+                let value = item
+                    .into_inner()
+                    .next()
+                    .map(|b| b.as_str() == "true")
+                    .unwrap_or(false);
+                reorder_on_merge = value;
             }
             _ => {}
         }
@@ -1154,6 +1180,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         fields,
         default_fields,
         query_routers,
+        reorder_on_merge,
     })
 }
 
@@ -2402,5 +2429,40 @@ mod tests {
 
         let f2 = schema.get_field("embedding2").unwrap();
         assert!(!schema.get_field_entry(f2).unwrap().reorder);
+
+        // Index-level reorder_on_merge absent → disabled (current behaviour)
+        assert!(!schema.reorder_on_merge());
+    }
+
+    #[test]
+    fn test_reorder_on_merge_index_option() {
+        let sdl = r#"
+            index documents {
+                reorder_on_merge: true
+                field embedding: sparse_vector<u16> [indexed<format: bmp>, reorder]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert!(indexes[0].reorder_on_merge);
+        let schema = indexes[0].to_schema();
+        assert!(schema.reorder_on_merge());
+
+        // Explicit false parses and stays disabled
+        let sdl_off = r#"
+            index documents {
+                reorder_on_merge: false
+                field embedding: sparse_vector<u16> [indexed<format: bmp>, reorder]
+            }
+        "#;
+        let indexes = parse_sdl(sdl_off).unwrap();
+        assert!(!indexes[0].reorder_on_merge);
+        assert!(!indexes[0].to_schema().reorder_on_merge());
+
+        // Schema serde roundtrip preserves the flag (persisted in metadata)
+        let schema_on = parse_sdl(sdl).unwrap()[0].to_schema();
+        let json = serde_json::to_string(&schema_on).unwrap();
+        let back: crate::dsl::Schema = serde_json::from_str(&json).unwrap();
+        assert!(back.reorder_on_merge());
     }
 }

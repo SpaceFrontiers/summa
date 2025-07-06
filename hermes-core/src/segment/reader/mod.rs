@@ -522,7 +522,7 @@ impl SegmentReader {
         if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
             // Build BlockPostingList from inline data (no I/O needed!)
             let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                 posting_list.push(doc_id, tf);
             }
             let block_list = BlockPostingList::from_posting_list(&posting_list)?;
@@ -566,7 +566,7 @@ impl SegmentReader {
         for (_key, term_info) in entries {
             if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
                 let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                     posting_list.push(doc_id, tf);
                 }
                 results.push(BlockPostingList::from_posting_list(&posting_list)?);
@@ -1261,7 +1261,7 @@ impl SegmentReader {
         // Check if posting list is inlined
         if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
             let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                 posting_list.push(doc_id, tf);
             }
             let block_list = BlockPostingList::from_posting_list(&posting_list)?;
@@ -1304,7 +1304,7 @@ impl SegmentReader {
         for (_key, term_info) in entries {
             if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
                 let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                     posting_list.push(doc_id, tf);
                 }
                 results.push(BlockPostingList::from_posting_list(&posting_list)?);

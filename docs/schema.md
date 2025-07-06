@@ -61,12 +61,24 @@ index articles {
 
 Attributes control how fields are processed and stored:
 
-| Attribute | Description                                                       |
-| --------- | ----------------------------------------------------------------- |
-| `indexed` | Field is indexed for searching                                    |
-| `stored`  | Field value is stored and can be retrieved                        |
-| `primary` | Field is the primary key (enforces uniqueness, deduplicates)      |
-| `fast`    | Field is a fast field (column-oriented storage for range queries) |
+| Attribute | Description                                                                                                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `indexed` | Field is indexed for searching                                                                                                                                                                                  |
+| `stored`  | Field value is stored and can be retrieved                                                                                                                                                                      |
+| `primary` | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                    |
+| `fast`    | Field is a fast field (column-oriented storage for range queries)                                                                                                                                               |
+| `reorder` | Opt this BMP sparse field into BP (graph bisection) reordering — used by the background optimizer, `hermes-tool reorder`, and reorder-on-merge. Fields without it keep insertion order (blob copied unchanged). |
+
+Index-level options (inside the `index { ... }` block):
+
+```sdl
+index articles {
+    reorder_on_merge: true   # BP-reorder `reorder`-attributed BMP fields inside merges.
+                             # Absent = disabled: merges block-copy and the background
+                             # optimizer reorders afterwards.
+    field splade: sparse_vector<...> [indexed, reorder]
+}
+```
 
 ### Attribute Syntax
 

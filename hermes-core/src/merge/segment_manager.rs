@@ -155,6 +155,11 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     term_cache_blocks: usize,
     /// Maximum number of concurrent background merges
     max_concurrent_merges: usize,
+    /// Run BP reordering of `reorder`-attributed BMP fields inside merges.
+    /// Persisted index configuration (schema-level `reorder_on_merge: true`
+    /// in SDL); merged segments are marked `reordered` and skipped by the
+    /// standalone optimizer pass.
+    reorder_on_merge: bool,
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
@@ -167,6 +172,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         term_cache_blocks: usize,
         max_concurrent_merges: usize,
     ) -> Self {
+        // Persisted index option: set via `reorder_on_merge: true` in the SDL
+        // at index creation. Absent = disabled (merges block-copy).
+        let reorder_on_merge = schema.reorder_on_merge();
+        if reorder_on_merge {
+            log::info!("[merge] reorder-on-merge enabled by index schema");
+        }
+
         let tracker = Arc::new(SegmentTracker::new());
         for seg_id in metadata.segment_metas.keys() {
             tracker.register(seg_id);
@@ -207,6 +219,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             schema,
             term_cache_blocks,
             max_concurrent_merges: max_concurrent_merges.max(1),
+            reorder_on_merge,
         }
     }
 
@@ -422,12 +435,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 output_id,
                 sm.term_cache_blocks,
                 trained_snap.as_deref(),
+                sm.reorder_on_merge,
             )
             .await;
 
             match result {
                 Ok((new_id, doc_count)) => {
-                    if let Err(e) = sm.replace_segments(&ids, new_id, doc_count, false).await {
+                    if let Err(e) = sm
+                        .replace_segments(&ids, new_id, doc_count, sm.reorder_on_merge)
+                        .await
+                    {
                         log::error!("[merge] Failed to replace segments after merge: {:?}", e);
                     }
                 }
@@ -496,6 +513,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         output_segment_id: SegmentId,
         term_cache_blocks: usize,
         trained: Option<&TrainedVectorStructures>,
+        reorder_bmp: bool,
     ) -> Result<(String, u32)> {
         let output_hex = output_segment_id.to_hex();
         let load_start = std::time::Instant::now();
@@ -557,7 +575,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             load_start.elapsed().as_secs_f64()
         );
 
-        let merger = SegmentMerger::new(Arc::clone(schema));
+        let merger = SegmentMerger::new(Arc::clone(schema)).with_bmp_reorder(reorder_bmp);
 
         log::info!(
             "[merge] {} segments -> {} (trained={})",
@@ -710,10 +728,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 output_id,
                 self.term_cache_blocks,
                 trained_snap.as_deref(),
+                self.reorder_on_merge,
             )
             .await?;
 
-            self.replace_segments(&batch, new_segment_id, total_docs, false)
+            self.replace_segments(&batch, new_segment_id, total_docs, self.reorder_on_merge)
                 .await?;
 
             // _guard drops here → segments unregistered from inventory

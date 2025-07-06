@@ -49,7 +49,7 @@ impl SegmentMerger {
             .schema
             .fields()
             .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-            .map(|(field, entry)| (field, entry.sparse_vector_config.clone()))
+            .map(|(field, entry)| (field, entry.sparse_vector_config.clone(), entry.reorder))
             .collect();
 
         if sparse_fields.is_empty() {
@@ -67,7 +67,7 @@ impl SegmentMerger {
         let mut skip_count: u32 = 0;
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
-        for (field, sparse_config) in &sparse_fields {
+        for (field, sparse_config, field_reorder) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
@@ -109,6 +109,62 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
+                    if self.reorder_bmp && !*field_reorder {
+                        // Reorder-on-merge is on, but this field opted out via
+                        // its schema — fall through to block-copy. Loud so an
+                        // operator can see why the merged field stays unordered.
+                        log::info!(
+                            "[merge_bmp] field {}: `reorder` schema attribute not set — block-copy merge",
+                            field.0,
+                        );
+                    }
+                    if self.reorder_bmp && *field_reorder {
+                        // Merge-time BP reorder: write the merged blob in
+                        // permuted order instead of block stacking. The output
+                        // segment needs no standalone reorder pass afterwards.
+                        let sources: Vec<(BmpIndex, u32)> = bmp_indexes
+                            .iter()
+                            .zip(doc_offs.iter())
+                            .filter_map(|(opt, &off)| opt.map(|b| (b.clone(), off)))
+                            .collect();
+                        validate_bmp_sources(
+                            &sources,
+                            dims,
+                            bmp_block_size.min(256),
+                            max_weight_scale,
+                        )?;
+
+                        let fid = field.0;
+                        let effective_block_size = bmp_block_size.min(256) as usize;
+                        log::info!(
+                            "[merge_bmp] field {}: reorder-on-merge enabled — running BP over {} source(s)",
+                            fid,
+                            sources.len(),
+                        );
+                        let (w, ft) = tokio::task::spawn_blocking(move || {
+                            crate::segment::reorder::reorder_bmp_field(
+                                &sources,
+                                fid,
+                                quantization,
+                                dims,
+                                effective_block_size,
+                                max_weight_scale,
+                                total_vectors_bmp,
+                                crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+                                writer,
+                                field_tocs,
+                                None,
+                            )
+                        })
+                        .await
+                        .map_err(|e| {
+                            crate::Error::Internal(format!("merge-time reorder panicked: {}", e))
+                        })??;
+                        writer = w;
+                        field_tocs = ft;
+                        continue;
+                    }
+
                     merge_bmp_field(
                         &bmp_indexes,
                         &doc_offs,
@@ -640,6 +696,38 @@ fn merge_bmp_field(
         bmp.madvise_random_query();
     }
 
+    Ok(())
+}
+
+/// Validate that all BMP merge sources share `dims`, `block_size`, and
+/// `max_weight_scale` (same invariants as the block-copy path's Phase 0).
+fn validate_bmp_sources(
+    sources: &[(BmpIndex, u32)],
+    dims: u32,
+    effective_block_size: u32,
+    max_weight_scale: f32,
+) -> Result<()> {
+    for (bmp, _) in sources {
+        if bmp.dims() != dims {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source dims={} != expected dims={}",
+                bmp.dims(),
+                dims
+            )));
+        }
+        if bmp.bmp_block_size != effective_block_size {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source block_size={} != expected {}",
+                bmp.bmp_block_size, effective_block_size
+            )));
+        }
+        if (bmp.max_weight_scale - max_weight_scale).abs() > f32::EPSILON {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source max_weight_scale={:.4} != expected {:.4}",
+                bmp.max_weight_scale, max_weight_scale
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -46,10 +46,47 @@ impl ForwardIndex {
     }
 }
 
+/// Build virtual→real and real→virtual vid maps from a BMP doc map.
+///
+/// A virtual slot is real iff its doc-map entry is not the `u32::MAX` padding
+/// sentinel. Realness must come from the doc map itself: block-copy merged
+/// segments carry each source's tail padding as *interior* padding, so
+/// `vid < num_real_docs` does NOT identify real docs there.
+///
+/// Returns `(virtual_to_real, real_to_virtual)` where `virtual_to_real[vid]`
+/// is the dense real index or `u32::MAX` for padding.
+pub(crate) fn build_vid_maps(bmp: &crate::segment::reader::bmp::BmpIndex) -> (Vec<u32>, Vec<u32>) {
+    let ids = bmp.doc_map_ids_slice();
+    let num_virtual = bmp.num_virtual_docs as usize;
+    let mut virtual_to_real = vec![u32::MAX; num_virtual];
+    let mut real_to_virtual = Vec::with_capacity(bmp.num_real_docs() as usize);
+    for (vid, (slot, chunk)) in virtual_to_real
+        .iter_mut()
+        .zip(ids.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let doc_id = u32::from_le_bytes(*chunk);
+        if doc_id != u32::MAX {
+            *slot = real_to_virtual.len() as u32;
+            real_to_virtual.push(vid as u32);
+        }
+    }
+    if real_to_virtual.len() != bmp.num_real_docs() as usize {
+        log::warn!(
+            "[reorder] BMP doc map has {} real slots but footer says num_real_docs={} — trusting the doc map",
+            real_to_virtual.len(),
+            bmp.num_real_docs(),
+        );
+    }
+    (virtual_to_real, real_to_virtual)
+}
+
 /// Build forward index from BmpIndex sources (single or multi-source).
 ///
-/// Virtual IDs are assigned sequentially across sources: source 0 gets 0..n0,
-/// source 1 gets n0..n0+n1, etc. Returns `(forward_index, per_source_doc_counts)`.
+/// Documents are identified by dense *real* indices assigned sequentially
+/// across sources: source 0 gets 0..n0, source 1 gets n0..n0+n1, etc., where
+/// each n is the source's real (non-padding) doc count derived from its doc
+/// map via [`build_vid_maps`]. Returns `(forward_index, per_source_real_doc_counts)`.
 ///
 /// Filters dims with doc_freq outside `[min_doc_freq, max_doc_freq]`.
 /// If the estimated forward index memory exceeds `memory_budget_bytes`, the
@@ -63,7 +100,9 @@ pub(crate) fn build_forward_index_from_bmps(
     max_doc_freq: usize,
     memory_budget_bytes: usize,
 ) -> (ForwardIndex, Vec<usize>) {
-    let source_doc_counts: Vec<usize> = bmps.iter().map(|b| b.num_real_docs() as usize).collect();
+    // Per-source virtual→real maps (padding-aware realness from the doc map).
+    let vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmps.iter().map(|b| build_vid_maps(b)).collect();
+    let source_doc_counts: Vec<usize> = vid_maps.iter().map(|(_, r2v)| r2v.len()).collect();
     let total_docs: usize = source_doc_counts.iter().sum();
 
     if total_docs == 0 {
@@ -79,15 +118,14 @@ pub(crate) fn build_forward_index_from_bmps(
 
     // Phase 1: count doc freq per dimension across all sources + assign compact IDs
     let mut dim_df: FxHashMap<u32, usize> = FxHashMap::default();
-    for bmp in bmps {
+    for (bmp, (v2r, _)) in bmps.iter().zip(&vid_maps) {
         let num_blocks = bmp.num_blocks as usize;
         let block_size = bmp.bmp_block_size as usize;
-        let num_docs = bmp.num_real_docs() as usize;
         for block_id in 0..num_blocks {
             for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
                 for p in postings {
                     let vid = block_id * block_size + p.local_slot as usize;
-                    if vid < num_docs && p.impact > 0 {
+                    if v2r[vid] != u32::MAX && p.impact > 0 {
                         *dim_df.entry(dim_id).or_insert(0) += 1;
                     }
                 }
@@ -149,12 +187,12 @@ pub(crate) fn build_forward_index_from_bmps(
 
     // Phase 2: count terms per doc (filtered)
     let mut counts = vec![0u32; total_docs];
-    let mut vid_offset = 0usize;
+    let mut real_offset = 0usize;
 
-    for bmp in bmps {
+    for (src_idx, bmp) in bmps.iter().enumerate() {
+        let (v2r, _) = &vid_maps[src_idx];
         let num_blocks = bmp.num_blocks as usize;
         let block_size = bmp.bmp_block_size as usize;
-        let num_docs = bmp.num_real_docs() as usize;
         for block_id in 0..num_blocks {
             for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
                 if !term_remap.contains_key(&dim_id) {
@@ -162,13 +200,14 @@ pub(crate) fn build_forward_index_from_bmps(
                 }
                 for p in postings {
                     let vid = block_id * block_size + p.local_slot as usize;
-                    if vid < num_docs && p.impact > 0 {
-                        counts[vid_offset + vid] += 1;
+                    let real = v2r[vid];
+                    if real != u32::MAX && p.impact > 0 {
+                        counts[real_offset + real as usize] += 1;
                     }
                 }
             }
         }
-        vid_offset += num_docs;
+        real_offset += source_doc_counts[src_idx];
     }
 
     // Phase 3: build CSR offsets
@@ -182,12 +221,12 @@ pub(crate) fn build_forward_index_from_bmps(
     // Phase 4: fill terms (compact IDs)
     let mut terms = vec![0u32; total];
     counts.fill(0);
-    vid_offset = 0;
+    real_offset = 0;
 
-    for bmp in bmps {
+    for (src_idx, bmp) in bmps.iter().enumerate() {
+        let (v2r, _) = &vid_maps[src_idx];
         let num_blocks = bmp.num_blocks as usize;
         let block_size = bmp.bmp_block_size as usize;
-        let num_docs = bmp.num_real_docs() as usize;
         for block_id in 0..num_blocks {
             for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
                 let Some(&compact) = term_remap.get(&dim_id) else {
@@ -195,16 +234,17 @@ pub(crate) fn build_forward_index_from_bmps(
                 };
                 for p in postings {
                     let vid = block_id * block_size + p.local_slot as usize;
-                    if vid < num_docs && p.impact > 0 {
-                        let global_vid = vid_offset + vid;
-                        let pos = offsets[global_vid] as usize + counts[global_vid] as usize;
+                    let real = v2r[vid];
+                    if real != u32::MAX && p.impact > 0 {
+                        let global_real = real_offset + real as usize;
+                        let pos = offsets[global_real] as usize + counts[global_real] as usize;
                         terms[pos] = compact;
-                        counts[global_vid] += 1;
+                        counts[global_real] += 1;
                     }
                 }
             }
         }
-        vid_offset += num_docs;
+        real_offset += source_doc_counts[src_idx];
     }
 
     (

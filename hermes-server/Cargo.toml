@@ -29,7 +29,6 @@ tokio = { workspace = true, features = ["macros", "signal"] }
 tonic = { workspace = true, features = ["gzip", "zstd"] }
 tonic-prost = "0.14"
 prost = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 log = "0.4"
@@ -43,3 +42,7 @@ rayon = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 tonic-prost-build = "0.14"
+
+[package.metadata.cargo-machete]
+# prost/tonic-prost are used by tonic::include_proto! generated code
+ignored = ["prost", "tonic-prost"]

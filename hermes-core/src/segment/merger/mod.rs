@@ -78,11 +78,24 @@ pub use super::types::TrainedVectorStructures;
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
+    /// Run BP reordering on BMP sparse fields while writing the merged blob
+    /// (instead of byte-level block stacking). The output segment is then
+    /// already ordered, so the standalone reorder pass is unnecessary.
+    reorder_bmp: bool,
 }
 
 impl SegmentMerger {
     pub fn new(schema: Arc<Schema>) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            reorder_bmp: false,
+        }
+    }
+
+    /// Enable BP reordering of BMP fields during the merge (see `reorder_bmp`).
+    pub fn with_bmp_reorder(mut self, reorder: bool) -> Self {
+        self.reorder_bmp = reorder;
+        self
     }
 
     /// Merge segments into one, streaming postings/positions/store directly to files.

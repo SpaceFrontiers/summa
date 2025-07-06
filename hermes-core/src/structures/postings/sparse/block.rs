@@ -1044,7 +1044,7 @@ fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out
     match quant {
         WeightQuantization::Float32 => {
             out.reserve(count);
-            for chunk in data[..count * 4].chunks_exact(4) {
+            for chunk in data[..count * 4].as_chunks::<4>().0 {
                 out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
         }
@@ -1056,7 +1056,7 @@ fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out
             let byte_count = count * 2;
             let src = &data[..byte_count];
             let mut f16_buf: Vec<f16> = Vec::with_capacity(count);
-            for chunk in src.chunks_exact(2) {
+            for chunk in src.as_chunks::<2>().0 {
                 f16_buf.push(f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])));
             }
             let start = out.len();

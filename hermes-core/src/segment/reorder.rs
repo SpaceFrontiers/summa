@@ -130,21 +130,27 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     let sparse_fields: Vec<_> = schema
         .fields()
         .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-        .map(|(field, entry)| (field, entry.sparse_vector_config.clone()))
+        .map(|(field, entry)| (field, entry.sparse_vector_config.clone(), entry.reorder))
         .collect();
 
     if sparse_fields.is_empty() {
         return Ok(());
     }
 
-    // Check if there's any BMP data to reorder
-    let has_bmp_data = sparse_fields.iter().any(|(field, config)| {
-        config.as_ref().map(|c| c.format) == Some(SparseFormat::Bmp)
+    // Check if there's any BMP data to reorder. Per-field gate: only fields
+    // with the `reorder` schema attribute get BP; others are copied unchanged.
+    let has_bmp_data = sparse_fields.iter().any(|(field, config, reorder)| {
+        *reorder
+            && config.as_ref().map(|c| c.format) == Some(SparseFormat::Bmp)
             && reader.bmp_indexes().get(&field.0).is_some()
     });
 
     if !has_bmp_data {
-        // No BMP data — just copy the sparse file as-is
+        // No BMP field wants reordering — just copy the sparse file as-is
+        log::info!(
+            "[reorder] segment {:x}: no BMP field has the `reorder` schema attribute — sparse file copied unchanged",
+            reader.meta().id,
+        );
         let src_files = SegmentFiles::new(reader.meta().id);
         copy_segment_file(dir, &src_files.sparse, &dst_files.sparse).await?;
         return Ok(());
@@ -159,7 +165,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     let mut all_skip_bytes: Vec<u8> = Vec::new();
     let mut skip_count: u32 = 0;
 
-    for (field, sparse_config) in &sparse_fields {
+    for (field, sparse_config, reorder) in &sparse_fields {
         let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
         let quantization = sparse_config
             .as_ref()
@@ -168,6 +174,22 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
 
         if format == SparseFormat::Bmp {
             if let Some(bmp_idx) = reader.bmp_indexes().get(&field.0) {
+                if !*reorder {
+                    // Field opted out of BP: copy its blob byte-identically.
+                    log::info!(
+                        "[reorder] field {}: `reorder` attribute not set — blob copied unchanged",
+                        field.0,
+                    );
+                    copy_bmp_blob(
+                        bmp_idx,
+                        field.0,
+                        quantization,
+                        bmp_idx.total_vectors,
+                        &mut writer,
+                        &mut field_tocs,
+                    )?;
+                    continue;
+                }
                 let effective_block_size = sparse_config
                     .as_ref()
                     .map(|c| c.bmp_block_size)
@@ -186,12 +208,12 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 // Clone BmpIndex (cheap: Arc ref bumps on OwnedBytes) and move
                 // OffsetWriter + field_tocs into spawn_blocking so the entire
                 // CPU-heavy reorder runs off tokio worker threads.
-                let bmp_clone = bmp_idx.clone();
+                let bmp_sources = vec![(bmp_idx.clone(), 0u32)];
                 let fid = field.0;
                 let pool = rayon_pool.clone();
                 let (w, ft) = tokio::task::spawn_blocking(move || {
                     reorder_bmp_field(
-                        &bmp_clone,
+                        &bmp_sources,
                         fid,
                         quantization,
                         dims,
@@ -261,6 +283,46 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     Ok(())
 }
 
+/// Identity-copy a BMP field's raw blob (fields whose `reorder` schema
+/// attribute is unset). Byte-identical: insertion order, padding, and footer
+/// are all preserved.
+fn copy_bmp_blob(
+    bmp: &crate::segment::BmpIndex,
+    field_id: u32,
+    quantization: crate::structures::WeightQuantization,
+    total_vectors: u32,
+    writer: &mut OffsetWriter,
+    field_tocs: &mut Vec<SparseFieldToc>,
+) -> Result<()> {
+    let blob = bmp.read_raw_blob().map_err(crate::Error::Io)?;
+    let blob_start = writer.offset();
+    const CHUNK: usize = 4 * 1024 * 1024;
+    for chunk in blob.as_slice().chunks(CHUNK) {
+        writer.write_all(chunk).map_err(crate::Error::Io)?;
+    }
+    let blob_len = writer.offset() - blob_start;
+
+    let mut config_for_byte =
+        crate::structures::SparseVectorConfig::from_byte(quantization as u8).unwrap_or_default();
+    config_for_byte.format = SparseFormat::Bmp;
+    config_for_byte.weight_quantization = quantization;
+
+    field_tocs.push(SparseFieldToc {
+        field_id,
+        quantization: config_for_byte.to_byte(),
+        total_vectors,
+        dims: vec![crate::segment::format::SparseDimTocEntry {
+            dim_id: 0xFFFFFFFF, // sentinel for BMP
+            block_data_offset: blob_start,
+            skip_start: (blob_len & 0xFFFFFFFF) as u32,
+            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
+            doc_count: 0,
+            max_weight: 0.0,
+        }],
+    });
+    Ok(())
+}
+
 /// Identity-copy a MaxScore sparse field from source to destination.
 #[allow(clippy::too_many_arguments)]
 async fn copy_maxscore_field(
@@ -327,10 +389,20 @@ async fn copy_maxscore_field(
     Ok(())
 }
 
-/// Reorder a single BMP field via Recursive Graph Bisection (BP).
+/// Reorder one BMP field via Recursive Graph Bisection (BP), single- or
+/// multi-source.
 ///
-/// Reads block data from the source BmpIndex, builds a forward index,
-/// runs BP to compute a permutation, then writes the reordered blob.
+/// Reads block data from the source `BmpIndex`es (each paired with its doc-id
+/// offset in the output segment), builds a combined forward index, runs BP to
+/// compute a permutation over *real* (non-padding) records, then writes one
+/// reordered blob. With a single `(bmp, 0)` source this is the standalone
+/// segment reorder; with multiple sources it is the merge-time reorder path,
+/// which replaces byte-level block stacking.
+///
+/// Realness is derived from each source's doc map (`build_vid_maps`), never
+/// from `vid < num_real_docs` — block-copy merged sources carry interior
+/// padding. Interior padding is compacted away in the output: the written
+/// blob always has tail-only padding.
 ///
 /// This is a synchronous function called from `spawn_blocking` so the
 /// entire CPU-heavy reorder (forward index build, BP, blob write) runs
@@ -340,8 +412,8 @@ async fn copy_maxscore_field(
 /// When `rayon_pool` is `Some`, all rayon parallel work runs on that pool
 /// instead of the global pool, bounding optimizer CPU usage.
 #[allow(clippy::too_many_arguments)]
-fn reorder_bmp_field(
-    bmp: &crate::segment::BmpIndex,
+pub(crate) fn reorder_bmp_field(
+    sources: &[(crate::segment::BmpIndex, u32)],
     field_id: u32,
     quantization: crate::structures::WeightQuantization,
     dims: u32,
@@ -358,26 +430,42 @@ fn reorder_bmp_field(
         write_v13_footer,
     };
     use crate::segment::builder::graph_bisection::{
-        build_forward_index_from_bmps, graph_bisection,
+        build_forward_index_from_bmps, build_vid_maps, graph_bisection,
     };
 
-    let num_real_docs = bmp.num_real_docs() as usize;
+    if sources.is_empty() {
+        return Ok((writer, field_tocs));
+    }
+
+    // ── Phase 1: Build forward index and run BP ─────────────────────────
+    let bp_start = std::time::Instant::now();
+
+    let bmp_refs: Vec<&crate::segment::BmpIndex> = sources.iter().map(|(b, _)| b).collect();
+    // Real→virtual maps per source (padding-aware; doc map is ground truth).
+    let real_to_virtual: Vec<Vec<u32>> = bmp_refs.iter().map(|b| build_vid_maps(b).1).collect();
+    // Prefix sums of real doc counts: source s owns global real ids
+    // real_base[s]..real_base[s+1].
+    let real_base: Vec<usize> = std::iter::once(0)
+        .chain(real_to_virtual.iter().scan(0usize, |acc, r2v| {
+            *acc += r2v.len();
+            Some(*acc)
+        }))
+        .collect();
+    let num_real_docs = *real_base.last().unwrap();
     if num_real_docs == 0 {
         return Ok((writer, field_tocs));
     }
 
     log::info!(
-        "[reorder_bmp] field {}: running BP on {} real docs",
+        "[reorder_bmp] field {}: running BP on {} real docs from {} source(s)",
         field_id,
         num_real_docs,
+        sources.len(),
     );
 
-    // ── Phase 1: Build forward index and run BP ─────────────────────────
-    let bp_start = std::time::Instant::now();
     let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
     let min_doc_freq = 128.min(num_real_docs);
 
-    let bmp_refs = [bmp];
     let (fwd, _source_doc_counts) =
         build_forward_index_from_bmps(&bmp_refs, min_doc_freq, max_doc_freq.max(1), memory_budget);
 
@@ -430,7 +518,8 @@ fn reorder_bmp_field(
     const GRID_ENTRY_MEM_SIZE: usize = std::mem::size_of::<(u32, u32, u8)>(); // 12 bytes
     let max_entries_in_memory = GRID_ENTRIES_BUDGET / GRID_ENTRY_MEM_SIZE;
 
-    let est_entries = (bmp.total_terms() as usize).min(max_entries_in_memory);
+    let total_source_terms: usize = bmp_refs.iter().map(|b| b.total_terms() as usize).sum();
+    let est_entries = total_source_terms.min(max_entries_in_memory);
     let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_entries);
     let mut run_files: Vec<std::path::PathBuf> = Vec::new();
     let run_prefix = format!("hermes_grid_run_{}_{}", std::process::id(), field_id);
@@ -449,28 +538,32 @@ fn reorder_bmp_field(
 
         dim_postings.clear();
 
-        // Group records by source block, scatter matching slots
+        // Group records by (source, source block), scatter matching slots
         let mut slot_map = [u8::MAX; 256];
 
-        // Collect which old_blocks we need and the slot mappings
-        let mut block_mappings: rustc_hash::FxHashMap<usize, Vec<(u8, u8)>> =
+        // Collect which (source, old_block)s we need and the slot mappings.
+        // Global real ids resolve to a source via `real_base`, then to a
+        // virtual vid (block/slot position) via that source's real→virtual map.
+        let mut block_mappings: rustc_hash::FxHashMap<(usize, usize), Vec<(u8, u8)>> =
             rustc_hash::FxHashMap::default();
         for new_local_slot in 0..slots_count {
-            let old_vid = perm[new_vid_start + new_local_slot] as usize;
+            let global_real = perm[new_vid_start + new_local_slot] as usize;
+            let src = real_base.partition_point(|&b| b <= global_real) - 1;
+            let old_vid = real_to_virtual[src][global_real - real_base[src]] as usize;
             let old_block = old_vid / effective_block_size;
             let old_slot = (old_vid % effective_block_size) as u8;
             block_mappings
-                .entry(old_block)
+                .entry((src, old_block))
                 .or_default()
                 .push((old_slot, new_local_slot as u8));
         }
 
-        for (&old_block, mappings) in &block_mappings {
+        for (&(src, old_block), mappings) in &block_mappings {
             for &(old_s, new_s) in mappings {
                 slot_map[old_s as usize] = new_s;
             }
 
-            for (dim_id, postings) in bmp.iter_block_terms(old_block as u32) {
+            for (dim_id, postings) in sources[src].0.iter_block_terms(old_block as u32) {
                 for p in postings {
                     let new_slot = slot_map[p.local_slot as usize];
                     if new_slot != u8::MAX {
@@ -614,13 +707,23 @@ fn reorder_bmp_field(
     // Sections F+G: doc_map [new_num_virtual_docs each]
     let doc_map_offset = writer.offset() - blob_start;
 
-    let src_ids = bmp.doc_map_ids_slice();
-    let src_ords = bmp.doc_map_ordinals_slice();
+    // Resolve a global real id to (source, virtual vid within source).
+    let resolve = |global_real: usize| -> (usize, usize) {
+        let src = real_base.partition_point(|&b| b <= global_real) - 1;
+        (
+            src,
+            real_to_virtual[src][global_real - real_base[src]] as usize,
+        )
+    };
 
-    // Section F: doc_map_ids [u32-LE × new_num_virtual_docs]
-    for &vid in perm.iter().take(num_real_docs) {
-        let off = vid as usize * 4;
-        let doc_id = u32::from_le_bytes(src_ids[off..off + 4].try_into().unwrap());
+    // Section F: doc_map_ids [u32-LE × new_num_virtual_docs], doc ids patched
+    // with each source's offset in the output segment. Real slots are never
+    // the u32::MAX sentinel (realness came from the doc map itself).
+    for &global_real in perm.iter().take(num_real_docs) {
+        let (src, vid) = resolve(global_real as usize);
+        let ids = sources[src].0.doc_map_ids_slice();
+        let off = vid * 4;
+        let doc_id = u32::from_le_bytes(ids[off..off + 4].try_into().unwrap()) + sources[src].1;
         writer
             .write_all(&doc_id.to_le_bytes())
             .map_err(crate::Error::Io)?;
@@ -632,9 +735,11 @@ fn reorder_bmp_field(
     }
 
     // Section G: doc_map_ordinals [u16-LE × new_num_virtual_docs]
-    for &vid in perm.iter().take(num_real_docs) {
-        let off = vid as usize * 2;
-        let ordinal = u16::from_le_bytes(src_ords[off..off + 2].try_into().unwrap());
+    for &global_real in perm.iter().take(num_real_docs) {
+        let (src, vid) = resolve(global_real as usize);
+        let ords = sources[src].0.doc_map_ordinals_slice();
+        let off = vid * 2;
+        let ordinal = u16::from_le_bytes(ords[off..off + 2].try_into().unwrap());
         writer
             .write_all(&ordinal.to_le_bytes())
             .map_err(crate::Error::Io)?;

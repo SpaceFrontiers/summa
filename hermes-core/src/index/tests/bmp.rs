@@ -28,10 +28,12 @@ fn maxscore_config() -> SparseVectorConfig {
 }
 
 /// Helper: create BMP schema with a text field and a BMP sparse field.
+/// The sparse field carries the `reorder` attribute so BP paths are exercised.
 fn bmp_schema() -> (crate::dsl::Schema, crate::dsl::Field, crate::dsl::Field) {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_reorder(sparse, true);
     (sb.build(), title, sparse)
 }
 
@@ -956,6 +958,7 @@ async fn test_bmp_reorder_standalone() {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_reorder(sparse, true);
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -1047,6 +1050,312 @@ async fn test_bmp_reorder_standalone() {
     );
 }
 
+/// Reorder of a block-copy-merged segment must keep every doc, including docs
+/// whose vids sit past interior padding.
+///
+/// Block-copy merge concatenates each source's virtual doc space *including*
+/// its tail padding (u32::MAX doc-map slots in the last block), so the merged
+/// segment has interior padding and real docs are NOT contiguous in vid space.
+/// The reorder path used to assume `vid < num_real_docs` ⇔ real doc, which
+/// silently dropped the real docs shifted past `num_real_docs` and wrote
+/// padding slots as if they were docs.
+#[tokio::test]
+async fn test_bmp_reorder_after_merge_keeps_interior_padded_docs() {
+    let (schema, title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Two segments of 100 docs each. block_size=64 → each segment has 128
+    // virtual slots with padding at vids 100..128. After block-copy merge the
+    // padding from segment 1 is interior (merged vids 100..128), and segment
+    // 2's docs occupy vids 128..228 — the last 28 of them past
+    // num_real_docs=200.
+    const DOCS_PER_SEGMENT: usize = 100;
+    for seg in 0..2 {
+        for i in 0..DOCS_PER_SEGMENT {
+            let global = seg * DOCS_PER_SEGMENT + i;
+            let mut doc = Document::new();
+            doc.add_text(title, format!("doc{}", global));
+            doc.add_sparse_vector(sparse, vec![(global as u32, 1.0), (9999, 0.1)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    // Block-copy merge (no reorder) → merged segment with interior padding
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    // Standalone BP reorder of the merged segment
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Every unique dim must return exactly its doc
+    let total = 2 * DOCS_PER_SEGMENT;
+    let mut failures = Vec::new();
+    for i in 0..total {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        if results.len() != 1 {
+            failures.push(format!(
+                "dim {}: expected 1 result, got {}",
+                i,
+                results.len()
+            ));
+            continue;
+        }
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let got = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+        if got != format!("doc{}", i) {
+            failures.push(format!("dim {}: got '{}', expected 'doc{}'", i, got, i));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Reorder after merge lost docs past interior padding: {} failures:\n{}",
+        failures.len(),
+        failures[..failures.len().min(20)].join("\n")
+    );
+
+    // Shared dim must match every doc
+    let query = SparseVectorQuery::new(sparse, vec![(9999, 1.0)]);
+    let results = searcher.search(&query, 300).await.unwrap();
+    assert_eq!(
+        results.len(),
+        total,
+        "dim 9999 should match all {} docs after reorder, got {}",
+        total,
+        results.len()
+    );
+}
+
+/// Merge-time BP reorder (schema-level `reorder_on_merge: true`): force_merge
+/// writes the merged BMP blob in BP order directly, keeps every doc (including
+/// multi-ordinal records and docs behind source tail padding), and marks the
+/// output segment `reordered` so the standalone optimizer pass skips it.
+#[tokio::test]
+async fn test_bmp_merge_with_reorder_on_merge() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_reorder(sparse, true);
+    sb.set_reorder_on_merge(true);
+    let schema = sb.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Two segments of 100 docs (not a multiple of block_size=64 → each source
+    // has tail padding, exercising the padding-aware multi-source path).
+    // Every 10th doc carries a second sparse vector (ordinal 1).
+    const DOCS_PER_SEGMENT: usize = 100;
+    for seg in 0..2 {
+        for i in 0..DOCS_PER_SEGMENT {
+            let global = seg * DOCS_PER_SEGMENT + i;
+            let mut doc = Document::new();
+            doc.add_text(title, format!("doc{}", global));
+            doc.add_sparse_vector(sparse, vec![(global as u32, 1.0), (9999, 0.1)]);
+            if global.is_multiple_of(10) {
+                doc.add_sparse_vector(sparse, vec![(5000 + global as u32, 1.0)]);
+            }
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+
+    // Merged segment must be marked reordered — the optimizer must not rewrite it again
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(metadata.segment_metas.len(), 1);
+    assert!(
+        metadata.segment_metas.values().all(|m| m.reordered),
+        "merge with reorder_on_merge must mark the output segment reordered"
+    );
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let total = 2 * DOCS_PER_SEGMENT;
+    assert_eq!(index.num_docs().await.unwrap() as usize, total);
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Every unique dim returns exactly its doc; ordinal-1 vectors also found
+    let mut failures = Vec::new();
+    for i in 0..total {
+        let mut dims_to_check = vec![i as u32];
+        if i.is_multiple_of(10) {
+            dims_to_check.push(5000 + i as u32);
+        }
+        for dim in dims_to_check {
+            let query = SparseVectorQuery::new(sparse, vec![(dim, 1.0)]);
+            let results = searcher.search(&query, 5).await.unwrap();
+            if results.len() != 1 {
+                failures.push(format!(
+                    "dim {}: expected 1 result, got {}",
+                    dim,
+                    results.len()
+                ));
+                continue;
+            }
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+            if got != format!("doc{}", i) {
+                failures.push(format!("dim {}: got '{}', expected 'doc{}'", dim, got, i));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Merge-time reorder: {} failures:\n{}",
+        failures.len(),
+        failures[..failures.len().min(20)].join("\n")
+    );
+
+    // Shared dim matches every doc
+    let query = SparseVectorQuery::new(sparse, vec![(9999, 1.0)]);
+    let results = searcher.search(&query, 300).await.unwrap();
+    assert_eq!(
+        results.len(),
+        total,
+        "dim 9999 should match all {} docs after merge-time reorder, got {}",
+        total,
+        results.len()
+    );
+}
+
+/// Per-field reorder gate: a BMP field WITHOUT the `reorder` schema attribute
+/// must come out of writer.reorder() byte-identical (insertion order
+/// preserved), while a field WITH the attribute gets BP-reordered. Both must
+/// stay fully searchable.
+#[tokio::test]
+async fn test_bmp_reorder_skips_field_without_reorder_attribute() {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let ordered = sb.add_sparse_vector_field_with_config("ordered", true, true, bmp_config());
+    let frozen = sb.add_sparse_vector_field_with_config("frozen", true, true, bmp_config());
+    sb.set_reorder(ordered, true);
+    // `frozen` deliberately has NO reorder attribute
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Interleaved topics (i % 2) with df >= 128 so BP's min_doc_freq filter
+    // keeps them and clustering requires an actual permutation.
+    const NUM_DOCS: usize = 300;
+    for i in 0..NUM_DOCS {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc{}", i));
+        let topic_dim = 10000 + (i % 2) as u32 * 10;
+        doc.add_sparse_vector(ordered, vec![(i as u32, 1.0), (topic_dim, 0.5)]);
+        doc.add_sparse_vector(frozen, vec![(i as u32, 1.0), (9999, 0.1)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    // Snapshot the frozen field's doc map before reorder
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let frozen_doc_map_before: Vec<u8> = readers[0]
+        .bmp_indexes()
+        .get(&frozen.0)
+        .expect("frozen BMP index")
+        .doc_map_ids_slice()
+        .to_vec();
+    let ordered_doc_map_before: Vec<u8> = readers[0]
+        .bmp_indexes()
+        .get(&ordered.0)
+        .expect("ordered BMP index")
+        .doc_map_ids_slice()
+        .to_vec();
+    drop(readers);
+    drop(index);
+
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let frozen_doc_map_after: Vec<u8> = readers[0]
+        .bmp_indexes()
+        .get(&frozen.0)
+        .expect("frozen BMP index after reorder")
+        .doc_map_ids_slice()
+        .to_vec();
+    let ordered_doc_map_after: Vec<u8> = readers[0]
+        .bmp_indexes()
+        .get(&ordered.0)
+        .expect("ordered BMP index after reorder")
+        .doc_map_ids_slice()
+        .to_vec();
+    drop(readers);
+
+    assert_eq!(
+        frozen_doc_map_before, frozen_doc_map_after,
+        "field without `reorder` attribute must be copied byte-identically"
+    );
+    assert_ne!(
+        ordered_doc_map_before, ordered_doc_map_after,
+        "field with `reorder` attribute must actually be BP-reordered"
+    );
+
+    // Both fields stay fully searchable
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for (field, name) in [(ordered, "ordered"), (frozen, "frozen")] {
+        for i in [0usize, 63, 64, 150, NUM_DOCS - 1] {
+            let query = SparseVectorQuery::new(field, vec![(i as u32, 1.0)]);
+            let results = searcher.search(&query, 5).await.unwrap();
+            assert_eq!(results.len(), 1, "{} dim {}: expected 1 result", name, i);
+            let doc = searcher
+                .doc(results[0].segment_id, results[0].doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                doc.get_first(title).unwrap().as_text().unwrap(),
+                format!("doc{}", i),
+                "{} dim {} returned wrong doc",
+                name,
+                i
+            );
+        }
+    }
+}
+
 /// BMP reorder with multi-field: build index with 2 BMP sparse fields,
 /// call writer.reorder(), verify both fields return correct results.
 #[tokio::test]
@@ -1055,6 +1364,8 @@ async fn test_bmp_reorder_multi_field() {
     let title = sb.add_text_field("title", true, true);
     let sparse_a = sb.add_sparse_vector_field_with_config("sparse_a", true, true, bmp_config());
     let sparse_b = sb.add_sparse_vector_field_with_config("sparse_b", true, true, bmp_config());
+    sb.set_reorder(sparse_a, true);
+    sb.set_reorder(sparse_b, true);
     let schema = sb.build();
 
     let dir = RamDirectory::new();
