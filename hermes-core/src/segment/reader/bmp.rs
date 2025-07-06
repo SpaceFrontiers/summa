@@ -330,6 +330,20 @@ impl BmpIndex {
         }
     }
 
+    /// Page-level prefetch (`MADV_WILLNEED`) of a block-data byte range.
+    ///
+    /// Used by the BMP executor to batch-prefetch the surviving blocks of a
+    /// superblock before scoring: on memory-bound hosts the kernel clusters
+    /// the page-ins into large sequential reads instead of taking one
+    /// synchronous major fault per scored block (~265µs each on cold NVMe).
+    /// No-op for non-mmap (RAM/HTTP) backing.
+    #[cfg(feature = "native")]
+    #[inline]
+    pub(crate) fn prefetch_block_data(&self, byte_start: u64, byte_end: u64) {
+        self.block_data_bytes
+            .madvise_range(byte_start as usize..byte_end as usize, libc::MADV_WILLNEED);
+    }
+
     /// Get a raw pointer to the start of a block's contiguous data.
     /// Used for software prefetching — 1 prefetch loads all block scoring data.
     #[inline(always)]

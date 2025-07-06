@@ -493,6 +493,38 @@ fn execute_bmp_inner(
                 &mut scratch.local_block_order,
             );
 
+            // Level 3: page-level prefetch of the surviving blocks' data.
+            // Mirrors the scoring loop's skip conditions (UB-descending order,
+            // break on ub*alpha <= threshold, skip zero-mask blocks) to find
+            // the byte span that will actually be read, then issues a single
+            // MADV_WILLNEED so cold pages are clustered into sequential reads
+            // instead of one major fault per block (memory-bound hosts).
+            #[cfg(feature = "native")]
+            {
+                let thr = collector.threshold();
+                let heap_full = collector.len() >= collector_k;
+                let mut lo = u64::MAX;
+                let mut hi = 0u64;
+                for &li in scratch.local_block_order.iter().take(count) {
+                    let li = li as usize;
+                    if li >= count {
+                        break;
+                    }
+                    if heap_full && scratch.local_block_ubs[li] * alpha <= thr {
+                        break;
+                    }
+                    if scratch.local_block_masks[li] == 0 {
+                        continue;
+                    }
+                    let (s, e) = index.block_data_range((block_start + li) as u32);
+                    lo = lo.min(s);
+                    hi = hi.max(e);
+                }
+                if lo < hi {
+                    index.prefetch_block_data(lo, hi);
+                }
+            }
+
             score_superblock_blocks(
                 index,
                 block_start,
