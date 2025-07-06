@@ -28,7 +28,8 @@ mod imp {
     /// BMP executor finished one query on one segment/field.
     #[allow(clippy::too_many_arguments)]
     pub fn bmp_query(
-        field: u32,
+        index: &str,
+        field: &str,
         secs: f64,
         sbs_scored: usize,
         sbs_total: usize,
@@ -36,41 +37,47 @@ mod imp {
         blocks_total: usize,
         docmap_lookups: usize,
     ) {
-        let field = field.to_string();
-        metrics::histogram!("hermes_bmp_query_duration_seconds", "field" => field.clone())
+        let index = index.to_owned();
+        let field = field.to_owned();
+        metrics::histogram!("hermes_bmp_query_duration_seconds", "index" => index.clone(), "field" => field.clone())
             .record(secs);
-        metrics::counter!("hermes_bmp_superblocks_visited_total", "field" => field.clone())
+        metrics::counter!("hermes_bmp_superblocks_visited_total", "index" => index.clone(), "field" => field.clone())
             .increment(sbs_scored as u64);
-        metrics::counter!("hermes_bmp_superblocks_skipped_total", "field" => field.clone())
+        metrics::counter!("hermes_bmp_superblocks_skipped_total", "index" => index.clone(), "field" => field.clone())
             .increment(sbs_total.saturating_sub(sbs_scored) as u64);
-        metrics::counter!("hermes_bmp_blocks_scored_total", "field" => field.clone())
+        metrics::counter!("hermes_bmp_blocks_scored_total", "index" => index.clone(), "field" => field.clone())
             .increment(blocks_scored as u64);
-        metrics::counter!("hermes_bmp_blocks_skipped_total", "field" => field.clone())
+        metrics::counter!("hermes_bmp_blocks_skipped_total", "index" => index.clone(), "field" => field.clone())
             .increment(blocks_total.saturating_sub(blocks_scored) as u64);
-        metrics::histogram!("hermes_bmp_blocks_scored_per_query", "field" => field.clone())
+        metrics::histogram!("hermes_bmp_blocks_scored_per_query", "index" => index.clone(), "field" => field.clone())
             .record(blocks_scored as f64);
         // Doc-map indirection cost: BMP reorder permutes only the BMP-internal
         // record order (doc ids resolve through a mapping, the rest of the
         // segment is NOT physically reordered) — every scored candidate pays a
         // scattered doc-map lookup.
-        metrics::counter!("hermes_bmp_docmap_lookups_total", "field" => field.clone())
+        metrics::counter!("hermes_bmp_docmap_lookups_total", "index" => index.clone(), "field" => field.clone())
             .increment(docmap_lookups as u64);
-        metrics::histogram!("hermes_bmp_docmap_lookups_per_query", "field" => field)
+        metrics::histogram!("hermes_bmp_docmap_lookups_per_query", "index" => index, "field" => field)
             .record(docmap_lookups as f64);
     }
 
     /// Sparse DAAT MaxScore executor finished one query.
-    pub fn maxscore_query(secs: f64, docs_returned: usize) {
-        metrics::histogram!("hermes_sparse_maxscore_query_duration_seconds").record(secs);
-        metrics::histogram!("hermes_sparse_maxscore_docs_returned").record(docs_returned as f64);
+    pub fn maxscore_query(index: &str, field: &str, secs: f64, docs_returned: usize) {
+        let index = index.to_owned();
+        let field = field.to_owned();
+        metrics::histogram!("hermes_sparse_maxscore_query_duration_seconds", "index" => index.clone(), "field" => field.clone())
+            .record(secs);
+        metrics::histogram!("hermes_sparse_maxscore_docs_returned", "index" => index, "field" => field)
+            .record(docs_returned as f64);
     }
 
     /// Dense vector L1 candidate generation (ANN or brute force) finished.
-    pub fn dense_l1(field: u32, kind: &'static str, secs: f64, candidates: usize) {
-        let field = field.to_string();
-        metrics::histogram!("hermes_dense_l1_duration_seconds", "field" => field.clone(), "kind" => kind)
+    pub fn dense_l1(index: &str, field: &str, kind: &'static str, secs: f64, candidates: usize) {
+        let index = index.to_owned();
+        let field = field.to_owned();
+        metrics::histogram!("hermes_dense_l1_duration_seconds", "index" => index.clone(), "field" => field.clone(), "kind" => kind)
             .record(secs);
-        metrics::histogram!("hermes_dense_l1_candidates", "field" => field, "kind" => kind)
+        metrics::histogram!("hermes_dense_l1_candidates", "index" => index, "field" => field, "kind" => kind)
             .record(candidates as f64);
     }
 
@@ -80,20 +87,23 @@ mod imp {
     /// map, ANN results carry doc ids that must be mapped back to physical
     /// vector slots because the flat store is NOT reordered.
     pub fn dense_rerank(
-        field: u32,
+        index: &str,
+        field: &str,
         total_secs: f64,
         resolve_secs: f64,
         read_secs: f64,
         vectors: usize,
     ) {
-        let field = field.to_string();
-        metrics::histogram!("hermes_dense_rerank_duration_seconds", "field" => field.clone())
+        let index = index.to_owned();
+        let field = field.to_owned();
+        metrics::histogram!("hermes_dense_rerank_duration_seconds", "index" => index.clone(), "field" => field.clone())
             .record(total_secs);
-        metrics::histogram!("hermes_dense_rerank_resolve_duration_seconds", "field" => field.clone())
+        metrics::histogram!("hermes_dense_rerank_resolve_duration_seconds", "index" => index.clone(), "field" => field.clone())
             .record(resolve_secs);
-        metrics::histogram!("hermes_dense_rerank_read_duration_seconds", "field" => field.clone())
+        metrics::histogram!("hermes_dense_rerank_read_duration_seconds", "index" => index.clone(), "field" => field.clone())
             .record(read_secs);
-        metrics::histogram!("hermes_dense_rerank_vectors", "field" => field).record(vectors as f64);
+        metrics::histogram!("hermes_dense_rerank_vectors", "index" => index, "field" => field)
+            .record(vectors as f64);
     }
 
     /// One Directory-layer read completed.
@@ -103,8 +113,9 @@ mod imp {
     }
 
     /// One document store fetch completed.
-    pub fn store_get(secs: f64) {
-        metrics::histogram!("hermes_store_get_duration_seconds").record(secs);
+    pub fn store_get(index: &str, secs: f64) {
+        metrics::histogram!("hermes_store_get_duration_seconds", "index" => index.to_owned())
+            .record(secs);
     }
 
     /// A cold (page-cache-dropping) writer finished one file.
@@ -113,15 +124,23 @@ mod imp {
     }
 
     /// One reorder granularity decision was made (Auto or explicit).
-    pub fn reorder_granularity(field: u32, granularity: &'static str, coherence: f32) {
-        let field = field.to_string();
+    pub fn reorder_granularity(
+        index: &str,
+        field: &str,
+        granularity: &'static str,
+        coherence: f32,
+    ) {
+        let index = index.to_owned();
+        let field = field.to_owned();
         metrics::counter!(
             "hermes_reorder_granularity_total",
+            "index" => index.clone(),
             "field" => field.clone(),
             "granularity" => granularity,
         )
         .increment(1);
-        metrics::histogram!("hermes_reorder_coherence", "field" => field).record(coherence as f64);
+        metrics::histogram!("hermes_reorder_coherence", "index" => index, "field" => field)
+            .record(coherence as f64);
     }
 }
 
@@ -143,21 +162,21 @@ mod imp {
     }
 
     #[inline(always)]
-    pub fn bmp_query(_: u32, _: f64, _: usize, _: usize, _: usize, _: usize, _: usize) {}
+    pub fn bmp_query(_: &str, _: &str, _: f64, _: usize, _: usize, _: usize, _: usize, _: usize) {}
     #[inline(always)]
-    pub fn maxscore_query(_: f64, _: usize) {}
+    pub fn maxscore_query(_: &str, _: &str, _: f64, _: usize) {}
     #[inline(always)]
-    pub fn dense_l1(_: u32, _: &'static str, _: f64, _: usize) {}
+    pub fn dense_l1(_: &str, _: &str, _: &'static str, _: f64, _: usize) {}
     #[inline(always)]
-    pub fn dense_rerank(_: u32, _: f64, _: f64, _: f64, _: usize) {}
+    pub fn dense_rerank(_: &str, _: &str, _: f64, _: f64, _: f64, _: usize) {}
     #[inline(always)]
     pub fn directory_read(_: &'static str, _: f64, _: usize) {}
     #[inline(always)]
-    pub fn store_get(_: f64) {}
+    pub fn store_get(_: &str, _: f64) {}
     #[inline(always)]
     pub fn cold_write(_: usize) {}
     #[inline(always)]
-    pub fn reorder_granularity(_: u32, _: &'static str, _: f32) {}
+    pub fn reorder_granularity(_: &str, _: &str, _: &'static str, _: f32) {}
 }
 
 pub(crate) use imp::*;

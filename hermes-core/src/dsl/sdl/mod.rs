@@ -202,6 +202,8 @@ impl IndexDef {
             builder.set_query_routers(self.query_routers.clone());
         }
 
+        builder.set_index_name(self.name.clone());
+
         if self.reorder_on_merge {
             if self.fields.iter().any(|f| f.reorder) {
                 builder.set_reorder_on_merge(true);

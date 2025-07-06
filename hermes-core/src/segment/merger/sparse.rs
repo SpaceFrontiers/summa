@@ -49,7 +49,14 @@ impl SegmentMerger {
             .schema
             .fields()
             .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-            .map(|(field, entry)| (field, entry.sparse_vector_config.clone(), entry.reorder))
+            .map(|(field, entry)| {
+                (
+                    field,
+                    entry.sparse_vector_config.clone(),
+                    entry.reorder,
+                    entry.name.clone(),
+                )
+            })
             .collect();
 
         if sparse_fields.is_empty() {
@@ -67,7 +74,7 @@ impl SegmentMerger {
         let mut skip_count: u32 = 0;
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
-        for (field, sparse_config, field_reorder) in &sparse_fields {
+        for (field, sparse_config, field_reorder, field_name) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
@@ -135,6 +142,8 @@ impl SegmentMerger {
                         )?;
 
                         let fid = field.0;
+                        let fname = field_name.clone();
+                        let ilabel = self.schema.index_label().to_owned();
                         let effective_block_size = bmp_block_size.min(256) as usize;
                         let pool = self.background_pool.clone();
                         log::info!(
@@ -146,6 +155,8 @@ impl SegmentMerger {
                             crate::segment::reorder::reorder_bmp_field(
                                 &sources,
                                 fid,
+                                &ilabel,
+                                &fname,
                                 quantization,
                                 dims,
                                 effective_block_size,

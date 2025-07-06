@@ -165,7 +165,8 @@ thread_local! {
 /// Based on Mallia et al. (SIGIR 2024) and Carlson et al. (arXiv 2602.02883).
 pub fn execute_bmp(
     index: &BmpIndex,
-    field_id: u32,
+    index_label: &str,
+    field_label: &str,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -173,7 +174,8 @@ pub fn execute_bmp(
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
         index,
-        field_id,
+        index_label,
+        field_label,
         query_terms,
         k,
         heap_factor,
@@ -187,9 +189,11 @@ pub fn execute_bmp(
 /// Same as [`execute_bmp`] but only collects documents that pass the predicate.
 /// The predicate is checked during scoring (not post-filter), so the collector
 /// only contains valid documents and the threshold evolves correctly.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_bmp_filtered(
     index: &BmpIndex,
-    field_id: u32,
+    index_label: &str,
+    field_label: &str,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -198,7 +202,8 @@ pub fn execute_bmp_filtered(
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
         index,
-        field_id,
+        index_label,
+        field_label,
         query_terms,
         k,
         heap_factor,
@@ -207,9 +212,11 @@ pub fn execute_bmp_filtered(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_bmp_inner(
     index: &BmpIndex,
-    field_id: u32,
+    index_label: &str,
+    field_label: &str,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -580,7 +587,8 @@ fn execute_bmp_inner(
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let threshold = collector.threshold();
         crate::observe::bmp_query(
-            field_id,
+            index_label,
+            field_label,
             t_start.elapsed().as_secs_f64(),
             sbs_scored as usize,
             num_superblocks_total,

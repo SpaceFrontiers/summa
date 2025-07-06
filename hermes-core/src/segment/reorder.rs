@@ -186,7 +186,14 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     let sparse_fields: Vec<_> = schema
         .fields()
         .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-        .map(|(field, entry)| (field, entry.sparse_vector_config.clone(), entry.reorder))
+        .map(|(field, entry)| {
+            (
+                field,
+                entry.sparse_vector_config.clone(),
+                entry.reorder,
+                entry.name.clone(),
+            )
+        })
         .collect();
 
     if sparse_fields.is_empty() {
@@ -195,7 +202,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
 
     // Check if there's any BMP data to reorder. Per-field gate: only fields
     // with the `reorder` schema attribute get BP; others are copied unchanged.
-    let has_bmp_data = sparse_fields.iter().any(|(field, config, reorder)| {
+    let has_bmp_data = sparse_fields.iter().any(|(field, config, reorder, _)| {
         *reorder
             && config.as_ref().map(|c| c.format) == Some(SparseFormat::Bmp)
             && reader.bmp_indexes().get(&field.0).is_some()
@@ -222,7 +229,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     let mut all_skip_bytes: Vec<u8> = Vec::new();
     let mut skip_count: u32 = 0;
 
-    for (field, sparse_config, reorder) in &sparse_fields {
+    for (field, sparse_config, reorder, field_name) in &sparse_fields {
         let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
         let quantization = sparse_config
             .as_ref()
@@ -267,11 +274,15 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 // CPU-heavy reorder runs off tokio worker threads.
                 let bmp_sources = vec![(bmp_idx.clone(), 0u32)];
                 let fid = field.0;
+                let fname = field_name.clone();
+                let ilabel = schema.index_label().to_owned();
                 let pool = rayon_pool.clone();
                 let (w, ft, converged) = tokio::task::spawn_blocking(move || {
                     reorder_bmp_field(
                         &bmp_sources,
                         fid,
+                        &ilabel,
+                        &fname,
                         quantization,
                         dims,
                         effective_block_size,
@@ -704,6 +715,8 @@ async fn copy_maxscore_field(
 pub(crate) fn reorder_bmp_field(
     sources: &[(crate::segment::BmpIndex, u32)],
     field_id: u32,
+    index_label: &str,
+    field_name: &str,
     quantization: crate::structures::WeightQuantization,
     dims: u32,
     effective_block_size: usize,
@@ -749,7 +762,8 @@ pub(crate) fn reorder_bmp_field(
         explicit => explicit,
     };
     crate::observe::reorder_granularity(
-        field_id,
+        index_label,
+        field_name,
         match effective_granularity {
             BpGranularity::Blocks => "blocks",
             _ => "records",

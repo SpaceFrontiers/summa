@@ -205,6 +205,11 @@ pub struct ScoredDoc {
 /// 3. **Conjunction optimization** (Lucene/Grand 2023): progressively intersect
 ///    essential terms as threshold rises, skipping docs that lack enough terms
 pub struct MaxScoreExecutor<'a> {
+    /// Metric labels (index, field) — set via `with_metric_labels`; empty
+    /// strings render as "unknown"/"?" is avoided by callers passing real
+    /// names from the schema.
+    metric_index: &'a str,
+    metric_field: &'a str,
     cursors: Vec<TermCursor<'a>>,
     prefix_sums: Vec<f32>,
     collector: ScoreCollector,
@@ -996,7 +1001,16 @@ impl<'a> MaxScoreExecutor<'a> {
             collector: ScoreCollector::new(k),
             inv_heap_factor: 1.0 / clamped_heap_factor,
             predicate: None,
+            metric_index: "unknown",
+            metric_field: "unknown",
         }
+    }
+
+    /// Attach (index, field) labels for the metrics this executor emits.
+    pub fn with_metric_labels(mut self, index: &'a str, field: &'a str) -> Self {
+        self.metric_index = index;
+        self.metric_field = field;
+        self
     }
 
     /// Create an executor for sparse vector queries.
@@ -1073,7 +1087,7 @@ impl<'a> MaxScoreExecutor<'a> {
         let t = crate::observe::Timer::start();
         let results = bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await);
         if let Ok(r) = &results {
-            crate::observe::maxscore_query(t.secs(), r.len());
+            crate::observe::maxscore_query(self.metric_index, self.metric_field, t.secs(), r.len());
         }
         results
     }
@@ -1086,7 +1100,7 @@ impl<'a> MaxScoreExecutor<'a> {
         let t = crate::observe::Timer::start();
         let results = bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,);
         if let Ok(r) = &results {
-            crate::observe::maxscore_query(t.secs(), r.len());
+            crate::observe::maxscore_query(self.metric_index, self.metric_field, t.secs(), r.len());
         }
         results
     }

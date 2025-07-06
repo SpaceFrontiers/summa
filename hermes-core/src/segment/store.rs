@@ -661,7 +661,7 @@ impl AsyncStoreReader {
         let (entry, block) = self.find_and_load_block(doc_id).await?;
         let doc_bytes = block.doc_bytes(doc_id - entry.first_doc_id)?;
         let result = deserialize_document(doc_bytes, schema).map(Some);
-        crate::observe::store_get(t.secs());
+        crate::observe::store_get(schema.index_label(), t.secs());
         result
     }
 

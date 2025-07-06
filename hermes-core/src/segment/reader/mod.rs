@@ -935,7 +935,13 @@ impl SegmentReader {
                 Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
                 None => "flat",
             };
-            crate::observe::dense_l1(field.0, kind, l1_elapsed.as_secs_f64(), results.len());
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                kind,
+                l1_elapsed.as_secs_f64(),
+                results.len(),
+            );
         }
         log::debug!(
             "[search_dense] field {}: L1 returned {} candidates in {:.1}ms",
@@ -1005,7 +1011,8 @@ impl SegmentReader {
                 }
 
                 crate::observe::dense_rerank(
-                    field.0,
+                    self.schema.index_label(),
+                    self.schema.get_field_name(field).unwrap_or("?"),
                     t_rerank.elapsed().as_secs_f64(),
                     t_resolve.as_secs_f64(),
                     read_elapsed.as_secs_f64(),

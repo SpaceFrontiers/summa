@@ -88,9 +88,12 @@ impl IndexService for IndexServiceImpl {
             return Err(Status::invalid_argument("Schema is required"));
         }
 
-        let schema = parse_schema(&req.schema)
+        let mut schema = parse_schema(&req.schema)
             .map_err(|e| Status::invalid_argument(format!("Invalid schema: {}", e)))?;
 
+        // The registry name is the canonical index identity — use it as the
+        // metrics `index` label even when the SDL block is named differently.
+        schema.set_index_name(&req.index_name);
         self.registry.create_index(&req.index_name, schema).await?;
 
         info!("Created index: {}", req.index_name);

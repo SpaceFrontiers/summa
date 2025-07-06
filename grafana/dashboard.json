@@ -56,7 +56,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (index) (rate(hermes_search_requests_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "expr": "sum by (index) (rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
           "legendFormat": "{{index}}",
           "refId": "A",
           "range": true
@@ -108,7 +108,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (index) (rate(hermes_search_requests_total{namespace=\"$namespace\", pod=~\"$pod\", status=\"error\"}[$__rate_interval])) / sum by (index) (rate(hermes_search_requests_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "expr": "sum by (index) (rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\", status=\"error\"}[$__rate_interval])) / sum by (index) (rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
           "legendFormat": "{{index}}",
           "refId": "A",
           "range": true
@@ -162,7 +162,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(hermes_search_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(hermes_search_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A",
           "range": true
@@ -172,7 +172,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_search_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_search_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B",
           "range": true
@@ -182,7 +182,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(hermes_search_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hermes_search_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C",
           "range": true
@@ -234,7 +234,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, index) (rate(hermes_search_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, index) (rate(hermes_search_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95 {{index}}",
           "refId": "A",
           "range": true
@@ -286,7 +286,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(hermes_search_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(hermes_search_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "{{pod}}",
           "refId": "A",
           "range": true
@@ -338,7 +338,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (pod) (rate(hermes_search_requests_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "expr": "sum by (pod) (rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
           "legendFormat": "{{pod}}",
           "refId": "A",
           "range": true
@@ -403,7 +403,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_bmp_query_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_bmp_query_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95 {{field}}",
           "refId": "A",
           "range": true
@@ -413,7 +413,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, field) (rate(hermes_bmp_query_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, field) (rate(hermes_bmp_query_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p99 {{field}}",
           "refId": "B",
           "range": true
@@ -465,7 +465,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (field) (rate(hermes_bmp_superblocks_skipped_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / (sum by (field) (rate(hermes_bmp_superblocks_visited_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) + sum by (field) (rate(hermes_bmp_superblocks_skipped_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "sum by (field) (rate(hermes_bmp_superblocks_skipped_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / (sum by (field) (rate(hermes_bmp_superblocks_visited_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) + sum by (field) (rate(hermes_bmp_superblocks_skipped_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "field {{field}}",
           "refId": "A",
           "range": true
@@ -519,7 +519,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (field) (rate(hermes_bmp_blocks_skipped_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / (sum by (field) (rate(hermes_bmp_blocks_scored_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) + sum by (field) (rate(hermes_bmp_blocks_skipped_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "sum by (field) (rate(hermes_bmp_blocks_skipped_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / (sum by (field) (rate(hermes_bmp_blocks_scored_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) + sum by (field) (rate(hermes_bmp_blocks_skipped_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "field {{field}}",
           "refId": "A",
           "range": true
@@ -573,7 +573,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_bmp_blocks_scored_per_query_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_bmp_blocks_scored_per_query_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95 {{field}}",
           "refId": "A",
           "range": true
@@ -625,7 +625,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (field) (rate(hermes_bmp_docmap_lookups_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "expr": "sum by (field) (rate(hermes_bmp_docmap_lookups_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
           "legendFormat": "rate field {{field}}",
           "refId": "A",
           "range": true
@@ -635,7 +635,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_bmp_docmap_lookups_per_query_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_bmp_docmap_lookups_per_query_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95/query field {{field}}",
           "refId": "B",
           "range": true
@@ -687,7 +687,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(hermes_sparse_maxscore_query_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(hermes_sparse_maxscore_query_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A",
           "range": true
@@ -697,7 +697,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_sparse_maxscore_query_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_sparse_maxscore_query_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B",
           "range": true
@@ -707,7 +707,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(hermes_sparse_maxscore_query_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hermes_sparse_maxscore_query_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C",
           "range": true
@@ -759,7 +759,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (granularity, field) (increase(hermes_reorder_granularity_total{namespace=\"$namespace\", pod=~\"$pod\"}[$__interval]))",
+          "expr": "sum by (granularity, field) (increase(hermes_reorder_granularity_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__interval]))",
           "legendFormat": "{{granularity}} field {{field}}",
           "refId": "A",
           "range": true
@@ -811,7 +811,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, field) (rate(hermes_reorder_coherence_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, field) (rate(hermes_reorder_coherence_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p50 field {{field}}",
           "refId": "A",
           "range": true
@@ -821,7 +821,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_reorder_coherence_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_reorder_coherence_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95 field {{field}}",
           "refId": "B",
           "range": true
@@ -886,7 +886,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(hermes_dense_l1_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(hermes_dense_l1_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95 {{kind}}",
           "refId": "A",
           "range": true
@@ -938,7 +938,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_dense_rerank_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_dense_rerank_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "total",
           "refId": "A",
           "range": true
@@ -948,7 +948,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_dense_rerank_resolve_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_dense_rerank_resolve_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "resolve (indirection)",
           "refId": "B",
           "range": true
@@ -958,7 +958,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_dense_rerank_read_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_dense_rerank_read_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "read (page faults)",
           "refId": "C",
           "range": true
@@ -1010,7 +1010,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_dense_rerank_vectors_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, field) (rate(hermes_dense_rerank_vectors_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "vectors p95 field {{field}}",
           "refId": "A",
           "range": true
@@ -1020,7 +1020,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(hermes_dense_l1_candidates_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(hermes_dense_l1_candidates_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "L1 candidates p95 {{kind}}",
           "refId": "B",
           "range": true
@@ -1085,7 +1085,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(hermes_store_get_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(hermes_store_get_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A",
           "range": true
@@ -1095,7 +1095,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_store_get_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hermes_store_get_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B",
           "range": true
@@ -1105,7 +1105,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(hermes_store_get_duration_seconds_bucket{namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hermes_store_get_duration_seconds_bucket{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C",
           "range": true
@@ -1667,6 +1667,23 @@
         "hide": 0,
         "refresh": 2,
         "sort": 1
+      },
+      {
+        "name": "index",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(hermes_search_requests_total{namespace=\"$namespace\"}, index)",
+        "label": "Index",
+        "current": {},
+        "hide": 0,
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*"
       },
       {
         "name": "pod",

@@ -469,6 +469,11 @@ pub struct Schema {
     /// handles ordering).
     #[serde(default)]
     reorder_on_merge: bool,
+    /// Index name used as the `index` label on metrics. Set from the SDL
+    /// index name at parse time and overridden with the registry name at
+    /// server-side index creation. Empty on old metadata → "unknown".
+    #[serde(default)]
+    index_name: String,
 }
 
 impl Schema {
@@ -511,6 +516,21 @@ impl Schema {
         self.reorder_on_merge
     }
 
+    /// Index name for metric labels ("unknown" when not set — pre-existing
+    /// metadata or programmatic schemas without a name).
+    pub fn index_label(&self) -> &str {
+        if self.index_name.is_empty() {
+            "unknown"
+        } else {
+            &self.index_name
+        }
+    }
+
+    /// Set the index name used as the metrics `index` label.
+    pub fn set_index_name(&mut self, name: impl Into<String>) {
+        self.index_name = name.into();
+    }
+
     /// Get the default fields for query parsing
     pub fn default_fields(&self) -> &[Field] {
         &self.default_fields
@@ -548,6 +568,7 @@ pub struct SchemaBuilder {
     default_fields: Vec<String>,
     query_routers: Vec<QueryRouterRule>,
     reorder_on_merge: bool,
+    index_name: String,
 }
 
 impl SchemaBuilder {
@@ -826,6 +847,11 @@ impl SchemaBuilder {
         self.reorder_on_merge = on;
     }
 
+    /// Set the index name used as the metrics `index` label.
+    pub fn set_index_name(&mut self, name: impl Into<String>) {
+        self.index_name = name.into();
+    }
+
     /// Set position tracking mode for phrase queries and multi-field element tracking
     pub fn set_positions(&mut self, field: Field, mode: PositionMode) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
@@ -862,6 +888,7 @@ impl SchemaBuilder {
             default_fields,
             query_routers: self.query_routers,
             reorder_on_merge: self.reorder_on_merge,
+            index_name: self.index_name,
         }
     }
 }

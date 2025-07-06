@@ -24,8 +24,11 @@ degradation) has relied on debug log lines (`slow BMP: ...ms, sbs=, blocks=`)
 
 ## Metric set
 
-Histograms are seconds unless noted. `field` labels are numeric field ids
-(low cardinality); the server adds `index` labels at RPC level.
+Histograms are seconds unless noted. `field` labels are **field names** and
+every schema-scoped metric also carries an **`index` label** (the registry
+index name, embedded in the schema at creation; "unknown" for pre-existing
+indexes until recreated). Only `hermes_directory_read_*` and
+`hermes_cold_write_bytes_total` lack the index label (no schema in scope).
 
 | Metric                                                    | Type                | Labels                                                              | Meaning                                                                                                                                                                                                                                          |
 | --------------------------------------------------------- | ------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

@@ -77,11 +77,14 @@ pub(super) fn finish_text_maxscore<'a>(
     avg_field_len: f32,
     limit: usize,
     shared_threshold: &std::cell::Cell<f32>,
+    index_label: &str,
+    field_label: &str,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
     if posting_lists.is_empty() {
         return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
     }
-    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
+    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit)
+        .with_metric_labels(index_label, field_label);
     let initial = shared_threshold.get();
     if initial > 0.0 {
         executor.seed_threshold(initial);
@@ -185,7 +188,11 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
     let mut executor =
-        MaxScoreExecutor::sparse(si, query_terms, executor_limit, infos[0].heap_factor);
+        MaxScoreExecutor::sparse(si, query_terms, executor_limit, infos[0].heap_factor)
+            .with_metric_labels(
+                reader.schema().index_label(),
+                reader.schema().get_field_name(field).unwrap_or("?"),
+            );
     if let Some(pred) = predicate {
         executor = executor.with_predicate(pred);
     }
@@ -213,9 +220,11 @@ pub(crate) fn build_sparse_bmp_results(
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
     let max_sb = infos[0].max_superblocks;
+    let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     match super::bmp::execute_bmp(
         bmp,
-        field.0,
+        reader.schema().index_label(),
+        field_label,
         &query_terms,
         executor_limit,
         infos[0].heap_factor,
@@ -250,9 +259,11 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
     let max_sb = infos[0].max_superblocks;
+    let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     match super::bmp::execute_bmp_filtered(
         bmp,
-        field.0,
+        reader.schema().index_label(),
+        field_label,
         &query_terms,
         executor_limit,
         infos[0].heap_factor,

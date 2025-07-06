@@ -192,7 +192,7 @@ macro_rules! boolean_plan {
         // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
         if must.is_empty() && must_not.is_empty() && should.len() >= 2 {
             // 2a. Text MaxScore (single-field, all term queries)
-            if let Some((mut infos, _field, avg_field_len, num_docs)) =
+            if let Some((mut infos, text_field, avg_field_len, num_docs)) =
                 prepare_text_maxscore(should, reader, global_stats)
             {
                 let mut posting_lists = Vec::with_capacity(infos.len());
@@ -210,6 +210,8 @@ macro_rules! boolean_plan {
                     avg_field_len,
                     limit,
                     &shared_threshold,
+                    reader.schema().index_label(),
+                    reader.schema().get_field_name(text_field).unwrap_or("?"),
                 );
             }
 
@@ -253,6 +255,8 @@ macro_rules! boolean_plan {
                             *avg_field_len,
                             grouping.per_field_limit,
                             &shared_threshold,
+                            reader.schema().index_label(),
+                            reader.schema().get_field_name(*field).unwrap_or("?"),
                         )?);
                     }
                 }
