@@ -83,6 +83,15 @@ cross-pod `histogram_quantile` aggregation; cAdvisor pod-resource row for
 page-fault correlation). The server configures explicit histogram buckets so
 quantiles aggregate across pods.
 
+The **Search time breakdown by operation** panel (top of the overview row)
+stacks the mean time each disjoint phase — block search (BMP), MaxScore
+(DAAT), ANN L1 candidate gen, rerank, store fetch, directory read —
+contributes per search request: `rate(<phase>_duration_seconds_sum) /
+rate(hermes_search_requests_total)`. Because segments/sub-queries run
+concurrently, the stack is CPU-time-equivalent per request, not wall-clock
+latency — read it for _where time goes_, and the p50/p95/p99 latency panels
+for wall-clock.
+
 ## Non-goals / future
 
 - Per-page-fault disk latency: mmap faults are invisible to userspace timers;

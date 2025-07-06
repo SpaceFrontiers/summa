@@ -46,7 +46,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 1,
+        "y": 9,
         "w": 8,
         "h": 8
       },
@@ -98,7 +98,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 1,
+        "y": 9,
         "w": 8,
         "h": 8
       },
@@ -152,7 +152,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 1,
+        "y": 9,
         "w": 8,
         "h": 8
       },
@@ -224,7 +224,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 9,
+        "y": 17,
         "w": 8,
         "h": 8
       },
@@ -276,7 +276,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 9,
+        "y": 17,
         "w": 8,
         "h": 8
       },
@@ -328,7 +328,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 9,
+        "y": 17,
         "w": 8,
         "h": 8
       },
@@ -376,7 +376,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 25,
         "w": 24,
         "h": 1
       },
@@ -393,7 +393,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 18,
+        "y": 26,
         "w": 8,
         "h": 8
       },
@@ -455,7 +455,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 18,
+        "y": 26,
         "w": 8,
         "h": 8
       },
@@ -509,7 +509,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 18,
+        "y": 26,
         "w": 8,
         "h": 8
       },
@@ -563,7 +563,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 34,
         "w": 8,
         "h": 8
       },
@@ -615,7 +615,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 26,
+        "y": 34,
         "w": 8,
         "h": 8
       },
@@ -677,7 +677,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 26,
+        "y": 34,
         "w": 8,
         "h": 8
       },
@@ -749,7 +749,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 42,
         "w": 12,
         "h": 8
       },
@@ -801,7 +801,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 34,
+        "y": 42,
         "w": 12,
         "h": 8
       },
@@ -859,7 +859,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 42,
+        "y": 50,
         "w": 24,
         "h": 1
       },
@@ -876,7 +876,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 43,
+        "y": 51,
         "w": 8,
         "h": 8
       },
@@ -928,7 +928,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 43,
+        "y": 51,
         "w": 8,
         "h": 8
       },
@@ -1000,7 +1000,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 43,
+        "y": 51,
         "w": 8,
         "h": 8
       },
@@ -1058,7 +1058,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 51,
+        "y": 59,
         "w": 24,
         "h": 1
       },
@@ -1075,7 +1075,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 52,
+        "y": 60,
         "w": 8,
         "h": 8
       },
@@ -1147,7 +1147,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 52,
+        "y": 60,
         "w": 8,
         "h": 8
       },
@@ -1209,7 +1209,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 52,
+        "y": 60,
         "w": 8,
         "h": 8
       },
@@ -1257,7 +1257,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 60,
+        "y": 68,
         "w": 24,
         "h": 1
       },
@@ -1274,7 +1274,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 61,
+        "y": 69,
         "w": 8,
         "h": 8
       },
@@ -1336,7 +1336,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 61,
+        "y": 69,
         "w": 8,
         "h": 8
       },
@@ -1408,7 +1408,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 61,
+        "y": 69,
         "w": 8,
         "h": 8
       },
@@ -1470,7 +1470,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 69,
+        "y": 77,
         "w": 8,
         "h": 8
       },
@@ -1524,7 +1524,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 69,
+        "y": 77,
         "w": 8,
         "h": 8
       },
@@ -1578,7 +1578,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 69,
+        "y": 77,
         "w": 8,
         "h": 8
       },
@@ -1622,6 +1622,113 @@
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Search time breakdown by operation (per request)",
+      "description": "Mean time each essential operation contributes per search request, stacked. Each phase is a disjoint duration histogram summed over all fields/segments and divided by the search-request rate, so bars stack to the total per-request work spent across phases. Because segments/sub-queries run concurrently, the stack is CPU-time-equivalent per request, not wall-clock latency (see 'Search latency' panels for wall-clock).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hermes_bmp_query_duration_seconds_sum{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / sum(rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "block search (BMP)",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hermes_sparse_maxscore_query_duration_seconds_sum{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / sum(rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "MaxScore (DAAT)",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hermes_dense_l1_duration_seconds_sum{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / sum(rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "ANN L1 candidate gen",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hermes_dense_rerank_duration_seconds_sum{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / sum(rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "rerank",
+          "refId": "D",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hermes_store_get_duration_seconds_sum{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / sum(rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "store fetch",
+          "refId": "E",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hermes_directory_read_duration_seconds_sum{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval])) / sum(rate(hermes_search_requests_total{index=~\"$index\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "directory read",
+          "refId": "F",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": ["mean", "max"]
         },
         "tooltip": {
           "mode": "multi",
