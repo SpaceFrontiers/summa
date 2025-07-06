@@ -75,6 +75,20 @@ impl std::fmt::Display for MergeStats {
 // TrainedVectorStructures is defined in super::types (available on all platforms)
 pub use super::types::TrainedVectorStructures;
 
+/// Run a CPU/IO-heavy synchronous section, telling tokio to migrate this
+/// worker's task queue first (multi-thread runtimes only — `block_in_place`
+/// panics on current_thread, where we just run inline).
+pub(crate) fn block_in_place_if_multithread<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
@@ -82,6 +96,10 @@ pub struct SegmentMerger {
     /// (instead of byte-level block stacking). The output segment is then
     /// already ordered, so the standalone reorder pass is unnecessary.
     reorder_bmp: bool,
+    /// Bounded rayon pool for merge-time BP. `None` = global pool (tests);
+    /// the SegmentManager always passes its background pool so BP cannot
+    /// starve query scoring.
+    background_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl SegmentMerger {
@@ -89,12 +107,19 @@ impl SegmentMerger {
         Self {
             schema,
             reorder_bmp: false,
+            background_pool: None,
         }
     }
 
     /// Enable BP reordering of BMP fields during the merge (see `reorder_bmp`).
     pub fn with_bmp_reorder(mut self, reorder: bool) -> Self {
         self.reorder_bmp = reorder;
+        self
+    }
+
+    /// Run merge-time BP on this bounded pool instead of the global one.
+    pub fn with_background_pool(mut self, pool: Option<Arc<rayon::ThreadPool>>) -> Self {
+        self.background_pool = pool;
         self
     }
 

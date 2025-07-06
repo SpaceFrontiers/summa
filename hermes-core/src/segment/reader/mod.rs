@@ -158,7 +158,6 @@ pub struct SegmentReader {
     /// Per-segment MaxScore threshold (f32 stored as AtomicU32 bits).
     /// Allows per-field MaxScore groups within a single query to share thresholds:
     /// field A's result seeds field B's pruning on the same segment.
-    shared_threshold: std::sync::atomic::AtomicU32,
     /// Hot-metadata pin accounting (see `segment::pin`)
     #[cfg(feature = "native")]
     pin_report: crate::segment::pin::PinReport,
@@ -267,7 +266,6 @@ impl SegmentReader {
             bmp_indexes,
             positions_handle,
             fast_fields,
-            shared_threshold: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "native")]
             pin_report: Default::default(),
         };
@@ -337,40 +335,10 @@ impl SegmentReader {
         self.pin_report = report;
     }
 
-    /// Reset the per-segment threshold (call before each new search).
-    #[inline]
-    pub fn reset_shared_threshold(&self) {
-        self.shared_threshold
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Read the per-segment MaxScore threshold.
-    #[inline]
-    pub fn shared_threshold_f32(&self) -> f32 {
-        f32::from_bits(
-            self.shared_threshold
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-
-    /// Update the threshold if new value is higher (monotonic max).
-    #[inline]
-    pub fn update_shared_threshold(&self, new_threshold: f32) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let new_bits = new_threshold.to_bits();
-        let mut current_bits = self.shared_threshold.load(Relaxed);
-        while new_threshold > f32::from_bits(current_bits) {
-            match self.shared_threshold.compare_exchange_weak(
-                current_bits,
-                new_bits,
-                Relaxed,
-                Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current_bits = actual,
-            }
-        }
-    }
+    // NOTE: cross-group MaxScore threshold seeding is query-execution-local
+    // (a Cell in the boolean planner) — it must never live on the shared
+    // SegmentReader, where concurrent queries would leak thresholds into
+    // each other and wrongly prune results.
 
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta

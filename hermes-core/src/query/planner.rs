@@ -65,27 +65,33 @@ pub(super) fn prepare_text_maxscore(
 }
 
 /// Build a TopK scorer from fetched posting lists via text MaxScore.
+///
+/// `shared_threshold` is a QUERY-EXECUTION-local cell: when one query has
+/// multiple per-field MaxScore groups (path 2c), field A's result seeds
+/// field B's pruning. It must never be shared across queries — a
+/// per-segment cell here caused cross-query threshold leaks under
+/// concurrent searches (one query's threshold wrongly pruning another's
+/// results).
 pub(super) fn finish_text_maxscore<'a>(
     posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
     avg_field_len: f32,
     limit: usize,
-    reader: &crate::segment::SegmentReader,
+    shared_threshold: &std::cell::Cell<f32>,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
     if posting_lists.is_empty() {
         return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
     }
     let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
-    // Seed from per-segment threshold: when a query has multiple per-field
-    // MaxScore groups (path 2c), field A's result seeds field B's pruning.
-    let initial = reader.shared_threshold_f32();
+    let initial = shared_threshold.get();
     if initial > 0.0 {
         executor.seed_threshold(initial);
     }
     let results = executor.execute_sync()?;
     if results.len() >= limit
         && let Some(last) = results.last()
+        && last.score > shared_threshold.get()
     {
-        reader.update_shared_threshold(last.score);
+        shared_threshold.set(last.score);
     }
     Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
 }

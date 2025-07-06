@@ -1169,7 +1169,7 @@ async fn test_large_scale_merge_policy() {
 /// directories always go through the page-cache-dropping writer. The merged
 /// segment must be byte-valid: correct doc count, every doc retrievable via
 /// search after force_merge on a real filesystem directory.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_merge_with_cold_io_produces_valid_segment() {
     use crate::directories::MmapDirectory;
     use crate::query::TermQuery;

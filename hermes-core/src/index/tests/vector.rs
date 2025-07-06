@@ -804,6 +804,20 @@ async fn test_needle_combined_all_modalities() {
 
 #[tokio::test]
 async fn test_search_fused_hybrid_union() {
+    // current_thread runtime → sequential sub-query fallback path
+    search_fused_hybrid_union_impl().await;
+}
+
+/// Same scenario on a multi-thread runtime: sub-queries fan out on rayon
+/// under one block_in_place (the parallel fusion path) — results must be
+/// identical to the sequential path, including the query-local MaxScore
+/// threshold cell (no cross-sub-query threshold leaking).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_search_fused_hybrid_union_parallel_subqueries() {
+    search_fused_hybrid_union_impl().await;
+}
+
+async fn search_fused_hybrid_union_impl() {
     use crate::dsl::{DenseVectorConfig, VectorIndexType};
     use crate::query::{DenseVectorQuery, FusionMethod, TermQuery};
 

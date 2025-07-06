@@ -136,6 +136,7 @@ impl SegmentMerger {
 
                         let fid = field.0;
                         let effective_block_size = bmp_block_size.min(256) as usize;
+                        let pool = self.background_pool.clone();
                         log::info!(
                             "[merge_bmp] field {}: reorder-on-merge enabled — running BP over {} source(s)",
                             fid,
@@ -159,7 +160,7 @@ impl SegmentMerger {
                                 crate::segment::reorder::BpGranularity::Auto,
                                 writer,
                                 field_tocs,
-                                None,
+                                pool,
                             )
                         })
                         .await
@@ -171,18 +172,22 @@ impl SegmentMerger {
                         continue;
                     }
 
-                    merge_bmp_field(
-                        &bmp_indexes,
-                        &doc_offs,
-                        field.0,
-                        quantization,
-                        dims,
-                        bmp_block_size,
-                        max_weight_scale,
-                        total_vectors_bmp,
-                        &mut writer,
-                        &mut field_tocs,
-                    )?;
+                    // GB-scale sync copy loops — migrate this tokio worker's
+                    // queue so the merge doesn't pin a runtime thread.
+                    super::block_in_place_if_multithread(|| {
+                        merge_bmp_field(
+                            &bmp_indexes,
+                            &doc_offs,
+                            field.0,
+                            quantization,
+                            dims,
+                            bmp_block_size,
+                            max_weight_scale,
+                            total_vectors_bmp,
+                            &mut writer,
+                            &mut field_tocs,
+                        )
+                    })?;
                     continue;
                 }
                 // No BMP data — fall through to MaxScore path

@@ -204,7 +204,13 @@ macro_rules! boolean_plan {
                         posting_lists.push((pl, idf));
                     }
                 }
-                return finish_text_maxscore(posting_lists, avg_field_len, limit, reader);
+                let shared_threshold = std::cell::Cell::new(0.0f32);
+                return finish_text_maxscore(
+                    posting_lists,
+                    avg_field_len,
+                    limit,
+                    &shared_threshold,
+                );
             }
 
             // 2b. Sparse (single-field, all sparse term queries)
@@ -227,6 +233,8 @@ macro_rules! boolean_plan {
             if let Some(grouping) = prepare_per_field_grouping(should, reader, limit, global_stats)
             {
                 let mut scorers: Vec<Box<dyn Scorer + '_>> = Vec::new();
+                // Query-local cross-group threshold seeding (see finish_text_maxscore)
+                let shared_threshold = std::cell::Cell::new(0.0f32);
                 for (field, avg_field_len, infos) in &grouping.multi_term_groups {
                     let mut posting_lists = Vec::with_capacity(infos.len());
                     for info in infos {
@@ -244,7 +252,7 @@ macro_rules! boolean_plan {
                             posting_lists,
                             *avg_field_len,
                             grouping.per_field_limit,
-                            reader,
+                            &shared_threshold,
                         )?);
                     }
                 }

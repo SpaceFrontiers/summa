@@ -8,8 +8,11 @@
 //! directories — output is byte-identical to the buffered writer.
 //!
 //! Mechanism (O_DIRECT-equivalent without the alignment tax):
-//! - Linux: per 64 MB window `sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER)`
-//!   then `posix_fadvise(POSIX_FADV_DONTNEED)` on the clean window.
+//! - Linux: two-window write-behind — initiate async writeback
+//!   (`sync_file_range(WRITE)`) for each completed 64 MB window and
+//!   `posix_fadvise(DONTNEED)` the *previous* window (whose writeback was
+//!   initiated a window ago and is clean by now). No synchronous disk wait
+//!   on the writing thread; `finish()` fsyncs and drops everything.
 //! - macOS: `fcntl(fd, F_NOCACHE, 1)` at creation.
 //! - Elsewhere: plain buffered writes (logged once, loudly).
 
@@ -48,6 +51,9 @@ pub(crate) struct ColdStreamingWriter {
     buf: Vec<u8>,
     /// Bytes flushed to the fd.
     written: u64,
+    /// Start of the region whose writeback has not been initiated yet.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    writeback_cursor: u64,
     /// Start of the region not yet dropped from cache (linux windowed drop).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     drop_cursor: u64,
@@ -71,6 +77,7 @@ impl ColdStreamingWriter {
             file,
             buf: Vec::with_capacity(BUF_SIZE),
             written: 0,
+            writeback_cursor: 0,
             drop_cursor: 0,
         }
     }
@@ -86,38 +93,60 @@ impl ColdStreamingWriter {
         Ok(())
     }
 
-    /// Force writeback and drop clean pages of completed windows.
-    /// `final_drop` drops everything written so far (called from finish()).
+    /// Two-window write-behind: initiate async writeback for newly completed
+    /// windows and drop the previous (now clean) window's pages. No
+    /// synchronous disk wait on the writing thread — this runs on a tokio
+    /// worker during merges. `final_drop` (from finish(), after fsync) drops
+    /// everything.
     #[allow(unused_variables)]
     fn maybe_drop(&mut self, final_drop: bool) {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            let end = if final_drop {
-                self.written
-            } else {
-                // Only drop fully-completed windows.
-                (self.written / DROP_WINDOW) * DROP_WINDOW
-            };
-            if end <= self.drop_cursor {
+            let fd = self.file.as_raw_fd();
+            if final_drop {
+                // Caller fsync'd — all pages are clean; drop the whole file.
+                if self.written > self.drop_cursor {
+                    unsafe {
+                        libc::posix_fadvise(
+                            fd,
+                            self.drop_cursor as libc::off64_t,
+                            (self.written - self.drop_cursor) as libc::off64_t,
+                            libc::POSIX_FADV_DONTNEED,
+                        );
+                    }
+                    self.drop_cursor = self.written;
+                }
                 return;
             }
-            let fd = self.file.as_raw_fd();
-            let off = self.drop_cursor as libc::off64_t;
-            let len = (end - self.drop_cursor) as libc::off64_t;
+            // Only fully-completed windows.
+            let completed = (self.written / DROP_WINDOW) * DROP_WINDOW;
+            if completed <= self.writeback_cursor {
+                return;
+            }
             unsafe {
-                // Write the window to storage so DONTNEED can evict it.
+                // Kick off async writeback for the newly completed window(s).
                 libc::sync_file_range(
                     fd,
-                    off,
-                    len,
-                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                        | libc::SYNC_FILE_RANGE_WRITE
-                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                    self.writeback_cursor as libc::off64_t,
+                    (completed - self.writeback_cursor) as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WRITE,
                 );
-                libc::posix_fadvise(fd, off, len, libc::POSIX_FADV_DONTNEED);
+                // Drop the previous window — its writeback was initiated a
+                // full window of writing ago, so its pages are clean by now.
+                // (DONTNEED on a still-dirty page is a no-op; it gets another
+                // chance on the next call and at final_drop.)
+                if self.writeback_cursor > self.drop_cursor {
+                    libc::posix_fadvise(
+                        fd,
+                        self.drop_cursor as libc::off64_t,
+                        (self.writeback_cursor - self.drop_cursor) as libc::off64_t,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                    self.drop_cursor = self.writeback_cursor;
+                }
             }
-            self.drop_cursor = end;
+            self.writeback_cursor = completed;
         }
         // macOS: F_NOCACHE handles it per-write; other platforms: no-op.
     }

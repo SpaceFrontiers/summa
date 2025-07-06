@@ -472,11 +472,6 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
 
-        // Reset per-segment MaxScore thresholds from prior searches
-        for seg in &self.segments {
-            seg.reset_shared_threshold();
-        }
-
         // Use rayon + block_in_place for CPU-bound scoring (sync feature required).
         // Offloads the scoring loop from tokio workers so search doesn't starve
         // other async tasks. Works for any segment count (rayon degrades gracefully
@@ -549,34 +544,50 @@ impl<D: Directory + 'static> Searcher<D> {
         offset: usize,
         collect_positions: bool,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        tokio::task::block_in_place(|| {
+            self.search_internal_sync(query, fetch_limit, offset, collect_positions)
+        })
+    }
+
+    /// Sync body of the parallel search: rayon par_iter over segments.
+    /// Callers must already be off the async reactor (block_in_place or a
+    /// rayon/blocking thread) — safe to nest inside another par_iter
+    /// (rayon work-stealing composes).
+    #[cfg(feature = "sync")]
+    fn search_internal_sync(
+        &self,
+        query: &dyn crate::query::Query,
+        fetch_limit: usize,
+        offset: usize,
+        collect_positions: bool,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         use rayon::prelude::*;
 
-        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> =
-            tokio::task::block_in_place(|| {
-                self.segments
-                    .par_iter()
-                    .map(|segment| {
-                        let sid = segment.meta().id;
-                        let (mut results, segment_seen) = if collect_positions {
-                            crate::query::search_segment_with_positions_and_count_sync(
-                                segment.as_ref(),
-                                query,
-                                fetch_limit,
-                            )?
-                        } else {
-                            crate::query::search_segment_with_count_sync(
-                                segment.as_ref(),
-                                query,
-                                fetch_limit,
-                            )?
-                        };
-                        for r in &mut results {
-                            r.segment_id = sid;
-                        }
-                        Ok((results, segment_seen))
-                    })
-                    .collect()
-            });
+        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> = {
+            self.segments
+                .par_iter()
+                .map(|segment| {
+                    let sid = segment.meta().id;
+                    let (mut results, segment_seen) = if collect_positions {
+                        crate::query::search_segment_with_positions_and_count_sync(
+                            segment.as_ref(),
+                            query,
+                            fetch_limit,
+                        )?
+                    } else {
+                        crate::query::search_segment_with_count_sync(
+                            segment.as_ref(),
+                            query,
+                            fetch_limit,
+                        )?
+                    };
+                    for r in &mut results {
+                        r.segment_id = sid;
+                    }
+                    Ok((results, segment_seen))
+                })
+                .collect()
+        };
 
         let mut total_seen: u32 = 0;
         let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
@@ -666,6 +677,33 @@ impl<D: Directory + 'static> Searcher<D> {
         method: crate::query::FusionMethod,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<crate::query::SearchResult>> {
+        // Sub-queries are independent — fan them out on rayon under a single
+        // block_in_place (each also par_iters its segments; rayon
+        // work-stealing composes the two levels). Sequential fallback for
+        // current_thread runtimes / non-sync builds.
+        #[cfg(feature = "sync")]
+        if !self.segments.is_empty()
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            use rayon::prelude::*;
+            let lists: Vec<Result<(Vec<crate::query::SearchResult>, f32)>> =
+                tokio::task::block_in_place(|| {
+                    queries
+                        .par_iter()
+                        .map(|&(query, weight)| {
+                            let (results, _) =
+                                self.search_internal_sync(query, fetch_limit, 0, true)?;
+                            Ok((results, weight))
+                        })
+                        .collect()
+                });
+            let lists = lists.into_iter().collect::<Result<Vec<_>>>()?;
+            return Ok(crate::query::fuse_ranked_lists_chunked(
+                lists, method, combiner, limit,
+            ));
+        }
+
         let mut lists = Vec::with_capacity(queries.len());
         for &(query, weight) in queries {
             let (results, _) = self.search_with_positions(query, fetch_limit).await?;
