@@ -126,6 +126,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ) -> Result<Self> {
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
+        // Directory-layer metrics (cold writes, lazy reads) carry the index label
+        directory.set_index_label(schema.index_label());
         let metadata = super::IndexMetadata::new((*schema).clone());
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
@@ -161,6 +163,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let directory = Arc::new(directory);
         let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
+        // Directory-layer metrics (cold writes, lazy reads) carry the index label
+        directory.set_index_label(schema.index_label());
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
             Arc::clone(&directory),

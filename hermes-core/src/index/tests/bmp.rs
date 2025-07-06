@@ -1688,8 +1688,10 @@ async fn test_bmp_multi_ordinal_clustering() {
 }
 
 /// Metrics emission: a BMP search must record the Prometheus metrics
-/// documented in docs/metrics.md, including the doc-map indirection counters.
-/// Only compiled with the `metrics` feature (cargo test --features metrics).
+/// documented in docs/metrics.md, including the doc-map indirection counters,
+/// and Directory-layer metrics (cold writes) must carry the index label set
+/// at Index open. Only compiled with the `metrics` feature
+/// (cargo test --features metrics).
 #[cfg(feature = "metrics")]
 #[tokio::test]
 async fn test_bmp_query_emits_prometheus_metrics() {
@@ -1700,18 +1702,27 @@ async fn test_bmp_query_emits_prometheus_metrics() {
     // Global install: first (and only) metrics test in the process.
     recorder.install().expect("install debugging recorder");
 
-    let (schema, _title, sparse) = bmp_schema();
-    let dir = RamDirectory::new();
+    let (mut schema, _title, sparse) = bmp_schema();
+    schema.set_index_name("metrics_test");
+    // MmapDirectory (the production directory) so merge outputs go through
+    // the cold streaming writer.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = crate::directories::MmapDirectory::new(tmp.path());
     let config = IndexConfig::default();
     let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
         .await
         .unwrap();
-    for i in 0..200u32 {
-        let mut doc = Document::new();
-        doc.add_sparse_vector(sparse, vec![(i, 1.0), (9999, 0.1)]);
-        writer.add_document(doc).unwrap();
+    for seg in 0..2u32 {
+        for i in 0..200u32 {
+            let mut doc = Document::new();
+            doc.add_sparse_vector(sparse, vec![(seg * 200 + i, 1.0), (9999, 0.1)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
     }
-    writer.commit().await.unwrap();
+    // Two segments → merge → cold write of the merged segment.
+    writer.force_merge().await.unwrap();
+    drop(writer);
 
     let index = Index::open(dir, config).await.unwrap();
     let reader = index.reader().await.unwrap();
@@ -1720,24 +1731,29 @@ async fn test_bmp_query_emits_prometheus_metrics() {
     let results = searcher.search(&query, 10).await.unwrap();
     assert!(!results.is_empty());
 
-    let names: std::collections::HashSet<String> = snapshotter
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .map(|(key, _, _, _)| key.key().name().to_string())
-        .collect();
+    // The recorder is global and other tests run concurrently, so assert
+    // per-metric that an emission with THIS index's label exists — including
+    // the Directory-layer cold write, whose label is attached late via
+    // Directory::set_index_label. "unknown" here = label-plumbing regression.
+    let snapshot = snapshotter.snapshot().into_vec();
     for expected in [
         "hermes_bmp_query_duration_seconds",
         "hermes_bmp_blocks_scored_total",
         "hermes_bmp_superblocks_visited_total",
         "hermes_bmp_docmap_lookups_total",
         "hermes_bmp_docmap_lookups_per_query",
+        "hermes_cold_write_bytes_total",
     ] {
         assert!(
-            names.contains(expected),
-            "metric '{}' not emitted; got: {:?}",
+            snapshot.iter().any(|(key, _, _, _)| {
+                let key = key.key();
+                key.name() == expected
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "index" && l.value() == "metrics_test")
+            }),
+            "metric '{}' not emitted with index=\"metrics_test\"",
             expected,
-            names
         );
     }
 }

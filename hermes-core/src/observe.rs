@@ -107,9 +107,12 @@ mod imp {
     }
 
     /// One Directory-layer read completed.
-    pub fn directory_read(op: &'static str, secs: f64, bytes: usize) {
-        metrics::histogram!("hermes_directory_read_duration_seconds", "op" => op).record(secs);
-        metrics::histogram!("hermes_directory_read_bytes", "op" => op).record(bytes as f64);
+    pub fn directory_read(index: &str, op: &'static str, secs: f64, bytes: usize) {
+        let index = index.to_owned();
+        metrics::histogram!("hermes_directory_read_duration_seconds", "index" => index.clone(), "op" => op)
+            .record(secs);
+        metrics::histogram!("hermes_directory_read_bytes", "index" => index, "op" => op)
+            .record(bytes as f64);
     }
 
     /// One document store fetch completed.
@@ -119,8 +122,9 @@ mod imp {
     }
 
     /// A cold (page-cache-dropping) writer finished one file.
-    pub fn cold_write(bytes: usize) {
-        metrics::counter!("hermes_cold_write_bytes_total").increment(bytes as u64);
+    pub fn cold_write(index: &str, bytes: usize) {
+        metrics::counter!("hermes_cold_write_bytes_total", "index" => index.to_owned())
+            .increment(bytes as u64);
     }
 
     /// One reorder granularity decision was made (Auto or explicit).
@@ -172,11 +176,11 @@ mod imp {
     #[inline(always)]
     pub fn dense_rerank(_: &str, _: &str, _: f64, _: f64, _: f64, _: usize) {}
     #[inline(always)]
-    pub fn directory_read(_: &'static str, _: f64, _: usize) {}
+    pub fn directory_read(_: &str, _: &'static str, _: f64, _: usize) {}
     #[inline(always)]
     pub fn store_get(_: &str, _: f64) {}
     #[inline(always)]
-    pub fn cold_write(_: usize) {}
+    pub fn cold_write(_: &str, _: usize) {}
     #[inline(always)]
     pub fn reorder_granularity(_: &str, _: &str, _: &'static str) {}
     #[inline(always)]

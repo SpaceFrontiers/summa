@@ -14,7 +14,7 @@ pub(crate) use directory::FileStreamingWriter;
 #[cfg(feature = "native")]
 pub use directory::FsDirectory;
 pub use directory::{
-    CachingDirectory, Directory, DirectoryWriter, FileHandle, OwnedBytes, RamDirectory,
+    CachingDirectory, Directory, DirectoryWriter, FileHandle, IndexLabel, OwnedBytes, RamDirectory,
     RangeReadFn, StreamingWriter,
 };
 #[cfg(feature = "http")]

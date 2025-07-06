@@ -25,10 +25,12 @@ degradation) has relied on debug log lines (`slow BMP: ...ms, sbs=, blocks=`)
 ## Metric set
 
 Histograms are seconds unless noted. `field` labels are **field names** and
-every schema-scoped metric also carries an **`index` label** (the registry
-index name, embedded in the schema at creation; "unknown" for pre-existing
-indexes until recreated). Only `hermes_directory_read_*` and
-`hermes_cold_write_bytes_total` lack the index label (no schema in scope).
+**every metric carries an `index` label** (the registry index name, embedded
+in the schema at creation; "unknown" for pre-existing indexes until recreated
+or patched — see below). Directory-layer metrics (`hermes_directory_read_*`,
+`hermes_cold_write_bytes_total`) have no schema in scope, so the label is
+attached late: `Index::open`/`create` call `Directory::set_index_label`
+on the index's directory instance once the schema is loaded.
 
 | Metric                                                    | Type                | Labels                                                              | Meaning                                                                                                                                                                                                                                          |
 | --------------------------------------------------------- | ------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -43,10 +45,10 @@ indexes until recreated). Only `hermes_directory_read_*` and
 | `hermes_dense_rerank_resolve_duration_seconds`            | histogram           | `field`                                                             | doc→flat-slot indirection (flat store is not reordered)                                                                                                                                                                                          |
 | `hermes_dense_rerank_read_duration_seconds`               | histogram           | `field`                                                             | raw-vector reads within rerank (page-fault sensitive)                                                                                                                                                                                            |
 | `hermes_dense_rerank_vectors`                             | histogram           | `field`                                                             | candidates reranked per query                                                                                                                                                                                                                    |
-| `hermes_directory_read_duration_seconds`                  | histogram           | `op` (`lazy_range`)                                                 | Directory-layer read latency — only Lazy handles (HTTP/custom `read_fn`) do real IO here; mmap slices are zero-copy and their fault latency lands inside the phase histograms                                                                    |
-| `hermes_directory_read_bytes`                             | histogram           | `op`                                                                | read sizes                                                                                                                                                                                                                                       |
+| `hermes_directory_read_duration_seconds`                  | histogram           | `index`, `op` (`lazy_range`)                                        | Directory-layer read latency — only Lazy handles (HTTP/custom `read_fn`) do real IO here; mmap slices are zero-copy and their fault latency lands inside the phase histograms                                                                    |
+| `hermes_directory_read_bytes`                             | histogram           | `index`, `op`                                                       | read sizes                                                                                                                                                                                                                                       |
 | `hermes_store_get_duration_seconds`                       | histogram           | `index`                                                             | document store fetch (decompression + faults), single- and multi-field paths                                                                                                                                                                     |
-| `hermes_cold_write_bytes_total`                           | counter             | —                                                                   | merge/reorder bytes written via the page-cache-dropping cold path (`docs/cold-io.md`)                                                                                                                                                            |
+| `hermes_cold_write_bytes_total`                           | counter             | `index`                                                             | merge/reorder bytes written via the page-cache-dropping cold path (`docs/cold-io.md`)                                                                                                                                                            |
 | `hermes_reorder_granularity_total`                        | counter             | `field`, `granularity` (`records`/`blocks`)                         | reorder passes by chosen granularity (`docs/block-level-reorder.md`)                                                                                                                                                                             |
 | `hermes_reorder_coherence`                                | histogram           | `field`                                                             | raw block coherence d (avg records per block×dim pair) measured at each reorder decision                                                                                                                                                         |
 | `hermes_reorder_coherence_norm`                           | histogram           | `field`                                                             | normalized coherence, 0 = random order, 1 = as coherent as the dim-frequency distribution allows — this drives the `Auto` decision (threshold 0.5)                                                                                               |
@@ -56,6 +58,22 @@ indexes until recreated). Only `hermes_directory_read_*` and
 Skip-ratio note: ratios are derived in PromQL
 (`rate(scored) / (rate(scored) + rate(skipped))`) rather than emitted, so
 they aggregate correctly across instances and windows.
+
+### Pre-existing indexes and `index="unknown"`
+
+Indexes created before the label shipped have no `index_name` in their
+stored schema. Recreate them, or patch the stored metadata in place. Do it
+with the server stopped (or the index not open for writing) — the server
+rewrites `metadata.json` on commit/merge and would overwrite a live patch:
+
+```bash
+cd <data_dir>/<index_name>
+jq --arg name "<index_name>" '.schema.index_name = $name' metadata.json \
+  > metadata.json.patched && mv metadata.json.patched metadata.json
+```
+
+Note: `metadata.json.tmp` is reserved for crash recovery — never use it as
+a scratch name.
 
 ## Dashboard
 

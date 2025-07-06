@@ -57,10 +57,12 @@ pub(crate) struct ColdStreamingWriter {
     /// Start of the region not yet dropped from cache (linux windowed drop).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     drop_cursor: u64,
+    /// Index name for the `hermes_cold_write_bytes_total` metric label.
+    label: std::sync::Arc<str>,
 }
 
 impl ColdStreamingWriter {
-    pub(crate) fn new(file: std::fs::File) -> Self {
+    pub(crate) fn new(file: std::fs::File, label: std::sync::Arc<str>) -> Self {
         log_mode_once();
         #[cfg(target_os = "macos")]
         {
@@ -79,6 +81,7 @@ impl ColdStreamingWriter {
             written: 0,
             writeback_cursor: 0,
             drop_cursor: 0,
+            label,
         }
     }
 
@@ -179,7 +182,7 @@ impl StreamingWriter for ColdStreamingWriter {
         self.flush_buf()?;
         self.file.sync_all()?;
         self.maybe_drop(true);
-        crate::observe::cold_write(self.written as usize);
+        crate::observe::cold_write(&self.label, self.written as usize);
         log::debug!(
             "[cold_io] wrote {:.1} MB with page cache dropped behind the cursor",
             self.written as f64 / (1024.0 * 1024.0)
@@ -203,7 +206,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cold.bin");
         let file = std::fs::File::create(&path).unwrap();
-        let mut writer: Box<dyn StreamingWriter> = Box::new(ColdStreamingWriter::new(file));
+        let mut writer: Box<dyn StreamingWriter> =
+            Box::new(ColdStreamingWriter::new(file, std::sync::Arc::from("test")));
 
         let mut expected: Vec<u8> = Vec::new();
         // Small writes

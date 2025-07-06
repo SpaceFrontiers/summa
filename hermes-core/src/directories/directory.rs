@@ -54,7 +54,37 @@ enum FileHandleInner {
         read_fn: RangeReadFn,
         offset: u64,
         len: u64,
+        /// Index name for the `hermes_directory_read_*` metric labels.
+        label: Arc<str>,
     },
+}
+
+/// Late-bound index name for Directory-layer metric labels
+/// (`hermes_directory_read_*`, `hermes_cold_write_bytes_total`).
+///
+/// Directories are constructed before the schema is loaded, so the label is
+/// attached afterwards: `Index::open`/`create` call
+/// `Directory::set_index_label(schema.index_label())` on the index's
+/// directory instance. Reads happen at handle/writer creation, not per IO.
+#[derive(Clone, Debug)]
+pub struct IndexLabel(Arc<std::sync::RwLock<Arc<str>>>);
+
+impl Default for IndexLabel {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::RwLock::new(Arc::from("unknown"))))
+    }
+}
+
+impl IndexLabel {
+    /// Current label ("unknown" until set).
+    pub fn get(&self) -> Arc<str> {
+        self.0.read().expect("IndexLabel lock poisoned").clone()
+    }
+
+    /// Set the label (idempotent; last write wins).
+    pub fn set(&self, label: &str) {
+        *self.0.write().expect("IndexLabel lock poisoned") = Arc::from(label);
+    }
 }
 
 impl std::fmt::Debug for FileHandle {
@@ -94,13 +124,21 @@ impl FileHandle {
     }
 
     /// Create a lazy file handle from an async range-read callback.
-    /// Only async reads are available.
+    /// Only async reads are available. Reads emit `hermes_directory_read_*`
+    /// with `index="unknown"` — use [`FileHandle::lazy_labeled`] when the
+    /// owning index is known.
     pub fn lazy(len: u64, read_fn: RangeReadFn) -> Self {
+        Self::lazy_labeled(len, read_fn, Arc::from("unknown"))
+    }
+
+    /// [`FileHandle::lazy`] with an index name for metric labels.
+    pub fn lazy_labeled(len: u64, read_fn: RangeReadFn, label: Arc<str>) -> Self {
         Self {
             inner: FileHandleInner::Lazy {
                 read_fn,
                 offset: 0,
                 len,
+                label,
             },
         }
     }
@@ -152,6 +190,7 @@ impl FileHandle {
                 read_fn,
                 offset,
                 len,
+                label,
             } => {
                 let new_offset = offset + range.start;
                 let new_len = range.end - range.start;
@@ -168,6 +207,7 @@ impl FileHandle {
                         read_fn: Arc::clone(read_fn),
                         offset: new_offset,
                         len: new_len,
+                        label: Arc::clone(label),
                     },
                 }
             }
@@ -209,6 +249,7 @@ impl FileHandle {
                 read_fn,
                 offset,
                 len,
+                label,
             } => {
                 if range.end > *len {
                     return Err(io::Error::new(
@@ -224,7 +265,7 @@ impl FileHandle {
                 let t = crate::observe::Timer::start();
                 let result = (read_fn)(abs_start..abs_end).await;
                 if let Ok(bytes) = &result {
-                    crate::observe::directory_read("lazy_range", t.secs(), bytes.len());
+                    crate::observe::directory_read(label, "lazy_range", t.secs(), bytes.len());
                 }
                 result
             }
@@ -478,6 +519,13 @@ pub trait Directory: Send + Sync + 'static {
     /// For mmap directories this returns an Inline handle (sync-capable).
     /// For HTTP/filesystem directories this returns a Lazy handle.
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle>;
+
+    /// Attach the owning index's name for Directory-layer metric labels
+    /// (`hermes_directory_read_*`, `hermes_cold_write_bytes_total`).
+    /// Called by `Index::open`/`create` once the schema is loaded; wrappers
+    /// forward to their inner directory. Default: no-op (directories that
+    /// emit no Directory-layer metrics, e.g. RamDirectory).
+    fn set_index_label(&self, _label: &str) {}
 }
 
 /// Async directory trait for reading index files (WASM version - no Send requirement)
@@ -501,6 +549,10 @@ pub trait Directory: 'static {
 
     /// Open a file handle that fetches ranges on demand.
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle>;
+
+    /// Attach the owning index's name for Directory-layer metric labels.
+    /// No-op default; metrics are native-only but the label is harmless.
+    fn set_index_label(&self, _label: &str) {}
 }
 
 /// A writer for incrementally writing data to a directory file.
@@ -776,6 +828,7 @@ impl DirectoryWriter for RamDirectory {
 #[derive(Debug, Clone)]
 pub struct FsDirectory {
     root: PathBuf,
+    label: IndexLabel,
 }
 
 #[cfg(feature = "native")]
@@ -783,6 +836,7 @@ impl FsDirectory {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            label: IndexLabel::default(),
         }
     }
 
@@ -861,7 +915,15 @@ impl Directory for FsDirectory {
             })
         });
 
-        Ok(FileHandle::lazy(file_size, read_fn))
+        Ok(FileHandle::lazy_labeled(
+            file_size,
+            read_fn,
+            self.label.get(),
+        ))
+    }
+
+    fn set_index_label(&self, label: &str) {
+        self.label.set(label);
     }
 }
 
@@ -912,7 +974,10 @@ impl DirectoryWriter for FsDirectory {
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(super::ColdStreamingWriter::new(file)))
+        Ok(Box::new(super::ColdStreamingWriter::new(
+            file,
+            self.label.get(),
+        )))
     }
 }
 
@@ -998,6 +1063,10 @@ impl<D: Directory> Directory for CachingDirectory<D> {
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
         // For caching directory, delegate to inner - caching happens at read_range level
         self.inner.open_lazy(path).await
+    }
+
+    fn set_index_label(&self, label: &str) {
+        self.inner.set_index_label(label);
     }
 }
 
