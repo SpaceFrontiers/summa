@@ -1789,7 +1789,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.42"
+version = "1.8.43"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.42"
+version = "1.8.43"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.42"
+version = "1.8.43"
 dependencies = [
  "anyhow",
  "clap",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.42"
+version = "1.8.43"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.42"
+version = "1.8.43"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -2288,9 +2288,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiff"
-version = "0.2.31"
+version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccfe6121cbe750cf81efa362d85c0bde7ea298ec43092d3a193baca59cdbd634"
+checksum = "961d16382652bfdd8c6f68b223b26a8c93e0d475c672f414411db31c6c5c900e"
 dependencies = [
  "defmt",
  "jiff-static",
@@ -2302,9 +2302,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.31"
+version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e165e897f662d428f3cd3828a919dbe067c2d42bb1031eede74ef9d27ecdedd2"
+checksum = "d0879bd39df99c4c5e2c6615ccc026391a423dde10532c573e6086eb94a802cc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5465,18 +5465,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.53"
+version = "0.8.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75726053136156d419e285b9b7eddaaea9e3fea6ce32eed44a89901f0bd98de1"
+checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.53"
+version = "0.8.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4714fd92cf900833d49538023a9b3915155210801d1c1169eba513b2addefd71"
+checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
 dependencies = [
  "proc-macro2",
  "quote",
