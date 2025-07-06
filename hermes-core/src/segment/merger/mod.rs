@@ -100,6 +100,11 @@ pub struct SegmentMerger {
     /// the SegmentManager always passes its background pool so BP cannot
     /// starve query scoring.
     background_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Granularity for merge-time BP. `Auto` by default; the SegmentManager
+    /// forces `Records` when any merge source is an unconverged partial
+    /// reorder — the merged segment is marked `bp_converged`, so this merge
+    /// is the deepening pass those sources were owed.
+    granularity: crate::segment::reorder::BpGranularity,
 }
 
 impl SegmentMerger {
@@ -108,6 +113,7 @@ impl SegmentMerger {
             schema,
             reorder_bmp: false,
             background_pool: None,
+            granularity: crate::segment::reorder::BpGranularity::Auto,
         }
     }
 
@@ -120,6 +126,12 @@ impl SegmentMerger {
     /// Run merge-time BP on this bounded pool instead of the global one.
     pub fn with_background_pool(mut self, pool: Option<Arc<rayon::ThreadPool>>) -> Self {
         self.background_pool = pool;
+        self
+    }
+
+    /// Set merge-time BP granularity (see `granularity`).
+    pub fn with_granularity(mut self, granularity: crate::segment::reorder::BpGranularity) -> Self {
+        self.granularity = granularity;
         self
     }
 

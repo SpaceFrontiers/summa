@@ -124,23 +124,25 @@ mod imp {
     }
 
     /// One reorder granularity decision was made (Auto or explicit).
-    pub fn reorder_granularity(
-        index: &str,
-        field: &str,
-        granularity: &'static str,
-        coherence: f32,
-    ) {
-        let index = index.to_owned();
-        let field = field.to_owned();
+    pub fn reorder_granularity(index: &str, field: &str, granularity: &'static str) {
         metrics::counter!(
             "hermes_reorder_granularity_total",
-            "index" => index.clone(),
-            "field" => field.clone(),
+            "index" => index.to_owned(),
+            "field" => field.to_owned(),
             "granularity" => granularity,
         )
         .increment(1);
-        metrics::histogram!("hermes_reorder_coherence", "index" => index, "field" => field)
+    }
+
+    /// Coherence measured for one `Auto` granularity decision (explicit
+    /// granularity skips the scan and emits nothing here).
+    pub fn reorder_coherence(index: &str, field: &str, coherence: f32, coherence_norm: f32) {
+        let index = index.to_owned();
+        let field = field.to_owned();
+        metrics::histogram!("hermes_reorder_coherence", "index" => index.clone(), "field" => field.clone())
             .record(coherence as f64);
+        metrics::histogram!("hermes_reorder_coherence_norm", "index" => index, "field" => field)
+            .record(coherence_norm as f64);
     }
 }
 
@@ -176,7 +178,9 @@ mod imp {
     #[inline(always)]
     pub fn cold_write(_: usize) {}
     #[inline(always)]
-    pub fn reorder_granularity(_: &str, _: &str, _: &'static str, _: f32) {}
+    pub fn reorder_granularity(_: &str, _: &str, _: &'static str) {}
+    #[inline(always)]
+    pub fn reorder_coherence(_: &str, _: &str, _: f32, _: f32) {}
 }
 
 pub(crate) use imp::*;

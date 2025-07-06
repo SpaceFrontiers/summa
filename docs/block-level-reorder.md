@@ -33,21 +33,81 @@ That remains record-level BP's job.
 
 ## The decision algorithm (`BpGranularity::Auto`)
 
-Per (segment, field), from footer stats alone — zero scan cost:
+Per (segment, field), the raw signal is block coherence:
 
 ```
 coherence d = total_postings / total_terms
             = average number of records sharing a (block, dim) pair
 ```
 
-- `d ≈ 1–2`: blocks are scrambled — every dim appears once or twice per
-  block. Record-level BP required (with the existing size-tiered BpBudget).
-- `d` high (records in a block share vocabulary): blocks are internally
-  coherent — block-level reorder recovers everything reordering can still
-  give. Threshold: `BLOCKWISE_COHERENCE_THRESHOLD = 4.0` (average of 4
-  records per block sharing each dim), chosen conservatively; every decision
-  logs the measured `d`, the threshold, and the chosen granularity so the
-  default can be tuned from production logs.
+`d` alone is **not value-independent**: it is dominated by the corpus's
+dim-frequency distribution, not by ordering quality. A rare-dim corpus
+(short title vectors — a dim in only 3 documents can never contribute more
+than 3) caps `d` low even when perfectly clustered, while ubiquitous dims
+inflate `d` even when records are fully scrambled. An absolute cutoff
+inverts the decision on both.
+
+So the decision normalizes `d` between two per-corpus bounds, both derived
+from the same per-dim record frequencies `df_t` (one streaming pass over
+block headers, posting-slice lengths only — no posting decode):
+
+```
+d_rand = P / Σ_t B·(1 − (1 − 1/B)^df_t)   expected d under random record→block assignment
+d_max  = P / Σ_t ceil(df_t / block_size)   perfect per-dim packing bound (overestimates
+                                           achievable d → biases toward record-level)
+norm   = (d − d_rand) / (d_max − d_rand)   clamped to 0..=1
+```
+
+- `norm ≈ 0`: ordering is indistinguishable from random — record-level BP
+  required (with the existing size-tiered BpBudget).
+- `norm ≈ 1`: blocks are as internally coherent as the data allows —
+  block-level reorder recovers everything reordering can still give.
+- No headroom (`d_max ≈ d_rand`, e.g. only ubiquitous dims): record-level
+  BP cannot help either, so `norm = 1` and the near-free blockwise pass
+  runs.
+
+Two estimator details:
+
+- **Singleton dims (df=1) are excluded from all aggregates.** They
+  contribute one pair to actual, random, and packed counts alike — zero
+  ordering signal — and on id-heavy corpora (a unique dim per record) they
+  compress the bounds enough to fake "no headroom" and mask real headroom
+  in the informative dims.
+- **Large segments are stride-sampled** (cap: 8192 blocks ≈ 512k docs at
+  block_size 64). All aggregates come from the sampled sub-population, so
+  the estimator stays consistent at both extremes; the decision log reports
+  scanned/total blocks.
+
+Threshold: `BLOCKWISE_NORM_COHERENCE_THRESHOLD = 0.5`. Every `Auto`
+decision logs `norm`, `d`, `d_rand`, `d_max`, blocks scanned, scan time,
+and the chosen granularity (and emits `hermes_reorder_coherence{,_norm}`)
+so the default can be tuned from production data. Explicit granularity
+skips the scan entirely and emits only the granularity counter.
+
+## Alignment with depth budgets and deepening
+
+The granularity decision and the `BpBudget` depth machinery interact; three
+rules keep them consistent:
+
+- **Unconverged sources force record-level.** A segment marked
+  `bp_converged = false` (wall-clock-truncated pass) is owed a deepening
+  pass, and the output of the next pass over it — standalone reorder or
+  merge — is what discharges that debt. `Auto` would measure the partial
+  pass's residual coherence, potentially take the blockwise path (which
+  cannot deepen record clustering) and report converged, silently ending
+  the cascade at partial quality. `SegmentManager::merge_granularity`
+  resolves `Records` whenever any source is unconverged.
+- **Depth caps are converted to block units for blockwise BP.**
+  `BpBudget::min_partition_docs` is in docs; blockwise BP entities are
+  blocks. Unconverted, the optimizer's large-segment cap (4096 docs) reads
+  as 4096 _blocks_ and stops blockwise BP above superblock depth as a
+  silent no-op. 4096 docs / 64 = 64 blocks = exactly the superblock target.
+- **Partial record-level output legitimately reads `norm ≈ 0`.** Budgeted
+  passes (`min_partition_docs` above block size) leave intra-block order
+  random, so Auto keeps routing such segments to record-level until a
+  full-depth pass lands — correct, not a mis-decision. A blockwise pass
+  never changes `d` or `norm` at all: blocks are copied verbatim and the
+  metric is invariant under block permutation.
 
 Where Auto applies:
 

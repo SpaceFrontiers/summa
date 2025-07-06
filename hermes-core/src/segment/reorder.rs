@@ -39,21 +39,143 @@ pub enum BpGranularity {
     Blocks,
 }
 
-/// `Auto` picks block-level reorder when the average number of records
-/// sharing a (block, dim) pair — `total_postings / total_terms` — is at
-/// least this. Conservative default; measured values are logged per pass
+/// `Auto` picks block-level reorder when normalized coherence — how far the
+/// measured d sits between its random-order baseline and its perfect-packing
+/// bound, 0..=1 — is at least this. Value-independent: unlike an absolute d
+/// cutoff, it is not skewed by the corpus's dim-frequency distribution
+/// (rare-dim corpora cap d low even when perfectly clustered; ubiquitous
+/// dims inflate d even when scrambled). Measured values are logged per pass
 /// for tuning.
-pub const BLOCKWISE_COHERENCE_THRESHOLD: f32 = 4.0;
+pub const BLOCKWISE_NORM_COHERENCE_THRESHOLD: f32 = 0.5;
 
-/// Average records per (block, dim) pair across sources: ≈1 when blocks are
-/// scrambled, grows toward block_size as blocks become internally coherent.
-fn block_coherence(sources: &[(crate::segment::BmpIndex, u32)]) -> f32 {
-    let postings: u64 = sources.iter().map(|(b, _)| b.total_postings()).sum();
-    let terms: u64 = sources.iter().map(|(b, _)| b.total_terms()).sum();
-    if terms == 0 {
-        return 0.0;
+/// Scan cap for the coherence decision: above this many blocks the scan
+/// samples every k-th block instead of all of them. 8192 blocks (~512k
+/// docs at block_size 64) is statistically ample for a 0.5 threshold and
+/// bounds the decision cost on multi-million-doc segments.
+const MAX_COHERENCE_SCAN_BLOCKS: usize = 8192;
+
+/// Coherence statistics driving the `Auto` granularity decision.
+#[derive(Clone, Copy, Debug)]
+struct CoherenceStats {
+    /// Raw average records per (block, dim) pair: ≈1 when blocks are
+    /// scrambled, grows toward block_size as blocks become coherent.
+    d: f32,
+    /// Expected `d` if the same records were assigned to blocks uniformly at
+    /// random: `P / Σ_t B·(1 − (1 − 1/B)^df_t)`.
+    d_rand: f32,
+    /// Upper bound on achievable `d`: every dim packed into its minimal
+    /// `ceil(df_t / block_size)` blocks. Ignores joint constraints across
+    /// dims, so it overestimates — which biases `norm` down, toward the
+    /// higher-quality record-level path.
+    d_max: f32,
+    /// `(d − d_rand) / (d_max − d_rand)`, clamped to 0..=1. When the data
+    /// offers no clustering headroom (`d_max ≈ d_rand`, e.g. only ubiquitous
+    /// or singleton dims), reordering records cannot help, so this is 1.0.
+    norm: f32,
+    /// Blocks actually scanned vs total — differ when the sampling cap hit.
+    scanned_blocks: usize,
+    total_blocks: usize,
+}
+
+/// Compute [`CoherenceStats`] from a streaming pass over block headers:
+/// per-dim record frequencies come from posting-slice lengths, no weight
+/// decode. Dim ids in block headers are raw (not bounded by the configured
+/// grid dims), so counts live in a hash map; segments above
+/// [`MAX_COHERENCE_SCAN_BLOCKS`] are stride-sampled and all aggregates
+/// come from the sampled sub-population, which keeps the estimator
+/// consistent at both the clustered and scrambled extremes.
+///
+/// Singleton dims (df=1) are excluded from every aggregate: they contribute
+/// identically to the actual, random, and packed pair counts (one pair
+/// each), so they carry zero ordering signal and would only compress the
+/// three bounds together — on id-heavy corpora (every record has a unique
+/// dim) enough to trip the no-headroom epsilon and mask real headroom in
+/// the informative dims.
+fn block_coherence(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    block_size: usize,
+) -> CoherenceStats {
+    let total_blocks: usize = sources.iter().map(|(b, _)| b.num_blocks as usize).sum();
+    if total_blocks == 0 {
+        return CoherenceStats {
+            d: 0.0,
+            d_rand: 0.0,
+            d_max: 0.0,
+            norm: 0.0,
+            scanned_blocks: 0,
+            total_blocks,
+        };
     }
-    postings as f32 / terms as f32
+
+    let stride = total_blocks.div_ceil(MAX_COHERENCE_SCAN_BLOCKS).max(1);
+    // dim → (record count, block count) within the sampled blocks
+    let mut df: rustc_hash::FxHashMap<u32, (u32, u32)> = rustc_hash::FxHashMap::default();
+    let mut scanned_blocks = 0usize;
+    let mut global_block = 0usize;
+    for (bmp, _) in sources {
+        for block_id in 0..bmp.num_blocks {
+            if global_block.is_multiple_of(stride) {
+                scanned_blocks += 1;
+                for (dim_id, posts) in bmp.iter_block_terms(block_id) {
+                    let e = df.entry(dim_id).or_insert((0, 0));
+                    e.0 += posts.len() as u32;
+                    e.1 += 1;
+                }
+            }
+            global_block += 1;
+        }
+    }
+
+    let b = scanned_blocks as f64;
+    let keep = 1.0 - 1.0 / b;
+    let mut postings: u64 = 0;
+    let mut terms: u64 = 0;
+    let mut expected_rand_pairs = 0.0f64;
+    let mut min_pairs = 0u64;
+    for &(records, blocks) in df.values() {
+        if records < 2 {
+            continue; // singleton: inert for clustering, see above
+        }
+        postings += records as u64;
+        terms += blocks as u64;
+        expected_rand_pairs += b * (1.0 - keep.powf(records as f64));
+        min_pairs += (records as u64).div_ceil(block_size as u64);
+    }
+    if terms == 0 || postings == 0 {
+        // No dim shared by ≥2 records: BP has no signal at any granularity.
+        return CoherenceStats {
+            d: 0.0,
+            d_rand: 0.0,
+            d_max: 0.0,
+            norm: 0.0,
+            scanned_blocks,
+            total_blocks,
+        };
+    }
+
+    let d = postings as f32 / terms as f32;
+    let d_rand = if expected_rand_pairs > 0.0 {
+        (postings as f64 / expected_rand_pairs) as f32
+    } else {
+        d
+    };
+    let d_max = postings as f32 / min_pairs.max(1) as f32;
+    let headroom = d_max - d_rand;
+    // Relative epsilon: below ~5% headroom the bounds are within estimation
+    // noise of each other and no ordering can move d meaningfully.
+    let norm = if headroom <= 0.05 * d_rand {
+        1.0
+    } else {
+        ((d - d_rand) / headroom).clamp(0.0, 1.0)
+    };
+    CoherenceStats {
+        d,
+        d_rand,
+        d_max,
+        norm,
+        scanned_blocks,
+        total_blocks,
+    }
 }
 
 /// Reorder a single segment's BMP data via Recursive Graph Bisection (BP).
@@ -70,6 +192,11 @@ fn block_coherence(sources: &[(crate::segment::BmpIndex, u32)]) -> f32 {
 /// false iff the BP wall-clock budget ended a field's pass early (the output
 /// is still valid and better-ordered than the input; a later pass warm-starts
 /// from it and deepens).
+///
+/// `granularity`: callers deepening an unconverged segment must pass
+/// `BpGranularity::Records` — `Auto` would measure the partial pass's
+/// residual coherence, potentially take the blockwise path, report converged,
+/// and end the deepening cascade at partial quality.
 #[allow(clippy::too_many_arguments)]
 pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     dir: &D,
@@ -79,6 +206,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     term_cache_blocks: usize,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    granularity: BpGranularity,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(String, u32, bool)> {
     let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
@@ -119,6 +247,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
         schema,
         memory_budget,
         bp_budget,
+        granularity,
         rayon_pool,
     )
     .await?;
@@ -174,6 +303,7 @@ async fn copy_segment_file<D: Directory + DirectoryWriter>(
 /// - BMP fields: run BP reorder and write new blob
 /// - MaxScore fields: identity-copy raw data from source
 /// - No sparse fields: no-op
+#[allow(clippy::too_many_arguments)]
 async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     dir: &D,
     reader: &SegmentReader,
@@ -181,6 +311,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     schema: &Schema,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    granularity: BpGranularity,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<bool> {
     let sparse_fields: Vec<_> = schema
@@ -290,7 +421,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                         total_vectors,
                         memory_budget,
                         bp_budget,
-                        BpGranularity::Auto,
+                        granularity,
                         writer,
                         field_tocs,
                         pool,
@@ -402,11 +533,20 @@ fn reorder_bmp_field_blockwise(
     let bp_start = std::time::Instant::now();
     let fwd = build_forward_index_from_blocks(&bmp_refs, memory_budget);
     let sb = BMP_SUPERBLOCK_SIZE as usize;
+    // The budget's depth cap is in DOCS but BP entities here are BLOCKS —
+    // convert units, or the optimizer's partial cap (e.g. 4096 docs) would
+    // be read as 4096 blocks and silently stop BP above superblock depth.
+    let block_budget = crate::segment::BpBudget {
+        min_partition_docs: bp_budget
+            .min_partition_docs
+            .map(|docs| (docs / effective_block_size).max(1)),
+        time_budget: bp_budget.time_budget,
+    };
     let (perm, converged) = if fwd.num_terms > 0 && num_blocks_total > sb {
         let (perm, converged) = if let Some(ref pool) = rayon_pool {
-            pool.install(|| graph_bisection(&fwd, sb, 20, bp_budget))
+            pool.install(|| graph_bisection(&fwd, sb, 20, block_budget))
         } else {
-            graph_bisection(&fwd, sb, 20, bp_budget)
+            graph_bisection(&fwd, sb, 20, block_budget)
         };
         (perm, converged)
     } else {
@@ -742,24 +882,42 @@ pub(crate) fn reorder_bmp_field(
     }
 
     // ── Granularity decision (docs/block-level-reorder.md) ──────────────
-    let coherence = block_coherence(sources);
+    // The coherence scan runs only for `Auto`: explicit granularity (manual
+    // override, or a deepening pass on an unconverged segment) must not pay
+    // a header scan just to decide what is already decided.
     let effective_granularity = match granularity {
         BpGranularity::Auto => {
-            let chosen = if coherence >= BLOCKWISE_COHERENCE_THRESHOLD {
+            let stats_start = std::time::Instant::now();
+            let coherence = block_coherence(sources, effective_block_size);
+            let chosen = if coherence.norm >= BLOCKWISE_NORM_COHERENCE_THRESHOLD {
                 BpGranularity::Blocks
             } else {
                 BpGranularity::Records
             };
             log::info!(
-                "[reorder_bmp] field {}: coherence d={:.2} (threshold {:.1}) → {:?} granularity",
+                "[reorder_bmp] field {}: coherence norm={:.3} (d={:.2}, rand={:.2}, max={:.2}, threshold {:.2}, {}/{} blocks scanned in {:.1}ms) → {:?} granularity",
                 field_id,
-                coherence,
-                BLOCKWISE_COHERENCE_THRESHOLD,
+                coherence.norm,
+                coherence.d,
+                coherence.d_rand,
+                coherence.d_max,
+                BLOCKWISE_NORM_COHERENCE_THRESHOLD,
+                coherence.scanned_blocks,
+                coherence.total_blocks,
+                stats_start.elapsed().as_secs_f64() * 1000.0,
                 chosen,
             );
+            crate::observe::reorder_coherence(index_label, field_name, coherence.d, coherence.norm);
             chosen
         }
-        explicit => explicit,
+        explicit => {
+            log::info!(
+                "[reorder_bmp] field {}: {:?} granularity (explicit, coherence scan skipped)",
+                field_id,
+                explicit,
+            );
+            explicit
+        }
     };
     crate::observe::reorder_granularity(
         index_label,
@@ -768,7 +926,6 @@ pub(crate) fn reorder_bmp_field(
             BpGranularity::Blocks => "blocks",
             _ => "records",
         },
-        coherence,
     );
 
     if effective_granularity == BpGranularity::Blocks {

@@ -1065,6 +1065,7 @@ impl SegmentReader {
         k: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
+        let t0 = crate::observe::Timer::start();
         // Binary IVF index: probe nprobe nearest Hamming clusters (exact
         // distances within probed clusters — no rerank needed).
         if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
@@ -1072,6 +1073,13 @@ impl SegmentReader {
         {
             let nprobe = self.binary_ivf_nprobe(field);
             let results = ivf.search(query, k, nprobe);
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                "binary_ivf",
+                t0.secs(),
+                results.len(),
+            );
             return Ok(combine_ordinal_results(results, combiner, k));
         }
 
@@ -1128,6 +1136,13 @@ impl SegmentReader {
             .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
             .collect();
 
+        crate::observe::dense_l1(
+            self.schema.index_label(),
+            self.schema.get_field_name(field).unwrap_or("?"),
+            "binary_flat",
+            t0.secs(),
+            results.len(),
+        );
         Ok(combine_ordinal_results(results, combiner, k))
     }
 
@@ -1526,6 +1541,7 @@ impl SegmentReader {
         k: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
+        let t0 = crate::observe::Timer::start();
         // Binary IVF index: probe nprobe nearest Hamming clusters (exact
         // distances within probed clusters — no rerank needed).
         if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
@@ -1533,6 +1549,13 @@ impl SegmentReader {
         {
             let nprobe = self.binary_ivf_nprobe(field);
             let results = ivf.search(query, k, nprobe);
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                "binary_ivf",
+                t0.secs(),
+                results.len(),
+            );
             return Ok(combine_ordinal_results(results, combiner, k));
         }
 
@@ -1588,6 +1611,13 @@ impl SegmentReader {
             .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
             .collect();
 
+        crate::observe::dense_l1(
+            self.schema.index_label(),
+            self.schema.get_field_name(field).unwrap_or("?"),
+            "binary_flat",
+            t0.secs(),
+            results.len(),
+        );
         Ok(combine_ordinal_results(results, combiner, k))
     }
 }

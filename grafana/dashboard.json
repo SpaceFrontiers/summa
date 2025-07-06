@@ -793,8 +793,8 @@
     {
       "id": 31,
       "type": "timeseries",
-      "title": "Block coherence d at reorder",
-      "description": "Measured d = postings/terms per (block,dim) \u2014 the Auto threshold input (default 4.0). Bimodal distribution with the threshold in the valley = well-tuned; mass near 3\u20136 = revisit BLOCKWISE_COHERENCE_THRESHOLD.",
+      "title": "Normalized coherence at reorder",
+      "description": "Auto decision input: 0 = ordering indistinguishable from random, 1 = as coherent as the dim-frequency distribution allows (docs/block-level-reorder.md). Threshold 0.5 \u2192 blockwise above, record-level below. Raw d is still exported as hermes_reorder_coherence.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1267,7 +1267,7 @@
       "id": 24,
       "type": "timeseries",
       "title": "CPU usage vs limits by pod",
-      "description": "Usage against requests/limits. Sustained usage at the limit means throttling \u2014 see the throttling panel.",
+      "description": "Usage vs the cgroup CPU limit (cAdvisor container_spec_*; no kube-state-metrics needed). No limit set \u2192 no limit line and no throttling.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1294,19 +1294,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (pod) (kube_pod_container_resource_limits{namespace=\"$namespace\", pod=~\"$pod\", resource=\"cpu\"})",
+          "expr": "sum by (pod) (container_spec_cpu_quota{namespace=\"$namespace\", pod=~\"$pod\", container!=\"\"} / container_spec_cpu_period{namespace=\"$namespace\", pod=~\"$pod\", container!=\"\"})",
           "legendFormat": "limit {{pod}}",
           "refId": "B",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (pod) (kube_pod_container_resource_requests{namespace=\"$namespace\", pod=~\"$pod\", resource=\"cpu\"})",
-          "legendFormat": "request {{pod}}",
-          "refId": "C",
           "range": true
         }
       ],
@@ -1339,7 +1329,7 @@
       "id": 25,
       "type": "timeseries",
       "title": "Memory vs limits by pod",
-      "description": "Working set (what the OOM-killer judges \u2014 includes cgroup-charged page cache holding the mmap'd index) vs RSS (anonymous/heap: scratch buffers, pinned copies) vs the pod memory limit. Working set near the limit under merge = cold-IO/pinning territory.",
+      "description": "Working set (what the OOM-killer judges \u2014 includes cgroup-charged page cache holding the mmap'd index) vs RSS vs the cgroup memory limit (cAdvisor container_spec_*). Working set near the limit under merge = cold-IO/pinning territory.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1376,7 +1366,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (pod) (kube_pod_container_resource_limits{namespace=\"$namespace\", pod=~\"$pod\", resource=\"memory\"})",
+          "expr": "sum by (pod) (container_spec_memory_limit_bytes{namespace=\"$namespace\", pod=~\"$pod\", container!=\"\"})",
           "legendFormat": "limit {{pod}}",
           "refId": "C",
           "range": true
@@ -1544,7 +1534,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"$namespace\", pod=~\"$pod\", container!=\"\"}) / sum by (pod) (kube_pod_container_resource_limits{namespace=\"$namespace\", pod=~\"$pod\", resource=\"memory\"})",
+          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"$namespace\", pod=~\"$pod\", container!=\"\"}) / sum by (pod) (container_spec_memory_limit_bytes{namespace=\"$namespace\", pod=~\"$pod\", container!=\"\"})",
           "legendFormat": "{{pod}}",
           "refId": "A",
           "range": true

@@ -146,6 +146,7 @@ impl SegmentMerger {
                         let ilabel = self.schema.index_label().to_owned();
                         let effective_block_size = bmp_block_size.min(256) as usize;
                         let pool = self.background_pool.clone();
+                        let granularity = self.granularity;
                         log::info!(
                             "[merge_bmp] field {}: reorder-on-merge enabled — running BP over {} source(s)",
                             fid,
@@ -166,9 +167,10 @@ impl SegmentMerger {
                                 // Merge-time reorder is unbudgeted: the merge
                                 // already pays the rewrite and warm-starts BP.
                                 crate::segment::BpBudget::full(),
-                                // Auto: coherent sources (already-reordered
-                                // segments) get the near-free blockwise pass.
-                                crate::segment::reorder::BpGranularity::Auto,
+                                // Auto unless a source is an unconverged
+                                // partial reorder (then Records, see
+                                // SegmentMerger::granularity).
+                                granularity,
                                 writer,
                                 field_tocs,
                                 pool,

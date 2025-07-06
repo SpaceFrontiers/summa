@@ -1993,3 +1993,338 @@ async fn test_auto_reorder_uses_blockwise_for_coherent_merged_segments() {
         assert_eq!(results.len(), 1, "dim {} lost after blockwise reorder", i);
     }
 }
+
+/// Corpus for granularity-decision tests: 8192 docs = 128 blocks = 2
+/// superblocks, one commit. Groups of 4 consecutive docs share 4 rare dims
+/// (df=4, block-local → blocks are internally coherent by construction),
+/// each doc has a unique dim, and each group carries one of 32 topic dims
+/// assigned round-robin — so topic dims are scrambled at the *block* level
+/// and block-level BP has superblock assignments to fix, while record-level
+/// BP would scatter records across block boundaries. Expected coherence:
+/// d ≈ 2.7 (< 4.0), norm ≈ 0.8 (> 0.5).
+const RARE_DIM_CORPUS_DOCS: usize = 8192;
+fn add_rare_dim_clustered_corpus(
+    writer: &mut IndexWriter<RamDirectory>,
+    sparse: crate::dsl::Field,
+) {
+    for i in 0..RARE_DIM_CORPUS_DOCS {
+        let group = i / 4;
+        let topic = (group % 32) as u32;
+        let mut entries: Vec<(u32, f32)> = (0..4)
+            .map(|k| (100_000 + (group as u32) * 4 + k, 0.5))
+            .collect();
+        entries.push((90_000 + topic, 0.5));
+        entries.push((i as u32, 1.0));
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, entries);
+        writer.add_document(doc).unwrap();
+    }
+}
+
+/// Sorted multiset of 64-entry doc-map chunks — preserved by blockwise
+/// reorder (blocks move as units), broken by record-level scatter.
+fn doc_map_chunks(v: &[u8]) -> Vec<Vec<u8>> {
+    const CHUNK_BYTES: usize = 64 * 4;
+    let mut c: Vec<Vec<u8>> = v.chunks(CHUNK_BYTES).map(|x| x.to_vec()).collect();
+    c.sort();
+    c
+}
+
+/// Auto granularity is value-independent: a rare-dim corpus whose blocks are
+/// already internally coherent must pick blockwise even though its absolute
+/// coherence d sits far below the old fixed cutoff of 4.0 (rare dims cap d
+/// regardless of ordering). An absolute-d threshold would wrongly run the
+/// full record-level scatter here.
+#[tokio::test]
+async fn test_auto_reorder_rare_dim_clustered_low_d_picks_blockwise() {
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    add_rare_dim_clustered_corpus(&mut writer, sparse);
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    // Setup guard: this corpus must sit below the old absolute cutoff —
+    // that is exactly the case the normalized threshold exists for.
+    let d = bmp.total_postings() as f32 / bmp.total_terms() as f32;
+    assert!(
+        d < 4.0,
+        "test setup: expected rare-dim corpus with low absolute d, got d={:.2}",
+        d
+    );
+    let ids_before = bmp.doc_map_ids_slice().to_vec();
+    drop(readers);
+    drop(index);
+
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    let ids_after = bmp.doc_map_ids_slice().to_vec();
+
+    // Blockwise ⇒ blocks moved as intact 64-entry doc-map chunks. The
+    // record-level path would scatter records across block boundaries.
+    assert_eq!(
+        doc_map_chunks(&ids_before),
+        doc_map_chunks(&ids_after),
+        "coherent rare-dim segment must take the blockwise path"
+    );
+    assert_ne!(
+        ids_before, ids_after,
+        "blockwise reorder should actually permute block order"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 63, 4096, 8191] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(results.len(), 1, "dim {} lost after blockwise reorder", i);
+    }
+}
+
+/// Alignment of the granularity decision with warm-start deepening: a
+/// deepening pass on an unconverged (budget-truncated) segment must force
+/// record-level BP. `Auto` would measure the partial pass's residual
+/// coherence, take the blockwise path — which cannot deepen record
+/// clustering — report converged, and end the deepening cascade at partial
+/// quality.
+#[tokio::test]
+async fn test_deepening_pass_on_unconverged_segment_forces_record_level() {
+    use crate::segment::BpBudget;
+
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    add_rare_dim_clustered_corpus(&mut writer, sparse);
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let seg_id = index.segment_readers().await.unwrap()[0].meta().id;
+    let sm = std::sync::Arc::clone(index.segment_manager());
+
+    // Pass 1: coherent corpus + zero time budget → Auto takes blockwise,
+    // which the deadline interrupts → reordered but unconverged.
+    let budget = BpBudget {
+        min_partition_docs: None,
+        time_budget: Some(std::time::Duration::ZERO),
+    };
+    assert!(
+        sm.reorder_single_segment(&format!("{:032x}", seg_id), None, budget)
+            .await
+            .unwrap()
+    );
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let info = metadata.segment_metas.values().next().unwrap();
+    assert!(info.reordered);
+    assert!(
+        !info.bp_converged,
+        "zero-budget pass must be marked unconverged"
+    );
+    drop(index);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let ids_partial = index.segment_readers().await.unwrap()[0]
+        .bmp_indexes()
+        .get(&sparse.0)
+        .unwrap()
+        .doc_map_ids_slice()
+        .to_vec();
+    let sm = std::sync::Arc::clone(index.segment_manager());
+
+    // Pass 2 (deepening): the segment is still coherent, so Auto would pick
+    // blockwise again — the unconverged flag must force record-level.
+    let new_seg_id = metadata.segment_ids()[0].clone();
+    assert!(
+        sm.reorder_single_segment(&new_seg_id, None, BpBudget::full())
+            .await
+            .unwrap()
+    );
+
+    let index2 = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let ids_deepened = index2.segment_readers().await.unwrap()[0]
+        .bmp_indexes()
+        .get(&sparse.0)
+        .unwrap()
+        .doc_map_ids_slice()
+        .to_vec();
+    assert_ne!(
+        doc_map_chunks(&ids_partial),
+        doc_map_chunks(&ids_deepened),
+        "deepening pass must run record-level BP (scatter records), not blockwise"
+    );
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let info = metadata.segment_metas.values().next().unwrap();
+    assert!(
+        info.bp_converged,
+        "full-budget deepening pass must converge"
+    );
+
+    let reader = index2.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 63, 4096, 8191] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(results.len(), 1, "dim {} lost after deepening pass", i);
+    }
+}
+
+/// Alignment of the depth budget with blockwise BP: `min_partition_docs` is
+/// in DOC units, but blockwise BP entities are BLOCKS — the cap must be
+/// converted (4096 docs = 64 blocks = exactly superblock depth), or the
+/// optimizer's large-segment cap silently stops blockwise BP above
+/// superblock granularity and the pass becomes an identity no-op.
+#[tokio::test]
+async fn test_blockwise_budget_depth_cap_scales_to_block_units() {
+    use crate::segment::BpBudget;
+
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    add_rare_dim_clustered_corpus(&mut writer, sparse);
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let seg_id = index.segment_readers().await.unwrap()[0].meta().id;
+    let ids_before = index.segment_readers().await.unwrap()[0]
+        .bmp_indexes()
+        .get(&sparse.0)
+        .unwrap()
+        .doc_map_ids_slice()
+        .to_vec();
+    let sm = std::sync::Arc::clone(index.segment_manager());
+
+    // The optimizer's partial budget for large segments. Misread as 4096
+    // *blocks*, BP over this corpus's 128 blocks would stop at depth 0.
+    let budget = BpBudget {
+        min_partition_docs: Some(4096),
+        time_budget: None,
+    };
+    assert!(
+        sm.reorder_single_segment(&format!("{:032x}", seg_id), None, budget)
+            .await
+            .unwrap()
+    );
+
+    let index2 = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let ids_after = index2.segment_readers().await.unwrap()[0]
+        .bmp_indexes()
+        .get(&sparse.0)
+        .unwrap()
+        .doc_map_ids_slice()
+        .to_vec();
+    assert_eq!(
+        doc_map_chunks(&ids_before),
+        doc_map_chunks(&ids_after),
+        "coherent corpus must take the blockwise path"
+    );
+    assert_ne!(
+        ids_before, ids_after,
+        "a 4096-doc depth cap = superblock depth for blockwise BP — the pass must actually permute blocks"
+    );
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let info = metadata.segment_metas.values().next().unwrap();
+    assert!(
+        info.bp_converged,
+        "a depth cap is a chosen target, not an interruption"
+    );
+}
+
+/// Auto granularity is value-independent in the other direction too: a
+/// corpus with mid-frequency dims interleaved at the record level reads a
+/// high absolute d (≈11, well above the old fixed cutoff of 4.0) purely
+/// because every dim touches many records per block by chance — yet blocks
+/// hold nothing together and only record-level BP can pack topics into
+/// blocks. An absolute-d threshold would wrongly take the blockwise path,
+/// which cannot fix intra-block scramble.
+#[tokio::test]
+async fn test_auto_reorder_interleaved_high_d_picks_records() {
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // One segment, 8192 docs = 128 blocks. Topic = i % 4 → every block mixes
+    // all 4 topics (32 shared dims each, df=2048), so actual pair counts
+    // equal the random baseline. Expected: d ≈ 11, norm ≈ 0.
+    const NUM_DOCS: usize = 8192;
+    for i in 0..NUM_DOCS {
+        let topic = (i % 4) as u32;
+        let mut entries: Vec<(u32, f32)> =
+            (0..32).map(|t| (50_000 + topic * 100 + t, 0.5)).collect();
+        entries.push((i as u32, 1.0));
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, entries);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    // Setup guard: this corpus must sit above the old absolute cutoff.
+    let d = bmp.total_postings() as f32 / bmp.total_terms() as f32;
+    assert!(
+        d >= 4.0,
+        "test setup: expected interleaved corpus with high absolute d, got d={:.2}",
+        d
+    );
+    let ids_before = bmp.doc_map_ids_slice().to_vec();
+    drop(readers);
+    drop(index);
+
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    let ids_after = bmp.doc_map_ids_slice().to_vec();
+
+    // Record-level ⇒ records scattered across block boundaries: the 64-entry
+    // doc-map chunk multiset must change. Blockwise would preserve it.
+    assert_ne!(
+        doc_map_chunks(&ids_before),
+        doc_map_chunks(&ids_after),
+        "interleaved segment must take the record-level path (blockwise cannot fix intra-block scramble)"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 63, 4096, 8191] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "dim {} lost after record-level reorder",
+            i
+        );
+    }
+}

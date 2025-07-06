@@ -680,9 +680,12 @@ impl AsyncStoreReader {
             return Ok(None);
         }
 
+        let t = crate::observe::Timer::start();
         let (entry, block) = self.find_and_load_block(doc_id).await?;
         let doc_bytes = block.doc_bytes(doc_id - entry.first_doc_id)?;
-        deserialize_document_fields(doc_bytes, schema, field_ids).map(Some)
+        let result = deserialize_document_fields(doc_bytes, schema, field_ids).map(Some);
+        crate::observe::store_get(schema.index_label(), t.secs());
+        result
     }
 
     /// Find the block index entry and load/cache the block for a given doc_id
