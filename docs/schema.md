@@ -363,6 +363,23 @@ field emb: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
 Use `hermes-tool info <index>` to inspect the resulting average sparse vector
 length (`avg terms/vector`).
 
+### BMP Format Options
+
+The BMP (block-max pruning) format takes additional `indexed<...>` options:
+
+```
+field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.0,
+    bmp_block_size: 256>, reorder]
+```
+
+- `bmp_block_size` (power of two, max 256; default 64) — docs per BMP
+  block, uniform across every segment of the field. The dense 4-bit grid
+  is `dims × num_blocks / 2` bytes, so grid memory scales as
+  1/block_size; smaller blocks give finer pruning granularity. Large
+  corpora (10M+ docs at 100k-dim vocabularies) should set 256 — at 50M
+  docs the grid is ~41 GB at block 64 vs ~10 GB at 256. See
+  `docs/bmp-grid-compression.md`.
+
 ### Quantization and Pruning
 
 Sparse posting lists support configurable weight quantization and pruning via `SparseVectorConfig`:

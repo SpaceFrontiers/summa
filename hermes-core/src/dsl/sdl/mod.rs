@@ -267,6 +267,7 @@ struct IndexConfig {
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
+    bmp_block_size: Option<u32>,
     pruning: Option<f32>,
     min_terms: Option<usize>,
     doc_mass: Option<f32>,
@@ -485,6 +486,18 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                         n.as_str()
                     );
                     128
+                }));
+            }
+        }
+        Rule::bmp_block_size_kwarg => {
+            // bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.bmp_block_size = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid bmp_block_size value '{}', using default 64",
+                        n.as_str()
+                    );
+                    64
                 }));
             }
         }
@@ -857,20 +870,8 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
     }
 
     SparseVectorConfig {
-        format: SparseFormat::default(),
         index_size,
-        weight_quantization: WeightQuantization::default(),
-        weight_threshold: 0.0,
-        doc_mass: None,
-        block_size: 128,
-        bmp_block_size: 64,
-        max_bmp_grid_bytes: 0,
-        bmp_superblock_size: 64,
-        pruning: None,
-        query_config: None,
-        dims: None,
-        max_weight: None,
-        min_terms: 4,
+        ..SparseVectorConfig::default()
     }
 }
 
@@ -895,6 +896,17 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
             );
         }
         config.block_size = adjusted;
+    }
+    if let Some(bs) = idx_cfg.bmp_block_size {
+        let adjusted = bs.next_power_of_two().clamp(1, 256);
+        if adjusted != bs {
+            log::warn!(
+                "bmp_block_size {} adjusted to power of two in 1..=256: {}",
+                bs,
+                adjusted
+            );
+        }
+        config.bmp_block_size = adjusted;
     }
     if let Some(p) = idx_cfg.pruning {
         let clamped = p.clamp(0.0, 1.0);
@@ -1584,6 +1596,25 @@ mod tests {
         let config2 = f2.sparse_vector_config.as_ref().unwrap();
         assert_eq!(config2.index_size, IndexSize::U32);
         assert_eq!(config2.weight_quantization, WeightQuantization::Float32);
+    }
+
+    #[test]
+    fn test_sparse_vector_bmp_block_size() {
+        let sdl = r#"
+            index documents {
+                field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, bmp_block_size: 256>]
+                field emb2: sparse_vector<u32> [indexed<format: bmp, dims: 30522>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config1 = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config1.format, SparseFormat::Bmp);
+        assert_eq!(config1.bmp_block_size, 256);
+
+        // Default block size stays 64
+        let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config2.bmp_block_size, 64);
     }
 
     #[test]

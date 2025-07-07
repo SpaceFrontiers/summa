@@ -244,16 +244,16 @@ pub struct SparseVectorConfig {
     /// Used by MaxScore format only.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
-    /// BMP block size: number of consecutive doc_ids per block (must be power of 2).
-    /// Default 64. Only used when format = Bmp.
-    /// Smaller = better pruning granularity, larger = less overhead.
+    /// BMP block size: number of consecutive doc_ids per block (must be power
+    /// of 2, max 256). Only used when format = Bmp. Uniform across every
+    /// segment of the field — set per field in SDL (`bmp_block_size: N`).
+    /// Smaller = better pruning granularity; larger = smaller grid — the
+    /// dense 4-bit grid is `dims × num_blocks / 2` bytes, so grid memory
+    /// scales as 1/block_size. Default 64; large corpora (10M+ docs at
+    /// 100k-dim vocabularies) should set 256 to bound grid memory
+    /// (docs/bmp-grid-compression.md).
     #[serde(default = "default_bmp_block_size")]
     pub bmp_block_size: u32,
-    /// Maximum BMP grid memory in bytes. If the grid (num_dims × num_blocks)
-    /// would exceed this, bmp_block_size is automatically increased to cap memory.
-    /// Default: 256MB. Set to 0 to disable the cap.
-    #[serde(default = "default_max_bmp_grid_bytes")]
-    pub max_bmp_grid_bytes: u64,
     /// BMP superblock size: number of consecutive blocks grouped for hierarchical
     /// pruning (Carlson et al., SIGIR 2025). Must be power of 2.
     /// Default 64. Set to 0 to disable superblock pruning (flat BMP scoring).
@@ -316,10 +316,6 @@ fn default_bmp_block_size() -> u32 {
     64
 }
 
-fn default_max_bmp_grid_bytes() -> u64 {
-    0 // disabled by default — masks eliminate DRAM stalls during scoring
-}
-
 fn default_bmp_superblock_size() -> u32 {
     64
 }
@@ -337,8 +333,7 @@ impl Default for SparseVectorConfig {
             weight_threshold: 0.0,
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
@@ -374,8 +369,7 @@ impl SparseVectorConfig {
             weight_threshold: 0.01, // Remove ~30-50% of low-weight postings
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: Some(0.1), // Keep top 10% per dimension
             query_config: Some(SparseQueryConfig {
@@ -409,8 +403,7 @@ impl SparseVectorConfig {
             weight_threshold: 0.01,
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: Some(0.1),
             query_config: Some(SparseQueryConfig {
@@ -446,8 +439,7 @@ impl SparseVectorConfig {
             weight_threshold: 0.02, // Slightly higher threshold for UInt4
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
@@ -478,8 +470,7 @@ impl SparseVectorConfig {
             weight_threshold: 0.0,
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
@@ -507,8 +498,7 @@ impl SparseVectorConfig {
             weight_threshold: 0.005, // Minimal pruning
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
@@ -584,8 +574,7 @@ impl SparseVectorConfig {
             weight_threshold: 0.0,
             doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,

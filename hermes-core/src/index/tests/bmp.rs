@@ -2010,6 +2010,60 @@ async fn test_auto_reorder_uses_blockwise_for_coherent_merged_segments() {
     }
 }
 
+/// Helper: BMP schema with a custom sparse config (grid-cap / block-size tests).
+fn bmp_schema_with_config(
+    config: SparseVectorConfig,
+) -> (crate::dsl::Schema, crate::dsl::Field, crate::dsl::Field) {
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, config);
+    sb.set_reorder(sparse, true);
+    (sb.build(), title, sparse)
+}
+
+/// Block size 256 (the default) must work end-to-end: build, block-copy
+/// merge, BP reorder, and exact search.
+#[tokio::test]
+async fn test_bmp_block_size_256_build_merge_reorder_search() {
+    let (schema, _title, sparse) = bmp_schema_with_config(SparseVectorConfig {
+        bmp_block_size: 256,
+        ..bmp_config()
+    });
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    const DOCS_PER_SEGMENT: usize = 600; // >2 blocks of 256 per segment
+    for seg in 0..2 {
+        for i in 0..DOCS_PER_SEGMENT {
+            let global = (seg * DOCS_PER_SEGMENT + i) as u32;
+            let mut doc = Document::new();
+            doc.add_sparse_vector(sparse, vec![(global, 1.0), (900_000 + global % 4, 0.5)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    writer.force_merge().await.unwrap();
+    writer.reorder().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    assert_eq!(bmp.bmp_block_size, 256);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    for i in [0usize, 255, 256, 599, 600, 2 * DOCS_PER_SEGMENT - 1] {
+        let query = SparseVectorQuery::new(sparse, vec![(i as u32, 1.0)]);
+        let results = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(results.len(), 1, "dim {} lost at block_size 256", i);
+    }
+}
+
 /// Corpus for granularity-decision tests: 8192 docs = 128 blocks = 2
 /// superblocks, one commit. Groups of 4 consecutive docs share 4 rare dims
 /// (df=4, block-local → blocks are internally coherent by construction),

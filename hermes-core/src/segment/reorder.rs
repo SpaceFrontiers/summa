@@ -971,43 +971,61 @@ pub(crate) fn reorder_bmp_field(
         sources.len(),
     );
 
-    let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
-    // Scale the df floor with segment size: a fixed 128 keeps only dims in
-    // >=2.5% of docs on a 5k-doc segment — exactly the discriminative
-    // mid-frequency dims BP needs — making reorder a near-no-op on small
-    // segments. Rare dims are cheap (few postings), and the memory budget
-    // already drops the highest-df dims when the forward index overflows.
-    let min_doc_freq = (num_real_docs / 5000).clamp(2, 128);
+    // Zero time budget = identity permutation by construction — skip the
+    // forward-index build entirely, it would be discarded unread. Reported
+    // unconverged, matching budgeted-pass semantics (a follow-up pass
+    // deepens).
+    let zero_budget = bp_budget.time_budget.is_some_and(|d| d.is_zero());
 
-    let (fwd, _source_doc_counts) =
-        build_forward_index_from_bmps(&bmp_refs, min_doc_freq, max_doc_freq.max(1), memory_budget);
-
-    log::info!(
-        "[reorder_bmp] field {}: forward index built in {:.1}ms ({} terms, {} postings)",
-        field_id,
-        bp_start.elapsed().as_secs_f64() * 1000.0,
-        fwd.num_terms,
-        fwd.total_postings(),
-    );
-
-    let (perm, converged) = if fwd.num_terms > 0 && num_real_docs > effective_block_size {
-        let bp_start = std::time::Instant::now();
-        // Run BP on the bounded rayon pool if provided, otherwise global pool.
-        let (perm, converged) = if let Some(ref pool) = rayon_pool {
-            pool.install(|| graph_bisection(&fwd, effective_block_size, 20, bp_budget))
-        } else {
-            graph_bisection(&fwd, effective_block_size, 20, bp_budget)
-        };
+    let (perm, converged) = if zero_budget {
         log::info!(
-            "[reorder_bmp] field {}: BP completed in {:.1}ms (converged={})",
+            "[reorder_bmp] field {}: zero time budget — identity re-block, forward index skipped",
+            field_id,
+        );
+        ((0..num_real_docs as u32).collect(), false)
+    } else {
+        let max_doc_freq = ((num_real_docs as f64) * 0.9) as usize;
+        // Scale the df floor with segment size: a fixed 128 keeps only dims in
+        // >=2.5% of docs on a 5k-doc segment — exactly the discriminative
+        // mid-frequency dims BP needs — making reorder a near-no-op on small
+        // segments. Rare dims are cheap (few postings), and the memory budget
+        // already drops the highest-df dims when the forward index overflows.
+        let min_doc_freq = (num_real_docs / 5000).clamp(2, 128);
+
+        let (fwd, _source_doc_counts) = build_forward_index_from_bmps(
+            &bmp_refs,
+            min_doc_freq,
+            max_doc_freq.max(1),
+            memory_budget,
+        );
+
+        log::info!(
+            "[reorder_bmp] field {}: forward index built in {:.1}ms ({} terms, {} postings)",
             field_id,
             bp_start.elapsed().as_secs_f64() * 1000.0,
-            converged,
+            fwd.num_terms,
+            fwd.total_postings(),
         );
-        (perm, converged)
-    } else {
-        drop(fwd);
-        ((0..num_real_docs as u32).collect(), true)
+
+        if fwd.num_terms > 0 && num_real_docs > effective_block_size {
+            let bp_start = std::time::Instant::now();
+            // Run BP on the bounded rayon pool if provided, otherwise global pool.
+            let (perm, converged) = if let Some(ref pool) = rayon_pool {
+                pool.install(|| graph_bisection(&fwd, effective_block_size, 20, bp_budget))
+            } else {
+                graph_bisection(&fwd, effective_block_size, 20, bp_budget)
+            };
+            log::info!(
+                "[reorder_bmp] field {}: BP completed in {:.1}ms (converged={})",
+                field_id,
+                bp_start.elapsed().as_secs_f64() * 1000.0,
+                converged,
+            );
+            (perm, converged)
+        } else {
+            drop(fwd);
+            ((0..num_real_docs as u32).collect(), true)
+        }
     };
 
     log::info!(
@@ -1058,14 +1076,18 @@ pub(crate) fn reorder_bmp_field(
         // Collect which (source, old_block)s we need and the slot mappings.
         // Global real ids resolve to a source via `real_base`, then to a
         // virtual vid (block/slot position) via that source's real→virtual map.
+        // Old block/slot arithmetic uses each source's own stored block size
+        // (uniform with the output in practice — merge validates it — but the
+        // source footer is the ground truth for parsing source blocks).
         let mut block_mappings: rustc_hash::FxHashMap<(usize, usize), Vec<(u8, u8)>> =
             rustc_hash::FxHashMap::default();
         for new_local_slot in 0..slots_count {
             let global_real = perm[new_vid_start + new_local_slot] as usize;
             let src = real_base.partition_point(|&b| b <= global_real) - 1;
             let old_vid = real_to_virtual[src][global_real - real_base[src]] as usize;
-            let old_block = old_vid / effective_block_size;
-            let old_slot = (old_vid % effective_block_size) as u8;
+            let src_block_size = sources[src].0.bmp_block_size.max(1) as usize;
+            let old_block = old_vid / src_block_size;
+            let old_slot = (old_vid % src_block_size) as u8;
             block_mappings
                 .entry((src, old_block))
                 .or_default()
