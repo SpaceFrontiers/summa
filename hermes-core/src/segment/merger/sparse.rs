@@ -416,9 +416,9 @@ impl SegmentMerger {
     }
 }
 
-/// Merge BMP fields with **streaming block-copy V13 format**.
+/// Merge BMP fields with **streaming block-copy V14 format**.
 ///
-/// V13 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
+/// V14 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
 /// and `max_weight_scale`, so blocks are self-contained and can be copied directly.
 ///
 /// Phases:
@@ -427,7 +427,7 @@ impl SegmentMerger {
 /// 3. Stream Section D (packed_grid) — one row at a time
 /// 4. Write Section E (sb_grid) — one row at a time
 /// 5. Stream Section F+G (doc_map) — bulk copy with offset patching
-/// 6. Write V13 footer (64 bytes)
+/// 6. Write V14 footer (64 bytes)
 ///
 /// Peak memory: row_buf (~4 MB) + sb_row (~120 KB) + id_buf (256 KB) + tiny Vecs.
 #[allow(clippy::too_many_arguments)]
@@ -705,7 +705,7 @@ fn merge_bmp_field(
         }
     }
 
-    // ── Phase 6: Write V13 footer (64 bytes) ────────────────────────────
+    // ── Phase 6: Write V14 footer (64 bytes) ────────────────────────────
     write_bmp_footer(
         writer,
         total_terms,

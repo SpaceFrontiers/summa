@@ -1072,7 +1072,7 @@ pub(crate) fn reorder_bmp_field(
     let run_prefix = format!("hermes_grid_run_{}_{}", std::process::id(), field_id);
 
     // Encode one output block: gather its records from source blocks and
-    // serialize the V13 block layout. Pure function of `perm` + read-only
+    // serialize the V14 block layout. Pure function of `perm` + read-only
     // sources — output blocks encode independently.
     //
     // Global real ids resolve to a source via `real_base`, then to a
@@ -1344,7 +1344,7 @@ pub(crate) fn reorder_bmp_field(
             .map_err(crate::Error::Io)?;
     }
 
-    // V13 footer (64 bytes)
+    // V14 footer (64 bytes)
     write_bmp_footer(
         &mut writer,
         total_terms,

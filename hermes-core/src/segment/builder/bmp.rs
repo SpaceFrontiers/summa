@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V13 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V14 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -25,7 +25,7 @@
 //! - **64-byte footer** (was 72): `block_simhash_offset` field removed
 //! - V12 segments are incompatible — must rebuild
 //!
-//! ## BMP V13 Blob Layout (data-first, block-interleaved)
+//! ## BMP V14 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -96,7 +96,7 @@ use crate::DocId;
 use crate::segment::format::BMP_BLOB_MAGIC_V14;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V13 blob from per-dimension postings.
+/// Build a BMP V14 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -412,7 +412,7 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V13 vectors={} padded={} blocks={} dims={} \
+        "[bmp_build] V14 vectors={} padded={} blocks={} dims={} \
          terms={} postings={} grid_entries={}",
         num_real_docs,
         num_virtual_docs,
@@ -475,7 +475,7 @@ pub(crate) fn build_bmp_blob(
 
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V13 Footer (64 bytes)
+    // BMP V14 Footer (64 bytes)
     write_bmp_footer(
         writer,
         total_terms,
@@ -496,7 +496,7 @@ pub(crate) fn build_bmp_blob(
     Ok(bytes_written)
 }
 
-/// Write the BMP V13 footer (64 bytes).
+/// Write the BMP V14 footer (64 bytes).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
@@ -861,7 +861,7 @@ mod tests {
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
-        // Verify V13 footer magic (last 4 bytes of 64-byte footer)
+        // Verify V14 footer magic (last 4 bytes of 64-byte footer)
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
         assert_eq!(magic, BMP_BLOB_MAGIC_V14);
@@ -877,7 +877,7 @@ mod tests {
         let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify V13 footer: num_virtual_docs should be 64 (padded to block_size)
+        // Verify V14 footer: num_virtual_docs should be 64 (padded to block_size)
         // 3 real docs padded to 64
         let footer_start = buf.len() - 64;
         let fb = &buf[footer_start..];
@@ -902,7 +902,7 @@ mod tests {
         let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify max_weight_scale in V13 footer (bytes 40-43)
+        // Verify max_weight_scale in V14 footer (bytes 40-43)
         let footer_start = buf.len() - 64;
         let fb = &buf[footer_start..];
         let scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());

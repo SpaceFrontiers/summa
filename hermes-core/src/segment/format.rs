@@ -91,7 +91,7 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V13 blob footer ("BMP3" in LE)
+/// Magic number for BMP V14 blob footer ("BMP4" in LE)
 ///
 /// V14 changes from V13:
 /// - **u32 num_terms and u32 posting prefix sums** per block (were u16):

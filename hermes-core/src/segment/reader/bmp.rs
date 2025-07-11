@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V13 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V14 zero-copy**.
 //!
-//! V13 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! V14 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -72,9 +72,9 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V13 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V14 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V13 format with Recursive Graph Bisection (BP) document ordering.
+/// V14 format with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -142,12 +142,12 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V13 blob from the given file handle.
+    /// Parse a BMP V14 blob from the given file handle.
     ///
     /// Reads the 64-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V13 data-first layout: Section B (per-block interleaved data) first,
+    /// V14 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
     pub fn parse(
         handle: FileHandle,
@@ -160,7 +160,7 @@ impl BmpIndex {
 
         if blob_len < BMP_BLOB_FOOTER_SIZE_V14 as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V13 footer".into(),
+                "BMP blob too small for V14 footer".into(),
             ));
         }
 
@@ -293,7 +293,7 @@ impl BmpIndex {
         }
 
         log::debug!(
-            "BMP V13 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
+            "BMP V14 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
              packed_row_size={}, block_data={}B, doc_map={}B",
             num_blocks,
@@ -334,7 +334,7 @@ impl BmpIndex {
         })
     }
 
-    /// Read the entire raw V13 blob (including footer) from the source file.
+    /// Read the entire raw V14 blob (including footer) from the source file.
     ///
     /// Used by reorder paths (native-only) to copy a field byte-identically
     /// when its `reorder` schema attribute is unset.
