@@ -156,18 +156,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V13, BMP_BLOB_MAGIC_V13};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V14, BMP_BLOB_MAGIC_V14};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V13 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V14 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for V13 footer".into(),
             ));
         }
 
         // Read the footer (last 64 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V13 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V13 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V14 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -186,10 +186,12 @@ impl BmpIndex {
         let grid_bits_raw = u32::from_le_bytes(fb[56..60].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V13 {
+        if magic != BMP_BLOB_MAGIC_V14 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP3 {:#x})",
-                magic, BMP_BLOB_MAGIC_V13
+                "Invalid BMP blob magic: {:#x} (expected BMP4 {:#x}). V13 and \
+                 older segments use u16 posting prefix sums that overflow on \
+                 large blocks — rebuild the index with this version.",
+                magic, BMP_BLOB_MAGIC_V14
             )));
         }
         let grid_bits: u8 = match grid_bits_raw {
@@ -231,7 +233,7 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V13 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
@@ -477,7 +479,7 @@ impl BmpIndex {
     ///
     /// Returns `(0, null, null, null)` for empty blocks.
     #[inline(always)]
-    pub(crate) fn parse_block(&self, block_id: u32) -> (u16, *const u8, *const u8, *const u8) {
+    pub(crate) fn parse_block(&self, block_id: u32) -> (u32, *const u8, *const u8, *const u8) {
         let (start, end) = self.block_data_range(block_id);
         if start == end {
             return (0, std::ptr::null(), std::ptr::null(), std::ptr::null());
@@ -488,11 +490,12 @@ impl BmpIndex {
                 .as_ptr()
                 .add(start as usize)
         };
-        let num_terms = unsafe { u16::from_le((base as *const u16).read_unaligned()) };
-        let dim_ptr = unsafe { base.add(2) };
+        let num_terms = unsafe { u32::from_le((base as *const u32).read_unaligned()) };
+        let dim_ptr = unsafe { base.add(4) };
         // Always u32 dim IDs (4 bytes each)
         let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * 4) };
-        let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 2) };
+        // u32 prefix sums (V14): u16 wrapped past 65,535 postings per block
+        let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 4) };
         (num_terms, dim_ptr, ps_ptr, post_ptr)
     }
 
@@ -708,8 +711,8 @@ pub struct BlockTermIter<'a> {
     dim_ptr: *const u8,
     ps_ptr: *const u8,
     post_ptr: *const u8,
-    num_terms: u16,
-    current: u16,
+    num_terms: u32,
+    current: u32,
     // lifetime marker for the underlying BmpIndex data
     _marker: std::marker::PhantomData<&'a ()>,
 }
@@ -759,9 +762,9 @@ impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
 #[inline(always)]
 pub(crate) fn find_dim_in_block_data(
     dim_ptr: *const u8,
-    num_terms: u16,
+    num_terms: u32,
     dim_id: u32,
-) -> Option<u16> {
+) -> Option<u32> {
     let count = num_terms as usize;
     if count == 0 {
         return None;
@@ -774,7 +777,7 @@ pub(crate) fn find_dim_in_block_data(
         let val = unsafe { read_u32_unchecked(dim_ptr, mid) };
         match val.cmp(&dim_id) {
             std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Equal => return Some(mid as u16),
+            std::cmp::Ordering::Equal => return Some(mid as u32),
             std::cmp::Ordering::Greater => hi = mid,
         }
     }
@@ -783,7 +786,7 @@ pub(crate) fn find_dim_in_block_data(
 
 /// Get postings for a local term index within a parsed block.
 ///
-/// `ps_ptr` points to the block's posting_starts array [u16 × (num_terms + 1)].
+/// `ps_ptr` points to the block's posting_starts array [u32 × (num_terms + 1)].
 /// `post_ptr` points to the block's postings array [(u8, u8) × total].
 ///
 /// # Safety
@@ -793,16 +796,20 @@ pub(crate) fn find_dim_in_block_data(
 pub(crate) unsafe fn block_term_postings<'a>(
     ps_ptr: *const u8,
     post_ptr: *const u8,
-    local_term: u16,
+    local_term: u32,
 ) -> &'a [BmpPosting] {
-    let start_p = ps_ptr.add(local_term as usize * 2);
-    let end_p = ps_ptr.add((local_term as usize + 1) * 2);
-    let start = u16::from_le((start_p as *const u16).read_unaligned()) as usize;
-    let end = u16::from_le((end_p as *const u16).read_unaligned()) as usize;
-    let count = end - start;
-    if count == 0 {
+    let start_p = ps_ptr.add(local_term as usize * 4);
+    let end_p = ps_ptr.add((local_term as usize + 1) * 4);
+    let start = u32::from_le((start_p as *const u32).read_unaligned()) as usize;
+    let end = u32::from_le((end_p as *const u32).read_unaligned()) as usize;
+    // Prefix sums are cumulative — a non-monotonic pair means the block is
+    // corrupt. Never build a wild slice from it (`end - start` underflow on
+    // wrapped V13 data was a production SIGSEGV).
+    debug_assert!(end >= start, "corrupt BMP block: prefix sums not monotonic");
+    if end <= start {
         return &[];
     }
+    let count = end - start;
     // SAFETY: BmpPosting is #[repr(C)] with align=1 (two u8 fields).
     let ptr = post_ptr.add(start * 2) as *const BmpPosting;
     std::slice::from_raw_parts(ptr, count)

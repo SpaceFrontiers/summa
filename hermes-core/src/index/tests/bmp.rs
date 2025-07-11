@@ -2615,3 +2615,74 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
          cell-scale values (≤15) deflate superblock UBs ~17× (unsafe pruning)"
     );
 }
+
+/// Regression: a block with more than 65,535 postings overflowed the u16
+/// posting prefix sums at build time (bmp_block_size=256 × ~300-dim docs
+/// hits this in production), silently corrupting the block; the reader's
+/// `end - start` then underflowed into a wild posting slice — SIGSEGV in
+/// the BP forward-index build (optimizer-bp threads). V14 stores num_terms
+/// and prefix sums as u32.
+#[tokio::test]
+async fn test_bmp_block_posting_overflow_256() {
+    // 256 docs × 301 dims each → 77,056 postings in block 0 (> u16::MAX).
+    // Needle dims (50_000 + d) sort after the shared mass, so their prefix
+    // offsets exceed 65,535 — exactly where the u16 wrap corrupted reads.
+    let config = SparseVectorConfig {
+        format: SparseFormat::Bmp,
+        weight_quantization: WeightQuantization::UInt8,
+        bmp_block_size: 256,
+        dims: Some(100_000),
+        max_weight: Some(5.0),
+        ..SparseVectorConfig::default()
+    };
+    let (schema, _title, sparse) = bmp_schema_with_config(config);
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for d in 0..256u32 {
+        let mut entries: Vec<(u32, f32)> = (0..300u32)
+            .map(|t| (t, 0.5 + (t % 40) as f32 * 0.1))
+            .collect();
+        entries.push((50_000 + d, 4.0)); // needle, one per doc
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, entries);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
+    assert!(
+        bmp.total_postings() > u16::MAX as u64,
+        "test setup must overflow u16 postings per block (got {})",
+        bmp.total_postings()
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    // Every needle dim must resolve to exactly its doc with the exact score.
+    for d in [0u32, 100, 255] {
+        let query = SparseVectorQuery::new(sparse, vec![(50_000 + d, 1.0)]);
+        let r = searcher.search(&query, 5).await.unwrap();
+        assert_eq!(r.len(), 1, "needle {d} lost past the 65,535th posting");
+        assert_eq!(r[0].doc_id, d);
+    }
+    // Shared dims still score correctly across the whole block.
+    let query = SparseVectorQuery::new(sparse, vec![(0, 1.0), (299, 1.0)]);
+    let r = searcher.search(&query, 10).await.unwrap();
+    assert_eq!(r.len(), 10);
+
+    // BP forward-index build over the oversized block must not read wild
+    // slices (this is the exact prod crash path).
+    let (fwd, _) =
+        crate::segment::build_forward_index_from_bmps(&[bmp], 2, 1_000_000, 2 * 1024 * 1024 * 1024);
+    // Needle dims have df=1 and are correctly filtered by min_doc_freq=2;
+    // the 300 shared dims × 256 docs must all survive — reading them walks
+    // every posting slice past the old u16 wrap point.
+    assert_eq!(fwd.total_postings(), 300 * 256);
+}

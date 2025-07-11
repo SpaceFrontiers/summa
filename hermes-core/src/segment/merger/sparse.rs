@@ -444,7 +444,7 @@ fn merge_bmp_field(
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    use crate::segment::builder::bmp::write_v13_footer;
+    use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
     let effective_block_size = bmp_block_size.min(256);
@@ -706,7 +706,7 @@ fn merge_bmp_field(
     }
 
     // ── Phase 6: Write V13 footer (64 bytes) ────────────────────────────
-    write_v13_footer(
+    write_bmp_footer(
         writer,
         total_terms,
         total_postings,

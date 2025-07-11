@@ -93,15 +93,21 @@ pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
 /// Magic number for BMP V13 blob footer ("BMP3" in LE)
 ///
+/// V14 changes from V13:
+/// - **u32 num_terms and u32 posting prefix sums** per block (were u16):
+///   blocks with >65,535 postings (bmp_block_size 256 × ~300-dim docs)
+///   silently wrapped the u16 prefix sums, corrupting the block and
+///   producing wild posting slices at read time. No compatibility shim —
+///   V13 and older segments must be rebuilt.
+///
 /// V13 changes from V12:
 /// - **Recursive Graph Bisection (BP)** replaces SimHash for document ordering
 /// - **Section H removed**: no per-block SimHash (BP needs no stored metadata)
 /// - **64-byte footer** (was 72): `block_simhash_offset` field removed
-/// - V12 segments are incompatible — must rebuild
-pub const BMP_BLOB_MAGIC_V13: u32 = 0x33504D42;
+pub const BMP_BLOB_MAGIC_V14: u32 = 0x34504D42;
 
-/// BMP V13 blob footer size: 64 bytes
-pub const BMP_BLOB_FOOTER_SIZE_V13: usize = 64;
+/// BMP V14 blob footer size: 64 bytes (unchanged from V13)
+pub const BMP_BLOB_FOOTER_SIZE_V14: usize = 64;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

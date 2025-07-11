@@ -37,12 +37,12 @@
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
 //!
 //! Per-block data layout (for non-empty blocks):
-//!   num_terms: u16                                    offset 0
-//!   term_dim_ids: [u32-LE × num_terms]                offset 2
-//!   posting_starts: [u16-LE × (num_terms + 1)]        relative cumulative counts
+//!   num_terms: u32                                    offset 0
+//!   term_dim_ids: [u32-LE × num_terms]                offset 4
+//!   posting_starts: [u32-LE × (num_terms + 1)]        relative cumulative counts
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP V13 Footer (64 bytes):
+//! BMP V14 Footer (64 bytes):
 //!   total_terms: u32              //  0- 3  (stats only)
 //!   total_postings: u32           //  4- 7  (stats only)
 //!   grid_offset: u64              //  8-15  (byte offset of Section D)
@@ -93,7 +93,7 @@ impl VidLookup {
 }
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V13;
+use crate::segment::format::BMP_BLOB_MAGIC_V14;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
 /// Build a BMP V13 blob from per-dimension postings.
@@ -375,19 +375,21 @@ pub(crate) fn build_bmp_blob(
             blk_buf.clear();
             let nt = blk_dim_ids.len();
 
-            // num_terms (u16)
-            blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
+            // num_terms (u32)
+            blk_buf.extend_from_slice(&(nt as u32).to_le_bytes());
 
             // term_dim_ids [u32 × nt]
             for &did in &blk_dim_ids {
                 blk_buf.extend_from_slice(&did.to_le_bytes());
             }
 
-            // posting_starts [u16 × (nt + 1)] — relative cumulative
-            let mut cum: u16 = 0;
+            // posting_starts [u32 × (nt + 1)] — relative cumulative.
+            // u32, not u16: a 256-doc block of ~300-dim docs exceeds 65,535
+            // postings, and the old u16 sums wrapped silently (V13 → V14).
+            let mut cum: u32 = 0;
             for &count in &blk_posting_counts {
                 blk_buf.extend_from_slice(&cum.to_le_bytes());
-                cum += count;
+                cum += count as u32;
             }
             blk_buf.extend_from_slice(&cum.to_le_bytes());
 
@@ -474,7 +476,7 @@ pub(crate) fn build_bmp_blob(
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
     // BMP V13 Footer (64 bytes)
-    write_v13_footer(
+    write_bmp_footer(
         writer,
         total_terms,
         total_postings,
@@ -496,7 +498,7 @@ pub(crate) fn build_bmp_blob(
 
 /// Write the BMP V13 footer (64 bytes).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_v13_footer(
+pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
     total_terms: u32,
     total_postings: u32,
@@ -524,7 +526,7 @@ pub(crate) fn write_v13_footer(
     writer.write_u32::<LittleEndian>(num_real_docs)?; // 52-55
     // 56-59: grid cell width in bits (0 = legacy 4-bit; else 2 or 4)
     writer.write_u32::<LittleEndian>(grid_bits as u32)?;
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V13)?; // 60-63
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V14)?; // 60-63
     Ok(())
 }
 
@@ -862,7 +864,7 @@ mod tests {
         // Verify V13 footer magic (last 4 bytes of 64-byte footer)
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V13);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V14);
     }
 
     #[test]

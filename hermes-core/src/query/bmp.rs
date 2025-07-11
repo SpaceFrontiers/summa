@@ -683,7 +683,7 @@ fn zero_touched_acc(acc: &mut [u32], touched: &[u64; 4]) {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn score_block_bsearch_int(
-    num_terms: u16,
+    num_terms: u32,
     dim_ptr: *const u8,
     ps_ptr: *const u8,
     post_ptr: *const u8,

@@ -511,7 +511,7 @@ fn reorder_bmp_field_blockwise(
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
-    use crate::segment::builder::bmp::write_v13_footer;
+    use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::builder::graph_bisection::{
         build_forward_index_from_blocks, graph_bisection,
     };
@@ -686,7 +686,7 @@ fn reorder_bmp_field_blockwise(
     }
 
     // Footer
-    write_v13_footer(
+    write_bmp_footer(
         &mut writer,
         total_terms as u32,
         total_postings as u32,
@@ -880,8 +880,8 @@ pub(crate) fn reorder_bmp_field(
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
     use crate::segment::builder::bmp::{
-        GridRunReader, stream_write_grids, stream_write_grids_merged, write_grid_run,
-        write_v13_footer,
+        GridRunReader, stream_write_grids, stream_write_grids_merged, write_bmp_footer,
+        write_grid_run,
     };
     use crate::segment::builder::graph_bisection::{
         build_forward_index_from_bmps, build_vid_maps, graph_bisection,
@@ -1136,17 +1136,18 @@ pub(crate) fn reorder_bmp_field(
         sorted_dims.sort_unstable();
         let nt = sorted_dims.len();
 
-        let mut blk_buf: Vec<u8> = Vec::with_capacity(2 + nt * 6 + 2);
-        blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
+        let mut blk_buf: Vec<u8> = Vec::with_capacity(4 + nt * 8 + 4);
+        blk_buf.extend_from_slice(&(nt as u32).to_le_bytes());
 
         for &dim_id in &sorted_dims {
             blk_buf.extend_from_slice(&dim_id.to_le_bytes());
         }
 
-        let mut cum: u16 = 0;
+        // u32 prefix sums (V14): u16 wrapped past 65,535 postings per block
+        let mut cum: u32 = 0;
         for &dim_id in &sorted_dims {
             blk_buf.extend_from_slice(&cum.to_le_bytes());
-            cum += dim_postings[&dim_id].len() as u16;
+            cum += dim_postings[&dim_id].len() as u32;
         }
         blk_buf.extend_from_slice(&cum.to_le_bytes());
 
@@ -1192,7 +1193,8 @@ pub(crate) fn reorder_bmp_field(
                 continue;
             }
             total_terms += grid.len() as u32;
-            total_postings += (blk_buf.len() - 2 - grid.len() * 6 - 2) as u32 / 2;
+            // layout: 4 (nt) + nt*4 (dims) + (nt+1)*4 (prefix) + postings*2
+            total_postings += ((blk_buf.len() - 8 - grid.len() * 8) / 2) as u32;
             grid_entries.extend_from_slice(grid);
             writer.write_all(blk_buf).map_err(crate::Error::Io)?;
             cumulative_bytes += blk_buf.len() as u64;
@@ -1343,7 +1345,7 @@ pub(crate) fn reorder_bmp_field(
     }
 
     // V13 footer (64 bytes)
-    write_v13_footer(
+    write_bmp_footer(
         &mut writer,
         total_terms,
         total_postings,

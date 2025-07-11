@@ -1,6 +1,6 @@
 # BMP Grid Memory: Compression Research & Roadmap
 
-## Memory anatomy of a BMP V13 segment
+## Memory anatomy of a BMP segment (V13/V14)
 
 Everything is mmap-backed (page cache, not heap), but resident-set pressure
 is real on memory-bound deployments. Per field, per segment:
