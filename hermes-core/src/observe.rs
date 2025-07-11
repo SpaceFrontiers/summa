@@ -179,11 +179,16 @@ mod imp {
     pub fn directory_read(_: &str, _: &'static str, _: f64, _: usize) {}
     #[inline(always)]
     pub fn store_get(_: &str, _: f64) {}
+    // Caller is native-only directory code — dead on wasm.
     #[inline(always)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub fn cold_write(_: &str, _: usize) {}
+    // Callers live in native-only modules (segment::reorder) — dead on wasm.
     #[inline(always)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub fn reorder_granularity(_: &str, _: &str, _: &'static str) {}
     #[inline(always)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub fn reorder_coherence(_: &str, _: &str, _: f32, _: f32) {}
 }
 

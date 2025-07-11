@@ -127,8 +127,12 @@ pub struct BmpIndex {
     // ── Raw blob source (identity copies) ─────────────────────────────
     /// Source file handle + blob range, kept so reorder can copy the blob
     /// byte-identically for fields whose `reorder` schema attribute is unset.
+    /// Reorder is native-only, so these are dead on wasm.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     source: FileHandle,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     blob_offset: u64,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     blob_len: u64,
 }
 
@@ -330,8 +334,9 @@ impl BmpIndex {
 
     /// Read the entire raw V13 blob (including footer) from the source file.
     ///
-    /// Used by reorder paths to copy a field byte-identically when its
-    /// `reorder` schema attribute is unset.
+    /// Used by reorder paths (native-only) to copy a field byte-identically
+    /// when its `reorder` schema attribute is unset.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub(crate) fn read_raw_blob(&self) -> std::io::Result<OwnedBytes> {
         self.source
             .read_bytes_range_sync(self.blob_offset..self.blob_offset + self.blob_len)
