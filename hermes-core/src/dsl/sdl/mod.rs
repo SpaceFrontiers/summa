@@ -268,6 +268,7 @@ struct IndexConfig {
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
     bmp_block_size: Option<u32>,
+    bmp_grid_bits: Option<u8>,
     pruning: Option<f32>,
     min_terms: Option<usize>,
     doc_mass: Option<f32>,
@@ -486,6 +487,18 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                         n.as_str()
                     );
                     128
+                }));
+            }
+        }
+        Rule::bmp_grid_bits_kwarg => {
+            // bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.bmp_grid_bits = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid bmp_grid_bits value '{}', using default 4",
+                        n.as_str()
+                    );
+                    4
                 }));
             }
         }

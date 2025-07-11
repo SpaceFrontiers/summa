@@ -254,6 +254,15 @@ pub struct SparseVectorConfig {
     /// (docs/bmp-grid-compression.md).
     #[serde(default = "default_bmp_block_size")]
     pub bmp_block_size: u32,
+    /// Bits per BMP block-grid cell: 4 (default) or 2. The grid is
+    /// `dims × num_blocks × bits/8` bytes, so 2 halves grid memory; measured
+    /// pruning cost is ~free (+0.4-2.2% blocks scored — the exact u8 sb_grid
+    /// prunes first and shields the block grid; docs/bmp-grid-compression.md).
+    /// Grid bounds are ceil-quantized, so exact top-k results are unchanged
+    /// at any width. Uniform per field across all segments — set in SDL
+    /// (`bmp_grid_bits: 2`) at index creation.
+    #[serde(default = "default_bmp_grid_bits")]
+    pub bmp_grid_bits: u8,
     /// BMP superblock size: number of consecutive blocks grouped for hierarchical
     /// pruning (Carlson et al., SIGIR 2025). Must be power of 2.
     /// Default 64. Set to 0 to disable superblock pruning (flat BMP scoring).
@@ -316,6 +325,10 @@ fn default_bmp_block_size() -> u32 {
     64
 }
 
+fn default_bmp_grid_bits() -> u8 {
+    4
+}
+
 fn default_bmp_superblock_size() -> u32 {
     64
 }
@@ -334,6 +347,7 @@ impl Default for SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
@@ -370,6 +384,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: Some(0.1), // Keep top 10% per dimension
             query_config: Some(SparseQueryConfig {
@@ -404,6 +419,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: Some(0.1),
             query_config: Some(SparseQueryConfig {
@@ -440,6 +456,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
@@ -471,6 +488,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
@@ -499,6 +517,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
@@ -575,6 +594,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,

@@ -160,6 +160,13 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// in SDL); merged segments are marked `reordered` and skipped by the
     /// standalone optimizer pass.
     reorder_on_merge: bool,
+    /// Wall-clock budget for merge-time BP (from `IndexConfig`); truncated
+    /// passes mark the merged segment `bp_converged = false` so the
+    /// background optimizer deepens it later (warm-started).
+    merge_bp_time_budget: Option<std::time::Duration>,
+    /// Memory budget for the BP forward index (merge-time and background
+    /// reorder). Over-budget passes drop highest-df dims, logged loudly.
+    bp_memory_budget_bytes: usize,
     /// Bounded rayon pool for background CPU work (merge-time BP, manual
     /// reorder). Built lazily at ~cores/4 so background passes cannot
     /// saturate the global rayon pool that query scoring runs on.
@@ -168,6 +175,7 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Create a new segment manager with existing metadata
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         directory: Arc<D>,
         schema: Arc<crate::dsl::Schema>,
@@ -175,6 +183,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         merge_policy: Box<dyn MergePolicy>,
         term_cache_blocks: usize,
         max_concurrent_merges: usize,
+        merge_bp_time_budget: Option<std::time::Duration>,
+        bp_memory_budget_bytes: usize,
     ) -> Self {
         // Persisted index option: set via `reorder_on_merge: true` in the SDL
         // at index creation. Absent = disabled (merges block-copy).
@@ -224,6 +234,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             term_cache_blocks,
             max_concurrent_merges: max_concurrent_merges.max(1),
             reorder_on_merge,
+            merge_bp_time_budget,
+            bp_memory_budget_bytes,
             bg_cpu_pool: std::sync::OnceLock::new(),
         }
     }
@@ -233,7 +245,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// prevents a large merge from queueing every search behind gain passes.
     pub fn background_cpu_pool(&self) -> Arc<rayon::ThreadPool> {
         Arc::clone(self.bg_cpu_pool.get_or_init(|| {
-            let threads = (num_cpus::get() / 4).max(1);
+            let threads = (num_cpus::get() / 2).max(1);
             log::info!("[merge] background CPU pool: {} thread(s)", threads);
             Arc::new(
                 rayon::ThreadPoolBuilder::new()
@@ -460,14 +472,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 trained_snap.as_deref(),
                 sm.reorder_on_merge,
                 granularity,
+                sm.merge_bp_time_budget,
+                sm.bp_memory_budget_bytes,
                 Some(sm.background_cpu_pool()),
             )
             .await;
 
             match result {
-                Ok((new_id, doc_count)) => {
+                Ok((new_id, doc_count, bp_converged)) => {
                     if let Err(e) = sm
-                        .replace_segments(&ids, new_id, doc_count, sm.reorder_on_merge, true)
+                        .replace_segments(
+                            &ids,
+                            new_id,
+                            doc_count,
+                            sm.reorder_on_merge,
+                            bp_converged,
+                        )
                         .await
                     {
                         log::error!("[merge] Failed to replace segments after merge: {:?}", e);
@@ -549,8 +569,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         trained: Option<&TrainedVectorStructures>,
         reorder_bmp: bool,
         granularity: crate::segment::reorder::BpGranularity,
+        merge_bp_time_budget: Option<std::time::Duration>,
+        bp_memory_budget_bytes: usize,
         bg_cpu_pool: Option<Arc<rayon::ThreadPool>>,
-    ) -> Result<(String, u32)> {
+    ) -> Result<(String, u32, bool)> {
         let output_hex = output_segment_id.to_hex();
         let load_start = std::time::Instant::now();
 
@@ -614,6 +636,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let merger = SegmentMerger::new(Arc::clone(schema))
             .with_bmp_reorder(reorder_bmp)
             .with_granularity(granularity)
+            .with_bp_budget(crate::segment::BpBudget {
+                min_partition_docs: None,
+                time_budget: merge_bp_time_budget,
+            })
+            .with_bp_memory_budget(bp_memory_budget_bytes)
             .with_background_pool(bg_cpu_pool);
 
         log::info!(
@@ -623,9 +650,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             trained.map_or(0, |t| t.centroids.len()),
         );
 
-        merger
+        let (_merged_meta, merge_stats) = merger
             .merge(directory, &readers, output_segment_id, trained)
             .await?;
+        let bp_converged = merge_stats.bp_converged;
+        if !bp_converged {
+            log::info!(
+                "[merge] merge-time BP hit its wall-clock budget — output marked unconverged;                  the background optimizer deepens it later",
+            );
+        }
 
         log::info!(
             "[merge] total wall-clock: {:.1}s ({} segments, {} docs)",
@@ -640,7 +673,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 total_docs
             )));
         }
-        Ok((output_hex, total_docs as u32))
+        Ok((output_hex, total_docs as u32, bp_converged))
     }
 
     /// Abort all in-flight merge tasks without waiting for completion.
@@ -761,7 +794,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             let trained_snap = self.trained();
             let granularity = self.merge_granularity(&batch).await;
-            let (new_segment_id, total_docs) = Self::do_merge(
+            let (new_segment_id, total_docs, bp_converged) = Self::do_merge(
                 self.directory.as_ref(),
                 &self.schema,
                 &batch,
@@ -770,6 +803,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 trained_snap.as_deref(),
                 self.reorder_on_merge,
                 granularity,
+                self.merge_bp_time_budget,
+                self.bp_memory_budget_bytes,
                 Some(self.background_cpu_pool()),
             )
             .await?;
@@ -779,7 +814,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 new_segment_id,
                 total_docs,
                 self.reorder_on_merge,
-                true,
+                bp_converged,
             )
             .await?;
 
@@ -921,19 +956,25 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             source_id,
             output_id,
             self.term_cache_blocks,
-            crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+            self.bp_memory_budget_bytes,
             bp_budget,
             granularity,
             rayon_pool,
         )
         .await?;
 
+        // A pass with a depth floor above block granularity has, by
+        // definition, not converged to block-level order — record it as
+        // unconverged so the optimizer's deepening ladder revisits it with a
+        // full-depth (warm-started) pass. Depth caps are only used by the
+        // optimizer's first pass on large segments.
+        let ladder_converged = bp_converged && bp_budget.min_partition_docs.is_none();
         self.replace_segments(
             &[seg_id.to_string()],
             new_id,
             total_docs,
             true,
-            bp_converged,
+            ladder_converged,
         )
         .await?;
 

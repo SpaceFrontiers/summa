@@ -52,6 +52,12 @@ pub struct MergeStats {
     pub vectors_bytes: usize,
     /// Sparse vector index output size
     pub sparse_bytes: usize,
+    /// Whether merge-time BP reorder ran to full depth on every BMP field
+    /// (false = a pass hit its wall-clock budget; the segment is valid and
+    /// better-ordered, and the background optimizer deepens it later).
+    /// True when no BP ran (block-copy merges have nothing to deepen... they
+    /// are simply not reordered and tracked by the `reordered` flag instead).
+    pub bp_converged: bool,
     /// Fast-field output size
     pub fast_bytes: usize,
 }
@@ -102,9 +108,15 @@ pub struct SegmentMerger {
     background_pool: Option<Arc<rayon::ThreadPool>>,
     /// Granularity for merge-time BP. `Auto` by default; the SegmentManager
     /// forces `Records` when any merge source is an unconverged partial
-    /// reorder — the merged segment is marked `bp_converged`, so this merge
-    /// is the deepening pass those sources were owed.
+    /// reorder.
     granularity: crate::segment::reorder::BpGranularity,
+    /// Budget for merge-time BP. Default unbudgeted; the SegmentManager
+    /// passes the index's `merge_bp_time_budget` so huge merges stop holding
+    /// a merge slot for the full BP depth — a truncated pass is marked
+    /// `bp_converged = false` and the background optimizer deepens it.
+    bp_budget: crate::segment::BpBudget,
+    /// Memory budget for the BP forward index during merge-time reorder.
+    bp_memory_budget: usize,
 }
 
 impl SegmentMerger {
@@ -114,6 +126,8 @@ impl SegmentMerger {
             reorder_bmp: false,
             background_pool: None,
             granularity: crate::segment::reorder::BpGranularity::Auto,
+            bp_budget: crate::segment::BpBudget::full(),
+            bp_memory_budget: crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
         }
     }
 
@@ -132,6 +146,18 @@ impl SegmentMerger {
     /// Set merge-time BP granularity (see `granularity`).
     pub fn with_granularity(mut self, granularity: crate::segment::reorder::BpGranularity) -> Self {
         self.granularity = granularity;
+        self
+    }
+
+    /// Bound merge-time BP wall clock (see `bp_budget`).
+    pub fn with_bp_budget(mut self, budget: crate::segment::BpBudget) -> Self {
+        self.bp_budget = budget;
+        self
+    }
+
+    /// Memory budget for the BP forward index (see `bp_memory_budget`).
+    pub fn with_bp_memory_budget(mut self, bytes: usize) -> Self {
+        self.bp_memory_budget = bytes;
         self
     }
 
@@ -241,7 +267,8 @@ impl SegmentMerger {
                 .await
         };
 
-        let (sparse_bytes, vectors_bytes) = tokio::try_join!(sparse_fut, dense_fut)?;
+        let ((sparse_bytes, bp_converged), vectors_bytes) =
+            tokio::try_join!(sparse_fut, dense_fut)?;
         let (store_bytes, store_num_docs) = store_result;
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
@@ -249,6 +276,7 @@ impl SegmentMerger {
         stats.store_bytes = store_bytes;
         stats.vectors_bytes = vectors_bytes;
         stats.sparse_bytes = sparse_bytes;
+        stats.bp_converged = bp_converged;
         stats.fast_bytes = fast_bytes;
         log::info!(
             "[merge] all phases done in {:.1}s: {}",

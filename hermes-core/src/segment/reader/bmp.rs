@@ -103,6 +103,8 @@ pub struct BmpIndex {
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
+    /// Bits per block-grid cell (4 or 2); dequant scale is 17 or 85.
+    grid_bits: u8,
     /// Actual vector count before padding
     num_real_docs: u32,
 
@@ -176,7 +178,8 @@ impl BmpIndex {
         let max_weight_scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
         let doc_map_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
         let num_real_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
-        // fb[56..60] = reserved
+        // fb[56..60]: grid cell width in bits (0 = legacy 4-bit)
+        let grid_bits_raw = u32::from_le_bytes(fb[56..60].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
 
         if magic != BMP_BLOB_MAGIC_V13 {
@@ -185,6 +188,16 @@ impl BmpIndex {
                 magic, BMP_BLOB_MAGIC_V13
             )));
         }
+        let grid_bits: u8 = match grid_bits_raw {
+            0 | 4 => 4, // 0 = blobs written before the field existed
+            2 => 2,
+            other => {
+                return Err(crate::Error::Corruption(format!(
+                    "Unsupported BMP grid_bits {} (expected 2 or 4) — data too new to read?",
+                    other
+                )));
+            }
+        };
 
         // Handle empty index
         if num_blocks == 0 {
@@ -198,6 +211,7 @@ impl BmpIndex {
                 total_terms: 0,
                 total_postings: 0,
                 packed_row_size: 0,
+                grid_bits,
                 num_real_docs,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
@@ -229,7 +243,9 @@ impl BmpIndex {
         let block_data_starts_bytes = blob.slice(bds_start..grid_offset as usize);
 
         // Sections D+E: grid, sb_grid, doc_map
-        let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
+        let packed_row_size =
+            crate::segment::builder::bmp::grid_packed_row_size(num_blocks as usize, grid_bits)
+                as u32;
         let grid_start = grid_offset as usize;
         let grid_end = grid_start + dims as usize * packed_row_size as usize;
 
@@ -297,6 +313,7 @@ impl BmpIndex {
             total_terms,
             total_postings,
             packed_row_size,
+            grid_bits,
             num_real_docs,
             block_data_starts_bytes,
             block_data_bytes,
@@ -577,6 +594,11 @@ impl BmpIndex {
         self.packed_row_size as usize
     }
 
+    /// Bits per block-grid cell (4 or 2).
+    pub fn grid_bits(&self) -> u8 {
+        self.grid_bits
+    }
+
     /// Direct access to mmap-backed superblock grid (zero-copy, zero allocation).
     /// Used for large segments where compact grid extraction would be too expensive.
     #[inline]
@@ -794,6 +816,65 @@ pub(crate) unsafe fn block_term_postings<'a>(
 ///
 /// `packed[i/2]`: low nibble = even element, high nibble = odd element.
 #[inline]
+/// Bits-dispatching grid accumulate: 4-bit takes the SIMD path
+/// (`accumulate_u4_weighted`); 2-bit uses an unrolled scalar kernel
+/// (dequant ×85). SIMD u2 variants are a follow-up — 2-bit is opt-in per
+/// field and the block grid is probed only inside surviving superblocks.
+pub(crate) fn accumulate_grid_weighted(
+    packed: &[u8],
+    grid_bits: u8,
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    if grid_bits == 2 {
+        accumulate_u2_weighted(packed, elem_offset, count, weight, out);
+    } else {
+        accumulate_u4_weighted(packed, elem_offset, count, weight, out);
+    }
+}
+
+/// Scalar 2-bit accumulate: `out[i] += cell(elem_offset + i) * 85 * weight`.
+/// Processes 4 cells per source byte.
+pub(crate) fn accumulate_u2_weighted(
+    packed: &[u8],
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    let w85 = 85.0 * weight;
+    let mut i = 0usize;
+    // Head: unaligned cells until byte boundary
+    while i < count && !(elem_offset + i).is_multiple_of(4) {
+        let abs = elem_offset + i;
+        let cell = (unsafe { *packed.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
+        unsafe { *out.get_unchecked_mut(i) += cell as f32 * w85 };
+        i += 1;
+    }
+    // Body: whole bytes, 4 cells each
+    while i + 4 <= count {
+        let byte = unsafe { *packed.get_unchecked((elem_offset + i) / 4) };
+        if byte != 0 {
+            unsafe {
+                *out.get_unchecked_mut(i) += (byte & 0x03) as f32 * w85;
+                *out.get_unchecked_mut(i + 1) += ((byte >> 2) & 0x03) as f32 * w85;
+                *out.get_unchecked_mut(i + 2) += ((byte >> 4) & 0x03) as f32 * w85;
+                *out.get_unchecked_mut(i + 3) += (byte >> 6) as f32 * w85;
+            }
+        }
+        i += 4;
+    }
+    // Tail
+    while i < count {
+        let abs = elem_offset + i;
+        let cell = (unsafe { *packed.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
+        unsafe { *out.get_unchecked_mut(i) += cell as f32 * w85 };
+        i += 1;
+    }
+}
+
 pub(crate) fn accumulate_u4_weighted(
     packed: &[u8],
     elem_offset: usize,
@@ -1061,6 +1142,47 @@ unsafe fn accumulate_u4_weighted_sse41(
 /// two 4-bit values (low nibble = even block, high nibble = odd block).
 ///
 /// `query_dims` entries: `(dim_idx, weight)` where dim_idx indexes into grid rows.
+/// Bits-dispatching mask computation (which query dims are present per block).
+pub(crate) fn compute_block_masks(
+    grid: &[u8],
+    grid_bits: u8,
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    if grid_bits == 2 {
+        compute_block_masks_2bit(grid, prs, query_dims, block_start, count, masks);
+    } else {
+        compute_block_masks_4bit(grid, prs, query_dims, block_start, count, masks);
+    }
+}
+
+/// Scalar 2-bit presence masks.
+pub(crate) fn compute_block_masks_2bit(
+    grid: &[u8],
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    debug_assert!(masks.len() >= count);
+    masks[..count].fill(0);
+    for (q, &(dim_idx, _)) in query_dims.iter().enumerate() {
+        let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
+        let bit = 1u64 << q;
+        for b in 0..count {
+            let abs = block_start + b;
+            let cell = (unsafe { *row.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
+            if cell != 0 {
+                unsafe { *masks.get_unchecked_mut(b) |= bit };
+            }
+        }
+    }
+}
+
 pub(crate) fn compute_block_masks_4bit(
     grid: &[u8],
     prs: usize,

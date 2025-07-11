@@ -39,8 +39,8 @@
 
 use super::scoring::{ScoreCollector, ScoredDoc};
 use crate::segment::{
-    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_u4_weighted, block_term_postings,
-    compute_block_masks_4bit, find_dim_in_block_data,
+    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_grid_weighted, block_term_postings,
+    compute_block_masks, find_dim_in_block_data,
 };
 
 // dim_id is used directly as grid row index. No dim_idx indirection.
@@ -477,14 +477,16 @@ fn execute_bmp_inner(
             // Compute block UBs + masks from grid
             compute_block_ubs_compact(
                 grid_slice,
+                index.grid_bits(),
                 prs,
                 &grid_dims,
                 block_start,
                 block_end,
                 &mut scratch.local_block_ubs,
             );
-            compute_block_masks_4bit(
+            compute_block_masks(
                 grid_slice,
+                index.grid_bits(),
                 prs,
                 &grid_dims,
                 block_start,
@@ -500,6 +502,7 @@ fn execute_bmp_inner(
                     .collect();
                 compute_block_ubs_compact(
                     grid_slice,
+                    index.grid_bits(),
                     prs,
                     &phase1_dims,
                     block_start,
@@ -1029,6 +1032,7 @@ fn compute_sb_ubs_int(
 #[inline]
 fn compute_block_ubs_compact(
     compact_grid: &[u8],
+    grid_bits: u8,
     prs: usize,
     compact_dims: &[(usize, f32)],
     block_start: usize,
@@ -1040,6 +1044,13 @@ fn compute_block_ubs_compact(
     out[..count].fill(0.0);
     for &(local_idx, weight) in compact_dims {
         let row = &compact_grid[local_idx * prs..(local_idx + 1) * prs];
-        accumulate_u4_weighted(row, block_start, count, weight, &mut out[..count]);
+        accumulate_grid_weighted(
+            row,
+            grid_bits,
+            block_start,
+            count,
+            weight,
+            &mut out[..count],
+        );
     }
 }

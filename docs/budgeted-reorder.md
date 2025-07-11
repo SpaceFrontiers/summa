@@ -63,3 +63,67 @@ formulation negates the right half, producing one coherent
 half. Fixed in `compute_gains` + the selection comparator; pinned by
 `test_bp_depth_cap_separates_clusters_and_converges`. Expect measurably
 better pruning from all reorders after this fix.
+
+## Deepening ladder (2026-07-14)
+
+Semantics change for aggressive continuous background reordering:
+
+- A pass with a **depth floor above block granularity** (the optimizer's
+  budgeted first pass on large segments, `min_partition_docs = 4096`) is now
+  recorded `bp_converged = false` — by definition it has not reached
+  block-level order. Previously it reported converged and large segments
+  were permanently stuck at superblock-granularity order.
+- **Merge-time BP is wall-clock-budgeted** (`--merge-bp-budget-secs`,
+  default 600; `IndexConfig::merge_bp_time_budget`). A truncated merge pass
+  still writes a valid, better-ordered segment, marked unconverged. This
+  caps how long one merge holds a merge slot — previously a 64-source/18M-doc
+  merge ran full-depth BP inline (10-30+ min per slot), which is how merge
+  backlogs (350 segments at 30M docs) built up.
+- The optimizer's **deepening is no longer starved by fresh segments**:
+  under continuous ingestion fresh candidates arrive every commit, and the
+  old "deepen only when idle" rule postponed deepening indefinitely. Now one
+  unconverged segment is deepened per cooldown window
+  (`--optimizer-unconverged-cooldown-secs`, default now 600, was 1800)
+  alongside fresh work. Deepening passes run **full depth** with the wall
+  clock budget — warm-starting makes already-ordered prefixes nearly free,
+  so each pass pushes deeper until one beats the clock and converges.
+
+- **Merge fan-in default raised** (`TieredMergePolicy::large_scale()`
+  `max_merge_at_once: 10 → 24`, baked in — no tuning flags): wide fan-in
+  absorbs continuous-ingestion floods of small memtable segments in ~2.4×
+  fewer merge passes. Giant merges are safe because output docs are capped
+  by `max_merged_docs` and merge-time BP is wall-clock budgeted.
+
+Net effect: merges are fast and bounded; order quality converges in the
+background via warm-started passes; `bp_converged` now means
+"block-granularity order reached".
+
+## Single-pass parallelism (2026-07-14)
+
+A single reorder pass has three phases; all three are now parallel and all
+three run on the bounded background pool (`cores/2` threads — merge-time
+pool in `SegmentManager::background_cpu_pool`, optimizer pool sized
+`max(--optimizer-threads, cores/2)`), keeping background CPU off the global
+query pool:
+
+1. **Forward-index build** (was fully serial). Real doc ids are assigned in
+   ascending vid order, so each BMP block owns a contiguous real-id range —
+   df counting is a rayon fold/reduce over blocks, and the CSR count/fill
+   phases write disjoint per-block slices (safe `split_at_mut` carving, no
+   locks). Also df counting aggregates per (block, dim) instead of per
+   posting, which speeds up the serial path too.
+2. **Graph bisection** (already parallel: `rayon::join` halves + parallel
+   gain passes, wall-clock budgeted).
+3. **Permuted blob write** (was fully serial). Output blocks encode
+   independently; they are encoded in parallel in 4096-block windows and
+   written serially in blob order (the window bounds buffered bytes).
+
+## Default changes (2026-07-14, follow-up)
+
+- `IndexConfig::default()` now uses `TieredMergePolicy::large_scale()` (the
+  server already did). Tier floors only shape _when_ segments merge, and
+  merge-time BP is wall-clock budgeted, so the policy is safe at any scale.
+- `bp_memory_budget_bytes` default 2 GB → 8 GB (`--bp-memory-budget-mb`
+  default 8192). It is a cap, not an allocation — memory use is proportional
+  to the segment actually being reordered; the cap only bites on 10M+ doc
+  passes, where 2 GB was dropping ~10% of eligible dims.

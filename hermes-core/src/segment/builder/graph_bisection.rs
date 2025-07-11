@@ -81,6 +81,65 @@ pub(crate) fn build_vid_maps(bmp: &crate::segment::reader::bmp::BmpIndex) -> (Ve
     (virtual_to_real, real_to_virtual)
 }
 
+/// One (source, block) unit of forward-index construction. Because
+/// [`build_vid_maps`] assigns real ids in ascending vid order, a block's real
+/// docs form the contiguous per-source range
+/// `real_start..real_start + real_len` — blocks can be processed in parallel
+/// with disjoint output slices.
+struct BlockJob {
+    src: u32,
+    block_id: u32,
+    /// Per-source real index of the block's first real doc.
+    real_start: u32,
+    /// Number of real (non-padding) docs in the block.
+    real_len: u32,
+}
+
+/// Enumerate jobs in (source, block) order — cumulative `real_len` tiles the
+/// global real-id space `0..total_docs` exactly.
+fn build_block_jobs(
+    bmps: &[&crate::segment::reader::bmp::BmpIndex],
+    vid_maps: &[(Vec<u32>, Vec<u32>)],
+) -> Vec<BlockJob> {
+    let total_blocks: usize = bmps.iter().map(|b| b.num_blocks as usize).sum();
+    let mut jobs = Vec::with_capacity(total_blocks);
+    for (src, (bmp, (v2r, _))) in bmps.iter().zip(vid_maps).enumerate() {
+        let block_size = bmp.bmp_block_size as usize;
+        let mut real_cursor = 0u32;
+        for block_id in 0..bmp.num_blocks as usize {
+            let vid_start = block_id * block_size;
+            let vid_end = ((block_id + 1) * block_size).min(v2r.len());
+            let real_len = v2r[vid_start..vid_end]
+                .iter()
+                .filter(|&&r| r != u32::MAX)
+                .count() as u32;
+            jobs.push(BlockJob {
+                src: src as u32,
+                block_id: block_id as u32,
+                real_start: real_cursor,
+                real_len,
+            });
+            real_cursor += real_len;
+        }
+    }
+    jobs
+}
+
+/// Merge the smaller df map into the larger (rayon reduce combiner).
+#[cfg(feature = "native")]
+fn merge_df_maps(
+    mut a: FxHashMap<u32, usize>,
+    mut b: FxHashMap<u32, usize>,
+) -> FxHashMap<u32, usize> {
+    if a.len() < b.len() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    for (k, v) in b {
+        *a.entry(k).or_insert(0) += v;
+    }
+    a
+}
+
 /// Build forward index from BmpIndex sources (single or multi-source).
 ///
 /// Documents are identified by dense *real* indices assigned sequentially
@@ -116,22 +175,46 @@ pub(crate) fn build_forward_index_from_bmps(
         );
     }
 
+    // Job list: one entry per (source, block). Real ids are assigned in
+    // ascending vid order (see build_vid_maps), so each block owns a
+    // contiguous real-id range — every phase below can process blocks in
+    // parallel, writing disjoint slices.
+    let jobs = build_block_jobs(bmps, &vid_maps);
+
     // Phase 1: count doc freq per dimension across all sources + assign compact IDs
-    let mut dim_df: FxHashMap<u32, usize> = FxHashMap::default();
-    for (bmp, (v2r, _)) in bmps.iter().zip(&vid_maps) {
-        let num_blocks = bmp.num_blocks as usize;
+    let count_block_df = |job: &BlockJob, acc: &mut FxHashMap<u32, usize>| {
+        let bmp = bmps[job.src as usize];
+        let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        for block_id in 0..num_blocks {
-            for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-                for p in postings {
-                    let vid = block_id * block_size + p.local_slot as usize;
-                    if v2r[vid] != u32::MAX && p.impact > 0 {
-                        *dim_df.entry(dim_id).or_insert(0) += 1;
-                    }
+        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+            let mut n = 0usize;
+            for p in postings {
+                let vid = job.block_id as usize * block_size + p.local_slot as usize;
+                if v2r[vid] != u32::MAX && p.impact > 0 {
+                    n += 1;
                 }
             }
+            if n > 0 {
+                *acc.entry(dim_id).or_insert(0) += n;
+            }
         }
-    }
+    };
+    #[cfg(feature = "native")]
+    let dim_df: FxHashMap<u32, usize> = jobs
+        .par_iter()
+        .fold(FxHashMap::default, |mut acc, job| {
+            count_block_df(job, &mut acc);
+            acc
+        })
+        .reduce(FxHashMap::default, merge_df_maps);
+    #[cfg(not(feature = "native"))]
+    let dim_df: FxHashMap<u32, usize> = {
+        let mut acc = FxHashMap::default();
+        for job in &jobs {
+            count_block_df(job, &mut acc);
+        }
+        acc
+    };
 
     // Filter dims by [min_doc_freq, max_doc_freq] range
     let mut eligible: Vec<(u32, usize)> = dim_df
@@ -185,29 +268,41 @@ pub(crate) fn build_forward_index_from_bmps(
     let num_active_terms = term_remap.len();
     drop(eligible);
 
-    // Phase 2: count terms per doc (filtered)
+    // Phase 2: count terms per doc (filtered) — per-block disjoint slices
     let mut counts = vec![0u32; total_docs];
-    let mut real_offset = 0usize;
-
-    for (src_idx, bmp) in bmps.iter().enumerate() {
-        let (v2r, _) = &vid_maps[src_idx];
-        let num_blocks = bmp.num_blocks as usize;
+    let fill_block_counts = |job: &BlockJob, out: &mut [u32]| {
+        let bmp = bmps[job.src as usize];
+        let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        for block_id in 0..num_blocks {
-            for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-                if !term_remap.contains_key(&dim_id) {
-                    continue;
-                }
-                for p in postings {
-                    let vid = block_id * block_size + p.local_slot as usize;
-                    let real = v2r[vid];
-                    if real != u32::MAX && p.impact > 0 {
-                        counts[real_offset + real as usize] += 1;
-                    }
+        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+            if !term_remap.contains_key(&dim_id) {
+                continue;
+            }
+            for p in postings {
+                let vid = job.block_id as usize * block_size + p.local_slot as usize;
+                let real = v2r[vid];
+                if real != u32::MAX && p.impact > 0 {
+                    out[(real - job.real_start) as usize] += 1;
                 }
             }
         }
-        real_offset += source_doc_counts[src_idx];
+    };
+    {
+        let mut slices: Vec<(&BlockJob, &mut [u32])> = Vec::with_capacity(jobs.len());
+        let mut rest: &mut [u32] = &mut counts;
+        for job in &jobs {
+            let (head, tail) = rest.split_at_mut(job.real_len as usize);
+            slices.push((job, head));
+            rest = tail;
+        }
+        #[cfg(feature = "native")]
+        slices
+            .into_par_iter()
+            .for_each(|(job, out)| fill_block_counts(job, out));
+        #[cfg(not(feature = "native"))]
+        for (job, out) in slices {
+            fill_block_counts(job, out);
+        }
     }
 
     // Phase 3: build CSR offsets
@@ -217,34 +312,56 @@ pub(crate) fn build_forward_index_from_bmps(
         offsets.push(offsets.last().unwrap() + c);
     }
     let total = *offsets.last().unwrap() as usize;
+    drop(counts);
 
-    // Phase 4: fill terms (compact IDs)
+    // Phase 4: fill terms (compact IDs) — each block writes the contiguous
+    // terms range covering its real docs; per-doc write cursors are local.
     let mut terms = vec![0u32; total];
-    counts.fill(0);
-    real_offset = 0;
-
-    for (src_idx, bmp) in bmps.iter().enumerate() {
-        let (v2r, _) = &vid_maps[src_idx];
-        let num_blocks = bmp.num_blocks as usize;
+    let fill_block_terms = |job: &BlockJob, global_real_start: usize, out: &mut [u32]| {
+        let bmp = bmps[job.src as usize];
+        let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        for block_id in 0..num_blocks {
-            for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-                let Some(&compact) = term_remap.get(&dim_id) else {
-                    continue;
-                };
-                for p in postings {
-                    let vid = block_id * block_size + p.local_slot as usize;
-                    let real = v2r[vid];
-                    if real != u32::MAX && p.impact > 0 {
-                        let global_real = real_offset + real as usize;
-                        let pos = offsets[global_real] as usize + counts[global_real] as usize;
-                        terms[pos] = compact;
-                        counts[global_real] += 1;
-                    }
+        // local_slot is u8, so a block never holds more than 256 real docs
+        assert!(job.real_len as usize <= 256, "BMP block exceeds 256 docs");
+        let mut cursor = [0u32; 256];
+        let base = offsets[global_real_start] as usize;
+        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+            let Some(&compact) = term_remap.get(&dim_id) else {
+                continue;
+            };
+            for p in postings {
+                let vid = job.block_id as usize * block_size + p.local_slot as usize;
+                let real = v2r[vid];
+                if real != u32::MAX && p.impact > 0 {
+                    let local = (real - job.real_start) as usize;
+                    let pos =
+                        offsets[global_real_start + local] as usize - base + cursor[local] as usize;
+                    out[pos] = compact;
+                    cursor[local] += 1;
                 }
             }
         }
-        real_offset += source_doc_counts[src_idx];
+    };
+    {
+        let mut slices: Vec<(&BlockJob, usize, &mut [u32])> = Vec::with_capacity(jobs.len());
+        let mut rest: &mut [u32] = &mut terms;
+        let mut global_real = 0usize;
+        for job in &jobs {
+            let len =
+                (offsets[global_real + job.real_len as usize] - offsets[global_real]) as usize;
+            let (head, tail) = rest.split_at_mut(len);
+            slices.push((job, global_real, head));
+            rest = tail;
+            global_real += job.real_len as usize;
+        }
+        #[cfg(feature = "native")]
+        slices
+            .into_par_iter()
+            .for_each(|(job, g, out)| fill_block_terms(job, g, out));
+        #[cfg(not(feature = "native"))]
+        for (job, g, out) in slices {
+            fill_block_terms(job, g, out);
+        }
     }
 
     (
@@ -277,15 +394,35 @@ pub(crate) fn build_forward_index_from_blocks(
         };
     }
 
+    // (source, block) pairs in global block order — the parallel unit.
+    let blocks: Vec<(u32, u32)> = bmps
+        .iter()
+        .enumerate()
+        .flat_map(|(src, bmp)| (0..bmp.num_blocks).map(move |b| (src as u32, b)))
+        .collect();
+
     // Phase 1: dim → number of blocks containing it (block-level df)
-    let mut dim_bf: FxHashMap<u32, usize> = FxHashMap::default();
-    for bmp in bmps {
-        for block_id in 0..bmp.num_blocks {
-            for (dim_id, _) in bmp.iter_block_terms(block_id) {
-                *dim_bf.entry(dim_id).or_insert(0) += 1;
-            }
+    let count_block_bf = |&(src, block_id): &(u32, u32), acc: &mut FxHashMap<u32, usize>| {
+        for (dim_id, _) in bmps[src as usize].iter_block_terms(block_id) {
+            *acc.entry(dim_id).or_insert(0) += 1;
         }
-    }
+    };
+    #[cfg(feature = "native")]
+    let dim_bf: FxHashMap<u32, usize> = blocks
+        .par_iter()
+        .fold(FxHashMap::default, |mut acc, b| {
+            count_block_bf(b, &mut acc);
+            acc
+        })
+        .reduce(FxHashMap::default, merge_df_maps);
+    #[cfg(not(feature = "native"))]
+    let dim_bf: FxHashMap<u32, usize> = {
+        let mut acc = FxHashMap::default();
+        for b in &blocks {
+            count_block_bf(b, &mut acc);
+        }
+        acc
+    };
 
     let max_bf = (total_blocks as f64 * 0.9) as usize;
     let mut eligible: Vec<(u32, usize)> = dim_bf
@@ -324,38 +461,53 @@ pub(crate) fn build_forward_index_from_blocks(
     let num_terms = term_remap.len();
     drop(eligible);
 
-    // Phase 2+3: counts and CSR fill
-    let mut counts = vec![0u32; total_blocks];
-    let mut gb = 0usize;
-    for bmp in bmps {
-        for block_id in 0..bmp.num_blocks {
-            for (dim_id, _) in bmp.iter_block_terms(block_id) {
-                if term_remap.contains_key(&dim_id) {
-                    counts[gb] += 1;
-                }
-            }
-            gb += 1;
-        }
-    }
+    // Phase 2+3: counts and CSR fill — one entity per block, so each block
+    // maps to a single count cell and a contiguous terms range.
+    let count_remapped = |&(src, block_id): &(u32, u32)| -> u32 {
+        bmps[src as usize]
+            .iter_block_terms(block_id)
+            .filter(|(dim_id, _)| term_remap.contains_key(dim_id))
+            .count() as u32
+    };
+    #[cfg(feature = "native")]
+    let counts: Vec<u32> = blocks.par_iter().map(count_remapped).collect();
+    #[cfg(not(feature = "native"))]
+    let counts: Vec<u32> = blocks.iter().map(count_remapped).collect();
+
     let mut offsets = Vec::with_capacity(total_blocks + 1);
     offsets.push(0u32);
     for &c in &counts {
         offsets.push(offsets.last().unwrap() + c);
     }
     let total = *offsets.last().unwrap() as usize;
+    drop(counts);
+
     let mut terms = vec![0u32; total];
-    counts.fill(0);
-    gb = 0;
-    for bmp in bmps {
-        for block_id in 0..bmp.num_blocks {
-            for (dim_id, _) in bmp.iter_block_terms(block_id) {
-                if let Some(&compact) = term_remap.get(&dim_id) {
-                    let pos = offsets[gb] as usize + counts[gb] as usize;
-                    terms[pos] = compact;
-                    counts[gb] += 1;
-                }
+    let fill_block = |&(src, block_id): &(u32, u32), out: &mut [u32]| {
+        let mut n = 0usize;
+        for (dim_id, _) in bmps[src as usize].iter_block_terms(block_id) {
+            if let Some(&compact) = term_remap.get(&dim_id) {
+                out[n] = compact;
+                n += 1;
             }
-            gb += 1;
+        }
+    };
+    {
+        let mut slices: Vec<(&(u32, u32), &mut [u32])> = Vec::with_capacity(blocks.len());
+        let mut rest: &mut [u32] = &mut terms;
+        for (gb, b) in blocks.iter().enumerate() {
+            let len = (offsets[gb + 1] - offsets[gb]) as usize;
+            let (head, tail) = rest.split_at_mut(len);
+            slices.push((b, head));
+            rest = tail;
+        }
+        #[cfg(feature = "native")]
+        slices
+            .into_par_iter()
+            .for_each(|(b, out)| fill_block(b, out));
+        #[cfg(not(feature = "native"))]
+        for (b, out) in slices {
+            fill_block(b, out);
         }
     }
 

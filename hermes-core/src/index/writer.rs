@@ -137,6 +137,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            config.merge_bp_time_budget,
+            config.bp_memory_budget_bytes,
         ));
         segment_manager.update_metadata(|_| {}).await?;
 
@@ -173,6 +175,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            config.merge_bp_time_budget,
+            config.bp_memory_budget_bytes,
         ));
         segment_manager.load_and_publish_trained().await;
 

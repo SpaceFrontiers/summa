@@ -86,8 +86,22 @@ struct Args {
     optimizer_partial_min_partition_docs: usize,
 
     /// Cooldown in seconds between deepening passes on budget-truncated segments
-    #[arg(long, default_value = "1800")]
+    #[arg(long, default_value = "600")]
     optimizer_unconverged_cooldown_secs: u64,
+
+    /// Wall-clock budget in seconds for merge-time BP reorder (0 = unbudgeted).
+    /// A truncated pass still produces a valid, better-ordered segment; it is
+    /// marked unconverged and the background optimizer deepens it later.
+    #[arg(long, default_value = "600")]
+    merge_bp_budget_secs: u64,
+
+    /// Memory budget (MB) for the BP forward index during reorder passes
+    /// (merge-time and background). A cap, not an allocation — usage is
+    /// proportional to the segment being reordered. Over-budget passes drop
+    /// highest-df dims from BP's input with a loud warning; raise to 16384
+    /// on hosts with headroom.
+    #[arg(long, default_value = "8192")]
+    bp_memory_budget_mb: usize,
 
     /// Address for the Prometheus /metrics HTTP endpoint.
     /// Set to "off" to disable the exporter.
@@ -173,6 +187,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         num_indexing_threads,
         reload_interval_ms: args.reload_interval_ms,
         merge_policy: Box::new(hermes_core::merge::TieredMergePolicy::large_scale()),
+        merge_bp_time_budget: (args.merge_bp_budget_secs > 0)
+            .then(|| Duration::from_secs(args.merge_bp_budget_secs)),
+        bp_memory_budget_bytes: args.bp_memory_budget_mb * 1024 * 1024,
         ..Default::default()
     };
 

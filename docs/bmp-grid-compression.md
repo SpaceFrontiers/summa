@@ -49,7 +49,44 @@ field embedding: sparse_vector<u32> [indexed<format: bmp, dims: 105879,
     max_weight: 5.0, bmp_block_size: 256>]
 ```
 
-### Cheaper next lever if another 2× is needed: 2-bit grid impacts
+### 2-bit grid impacts — MEASURED, IMPLEMENTED (`bmp_grid_bits: 2`)
+
+Halve the dense grid (dims × blocks / 4) by quantizing block UBs to 2 bits
+(ceil-quantized, recall-safe like `quantize_u8_to_u4_ceil`). Same layout,
+same SIMD shape, no probe-pattern change, no format fork beyond a footer
+flag.
+
+| grid            | topical queries (blocks/q) | background-only queries (blocks/q) |
+| --------------- | -------------------------- | ---------------------------------- |
+| 4-bit (shipped) | 25.7                       | 6057                               |
+| 3-bit (9 lvl)   | 25.8 (+0.4%)               | 6122 (+1.1%)                       |
+| 2-bit (4 lvl)   | 25.8 (+0.4%)               | 6188 (+2.2%)                       |
+
+Why so cheap: the exact u8 `sb_grid` prunes first and shields the block
+grid — coarse block bounds only act inside surviving superblocks. **2-bit
+grid ≈ free** (grid 10 GB → 5 GB at 50M docs / block 64; combine with
+`bmp_block_size: 256` for 2.5 GB).
+
+**Implemented**: SDL `indexed<bmp_grid_bits: 2>` (default 4; per field,
+uniform across segments — merge/blockwise validate loudly). The V13 blob
+footer's reserved field carries the cell width (0 = legacy 4-bit), so
+existing segments stay readable. 2-bit currently uses an unrolled scalar
+accumulate/mask kernel (4 cells/byte); SIMD u2 variants are a follow-up if
+profiling asks for them — the block grid is probed only inside surviving
+superblocks. Exactness is pinned by
+`test_bmp_grid_bits_2_exact_parity_and_roundtrip` (identical top-k vs a
+4-bit index over the same corpus, through block-copy merge and BP reorder).
+
+### 4-bit posting weights — MEASURED, REJECTED
+
+Snapping posting impacts to the u4 lattice (u8 multiples of 17; emulated at
+build time so quantization applies to both scores and grid maxes) costs
+real quality: **recall@10 vs the 8-bit index = 95.1%** on the same corpus,
+matching the classical 3-5% loss for sub-8-bit impact quantization
+(Anh & Moffat lineage). The saving is only ~25% of the postings section —
+NOT 50%, because a BMP posting is 2 bytes `(local_slot: u8, impact: u8)`
+and only the impact half shrinks: packed, 2 B → 1.5 B per posting. Bad
+trade — weights stay 8-bit.
 
 ## Phase 3 (assessed, not recommended): dropping grid rows for rare dims
 
