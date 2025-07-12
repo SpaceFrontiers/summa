@@ -258,6 +258,71 @@ def test_hybrid_forward_and_train_step(hybrid_config):
     )
 
 
+def test_qk_norm(hybrid_config):
+    for b in hybrid_config.pattern:
+        b.attention.qk_norm = True
+    model = Transformer(hybrid_config)
+    keys = model.state_dict().keys()
+    # Attention layers (2, 5 under [ssm, ssm, attn]) get per-head norms
+    assert "layers.2.attention.q_norm.weight" in keys
+    assert "layers.5.attention.k_norm.weight" in keys
+    assert "layers.0.attention.q_norm.weight" not in keys  # ssm layer
+    # Weight is per-head-dim (32/4 heads = 8)
+    assert model.state_dict()["layers.2.attention.q_norm.weight"].shape == (8,)
+    out = model(torch.randint(0, hybrid_config.vocab_size, (2, 12)))
+    assert out.isfinite().all()
+
+
+def test_wsd_schedule():
+    from hermes_train.train import get_lr_wsd
+
+    total, warmup = 1000, 100
+    assert get_lr_wsd(0, warmup, 1.0, 0.1, total) == 0.0
+    assert get_lr_wsd(50, warmup, 1.0, 0.1, total) == pytest.approx(0.5)
+    # Stable plateau covers the bulk
+    for step in (100, 400, 899):
+        assert get_lr_wsd(step, warmup, 1.0, 0.1, total) == 1.0
+    # Decay tail reaches min
+    assert get_lr_wsd(1000, warmup, 1.0, 0.1, total) == pytest.approx(0.1)
+    assert 0.1 < get_lr_wsd(950, warmup, 1.0, 0.1, total) < 1.0
+
+
+def test_document_masking(hybrid_config):
+    """Positions past the conv tail in doc 2 must be independent of doc 1."""
+    from hermes_train.data import Dataset
+
+    eos = 0
+    # Two windows: identical after the boundary, different before it
+    a = np.array([5, 6, 7, eos, 10, 11, 12, 13, 14, 15], dtype=np.uint32)
+    b = np.array([8, 9, 3, eos, 10, 11, 12, 13, 14, 15], dtype=np.uint32)
+
+    ds = Dataset(a, seq_len=9, eos_token_id=eos)
+    ids_a, _, doc_a = ds.get_batch(
+        np.array([0]), torch.device("cpu"), with_doc_ids=True
+    )
+    assert doc_a.tolist() == [[0, 0, 0, 0, 1, 1, 1, 1, 1]]
+
+    torch.manual_seed(0)
+    model = Transformer(hybrid_config)
+    model.eval()
+    ids_b = torch.from_numpy(b[:9].astype("int64")).unsqueeze(0)
+
+    with torch.no_grad():
+        la = model(ids_a, doc_ids=doc_a)
+        lb = model(ids_b, doc_ids=doc_a)  # same boundary structure
+        la_nomask = model(ids_a)
+        lb_nomask = model(ids_b)
+
+    # Segment conv + SSM reset + attention mask → all of doc 2 is isolated
+    boundary = 4
+    isolated = slice(boundary, 9)
+    assert torch.allclose(la[:, isolated], lb[:, isolated], atol=1e-5), (
+        "doc 2 logits must not depend on doc 1 content"
+    )
+    # Sanity: without masking they DO depend on doc 1
+    assert not torch.allclose(la_nomask[:, isolated], lb_nomask[:, isolated], atol=1e-5)
+
+
 def test_tied_embeddings(hybrid_config, tmp_path):
     from safetensors.torch import load_file, save_file
 
@@ -283,6 +348,11 @@ def test_tied_embeddings(hybrid_config, tmp_path):
     loss = cross_entropy_loss(model(ids), ids)
     loss.backward()
     assert model.embedding.weight.grad is not None
+
+    # Sane init: tied logits shouldn't explode initial loss far past ln(V)
+    import math
+
+    assert loss.item() < math.log(hybrid_config.vocab_size) * 1.5
 
 
 def test_fused_kernel_dispatch(hybrid_config):

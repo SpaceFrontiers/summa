@@ -101,6 +101,9 @@ pub struct AttentionDef {
     pub position_encoding: PositionEncoding,
     pub window_size: Option<usize>,
     pub causal: bool,
+    /// Per-head RMSNorm on Q and K before RoPE (OLMo2/Gemma-style stabilizer)
+    #[serde(default)]
+    pub qk_norm: bool,
 }
 
 impl Default for AttentionDef {
@@ -115,6 +118,7 @@ impl Default for AttentionDef {
             position_encoding: PositionEncoding::default(),
             window_size: None,
             causal: true,
+            qk_norm: false,
         }
     }
 }
@@ -804,6 +808,11 @@ fn parse_attention_prop(pair: pest::iterators::Pair<Rule>, def: &mut AttentionDe
                     def.position_encoding = parse_position_encoding(config)?;
                 }
             }
+            Rule::qk_norm_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.qk_norm = val.as_str() == "true";
+                }
+            }
             _ => {}
         }
     }
@@ -1244,6 +1253,24 @@ mod tests {
 
         let def = parse_mal(mal).unwrap();
         assert_eq!(def.rope_theta(), 100000.0, "theta must not be dropped");
+
+        // qk_norm parses and lands
+        let with_qk = parse_mal(
+            r#"
+            attention qk { num_heads: 4
+                           qk_norm: true }
+            ffn f { hidden_dim: 64 }
+            block b { attention: qk
+                      ffn: f }
+            model m { vocab_size: 100
+                      hidden_size: 64
+                      num_layers: 1
+                      block: b }
+        "#,
+        )
+        .unwrap();
+        assert!(with_qk.block.attention.qk_norm);
+
         assert!(
             def.embeddings.tie_weights,
             "tie_weights must not be dropped"

@@ -38,9 +38,23 @@ hermes-llm generate --checkpoint checkpoints/weights.safetensors \
 - **Optimizer**: Muon (Newton–Schulz orthogonalized momentum) for 2D weight
   matrices, AdamW for embeddings/norms/head — the hybrid scheme used by
   Kimi K2 / GLM-scale runs
-- **Schedule**: cosine with linear warmup
+- **Schedule**: WSD (warmup–stable–decay, the 2026 default) or cosine via
+  `--schedule`; the flat plateau makes run extension and curricula sane
 - **Data**: JSONL with a `text` field; `.gz` / `.zst` supported; documents are
   tokenized, EOS-joined and packed into fixed windows
+- **Document masking** (default on): attention is block-diagonal across
+  packed-document boundaries, SSM recurrent state resets at doc starts, and
+  the reference path uses a segment-aware causal conv — doc 2 is provably
+  independent of doc 1 (tested). The fused CUDA kernel (Mamba-1) has no
+  `seq_idx`, so under the fused path SSM state crosses boundaries
+  (warned once); attention layers still mask correctly. `--no-doc-masking`
+  disables.
+- **Curriculum stages**: repeat `-d` — each file trains sequentially under
+  one LR schedule, so with WSD the decay lands on your final
+  (highest-quality / task-specific) stage
+- **QK-Norm**: `qk_norm: true` in a MAL attention def adds per-head RMSNorm
+  on Q/K before RoPE (OLMo2/Gemma-style stabilizer); tensors
+  `layers.{i}.attention.{q,k}_norm.weight` in both engines
 - **Checkpoints**: `weights.safetensors` (Candle-compatible names) +
   `training_state.json`; Ctrl+C saves and exits, `--resume` continues
 - **Distributed**: DDP via `torchrun` (gradient sync); FSDP is a planned upgrade

@@ -18,23 +18,28 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     config = ModelDef.from_json(args.config)
 
+    data_files = args.data or []
+
     if Path(args.tokenizer).exists():
         tokenizer = Tokenizer.from_file(args.tokenizer)
-    elif args.data:
+    elif data_files:
         print("Tokenizer not found, training a new one...")
-        tokenizer = train_bpe([args.data], args.tokenizer)
+        tokenizer = train_bpe([data_files[0]], args.tokenizer)
     else:
         print("error: --data required to train a tokenizer", file=sys.stderr)
         return 1
     config.vocab_size = tokenizer.vocab_size
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
 
-    if args.data:
-        dataset = Dataset.from_file(args.data, tokenizer, args.seq_len)
+    # Each -d file is a curriculum stage, trained sequentially under one
+    # LR schedule (WSD keeps this sane: decay only hits the final stage).
+    if data_files:
+        datasets = [Dataset.from_file(p, tokenizer, args.seq_len) for p in data_files]
     else:
         print("Loading dataset from stdin...")
-        dataset = Dataset.from_stdin(tokenizer, args.seq_len)
-    print(f"Dataset size: {len(dataset.tokens)} tokens")
+        datasets = [Dataset.from_stdin(tokenizer, args.seq_len)]
+    for i, ds in enumerate(datasets):
+        print(f"Stage {i + 1}: {len(ds.tokens)} tokens")
 
     trainer = Trainer(
         config,
@@ -42,21 +47,34 @@ def cmd_train(args: argparse.Namespace) -> int:
         grad_clip=args.grad_clip,
         grad_accum_steps=args.grad_accum,
         warmup_steps=args.warmup_steps,
+        schedule=args.schedule,
+        doc_masking=not args.no_doc_masking,
     )
-    loader = DataLoader(
-        dataset,
-        args.batch_size,
-        shuffle=True,
-        rank=trainer.rank,
-        world_size=trainer.world_size,
-    )
-    print(f"Number of batches: {loader.num_batches()}")
+    loaders = [
+        DataLoader(
+            ds,
+            args.batch_size,
+            shuffle=True,
+            rank=trainer.rank,
+            world_size=trainer.world_size,
+        )
+        for ds in datasets
+    ]
+    total_steps = (
+        sum(loader.num_batches() for loader in loaders) // args.grad_accum
+    ) * args.epochs
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
     resume_state = None
     if args.resume:
+        if len(loaders) > 1:
+            print(
+                "warning: --resume with multiple stages restarts from stage 1 "
+                "(cross-stage positions are not checkpointed)",
+                file=sys.stderr,
+            )
         resume_state = trainer.load_training_state(output)
         if resume_state is None:
             print("No resumable state found, starting fresh")
@@ -76,13 +94,20 @@ def cmd_train(args: argparse.Namespace) -> int:
         raw["vocab_size"] = tokenizer.vocab_size
         (output / "config.json").write_text(json.dumps(raw, indent=2))
 
-    completed = trainer.train(
-        loader,
-        args.epochs,
-        checkpoint_dir=output,
-        resume_state=resume_state,
-        max_steps=args.max_steps,
-    )
+    completed = True
+    for stage, loader in enumerate(loaders):
+        if len(loaders) > 1:
+            print(f"=== Stage {stage + 1}/{len(loaders)} ===")
+        completed = trainer.train(
+            loader,
+            args.epochs,
+            checkpoint_dir=output,
+            resume_state=resume_state if stage == 0 else None,
+            total_steps=total_steps,
+            max_steps=args.max_steps,
+        )
+        if not completed:
+            break
     if completed:
         if trainer.is_main:
             trainer.save_training_state(output, epoch=args.epochs, batch_position=0)
@@ -141,7 +166,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("-t", "--tokenizer", required=True, help="Path to tokenizer.json")
     p.add_argument(
-        "-d", "--data", help="Training JSONL (.gz/.zst ok); stdin if omitted"
+        "-d",
+        "--data",
+        action="append",
+        help="Training JSONL (.gz/.zst ok); repeat for curriculum stages "
+        "trained sequentially; stdin if omitted",
+    )
+    p.add_argument(
+        "--schedule",
+        choices=["wsd", "cosine"],
+        default="wsd",
+        help="LR schedule (default: warmup-stable-decay)",
+    )
+    p.add_argument(
+        "--no-doc-masking",
+        action="store_true",
+        help="Let attention/SSM state cross packed-document boundaries",
     )
     p.add_argument("-o", "--output", default="checkpoints")
     p.add_argument("-b", "--batch-size", type=int, default=32)

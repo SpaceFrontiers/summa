@@ -27,6 +27,8 @@ class AttentionDef:
     )
     window_size: int | None = None
     causal: bool = True
+    # Per-head RMSNorm on Q/K before RoPE (OLMo2/Gemma-style stabilizer)
+    qk_norm: bool = False
 
 
 @dataclass

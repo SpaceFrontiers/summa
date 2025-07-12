@@ -52,6 +52,27 @@ def get_lr_with_warmup(
     return min_lr + coeff * (max_lr - min_lr)
 
 
+def get_lr_wsd(
+    step: int,
+    warmup_steps: int,
+    max_lr: float,
+    min_lr: float,
+    total_steps: int,
+    decay_frac: float = 0.1,
+) -> float:
+    """Warmup-Stable-Decay: flat peak LR for the bulk of training, cosine
+    decay only over the final `decay_frac` of steps. Makes mid-run extension
+    and multi-stage curricula sane (the 2026 default over cosine)."""
+    if step < warmup_steps:
+        return max_lr * (step / max(warmup_steps, 1))
+    decay_start = int(total_steps * (1.0 - decay_frac))
+    if step < decay_start:
+        return max_lr
+    decay_ratio = (step - decay_start) / max(total_steps - decay_start, 1)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * min(decay_ratio, 1.0)))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 class Trainer:
     def __init__(
         self,
@@ -61,6 +82,8 @@ class Trainer:
         grad_clip: float = 1.0,
         grad_accum_steps: int = 1,
         warmup_steps: int = 1000,
+        schedule: str = "wsd",  # wsd | cosine
+        doc_masking: bool = True,
         device: torch.device | None = None,
     ) -> None:
         self.config = config
@@ -69,6 +92,8 @@ class Trainer:
         self.grad_clip = grad_clip
         self.grad_accum_steps = grad_accum_steps
         self.warmup_steps = warmup_steps
+        self.schedule = schedule
+        self.doc_masking = doc_masking
         self.global_step = 0
         self.interrupted = False
 
@@ -129,7 +154,8 @@ class Trainer:
             print(f"Frozen {frozen} parameter tensors")
 
     def _set_lr(self, total_steps: int) -> float:
-        lr = get_lr_with_warmup(
+        schedule_fn = get_lr_wsd if self.schedule == "wsd" else get_lr_with_warmup
+        lr = schedule_fn(
             self.global_step, self.warmup_steps, self.lr, self.lr * 0.1, total_steps
         )
         scale = lr / self.lr
@@ -140,13 +166,16 @@ class Trainer:
         return lr
 
     def _forward_loss(
-        self, input_ids: torch.Tensor, targets: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.autocast_dtype is not None:
             with torch.autocast(self.device.type, dtype=self.autocast_dtype):
-                logits = self.ddp_model(input_ids)
+                logits = self.ddp_model(input_ids, doc_ids=doc_ids)
                 return cross_entropy_loss(logits, targets)
-        logits = self.ddp_model(input_ids)
+        logits = self.ddp_model(input_ids, doc_ids=doc_ids)
         return cross_entropy_loss(logits, targets)
 
     def train(
@@ -202,10 +231,10 @@ class Trainer:
                     pbar.close()
                     return False
 
-                input_ids, targets = train_loader.dataset.get_batch(
-                    batch_indices, self.device
+                input_ids, targets, doc_ids = train_loader.dataset.get_batch(
+                    batch_indices, self.device, with_doc_ids=self.doc_masking
                 )
-                loss = self._forward_loss(input_ids, targets)
+                loss = self._forward_loss(input_ids, targets, doc_ids)
                 (loss / self.grad_accum_steps).backward()
                 accumulated_loss += loss.item()
 
