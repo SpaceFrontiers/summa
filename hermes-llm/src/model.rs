@@ -620,11 +620,16 @@ impl MambaMixer {
         let conv = conv.broadcast_add(&self.conv1d_bias.reshape((1, self.d_inner, 1))?)?;
         let xs = candle_nn::ops::silu(&conv.transpose(1, 2)?.contiguous()?)?; // [B, L, di]
 
-        // Input-dependent Δ, B, C
+        // Input-dependent Δ, B, C. The narrows are made contiguous: Metal's
+        // matmul rejects strided views (dt_proj on the Δ slice).
         let x_dbl = self.x_proj.forward(&xs)?; // [B, L, dt_rank + 2N]
-        let delta = x_dbl.narrow(2, 0, self.dt_rank)?;
-        let b_mat = x_dbl.narrow(2, self.dt_rank, self.state_dim)?; // [B, L, N]
-        let c_mat = x_dbl.narrow(2, self.dt_rank + self.state_dim, self.state_dim)?;
+        let delta = x_dbl.narrow(2, 0, self.dt_rank)?.contiguous()?;
+        let b_mat = x_dbl
+            .narrow(2, self.dt_rank, self.state_dim)?
+            .contiguous()?; // [B, L, N]
+        let c_mat = x_dbl
+            .narrow(2, self.dt_rank + self.state_dim, self.state_dim)?
+            .contiguous()?;
         let delta = softplus(&self.dt_proj.forward(&delta)?)?; // [B, L, di]
 
         let a = self.a_log.exp()?.neg()?; // [di, N]
