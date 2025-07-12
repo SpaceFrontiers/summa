@@ -362,6 +362,27 @@ def test_wandb_logging_path_len(config):
         assert 0.0 <= data["epoch"] < 1.0
 
 
+def test_save_every_snapshots_midrun(config, tmp_path):
+    """save_every writes a loadable weights.safetensors during the epoch,
+    without stopping training — the basis for mid-run evaluation."""
+    from hermes_train.data import DataLoader, Dataset
+    from hermes_train.train import Trainer
+    from safetensors.torch import load_file
+
+    tokens = (np.arange(5000) % config.vocab_size).astype(np.uint32)
+    loader = DataLoader(Dataset(tokens, seq_len=16, eos_token_id=0), batch_size=4)
+    trainer = Trainer(config, lr=1e-2, warmup_steps=2, device=torch.device("cpu"))
+    completed = trainer.train(
+        loader, epochs=1, checkpoint_dir=tmp_path, max_steps=3, save_every=1
+    )
+    assert completed  # training ran to max_steps, snapshots did not abort it
+    snap = tmp_path / "weights.safetensors"
+    assert snap.exists() and not snap.with_suffix(".safetensors.tmp").exists()
+    # snapshot is a complete, loadable state dict
+    state = load_file(str(snap))
+    assert any(k.startswith("embedding") for k in state)
+
+
 def test_wsd_schedule():
     from hermes_train.train import get_lr_wsd
 

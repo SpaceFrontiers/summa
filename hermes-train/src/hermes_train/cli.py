@@ -105,6 +105,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             resume_state=resume_state if stage == 0 else None,
             total_steps=total_steps,
             max_steps=args.max_steps,
+            save_every=args.save_every,
         )
         if not completed:
             break
@@ -192,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--max-steps", type=int, help="Stop after N optimizer steps")
+    p.add_argument(
+        "--save-every",
+        type=int,
+        help="Snapshot weights.safetensors every N optimizer steps (atomic; "
+        "lets a separate process eval mid-run without interrupting training)",
+    )
     p.add_argument("--checkpoint", help="Checkpoint to fine-tune from")
     p.add_argument("--freeze-layers", type=int, default=0)
     p.add_argument("--resume", action="store_true", help="Resume interrupted training")

@@ -212,8 +212,15 @@ class Trainer:
         resume_state: dict | None = None,
         total_steps: int | None = None,
         max_steps: int | None = None,
+        save_every: int | None = None,
     ) -> bool:
-        """Run training. Returns True if completed, False if interrupted."""
+        """Run training. Returns True if completed, False if interrupted.
+
+        save_every>0 writes ``weights.safetensors`` every N optimizer steps
+        (atomic temp+rename, so a concurrent reader — e.g. an eval process
+        loading the snapshot — never sees a half-written file). This is what
+        makes mid-run evaluation possible without stopping training.
+        """
         start_epoch, start_position = 0, 0
         if resume_state:
             self.global_step = resume_state["global_step"]
@@ -299,6 +306,16 @@ class Trainer:
                             step=self.global_step,
                         )
 
+                    if (
+                        save_every
+                        and self.global_step % save_every == 0
+                        and self.is_main
+                        and checkpoint_dir
+                    ):
+                        snapshot = Path(checkpoint_dir) / "weights.safetensors"
+                        self.save_checkpoint_atomic(snapshot)
+                        print(f"[step {self.global_step}] snapshot → {snapshot}")
+
                     if max_steps is not None and self.global_step >= max_steps:
                         pbar.close()
                         if self.is_main and checkpoint_dir:
@@ -339,6 +356,15 @@ class Trainer:
 
     def save_checkpoint(self, path: str | Path) -> None:
         save_file(self.state_dict_for_export(), str(path))
+
+    def save_checkpoint_atomic(self, path: str | Path) -> None:
+        """Write via a temp file + rename so a reader loading the checkpoint
+        concurrently (mid-run eval) never observes a partial safetensors."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        save_file(self.state_dict_for_export(), str(tmp))
+        tmp.replace(path)
 
     def load_checkpoint(self, path: str | Path) -> None:
         state = load_file(str(path))
