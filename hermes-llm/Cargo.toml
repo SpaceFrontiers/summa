@@ -62,3 +62,8 @@ cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl"]
 [[bin]]
 name = "hermes-llm"
 path = "src/main.rs"
+
+[package.metadata.cargo-machete]
+# `#[cube]` macro expansion requires the direct crate even though static source
+# analysis only sees it behind the GPU feature gates.
+ignored = ["cubecl"]
