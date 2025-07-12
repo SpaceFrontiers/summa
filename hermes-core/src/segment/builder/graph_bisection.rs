@@ -19,8 +19,23 @@ use rustc_hash::FxHashMap;
 /// Term IDs are remapped to compact range `0..num_terms` for flat-array degree tracking.
 pub(crate) struct ForwardIndex {
     terms: Vec<u32>,
-    offsets: Vec<u32>,
+    /// u64, not u32: a 58M-doc / ~85-dims-per-doc reorder pass carries ~4.9B
+    /// postings — u32 prefix sums wrapped and the CSR carving panicked
+    /// (prod 2026-07-14, "mid > len"). The old 8 GB memory budget masked it
+    /// by dropping dims below the u32 limit.
+    offsets: Vec<u64>,
     pub num_terms: usize,
+}
+
+/// Build CSR offsets (prefix sums) from per-entity counts. u64 output — the
+/// sum of counts legitimately exceeds u32::MAX on large reorder passes.
+fn build_csr_offsets(counts: &[u32]) -> Vec<u64> {
+    let mut offsets = Vec::with_capacity(counts.len() + 1);
+    offsets.push(0u64);
+    for &c in counts {
+        offsets.push(offsets.last().unwrap() + c as u64);
+    }
+    offsets
 }
 
 impl ForwardIndex {
@@ -41,7 +56,7 @@ impl ForwardIndex {
     }
 
     /// Total postings in the forward index.
-    pub fn total_postings(&self) -> u32 {
+    pub fn total_postings(&self) -> u64 {
         self.offsets.last().copied().unwrap_or(0)
     }
 }
@@ -225,10 +240,11 @@ pub(crate) fn build_forward_index_from_bmps(
     drop(dim_df);
 
     // Memory budget: estimate forward index + bisection scratch.
-    // Peak ≈ 4*total_postings (terms array) + 28*total_docs (offsets, counts,
-    //   docs, gains, indices, new_left, new_right) + 8*num_terms (degree arrays).
+    // Peak ≈ 4*total_postings (terms array) + 32*total_docs (u64 offsets,
+    //   counts, docs, gains, indices, new_left, new_right) + 8*num_terms
+    //   (degree arrays).
     let total_postings_est: usize = eligible.iter().map(|(_, df)| *df).sum();
-    let estimated_bytes = total_postings_est * 4 + total_docs * 28 + eligible.len() * 8;
+    let estimated_bytes = total_postings_est * 4 + total_docs * 32 + eligible.len() * 8;
 
     if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
         // Sort by df ascending — keep discriminative low-df dims first,
@@ -236,7 +252,7 @@ pub(crate) fn build_forward_index_from_bmps(
         eligible.sort_by_key(|&(_, df)| df);
 
         let target_postings =
-            memory_budget_bytes.saturating_sub(total_docs * 28 + eligible.len() * 8) / 4;
+            memory_budget_bytes.saturating_sub(total_docs * 32 + eligible.len() * 8) / 4;
         let mut cum = 0usize;
         let mut keep_count = 0;
         for &(_, df) in &eligible {
@@ -305,12 +321,8 @@ pub(crate) fn build_forward_index_from_bmps(
         }
     }
 
-    // Phase 3: build CSR offsets
-    let mut offsets = Vec::with_capacity(total_docs + 1);
-    offsets.push(0u32);
-    for &c in &counts {
-        offsets.push(offsets.last().unwrap() + c);
-    }
+    // Phase 3: build CSR offsets (u64 — sums exceed u32::MAX at scale)
+    let offsets = build_csr_offsets(&counts);
     let total = *offsets.last().unwrap() as usize;
     drop(counts);
 
@@ -433,10 +445,10 @@ pub(crate) fn build_forward_index_from_blocks(
     drop(dim_bf);
 
     let total_postings_est: usize = eligible.iter().map(|(_, bf)| *bf).sum();
-    let estimated_bytes = total_postings_est * 4 + total_blocks * 28 + eligible.len() * 8;
+    let estimated_bytes = total_postings_est * 4 + total_blocks * 32 + eligible.len() * 8;
     if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
         eligible.sort_by_key(|&(_, bf)| bf);
-        let target = memory_budget_bytes.saturating_sub(total_blocks * 28 + eligible.len() * 8) / 4;
+        let target = memory_budget_bytes.saturating_sub(total_blocks * 32 + eligible.len() * 8) / 4;
         let mut cum = 0usize;
         let mut keep = 0;
         for &(_, bf) in &eligible {
@@ -474,11 +486,7 @@ pub(crate) fn build_forward_index_from_blocks(
     #[cfg(not(feature = "native"))]
     let counts: Vec<u32> = blocks.iter().map(count_remapped).collect();
 
-    let mut offsets = Vec::with_capacity(total_blocks + 1);
-    offsets.push(0u32);
-    for &c in &counts {
-        offsets.push(offsets.last().unwrap() + c);
-    }
+    let offsets = build_csr_offsets(&counts);
     let total = *offsets.last().unwrap() as usize;
     drop(counts);
 
@@ -922,13 +930,29 @@ fn fast_log2_lookup(val: usize, table: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    /// Regression: CSR offsets were u32 and wrapped past 4.29B postings —
+    /// a 58M-doc / ~85-dims-per-doc prod reorder pass (~4.9B postings)
+    /// panicked with "mid > len" in the terms carving. The old 8 GB memory
+    /// budget masked the overflow by dropping dims; raising the budget
+    /// exposed it. Offsets must be u64.
+    #[test]
+    fn test_csr_offsets_do_not_wrap_past_u32() {
+        let counts = [1_500_000_000u32; 3]; // 4.5B total > u32::MAX
+        let offsets = build_csr_offsets(&counts);
+        assert_eq!(
+            offsets,
+            vec![0, 1_500_000_000, 3_000_000_000, 4_500_000_000]
+        );
+        assert!(*offsets.last().unwrap() > u32::MAX as u64);
+    }
+
     /// Build a simple forward index from (doc_id, terms) pairs.
     fn make_fwd(docs: &[&[u32]], num_terms: usize) -> ForwardIndex {
         let mut terms = Vec::new();
-        let mut offsets = vec![0u32];
+        let mut offsets = vec![0u64];
         for doc_terms in docs {
             terms.extend_from_slice(doc_terms);
-            offsets.push(terms.len() as u32);
+            offsets.push(terms.len() as u64);
         }
         ForwardIndex {
             terms,
