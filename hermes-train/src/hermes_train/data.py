@@ -47,29 +47,50 @@ def _iter_texts(lines: Iterator[str]) -> Iterator[str]:
             yield text
 
 
+TOKENIZE_BATCH = 20_000
+
+
 class Dataset:
-    """Flat EOS-joined token stream with fixed-window sampling."""
+    """Flat EOS-joined token stream sampled as strided (non-overlapping)
+    windows — one epoch is one pass over the tokens.
+
+    Tokenization is parallel (HF ``encode_batch``) and cached next to the
+    source file as raw uint32 (``<file>.tokens.bin``), memory-mapped on
+    reload — corpus-scale runs restart in seconds instead of hours.
+    """
 
     def __init__(
         self, tokens: np.ndarray, seq_len: int, eos_token_id: int | None = None
     ) -> None:
-        self.tokens = tokens.astype(np.uint32, copy=False)
+        self.tokens = tokens if tokens.dtype == np.uint32 else tokens.astype(np.uint32)
         self.seq_len = seq_len
         self.eos_token_id = eos_token_id
 
     @classmethod
-    def _from_lines(
-        cls, lines: Iterator[str], tokenizer: Tokenizer, seq_len: int
-    ) -> Dataset:
-        all_tokens: list[int] = []
+    def _tokenize_to(
+        cls, lines: Iterator[str], tokenizer: Tokenizer, out: IO[bytes]
+    ) -> int:
+        total = 0
+        batch: list[str] = []
+
+        def flush() -> int:
+            if not batch:
+                return 0
+            encodings = tokenizer.inner.encode_batch(batch)
+            n = 0
+            for enc in encodings:
+                arr = np.array(enc.ids + [tokenizer.eos_token_id], dtype=np.uint32)
+                out.write(arr.tobytes())
+                n += len(arr)
+            batch.clear()
+            return n
+
         for text in _iter_texts(lines):
-            all_tokens.extend(tokenizer.encode(text))
-            all_tokens.append(tokenizer.eos_token_id)
-        return cls(
-            np.array(all_tokens, dtype=np.uint32),
-            seq_len,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+            batch.append(text)
+            if len(batch) >= TOKENIZE_BATCH:
+                total += flush()
+        total += flush()
+        return total
 
     @classmethod
     def from_files(
@@ -80,23 +101,48 @@ class Dataset:
                 with open_text(path) as f:
                     yield from f
 
-        return cls._from_lines(lines(), tokenizer, seq_len)
+        import io as _io
+
+        buf = _io.BytesIO()
+        cls._tokenize_to(lines(), tokenizer, buf)
+        tokens = np.frombuffer(buf.getvalue(), dtype=np.uint32)
+        return cls(tokens, seq_len, eos_token_id=tokenizer.eos_token_id)
 
     @classmethod
     def from_file(cls, path: str | Path, tokenizer: Tokenizer, seq_len: int) -> Dataset:
-        return cls.from_files([path], tokenizer, seq_len)
+        """Load with a sidecar token cache: tokenize once (parallel), then
+        memory-map ``<path>.tokens.bin`` on subsequent runs."""
+        path = Path(path)
+        cache = path.with_name(path.name + ".tokens.bin")
+        if not (cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime):
+            tmp = cache.with_suffix(".tmp")
+            with open(tmp, "wb") as out, open_text(path) as f:
+                n = cls._tokenize_to(iter(f), tokenizer, out)
+            tmp.rename(cache)
+            print(f"tokenized {path.name}: {n} tokens → {cache.name}")
+        tokens = np.memmap(cache, dtype=np.uint32, mode="r")
+        return cls(tokens, seq_len, eos_token_id=tokenizer.eos_token_id)
 
     @classmethod
     def from_stdin(cls, tokenizer: Tokenizer, seq_len: int) -> Dataset:
-        return cls._from_lines(iter(sys.stdin), tokenizer, seq_len)
+        import io as _io
+
+        buf = _io.BytesIO()
+        cls._tokenize_to(iter(sys.stdin), tokenizer, buf)
+        tokens = np.frombuffer(buf.getvalue(), dtype=np.uint32)
+        return cls(tokens, seq_len, eos_token_id=tokenizer.eos_token_id)
 
     def __len__(self) -> int:
-        return max(0, len(self.tokens) - self.seq_len)
+        """Number of non-overlapping (seq_len+1)-token windows."""
+        return max(0, (len(self.tokens) - 1) // self.seq_len)
 
     def get_batch(
         self, indices: np.ndarray, device: torch.device, with_doc_ids: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        windows = np.stack([self.tokens[i : i + self.seq_len + 1] for i in indices])
+        starts = indices * self.seq_len
+        windows = np.stack(
+            [np.asarray(self.tokens[i : i + self.seq_len + 1]) for i in starts]
+        )
         batch = torch.from_numpy(windows.astype(np.int64)).to(device)
         inputs = batch[:, :-1].contiguous()
 
