@@ -56,6 +56,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "cubecl")]
+pub mod cubecl_kernels;
 pub mod generate;
 /// Model Architecture Language (MAL) — re-exported from the standalone
 /// `hermes-mal` crate, which is the single source of truth shared with the

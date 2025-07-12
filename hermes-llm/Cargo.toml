@@ -19,6 +19,14 @@ candle-flash-attn = { version = "0.11", optional = true }
 # Fused Metal selective-scan kernel (docs/metal-selective-scan.md)
 candle-metal-kernels = { version = "0.11", optional = true }
 objc2-metal = { version = "0.3", optional = true }
+# CubeCL — one #[cube] kernel targets CUDA + Metal(wgpu) + CPU. OFF by default;
+# the wgpu runtime is pure Rust (Metal on macOS). See docs/cubecl-migration.md.
+# Pinned to 0.10.0. cubecl-cpu is intentionally NOT pulled in: it depends on
+# tracel-llvm (bundled LLVM/MLIR), a heavy system build — see the migration doc.
+cubecl = { version = "=0.10.0", default-features = false, features = [
+    "wgpu",
+    "std",
+], optional = true }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
 tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
@@ -68,6 +76,10 @@ metal = [
 ]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 flash-attn = ["cuda", "candle-flash-attn"]
+# Portable Mamba kernels (depthwise conv1d + selective scan) via CubeCL. OFF by
+# default; adds the wgpu (Metal/Vulkan/DX) runtime. Enable CUDA too via cubecl-cuda.
+cubecl = ["dep:cubecl"]
+cubecl-cuda = ["cubecl", "cubecl/cuda"]
 
 [[bin]]
 name = "hermes-llm"
