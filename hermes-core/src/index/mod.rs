@@ -117,15 +117,16 @@ impl Default for IndexConfig {
             reload_interval_ms: 1000, // 1 second default
             max_concurrent_merges: 4,
             merge_bp_time_budget: Some(std::time::Duration::from_secs(600)),
-            // 8 GB — mirrors segment::reorder::DEFAULT_MEMORY_BUDGET (that
+            // 24 GB — mirrors segment::reorder::DEFAULT_MEMORY_BUDGET (that
             // module is native-only; IndexConfig also compiles for wasm).
             // A cap, not an allocation: usage is proportional to the segment
-            // being reordered; the cap only bites on 10M+ doc passes (2 GB
-            // dropped ~10% of eligible dims on 18M-doc merges).
-            // 8 GB overflows 32-bit usize (wasm32) — reorder never runs
+            // being reordered (~4 B/posting + ~28 B/doc). Sized from prod
+            // evidence: a 58M-doc/5B-posting pass estimated 20.1 GB, which
+            // 8/16 GB budgets trimmed by dropping highest-df dims.
+            // 24 GB overflows 32-bit usize (wasm32) — reorder never runs
             // there, so any large value works; use usize::MAX.
             #[cfg(target_pointer_width = "64")]
-            bp_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            bp_memory_budget_bytes: 24 * 1024 * 1024 * 1024,
             #[cfg(not(target_pointer_width = "64"))]
             bp_memory_budget_bytes: usize::MAX,
         }

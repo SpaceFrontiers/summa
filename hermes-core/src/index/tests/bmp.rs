@@ -2686,3 +2686,70 @@ async fn test_bmp_block_posting_overflow_256() {
     // every posting slice past the old u16 wrap point.
     assert_eq!(fwd.total_postings(), 300 * 256);
 }
+
+/// Regression: the optimizer's reorder candidates are scanned long before the
+/// pass runs (hours behind under load). If a merge consumes the candidate in
+/// the meantime, the reorder must SKIP it — the inventory guard only covers
+/// concurrent work, not stale candidates. Before the fix, a stale reorder of
+/// a merged-away segment (files still on disk, held by a searcher snapshot)
+/// succeeded and re-inserted a duplicate copy of its docs next to the merge
+/// output; when the files were already deleted it surfaced as
+/// "failed to reorder ...: No such file or directory" in prod.
+#[tokio::test]
+async fn test_reorder_skips_segment_consumed_by_merge() {
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+    // One Index instance throughout: searcher snapshot, force_merge, and the
+    // stale reorder must all share the same SegmentManager/tracker, as in the
+    // server — that is what keeps the merged-away files on disk (deferred
+    // deletion), the dangerous variant of the race.
+    let index = Index::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    // Two commits → two segments
+    for seg in 0..2 {
+        for i in 0..300u32 {
+            let mut doc = Document::new();
+            doc.add_sparse_vector(sparse, vec![(seg * 1000 + i, 1.0), (50_000 + i % 7, 0.5)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+
+    let segs = index.segment_readers().await.unwrap();
+    assert_eq!(segs.len(), 2);
+    let victim = crate::segment::SegmentId(segs[0].meta().id).to_hex();
+    let total_docs: u32 = segs.iter().map(|s| s.num_docs()).sum();
+    drop(segs);
+
+    // Hold a searcher snapshot so the merged-away source files stay on disk.
+    let reader = index.reader().await.unwrap();
+    let _searcher = reader.searcher().await.unwrap();
+
+    writer.force_merge().await.unwrap();
+
+    // Stale candidate: reorder the segment the merge just consumed.
+    let reordered = index
+        .segment_manager()
+        .reorder_single_segment(&victim, None, crate::segment::BpBudget::full())
+        .await
+        .unwrap();
+    assert!(
+        !reordered,
+        "stale reorder of a merged-away segment must skip"
+    );
+
+    // No duplicate docs may appear.
+    let index2 = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let segs2 = index2.segment_readers().await.unwrap();
+    let total_after: u32 = segs2.iter().map(|s| s.num_docs()).sum();
+    assert_eq!(
+        total_after, total_docs,
+        "reordering a merged-away segment duplicated its documents"
+    );
+}

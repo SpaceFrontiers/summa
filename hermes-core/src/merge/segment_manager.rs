@@ -524,6 +524,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         {
             let mut st = self.state.lock().await;
+            // Every source must still be live: callers hold the inventory
+            // guard, so a missing source means a stale merge/reorder whose
+            // input was already replaced — adding the output would duplicate
+            // its documents. The orphaned output files are swept by
+            // cleanup_orphan_segments.
+            let missing: Vec<&String> = old_ids
+                .iter()
+                .filter(|id| !st.metadata.has_segment(id))
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::Corruption(format!(
+                    "replace_segments: source segment(s) {:?} not in metadata — \
+                     refusing to add output {} (would duplicate documents)",
+                    missing, new_id
+                )));
+            }
             // Compute generation from parents before removing them
             let parent_gen = old_ids
                 .iter()
@@ -949,6 +965,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 return Ok(false);
             }
         };
+
+        // The inventory guard only excludes CONCURRENT merges. Candidates are
+        // scanned ahead of time and can go stale: a merge may have consumed
+        // this segment since. Its files may even still be on disk (deferred
+        // deletion under a searcher snapshot) — reordering them would
+        // re-insert a duplicate copy of docs the merge output already holds.
+        {
+            let st = self.state.lock().await;
+            if !st.metadata.has_segment(seg_id) {
+                log::info!(
+                    "[optimizer] segment {} no longer in metadata (merged away), skipping reorder",
+                    seg_id
+                );
+                return Ok(false);
+            }
+        }
 
         let (new_id, total_docs, bp_converged) = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),

@@ -921,6 +921,17 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         config.bmp_block_size = adjusted;
     }
+    if let Some(bits) = idx_cfg.bmp_grid_bits {
+        if bits == 2 || bits == 4 {
+            config.bmp_grid_bits = bits;
+        } else {
+            log::warn!(
+                "bmp_grid_bits {} unsupported (must be 2 or 4), using 4",
+                bits
+            );
+            config.bmp_grid_bits = 4;
+        }
+    }
     if let Some(p) = idx_cfg.pruning {
         let clamped = p.clamp(0.0, 1.0);
         if (clamped - p).abs() > f32::EPSILON {
@@ -1628,6 +1639,29 @@ mod tests {
         // Default block size stays 64
         let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
         assert_eq!(config2.bmp_block_size, 64);
+    }
+
+    /// Regression: `bmp_grid_bits` parsed but was never applied to the field
+    /// config — SDL said 2, segments silently built 4-bit grids.
+    #[test]
+    fn test_sparse_vector_bmp_grid_bits() {
+        let sdl = r#"
+            index documents {
+                field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, bmp_block_size: 256, bmp_grid_bits: 2>]
+                field emb2: sparse_vector<u32> [indexed<format: bmp, dims: 30522>]
+                field emb3: sparse_vector<u32> [indexed<format: bmp, dims: 30522, bmp_grid_bits: 3>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config1 = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config1.bmp_grid_bits, 2);
+        // Default stays 4
+        let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config2.bmp_grid_bits, 4);
+        // Unsupported width falls back to 4 with a warning
+        let config3 = indexes[0].fields[2].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config3.bmp_grid_bits, 4);
     }
 
     #[test]

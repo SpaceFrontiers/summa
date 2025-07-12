@@ -123,7 +123,9 @@ query pool:
 - `IndexConfig::default()` now uses `TieredMergePolicy::large_scale()` (the
   server already did). Tier floors only shape _when_ segments merge, and
   merge-time BP is wall-clock budgeted, so the policy is safe at any scale.
-- `bp_memory_budget_bytes` default 2 GB → 8 GB (`--bp-memory-budget-mb`
-  default 8192). It is a cap, not an allocation — memory use is proportional
-  to the segment actually being reordered; the cap only bites on 10M+ doc
-  passes, where 2 GB was dropping ~10% of eligible dims.
+- `bp_memory_budget_bytes` default 2 GB → 24 GB (`--bp-memory-budget-mb`
+  default 24576). It is a cap, not an allocation — memory use is proportional
+  to the segment actually being reordered (~4 B/posting + ~28 B/doc). Sized
+  from prod evidence: a 58M-doc / 5B-posting pass estimated 20.1 GB; smaller
+  budgets trimmed it by dropping highest-df dims (2 GB dropped ~10% of
+  eligible dims on 18M-doc merges).
