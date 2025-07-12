@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-train"
-version = "1.8.56"
+version = "1.8.57"
 description = "PyTorch training for Hermes LLMs (MAL-defined models, safetensors checkpoints served by hermes-llm)"
 readme = "README.md"
 license = "MIT"
