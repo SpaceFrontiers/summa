@@ -115,13 +115,26 @@ pub struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    pub fn new(head_dim: usize, max_seq_len: usize, theta: f64, device: &Device) -> Result<Self> {
+    /// `scaling` is linear position interpolation (NTK-free): positions are
+    /// divided by the factor, extending the effective context. `None`/`<=1`
+    /// means no scaling.
+    pub fn new(
+        head_dim: usize,
+        max_seq_len: usize,
+        theta: f64,
+        scaling: Option<f64>,
+        device: &Device,
+    ) -> Result<Self> {
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1.0 / (theta as f32).powf(i as f32 / head_dim as f32))
             .collect();
         let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
-        let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32).collect();
+        let scale = match scaling {
+            Some(s) if s > 1.0 => s as f32,
+            _ => 1.0,
+        };
+        let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32 / scale).collect();
         let positions = Tensor::new(positions.as_slice(), device)?.unsqueeze(1)?;
         let freqs = positions.matmul(&inv_freq.unsqueeze(0)?)?;
         let cos = freqs.cos()?;
@@ -618,6 +631,7 @@ impl MambaMixer {
         mut state: Option<&mut MambaState>,
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
+        let use_fused = crate::metal_scan::fused_supported(x.device(), x.dtype(), self.state_dim);
 
         // Input projection → x, z gates
         let xz = self.in_proj.forward(x)?; // [B, L, 2*di]
@@ -638,7 +652,7 @@ impl MambaMixer {
                 .narrow(2, total - (self.conv_kernel - 1), self.conv_kernel - 1)?
                 .contiguous()?;
         }
-        let conv = if crate::metal_scan::fused_supported(x.device(), x.dtype(), self.state_dim) {
+        let conv = if use_fused {
             // Candle lowers grouped conv1d to one conv per group — ~16k
             // dispatches per decoded token with groups == d_inner (measured
             // 98% of Metal decode time). Fused: one dispatch, bias included.
@@ -678,7 +692,7 @@ impl MambaMixer {
             Some(s) => s.h.clone(),
             None => Tensor::zeros((batch, self.d_inner, self.state_dim), x.dtype(), x.device())?,
         };
-        let (y, h) = if crate::metal_scan::fused_supported(x.device(), x.dtype(), self.state_dim) {
+        let (y, h) = if use_fused {
             // Single-dispatch fused scan (docs/metal-selective-scan.md);
             // inputs/outputs packed to fit CustomOp3's 3-in/1-out shape.
             let xd = Tensor::cat(&[&xs, &delta], 2)?.contiguous()?;
@@ -941,22 +955,37 @@ impl Transformer {
             .map(|i| config.block_for_layer(i))
             .filter(|b| !b.is_ssm())
             .collect();
-        let (rope_head_dim, rope_theta) = match attn_blocks.first() {
+        // Only RoPE (or None) is implemented; fail loud rather than silently
+        // applying RoPE to a block that configured alibi/learned encodings.
+        for b in &attn_blocks {
+            match &b.attention.position_encoding {
+                crate::mal::PositionEncoding::Rope { .. } | crate::mal::PositionEncoding::None => {}
+                other => candle_core::bail!(
+                    "position_encoding {other:?} is not implemented for inference; \
+                     only rope and none are supported"
+                ),
+            }
+        }
+        let (rope_head_dim, rope_theta, rope_scaling) = match attn_blocks.first() {
             Some(first) => {
                 let hd = first.head_dim(config.hidden_size);
                 let theta = first.rope_theta();
+                let scaling = first.rope_scaling();
                 for b in &attn_blocks {
-                    if b.head_dim(config.hidden_size) != hd || b.rope_theta() != theta {
+                    if b.head_dim(config.hidden_size) != hd
+                        || b.rope_theta() != theta
+                        || b.rope_scaling() != scaling
+                    {
                         candle_core::bail!(
-                            "all attention blocks must share head_dim and rope theta \
-                             (shared RoPE table)"
+                            "all attention blocks must share head_dim, rope theta, and \
+                             rope scaling (shared RoPE table)"
                         );
                     }
                 }
-                (hd, theta)
+                (hd, theta, scaling)
             }
             // Pure-SSM model: RoPE is unused, build a minimal table
-            None => (2, 10000.0),
+            None => (2, 10000.0, None),
         };
 
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -986,8 +1015,13 @@ impl Transformer {
                 vb.pp("lm_head"),
             )?)
         };
-        let rope =
-            RotaryEmbedding::new(rope_head_dim, config.max_seq_len, rope_theta, vb.device())?;
+        let rope = RotaryEmbedding::new(
+            rope_head_dim,
+            config.max_seq_len,
+            rope_theta,
+            rope_scaling,
+            vb.device(),
+        )?;
         Ok(Self {
             embedding,
             layers,

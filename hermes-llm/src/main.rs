@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::Device;
 use clap::{Parser, Subcommand};
-use tracing::{Level, info, warn};
+use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 use hermes_llm::tokenizer::Tokenizer;
@@ -47,6 +47,14 @@ enum Commands {
         /// Top-k sampling
         #[arg(long)]
         top_k: Option<usize>,
+
+        /// RNG seed for reproducible sampling (random if unset)
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Keep generating for the full --max-tokens instead of stopping at EOS
+        #[arg(long, default_value_t = false)]
+        no_eos: bool,
 
         /// Use GPU (Metal on macOS, CUDA on Linux/Windows); pass `--gpu false` for CPU
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -100,14 +108,11 @@ fn get_model_def(name: &str) -> Result<hermes_llm::ModelDef> {
         return Ok(model_def);
     }
 
-    // Try to load from .mal file if it exists
+    // Try to load from .mal file if it exists — surface the real parse error
+    // rather than a misleading "unknown model".
     if std::path::Path::new(name).exists() {
-        match hermes_llm::parse_mal_file(name) {
-            Ok(model_def) => return Ok(model_def),
-            Err(e) => {
-                warn!("Failed to parse MAL file '{}': {}", name, e);
-            }
-        }
+        return hermes_llm::parse_mal_file(name)
+            .with_context(|| format!("failed to parse MAL file '{name}'"));
     }
 
     anyhow::bail!(
@@ -134,6 +139,8 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             top_k,
+            seed,
+            no_eos,
             gpu,
         } => {
             let device = get_device(gpu, 0)?;
@@ -159,8 +166,14 @@ fn main() -> Result<()> {
             info!("Prompt tokens: {:?}", prompt_tokens);
 
             let generator = hermes_llm::TextGenerator::new(&model, &device);
-            let output_tokens =
-                generator.generate(&prompt_tokens, max_tokens, temperature, top_k)?;
+            let sampling = hermes_llm::generate::SamplingConfig {
+                max_new_tokens: max_tokens,
+                temperature,
+                top_k,
+                eos_token: (!no_eos).then(|| tokenizer.eos_token_id()),
+                seed,
+            };
+            let output_tokens = generator.generate(&prompt_tokens, &sampling)?;
 
             let output_text = tokenizer.decode(&output_tokens, true)?;
             println!("\n{}", output_text);

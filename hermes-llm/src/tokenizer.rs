@@ -2,6 +2,19 @@ use anyhow::Result;
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
 
+// Common special-token spellings across tokenizer families — kept in lockstep
+// with hermes-train/src/hermes_train/tokenizer.py so train and serve resolve
+// the same ids.
+const EOS_NAMES: &[&str] = &[
+    "<eos>",
+    "<|endoftext|>",
+    "</s>",
+    "<|end_of_text|>",
+    "<|eot_id|>",
+];
+const PAD_NAMES: &[&str] = &["<pad>", "<|padding|>", "<|pad|>"];
+const BOS_NAMES: &[&str] = &["<bos>", "<|begin_of_text|>", "<s>", "<|startoftext|>"];
+
 pub struct Tokenizer {
     inner: HfTokenizer,
     pad_token_id: u32,
@@ -13,11 +26,25 @@ impl Tokenizer {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let inner = HfTokenizer::from_file(path).map_err(|e| anyhow::anyhow!("{}", e))?;
         let vocab_size = inner.get_vocab_size(true) as u32;
+        anyhow::ensure!(vocab_size > 0, "tokenizer has an empty vocabulary");
+        // EOS is load-bearing (stop token); resolve it from known names before
+        // falling back to a raw id, and warn loudly if the fallback is used.
+        let resolve = |names: &[&str]| names.iter().find_map(|n| inner.token_to_id(n));
+        let eos_token_id = resolve(EOS_NAMES).unwrap_or_else(|| {
+            let fallback = 2.min(vocab_size - 1);
+            tracing::warn!(
+                "no known EOS token in tokenizer; falling back to id {fallback}. \
+                 Generation stop-on-EOS may be wrong — set it explicitly."
+            );
+            fallback
+        });
+        let pad_token_id = resolve(PAD_NAMES).unwrap_or(eos_token_id);
+        let bos_token_id = resolve(BOS_NAMES).unwrap_or(eos_token_id);
         Ok(Self {
             inner,
-            pad_token_id: 0,
-            bos_token_id: 1,
-            eos_token_id: 2.min(vocab_size - 1),
+            pad_token_id,
+            bos_token_id,
+            eos_token_id,
         })
     }
 
