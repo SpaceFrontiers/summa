@@ -34,6 +34,8 @@ dependencies = [
 [project.optional-dependencies]
 # Fused Mamba-2 selective-scan kernels (CUDA only)
 mamba = ["mamba-ssm>=2.2"]
+# Live training-curve dashboard (enabled at runtime via WANDB_API_KEY)
+wandb = ["wandb>=0.18"]
 
 [project.scripts]
 hermes-train = "hermes_train.cli:main"
