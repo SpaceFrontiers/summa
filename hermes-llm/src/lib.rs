@@ -57,7 +57,10 @@
 //! ```
 
 pub mod generate;
-pub mod mal;
+/// Model Architecture Language (MAL) — re-exported from the standalone
+/// `hermes-mal` crate, which is the single source of truth shared with the
+/// Python `hermes_mal` PyO3 bindings used by `hermes-train`.
+pub use hermes_mal as mal;
 pub mod metal_scan;
 pub mod model;
 pub mod remote;

@@ -260,10 +260,16 @@ wheels = [
 ]
 
 [[package]]
+name = "hermes-mal"
+version = "1.8.54"
+source = { directory = "../hermes-mal-py" }
+
+[[package]]
 name = "hermes-train"
 version = "1.8.54"
 source = { editable = "." }
 dependencies = [
+    { name = "hermes-mal" },
     { name = "numpy" },
     { name = "safetensors" },
     { name = "tokenizers" },
@@ -289,6 +295,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hermes-mal", directory = "../hermes-mal-py" },
     { name = "mamba-ssm", marker = "extra == 'mamba'", specifier = ">=2.2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "safetensors", specifier = ">=0.4" },

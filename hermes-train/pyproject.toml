@@ -29,6 +29,8 @@ dependencies = [
     "numpy>=1.26",
     "zstandard>=0.22",
     "tqdm>=4.66",
+    # Rust MAL parser (PyO3) — single source of truth for `.mal` definitions.
+    "hermes-mal",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +58,8 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+# Build the Rust MAL parser (hermes-mal-py, maturin) from the local workspace.
+hermes-mal = { path = "../hermes-mal-py" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_train"]

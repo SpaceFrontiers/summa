@@ -1,10 +1,13 @@
-"""Drift guard for the in-process MAL parser.
+"""Drift guard + wheel smoke-test for the MAL parser.
 
-For every well-known preset, the pure-Python parser in `hermes_train.mal` must
-produce a dict byte-for-byte identical to the canonical JSON emitted by
-`hermes-llm export`. The fixtures under tests/fixtures/mal/ pair each `.mal`
-source with its expected `.json` (regenerate with `hermes-llm export` when the
-Rust schema changes). Plus negative tests for fail-loud behavior.
+`hermes_train.mal` is now a thin wrapper over the Rust `hermes-mal` parser
+(exposed via the `hermes_mal` PyO3 module). For every well-known preset the
+parsed dict must be byte-for-byte identical to the canonical JSON emitted by
+`hermes-llm export` — which, since both sides now run the *same* Rust parser,
+also smoke-tests that the wheel is built and wired into this environment. The
+fixtures under tests/fixtures/mal/ pair each `.mal` source with its expected
+`.json` (regenerate with `hermes-llm export` when the Rust schema changes).
+Plus negative tests for fail-loud behavior (Rust raises `ValueError`).
 """
 
 import json
@@ -81,7 +84,8 @@ def test_pattern_undefined_block_raises() -> None:
 
 
 def test_unknown_property_key_raises() -> None:
-    with pytest.raises(MalError, match="unknown attention property"):
+    # The Rust (pest) grammar rejects unknown keys with a "Parse error".
+    with pytest.raises(MalError, match="Parse error"):
         parse_mal(
             "attention a { num_heads: 4 bogus: 5 }\n"
             "ffn f { hidden_dim: 64 }\n"
@@ -92,7 +96,7 @@ def test_unknown_property_key_raises() -> None:
 
 
 def test_unknown_model_property_raises() -> None:
-    with pytest.raises(MalError, match="unknown model property"):
+    with pytest.raises(MalError, match="Parse error"):
         parse_mal(
             "block b { attention: { num_heads: 4 } ffn: { hidden_dim: 64 } }\n"
             "model m { vocab_size: 100 hidden_size: 32 num_layers: 2 "
@@ -101,5 +105,5 @@ def test_unknown_model_property_raises() -> None:
 
 
 def test_no_model_raises() -> None:
-    with pytest.raises(MalError, match="no model definition"):
+    with pytest.raises(MalError, match="No model definition"):
         parse_mal("ffn f { hidden_dim: 64 }")

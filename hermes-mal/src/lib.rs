@@ -64,7 +64,7 @@ use std::collections::HashMap;
 struct WellKnown;
 
 #[derive(Parser)]
-#[grammar = "mal/mal.pest"]
+#[grammar = "mal.pest"]
 pub struct MalParser;
 
 // ============================================================================
