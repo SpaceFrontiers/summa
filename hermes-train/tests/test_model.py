@@ -1,13 +1,22 @@
 """Naming-contract and training smoke tests."""
 
 import json
+import math
 
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
+from tokenizers import Tokenizer as HfTok
+from tokenizers import decoders, models, pre_tokenizers, trainers
+
+from hermes_train import model as model_mod
 from hermes_train.config import ModelDef
-from hermes_train.model import Transformer, cross_entropy_loss
+from hermes_train.data import DataLoader, Dataset
+from hermes_train.model import MambaMixer, Transformer, cross_entropy_loss
 from hermes_train.muon import build_optimizers
+from hermes_train.tokenizer import Tokenizer, train_bpe
+from hermes_train.train import Trainer, get_lr_wsd
 
 # Matches `hermes-llm export --model tiny` (GQA + gate exercised via overrides below)
 TINY_JSON = {
@@ -125,7 +134,6 @@ def test_train_step_reduces_loss(config):
 
 
 def test_checkpoint_roundtrip(config, tmp_path):
-    from safetensors.torch import load_file, save_file
 
     model = Transformer(config)
     path = tmp_path / "ckpt.safetensors"
@@ -276,9 +284,6 @@ def test_qk_norm(hybrid_config):
 def test_tokenizer_special_name_resolution(tmp_path):
     """EOS/PAD must resolve from family-specific special-token names, not
     fall back to arbitrary ids (breaks doc masking + generation stop)."""
-    from hermes_train.tokenizer import Tokenizer
-    from tokenizers import Tokenizer as HfTok
-    from tokenizers import decoders, models, pre_tokenizers, trainers
 
     # Build a small tokenizer whose specials use GPT-NeoX-style names
     hf = HfTok(models.BPE())
@@ -298,14 +303,12 @@ def test_tokenizer_special_name_resolution(tmp_path):
 
 def test_train_bpe_extracts_jsonl_text(tmp_path):
     """train_bpe must tokenize the `text` field, not raw JSON syntax."""
-    import json as _json
-
-    from hermes_train.tokenizer import train_bpe
 
     src = tmp_path / "corpus.jsonl"
     with open(src, "w") as f:
-        for _ in range(50):
-            f.write(_json.dumps({"text": "the quick brown fox " * 20}) + "\n")
+        f.writelines(
+            json.dumps({"text": "the quick brown fox " * 20}) + "\n" for _ in range(50)
+        )
     tok = train_bpe([str(src)], str(tmp_path / "tok.json"), vocab_size=280)
     vocab = tok.inner.get_vocab()
     # JSON structural tokens must not dominate the learned vocab
@@ -316,8 +319,6 @@ def test_train_bpe_extracts_jsonl_text(tmp_path):
 
 def test_wandb_disabled_without_key(config, monkeypatch):
     """Training must run identically with no WANDB_API_KEY (hook stays off)."""
-    from hermes_train.data import DataLoader, Dataset
-    from hermes_train.train import Trainer
 
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     trainer = Trainer(config, lr=1e-2, warmup_steps=2, device=torch.device("cpu"))
@@ -336,8 +337,6 @@ def test_wandb_logging_path_len(config):
     first log with TypeError — invisible in every disabled run because that
     branch is dead code. Exercise the enabled branch with a capturing stub.
     """
-    from hermes_train.data import DataLoader, Dataset
-    from hermes_train.train import Trainer
 
     tokens = (np.arange(5000) % config.vocab_size).astype(np.uint32)
     loader = DataLoader(Dataset(tokens, seq_len=16, eos_token_id=0), batch_size=4)
@@ -365,9 +364,6 @@ def test_wandb_logging_path_len(config):
 def test_save_every_snapshots_midrun(config, tmp_path):
     """save_every writes a loadable weights.safetensors during the epoch,
     without stopping training — the basis for mid-run evaluation."""
-    from hermes_train.data import DataLoader, Dataset
-    from hermes_train.train import Trainer
-    from safetensors.torch import load_file
 
     tokens = (np.arange(5000) % config.vocab_size).astype(np.uint32)
     loader = DataLoader(Dataset(tokens, seq_len=16, eos_token_id=0), batch_size=4)
@@ -384,7 +380,6 @@ def test_save_every_snapshots_midrun(config, tmp_path):
 
 
 def test_wsd_schedule():
-    from hermes_train.train import get_lr_wsd
 
     total, warmup = 1000, 100
     assert get_lr_wsd(0, warmup, 1.0, 0.1, total) == 0.0
@@ -399,7 +394,6 @@ def test_wsd_schedule():
 
 def test_document_masking(hybrid_config):
     """Positions past the conv tail in doc 2 must be independent of doc 1."""
-    from hermes_train.data import Dataset
 
     eos = 0
     # Two windows: identical after the boundary, different before it
@@ -434,7 +428,6 @@ def test_document_masking(hybrid_config):
 
 
 def test_tied_embeddings(hybrid_config, tmp_path):
-    from safetensors.torch import load_file, save_file
 
     hybrid_config.embeddings.tie_weights = True
     model = Transformer(hybrid_config)
@@ -460,15 +453,12 @@ def test_tied_embeddings(hybrid_config, tmp_path):
     assert model.embedding.weight.grad is not None
 
     # Sane init: tied logits shouldn't explode initial loss far past ln(V)
-    import math
 
     assert loss.item() < math.log(hybrid_config.vocab_size) * 1.5
 
 
 def test_fused_kernel_dispatch(hybrid_config):
     """Off-CUDA the reference scan must be used; fused path needs mamba-ssm."""
-    from hermes_train import model as model_mod
-    from hermes_train.model import MambaMixer
 
     mixer = MambaMixer(hybrid_config, hybrid_config.block_for_layer(0).ssm)
     x = torch.randn(1, 8, hybrid_config.hidden_size)
@@ -482,7 +472,6 @@ def test_fused_kernel_dispatch(hybrid_config):
 
 
 def test_hybrid_checkpoint_roundtrip(hybrid_config, tmp_path):
-    from safetensors.torch import load_file, save_file
 
     model = Transformer(hybrid_config)
     path = tmp_path / "hybrid.safetensors"
@@ -496,7 +485,6 @@ def test_hybrid_checkpoint_roundtrip(hybrid_config, tmp_path):
 
 
 def test_dataloader_resume_and_sharding(config):
-    from hermes_train.data import DataLoader, Dataset
 
     tokens = np.arange(1000, dtype=np.uint32)
     ds = Dataset(tokens, seq_len=16)
@@ -517,3 +505,103 @@ def test_dataloader_resume_and_sharding(config):
     loader.set_position(3 * 8)
     tail = list(map(tuple, loader))
     assert tail == full[3:]
+
+
+def test_forward_targets_matches_cross_entropy(config):
+    """The chunked in-forward loss must equal the plain full-logits CE."""
+    torch.manual_seed(0)
+    model = Transformer(config).eval()
+    ids = torch.randint(0, config.vocab_size, (2, 16))
+    targets = torch.randint(0, config.vocab_size, (2, 16))
+    for chunks in (1, 4, 16):
+        model.loss_chunks = chunks
+        fused = model(ids, targets=targets)
+        full = cross_entropy_loss(model(ids), targets)
+        assert torch.allclose(fused, full, atol=1e-5), f"chunks={chunks}"
+
+
+def test_gradient_accumulation_equivalence(config):
+    """Accumulating two half-batches (each scaled 1/2) must match one full
+    backward — pins the grad-accumulation contract."""
+    torch.manual_seed(0)
+    model = Transformer(config)
+    ids = torch.randint(0, config.vocab_size, (4, 16))
+    targets = torch.randint(0, config.vocab_size, (4, 16))
+
+    model.zero_grad()
+    cross_entropy_loss(model(ids), targets).backward()
+    full = [p.grad.clone() for p in model.parameters()]
+
+    model.zero_grad()
+    for mb in (slice(0, 2), slice(2, 4)):
+        (cross_entropy_loss(model(ids[mb]), targets[mb]) / 2).backward()
+    accum = [p.grad.clone() for p in model.parameters()]
+
+    for a, b in zip(full, accum, strict=True):
+        assert torch.allclose(a, b, atol=1e-4)
+
+
+def test_grad_checkpoint_matches(config):
+    """Gradient checkpointing must not change the loss."""
+    torch.manual_seed(0)
+    model = Transformer(config).train()
+    ids = torch.randint(0, config.vocab_size, (2, 16))
+    targets = torch.randint(0, config.vocab_size, (2, 16))
+    model.gradient_checkpointing = False
+    base = model(ids, targets=targets)
+    model.gradient_checkpointing = True
+    ckpt = model(ids, targets=targets)
+    assert torch.allclose(base, ckpt, atol=1e-5)
+
+
+def test_resume_restores_optimizer_state(config, tmp_path):
+    """--resume must reload optimizer moments, not restart them cold."""
+    dev = torch.device("cpu")
+    t1 = Trainer(config, lr=1e-2, warmup_steps=1, device=dev)
+    ids = torch.randint(0, config.vocab_size, (2, 16))
+    targets = torch.randint(0, config.vocab_size, (2, 16))
+    for _ in range(3):
+        loss = t1._forward_loss(ids, targets, None)
+        loss.backward()
+        for opt in t1.optimizers:
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        t1.global_step += 1
+    t1.save_training_state(tmp_path, epoch=0, batch_position=0)
+    assert (tmp_path / "optim_state.pt").exists()
+
+    t2 = Trainer(config, lr=1e-2, warmup_steps=1, device=dev)
+    state = t2.load_training_state(tmp_path)
+    assert state["global_step"] == 3
+    # Weights restored…
+    for p1, p2 in zip(t1.model.parameters(), t2.model.parameters(), strict=True):
+        assert torch.allclose(p1, p2)
+    # …and optimizer state is warm (non-empty), not a cold restart.
+    assert all(len(o.state_dict()["state"]) > 0 for o in t2.optimizers)
+
+
+def test_empty_dataset_raises(config):
+    """A dataset too small to yield a batch must fail loud, not no-op."""
+    ds = Dataset(np.arange(4, dtype=np.uint32), seq_len=16, eos_token_id=0)
+    with pytest.raises(ValueError, match="no batches"):
+        DataLoader(ds, batch_size=4)
+
+
+def test_tokenizer_fingerprint_changes_with_tokenizer():
+    """Cache keys use the fingerprint; different tokenizers must differ so a
+    changed tokenizer never reuses stale token caches."""
+
+    def make(specials):
+        tok = HfTok(models.BPE())
+        tok.pre_tokenizer = pre_tokenizers.ByteLevel()
+        tok.decoder = decoders.ByteLevel()
+        tok.train_from_iterator(
+            ["the quick brown fox jumps over the lazy dog"] * 50,
+            trainers.BpeTrainer(vocab_size=300, special_tokens=specials),
+        )
+        return Tokenizer(tok)
+
+    fp_a = make(["<eos>"]).fingerprint()
+    fp_b = make(["<eos>", "<pad>"]).fingerprint()
+    assert fp_a != fp_b
+    assert fp_a == make(["<eos>"]).fingerprint()  # stable

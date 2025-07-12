@@ -22,10 +22,12 @@ Math parity notes (vs model.rs):
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from hermes_train.config import BlockDef, ModelDef, SsmDef
 
@@ -275,8 +277,6 @@ class MambaMixer(nn.Module):
     def forward(self, x: Tensor, doc_ids: Tensor | None = None) -> Tensor:
         if _selective_scan_fn is not None and x.is_cuda:
             if doc_ids is not None and not MambaMixer._warned_fused_doc_masking:
-                import warnings
-
                 warnings.warn(
                     "fused selective_scan_fn does not support document-boundary "
                     "state resets (Mamba-1 kernel has no seq_idx); SSM state "
@@ -430,17 +430,22 @@ class TransformerBlock(nn.Module):
             x = x + h if self.use_residual else h
             h = self.feed_forward(self.ffn_norm(x))
             return x + h if self.use_residual else h
-        else:
-            h = self._mix(x, rope, start_pos, doc_ids)
-            x = self.attn_norm(x + h if self.use_residual else h)
-            h = self.feed_forward(x)
-            return self.ffn_norm(x + h if self.use_residual else h)
+        h = self._mix(x, rope, start_pos, doc_ids)
+        x = self.attn_norm(x + h if self.use_residual else h)
+        h = self.feed_forward(x)
+        return self.ffn_norm(x + h if self.use_residual else h)
 
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelDef) -> None:
         super().__init__()
         self.config = config
+        # Recompute per-layer activations in backward instead of storing them
+        # (memory ↓, ~30% compute ↑). Toggled by the trainer via --grad-checkpoint.
+        self.gradient_checkpointing = False
+        # Number of sequence chunks for fused loss (see forward). More chunks =
+        # smaller peak logits tensor. 1 = materialize full [B, S, V] logits.
+        self.loss_chunks = 4
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         # GPT-style init: nn.Embedding's default N(0,1) explodes initial
         # logits (badly so with tied weights — init loss ~2x ln(V))
@@ -477,19 +482,50 @@ class Transformer(nn.Module):
         )
         self.rope = RotaryEmbedding(rope_head_dim, config.max_seq_len, rope_theta)
 
+    def _backbone(
+        self, input_ids: Tensor, start_pos: int, doc_ids: Tensor | None
+    ) -> Tensor:
+        x = self.embedding(input_ids)
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(
+                    layer, x, self.rope, start_pos, doc_ids, use_reentrant=False
+                )
+            else:
+                x = layer(x, self.rope, start_pos, doc_ids)
+        return self.final_norm(x)
+
+    def _out_weight(self) -> Tensor:
+        return self.embedding.weight if self.lm_head is None else self.lm_head.weight
+
     def forward(
         self,
         input_ids: Tensor,
         start_pos: int = 0,
         doc_ids: Tensor | None = None,
+        targets: Tensor | None = None,
     ) -> Tensor:
-        x = self.embedding(input_ids)
-        for layer in self.layers:
-            x = layer(x, self.rope, start_pos, doc_ids)
-        x = self.final_norm(x)
-        if self.lm_head is None:
-            return F.linear(x, self.embedding.weight)
-        return self.lm_head(x)
+        """Return logits ``[B, S, V]`` — or, when ``targets`` is given, the mean
+        cross-entropy loss computed in sequence chunks so the full-vocab logits
+        tensor is never materialized (the seq_len x vocab OOM). Passing targets
+        keeps the loss inside the (DDP-wrapped) forward, so grads sync correctly.
+        """
+        x = self._backbone(input_ids, start_pos, doc_ids)
+        weight = self._out_weight()
+        if targets is None:
+            return F.linear(x, weight)
+
+        chunks = max(1, min(self.loss_chunks, x.shape[1]))
+        total = torch.zeros((), device=x.device, dtype=torch.float32)
+        n_tokens = 0
+        for xc, tc in zip(
+            x.chunk(chunks, dim=1), targets.chunk(chunks, dim=1), strict=True
+        ):
+            logits = F.linear(xc, weight).float().flatten(0, 1)
+            tgt = tc.reshape(-1).long()
+            total = total + F.cross_entropy(logits, tgt, reduction="sum")
+            n_tokens += tgt.numel()
+        return total / max(n_tokens, 1)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

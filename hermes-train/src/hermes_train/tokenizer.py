@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import warnings
 from pathlib import Path
 
 from tokenizers import Tokenizer as HfTokenizer
 from tokenizers import decoders, models, pre_tokenizers, trainers
+
+from hermes_train.textio import open_text
 
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
@@ -20,18 +24,34 @@ class Tokenizer:
     def __init__(self, inner: HfTokenizer) -> None:
         self.inner = inner
         vocab_size = inner.get_vocab_size(True)
+        if vocab_size == 0:
+            raise ValueError("tokenizer has an empty vocabulary")
         # EOS is load-bearing (document joins, doc-masking boundaries, stop):
-        # resolve it from known names before falling back to a raw id.
-        self.eos_token_id = self._first_id(self._EOS_NAMES, min(2, vocab_size - 1))
+        # resolve it from known names before falling back to a raw id, and warn
+        # loudly if the fallback is used (it drives doc boundaries).
+        eos = self._first_id(self._EOS_NAMES, None)
+        if eos is None:
+            eos = min(2, vocab_size - 1)
+            warnings.warn(
+                f"no known EOS token in tokenizer; falling back to id {eos}. "
+                "Document joins/masking may be wrong — add an EOS special token.",
+                stacklevel=2,
+            )
+        self.eos_token_id = eos
         self.pad_token_id = self._first_id(self._PAD_NAMES, self.eos_token_id)
         self.bos_token_id = self._first_id(self._BOS_NAMES, self.eos_token_id)
 
-    def _first_id(self, names: tuple[str, ...], default: int) -> int:
+    def _first_id(self, names: tuple[str, ...], default: int | None) -> int | None:
         for name in names:
             token_id = self.inner.token_to_id(name)
             if token_id is not None:
                 return token_id
         return default
+
+    def fingerprint(self) -> str:
+        """Short stable hash of the tokenizer definition, for cache keys — so a
+        changed tokenizer never silently reuses tokens from the old one."""
+        return hashlib.sha256(self.inner.to_str().encode()).hexdigest()[:12]
 
     @classmethod
     def from_file(cls, path: str | Path) -> Tokenizer:
@@ -60,8 +80,6 @@ def train_bpe(
     special_tokens: list[str] | None = None,
 ) -> Tokenizer:
     """Train a byte-level BPE tokenizer from text/JSONL files and save it."""
-    from hermes_train.data import open_text
-
     tokenizer = HfTokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
     tokenizer.decoder = decoders.ByteLevel()

@@ -8,7 +8,6 @@ strided across ranks, and a checkpointable position for resume.
 
 from __future__ import annotations
 
-import gzip
 import io
 import json
 import sys
@@ -18,33 +17,31 @@ from typing import IO
 
 import numpy as np
 import torch
-import zstandard
+import torch.distributed as dist
 
+from hermes_train.textio import open_text
 from hermes_train.tokenizer import Tokenizer
 
-
-def open_text(path: str | Path) -> IO[str]:
-    """Open a possibly-compressed text file for line reading."""
-    path = Path(path)
-    suffix = path.suffix.lower()
-    if suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    if suffix in (".zst", ".zstd"):
-        raw = open(path, "rb")  # noqa: SIM115 — ownership passes to the returned wrapper
-        return io.TextIOWrapper(
-            zstandard.ZstdDecompressor().stream_reader(raw), encoding="utf-8"
-        )
-    return open(path, encoding="utf-8")
+__all__ = ["DataLoader", "Dataset", "open_text"]
 
 
 def _iter_texts(lines: Iterator[str]) -> Iterator[str]:
+    """Yield the ``text`` field of each JSONL line. Malformed lines are skipped
+    and counted (logged at the end) rather than aborting a corpus-scale run."""
+    bad = 0
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        text = json.loads(line).get("text", "")
+        try:
+            text = json.loads(line).get("text", "")
+        except (json.JSONDecodeError, AttributeError):
+            bad += 1
+            continue
         if text:
             yield text
+    if bad:
+        print(f"WARNING: skipped {bad} malformed JSONL line(s) during tokenization")
 
 
 TOKENIZE_BATCH = 20_000
@@ -79,7 +76,7 @@ class Dataset:
             encodings = tokenizer.inner.encode_batch(batch)
             n = 0
             for enc in encodings:
-                arr = np.array(enc.ids + [tokenizer.eos_token_id], dtype=np.uint32)
+                arr = np.array([*enc.ids, tokenizer.eos_token_id], dtype=np.uint32)
                 out.write(arr.tobytes())
                 n += len(arr)
             batch.clear()
@@ -101,33 +98,44 @@ class Dataset:
                 with open_text(path) as f:
                     yield from f
 
-        import io as _io
-
-        buf = _io.BytesIO()
+        buf = io.BytesIO()
         cls._tokenize_to(lines(), tokenizer, buf)
         tokens = np.frombuffer(buf.getvalue(), dtype=np.uint32)
         return cls(tokens, seq_len, eos_token_id=tokenizer.eos_token_id)
 
     @classmethod
-    def from_file(cls, path: str | Path, tokenizer: Tokenizer, seq_len: int) -> Dataset:
-        """Load with a sidecar token cache: tokenize once (parallel), then
-        memory-map ``<path>.tokens.bin`` on subsequent runs."""
+    def from_file(
+        cls,
+        path: str | Path,
+        tokenizer: Tokenizer,
+        seq_len: int,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> Dataset:
+        """Load with a sidecar token cache: tokenize once, memory-map on later
+        runs. The cache key includes the tokenizer fingerprint, so changing the
+        tokenizer invalidates it instead of silently reusing stale tokens. Under
+        DDP only rank 0 tokenizes; other ranks wait on a barrier, avoiding the
+        concurrent-write race on a cold cache."""
         path = Path(path)
-        cache = path.with_name(path.name + ".tokens.bin")
-        if not (cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime):
-            tmp = cache.with_suffix(".tmp")
-            with open(tmp, "wb") as out, open_text(path) as f:
-                n = cls._tokenize_to(iter(f), tokenizer, out)
-            tmp.rename(cache)
-            print(f"tokenized {path.name}: {n} tokens → {cache.name}")
+        # Fingerprinted, rank-independent cache name.
+        cache = path.with_name(f"{path.name}.{tokenizer.fingerprint()}.tokens.bin")
+        fresh = cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime
+        if not fresh:
+            if rank == 0:
+                tmp = cache.with_suffix(f".{rank}.tmp")
+                with tmp.open("wb") as out, open_text(path) as f:
+                    n = cls._tokenize_to(iter(f), tokenizer, out)
+                tmp.replace(cache)  # atomic publish
+                print(f"tokenized {path.name}: {n} tokens → {cache.name}")
+            if world_size > 1 and dist.is_initialized():
+                dist.barrier()  # non-rank-0 ranks wait for the cache to exist
         tokens = np.memmap(cache, dtype=np.uint32, mode="r")
         return cls(tokens, seq_len, eos_token_id=tokenizer.eos_token_id)
 
     @classmethod
     def from_stdin(cls, tokenizer: Tokenizer, seq_len: int) -> Dataset:
-        import io as _io
-
-        buf = _io.BytesIO()
+        buf = io.BytesIO()
         cls._tokenize_to(iter(sys.stdin), tokenizer, buf)
         tokens = np.frombuffer(buf.getvalue(), dtype=np.uint32)
         return cls(tokens, seq_len, eos_token_id=tokenizer.eos_token_id)
@@ -178,6 +186,14 @@ class DataLoader:
         self.batches_yielded = 0
         self.max_batches = (len(dataset) // batch_size) // world_size
         self.shuffle_seed = 42
+        # Fail loud rather than "complete" instantly with zero steps and write
+        # an untrained checkpoint.
+        if self.max_batches == 0:
+            raise ValueError(
+                f"dataset yields no batches: {len(dataset)} windows, "
+                f"batch_size={batch_size}, world_size={world_size}. "
+                "Provide more data or lower --batch-size/--seq-len."
+            )
 
     def num_batches(self) -> int:
         return self.max_batches

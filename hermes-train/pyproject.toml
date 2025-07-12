@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-train"
-version = "1.8.57"
+version = "1.8.54"
 description = "PyTorch training for Hermes LLMs (MAL-defined models, safetensors checkpoints served by hermes-llm)"
 readme = "README.md"
 license = "MIT"
@@ -32,10 +32,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Fused Mamba-2 selective-scan kernels (CUDA only).
-# mamba-ssm pulls in transformers transitively; pin it forward so the lock
-# can't drift back to the vulnerable 4.17.0 (GHSA-3863-2447-669p et al.).
-mamba = ["mamba-ssm>=2.2", "transformers>=5.5.0"]
+# Fused Mamba-1 selective-scan kernels (CUDA only)
+mamba = ["mamba-ssm>=2.2"]
 # Live training-curve dashboard (enabled at runtime via WANDB_API_KEY)
 wandb = ["wandb>=0.18"]
 
@@ -45,6 +43,7 @@ hermes-train = "hermes_train.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.9",
 ]
 
 # CPU-only torch wheels on Linux (CI, most dev boxes without CUDA setup).
@@ -63,3 +62,42 @@ packages = ["src/hermes_train"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# ── Linting: strict. Enforces (among much else) top-level imports (PLC0415),
+# no silent bare excepts (BLE), pathlib usage, and numpy idioms. ──────────────
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort (import order)
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "SIM",       # simplify
+    "PERF",      # perflint (hot-path anti-patterns)
+    "NPY",       # numpy-specific
+    "PTH",       # prefer pathlib over os.path
+    "PIE", "RET", "TID", "ICN", "FURB",
+    "PLC", "PLE", "PLW",  # pylint conventions/errors/warnings (incl. PLC0415)
+    "BLE",       # no blind `except:` without re-raise/log
+    "LOG", "G",  # logging correctness
+    "RUF",
+]
+ignore = [
+    "E501",      # line length — the formatter wraps; unsplittable strings/URLs ok
+    "N812",      # `torch.nn.functional as F` (idiomatic ML capitalization)
+    "PLW2901",   # loop variable overwritten (common, readable in parsers)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: allow asserts on magic values, unused fixtures, non-PEP8 test names.
+"tests/*" = ["N802", "ARG", "PLR2004", "PTH", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hermes_train"]

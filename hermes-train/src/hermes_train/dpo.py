@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from hermes_train.config import ModelDef
 from hermes_train.model import Transformer
+from hermes_train.textio import open_text
 from hermes_train.tokenizer import Tokenizer
 
 
@@ -23,8 +24,6 @@ class PreferenceDataset:
 
     @classmethod
     def from_file(cls, path: str | Path) -> PreferenceDataset:
-        from hermes_train.data import open_text
-
         with open_text(path) as f:
             pairs = [json.loads(line) for line in f if line.strip()]
         print(f"Loaded {len(pairs)} preference pairs")
@@ -62,30 +61,60 @@ class DpoTrainer:
         print(f"DPO Trainer initialized: beta={beta}, max_len={max_len}, lr={lr}")
 
     def _sequence_log_probs(
-        self, model: Transformer, ids: torch.Tensor
+        self, model: Transformer, ids: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
-        """Sum of per-token log-probs of ids[1:] under the model."""
+        """Sum of per-token log-probs of ids[1:] under the model, restricted to
+        the completion (non-prompt, non-pad) positions via `mask` [B, L-1].
+        Summing over prompt/pad tokens would dilute and bias the DPO signal."""
         logits = model(ids[:, :-1])
         log_probs = F.log_softmax(logits, dim=-1)
         target = ids[:, 1:].unsqueeze(-1)
-        return log_probs.gather(-1, target).squeeze(-1).sum(dim=1)
+        token_lp = log_probs.gather(-1, target).squeeze(-1)
+        return (token_lp * mask).sum(dim=1)
 
-    def _tokenize_batch(self, texts: list[str], tokenizer: Tokenizer) -> torch.Tensor:
-        rows = []
-        for text in texts:
-            ids = tokenizer.encode(text)[: self.max_len]
-            ids += [tokenizer.pad_token_id] * (self.max_len - len(ids))
+    def _tokenize_pairs(
+        self, prompts: list[str], completions: list[str], tokenizer: Tokenizer
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode prompt+completion, returning padded ids [B, L] and a
+        completion-target mask [B, L-1] (1 where the target ids[:,1:] is a
+        completion token and not padding)."""
+        pad = tokenizer.pad_token_id
+        rows, masks = [], []
+        for prompt, completion in zip(prompts, completions, strict=True):
+            p_ids = tokenizer.encode(prompt)
+            c_ids = tokenizer.encode(completion)
+            ids = (p_ids + c_ids)[: self.max_len]
+            plen = min(len(p_ids), len(ids))
+            pad_n = self.max_len - len(ids)
+            # target position i predicts ids[i+1]; keep it iff that target is a
+            # completion token (index >= plen) and not padding.
+            mask = [1.0 if (i + 1) >= plen else 0.0 for i in range(len(ids) - 1)]
+            ids += [pad] * pad_n
+            mask += [0.0] * pad_n  # pad targets contribute nothing
             rows.append(ids)
-        return torch.tensor(rows, dtype=torch.long, device=self.device)
+            masks.append(mask)
+        ids_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+        mask_t = torch.tensor(masks, dtype=torch.float32, device=self.device)
+        return ids_t, mask_t
 
     def dpo_loss(
-        self, chosen_ids: torch.Tensor, rejected_ids: torch.Tensor
+        self,
+        chosen_ids: torch.Tensor,
+        chosen_mask: torch.Tensor,
+        rejected_ids: torch.Tensor,
+        rejected_mask: torch.Tensor,
     ) -> torch.Tensor:
-        policy_chosen = self._sequence_log_probs(self.policy, chosen_ids)
-        policy_rejected = self._sequence_log_probs(self.policy, rejected_ids)
+        policy_chosen = self._sequence_log_probs(self.policy, chosen_ids, chosen_mask)
+        policy_rejected = self._sequence_log_probs(
+            self.policy, rejected_ids, rejected_mask
+        )
         with torch.no_grad():
-            ref_chosen = self._sequence_log_probs(self.reference, chosen_ids)
-            ref_rejected = self._sequence_log_probs(self.reference, rejected_ids)
+            ref_chosen = self._sequence_log_probs(
+                self.reference, chosen_ids, chosen_mask
+            )
+            ref_rejected = self._sequence_log_probs(
+                self.reference, rejected_ids, rejected_mask
+            )
 
         chosen_rewards = policy_chosen - ref_chosen
         rejected_rewards = policy_rejected - ref_rejected
@@ -108,14 +137,17 @@ class DpoTrainer:
             )
             for start in pbar:
                 batch = dataset.pairs[start : start + batch_size]
-                chosen = self._tokenize_batch(
-                    [p["prompt"] + p["chosen"] for p in batch], tokenizer
+                prompts = [p["prompt"] for p in batch]
+                chosen_ids, chosen_mask = self._tokenize_pairs(
+                    prompts, [p["chosen"] for p in batch], tokenizer
                 )
-                rejected = self._tokenize_batch(
-                    [p["prompt"] + p["rejected"] for p in batch], tokenizer
+                rejected_ids, rejected_mask = self._tokenize_pairs(
+                    prompts, [p["rejected"] for p in batch], tokenizer
                 )
 
-                loss = self.dpo_loss(chosen, rejected)
+                loss = self.dpo_loss(
+                    chosen_ids, chosen_mask, rejected_ids, rejected_mask
+                )
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()

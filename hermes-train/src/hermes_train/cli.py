@@ -6,16 +6,18 @@ Model configs are JSON exported from MAL: `hermes-llm export --model <name|.mal>
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+from hermes_train.config import ModelDef
+from hermes_train.data import DataLoader, Dataset
+from hermes_train.dpo import DpoTrainer, PreferenceDataset
+from hermes_train.tokenizer import Tokenizer, train_bpe
+from hermes_train.train import Trainer, pick_device
+
 
 def cmd_train(args: argparse.Namespace) -> int:
-    from hermes_train.config import ModelDef
-    from hermes_train.data import DataLoader, Dataset
-    from hermes_train.tokenizer import Tokenizer, train_bpe
-    from hermes_train.train import Trainer
-
     config = ModelDef.from_json(args.config)
 
     data_files = args.data or []
@@ -31,16 +33,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     config.vocab_size = tokenizer.vocab_size
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
 
-    # Each -d file is a curriculum stage, trained sequentially under one
-    # LR schedule (WSD keeps this sane: decay only hits the final stage).
-    if data_files:
-        datasets = [Dataset.from_file(p, tokenizer, args.seq_len) for p in data_files]
-    else:
-        print("Loading dataset from stdin...")
-        datasets = [Dataset.from_stdin(tokenizer, args.seq_len)]
-    for i, ds in enumerate(datasets):
-        print(f"Stage {i + 1}: {len(ds.tokens)} tokens")
-
+    # Build the trainer first: it initializes the DDP process group, which the
+    # rank-0-only tokenization barrier below relies on.
     trainer = Trainer(
         config,
         lr=args.lr,
@@ -49,7 +43,29 @@ def cmd_train(args: argparse.Namespace) -> int:
         warmup_steps=args.warmup_steps,
         schedule=args.schedule,
         doc_masking=not args.no_doc_masking,
+        grad_checkpoint=args.grad_checkpoint,
+        seed=args.seed,
     )
+
+    # Each -d file is a curriculum stage, trained sequentially under one
+    # LR schedule (WSD keeps this sane: decay only hits the final stage).
+    if data_files:
+        datasets = [
+            Dataset.from_file(
+                p,
+                tokenizer,
+                args.seq_len,
+                rank=trainer.rank,
+                world_size=trainer.world_size,
+            )
+            for p in data_files
+        ]
+    else:
+        print("Loading dataset from stdin...")
+        datasets = [Dataset.from_stdin(tokenizer, args.seq_len)]
+    for i, ds in enumerate(datasets):
+        print(f"Stage {i + 1}: {len(ds.tokens)} tokens")
+
     loaders = [
         DataLoader(
             ds,
@@ -88,8 +104,6 @@ def cmd_train(args: argparse.Namespace) -> int:
     if trainer.is_main:
         # Persist the config with vocab_size synced to the tokenizer, like the
         # old Rust trainer did — hermes-llm generate reads this file.
-        import json
-
         raw = json.loads(Path(args.config).read_text())
         raw["vocab_size"] = tokenizer.vocab_size
         (output / "config.json").write_text(json.dumps(raw, indent=2))
@@ -121,8 +135,6 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_train_tokenizer(args: argparse.Namespace) -> int:
-    from hermes_train.tokenizer import train_bpe
-
     tokenizer = train_bpe(args.input, args.output, vocab_size=args.vocab_size)
     print(
         f"Tokenizer trained and saved to {args.output} (vocab size: {tokenizer.vocab_size})"
@@ -131,11 +143,6 @@ def cmd_train_tokenizer(args: argparse.Namespace) -> int:
 
 
 def cmd_dpo(args: argparse.Namespace) -> int:
-    from hermes_train.config import ModelDef
-    from hermes_train.dpo import DpoTrainer, PreferenceDataset
-    from hermes_train.tokenizer import Tokenizer
-    from hermes_train.train import pick_device
-
     config = ModelDef.from_json(args.config)
     tokenizer = Tokenizer.from_file(args.tokenizer)
     dataset = PreferenceDataset.from_file(args.data)
@@ -192,6 +199,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=0, help="RNG seed (reproducibility)")
+    p.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Recompute activations in backward to cut memory (enables longer "
+        "seq_len / larger batch at ~30%% more compute)",
+    )
     p.add_argument("--max-steps", type=int, help="Stop after N optimizer steps")
     p.add_argument(
         "--save-every",

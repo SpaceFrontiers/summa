@@ -232,5 +232,5 @@ class ModelDef:
 
     @classmethod
     def from_json(cls, path: str | Path) -> ModelDef:
-        with open(path) as f:
+        with Path(path).open() as f:
             return cls.from_dict(json.load(f))
