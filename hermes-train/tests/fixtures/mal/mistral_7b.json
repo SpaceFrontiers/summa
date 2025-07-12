@@ -1,0 +1,54 @@
+{
+  "name": "mistral_7b",
+  "description": "Mistral 7B with GQA and Sliding Window Attention",
+  "vocab_size": 32000,
+  "max_seq_len": 32768,
+  "hidden_size": 4096,
+  "num_layers": 32,
+  "block": {
+    "name": "mistral_block",
+    "attention": {
+      "name": "gqa",
+      "num_heads": 32,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "dropout": 0.0,
+      "bias": false,
+      "position_encoding": {
+        "Rope": {
+          "theta": 10000.0,
+          "scaling": null
+        }
+      },
+      "window_size": 4096,
+      "causal": true,
+      "qk_norm": false
+    },
+    "ssm": null,
+    "ffn": {
+      "name": "swiglu_mlp",
+      "hidden_dim": 14336,
+      "activation": "SwiGLU",
+      "bias": false,
+      "dropout": 0.0,
+      "gate": true
+    },
+    "norm": {
+      "norm_type": "RmsNorm",
+      "eps": 0.00001
+    },
+    "norm_position": "Pre",
+    "residual": true,
+    "dropout": 0.0
+  },
+  "pattern": null,
+  "embeddings": {
+    "tie_weights": false,
+    "dropout": 0.0,
+    "scale": null
+  },
+  "output": {
+    "bias": false,
+    "norm": null
+  }
+}

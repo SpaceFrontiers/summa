@@ -1,0 +1,30 @@
+# Nano model - minimal for testing (~4M params)
+# Fastest model for debugging and testing
+
+attention nano_attn {
+    num_heads: 2
+    bias: false
+}
+
+ffn nano_ffn {
+    hidden_dim: 256
+    activation: gelu
+    bias: false
+}
+
+block nano_block {
+    attention: nano_attn
+    ffn: nano_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+model nano {
+    description: "Minimal model for testing and debugging"
+    vocab_size: 32000
+    max_seq_len: 256
+    hidden_size: 64
+    num_layers: 2
+    block: nano_block
+}

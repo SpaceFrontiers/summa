@@ -1,0 +1,30 @@
+# GPT-2 Medium (~355M params)
+attention gpt2_medium_attn {
+    num_heads: 16
+    bias: true
+    dropout: 0.1
+}
+
+ffn gpt2_medium_ffn {
+    hidden_dim: 4096
+    activation: gelu
+    bias: true
+    dropout: 0.1
+}
+
+block gpt2_medium_block {
+    attention: gpt2_medium_attn
+    ffn: gpt2_medium_ffn
+    norm: layernorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+model gpt2_medium {
+    description: "GPT-2 Medium architecture"
+    vocab_size: 32000
+    max_seq_len: 1024
+    hidden_size: 1024
+    num_layers: 24
+    block: gpt2_medium_block
+}

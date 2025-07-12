@@ -1,0 +1,175 @@
+{
+  "name": "hybrid-tiny",
+  "description": "Tiny hybrid Mamba+attention model (2:1 SSM:attention)",
+  "vocab_size": 32000,
+  "max_seq_len": 512,
+  "hidden_size": 128,
+  "num_layers": 6,
+  "block": {
+    "name": "attn_block",
+    "attention": {
+      "name": "hybrid_attn",
+      "num_heads": 4,
+      "num_kv_heads": null,
+      "head_dim": null,
+      "dropout": 0.0,
+      "bias": false,
+      "position_encoding": {
+        "Rope": {
+          "theta": 10000.0,
+          "scaling": null
+        }
+      },
+      "window_size": null,
+      "causal": true,
+      "qk_norm": false
+    },
+    "ssm": null,
+    "ffn": {
+      "name": "hybrid_ffn",
+      "hidden_dim": 512,
+      "activation": "SwiGLU",
+      "bias": false,
+      "dropout": 0.0,
+      "gate": true
+    },
+    "norm": {
+      "norm_type": "RmsNorm",
+      "eps": 0.00001
+    },
+    "norm_position": "Pre",
+    "residual": true,
+    "dropout": 0.0
+  },
+  "pattern": [
+    {
+      "name": "mamba_block",
+      "attention": {
+        "name": "default",
+        "num_heads": null,
+        "num_kv_heads": null,
+        "head_dim": null,
+        "dropout": 0.0,
+        "bias": false,
+        "position_encoding": {
+          "Rope": {
+            "theta": 10000.0,
+            "scaling": null
+          }
+        },
+        "window_size": null,
+        "causal": true,
+        "qk_norm": false
+      },
+      "ssm": {
+        "name": "hybrid_ssm",
+        "state_dim": 16,
+        "conv_kernel": 4,
+        "expand": 2,
+        "dt_rank": null
+      },
+      "ffn": {
+        "name": "hybrid_ffn",
+        "hidden_dim": 512,
+        "activation": "SwiGLU",
+        "bias": false,
+        "dropout": 0.0,
+        "gate": true
+      },
+      "norm": {
+        "norm_type": "RmsNorm",
+        "eps": 0.00001
+      },
+      "norm_position": "Pre",
+      "residual": true,
+      "dropout": 0.0
+    },
+    {
+      "name": "mamba_block",
+      "attention": {
+        "name": "default",
+        "num_heads": null,
+        "num_kv_heads": null,
+        "head_dim": null,
+        "dropout": 0.0,
+        "bias": false,
+        "position_encoding": {
+          "Rope": {
+            "theta": 10000.0,
+            "scaling": null
+          }
+        },
+        "window_size": null,
+        "causal": true,
+        "qk_norm": false
+      },
+      "ssm": {
+        "name": "hybrid_ssm",
+        "state_dim": 16,
+        "conv_kernel": 4,
+        "expand": 2,
+        "dt_rank": null
+      },
+      "ffn": {
+        "name": "hybrid_ffn",
+        "hidden_dim": 512,
+        "activation": "SwiGLU",
+        "bias": false,
+        "dropout": 0.0,
+        "gate": true
+      },
+      "norm": {
+        "norm_type": "RmsNorm",
+        "eps": 0.00001
+      },
+      "norm_position": "Pre",
+      "residual": true,
+      "dropout": 0.0
+    },
+    {
+      "name": "attn_block",
+      "attention": {
+        "name": "hybrid_attn",
+        "num_heads": 4,
+        "num_kv_heads": null,
+        "head_dim": null,
+        "dropout": 0.0,
+        "bias": false,
+        "position_encoding": {
+          "Rope": {
+            "theta": 10000.0,
+            "scaling": null
+          }
+        },
+        "window_size": null,
+        "causal": true,
+        "qk_norm": false
+      },
+      "ssm": null,
+      "ffn": {
+        "name": "hybrid_ffn",
+        "hidden_dim": 512,
+        "activation": "SwiGLU",
+        "bias": false,
+        "dropout": 0.0,
+        "gate": true
+      },
+      "norm": {
+        "norm_type": "RmsNorm",
+        "eps": 0.00001
+      },
+      "norm_position": "Pre",
+      "residual": true,
+      "dropout": 0.0
+    }
+  ],
+  "embeddings": {
+    "tie_weights": false,
+    "dropout": 0.0,
+    "scale": null
+  },
+  "output": {
+    "bias": false,
+    "norm": null
+  }
+}

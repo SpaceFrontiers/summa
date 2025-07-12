@@ -1,0 +1,30 @@
+# Tiny model - small but trainable (~9M params)
+# Good for quick experiments and testing
+
+attention tiny_attn {
+    num_heads: 4
+    bias: false
+}
+
+ffn tiny_ffn {
+    hidden_dim: 512
+    activation: gelu
+    bias: false
+}
+
+block tiny_block {
+    attention: tiny_attn
+    ffn: tiny_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+model tiny {
+    description: "Small model for quick experiments"
+    vocab_size: 32000
+    max_seq_len: 512
+    hidden_size: 128
+    num_layers: 4
+    block: tiny_block
+}

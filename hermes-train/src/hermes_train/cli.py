@@ -1,6 +1,8 @@
 """CLI mirroring the old hermes-llm train/train-tokenizer/dpo subcommands.
 
-Model configs are JSON exported from MAL: `hermes-llm export --model <name|.mal>`.
+Model configs are either a MAL source file (`.mal`, parsed in-process) or the
+JSON that `hermes-llm export --model <name|.mal>` emits — both yield an
+identical `ModelDef`, so the separate export step is optional.
 """
 
 from __future__ import annotations
@@ -13,12 +15,37 @@ from pathlib import Path
 from hermes_train.config import ModelDef
 from hermes_train.data import DataLoader, Dataset
 from hermes_train.dpo import DpoTrainer, PreferenceDataset
+from hermes_train.mal import parse_mal
 from hermes_train.tokenizer import Tokenizer, train_bpe
 from hermes_train.train import Trainer, pick_device
 
 
+def load_model_dict(path: str) -> dict:
+    """Load the serde-compatible model dict from a `.mal` or exported JSON file.
+
+    A `.mal` extension (or content that fails to parse as JSON) is treated as
+    MAL and parsed in-process by `hermes_train.mal` — no `hermes-llm` binary
+    needed. Anything else is loaded as `hermes-llm export` JSON. The dict is the
+    same shape `ModelDef.from_dict` consumes and `config.json` is persisted in.
+    """
+    text = Path(path).read_text()
+    if path.endswith(".mal"):
+        return parse_mal(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Not JSON — fall back to MAL (e.g. a .mal saved under another name).
+        return parse_mal(text)
+
+
+def load_model_config(path: str) -> ModelDef:
+    """Load a `ModelDef` from a `.mal` source or exported JSON config."""
+    return ModelDef.from_dict(load_model_dict(path))
+
+
 def cmd_train(args: argparse.Namespace) -> int:
-    config = ModelDef.from_json(args.config)
+    raw_config = load_model_dict(args.config)
+    config = ModelDef.from_dict(raw_config)
 
     data_files = args.data or []
 
@@ -103,8 +130,9 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     if trainer.is_main:
         # Persist the config with vocab_size synced to the tokenizer, like the
-        # old Rust trainer did — hermes-llm generate reads this file.
-        raw = json.loads(Path(args.config).read_text())
+        # old Rust trainer did — hermes-llm generate reads this file. Sourced
+        # from the parsed model dict so a .mal input is persisted as JSON too.
+        raw = dict(raw_config)
         raw["vocab_size"] = tokenizer.vocab_size
         (output / "config.json").write_text(json.dumps(raw, indent=2))
 
@@ -143,7 +171,7 @@ def cmd_train_tokenizer(args: argparse.Namespace) -> int:
 
 
 def cmd_dpo(args: argparse.Namespace) -> int:
-    config = ModelDef.from_json(args.config)
+    config = load_model_config(args.config)
     tokenizer = Tokenizer.from_file(args.tokenizer)
     dataset = PreferenceDataset.from_file(args.data)
 
@@ -170,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("train", help="Pretrain or fine-tune a model")
     p.add_argument(
-        "--config", required=True, help="Model config JSON (from `hermes-llm export`)"
+        "--config",
+        required=True,
+        help="Model config: a MAL source (.mal) or JSON from `hermes-llm export`",
     )
     p.add_argument("-t", "--tokenizer", required=True, help="Path to tokenizer.json")
     p.add_argument(

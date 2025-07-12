@@ -1,0 +1,37 @@
+# LLaMA 7B Architecture
+# Demonstrates composable MAL with Grouped Query Attention
+
+# Attention mechanism - standard multi-head attention (no GQA in 7B)
+attention mha {
+    num_heads: 32
+    num_kv_heads: 32
+    head_dim: 128
+    bias: false
+    causal: true
+}
+
+# FFN with SwiGLU activation
+# hidden_dim = 8/3 * hidden_size, rounded to nearest multiple of 256
+ffn swiglu_mlp {
+    hidden_dim: 11008
+    activation: swiglu
+    bias: false
+}
+
+# Transformer block with pre-normalization
+block llama_block {
+    attention: mha
+    ffn: swiglu_mlp
+    norm_position: pre
+    residual: true
+}
+
+# Complete LLaMA 7B model
+model llama_7b {
+    description: "LLaMA 7B architecture"
+    vocab_size: 32000
+    max_seq_len: 4096
+    hidden_size: 4096
+    num_layers: 32
+    block: llama_block
+}
