@@ -37,6 +37,10 @@ pub enum VectorIndexState {
     },
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Per-segment metadata stored in index metadata
 /// This allows merge decisions without loading segment files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +56,12 @@ pub struct SegmentMetaInfo {
     /// been explicitly reordered (via background optimizer or reorder command) are marked true.
     #[serde(default)]
     pub reordered: bool,
+    /// Whether the last BP reorder pass ran to natural convergence. False when
+    /// a wall-clock BP budget ended the pass early — the segment is ordered
+    /// better than before, and a later warm-started pass can deepen it.
+    /// Old metadata (field absent) deserializes as converged.
+    #[serde(default = "default_true")]
+    pub bp_converged: bool,
 }
 
 /// Per-field vector index metadata
@@ -118,6 +128,7 @@ impl IndexMetadata {
                 ancestors: Vec::new(),
                 generation: 0,
                 reordered: false,
+                bp_converged: true,
             },
         );
     }
@@ -130,6 +141,7 @@ impl IndexMetadata {
         ancestors: Vec<String>,
         generation: u32,
         reordered: bool,
+        bp_converged: bool,
     ) {
         self.segment_metas.insert(
             segment_id,
@@ -138,6 +150,7 @@ impl IndexMetadata {
                 ancestors,
                 generation,
                 reordered,
+                bp_converged,
             },
         );
     }
@@ -525,6 +538,7 @@ mod tests {
             vec!["a".to_string(), "b".to_string()],
             1,
             false,
+            true,
         );
         assert_eq!(meta.segment_metas["c"].generation, 1);
         assert_eq!(meta.segment_metas["c"].ancestors, vec!["a", "b"]);
@@ -538,6 +552,7 @@ mod tests {
             vec!["c".to_string(), "d".to_string()],
             2,
             false,
+            true,
         );
         assert_eq!(meta.segment_metas["e"].generation, 2);
     }

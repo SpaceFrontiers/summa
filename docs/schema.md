@@ -61,12 +61,24 @@ index articles {
 
 Attributes control how fields are processed and stored:
 
-| Attribute | Description                                                       |
-| --------- | ----------------------------------------------------------------- |
-| `indexed` | Field is indexed for searching                                    |
-| `stored`  | Field value is stored and can be retrieved                        |
-| `primary` | Field is the primary key (enforces uniqueness, deduplicates)      |
-| `fast`    | Field is a fast field (column-oriented storage for range queries) |
+| Attribute | Description                                                                                                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `indexed` | Field is indexed for searching                                                                                                                                                                                  |
+| `stored`  | Field value is stored and can be retrieved                                                                                                                                                                      |
+| `primary` | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                    |
+| `fast`    | Field is a fast field (column-oriented storage for range queries)                                                                                                                                               |
+| `reorder` | Opt this BMP sparse field into BP (graph bisection) reordering — used by the background optimizer, `hermes-tool reorder`, and reorder-on-merge. Fields without it keep insertion order (blob copied unchanged). |
+
+Index-level options (inside the `index { ... }` block):
+
+```sdl
+index articles {
+    reorder_on_merge: true   # BP-reorder `reorder`-attributed BMP fields inside merges.
+                             # Absent = disabled: merges block-copy and the background
+                             # optimizer reorders afterwards.
+    field splade: sparse_vector<...> [indexed, reorder]
+}
+```
 
 ### Attribute Syntax
 
@@ -267,6 +279,35 @@ field e: dense_vector<768, f16> [indexed<flat>]                              # b
 field e: dense_vector<768> [stored]                                          # stored, not indexed
 ```
 
+### Extended RaBitQ (multi-bit codes for disk-resident indexes)
+
+IVF-RaBitQ supports extended multi-bit codes (`bits: 2-8`, default 1 = classic
+binary RaBitQ). Extra magnitude bits per dimension give much tighter distance
+estimates — with `bits: 4-5` the exact-rerank pool (`rerank_factor`) can be
+shrunk 2-3x at the same recall, which cuts raw-vector reads on memory-bound /
+disk-resident indexes:
+
+```
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, bits: 5>]
+```
+
+Segments built with different `bits` are not merge-compatible (the codebook
+version differs) — pick the value before building.
+
+### SOAR (higher recall for IVF indexes)
+
+IVF-based indexes (`ivf_rabitq`, `scann`) support SOAR — spilling each vector
+into a secondary cluster with an orthogonality-amplified residual. This
+improves recall at the same `nprobe` in exchange for larger cluster storage
+(~1.2-2x assignments):
+
+```
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: selective>]  # spill boundary vectors (recommended)
+field e: dense_vector<768, f16> [indexed<scann, soar: full>]            # spill every vector once
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: aggressive>] # spill every vector twice
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: off>]        # no spilling (default)
+```
+
 ### Example
 
 ```
@@ -276,6 +317,22 @@ index documents {
     field span: json [stored<multi>]
 }
 ```
+
+### Binary Vector IVF
+
+Binary dense vector fields default to brute-force SIMD Hamming scan (fast up
+to a few million vectors per segment). For larger segments, enable the IVF
+index — k-majority Hamming clustering with exact in-cluster distances (the
+only approximation is which clusters get probed):
+
+```
+field hash: binary_dense_vector<512> [indexed<ivf, num_clusters: 1024, nprobe: 32>]
+field hash: binary_dense_vector<512> [indexed<ivf, build_threshold: 500000>]
+```
+
+The index is built at commit once the segment crosses `build_threshold`
+(default 100000 vectors) and rebuilt on merge with fresh sample-trained
+centroids.
 
 ## Sparse Vectors
 
@@ -289,6 +346,39 @@ field sparse_emb: sparse_vector [indexed, stored]
 ```
 
 Sparse vectors are indexed as posting lists with float weights. At query time, you can provide raw `(indices, values)` pairs or raw text (tokenized server-side if a HuggingFace tokenizer is configured).
+
+### Document Mass Cropping
+
+`doc_mass` crops the excessive low-weight tail of each document's sparse vector
+at indexing time: entries are ranked by |weight| and only the head covering the
+given fraction of the vector's total |weight| mass is kept. SPLADE-style vectors
+concentrate importance in a few head terms, so `doc_mass: 0.9` typically drops
+20-40% of postings with <1% nDCG loss. Vectors with at most `min_terms` entries
+are never cropped.
+
+```
+field emb: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
+```
+
+Use `hermes-tool info <index>` to inspect the resulting average sparse vector
+length (`avg terms/vector`).
+
+### BMP Format Options
+
+The BMP (block-max pruning) format takes additional `indexed<...>` options:
+
+```
+field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.0,
+    bmp_block_size: 256>, reorder]
+```
+
+- `bmp_block_size` (power of two, max 256; default 64) — docs per BMP
+  block, uniform across every segment of the field. The dense 4-bit grid
+  is `dims × num_blocks / 2` bytes, so grid memory scales as
+  1/block_size; smaller blocks give finer pruning granularity. Large
+  corpora (10M+ docs at 100k-dim vocabularies) should set 256 — at 50M
+  docs the grid is ~41 GB at block 64 vs ~10 GB at 256. See
+  `docs/bmp-grid-compression.md`.
 
 ### Quantization and Pruning
 

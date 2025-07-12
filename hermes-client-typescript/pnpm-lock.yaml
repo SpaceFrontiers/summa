@@ -17,6 +17,9 @@ importers:
       nice-grpc:
         specifier: ^2.1.10
         version: 2.1.14
+      nice-grpc-client-middleware-deadline:
+        specifier: ^2.0.14
+        version: 2.0.19
     devDependencies:
       grpc-tools:
         specifier: ^1.12.4
@@ -190,8 +193,14 @@ packages:
   ms@2.1.3:
     resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
 
+  nice-grpc-client-middleware-deadline@2.0.19:
+    resolution: {integrity: sha512-9zmBfaxQpq/rzOmJRIsv1xZB4tYF70OPZ+u6c4/nGVYU8gjtXDgGup2UqmxO9vW3ApFf5zV0txkFA2Wa2A1R9Q==}
+
   nice-grpc-common@2.0.2:
     resolution: {integrity: sha512-7RNWbls5kAL1QVUOXvBsv1uO0wPQK3lHv+cY1gwkTzirnG1Nop4cBJZubpgziNbaVc/bl9QJcyvsf/NQxa3rjQ==}
+
+  nice-grpc-common@2.0.3:
+    resolution: {integrity: sha512-MEhnD3JMah0mgyivpb9hpRDbOBuXBxI/TVO+OK1h6rC97WM42HsPMR+zzRNQ0C5BqYJTw1nyWiQRD0DucO+pjQ==}
 
   nice-grpc@2.1.14:
     resolution: {integrity: sha512-GK9pKNxlvnU5FAdaw7i2FFuR9CqBspcE+if2tqnKXBcE0R8525wj4BZvfcwj7FjvqbssqKxRHt2nwedalbJlww==}
@@ -423,7 +432,15 @@ snapshots:
 
   ms@2.1.3: {}
 
+  nice-grpc-client-middleware-deadline@2.0.19:
+    dependencies:
+      nice-grpc-common: 2.0.3
+
   nice-grpc-common@2.0.2:
+    dependencies:
+      ts-error: 1.0.6
+
+  nice-grpc-common@2.0.3:
     dependencies:
       ts-error: 1.0.6
 

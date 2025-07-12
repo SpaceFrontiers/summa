@@ -192,7 +192,7 @@ macro_rules! boolean_plan {
         // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
         if must.is_empty() && must_not.is_empty() && should.len() >= 2 {
             // 2a. Text MaxScore (single-field, all term queries)
-            if let Some((mut infos, _field, avg_field_len, num_docs)) =
+            if let Some((mut infos, text_field, avg_field_len, num_docs)) =
                 prepare_text_maxscore(should, reader, global_stats)
             {
                 let mut posting_lists = Vec::with_capacity(infos.len());
@@ -204,7 +204,15 @@ macro_rules! boolean_plan {
                         posting_lists.push((pl, idf));
                     }
                 }
-                return finish_text_maxscore(posting_lists, avg_field_len, limit, reader);
+                let shared_threshold = std::cell::Cell::new(0.0f32);
+                return finish_text_maxscore(
+                    posting_lists,
+                    avg_field_len,
+                    limit,
+                    &shared_threshold,
+                    reader.schema().index_label(),
+                    reader.schema().get_field_name(text_field).unwrap_or("?"),
+                );
             }
 
             // 2b. Sparse (single-field, all sparse term queries)
@@ -227,6 +235,8 @@ macro_rules! boolean_plan {
             if let Some(grouping) = prepare_per_field_grouping(should, reader, limit, global_stats)
             {
                 let mut scorers: Vec<Box<dyn Scorer + '_>> = Vec::new();
+                // Query-local cross-group threshold seeding (see finish_text_maxscore)
+                let shared_threshold = std::cell::Cell::new(0.0f32);
                 for (field, avg_field_len, infos) in &grouping.multi_term_groups {
                     let mut posting_lists = Vec::with_capacity(infos.len());
                     for info in infos {
@@ -244,7 +254,9 @@ macro_rules! boolean_plan {
                             posting_lists,
                             *avg_field_len,
                             grouping.per_field_limit,
-                            reader,
+                            &shared_threshold,
+                            reader.schema().index_label(),
+                            reader.schema().get_field_name(*field).unwrap_or("?"),
                         )?);
                     }
                 }
@@ -529,11 +541,9 @@ impl Query for BooleanQuery {
         // MUST_NOT clauses: subtract bitsets (ANDNOT)
         if let Some(ref mut acc) = result {
             for q in &self.must_not {
-                if let Some(bs) = q.as_doc_bitset(reader) {
+                {
+                    let bs = q.as_doc_bitset(reader)?;
                     acc.subtract(&bs);
-                } else {
-                    // Can't build bitset for this MUST_NOT clause — bail
-                    return None;
                 }
             }
         }

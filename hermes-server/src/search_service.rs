@@ -23,6 +23,9 @@ impl SearchService for SearchServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
+        let index_name = req.index_name.clone();
+        let t = std::time::Instant::now();
+        let result = async {
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let reader = index
@@ -38,50 +41,157 @@ impl SearchService for SearchServiceImpl {
             .query
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
-        let core_query = convert_query(
-            &query,
-            reader.schema(),
-            Some(searcher.global_stats()),
-            Some(index.directory().root()),
-        )
-        .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
-
-        log::info!(
-            "search: index={}, limit={}, query={}",
-            req.index_name,
-            req.limit,
-            core_query
-        );
-
         let limit = if req.limit == 0 {
             10
         } else {
             req.limit as usize
         };
 
+        // Optional L2 reranker config; the L1 pool it consumes is either a
+        // single query's results or the fused union of sub-query results.
+        let rerank_setup = match &req.reranker {
+            Some(reranker) => {
+                let config = convert_reranker(reranker, reader.schema())
+                    .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))?;
+                let l1_limit = if reranker.limit == 0 {
+                    limit * 10
+                } else {
+                    reranker.limit as usize
+                };
+                Some((config, l1_limit))
+            }
+            None => None,
+        };
+
         // ── Phase 1: L1 search ──────────────────────────────────────────────
         let start = Instant::now();
         let t_search = Instant::now();
-        let (results, total_seen, rerank_config) = if let Some(reranker) = &req.reranker {
-            let config = convert_reranker(reranker, reader.schema())
-                .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))?;
-            let l1_limit = if reranker.limit == 0 {
-                limit * 10
+        let query_desc;
+        let (results, total_seen, rerank_config) =
+            if let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query {
+                // Fusion: run each sub-query independently and fuse the ranked
+                // lists (union). Handled here rather than in convert_query
+                // because fusion is a searcher-level operation.
+                let mut sub_queries = Vec::with_capacity(fusion.queries.len());
+                for weighted in &fusion.queries {
+                    let sub = weighted
+                        .query
+                        .as_ref()
+                        .ok_or_else(|| Status::invalid_argument("Fusion sub-query is missing"))?;
+                    let core = convert_query(
+                        sub,
+                        reader.schema(),
+                        Some(searcher.global_stats()),
+                        Some(index.directory().root()),
+                    )
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("Invalid fusion sub-query: {}", e))
+                    })?;
+                    let weight = if weighted.weight > 0.0 {
+                        weighted.weight
+                    } else {
+                        1.0
+                    };
+                    sub_queries.push((core, weight));
+                }
+                if sub_queries.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "FusionQuery requires at least one sub-query",
+                    ));
+                }
+
+                let method = match fusion.method() {
+                    crate::proto::FusionMethod::FusionRrf => {
+                        hermes_core::query::FusionMethod::Rrf {
+                            k: if fusion.rrf_k > 0.0 {
+                                fusion.rrf_k
+                            } else {
+                                hermes_core::query::DEFAULT_RRF_K
+                            },
+                        }
+                    }
+                    crate::proto::FusionMethod::FusionNormalizedWeightedSum => {
+                        hermes_core::query::FusionMethod::NormalizedWeightedSum
+                    }
+                };
+
+                // With a reranker, the fused list is the L1 candidate pool.
+                let fused_limit = rerank_setup.as_ref().map_or(limit, |&(_, l1)| l1);
+                let fetch_limit = if fusion.fetch_limit > 0 {
+                    fusion.fetch_limit as usize
+                } else {
+                    (fused_limit * 4).max(50)
+                };
+
+                // Chunk combiner for fused per-ordinal scores. Unset (0) maps
+                // to Max — LogSumExp is unsuitable at RRF score magnitudes.
+                let combiner = match fusion.combiner {
+                    0 => hermes_core::query::MultiValueCombiner::Max,
+                    c => crate::converters::convert_fusion_combiner(c),
+                };
+
+                query_desc = format!(
+                    "fusion of {} sub-queries (method={:?}, fetch={})",
+                    sub_queries.len(),
+                    method,
+                    fetch_limit
+                );
+                log::info!(
+                    "search: index={}, limit={}, query={}",
+                    req.index_name,
+                    req.limit,
+                    query_desc
+                );
+
+                let mut lists = Vec::with_capacity(sub_queries.len());
+                let mut seen: u32 = 0;
+                for (sub, weight) in &sub_queries {
+                    let (sub_results, sub_seen) = searcher
+                        .search_with_positions(sub.as_ref(), fetch_limit)
+                        .await
+                        .map_err(crate::error::hermes_error_to_status)?;
+                    seen = seen.saturating_add(sub_seen);
+                    lists.push((sub_results, *weight));
+                }
+                let fused = hermes_core::query::fuse_ranked_lists_chunked(
+                    lists,
+                    method,
+                    combiner,
+                    fused_limit,
+                );
+                let rerank_config = rerank_setup.map(|(config, _)| (config, limit));
+                (fused, seen, rerank_config)
             } else {
-                reranker.limit as usize
+                let core_query = convert_query(
+                    &query,
+                    reader.schema(),
+                    Some(searcher.global_stats()),
+                    Some(index.directory().root()),
+                )
+                .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
+
+                query_desc = core_query.to_string();
+                log::info!(
+                    "search: index={}, limit={}, query={}",
+                    req.index_name,
+                    req.limit,
+                    query_desc
+                );
+
+                if let Some((config, l1_limit)) = rerank_setup {
+                    let (candidates, seen) = searcher
+                        .search_with_count(core_query.as_ref(), l1_limit)
+                        .await
+                        .map_err(crate::error::hermes_error_to_status)?;
+                    (candidates, seen, Some((config, limit)))
+                } else {
+                    let (results, seen) = searcher
+                        .search_with_positions(core_query.as_ref(), limit)
+                        .await
+                        .map_err(crate::error::hermes_error_to_status)?;
+                    (results, seen, None)
+                }
             };
-            let (candidates, seen) = searcher
-                .search_with_count(core_query.as_ref(), l1_limit)
-                .await
-                .map_err(crate::error::hermes_error_to_status)?;
-            (candidates, seen, Some((config, limit)))
-        } else {
-            let (results, seen) = searcher
-                .search_with_positions(core_query.as_ref(), limit)
-                .await
-                .map_err(crate::error::hermes_error_to_status)?;
-            (results, seen, None)
-        };
         let search_us = t_search.elapsed().as_micros() as u64;
 
         // ── Phase 2: L2 reranking (optional) ────────────────────────────────
@@ -200,7 +310,7 @@ impl SearchService for SearchServiceImpl {
                 load_us,
                 hits.len(),
                 total_seen,
-                core_query
+                query_desc
             );
         }
 
@@ -216,6 +326,22 @@ impl SearchService for SearchServiceImpl {
                 total_us,
             }),
         }))
+            }
+        .await;
+        let status = if result.is_ok() { "ok" } else { "error" };
+        metrics::histogram!(
+            "hermes_search_duration_seconds",
+            "index" => index_name.clone(),
+            "status" => status,
+        )
+        .record(t.elapsed().as_secs_f64());
+        metrics::counter!(
+            "hermes_search_requests_total",
+            "index" => index_name,
+            "status" => status,
+        )
+        .increment(1);
+        result
     }
 
     async fn get_document(
@@ -313,6 +439,7 @@ impl SearchService for SearchServiceImpl {
         let schema = index.schema();
         let mut dense_totals: HashMap<u32, u64> = HashMap::new();
         let mut sparse_totals: HashMap<u32, u64> = HashMap::new();
+        let mut sparse_postings: HashMap<u32, u64> = HashMap::new();
         let mut dense_dims: HashMap<u32, u32> = HashMap::new();
         let mut sparse_dims: HashMap<u32, u32> = HashMap::new();
 
@@ -323,12 +450,14 @@ impl SearchService for SearchServiceImpl {
             }
             for (&field_id, sparse_idx) in segment.sparse_indexes() {
                 *sparse_totals.entry(field_id).or_default() += sparse_idx.total_vectors as u64;
+                *sparse_postings.entry(field_id).or_default() += sparse_idx.total_postings();
                 sparse_dims
                     .entry(field_id)
                     .or_insert(sparse_idx.num_dimensions() as u32);
             }
             for (&field_id, bmp_idx) in segment.bmp_indexes() {
                 *sparse_totals.entry(field_id).or_default() += bmp_idx.total_vectors as u64;
+                *sparse_postings.entry(field_id).or_default() += bmp_idx.total_postings();
                 sparse_dims.entry(field_id).or_insert(bmp_idx.dims());
             }
         }
@@ -344,6 +473,7 @@ impl SearchService for SearchServiceImpl {
                 vector_type: "dense".to_string(),
                 total_vectors: *total,
                 dimension: dense_dims.get(field_id).copied().unwrap_or(0),
+                avg_terms_per_vector: 0.0,
             });
         }
         for (field_id, total) in &sparse_totals {
@@ -351,11 +481,18 @@ impl SearchService for SearchServiceImpl {
                 .get_field_name(hermes_core::dsl::Field(*field_id))
                 .unwrap_or("unknown")
                 .to_string();
+            let postings = sparse_postings.get(field_id).copied().unwrap_or(0);
+            let avg_terms_per_vector = if *total > 0 {
+                postings as f32 / *total as f32
+            } else {
+                0.0
+            };
             vector_stats.push(VectorFieldStats {
                 field_name: name,
                 vector_type: "sparse".to_string(),
                 total_vectors: *total,
                 dimension: sparse_dims.get(field_id).copied().unwrap_or(0),
+                avg_terms_per_vector,
             });
         }
         vector_stats.sort_by(|a, b| a.field_name.cmp(&b.field_name));

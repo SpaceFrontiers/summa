@@ -6,7 +6,11 @@
  */
 
 import { ChannelCredentials } from "@grpc/grpc-js";
-import { createChannel, createClient, Channel, Client } from "nice-grpc";
+import { createChannel, createClientFactory, Channel, Client } from "nice-grpc";
+import {
+  deadlineMiddleware,
+  DeadlineOptions,
+} from "nice-grpc-client-middleware-deadline";
 
 import {
   SearchServiceDefinition,
@@ -16,6 +20,7 @@ import {
   FieldEntry as PbFieldEntry,
   Query as PbQuery,
   MultiValueCombiner,
+  FusionMethod as PbFusionMethod,
 } from "./generated/hermes";
 
 import type {
@@ -31,24 +36,44 @@ import type {
   Reranker,
 } from "./types";
 
-type SearchClient = Client<typeof SearchServiceDefinition>;
-type IndexClient = Client<typeof IndexServiceDefinition>;
+type SearchClient = Client<typeof SearchServiceDefinition, DeadlineOptions>;
+type IndexClient = Client<typeof IndexServiceDefinition, DeadlineOptions>;
+
+export interface HermesClientOptions {
+  /**
+   * Default per-RPC deadline in milliseconds, applied to every call unless
+   * overridden by the call's `timeoutMs` argument. Undefined = no deadline.
+   * On expiry the call rejects with a gRPC DEADLINE_EXCEEDED error.
+   */
+  defaultTimeoutMs?: number;
+}
 
 export class HermesClient {
   private address: string;
   private channel: Channel | null = null;
   private indexClient: IndexClient | null = null;
   private searchClient: SearchClient | null = null;
+  private defaultTimeoutMs?: number;
 
-  constructor(address: string = "localhost:50051") {
+  constructor(address: string = "localhost:50051", options: HermesClientOptions = {}) {
     this.address = address;
+    this.defaultTimeoutMs = options.defaultTimeoutMs;
+  }
+
+  /** Per-call options with the effective deadline (call override > default). */
+  private callOptions(timeoutMs?: number): DeadlineOptions {
+    const ms = timeoutMs ?? this.defaultTimeoutMs;
+    return ms !== undefined && ms > 0 ? { deadline: new Date(Date.now() + ms) } : {};
   }
 
   /** Connect to the server. */
   connect(): void {
     this.channel = createChannel(this.address, ChannelCredentials.createInsecure());
-    this.indexClient = createClient(IndexServiceDefinition, this.channel);
-    this.searchClient = createClient(SearchServiceDefinition, this.channel);
+    // Deadline middleware: per-call `deadline` becomes a real gRPC deadline
+    // (grpc-timeout header, DEADLINE_EXCEEDED on expiry).
+    const factory = createClientFactory().use(deadlineMiddleware);
+    this.indexClient = factory.create(IndexServiceDefinition, this.channel);
+    this.searchClient = factory.create(SearchServiceDefinition, this.channel);
   }
 
   /** Close the connection. */
@@ -72,30 +97,30 @@ export class HermesClient {
   // =========================================================================
 
   /** Create a new index. */
-  async createIndex(indexName: string, schema: string): Promise<boolean> {
+  async createIndex(indexName: string, schema: string, timeoutMs?: number): Promise<boolean> {
     this.ensureConnected();
-    const response = await this.indexClient!.createIndex({ indexName, schema });
+    const response = await this.indexClient!.createIndex({ indexName, schema }, this.callOptions(timeoutMs));
     return response.success;
   }
 
   /** Delete an index. */
-  async deleteIndex(indexName: string): Promise<boolean> {
+  async deleteIndex(indexName: string, timeoutMs?: number): Promise<boolean> {
     this.ensureConnected();
-    const response = await this.indexClient!.deleteIndex({ indexName });
+    const response = await this.indexClient!.deleteIndex({ indexName }, this.callOptions(timeoutMs));
     return response.success;
   }
 
   /** List all indexes on the server. */
-  async listIndexes(): Promise<string[]> {
+  async listIndexes(timeoutMs?: number): Promise<string[]> {
     this.ensureConnected();
-    const response = await this.indexClient!.listIndexes({});
+    const response = await this.indexClient!.listIndexes({}, this.callOptions(timeoutMs));
     return response.indexNames;
   }
 
   /** Get information about an index. */
-  async getIndexInfo(indexName: string): Promise<IndexInfo> {
+  async getIndexInfo(indexName: string, timeoutMs?: number): Promise<IndexInfo> {
     this.ensureConnected();
-    const response = await this.searchClient!.getIndexInfo({ indexName });
+    const response = await this.searchClient!.getIndexInfo({ indexName }, this.callOptions(timeoutMs));
     return {
       indexName: response.indexName,
       numDocs: response.numDocs,
@@ -117,7 +142,8 @@ export class HermesClient {
   /** Index multiple documents in batch. Returns [indexedCount, errorCount, errors]. */
   async indexDocuments(
     indexName: string,
-    documents: Record<string, any>[]
+    documents: Record<string, any>[],
+    timeoutMs?: number
   ): Promise<[number, number, Array<{ index: number; error: string }>]> {
     this.ensureConnected();
 
@@ -125,10 +151,13 @@ export class HermesClient {
       fields: toFieldEntries(doc),
     }));
 
-    const response = await this.indexClient!.batchIndexDocuments({
-      indexName,
-      documents: namedDocs,
-    });
+    const response = await this.indexClient!.batchIndexDocuments(
+      {
+        indexName,
+        documents: namedDocs,
+      },
+      this.callOptions(timeoutMs)
+    );
     const errors = (response.errors ?? []).map((e) => ({
       index: e.index,
       error: e.error,
@@ -139,15 +168,17 @@ export class HermesClient {
   /** Index a single document. */
   async indexDocument(
     indexName: string,
-    document: Record<string, any>
+    document: Record<string, any>,
+    timeoutMs?: number
   ): Promise<void> {
-    await this.indexDocuments(indexName, [document]);
+    await this.indexDocuments(indexName, [document], timeoutMs);
   }
 
   /** Stream documents for indexing. Returns number of indexed documents. */
   async indexDocumentsStream(
     indexName: string,
-    documents: AsyncIterable<Record<string, any>>
+    documents: AsyncIterable<Record<string, any>>,
+    timeoutMs?: number
   ): Promise<number> {
     this.ensureConnected();
 
@@ -160,35 +191,38 @@ export class HermesClient {
       }
     }
 
-    const response = await this.indexClient!.indexDocuments(requestIterator());
+    const response = await this.indexClient!.indexDocuments(
+      requestIterator(),
+      this.callOptions(timeoutMs)
+    );
     return response.indexedCount;
   }
 
   /** Commit pending changes. Returns total number of documents. */
-  async commit(indexName: string): Promise<number> {
+  async commit(indexName: string, timeoutMs?: number): Promise<number> {
     this.ensureConnected();
-    const response = await this.indexClient!.commit({ indexName });
+    const response = await this.indexClient!.commit({ indexName }, this.callOptions(timeoutMs));
     return response.numDocs;
   }
 
   /** Force merge all segments. Returns number of segments after merge. */
-  async forceMerge(indexName: string): Promise<number> {
+  async forceMerge(indexName: string, timeoutMs?: number): Promise<number> {
     this.ensureConnected();
-    const response = await this.indexClient!.forceMerge({ indexName });
+    const response = await this.indexClient!.forceMerge({ indexName }, this.callOptions(timeoutMs));
     return response.numSegments;
   }
 
   /** Retrain vector index centroids/codebooks from current data. */
-  async retrainVectorIndex(indexName: string): Promise<boolean> {
+  async retrainVectorIndex(indexName: string, timeoutMs?: number): Promise<boolean> {
     this.ensureConnected();
-    const response = await this.indexClient!.retrainVectorIndex({ indexName });
+    const response = await this.indexClient!.retrainVectorIndex({ indexName }, this.callOptions(timeoutMs));
     return response.success;
   }
 
   /** Reorder BMP blocks by SimHash similarity for better pruning. Returns number of segments. */
-  async reorder(indexName: string): Promise<number> {
+  async reorder(indexName: string, timeoutMs?: number): Promise<number> {
     this.ensureConnected();
-    const response = await this.indexClient!.reorder({ indexName });
+    const response = await this.indexClient!.reorder({ indexName }, this.callOptions(timeoutMs));
     return response.numSegments;
   }
 
@@ -230,20 +264,23 @@ export class HermesClient {
    *   }},
    * });
    */
-  async search(indexName: string, request: SearchRequest): Promise<SearchResponse> {
+  async search(indexName: string, request: SearchRequest, timeoutMs?: number): Promise<SearchResponse> {
     this.ensureConnected();
 
     const query = buildQuery(request.query);
     const reranker = request.reranker ? buildReranker(request.reranker) : undefined;
 
-    const response = await this.searchClient!.search({
-      indexName,
-      query,
-      limit: request.limit ?? 10,
-      offset: request.offset ?? 0,
-      fieldsToLoad: request.fieldsToLoad ?? [],
-      reranker,
-    });
+    const response = await this.searchClient!.search(
+      {
+        indexName,
+        query,
+        limit: request.limit ?? 10,
+        offset: request.offset ?? 0,
+        fieldsToLoad: request.fieldsToLoad ?? [],
+        reranker,
+      },
+      this.callOptions(timeoutMs)
+    );
 
     const hits: SearchHit[] = response.hits.map((hit) => ({
       address: {
@@ -278,16 +315,19 @@ export class HermesClient {
   }
 
   /** Get a document by address. Returns null if not found. */
-  async getDocument(indexName: string, address: DocAddress): Promise<Document | null> {
+  async getDocument(indexName: string, address: DocAddress, timeoutMs?: number): Promise<Document | null> {
     this.ensureConnected();
     try {
-      const response = await this.searchClient!.getDocument({
-        indexName,
-        address: {
-          segmentId: address.segmentId,
-          docId: address.docId,
+      const response = await this.searchClient!.getDocument(
+        {
+          indexName,
+          address: {
+            segmentId: address.segmentId,
+            docId: address.docId,
+          },
         },
-      });
+        this.callOptions(timeoutMs)
+      );
       const fields = Object.fromEntries(
         Object.entries(response.fields).map(([k, v]) => [k, fromFieldValueList(v)])
       );
@@ -405,7 +445,25 @@ function buildQuery(q: Query): PbQuery {
   if ("all" in q) {
     return { all: {} };
   }
-  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "binaryDenseVector", "boost", "range", "prefix", "all"];
+  if ("fusion" in q) {
+    const f = q.fusion;
+    return {
+      fusion: {
+        queries: f.queries.map((wq) => ({
+          query: buildQuery(wq.query),
+          weight: wq.weight ?? 1.0,
+        })),
+        method:
+          f.method === "normalized_weighted_sum"
+            ? PbFusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
+            : PbFusionMethod.FUSION_RRF,
+        rrfK: f.rrfK ?? 0,
+        fetchLimit: f.fetchLimit ?? 0,
+        combiner: combinerToProto(f.combiner),
+      },
+    };
+  }
+  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "binaryDenseVector", "boost", "range", "prefix", "all", "fusion"];
   const keys = Object.keys(q);
   throw new Error(
     `Unrecognized query key(s): ${keys.join(", ")}. Valid keys: ${validKeys.join(", ")}`

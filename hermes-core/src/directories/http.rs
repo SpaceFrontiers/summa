@@ -91,17 +91,14 @@ pub struct HttpDirectory {
     cache: RwLock<HashMap<PathBuf, Arc<Vec<u8>>>>,
     /// Network statistics tracker
     stats: Arc<StatsTracker>,
+    /// Index name for Directory-layer metric labels
+    label: super::IndexLabel,
 }
 
 impl HttpDirectory {
     /// Create a new HTTP directory pointing to the given base URL
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-            client: reqwest::Client::new(),
-            cache: RwLock::new(HashMap::new()),
-            stats: Arc::new(StatsTracker::new()),
-        }
+        Self::with_client(base_url, reqwest::Client::new())
     }
 
     /// Create with a custom reqwest client
@@ -111,6 +108,7 @@ impl HttpDirectory {
             client,
             cache: RwLock::new(HashMap::new()),
             stats: Arc::new(StatsTracker::new()),
+            label: super::IndexLabel::default(),
         }
     }
 
@@ -340,7 +338,15 @@ impl Directory for HttpDirectory {
             })
         });
 
-        Ok(FileHandle::lazy(file_size, read_fn))
+        Ok(FileHandle::lazy_labeled(
+            file_size,
+            read_fn,
+            self.label.get(),
+        ))
+    }
+
+    fn set_index_label(&self, label: &str) {
+        self.label.set(label);
     }
 }
 

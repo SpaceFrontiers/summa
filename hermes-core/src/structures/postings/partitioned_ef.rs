@@ -174,8 +174,7 @@ impl EFPartition {
         {
             use std::arch::aarch64::*;
 
-            let chunks = self.upper_bits.chunks_exact(4);
-            let remainder = chunks.remainder();
+            let (chunks, remainder) = self.upper_bits.as_chunks::<4>();
 
             for chunk in chunks {
                 // Load 4 u64 words (32 bytes)

@@ -19,8 +19,23 @@ use rustc_hash::FxHashMap;
 /// Term IDs are remapped to compact range `0..num_terms` for flat-array degree tracking.
 pub(crate) struct ForwardIndex {
     terms: Vec<u32>,
-    offsets: Vec<u32>,
+    /// u64, not u32: a 58M-doc / ~85-dims-per-doc reorder pass carries ~4.9B
+    /// postings — u32 prefix sums wrapped and the CSR carving panicked
+    /// (prod 2026-07-14, "mid > len"). The old 8 GB memory budget masked it
+    /// by dropping dims below the u32 limit.
+    offsets: Vec<u64>,
     pub num_terms: usize,
+}
+
+/// Build CSR offsets (prefix sums) from per-entity counts. u64 output — the
+/// sum of counts legitimately exceeds u32::MAX on large reorder passes.
+fn build_csr_offsets(counts: &[u32]) -> Vec<u64> {
+    let mut offsets = Vec::with_capacity(counts.len() + 1);
+    offsets.push(0u64);
+    for &c in counts {
+        offsets.push(offsets.last().unwrap() + c as u64);
+    }
+    offsets
 }
 
 impl ForwardIndex {
@@ -41,15 +56,111 @@ impl ForwardIndex {
     }
 
     /// Total postings in the forward index.
-    pub fn total_postings(&self) -> u32 {
+    pub fn total_postings(&self) -> u64 {
         self.offsets.last().copied().unwrap_or(0)
     }
 }
 
+/// Build virtual→real and real→virtual vid maps from a BMP doc map.
+///
+/// A virtual slot is real iff its doc-map entry is not the `u32::MAX` padding
+/// sentinel. Realness must come from the doc map itself: block-copy merged
+/// segments carry each source's tail padding as *interior* padding, so
+/// `vid < num_real_docs` does NOT identify real docs there.
+///
+/// Returns `(virtual_to_real, real_to_virtual)` where `virtual_to_real[vid]`
+/// is the dense real index or `u32::MAX` for padding.
+pub(crate) fn build_vid_maps(bmp: &crate::segment::reader::bmp::BmpIndex) -> (Vec<u32>, Vec<u32>) {
+    let ids = bmp.doc_map_ids_slice();
+    let num_virtual = bmp.num_virtual_docs as usize;
+    let mut virtual_to_real = vec![u32::MAX; num_virtual];
+    let mut real_to_virtual = Vec::with_capacity(bmp.num_real_docs() as usize);
+    for (vid, (slot, chunk)) in virtual_to_real
+        .iter_mut()
+        .zip(ids.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let doc_id = u32::from_le_bytes(*chunk);
+        if doc_id != u32::MAX {
+            *slot = real_to_virtual.len() as u32;
+            real_to_virtual.push(vid as u32);
+        }
+    }
+    if real_to_virtual.len() != bmp.num_real_docs() as usize {
+        log::warn!(
+            "[reorder] BMP doc map has {} real slots but footer says num_real_docs={} — trusting the doc map",
+            real_to_virtual.len(),
+            bmp.num_real_docs(),
+        );
+    }
+    (virtual_to_real, real_to_virtual)
+}
+
+/// One (source, block) unit of forward-index construction. Because
+/// [`build_vid_maps`] assigns real ids in ascending vid order, a block's real
+/// docs form the contiguous per-source range
+/// `real_start..real_start + real_len` — blocks can be processed in parallel
+/// with disjoint output slices.
+struct BlockJob {
+    src: u32,
+    block_id: u32,
+    /// Per-source real index of the block's first real doc.
+    real_start: u32,
+    /// Number of real (non-padding) docs in the block.
+    real_len: u32,
+}
+
+/// Enumerate jobs in (source, block) order — cumulative `real_len` tiles the
+/// global real-id space `0..total_docs` exactly.
+fn build_block_jobs(
+    bmps: &[&crate::segment::reader::bmp::BmpIndex],
+    vid_maps: &[(Vec<u32>, Vec<u32>)],
+) -> Vec<BlockJob> {
+    let total_blocks: usize = bmps.iter().map(|b| b.num_blocks as usize).sum();
+    let mut jobs = Vec::with_capacity(total_blocks);
+    for (src, (bmp, (v2r, _))) in bmps.iter().zip(vid_maps).enumerate() {
+        let block_size = bmp.bmp_block_size as usize;
+        let mut real_cursor = 0u32;
+        for block_id in 0..bmp.num_blocks as usize {
+            let vid_start = block_id * block_size;
+            let vid_end = ((block_id + 1) * block_size).min(v2r.len());
+            let real_len = v2r[vid_start..vid_end]
+                .iter()
+                .filter(|&&r| r != u32::MAX)
+                .count() as u32;
+            jobs.push(BlockJob {
+                src: src as u32,
+                block_id: block_id as u32,
+                real_start: real_cursor,
+                real_len,
+            });
+            real_cursor += real_len;
+        }
+    }
+    jobs
+}
+
+/// Merge the smaller df map into the larger (rayon reduce combiner).
+#[cfg(feature = "native")]
+fn merge_df_maps(
+    mut a: FxHashMap<u32, usize>,
+    mut b: FxHashMap<u32, usize>,
+) -> FxHashMap<u32, usize> {
+    if a.len() < b.len() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    for (k, v) in b {
+        *a.entry(k).or_insert(0) += v;
+    }
+    a
+}
+
 /// Build forward index from BmpIndex sources (single or multi-source).
 ///
-/// Virtual IDs are assigned sequentially across sources: source 0 gets 0..n0,
-/// source 1 gets n0..n0+n1, etc. Returns `(forward_index, per_source_doc_counts)`.
+/// Documents are identified by dense *real* indices assigned sequentially
+/// across sources: source 0 gets 0..n0, source 1 gets n0..n0+n1, etc., where
+/// each n is the source's real (non-padding) doc count derived from its doc
+/// map via [`build_vid_maps`]. Returns `(forward_index, per_source_real_doc_counts)`.
 ///
 /// Filters dims with doc_freq outside `[min_doc_freq, max_doc_freq]`.
 /// If the estimated forward index memory exceeds `memory_budget_bytes`, the
@@ -63,7 +174,9 @@ pub(crate) fn build_forward_index_from_bmps(
     max_doc_freq: usize,
     memory_budget_bytes: usize,
 ) -> (ForwardIndex, Vec<usize>) {
-    let source_doc_counts: Vec<usize> = bmps.iter().map(|b| b.num_real_docs() as usize).collect();
+    // Per-source virtual→real maps (padding-aware realness from the doc map).
+    let vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmps.iter().map(|b| build_vid_maps(b)).collect();
+    let source_doc_counts: Vec<usize> = vid_maps.iter().map(|(_, r2v)| r2v.len()).collect();
     let total_docs: usize = source_doc_counts.iter().sum();
 
     if total_docs == 0 {
@@ -77,23 +190,46 @@ pub(crate) fn build_forward_index_from_bmps(
         );
     }
 
+    // Job list: one entry per (source, block). Real ids are assigned in
+    // ascending vid order (see build_vid_maps), so each block owns a
+    // contiguous real-id range — every phase below can process blocks in
+    // parallel, writing disjoint slices.
+    let jobs = build_block_jobs(bmps, &vid_maps);
+
     // Phase 1: count doc freq per dimension across all sources + assign compact IDs
-    let mut dim_df: FxHashMap<u32, usize> = FxHashMap::default();
-    for bmp in bmps {
-        let num_blocks = bmp.num_blocks as usize;
+    let count_block_df = |job: &BlockJob, acc: &mut FxHashMap<u32, usize>| {
+        let bmp = bmps[job.src as usize];
+        let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        let num_docs = bmp.num_real_docs() as usize;
-        for block_id in 0..num_blocks {
-            for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-                for p in postings {
-                    let vid = block_id * block_size + p.local_slot as usize;
-                    if vid < num_docs && p.impact > 0 {
-                        *dim_df.entry(dim_id).or_insert(0) += 1;
-                    }
+        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+            let mut n = 0usize;
+            for p in postings {
+                let vid = job.block_id as usize * block_size + p.local_slot as usize;
+                if v2r[vid] != u32::MAX && p.impact > 0 {
+                    n += 1;
                 }
             }
+            if n > 0 {
+                *acc.entry(dim_id).or_insert(0) += n;
+            }
         }
-    }
+    };
+    #[cfg(feature = "native")]
+    let dim_df: FxHashMap<u32, usize> = jobs
+        .par_iter()
+        .fold(FxHashMap::default, |mut acc, job| {
+            count_block_df(job, &mut acc);
+            acc
+        })
+        .reduce(FxHashMap::default, merge_df_maps);
+    #[cfg(not(feature = "native"))]
+    let dim_df: FxHashMap<u32, usize> = {
+        let mut acc = FxHashMap::default();
+        for job in &jobs {
+            count_block_df(job, &mut acc);
+        }
+        acc
+    };
 
     // Filter dims by [min_doc_freq, max_doc_freq] range
     let mut eligible: Vec<(u32, usize)> = dim_df
@@ -104,10 +240,11 @@ pub(crate) fn build_forward_index_from_bmps(
     drop(dim_df);
 
     // Memory budget: estimate forward index + bisection scratch.
-    // Peak ≈ 4*total_postings (terms array) + 28*total_docs (offsets, counts,
-    //   docs, gains, indices, new_left, new_right) + 8*num_terms (degree arrays).
+    // Peak ≈ 4*total_postings (terms array) + 32*total_docs (u64 offsets,
+    //   counts, docs, gains, indices, new_left, new_right) + 8*num_terms
+    //   (degree arrays).
     let total_postings_est: usize = eligible.iter().map(|(_, df)| *df).sum();
-    let estimated_bytes = total_postings_est * 4 + total_docs * 28 + eligible.len() * 8;
+    let estimated_bytes = total_postings_est * 4 + total_docs * 32 + eligible.len() * 8;
 
     if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
         // Sort by df ascending — keep discriminative low-df dims first,
@@ -115,7 +252,7 @@ pub(crate) fn build_forward_index_from_bmps(
         eligible.sort_by_key(|&(_, df)| df);
 
         let target_postings =
-            memory_budget_bytes.saturating_sub(total_docs * 28 + eligible.len() * 8) / 4;
+            memory_budget_bytes.saturating_sub(total_docs * 32 + eligible.len() * 8) / 4;
         let mut cum = 0usize;
         let mut keep_count = 0;
         for &(_, df) in &eligible {
@@ -147,64 +284,96 @@ pub(crate) fn build_forward_index_from_bmps(
     let num_active_terms = term_remap.len();
     drop(eligible);
 
-    // Phase 2: count terms per doc (filtered)
+    // Phase 2: count terms per doc (filtered) — per-block disjoint slices
     let mut counts = vec![0u32; total_docs];
-    let mut vid_offset = 0usize;
-
-    for bmp in bmps {
-        let num_blocks = bmp.num_blocks as usize;
+    let fill_block_counts = |job: &BlockJob, out: &mut [u32]| {
+        let bmp = bmps[job.src as usize];
+        let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        let num_docs = bmp.num_real_docs() as usize;
-        for block_id in 0..num_blocks {
-            for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-                if !term_remap.contains_key(&dim_id) {
-                    continue;
-                }
-                for p in postings {
-                    let vid = block_id * block_size + p.local_slot as usize;
-                    if vid < num_docs && p.impact > 0 {
-                        counts[vid_offset + vid] += 1;
-                    }
+        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+            if !term_remap.contains_key(&dim_id) {
+                continue;
+            }
+            for p in postings {
+                let vid = job.block_id as usize * block_size + p.local_slot as usize;
+                let real = v2r[vid];
+                if real != u32::MAX && p.impact > 0 {
+                    out[(real - job.real_start) as usize] += 1;
                 }
             }
         }
-        vid_offset += num_docs;
+    };
+    {
+        let mut slices: Vec<(&BlockJob, &mut [u32])> = Vec::with_capacity(jobs.len());
+        let mut rest: &mut [u32] = &mut counts;
+        for job in &jobs {
+            let (head, tail) = rest.split_at_mut(job.real_len as usize);
+            slices.push((job, head));
+            rest = tail;
+        }
+        #[cfg(feature = "native")]
+        slices
+            .into_par_iter()
+            .for_each(|(job, out)| fill_block_counts(job, out));
+        #[cfg(not(feature = "native"))]
+        for (job, out) in slices {
+            fill_block_counts(job, out);
+        }
     }
 
-    // Phase 3: build CSR offsets
-    let mut offsets = Vec::with_capacity(total_docs + 1);
-    offsets.push(0u32);
-    for &c in &counts {
-        offsets.push(offsets.last().unwrap() + c);
-    }
+    // Phase 3: build CSR offsets (u64 — sums exceed u32::MAX at scale)
+    let offsets = build_csr_offsets(&counts);
     let total = *offsets.last().unwrap() as usize;
+    drop(counts);
 
-    // Phase 4: fill terms (compact IDs)
+    // Phase 4: fill terms (compact IDs) — each block writes the contiguous
+    // terms range covering its real docs; per-doc write cursors are local.
     let mut terms = vec![0u32; total];
-    counts.fill(0);
-    vid_offset = 0;
-
-    for bmp in bmps {
-        let num_blocks = bmp.num_blocks as usize;
+    let fill_block_terms = |job: &BlockJob, global_real_start: usize, out: &mut [u32]| {
+        let bmp = bmps[job.src as usize];
+        let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        let num_docs = bmp.num_real_docs() as usize;
-        for block_id in 0..num_blocks {
-            for (dim_id, postings) in bmp.iter_block_terms(block_id as u32) {
-                let Some(&compact) = term_remap.get(&dim_id) else {
-                    continue;
-                };
-                for p in postings {
-                    let vid = block_id * block_size + p.local_slot as usize;
-                    if vid < num_docs && p.impact > 0 {
-                        let global_vid = vid_offset + vid;
-                        let pos = offsets[global_vid] as usize + counts[global_vid] as usize;
-                        terms[pos] = compact;
-                        counts[global_vid] += 1;
-                    }
+        // local_slot is u8, so a block never holds more than 256 real docs
+        assert!(job.real_len as usize <= 256, "BMP block exceeds 256 docs");
+        let mut cursor = [0u32; 256];
+        let base = offsets[global_real_start] as usize;
+        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+            let Some(&compact) = term_remap.get(&dim_id) else {
+                continue;
+            };
+            for p in postings {
+                let vid = job.block_id as usize * block_size + p.local_slot as usize;
+                let real = v2r[vid];
+                if real != u32::MAX && p.impact > 0 {
+                    let local = (real - job.real_start) as usize;
+                    let pos =
+                        offsets[global_real_start + local] as usize - base + cursor[local] as usize;
+                    out[pos] = compact;
+                    cursor[local] += 1;
                 }
             }
         }
-        vid_offset += num_docs;
+    };
+    {
+        let mut slices: Vec<(&BlockJob, usize, &mut [u32])> = Vec::with_capacity(jobs.len());
+        let mut rest: &mut [u32] = &mut terms;
+        let mut global_real = 0usize;
+        for job in &jobs {
+            let len =
+                (offsets[global_real + job.real_len as usize] - offsets[global_real]) as usize;
+            let (head, tail) = rest.split_at_mut(len);
+            slices.push((job, global_real, head));
+            rest = tail;
+            global_real += job.real_len as usize;
+        }
+        #[cfg(feature = "native")]
+        slices
+            .into_par_iter()
+            .for_each(|(job, g, out)| fill_block_terms(job, g, out));
+        #[cfg(not(feature = "native"))]
+        for (job, g, out) in slices {
+            fill_block_terms(job, g, out);
+        }
     }
 
     (
@@ -217,9 +386,177 @@ pub(crate) fn build_forward_index_from_bmps(
     )
 }
 
+/// Build a forward index over BLOCKS (one entity per block, its terms = the
+/// block's header dim list). Used by block-level reorder: BP over blocks is
+/// ~block_size× cheaper than over records and only needs to decide superblock
+/// assignment. Blocks are numbered globally across sources in source order.
+///
+/// Dims appearing in fewer than 2 blocks carry no clustering signal and are
+/// dropped; the memory budget applies as in the record-level builder.
+pub(crate) fn build_forward_index_from_blocks(
+    bmps: &[&crate::segment::reader::bmp::BmpIndex],
+    memory_budget_bytes: usize,
+) -> ForwardIndex {
+    let total_blocks: usize = bmps.iter().map(|b| b.num_blocks as usize).sum();
+    if total_blocks == 0 {
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+        };
+    }
+
+    // (source, block) pairs in global block order — the parallel unit.
+    let blocks: Vec<(u32, u32)> = bmps
+        .iter()
+        .enumerate()
+        .flat_map(|(src, bmp)| (0..bmp.num_blocks).map(move |b| (src as u32, b)))
+        .collect();
+
+    // Phase 1: dim → number of blocks containing it (block-level df)
+    let count_block_bf = |&(src, block_id): &(u32, u32), acc: &mut FxHashMap<u32, usize>| {
+        for (dim_id, _) in bmps[src as usize].iter_block_terms(block_id) {
+            *acc.entry(dim_id).or_insert(0) += 1;
+        }
+    };
+    #[cfg(feature = "native")]
+    let dim_bf: FxHashMap<u32, usize> = blocks
+        .par_iter()
+        .fold(FxHashMap::default, |mut acc, b| {
+            count_block_bf(b, &mut acc);
+            acc
+        })
+        .reduce(FxHashMap::default, merge_df_maps);
+    #[cfg(not(feature = "native"))]
+    let dim_bf: FxHashMap<u32, usize> = {
+        let mut acc = FxHashMap::default();
+        for b in &blocks {
+            count_block_bf(b, &mut acc);
+        }
+        acc
+    };
+
+    let max_bf = (total_blocks as f64 * 0.9) as usize;
+    let mut eligible: Vec<(u32, usize)> = dim_bf
+        .iter()
+        .filter(|&(_, bf)| *bf >= 2 && *bf <= max_bf.max(2))
+        .map(|(&dim_id, &bf)| (dim_id, bf))
+        .collect();
+    drop(dim_bf);
+
+    let total_postings_est: usize = eligible.iter().map(|(_, bf)| *bf).sum();
+    let estimated_bytes = total_postings_est * 4 + total_blocks * 32 + eligible.len() * 8;
+    if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
+        eligible.sort_by_key(|&(_, bf)| bf);
+        let target = memory_budget_bytes.saturating_sub(total_blocks * 32 + eligible.len() * 8) / 4;
+        let mut cum = 0usize;
+        let mut keep = 0;
+        for &(_, bf) in &eligible {
+            if cum + bf > target {
+                break;
+            }
+            cum += bf;
+            keep += 1;
+        }
+        log::warn!(
+            "[reorder] block-level fwd index over budget — dropped {} highest-bf dims",
+            eligible.len() - keep,
+        );
+        eligible.truncate(keep);
+    }
+
+    let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
+    for &(dim_id, _) in &eligible {
+        let compact = term_remap.len() as u32;
+        term_remap.insert(dim_id, compact);
+    }
+    let num_terms = term_remap.len();
+    drop(eligible);
+
+    // Phase 2+3: counts and CSR fill — one entity per block, so each block
+    // maps to a single count cell and a contiguous terms range.
+    let count_remapped = |&(src, block_id): &(u32, u32)| -> u32 {
+        bmps[src as usize]
+            .iter_block_terms(block_id)
+            .filter(|(dim_id, _)| term_remap.contains_key(dim_id))
+            .count() as u32
+    };
+    #[cfg(feature = "native")]
+    let counts: Vec<u32> = blocks.par_iter().map(count_remapped).collect();
+    #[cfg(not(feature = "native"))]
+    let counts: Vec<u32> = blocks.iter().map(count_remapped).collect();
+
+    let offsets = build_csr_offsets(&counts);
+    let total = *offsets.last().unwrap() as usize;
+    drop(counts);
+
+    let mut terms = vec![0u32; total];
+    let fill_block = |&(src, block_id): &(u32, u32), out: &mut [u32]| {
+        let mut n = 0usize;
+        for (dim_id, _) in bmps[src as usize].iter_block_terms(block_id) {
+            if let Some(&compact) = term_remap.get(&dim_id) {
+                out[n] = compact;
+                n += 1;
+            }
+        }
+    };
+    {
+        let mut slices: Vec<(&(u32, u32), &mut [u32])> = Vec::with_capacity(blocks.len());
+        let mut rest: &mut [u32] = &mut terms;
+        for (gb, b) in blocks.iter().enumerate() {
+            let len = (offsets[gb + 1] - offsets[gb]) as usize;
+            let (head, tail) = rest.split_at_mut(len);
+            slices.push((b, head));
+            rest = tail;
+        }
+        #[cfg(feature = "native")]
+        slices
+            .into_par_iter()
+            .for_each(|(b, out)| fill_block(b, out));
+        #[cfg(not(feature = "native"))]
+        for (b, out) in slices {
+            fill_block(b, out);
+        }
+    }
+
+    ForwardIndex {
+        terms,
+        offsets,
+        num_terms,
+    }
+}
+
 // ── Recursive Graph Bisection ────────────────────────────────────────────
 
-/// Recursive graph bisection. Returns permutation: `perm[new_pos] = old_index`.
+/// CPU/depth budget for a BP pass. BP is an anytime algorithm: stopping at
+/// any depth or deadline still yields a valid permutation, and because the
+/// output layout becomes the next pass's input order, repeated budgeted
+/// passes warm-start and deepen (top levels converge in ~0 swaps, the budget
+/// flows to deeper levels).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BpBudget {
+    /// Stop recursion at partitions of at most this many docs instead of
+    /// descending to block granularity. `None` = full depth. Capping at
+    /// superblock granularity (superblock_size × block_size docs) keeps most
+    /// of the superblock-pruning win at ~⅓ less depth.
+    pub min_partition_docs: Option<usize>,
+    /// Wall-clock cap for the whole BP computation. The pass ends cleanly at
+    /// the deadline with whatever depth it reached (`converged = false`).
+    /// Ignored on wasm (no monotonic clock).
+    pub time_budget: Option<std::time::Duration>,
+}
+
+impl BpBudget {
+    /// Unbudgeted: full depth, no deadline.
+    pub fn full() -> Self {
+        Self::default()
+    }
+}
+
+/// Recursive graph bisection. Returns `(perm, converged)` where
+/// `perm[new_pos] = old_index` and `converged` is false iff the wall-clock
+/// budget ended the pass before it finished (a depth cap alone is a chosen
+/// target, not an interruption — it reports converged).
 ///
 /// `min_partition_size` should be the BMP block_size (64).
 /// `max_iters` controls convergence (20 is standard).
@@ -230,31 +567,75 @@ pub(crate) fn graph_bisection(
     fwd: &ForwardIndex,
     min_partition_size: usize,
     max_iters: usize,
-) -> Vec<u32> {
+    budget: BpBudget,
+) -> (Vec<u32>, bool) {
     let n = fwd.num_docs();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
+    let effective_min_partition = budget
+        .min_partition_docs
+        .unwrap_or(0)
+        .max(min_partition_size);
+
     let mut docs: Vec<u32> = (0..n as u32).collect();
-    let depth = if min_partition_size > 0 {
-        ((n as f64) / (min_partition_size as f64)).log2().ceil() as usize
+    let depth = if effective_min_partition > 0 {
+        ((n as f64) / (effective_min_partition as f64))
+            .log2()
+            .ceil() as usize
     } else {
         0
     };
     let log_table = build_log_table(4096);
 
     log::debug!(
-        "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}",
+        "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}, time_budget={:?}",
         n,
-        min_partition_size,
+        effective_min_partition,
         max_iters,
         depth,
+        budget.time_budget,
     );
 
-    bisect(&mut docs, fwd, min_partition_size, max_iters, &log_table);
+    #[cfg(feature = "native")]
+    let deadline = budget.time_budget.map(|d| std::time::Instant::now() + d);
+    #[cfg(not(feature = "native"))]
+    let deadline: Option<()> = None;
+    #[cfg(not(feature = "native"))]
+    let _ = deadline;
 
-    docs
+    let exhausted = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(feature = "native")]
+    bisect(
+        &mut docs,
+        fwd,
+        effective_min_partition,
+        max_iters,
+        &log_table,
+        deadline,
+        &exhausted,
+    );
+    #[cfg(not(feature = "native"))]
+    bisect(
+        &mut docs,
+        fwd,
+        effective_min_partition,
+        max_iters,
+        &log_table,
+        None,
+        &exhausted,
+    );
+
+    let converged = !exhausted.load(std::sync::atomic::Ordering::Relaxed);
+    if !converged {
+        log::info!(
+            "BP graph_bisection: wall-clock budget {:?} exhausted at n={} — emitting partial (still valid) permutation",
+            budget.time_budget,
+            n,
+        );
+    }
+    (docs, converged)
 }
 
 /// Recursive bisection of a document slice.
@@ -271,11 +652,27 @@ fn bisect(
     min_partition_size: usize,
     max_iters: usize,
     log_table: &[f32],
+    #[cfg(feature = "native")] deadline: Option<std::time::Instant>,
+    #[cfg(not(feature = "native"))] deadline: Option<()>,
+    exhausted: &std::sync::atomic::AtomicBool,
 ) {
     let n = docs.len();
     if n <= min_partition_size {
         return;
     }
+    // Anytime cutoff: leave this subtree in its current (valid) order.
+    if exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(feature = "native")]
+    if let Some(dl) = deadline
+        && std::time::Instant::now() >= dl
+    {
+        exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    #[cfg(not(feature = "native"))]
+    let _ = deadline;
 
     let mid = n / 2;
     let nt = fwd.num_terms;
@@ -313,16 +710,24 @@ fn bisect(
     let mut new_right: Vec<u32> = Vec::with_capacity(n - mid);
 
     for iter in 0..effective_iters {
+        // Anytime cutoff between refinement passes: keep the current split.
+        #[cfg(feature = "native")]
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
         // Compute gain for each document (approx_1 from Dhulipala et al.)
         // Parallelized for large partitions where per-doc work dominates.
         compute_gains(docs, fwd, mid, &left_deg, &right_deg, log_table, &mut gains);
 
-        // Partition: top `mid` by gain go to left
+        // Partition: the `mid` LOWEST keys (strongest left affinity) go left
         indices.clear();
         indices.extend(0..n);
         indices.select_nth_unstable_by(mid, |&a, &b| {
-            gains[b]
-                .partial_cmp(&gains[a])
+            gains[a]
+                .partial_cmp(&gains[b])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -389,13 +794,49 @@ fn bisect(
     let (left, right) = docs.split_at_mut(mid);
     #[cfg(feature = "native")]
     rayon::join(
-        || bisect(left, fwd, min_partition_size, max_iters, log_table),
-        || bisect(right, fwd, min_partition_size, max_iters, log_table),
+        || {
+            bisect(
+                left,
+                fwd,
+                min_partition_size,
+                max_iters,
+                log_table,
+                deadline,
+                exhausted,
+            )
+        },
+        || {
+            bisect(
+                right,
+                fwd,
+                min_partition_size,
+                max_iters,
+                log_table,
+                deadline,
+                exhausted,
+            )
+        },
     );
     #[cfg(not(feature = "native"))]
     {
-        bisect(left, fwd, min_partition_size, max_iters, log_table);
-        bisect(right, fwd, min_partition_size, max_iters, log_table);
+        bisect(
+            left,
+            fwd,
+            min_partition_size,
+            max_iters,
+            log_table,
+            deadline,
+            exhausted,
+        );
+        bisect(
+            right,
+            fwd,
+            min_partition_size,
+            max_iters,
+            log_table,
+            deadline,
+            exhausted,
+        );
     }
 }
 
@@ -414,20 +855,29 @@ fn compute_gains(
     log_table: &[f32],
     gains: &mut [f32],
 ) {
+    // Single coherent key: HIGH = belongs in the RIGHT half.
+    // Left docs get +approx_one(from=left, to=right) — a misplaced left doc
+    // (terms concentrated right) scores high. Right docs get
+    // -approx_one(from=right, to=left) — a misplaced right doc scores low.
+    // This matches the reference two-sided formulation (compute_gains_left /
+    // compute_gains_right with negation); ranking both halves by raw
+    // "move gain" instead made both sides' misplaced docs rank identically,
+    // so the partition step could never exchange them.
     let gain_for_doc = |i: usize| -> f32 {
         let doc = docs[i] as usize;
         let in_left = i < mid;
         let mut g = 0.0f32;
         for &term in fwd.doc_terms(doc) {
             let t = term as usize;
-            let (same, other) = if in_left {
+            let (from, to) = if in_left {
                 (left_deg[t], right_deg[t])
             } else {
                 (right_deg[t], left_deg[t])
             };
-            g += fast_log2_lookup(other as usize + 2, log_table)
-                - fast_log2_lookup(same as usize, log_table)
-                - std::f32::consts::LOG2_E / (1.0 + other as f32);
+            let move_gain = fast_log2_lookup(to as usize + 2, log_table)
+                - fast_log2_lookup(from as usize, log_table)
+                - std::f32::consts::LOG2_E / (1.0 + to as f32);
+            g += if in_left { move_gain } else { -move_gain };
         }
         g
     };
@@ -480,13 +930,29 @@ fn fast_log2_lookup(val: usize, table: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    /// Regression: CSR offsets were u32 and wrapped past 4.29B postings —
+    /// a 58M-doc / ~85-dims-per-doc prod reorder pass (~4.9B postings)
+    /// panicked with "mid > len" in the terms carving. The old 8 GB memory
+    /// budget masked the overflow by dropping dims; raising the budget
+    /// exposed it. Offsets must be u64.
+    #[test]
+    fn test_csr_offsets_do_not_wrap_past_u32() {
+        let counts = [1_500_000_000u32; 3]; // 4.5B total > u32::MAX
+        let offsets = build_csr_offsets(&counts);
+        assert_eq!(
+            offsets,
+            vec![0, 1_500_000_000, 3_000_000_000, 4_500_000_000]
+        );
+        assert!(*offsets.last().unwrap() > u32::MAX as u64);
+    }
+
     /// Build a simple forward index from (doc_id, terms) pairs.
     fn make_fwd(docs: &[&[u32]], num_terms: usize) -> ForwardIndex {
         let mut terms = Vec::new();
-        let mut offsets = vec![0u32];
+        let mut offsets = vec![0u64];
         for doc_terms in docs {
             terms.extend_from_slice(doc_terms);
-            offsets.push(terms.len() as u32);
+            offsets.push(terms.len() as u64);
         }
         ForwardIndex {
             terms,
@@ -502,7 +968,7 @@ mod tests {
             offsets: Vec::new(),
             num_terms: 0,
         };
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
         assert!(perm.is_empty());
     }
 
@@ -510,7 +976,7 @@ mod tests {
     fn test_bp_small() {
         // 4 docs, min_partition_size=4 → no bisection, identity
         let fwd = make_fwd(&[&[0, 1], &[0, 2], &[1, 3], &[2, 3]], 4);
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
         assert_eq!(perm.len(), 4);
         // All docs present
         let mut sorted = perm.clone();
@@ -536,7 +1002,7 @@ mod tests {
             ],
             4,
         );
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
         assert_eq!(perm.len(), 8);
 
         // After bisection, docs from same cluster should be in same half
@@ -559,7 +1025,7 @@ mod tests {
         let docs: Vec<Vec<u32>> = (0..16).map(|i| vec![i / 4, 10 + i / 2]).collect();
         let doc_refs: Vec<&[u32]> = docs.iter().map(|v| v.as_slice()).collect();
         let fwd = make_fwd(&doc_refs, 18); // max term = 10 + 15/2 = 17, so need 18
-        let perm = graph_bisection(&fwd, 4, 20);
+        let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());
 
         assert_eq!(perm.len(), 16);
         // Must be a valid permutation
@@ -567,6 +1033,71 @@ mod tests {
         sorted.sort();
         let expected: Vec<u32> = (0..16).collect();
         assert_eq!(sorted, expected);
+    }
+
+    /// Depth-capped BP: with min_partition_docs above the cluster size, only
+    /// the top-level split happens — clusters still separate (coarse
+    /// clustering), the permutation stays valid, and the pass converges
+    /// (a depth cap is a chosen target, not an interruption).
+    #[test]
+    fn test_bp_depth_cap_separates_clusters_and_converges() {
+        // Mostly-separated clusters with one misplaced doc per half — the
+        // top-level swap pass must exchange docs 3 and 4.
+        let fwd = make_fwd(
+            &[
+                &[0, 1],
+                &[0, 1],
+                &[0, 1],
+                &[2, 3],
+                &[0, 1],
+                &[2, 3],
+                &[2, 3],
+                &[2, 3],
+            ],
+            4,
+        );
+        let budget = BpBudget {
+            min_partition_docs: Some(4),
+            time_budget: None,
+        };
+        let (perm, converged) = graph_bisection(&fwd, 2, 20, budget);
+        assert!(converged, "depth cap must report converged");
+        assert_eq!(perm.len(), 8);
+        let mut sorted = perm.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            (0..8).collect::<Vec<u32>>(),
+            "must stay a valid permutation"
+        );
+        // Top-level split separates the clusters (docs {0,1,2,4} share terms
+        // 0/1; docs {3,5,6,7} share terms 2/3)
+        let cluster_a = [0u32, 1, 2, 4];
+        let a_in_left = perm[..4].iter().filter(|d| cluster_a.contains(d)).count();
+        assert!(
+            a_in_left == 4 || a_in_left == 0,
+            "clusters should separate at the top level: {:?}",
+            perm
+        );
+    }
+
+    /// Zero wall-clock budget: the pass ends immediately, reports
+    /// converged=false, and still emits a valid (identity) permutation.
+    #[test]
+    fn test_bp_zero_time_budget_emits_valid_partial_permutation() {
+        let docs: Vec<Vec<u32>> = (0..64).map(|i| vec![i % 4]).collect();
+        let doc_refs: Vec<&[u32]> = docs.iter().map(|v| v.as_slice()).collect();
+        let fwd = make_fwd(&doc_refs, 4);
+        let budget = BpBudget {
+            min_partition_docs: None,
+            time_budget: Some(std::time::Duration::ZERO),
+        };
+        let (perm, converged) = graph_bisection(&fwd, 4, 20, budget);
+        assert!(!converged, "zero budget must report unconverged");
+        assert_eq!(perm.len(), 64);
+        let mut sorted = perm.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..64).collect::<Vec<u32>>());
     }
 
     #[test]

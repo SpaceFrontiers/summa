@@ -13,16 +13,22 @@ mod tracker;
 mod types;
 mod vector_data;
 
+#[cfg(test)]
+pub(crate) use builder::graph_bisection::build_forward_index_from_bmps;
 #[cfg(any(feature = "native", feature = "wasm"))]
-pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
+pub use builder::{
+    BpBudget, MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats,
+};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub(crate) use reader::BmpIndex;
 pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
 pub(crate) use reader::bmp::{
-    accumulate_u4_weighted, block_term_postings, compute_block_masks_4bit, find_dim_in_block_data,
+    accumulate_grid_weighted, block_term_postings, compute_block_masks, find_dim_in_block_data,
 };
 pub(crate) use reader::combine_ordinal_results;
+#[cfg(feature = "native")]
+pub mod pin;
 pub use reader::{SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;
 #[cfg(feature = "native")]

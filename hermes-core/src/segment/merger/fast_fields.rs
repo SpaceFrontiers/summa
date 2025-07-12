@@ -63,7 +63,7 @@ impl SegmentMerger {
         let mut sorted_fields = fast_fields.clone();
         sorted_fields.sort_by_key(|&(id, _)| id);
 
-        let mut fast_writer = dir.streaming_writer(&files.fast).await?;
+        let mut fast_writer = dir.streaming_writer_cold(&files.fast).await?;
         let mut toc_entries: Vec<FastFieldTocEntry> = Vec::with_capacity(sorted_fields.len());
         let mut current_offset = 0u64;
 

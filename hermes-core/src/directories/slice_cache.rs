@@ -272,6 +272,8 @@ pub struct SliceCachingDirectory<D: Directory> {
     current_bytes: Arc<RwLock<usize>>,
     /// Global access counter for LRU
     access_counter: Arc<RwLock<u64>>,
+    /// Index name for Directory-layer metric labels (also forwarded to inner)
+    label: super::IndexLabel,
 }
 
 impl<D: Directory> SliceCachingDirectory<D> {
@@ -284,6 +286,7 @@ impl<D: Directory> SliceCachingDirectory<D> {
             max_bytes,
             current_bytes: Arc::new(RwLock::new(0)),
             access_counter: Arc::new(RwLock::new(0)),
+            label: super::IndexLabel::default(),
         }
     }
 
@@ -721,7 +724,16 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
             })
         });
 
-        Ok(FileHandle::lazy(file_size, read_fn))
+        Ok(FileHandle::lazy_labeled(
+            file_size,
+            read_fn,
+            self.label.get(),
+        ))
+    }
+
+    fn set_index_label(&self, label: &str) {
+        self.label.set(label);
+        self.inner.set_index_label(label);
     }
 }
 

@@ -73,6 +73,20 @@ pub struct IndexConfig {
     pub reload_interval_ms: u64,
     /// Maximum number of concurrent background merges (default: 4)
     pub max_concurrent_merges: usize,
+    /// Wall-clock budget for merge-time BP reorder per field (only applies
+    /// when the index has `reorder_on_merge`). A truncated pass still writes
+    /// a valid, better-ordered segment; it is marked `bp_converged = false`
+    /// and the background optimizer deepens it later (warm-started).
+    /// `None` = unbudgeted (BP runs to full depth inside the merge, which can
+    /// hold a merge slot for 10-30+ minutes on 10M+ doc outputs).
+    pub merge_bp_time_budget: Option<std::time::Duration>,
+    /// Memory budget (bytes) for the BP forward index during reorder passes
+    /// (merge-time and background). When a large segment's forward index
+    /// would exceed this, the highest-df dims are dropped from BP's input
+    /// (logged loudly) — clustering quality degrades gracefully. Production
+    /// evidence: 18M-doc merges exceed the 2 GB default and drop ~10% of
+    /// eligible dims; hosts with headroom should raise this.
+    pub bp_memory_budget_bytes: usize,
 }
 
 impl Default for IndexConfig {
@@ -94,10 +108,27 @@ impl Default for IndexConfig {
             term_cache_blocks: 256,
             store_cache_blocks: 32,
             max_indexing_memory_bytes: 256 * 1024 * 1024, // 256 MB default
-            merge_policy: Box::new(crate::merge::TieredMergePolicy::default()),
+            // large_scale: wide fan-in + budget/scored selection. Safe for
+            // small indexes too (tier floors only shape *when* segments
+            // merge); merge-time BP is wall-clock budgeted, so giant merges
+            // cannot hold slots indefinitely.
+            merge_policy: Box::new(crate::merge::TieredMergePolicy::large_scale()),
             optimization: crate::structures::IndexOptimization::default(),
             reload_interval_ms: 1000, // 1 second default
             max_concurrent_merges: 4,
+            merge_bp_time_budget: Some(std::time::Duration::from_secs(600)),
+            // 24 GB — mirrors segment::reorder::DEFAULT_MEMORY_BUDGET (that
+            // module is native-only; IndexConfig also compiles for wasm).
+            // A cap, not an allocation: usage is proportional to the segment
+            // being reordered (~4 B/posting + ~28 B/doc). Sized from prod
+            // evidence: a 58M-doc/5B-posting pass estimated 20.1 GB, which
+            // 8/16 GB budgets trimmed by dropping highest-df dims.
+            // 24 GB overflows 32-bit usize (wasm32) — reorder never runs
+            // there, so any large value works; use usize::MAX.
+            #[cfg(target_pointer_width = "64")]
+            bp_memory_budget_bytes: 24 * 1024 * 1024 * 1024,
+            #[cfg(not(target_pointer_width = "64"))]
+            bp_memory_budget_bytes: usize::MAX,
         }
     }
 }
@@ -127,6 +158,8 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
+        // Directory-layer metrics (cold writes, lazy reads) carry the index label
+        directory.set_index_label(schema.index_label());
         let metadata = IndexMetadata::new((*schema).clone());
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
@@ -136,6 +169,8 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            config.merge_bp_time_budget,
+            config.bp_memory_budget_bytes,
         ));
 
         // Save initial metadata
@@ -157,6 +192,8 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         // Load metadata (includes schema)
         let metadata = IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
+        // Directory-layer metrics (cold writes, lazy reads) carry the index label
+        directory.set_index_label(schema.index_label());
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
             Arc::clone(&directory),
@@ -165,6 +202,8 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            config.merge_bp_time_budget,
+            config.bp_memory_budget_bytes,
         ));
 
         // Load trained structures into SegmentManager's ArcSwap

@@ -65,27 +65,36 @@ pub(super) fn prepare_text_maxscore(
 }
 
 /// Build a TopK scorer from fetched posting lists via text MaxScore.
+///
+/// `shared_threshold` is a QUERY-EXECUTION-local cell: when one query has
+/// multiple per-field MaxScore groups (path 2c), field A's result seeds
+/// field B's pruning. It must never be shared across queries — a
+/// per-segment cell here caused cross-query threshold leaks under
+/// concurrent searches (one query's threshold wrongly pruning another's
+/// results).
 pub(super) fn finish_text_maxscore<'a>(
     posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
     avg_field_len: f32,
     limit: usize,
-    reader: &crate::segment::SegmentReader,
+    shared_threshold: &std::cell::Cell<f32>,
+    index_label: &str,
+    field_label: &str,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
     if posting_lists.is_empty() {
         return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
     }
-    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
-    // Seed from per-segment threshold: when a query has multiple per-field
-    // MaxScore groups (path 2c), field A's result seeds field B's pruning.
-    let initial = reader.shared_threshold_f32();
+    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit)
+        .with_metric_labels(index_label, field_label);
+    let initial = shared_threshold.get();
     if initial > 0.0 {
         executor.seed_threshold(initial);
     }
     let results = executor.execute_sync()?;
     if results.len() >= limit
         && let Some(last) = results.last()
+        && last.score > shared_threshold.get()
     {
-        reader.update_shared_threshold(last.score);
+        shared_threshold.set(last.score);
     }
     Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
 }
@@ -179,7 +188,11 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
     let mut executor =
-        MaxScoreExecutor::sparse(si, query_terms, executor_limit, infos[0].heap_factor);
+        MaxScoreExecutor::sparse(si, query_terms, executor_limit, infos[0].heap_factor)
+            .with_metric_labels(
+                reader.schema().index_label(),
+                reader.schema().get_field_name(field).unwrap_or("?"),
+            );
     if let Some(pred) = predicate {
         executor = executor.with_predicate(pred);
     }
@@ -207,8 +220,11 @@ pub(crate) fn build_sparse_bmp_results(
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
     let max_sb = infos[0].max_superblocks;
+    let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     match super::bmp::execute_bmp(
         bmp,
+        reader.schema().index_label(),
+        field_label,
         &query_terms,
         executor_limit,
         infos[0].heap_factor,
@@ -243,8 +259,11 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
     let max_sb = infos[0].max_superblocks;
+    let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     match super::bmp::execute_bmp_filtered(
         bmp,
+        reader.schema().index_label(),
+        field_label,
         &query_terms,
         executor_limit,
         infos[0].heap_factor,
@@ -308,10 +327,24 @@ pub(super) fn chain_predicates<'a>(predicates: Vec<DocPredicate<'a>>) -> DocPred
     Box::new(move |doc_id| predicates.iter().all(|p| p(doc_id)))
 }
 
+/// Refining a small accumulator beats materializing a clause's full bitset
+/// when the clause is estimated to match at least this many times more docs
+/// than the accumulator holds. Probes cost ~30-40ns (fast-field closure) vs
+/// ~2-5ns per materialized entry, hence the margin.
+const PROBE_ADVANTAGE: u64 = 8;
+
 /// Build a combined DocBitset from MUST and MUST_NOT clause bitsets.
 ///
-/// Returns None if any clause doesn't support bitset creation.
-/// For term queries this is O(M) (posting list iteration); for range queries O(N).
+/// Selectivity-aware: MUST clauses are evaluated narrowest-first (posting
+/// doc counts are exact, fast-field ranges are sampled), and once the
+/// accumulator is much smaller than a remaining clause's estimate, that
+/// clause is applied as O(|acc|) per-doc predicate probes instead of being
+/// materialized. A `type = X` filter matching millions of docs is then never
+/// iterated when a recent-dates range keeps only a few thousand candidates —
+/// each surviving doc just probes the `type` fast field once.
+///
+/// Returns None if a clause that must be materialized doesn't support bitset
+/// creation (probed clauses only need `as_doc_predicate`).
 /// The resulting bitset enables ~2ns per-doc lookups in BMP (vs ~30-40ns for closures).
 pub(super) fn build_combined_bitset(
     must: &[std::sync::Arc<dyn super::Query>],
@@ -323,27 +356,70 @@ pub(super) fn build_combined_bitset(
     }
 
     let num_docs = reader.num_docs();
-    let mut result: Option<super::DocBitset> = None;
 
-    // Intersect MUST bitsets
-    for q in must {
-        let bs = q.as_doc_bitset(reader)?;
+    // Order MUST clauses by estimated match count, narrowest first. Unknown
+    // estimates sort last (pessimistically treated as matching everything).
+    let mut order: Vec<(usize, u64)> = must
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            (
+                i,
+                q.bitset_cardinality_estimate(reader)
+                    .unwrap_or(num_docs as u64),
+            )
+        })
+        .collect();
+    order.sort_unstable_by_key(|&(_, est)| est);
+
+    let mut result: Option<super::DocBitset> = None;
+    let mut acc_count: u64 = 0;
+
+    for (idx, est) in order {
+        let q = &must[idx];
         match result {
-            None => result = Some(bs),
-            Some(ref mut acc) => acc.intersect_with(&bs),
+            None => {
+                // Seed: materialize the narrowest clause.
+                let bs = q.as_doc_bitset(reader)?;
+                acc_count = bs.count() as u64;
+                result = Some(bs);
+            }
+            Some(ref mut acc) => {
+                let mut probed = false;
+                if acc_count.saturating_mul(PROBE_ADVANTAGE) <= est
+                    && let Some(pred) = q.as_doc_predicate(reader)
+                {
+                    acc.retain(&*pred);
+                    probed = true;
+                }
+                if !probed {
+                    let bs = q.as_doc_bitset(reader)?;
+                    acc.intersect_with(&bs);
+                }
+                acc_count = acc.count() as u64;
+                log::debug!(
+                    "[planner] MUST clause {}: est={} probed={} acc={}",
+                    idx,
+                    est,
+                    probed,
+                    acc_count,
+                );
+            }
+        }
+        if acc_count == 0 {
+            // AND is already empty — nothing can revive it.
+            break;
         }
     }
 
-    // Subtract MUST_NOT bitsets
+    // Subtract MUST_NOT bitsets (probe-refined when the accumulator is small)
     for q in must_not {
-        let bs = q.as_doc_bitset(reader)?;
         match result {
             None => {
                 // No MUST clauses — start with all-ones, then subtract
+                let bs = q.as_doc_bitset(reader)?;
                 let mut all = super::DocBitset::new(num_docs);
-                for w in &mut all.bits {
-                    *w = u64::MAX;
-                }
+                all.bits.fill(u64::MAX);
                 // Clear bits beyond num_docs
                 let tail_bits = num_docs as usize % 64;
                 if tail_bits > 0 && !all.bits.is_empty() {
@@ -351,9 +427,26 @@ pub(super) fn build_combined_bitset(
                     all.bits[last] &= (1u64 << tail_bits) - 1;
                 }
                 all.subtract(&bs);
+                acc_count = all.count() as u64;
                 result = Some(all);
             }
-            Some(ref mut acc) => acc.subtract(&bs),
+            Some(ref mut acc) => {
+                let est = q
+                    .bitset_cardinality_estimate(reader)
+                    .unwrap_or(num_docs as u64);
+                let mut probed = false;
+                if acc_count.saturating_mul(PROBE_ADVANTAGE) <= est
+                    && let Some(pred) = q.as_doc_predicate(reader)
+                {
+                    acc.retain(&|doc| !pred(doc));
+                    probed = true;
+                }
+                if !probed {
+                    let bs = q.as_doc_bitset(reader)?;
+                    acc.subtract(&bs);
+                }
+                acc_count = acc.count() as u64;
+            }
         }
     }
 

@@ -52,6 +52,12 @@ pub struct MergeStats {
     pub vectors_bytes: usize,
     /// Sparse vector index output size
     pub sparse_bytes: usize,
+    /// Whether merge-time BP reorder ran to full depth on every BMP field
+    /// (false = a pass hit its wall-clock budget; the segment is valid and
+    /// better-ordered, and the background optimizer deepens it later).
+    /// True when no BP ran (block-copy merges have nothing to deepen... they
+    /// are simply not reordered and tracked by the `reordered` flag instead).
+    pub bp_converged: bool,
     /// Fast-field output size
     pub fast_bytes: usize,
 }
@@ -75,14 +81,84 @@ impl std::fmt::Display for MergeStats {
 // TrainedVectorStructures is defined in super::types (available on all platforms)
 pub use super::types::TrainedVectorStructures;
 
+/// Run a CPU/IO-heavy synchronous section, telling tokio to migrate this
+/// worker's task queue first (multi-thread runtimes only — `block_in_place`
+/// panics on current_thread, where we just run inline).
+pub(crate) fn block_in_place_if_multithread<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
+    /// Run BP reordering on BMP sparse fields while writing the merged blob
+    /// (instead of byte-level block stacking). The output segment is then
+    /// already ordered, so the standalone reorder pass is unnecessary.
+    reorder_bmp: bool,
+    /// Bounded rayon pool for merge-time BP. `None` = global pool (tests);
+    /// the SegmentManager always passes its background pool so BP cannot
+    /// starve query scoring.
+    background_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Granularity for merge-time BP. `Auto` by default; the SegmentManager
+    /// forces `Records` when any merge source is an unconverged partial
+    /// reorder.
+    granularity: crate::segment::reorder::BpGranularity,
+    /// Budget for merge-time BP. Default unbudgeted; the SegmentManager
+    /// passes the index's `merge_bp_time_budget` so huge merges stop holding
+    /// a merge slot for the full BP depth — a truncated pass is marked
+    /// `bp_converged = false` and the background optimizer deepens it.
+    bp_budget: crate::segment::BpBudget,
+    /// Memory budget for the BP forward index during merge-time reorder.
+    bp_memory_budget: usize,
 }
 
 impl SegmentMerger {
     pub fn new(schema: Arc<Schema>) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            reorder_bmp: false,
+            background_pool: None,
+            granularity: crate::segment::reorder::BpGranularity::Auto,
+            bp_budget: crate::segment::BpBudget::full(),
+            bp_memory_budget: crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+        }
+    }
+
+    /// Enable BP reordering of BMP fields during the merge (see `reorder_bmp`).
+    pub fn with_bmp_reorder(mut self, reorder: bool) -> Self {
+        self.reorder_bmp = reorder;
+        self
+    }
+
+    /// Run merge-time BP on this bounded pool instead of the global one.
+    pub fn with_background_pool(mut self, pool: Option<Arc<rayon::ThreadPool>>) -> Self {
+        self.background_pool = pool;
+        self
+    }
+
+    /// Set merge-time BP granularity (see `granularity`).
+    pub fn with_granularity(mut self, granularity: crate::segment::reorder::BpGranularity) -> Self {
+        self.granularity = granularity;
+        self
+    }
+
+    /// Bound merge-time BP wall clock (see `bp_budget`).
+    pub fn with_bp_budget(mut self, budget: crate::segment::BpBudget) -> Self {
+        self.bp_budget = budget;
+        self
+    }
+
+    /// Memory budget for the BP forward index (see `bp_memory_budget`).
+    pub fn with_bp_memory_budget(mut self, bytes: usize) -> Self {
+        self.bp_memory_budget = bytes;
+        self
     }
 
     /// Merge segments into one, streaming postings/positions/store directly to files.
@@ -121,11 +197,11 @@ impl SegmentMerger {
         // ── Stage 1: text + store + fast fields ─────────────────────────
         let postings_fut = async {
             let mut postings_writer =
-                OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
+                OffsetWriter::new(dir.streaming_writer_cold(&files.postings).await?);
             let mut positions_writer =
-                OffsetWriter::new(dir.streaming_writer(&files.positions).await?);
+                OffsetWriter::new(dir.streaming_writer_cold(&files.positions).await?);
             let mut term_dict_writer =
-                OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
+                OffsetWriter::new(dir.streaming_writer_cold(&files.term_dict).await?);
 
             let terms_processed = self
                 .merge_postings(
@@ -163,7 +239,8 @@ impl SegmentMerger {
         };
 
         let store_fut = async {
-            let mut store_writer = OffsetWriter::new(dir.streaming_writer(&files.store).await?);
+            let mut store_writer =
+                OffsetWriter::new(dir.streaming_writer_cold(&files.store).await?);
             let store_num_docs = self.merge_store(segments, &mut store_writer).await?;
             let bytes = store_writer.offset() as usize;
             store_writer.finish()?;
@@ -190,7 +267,8 @@ impl SegmentMerger {
                 .await
         };
 
-        let (sparse_bytes, vectors_bytes) = tokio::try_join!(sparse_fut, dense_fut)?;
+        let ((sparse_bytes, bp_converged), vectors_bytes) =
+            tokio::try_join!(sparse_fut, dense_fut)?;
         let (store_bytes, store_num_docs) = store_result;
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
@@ -198,6 +276,7 @@ impl SegmentMerger {
         stats.store_bytes = store_bytes;
         stats.vectors_bytes = vectors_bytes;
         stats.sparse_bytes = sparse_bytes;
+        stats.bp_converged = bp_converged;
         stats.fast_bytes = fast_bytes;
         log::info!(
             "[merge] all phases done in {:.1}s: {}",

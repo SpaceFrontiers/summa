@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V13 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V14 zero-copy**.
 //!
-//! V13 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! V14 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -42,7 +42,6 @@ pub struct BmpPosting {
 }
 
 // ── u32 read helpers ─────────────────────────────────────────────────────────
-
 /// Read a little-endian u32 from a raw pointer at element index.
 /// No bounds check — used in the hot scoring loop where bounds are
 /// validated once at the method boundary via debug_assert.
@@ -73,9 +72,9 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V13 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V14 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V13 format with Recursive Graph Bisection (BP) document ordering.
+/// V14 format with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -104,6 +103,8 @@ pub struct BmpIndex {
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
+    /// Bits per block-grid cell (4 or 2); dequant scale is 17 or 85.
+    grid_bits: u8,
     /// Actual vector count before padding
     num_real_docs: u32,
 
@@ -122,6 +123,17 @@ pub struct BmpIndex {
     doc_map_ids_bytes: OwnedBytes,
     /// doc_map_ordinals[virtual_id] = original ordinal — zero-copy OwnedBytes
     doc_map_ordinals_bytes: OwnedBytes,
+
+    // ── Raw blob source (identity copies) ─────────────────────────────
+    /// Source file handle + blob range, kept so reorder can copy the blob
+    /// byte-identically for fields whose `reorder` schema attribute is unset.
+    /// Reorder is native-only, so these are dead on wasm.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    source: FileHandle,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    blob_offset: u64,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    blob_len: u64,
 }
 
 // SAFETY: All raw pointer access is derived from OwnedBytes which are Send+Sync
@@ -130,12 +142,12 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V13 blob from the given file handle.
+    /// Parse a BMP V14 blob from the given file handle.
     ///
     /// Reads the 64-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V13 data-first layout: Section B (per-block interleaved data) first,
+    /// V14 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
     pub fn parse(
         handle: FileHandle,
@@ -144,18 +156,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V13, BMP_BLOB_MAGIC_V13};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V14, BMP_BLOB_MAGIC_V14};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V13 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V14 as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V13 footer".into(),
+                "BMP blob too small for V14 footer".into(),
             ));
         }
 
         // Read the footer (last 64 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V13 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V13 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V14 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -170,15 +182,28 @@ impl BmpIndex {
         let max_weight_scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
         let doc_map_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
         let num_real_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
-        // fb[56..60] = reserved
+        // fb[56..60]: grid cell width in bits (0 = legacy 4-bit)
+        let grid_bits_raw = u32::from_le_bytes(fb[56..60].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V13 {
+        if magic != BMP_BLOB_MAGIC_V14 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP3 {:#x})",
-                magic, BMP_BLOB_MAGIC_V13
+                "Invalid BMP blob magic: {:#x} (expected BMP4 {:#x}). V13 and \
+                 older segments use u16 posting prefix sums that overflow on \
+                 large blocks — rebuild the index with this version.",
+                magic, BMP_BLOB_MAGIC_V14
             )));
         }
+        let grid_bits: u8 = match grid_bits_raw {
+            0 | 4 => 4, // 0 = blobs written before the field existed
+            2 => 2,
+            other => {
+                return Err(crate::Error::Corruption(format!(
+                    "Unsupported BMP grid_bits {} (expected 2 or 4) — data too new to read?",
+                    other
+                )));
+            }
+        };
 
         // Handle empty index
         if num_blocks == 0 {
@@ -192,6 +217,7 @@ impl BmpIndex {
                 total_terms: 0,
                 total_postings: 0,
                 packed_row_size: 0,
+                grid_bits,
                 num_real_docs,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
@@ -200,11 +226,14 @@ impl BmpIndex {
                 num_superblocks: 0,
                 doc_map_ids_bytes: OwnedBytes::empty(),
                 doc_map_ordinals_bytes: OwnedBytes::empty(),
+                source: handle,
+                blob_offset,
+                blob_len,
             });
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V13 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
@@ -220,7 +249,9 @@ impl BmpIndex {
         let block_data_starts_bytes = blob.slice(bds_start..grid_offset as usize);
 
         // Sections D+E: grid, sb_grid, doc_map
-        let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
+        let packed_row_size =
+            crate::segment::builder::bmp::grid_packed_row_size(num_blocks as usize, grid_bits)
+                as u32;
         let grid_start = grid_offset as usize;
         let grid_end = grid_start + dims as usize * packed_row_size as usize;
 
@@ -238,8 +269,31 @@ impl BmpIndex {
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
+        // Query-time access to block data, the doc map, AND the block grid is
+        // scattered. Default kernel readahead pulls in 128KB per fault around
+        // each touched location, which evicts hot pages under memory pressure.
+        //
+        // The grid especially: at production scale queries take the direct
+        // (non-compact) path and read 32 bytes per (query dim, surviving
+        // superblock) at UB-priority — i.e. effectively random — offsets
+        // within each ~100KB+ row. Default readahead amplifies each 32-byte
+        // probe into 128KB of page cache (~4000×), marching the entire
+        // data-sized grid into memory and OOMing cgroup-limited deployments.
+        // The compact path (whole-row copies) only runs when a query's rows
+        // total ≤128KB, where losing readahead costs a couple of pages.
+        //
+        // sb_grid keeps default readahead: its rows are swept contiguously
+        // per query dim, and it is pinnable (priority 4).
+        #[cfg(feature = "native")]
+        {
+            block_data_bytes.madvise(libc::MADV_RANDOM);
+            doc_map_ids_bytes.madvise(libc::MADV_RANDOM);
+            doc_map_ordinals_bytes.madvise(libc::MADV_RANDOM);
+            grid_bytes.madvise(libc::MADV_RANDOM);
+        }
+
         log::debug!(
-            "BMP V13 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
+            "BMP V14 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
              packed_row_size={}, block_data={}B, doc_map={}B",
             num_blocks,
@@ -265,6 +319,7 @@ impl BmpIndex {
             total_terms,
             total_postings,
             packed_row_size,
+            grid_bits,
             num_real_docs,
             block_data_starts_bytes,
             block_data_bytes,
@@ -273,7 +328,20 @@ impl BmpIndex {
             num_superblocks,
             doc_map_ids_bytes,
             doc_map_ordinals_bytes,
+            source: handle,
+            blob_offset,
+            blob_len,
         })
+    }
+
+    /// Read the entire raw V14 blob (including footer) from the source file.
+    ///
+    /// Used by reorder paths (native-only) to copy a field byte-identically
+    /// when its `reorder` schema attribute is unset.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub(crate) fn read_raw_blob(&self) -> std::io::Result<OwnedBytes> {
+        self.source
+            .read_bytes_range_sync(self.blob_offset..self.blob_offset + self.blob_len)
     }
 
     /// Convert a compact virtual_id to (doc_id, ordinal) via table lookup.
@@ -304,7 +372,6 @@ impl BmpIndex {
     }
 
     // ── Hot-path block-data accessors ────────────────────────────────
-
     /// Byte offset range in block_data_bytes for a block (u64 entries).
     #[inline(always)]
     pub(crate) fn block_data_range(&self, block_id: u32) -> (u64, u64) {
@@ -315,6 +382,81 @@ impl BmpIndex {
             let end = read_u64_unchecked(d.as_ptr(), block_id as usize + 1);
             (start, end)
         }
+    }
+
+    /// Pin the block-offset table (priority 1: every scored block does an
+    /// offset lookup through it).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_block_starts(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.block_data_starts_bytes,
+            "bmp block_data_starts",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
+    /// Pin the virtual-doc → (doc_id, ordinal) maps (priority 3: every
+    /// top-k resolution touches them).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_doc_maps(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.doc_map_ids_bytes,
+            "bmp doc_map_ids",
+            mode,
+            remaining,
+            report,
+        );
+        crate::segment::pin::pin_section(
+            &mut self.doc_map_ordinals_bytes,
+            "bmp doc_map_ordinals",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
+    /// Pin the superblock grid (priority 4: every query dim reads a row).
+    /// The 4-bit block grid is deliberately never pinned (data-sized).
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_sb_grid(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        crate::segment::pin::pin_section(
+            &mut self.sb_grid_bytes,
+            "bmp sb_grid",
+            mode,
+            remaining,
+            report,
+        );
+    }
+
+    /// Page-level prefetch (`MADV_WILLNEED`) of a block-data byte range.
+    ///
+    /// Used by the BMP executor to batch-prefetch the surviving blocks of a
+    /// superblock before scoring: on memory-bound hosts the kernel clusters
+    /// the page-ins into large sequential reads instead of taking one
+    /// synchronous major fault per scored block (~265µs each on cold NVMe).
+    /// No-op for non-mmap (RAM/HTTP) backing.
+    #[cfg(feature = "native")]
+    #[inline]
+    pub(crate) fn prefetch_block_data(&self, byte_start: u64, byte_end: u64) {
+        self.block_data_bytes
+            .madvise_range(byte_start as usize..byte_end as usize, libc::MADV_WILLNEED);
     }
 
     /// Get a raw pointer to the start of a block's contiguous data.
@@ -337,7 +479,7 @@ impl BmpIndex {
     ///
     /// Returns `(0, null, null, null)` for empty blocks.
     #[inline(always)]
-    pub(crate) fn parse_block(&self, block_id: u32) -> (u16, *const u8, *const u8, *const u8) {
+    pub(crate) fn parse_block(&self, block_id: u32) -> (u32, *const u8, *const u8, *const u8) {
         let (start, end) = self.block_data_range(block_id);
         if start == end {
             return (0, std::ptr::null(), std::ptr::null(), std::ptr::null());
@@ -348,11 +490,12 @@ impl BmpIndex {
                 .as_ptr()
                 .add(start as usize)
         };
-        let num_terms = unsafe { u16::from_le((base as *const u16).read_unaligned()) };
-        let dim_ptr = unsafe { base.add(2) };
+        let num_terms = unsafe { u32::from_le((base as *const u32).read_unaligned()) };
+        let dim_ptr = unsafe { base.add(4) };
         // Always u32 dim IDs (4 bytes each)
         let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * 4) };
-        let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 2) };
+        // u32 prefix sums (V14): u16 wrapped past 65,535 postings per block
+        let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 4) };
         (num_terms, dim_ptr, ps_ptr, post_ptr)
     }
 
@@ -385,7 +528,6 @@ impl BmpIndex {
     }
 
     // ── Non-hot-path accessors ───────────────────────────────────────
-
     /// Fixed vocabulary size (number of grid rows).
     pub fn dims(&self) -> u32 {
         self.dims
@@ -460,6 +602,11 @@ impl BmpIndex {
         self.packed_row_size as usize
     }
 
+    /// Bits per block-grid cell (4 or 2).
+    pub fn grid_bits(&self) -> u8 {
+        self.grid_bits
+    }
+
     /// Direct access to mmap-backed superblock grid (zero-copy, zero allocation).
     /// Used for large segments where compact grid extraction would be too expensive.
     #[inline]
@@ -474,7 +621,6 @@ impl BmpIndex {
     }
 
     // ── Streaming merge accessors (block-copy) ────────────────────────
-
     /// Raw block data bytes (Section B). For block-copy merge.
     #[inline]
     pub fn block_data_slice(&self) -> &[u8] {
@@ -529,6 +675,16 @@ impl BmpIndex {
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_DONTNEED);
     }
 
+    /// Restore query-pattern advice (same as set at `parse`) after a merge
+    /// flipped these regions to `MADV_SEQUENTIAL`. Source segments keep
+    /// serving queries while and after being merged, until swapped out.
+    #[cfg(feature = "native")]
+    pub fn madvise_random_query(&self) {
+        Self::madvise_owned(&self.block_data_bytes, libc::MADV_RANDOM);
+        Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_RANDOM);
+        Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_RANDOM);
+    }
+
     /// Release grid pages after Phase 3+4 complete.
     #[cfg(feature = "native")]
     pub fn madvise_dontneed_grids(&self) {
@@ -544,22 +700,7 @@ impl BmpIndex {
     /// pointer` crashes in CI where tests use RamDirectory (Vec-backed).
     #[cfg(feature = "native")]
     fn madvise_owned(bytes: &crate::directories::OwnedBytes, advice: i32) {
-        if !bytes.is_mmap() {
-            return;
-        }
-        let slice = bytes.as_slice();
-        if slice.is_empty() {
-            return;
-        }
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-        // Align down to page boundary
-        let page_size = 4096usize;
-        let aligned_ptr = (ptr as usize) & !(page_size - 1);
-        let aligned_len = len + (ptr as usize - aligned_ptr);
-        unsafe {
-            libc::madvise(aligned_ptr as *mut libc::c_void, aligned_len, advice);
-        }
+        bytes.madvise(advice);
     }
 }
 
@@ -570,8 +711,8 @@ pub struct BlockTermIter<'a> {
     dim_ptr: *const u8,
     ps_ptr: *const u8,
     post_ptr: *const u8,
-    num_terms: u16,
-    current: u16,
+    num_terms: u32,
+    current: u32,
     // lifetime marker for the underlying BmpIndex data
     _marker: std::marker::PhantomData<&'a ()>,
 }
@@ -611,7 +752,6 @@ impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
 // ============================================================================
 // Block-data free functions (used by query and merger)
 // ============================================================================
-
 /// Binary search for a dimension ID in a block's term_dim_ids.
 ///
 /// Always u32 dim_ids. `dim_ptr` points to the block's term_dim_ids array.
@@ -622,9 +762,9 @@ impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
 #[inline(always)]
 pub(crate) fn find_dim_in_block_data(
     dim_ptr: *const u8,
-    num_terms: u16,
+    num_terms: u32,
     dim_id: u32,
-) -> Option<u16> {
+) -> Option<u32> {
     let count = num_terms as usize;
     if count == 0 {
         return None;
@@ -637,7 +777,7 @@ pub(crate) fn find_dim_in_block_data(
         let val = unsafe { read_u32_unchecked(dim_ptr, mid) };
         match val.cmp(&dim_id) {
             std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Equal => return Some(mid as u16),
+            std::cmp::Ordering::Equal => return Some(mid as u32),
             std::cmp::Ordering::Greater => hi = mid,
         }
     }
@@ -646,7 +786,7 @@ pub(crate) fn find_dim_in_block_data(
 
 /// Get postings for a local term index within a parsed block.
 ///
-/// `ps_ptr` points to the block's posting_starts array [u16 × (num_terms + 1)].
+/// `ps_ptr` points to the block's posting_starts array [u32 × (num_terms + 1)].
 /// `post_ptr` points to the block's postings array [(u8, u8) × total].
 ///
 /// # Safety
@@ -656,16 +796,20 @@ pub(crate) fn find_dim_in_block_data(
 pub(crate) unsafe fn block_term_postings<'a>(
     ps_ptr: *const u8,
     post_ptr: *const u8,
-    local_term: u16,
+    local_term: u32,
 ) -> &'a [BmpPosting] {
-    let start_p = ps_ptr.add(local_term as usize * 2);
-    let end_p = ps_ptr.add((local_term as usize + 1) * 2);
-    let start = u16::from_le((start_p as *const u16).read_unaligned()) as usize;
-    let end = u16::from_le((end_p as *const u16).read_unaligned()) as usize;
-    let count = end - start;
-    if count == 0 {
+    let start_p = ps_ptr.add(local_term as usize * 4);
+    let end_p = ps_ptr.add((local_term as usize + 1) * 4);
+    let start = u32::from_le((start_p as *const u32).read_unaligned()) as usize;
+    let end = u32::from_le((end_p as *const u32).read_unaligned()) as usize;
+    // Prefix sums are cumulative — a non-monotonic pair means the block is
+    // corrupt. Never build a wild slice from it (`end - start` underflow on
+    // wrapped V13 data was a production SIGSEGV).
+    debug_assert!(end >= start, "corrupt BMP block: prefix sums not monotonic");
+    if end <= start {
         return &[];
     }
+    let count = end - start;
     // SAFETY: BmpPosting is #[repr(C)] with align=1 (two u8 fields).
     let ptr = post_ptr.add(start * 2) as *const BmpPosting;
     std::slice::from_raw_parts(ptr, count)
@@ -674,11 +818,9 @@ pub(crate) unsafe fn block_term_postings<'a>(
 // ============================================================================
 // SIMD-accelerated helpers for BMP scoring
 // ============================================================================
-
 // ============================================================================
 // 4-bit grid accumulation
 // ============================================================================
-
 /// Accumulate 4-bit packed grid values into f32 output.
 ///
 /// Internally unpacks u4 → u8 (×17) then does FMA, so the caller can use the
@@ -686,6 +828,65 @@ pub(crate) unsafe fn block_term_postings<'a>(
 ///
 /// `packed[i/2]`: low nibble = even element, high nibble = odd element.
 #[inline]
+/// Bits-dispatching grid accumulate: 4-bit takes the SIMD path
+/// (`accumulate_u4_weighted`); 2-bit uses an unrolled scalar kernel
+/// (dequant ×85). SIMD u2 variants are a follow-up — 2-bit is opt-in per
+/// field and the block grid is probed only inside surviving superblocks.
+pub(crate) fn accumulate_grid_weighted(
+    packed: &[u8],
+    grid_bits: u8,
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    if grid_bits == 2 {
+        accumulate_u2_weighted(packed, elem_offset, count, weight, out);
+    } else {
+        accumulate_u4_weighted(packed, elem_offset, count, weight, out);
+    }
+}
+
+/// Scalar 2-bit accumulate: `out[i] += cell(elem_offset + i) * 85 * weight`.
+/// Processes 4 cells per source byte.
+pub(crate) fn accumulate_u2_weighted(
+    packed: &[u8],
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    let w85 = 85.0 * weight;
+    let mut i = 0usize;
+    // Head: unaligned cells until byte boundary
+    while i < count && !(elem_offset + i).is_multiple_of(4) {
+        let abs = elem_offset + i;
+        let cell = (unsafe { *packed.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
+        unsafe { *out.get_unchecked_mut(i) += cell as f32 * w85 };
+        i += 1;
+    }
+    // Body: whole bytes, 4 cells each
+    while i + 4 <= count {
+        let byte = unsafe { *packed.get_unchecked((elem_offset + i) / 4) };
+        if byte != 0 {
+            unsafe {
+                *out.get_unchecked_mut(i) += (byte & 0x03) as f32 * w85;
+                *out.get_unchecked_mut(i + 1) += ((byte >> 2) & 0x03) as f32 * w85;
+                *out.get_unchecked_mut(i + 2) += ((byte >> 4) & 0x03) as f32 * w85;
+                *out.get_unchecked_mut(i + 3) += (byte >> 6) as f32 * w85;
+            }
+        }
+        i += 4;
+    }
+    // Tail
+    while i < count {
+        let abs = elem_offset + i;
+        let cell = (unsafe { *packed.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
+        unsafe { *out.get_unchecked_mut(i) += cell as f32 * w85 };
+        i += 1;
+    }
+}
+
 pub(crate) fn accumulate_u4_weighted(
     packed: &[u8],
     elem_offset: usize,
@@ -944,7 +1145,6 @@ unsafe fn accumulate_u4_weighted_sse41(
 // ============================================================================
 // Block mask computation: standalone function with SIMD dispatch
 // ============================================================================
-
 /// Compute per-block query-dim presence masks from 4-bit packed grid data.
 ///
 /// Standalone function that works with any grid slice (full index grid or
@@ -954,6 +1154,47 @@ unsafe fn accumulate_u4_weighted_sse41(
 /// two 4-bit values (low nibble = even block, high nibble = odd block).
 ///
 /// `query_dims` entries: `(dim_idx, weight)` where dim_idx indexes into grid rows.
+/// Bits-dispatching mask computation (which query dims are present per block).
+pub(crate) fn compute_block_masks(
+    grid: &[u8],
+    grid_bits: u8,
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    if grid_bits == 2 {
+        compute_block_masks_2bit(grid, prs, query_dims, block_start, count, masks);
+    } else {
+        compute_block_masks_4bit(grid, prs, query_dims, block_start, count, masks);
+    }
+}
+
+/// Scalar 2-bit presence masks.
+pub(crate) fn compute_block_masks_2bit(
+    grid: &[u8],
+    prs: usize,
+    query_dims: &[(usize, f32)],
+    block_start: usize,
+    count: usize,
+    masks: &mut [u64],
+) {
+    debug_assert!(masks.len() >= count);
+    masks[..count].fill(0);
+    for (q, &(dim_idx, _)) in query_dims.iter().enumerate() {
+        let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
+        let bit = 1u64 << q;
+        for b in 0..count {
+            let abs = block_start + b;
+            let cell = (unsafe { *row.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
+            if cell != 0 {
+                unsafe { *masks.get_unchecked_mut(b) |= bit };
+            }
+        }
+    }
+}
+
 pub(crate) fn compute_block_masks_4bit(
     grid: &[u8],
     prs: usize,
@@ -1006,7 +1247,6 @@ pub(crate) fn compute_block_masks_4bit(
 // ============================================================================
 // Block mask SIMD kernels
 // ============================================================================
-
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1147,5 +1387,250 @@ unsafe fn compute_block_masks_range_sse41(
                 *masks.get_unchecked_mut(base + i) |= bit;
             }
         }
+    }
+}
+
+/// Microbenchmark: dense 4-bit grid (SIMD nibble sweep, the current layout)
+/// vs a CSR superblock-run grid, on Zipfian SPLADE-like block occupancy.
+/// Run: cargo test --release -p hermes-core --features native --lib -- \
+///        --ignored bench_grid_dense_vs_csr --nocapture
+/// See docs/bmp-grid-compression.md for measured results.
+#[cfg(test)]
+mod grid_bench {
+    use super::accumulate_u4_weighted;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn next_f64(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// CSR grid: per dim, runs of present superblocks with (slot, nibble)
+    /// entries. Flattened per dim for cache-friendly probing.
+    struct CsrGrid {
+        /// per dim: [start..end) into run_sbs / run_entry_offsets
+        dim_run_offsets: Vec<u32>,
+        /// superblock id of each run
+        run_sbs: Vec<u16>,
+        /// per run: [start..end) into entries
+        run_entry_offsets: Vec<u32>,
+        /// (block_in_sb, nibble)
+        entries: Vec<(u8, u8)>,
+    }
+
+    impl CsrGrid {
+        /// Accumulate dim's contribution to the 64 block UBs of superblock
+        /// `sb` — the CSR replacement for one dense accumulate_u4_weighted
+        /// call. Returns false if the dim has no blocks in this superblock.
+        #[inline]
+        fn accumulate(&self, dim: usize, sb: u16, weight: f32, out: &mut [f32]) -> bool {
+            let rs = self.dim_run_offsets[dim] as usize;
+            let re = self.dim_run_offsets[dim + 1] as usize;
+            let runs = &self.run_sbs[rs..re];
+            match runs.binary_search(&sb) {
+                Ok(pos) => {
+                    let es = self.run_entry_offsets[rs + pos] as usize;
+                    let ee = self.run_entry_offsets[rs + pos + 1] as usize;
+                    for &(slot, nib) in &self.entries[es..ee] {
+                        unsafe {
+                            *out.get_unchecked_mut(slot as usize) +=
+                                (nib as u32 * 17) as f32 * weight;
+                        }
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
+    fn run_config(num_docs: usize, block_size: usize, dims: usize, nnz_per_doc: usize) {
+        const SB: usize = 64; // blocks per superblock
+        let num_blocks = num_docs.div_ceil(block_size);
+        let num_sbs = num_blocks.div_ceil(SB);
+        let prs = num_blocks.div_ceil(2);
+
+        // Zipf(1.0) over dims: cumulative distribution for binary-search sampling
+        let mut cum = Vec::with_capacity(dims);
+        let mut acc = 0.0f64;
+        for i in 0..dims {
+            acc += 1.0 / (i + 1) as f64;
+            cum.push(acc);
+        }
+        let total = acc;
+
+        // Per-block occupancy: block_size × nnz draws, dedup per block.
+        // (dim, block) → nibble, filling dense + collecting CSR entries.
+        let mut rng = XorShift(0x9E3779B97F4A7C15);
+        let mut dense = vec![0u8; dims * prs];
+        // per-dim collected (block, nibble), built block-major then sorted
+        let mut per_dim: Vec<Vec<(u32, u8)>> = vec![Vec::new(); dims];
+        let mut seen = vec![u32::MAX; dims];
+        let mut total_entries = 0u64;
+        let gen_start = Instant::now();
+        for b in 0..num_blocks {
+            let draws = block_size * nnz_per_doc;
+            for _ in 0..draws {
+                let r = rng.next_f64() * total;
+                let dim = cum.partition_point(|&c| c < r).min(dims - 1);
+                if seen[dim] != b as u32 {
+                    seen[dim] = b as u32;
+                    let nib = (rng.next() % 15 + 1) as u8;
+                    dense[dim * prs + b / 2] |= if b % 2 == 0 { nib } else { nib << 4 };
+                    per_dim[dim].push((b as u32, nib));
+                    total_entries += 1;
+                }
+            }
+        }
+        // Build CSR (per-dim vectors are already block-sorted by construction)
+        let mut csr = CsrGrid {
+            dim_run_offsets: Vec::with_capacity(dims + 1),
+            run_sbs: Vec::new(),
+            run_entry_offsets: Vec::new(),
+            entries: Vec::with_capacity(total_entries as usize),
+        };
+        csr.dim_run_offsets.push(0);
+        for blocks in &per_dim {
+            let mut cur_sb = u32::MAX;
+            for &(b, nib) in blocks {
+                let sb = b as usize / SB;
+                if sb as u32 != cur_sb {
+                    cur_sb = sb as u32;
+                    csr.run_sbs.push(sb as u16);
+                    csr.run_entry_offsets.push(csr.entries.len() as u32);
+                }
+                csr.entries.push(((b as usize % SB) as u8, nib));
+            }
+            csr.dim_run_offsets.push(csr.run_sbs.len() as u32);
+        }
+        csr.run_entry_offsets.push(csr.entries.len() as u32);
+        let num_runs = csr.run_sbs.len() as u64;
+
+        // ── Memory accounting ────────────────────────────────────────────
+        let dense_bytes = dense.len() as u64;
+        // sb-run encoding: 10 bits/entry (6-bit slot + 4-bit nibble) + 3B/run
+        // (u16 sb + u8 count) + 5B/dim row offset
+        let csr_bytes = total_entries * 10 / 8 + num_runs * 3 + dims as u64 * 5;
+        // flat encoding: u16 block delta + 4-bit nibble + 4B/dim offset
+        let flat_bytes = total_entries * 5 / 2 + dims as u64 * 4;
+        let density = total_entries as f64 / (dims as f64 * num_blocks as f64);
+        println!(
+            "\n=== docs={num_docs} block={block_size} dims={dims} blocks={num_blocks} sbs={num_sbs} (gen {:.1}s) ===",
+            gen_start.elapsed().as_secs_f64()
+        );
+        println!(
+            "occupancy: {total_entries} (dim,block) pairs, density {:.2}% | runs {num_runs}",
+            density * 100.0
+        );
+        println!(
+            "memory: dense {:.1} MB | csr sb-run {:.1} MB ({:.1}x) | csr flat {:.1} MB ({:.1}x)",
+            dense_bytes as f64 / 1e6,
+            csr_bytes as f64 / 1e6,
+            dense_bytes as f64 / csr_bytes as f64,
+            flat_bytes as f64 / 1e6,
+            dense_bytes as f64 / flat_bytes as f64,
+        );
+
+        // ── Correctness: identical block UBs from both layouts ──────────
+        let mut out_d = vec![0.0f32; SB];
+        let mut out_c = vec![0.0f32; SB];
+        for probe in 0..200 {
+            let dim = (rng.next() % dims as u64) as usize;
+            let sb = (rng.next() % num_sbs as u64) as usize;
+            let count = SB.min(num_blocks - sb * SB);
+            out_d[..count].fill(0.0);
+            out_c[..count].fill(0.0);
+            accumulate_u4_weighted(
+                &dense[dim * prs..(dim + 1) * prs],
+                sb * SB,
+                count,
+                1.5,
+                &mut out_d[..count],
+            );
+            csr.accumulate(dim, sb as u16, 1.5, &mut out_c[..count]);
+            assert_eq!(out_d, out_c, "layout mismatch at probe {probe}");
+        }
+
+        // ── Timing: Q queries × 16 dims × 30% surviving superblocks ─────
+        const QUERIES: usize = 200;
+        const QDIMS: usize = 16;
+        let surviving = (num_sbs * 3 / 10).max(1);
+        type Query = (Vec<(usize, f32)>, Vec<u16>);
+        let queries: Vec<Query> = (0..QUERIES)
+            .map(|_| {
+                let qdims: Vec<(usize, f32)> = (0..QDIMS)
+                    .map(|_| {
+                        let r = rng.next_f64() * total;
+                        let dim = cum.partition_point(|&c| c < r).min(dims - 1);
+                        (dim, rng.next_f64() as f32 + 0.1)
+                    })
+                    .collect();
+                let sbs: Vec<u16> = (0..surviving)
+                    .map(|_| (rng.next() % num_sbs as u64) as u16)
+                    .collect();
+                (qdims, sbs)
+            })
+            .collect();
+
+        let probes = (QUERIES * QDIMS * surviving) as f64;
+
+        let t = Instant::now();
+        let mut sink = 0.0f32;
+        for (qdims, sbs) in &queries {
+            for &sb in sbs {
+                out_d.fill(0.0);
+                for &(dim, w) in qdims {
+                    let count = SB.min(num_blocks - (sb as usize) * SB);
+                    accumulate_u4_weighted(
+                        &dense[dim * prs..(dim + 1) * prs],
+                        sb as usize * SB,
+                        count,
+                        w,
+                        &mut out_d[..count],
+                    );
+                }
+                sink += out_d[0];
+            }
+        }
+        let dense_t = t.elapsed();
+        black_box(sink);
+
+        let t = Instant::now();
+        let mut sink = 0.0f32;
+        let mut hits = 0u64;
+        for (qdims, sbs) in &queries {
+            for &sb in sbs {
+                out_c.fill(0.0);
+                for &(dim, w) in qdims {
+                    if csr.accumulate(dim, sb, w, &mut out_c) {
+                        hits += 1;
+                    }
+                }
+                sink += out_c[0];
+            }
+        }
+        let csr_t = t.elapsed();
+        black_box(sink);
+
+        println!(
+            "block-UB compute: dense {:.0} ns/probe ({:.2} ms/query) | csr {:.0} ns/probe ({:.2} ms/query, {:.0}% probes hit) | csr/dense {:.2}x",
+            dense_t.as_nanos() as f64 / probes,
+            dense_t.as_secs_f64() * 1000.0 / QUERIES as f64,
+            csr_t.as_nanos() as f64 / probes,
+            csr_t.as_secs_f64() * 1000.0 / QUERIES as f64,
+            hits as f64 / probes * 100.0,
+            csr_t.as_secs_f64() / dense_t.as_secs_f64(),
+        );
     }
 }

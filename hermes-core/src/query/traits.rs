@@ -117,6 +117,23 @@ impl DocBitset {
             *a &= !*b;
         }
     }
+
+    /// Keep only the set docs for which `pred` returns true. O(count) probes —
+    /// the planner uses this to refine a small accumulator against a wide
+    /// clause instead of materializing that clause's full bitset.
+    pub fn retain(&mut self, pred: &dyn Fn(DocId) -> bool) {
+        for (w, word) in self.bits.iter_mut().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                let doc = (w * 64) as u32 + b;
+                if !pred(doc) {
+                    *word &= !(1u64 << b);
+                }
+                bits &= bits - 1;
+            }
+        }
+    }
 }
 
 /// Info for MaxScore-optimizable term queries
@@ -242,6 +259,15 @@ macro_rules! define_query_traits {
             ) -> Option<DocBitset> {
                 None
             }
+
+            /// Cheap estimate of how many docs this filter clause matches in
+            /// the segment. Used by the boolean planner to order MUST/MUST_NOT
+            /// evaluation: the narrowest clause is materialized first and wider
+            /// clauses refine it with per-doc probes instead of being fully
+            /// materialized. `None` = unknown (treated as matching everything).
+            fn bitset_cardinality_estimate(&self, _reader: &SegmentReader) -> Option<u64> {
+                None
+            }
         }
 
         /// Scored document stream: a DocSet that also provides scores.
@@ -287,6 +313,10 @@ impl Query for Box<dyn Query> {
 
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<DocBitset> {
         (**self).as_doc_bitset(reader)
+    }
+
+    fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
+        (**self).bitset_cardinality_estimate(reader)
     }
 
     #[cfg(feature = "sync")]

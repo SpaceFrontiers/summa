@@ -110,6 +110,7 @@ pub(super) fn build_sparse_streaming(
         match format {
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
+                let grid_bits = sparse_config.map(|c| c.bmp_grid_bits).unwrap_or(4);
                 let dims = sparse_config.and_then(|c| c.dims).unwrap_or(105879); // default SPLADE vocab
                 let max_weight = sparse_config.and_then(|c| c.max_weight).unwrap_or(5.0); // default SPLADE max
 
@@ -117,6 +118,7 @@ pub(super) fn build_sparse_streaming(
                 let blob_len = super::bmp::build_bmp_blob(
                     std::mem::take(&mut builder.postings),
                     bmp_block_size,
+                    grid_bits,
                     weight_threshold,
                     pruning_fraction,
                     dims,

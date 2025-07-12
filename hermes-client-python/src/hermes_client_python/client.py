@@ -56,16 +56,30 @@ class HermesClient:
                 print(hit.address, hit.score)
     """
 
-    def __init__(self, address: str = "localhost:50051"):
+    def __init__(
+        self,
+        address: str = "localhost:50051",
+        default_timeout: float | None = None,
+    ):
         """Initialize client.
 
         Args:
             address: Server address in format "host:port"
+            default_timeout: Default per-RPC deadline in seconds, applied to
+                every call unless overridden by the call's ``timeout=``
+                argument. ``None`` = no deadline (current behaviour). On
+                expiry the call raises ``grpc.aio.AioRpcError`` with
+                ``DEADLINE_EXCEEDED``.
         """
         self.address = address
+        self.default_timeout = default_timeout
         self._channel: aio.Channel | None = None
         self._index_stub: pb_grpc.IndexServiceStub | None = None
         self._search_stub: pb_grpc.SearchServiceStub | None = None
+
+    def _deadline(self, timeout: float | None) -> float | None:
+        """Effective per-call gRPC deadline in seconds."""
+        return timeout if timeout is not None else self.default_timeout
 
     async def connect(self) -> None:
         """Connect to the server."""
@@ -108,7 +122,9 @@ class HermesClient:
     # Index Management
     # =========================================================================
 
-    async def create_index(self, index_name: str, schema: str) -> bool:
+    async def create_index(
+        self, index_name: str, schema: str, timeout: float | None = None
+    ) -> bool:
         """Create a new index.
 
         Args:
@@ -134,10 +150,12 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.CreateIndexRequest(index_name=index_name, schema=schema)
-        response = await self._index_stub.CreateIndex(request)
+        response = await self._index_stub.CreateIndex(
+            request, timeout=self._deadline(timeout)
+        )
         return response.success
 
-    async def delete_index(self, index_name: str) -> bool:
+    async def delete_index(self, index_name: str, timeout: float | None = None) -> bool:
         """Delete an index.
 
         Args:
@@ -148,10 +166,12 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.DeleteIndexRequest(index_name=index_name)
-        response = await self._index_stub.DeleteIndex(request)
+        response = await self._index_stub.DeleteIndex(
+            request, timeout=self._deadline(timeout)
+        )
         return response.success
 
-    async def list_indexes(self) -> list[str]:
+    async def list_indexes(self, timeout: float | None = None) -> list[str]:
         """List all indexes on the server.
 
         Returns:
@@ -159,10 +179,14 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.ListIndexesRequest()
-        response = await self._index_stub.ListIndexes(request)
+        response = await self._index_stub.ListIndexes(
+            request, timeout=self._deadline(timeout)
+        )
         return list(response.index_names)
 
-    async def get_index_info(self, index_name: str) -> IndexInfo:
+    async def get_index_info(
+        self, index_name: str, timeout: float | None = None
+    ) -> IndexInfo:
         """Get information about an index.
 
         Args:
@@ -173,7 +197,9 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.GetIndexInfoRequest(index_name=index_name)
-        response = await self._search_stub.GetIndexInfo(request)
+        response = await self._search_stub.GetIndexInfo(
+            request, timeout=self._deadline(timeout)
+        )
         vector_stats = [
             VectorFieldStats(
                 field_name=vs.field_name,
@@ -196,7 +222,10 @@ class HermesClient:
     # =========================================================================
 
     async def index_documents(
-        self, index_name: str, documents: list[dict[str, Any]]
+        self,
+        index_name: str,
+        documents: list[dict[str, Any]],
+        timeout: float | None = None,
     ) -> tuple[int, int, list[dict[str, Any]]]:
         """Index multiple documents in batch.
 
@@ -218,21 +247,32 @@ class HermesClient:
         request = pb.BatchIndexDocumentsRequest(
             index_name=index_name, documents=named_docs
         )
-        response = await self._index_stub.BatchIndexDocuments(request)
+        response = await self._index_stub.BatchIndexDocuments(
+            request, timeout=self._deadline(timeout)
+        )
         errors = [{"index": e.index, "error": e.error} for e in response.errors]
         return response.indexed_count, response.error_count, errors
 
-    async def index_document(self, index_name: str, document: dict[str, Any]) -> None:
+    async def index_document(
+        self,
+        index_name: str,
+        document: dict[str, Any],
+        timeout: float | None = None,
+    ) -> None:
         """Index a single document.
 
         Args:
             index_name: Name of the index
             document: Document as dict with field names as keys
+            timeout: Per-call deadline in seconds (overrides ``default_timeout``)
         """
-        await self.index_documents(index_name, [document])
+        await self.index_documents(index_name, [document], timeout=timeout)
 
     async def index_documents_stream(
-        self, index_name: str, documents: AsyncIterator[dict[str, Any]]
+        self,
+        index_name: str,
+        documents: AsyncIterator[dict[str, Any]],
+        timeout: float | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
         """Stream documents for indexing.
 
@@ -251,11 +291,13 @@ class HermesClient:
                 fields = _to_field_entries(doc)
                 yield pb.IndexDocumentRequest(index_name=index_name, fields=fields)
 
-        response = await self._index_stub.IndexDocuments(request_iterator())
+        response = await self._index_stub.IndexDocuments(
+            request_iterator(), timeout=self._deadline(timeout)
+        )
         errors = [{"index": e.index, "error": e.error} for e in response.errors]
         return response.indexed_count, errors
 
-    async def commit(self, index_name: str) -> int:
+    async def commit(self, index_name: str, timeout: float | None = None) -> int:
         """Commit pending changes.
 
         Args:
@@ -266,10 +308,12 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.CommitRequest(index_name=index_name)
-        response = await self._index_stub.Commit(request)
+        response = await self._index_stub.Commit(
+            request, timeout=self._deadline(timeout)
+        )
         return response.num_docs
 
-    async def force_merge(self, index_name: str) -> int:
+    async def force_merge(self, index_name: str, timeout: float | None = None) -> int:
         """Force merge all segments.
 
         Args:
@@ -280,10 +324,12 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.ForceMergeRequest(index_name=index_name)
-        response = await self._index_stub.ForceMerge(request)
+        response = await self._index_stub.ForceMerge(
+            request, timeout=self._deadline(timeout)
+        )
         return response.num_segments
 
-    async def reorder(self, index_name: str) -> int:
+    async def reorder(self, index_name: str, timeout: float | None = None) -> int:
         """Reorder BMP blocks by SimHash similarity for better pruning.
 
         Performs record-level reordering: shuffles individual ordinals across
@@ -298,10 +344,14 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.ReorderRequest(index_name=index_name)
-        response = await self._index_stub.Reorder(request)
+        response = await self._index_stub.Reorder(
+            request, timeout=self._deadline(timeout)
+        )
         return response.num_segments
 
-    async def retrain_vector_index(self, index_name: str) -> bool:
+    async def retrain_vector_index(
+        self, index_name: str, timeout: float | None = None
+    ) -> bool:
         """Retrain vector index centroids/codebooks from current data.
 
         Resets the trained ANN structures and rebuilds them from scratch.
@@ -316,7 +366,9 @@ class HermesClient:
         """
         self._ensure_connected()
         request = pb.RetrainVectorIndexRequest(index_name=index_name)
-        response = await self._index_stub.RetrainVectorIndex(request)
+        response = await self._index_stub.RetrainVectorIndex(
+            request, timeout=self._deadline(timeout)
+        )
         return response.success
 
     # =========================================================================
@@ -332,6 +384,7 @@ class HermesClient:
         offset: int = 0,
         fields_to_load: list[str] | None = None,
         reranker: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> SearchResponse:
         """Search for documents.
 
@@ -341,7 +394,11 @@ class HermesClient:
         Args:
             index_name: Name of the index
             query: Query dict with one key: "term", "match", "boolean",
-                "sparse_vector", "dense_vector", "boost", or "all".
+                "sparse_vector", "dense_vector", "boost", "all", or "fusion".
+                Fusion (hybrid union of sub-queries, top-level only):
+                {"fusion": {"queries": [{"query": {...}, "weight": 1.0}, ...],
+                "method": "rrf" | "normalized_weighted_sum",
+                "rrf_k": 60, "fetch_limit": 100}}
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
@@ -412,7 +469,9 @@ class HermesClient:
             reranker=pb_reranker,
         )
 
-        response = await self._search_stub.Search(request)
+        response = await self._search_stub.Search(
+            request, timeout=self._deadline(timeout)
+        )
 
         hits = [
             SearchHit(
@@ -448,7 +507,10 @@ class HermesClient:
         )
 
     async def get_document(
-        self, index_name: str, address: DocAddress
+        self,
+        index_name: str,
+        address: DocAddress,
+        timeout: float | None = None,
     ) -> Document | None:
         """Get a document by address.
 
@@ -465,7 +527,9 @@ class HermesClient:
             address=pb.DocAddress(segment_id=address.segment_id, doc_id=address.doc_id),
         )
         try:
-            response = await self._search_stub.GetDocument(request)
+            response = await self._search_stub.GetDocument(
+                request, timeout=self._deadline(timeout)
+            )
             fields = {k: _from_field_value_list(v) for k, v in response.fields.items()}
             return Document(fields=fields)
         except grpc.RpcError as e:
@@ -773,6 +837,35 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
     if "all" in q:
         return pb.Query(all=pb.AllQuery())
 
+    if "fusion" in q:
+        f = q["fusion"]
+        method = f.get("method", "rrf")
+        if method == "rrf":
+            pb_method = pb.FusionMethod.FUSION_RRF
+        elif method == "normalized_weighted_sum":
+            pb_method = pb.FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
+        else:
+            raise ValueError(
+                f"Unknown fusion method {method!r}: "
+                "expected 'rrf' or 'normalized_weighted_sum'"
+            )
+        return pb.Query(
+            fusion=pb.FusionQuery(
+                queries=[
+                    pb.WeightedQuery(
+                        query=_build_query(wq["query"]),
+                        weight=wq.get("weight", 1.0),
+                    )
+                    for wq in f["queries"]
+                ],
+                method=pb_method,
+                rrf_k=f.get("rrf_k", 0),
+                fetch_limit=f.get("fetch_limit", 0),
+                # Chunk combiner; unset -> MAX server-side (chunk-level fusion)
+                combiner=_combiner_to_proto(f.get("combiner")),
+            )
+        )
+
     # No recognized query key found
     valid_keys = [
         "term",
@@ -785,6 +878,7 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
         "range",
         "prefix",
         "all",
+        "fusion",
     ]
     raise ValueError(
         f"Unrecognized query key(s): {set(q.keys()) - set(valid_keys)}. "

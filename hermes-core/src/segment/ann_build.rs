@@ -8,6 +8,7 @@ pub const RABITQ_TYPE: u8 = 0;
 pub const IVF_RABITQ_TYPE: u8 = 1;
 pub const SCANN_TYPE: u8 = 2;
 pub const FLAT_TYPE: u8 = 4;
+pub const BINARY_IVF_TYPE: u8 = 5;
 
 // --- Native-only builder/serialization functions ---
 
@@ -18,9 +19,16 @@ use crate::structures::{
 };
 
 /// Create a fresh IVF-RaBitQ index and codebook ready for vector insertion.
+///
+/// `bits` = total bits per dimension (1 = classic binary RaBitQ,
+/// 2-8 = extended multi-bit codes with refined distance estimates).
 #[cfg(feature = "native")]
-pub fn new_ivf_rabitq(dim: usize, centroids: &CoarseCentroids) -> (IVFRaBitQIndex, RaBitQCodebook) {
-    let rabitq_config = RaBitQConfig::new(dim);
+pub fn new_ivf_rabitq(
+    dim: usize,
+    centroids: &CoarseCentroids,
+    bits: u8,
+) -> (IVFRaBitQIndex, RaBitQCodebook) {
+    let rabitq_config = RaBitQConfig::new(dim).with_bits(bits);
     let codebook = RaBitQCodebook::new(rabitq_config);
     let ivf_config = IVFRaBitQConfig::new(dim);
     let index = IVFRaBitQIndex::new(ivf_config, centroids.version, codebook.version);

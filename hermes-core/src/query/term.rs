@@ -206,6 +206,13 @@ impl Query for TermQuery {
     }
 
     #[cfg(feature = "sync")]
+    fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
+        // Exact: the posting list header carries the doc count.
+        let pl = reader.get_postings_sync(self.field, &self.term).ok()??;
+        Some(pl.doc_count() as u64)
+    }
+
+    #[cfg(feature = "sync")]
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
         // Build bitset from posting list: O(M) where M = matching doc count.
         // Much faster than O(N) fast-field scan for selective terms.

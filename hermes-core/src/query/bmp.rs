@@ -39,8 +39,8 @@
 
 use super::scoring::{ScoreCollector, ScoredDoc};
 use crate::segment::{
-    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_u4_weighted, block_term_postings,
-    compute_block_masks_4bit, find_dim_in_block_data,
+    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_grid_weighted, block_term_postings,
+    compute_block_masks, find_dim_in_block_data,
 };
 
 // dim_id is used directly as grid row index. No dim_idx indirection.
@@ -165,12 +165,23 @@ thread_local! {
 /// Based on Mallia et al. (SIGIR 2024) and Carlson et al. (arXiv 2602.02883).
 pub fn execute_bmp(
     index: &BmpIndex,
+    index_label: &str,
+    field_label: &str,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
     max_superblocks: usize,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    execute_bmp_inner(index, query_terms, k, heap_factor, max_superblocks, None)
+    execute_bmp_inner(
+        index,
+        index_label,
+        field_label,
+        query_terms,
+        k,
+        heap_factor,
+        max_superblocks,
+        None,
+    )
 }
 
 /// Execute a BMP query with a document predicate filter.
@@ -178,8 +189,11 @@ pub fn execute_bmp(
 /// Same as [`execute_bmp`] but only collects documents that pass the predicate.
 /// The predicate is checked during scoring (not post-filter), so the collector
 /// only contains valid documents and the threshold evolves correctly.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_bmp_filtered(
     index: &BmpIndex,
+    index_label: &str,
+    field_label: &str,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -188,6 +202,8 @@ pub fn execute_bmp_filtered(
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
         index,
+        index_label,
+        field_label,
         query_terms,
         k,
         heap_factor,
@@ -196,8 +212,11 @@ pub fn execute_bmp_filtered(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_bmp_inner(
     index: &BmpIndex,
+    index_label: &str,
+    field_label: &str,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
@@ -417,6 +436,7 @@ fn execute_bmp_inner(
 
         // Phase 3: Score superblocks in priority-descending order
         let mut blocks_scored = 0u32;
+        let mut docmap_lookups = 0u32;
         let mut sbs_scored = 0u32;
         let mut collector = ScoreCollector::new(collector_k);
 
@@ -457,14 +477,16 @@ fn execute_bmp_inner(
             // Compute block UBs + masks from grid
             compute_block_ubs_compact(
                 grid_slice,
+                index.grid_bits(),
                 prs,
                 &grid_dims,
                 block_start,
                 block_end,
                 &mut scratch.local_block_ubs,
             );
-            compute_block_masks_4bit(
+            compute_block_masks(
                 grid_slice,
+                index.grid_bits(),
                 prs,
                 &grid_dims,
                 block_start,
@@ -480,6 +502,7 @@ fn execute_bmp_inner(
                     .collect();
                 compute_block_ubs_compact(
                     grid_slice,
+                    index.grid_bits(),
                     prs,
                     &phase1_dims,
                     block_start,
@@ -492,6 +515,38 @@ fn execute_bmp_inner(
                 &scratch.local_block_ubs[..count],
                 &mut scratch.local_block_order,
             );
+
+            // Level 3: page-level prefetch of the surviving blocks' data.
+            // Mirrors the scoring loop's skip conditions (UB-descending order,
+            // break on ub*alpha <= threshold, skip zero-mask blocks) to find
+            // the byte span that will actually be read, then issues a single
+            // MADV_WILLNEED so cold pages are clustered into sequential reads
+            // instead of one major fault per block (memory-bound hosts).
+            #[cfg(feature = "native")]
+            {
+                let thr = collector.threshold();
+                let heap_full = collector.len() >= collector_k;
+                let mut lo = u64::MAX;
+                let mut hi = 0u64;
+                for &li in scratch.local_block_order.iter().take(count) {
+                    let li = li as usize;
+                    if li >= count {
+                        break;
+                    }
+                    if heap_full && scratch.local_block_ubs[li] * alpha <= thr {
+                        break;
+                    }
+                    if scratch.local_block_masks[li] == 0 {
+                        continue;
+                    }
+                    let (s, e) = index.block_data_range((block_start + li) as u32);
+                    lo = lo.min(s);
+                    hi = hi.max(e);
+                }
+                if lo < hi {
+                    index.prefetch_block_data(lo, hi);
+                }
+            }
 
             score_superblock_blocks(
                 index,
@@ -507,6 +562,7 @@ fn execute_bmp_inner(
                 &predicate,
                 &mut collector,
                 &mut blocks_scored,
+                &mut docmap_lookups,
                 &mut scratch.acc,
                 phase1_mask,
                 if two_phase_active {
@@ -533,6 +589,16 @@ fn execute_bmp_inner(
 
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let threshold = collector.threshold();
+        crate::observe::bmp_query(
+            index_label,
+            field_label,
+            t_start.elapsed().as_secs_f64(),
+            sbs_scored as usize,
+            num_superblocks_total,
+            blocks_scored as usize,
+            num_blocks,
+            docmap_lookups as usize,
+        );
         if elapsed_ms > 500.0 {
             log::warn!(
                 "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}, alpha={:.2}",
@@ -617,7 +683,7 @@ fn zero_touched_acc(acc: &mut [u32], touched: &[u64; 4]) {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn score_block_bsearch_int(
-    num_terms: u16,
+    num_terms: u32,
     dim_ptr: *const u8,
     ps_ptr: *const u8,
     post_ptr: *const u8,
@@ -676,6 +742,7 @@ fn score_superblock_blocks(
     predicate: &Option<&dyn Fn(crate::DocId) -> bool>,
     collector: &mut ScoreCollector,
     blocks_scored: &mut u32,
+    docmap_lookups: &mut u32,
     acc: &mut [u32],
     phase1_mask: u64,
     phase1_local_ubs: Option<&[f32]>,
@@ -835,6 +902,11 @@ fn score_superblock_blocks(
                 if virtual_id >= num_vdocs {
                     continue;
                 }
+                // Doc-map indirection: BMP reorder permutes only BMP-internal
+                // record order, so every candidate pays a scattered lookup
+                // into the doc-id map here. Counted per query (metered as
+                // hermes_bmp_docmap_lookups_*).
+                *docmap_lookups += 1;
                 let (doc_id, ordinal) = index.virtual_to_doc(virtual_id as u32);
                 if doc_id == u32::MAX {
                     continue;
@@ -960,6 +1032,7 @@ fn compute_sb_ubs_int(
 #[inline]
 fn compute_block_ubs_compact(
     compact_grid: &[u8],
+    grid_bits: u8,
     prs: usize,
     compact_dims: &[(usize, f32)],
     block_start: usize,
@@ -971,6 +1044,13 @@ fn compute_block_ubs_compact(
     out[..count].fill(0.0);
     for &(local_idx, weight) in compact_dims {
         let row = &compact_grid[local_idx * prs..(local_idx + 1) * prs];
-        accumulate_u4_weighted(row, block_start, count, weight, &mut out[..count]);
+        accumulate_grid_weighted(
+            row,
+            grid_bits,
+            block_start,
+            count,
+            weight,
+            &mut out[..count],
+        );
     }
 }

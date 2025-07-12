@@ -549,6 +549,8 @@ impl SparseTermQuery {
         if let Some(bmp) = reader.bmp_index(self.field) {
             let results = crate::query::bmp::execute_bmp(
                 bmp,
+                reader.schema().index_label(),
+                reader.schema().get_field_name(self.field).unwrap_or("?"),
                 &[(self.dim_id, self.weight)],
                 limit,
                 self.heap_factor,

@@ -16,6 +16,7 @@ mod dense;
 mod diagnostics;
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) mod graph_bisection;
+pub use graph_bisection::BpBudget;
 mod postings;
 mod sparse;
 mod store;
@@ -886,7 +887,10 @@ impl SegmentBuilder {
     /// Collects (doc_id, ordinal, weight) postings per dimension. During commit, these are
     /// converted to BlockSparsePostingList with proper quantization from SparseVectorConfig.
     ///
-    /// Weights below the configured `weight_threshold` are not indexed.
+    /// Weights below the configured `weight_threshold` are not indexed. When
+    /// `doc_mass` is configured, only the top-|weight| entries covering that
+    /// fraction of the vector's total |weight| mass are kept (the excessive
+    /// tail of SPLADE-style vectors is cropped).
     fn index_sparse_vector_field(
         &mut self,
         field: Field,
@@ -894,13 +898,12 @@ impl SegmentBuilder {
         ordinal: u16,
         entries: &[(u32, f32)],
     ) -> Result<()> {
-        // Get weight threshold from field config (default 0.0 = no filtering)
-        let weight_threshold = self
+        let (weight_threshold, doc_mass, min_terms) = self
             .schema
             .get_field_entry(field)
             .and_then(|entry| entry.sparse_vector_config.as_ref())
-            .map(|config| config.weight_threshold)
-            .unwrap_or(0.0);
+            .map(|config| (config.weight_threshold, config.doc_mass, config.min_terms))
+            .unwrap_or((0.0, None, 0));
 
         let builder = self
             .sparse_vectors
@@ -909,9 +912,36 @@ impl SegmentBuilder {
 
         builder.inc_vector_count();
 
+        // Document-side mass cropping: determine the per-vector weight cutoff
+        // below which entries fall outside the doc_mass fraction of total mass.
+        // Short vectors (<= min_terms entries) are never cropped.
+        let mass_cutoff = match doc_mass {
+            Some(mass) if mass < 1.0 && entries.len() > min_terms => {
+                let mut weights: Vec<f32> = entries
+                    .iter()
+                    .map(|&(_, w)| w.abs())
+                    .filter(|w| *w >= weight_threshold)
+                    .collect();
+                weights.sort_unstable_by(|a, b| b.total_cmp(a));
+                let total: f64 = weights.iter().map(|&w| w as f64).sum();
+                let target = total * mass as f64;
+                let mut cumulative = 0.0f64;
+                let mut cutoff = 0.0f32;
+                for &w in &weights {
+                    if cumulative >= target {
+                        break;
+                    }
+                    cumulative += w as f64;
+                    cutoff = w;
+                }
+                cutoff
+            }
+            _ => 0.0,
+        };
+
         for &(dim_id, weight) in entries {
-            // Skip weights below threshold
-            if weight.abs() < weight_threshold {
+            // Skip weights below threshold or outside the doc_mass prefix
+            if weight.abs() < weight_threshold || weight.abs() < mass_cutoff {
                 continue;
             }
 

@@ -167,7 +167,12 @@ impl TieredMergePolicy {
     pub fn large_scale() -> Self {
         Self {
             segments_per_tier: 10,
-            max_merge_at_once: 10,
+            // Wide fan-in absorbs continuous-ingestion floods of small
+            // memtable segments in fewer passes (350-segment backlogs at
+            // 30M docs were observed with fan-in 10). Giant merges are safe:
+            // output docs are capped by max_merged_docs and merge-time BP is
+            // wall-clock budgeted (IndexConfig::merge_bp_time_budget).
+            max_merge_at_once: 24,
             tier_factor: 10.0,
             tier_floor: 50_000,
             max_merged_docs: 20_000_000,

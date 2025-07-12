@@ -29,6 +29,7 @@ use super::{
 /// No application-level cache - the OS page cache handles this efficiently.
 pub struct MmapDirectory {
     root: PathBuf,
+    label: super::IndexLabel,
 }
 
 impl MmapDirectory {
@@ -36,6 +37,7 @@ impl MmapDirectory {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            label: super::IndexLabel::default(),
         }
     }
 
@@ -61,6 +63,8 @@ impl Clone for MmapDirectory {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
+            // Shared, so a label set on any clone is visible on all
+            label: self.label.clone(),
         }
     }
 }
@@ -119,6 +123,10 @@ impl Directory for MmapDirectory {
         // This eliminates the async callback overhead entirely for mmap paths
         self.open_read(path).await
     }
+
+    fn set_index_label(&self, label: &str) {
+        self.label.set(label);
+    }
 }
 
 #[async_trait]
@@ -159,6 +167,18 @@ impl DirectoryWriter for MmapDirectory {
         }
         let file = std::fs::File::create(&full_path)?;
         Ok(Box::new(FileStreamingWriter::new(file)))
+    }
+
+    async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        let full_path = self.resolve(path);
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = std::fs::File::create(&full_path)?;
+        Ok(Box::new(super::ColdStreamingWriter::new(
+            file,
+            self.label.get(),
+        )))
     }
 }
 

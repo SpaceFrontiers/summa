@@ -149,6 +149,15 @@ pub async fn load_vectors_file<D: Directory>(
                     VectorIndex::IVF(Arc::new(super::types::LazyIVF::new(data))),
                 );
             }
+            ann_build::BINARY_IVF_TYPE => {
+                // Binary IVF (Hamming) — lazy: OwnedBytes stored (zero-copy mmap ref),
+                // deserialized on first search. No heap copy during segment load.
+                let data = handle.read_bytes_range(offset..offset + length).await?;
+                indexes.insert(
+                    field_id,
+                    VectorIndex::BinaryIvf(Arc::new(super::types::LazyBinaryIvf::new(data))),
+                );
+            }
             ann_build::RABITQ_TYPE => {
                 // RaBitQ — lazy: OwnedBytes stored (zero-copy mmap ref),
                 // deserialized on first search. No heap copy during segment load.

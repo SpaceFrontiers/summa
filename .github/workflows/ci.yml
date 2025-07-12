@@ -20,7 +20,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-02-17
+          toolchain: nightly-2026-07-07
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -62,6 +62,21 @@ jobs:
       - name: Run cargo audit
         run: cargo audit
 
+  # Unused dependency check
+  machete:
+    name: Cargo Machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Run cargo machete
+        run: cargo machete
+
   # WASM build - separate due to different target
   wasm:
     name: WASM Build
@@ -71,7 +86,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-02-17
+          toolchain: nightly-2026-07-07
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo

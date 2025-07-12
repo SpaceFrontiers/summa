@@ -209,6 +209,19 @@ pub struct DenseVectorConfig {
     /// Default: true (most embedding models produce L2-normalized vectors).
     #[serde(default = "default_unit_norm")]
     pub unit_norm: bool,
+    /// Total RaBitQ bits per dimension for IVF-RaBitQ indexes.
+    /// 1 = classic binary RaBitQ (default). 2-8 = extended multi-bit codes
+    /// with much tighter distance estimates — allows lowering rerank_factor
+    /// (fewer raw-vector reads) at the same recall. Recommended: 4-5 for
+    /// disk-resident indexes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq_bits: Option<u8>,
+    /// SOAR spilled cluster assignments for IVF-based indexes (IVF-RaBitQ, ScaNN).
+    /// Assigns vectors to a secondary cluster with an orthogonality-amplified
+    /// residual, improving recall at the same nprobe for ~1.2-2x assignment storage.
+    /// Default: None (disabled). Ignored for Flat/RaBitQ index types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soar: Option<crate::structures::SoarConfig>,
 }
 
 fn default_nprobe() -> usize {
@@ -229,6 +242,8 @@ impl DenseVectorConfig {
             nprobe: 32,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -242,6 +257,8 @@ impl DenseVectorConfig {
             nprobe,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -255,6 +272,8 @@ impl DenseVectorConfig {
             nprobe,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -268,6 +287,8 @@ impl DenseVectorConfig {
             nprobe: 0,
             build_threshold: None,
             unit_norm: true,
+            soar: None,
+            rabitq_bits: None,
         }
     }
 
@@ -292,6 +313,18 @@ impl DenseVectorConfig {
     /// Set number of IVF clusters
     pub fn with_num_clusters(mut self, num_clusters: usize) -> Self {
         self.num_clusters = Some(num_clusters);
+        self
+    }
+
+    /// Set RaBitQ total bits per dimension (1 = classic, 2-8 = extended)
+    pub fn with_rabitq_bits(mut self, bits: u8) -> Self {
+        self.rabitq_bits = Some(bits.clamp(1, 8));
+        self
+    }
+
+    /// Enable SOAR spilled secondary cluster assignments (IVF-based indexes only)
+    pub fn with_soar(mut self, soar: crate::structures::SoarConfig) -> Self {
+        self.soar = Some(soar);
         self
     }
 
@@ -341,6 +374,32 @@ impl DenseVectorConfig {
 pub struct BinaryDenseVectorConfig {
     /// Number of bits (dimensions). Storage is ceil(dim/8) bytes per vector.
     pub dim: usize,
+    /// ANN index type: Flat (brute-force SIMD Hamming, default) or Ivf
+    /// (k-majority Hamming clusters — probe `nprobe` clusters at query time).
+    /// IVF pays off for segments past a few million vectors.
+    #[serde(default)]
+    pub index_type: BinaryIndexType,
+    /// Number of IVF clusters (default: sqrt(n) capped at 4096)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_clusters: Option<usize>,
+    /// Clusters to probe during search (default: 32)
+    #[serde(default = "default_nprobe")]
+    pub nprobe: usize,
+    /// Minimum vectors before building the IVF index (default: 100_000 —
+    /// below that brute-force SIMD Hamming is faster than probing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_threshold: Option<usize>,
+}
+
+/// ANN index type for binary dense vector fields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryIndexType {
+    /// Brute-force SIMD Hamming scan (default)
+    #[default]
+    Flat,
+    /// IVF with k-majority Hamming clustering
+    Ivf,
 }
 
 impl BinaryDenseVectorConfig {
@@ -349,7 +408,40 @@ impl BinaryDenseVectorConfig {
             dim.is_multiple_of(8),
             "BinaryDenseVector dimension must be a multiple of 8, got {dim}"
         );
-        Self { dim }
+        Self {
+            dim,
+            index_type: BinaryIndexType::Flat,
+            num_clusters: None,
+            nprobe: 32,
+            build_threshold: None,
+        }
+    }
+
+    /// Enable the IVF index (builder pattern)
+    pub fn with_ivf(mut self, num_clusters: Option<usize>, nprobe: usize) -> Self {
+        self.index_type = BinaryIndexType::Ivf;
+        self.num_clusters = num_clusters;
+        self.nprobe = nprobe;
+        self
+    }
+
+    /// Set the build threshold (builder pattern)
+    pub fn with_build_threshold(mut self, threshold: usize) -> Self {
+        self.build_threshold = Some(threshold);
+        self
+    }
+
+    /// Default build threshold: brute-force wins below ~100K vectors.
+    pub fn default_build_threshold(&self) -> usize {
+        self.build_threshold.unwrap_or(100_000)
+    }
+
+    /// Optimal cluster count for a given vector count (sqrt(n), capped)
+    pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
+        self.num_clusters.unwrap_or_else(|| {
+            let optimal = (num_vectors as f64).sqrt() as usize;
+            optimal.clamp(16, 4096)
+        })
     }
 
     /// Number of bytes needed to store one vector
@@ -371,6 +463,17 @@ pub struct Schema {
     /// Query router rules for routing queries to specific fields based on regex patterns
     #[serde(default)]
     query_routers: Vec<QueryRouterRule>,
+    /// Run BP (graph bisection) reordering of `reorder`-attributed BMP fields
+    /// inside segment merges. SDL: `reorder_on_merge: true` at index level.
+    /// Absent = disabled (merges block-copy; the standalone reorder pass
+    /// handles ordering).
+    #[serde(default)]
+    reorder_on_merge: bool,
+    /// Index name used as the `index` label on metrics. Set from the SDL
+    /// index name at parse time and overridden with the registry name at
+    /// server-side index creation. Empty on old metadata → "unknown".
+    #[serde(default)]
+    index_name: String,
 }
 
 impl Schema {
@@ -405,6 +508,27 @@ impl Schema {
     /// Used by the background optimizer to determine which indexes need BP reordering.
     pub fn has_reorder_fields(&self) -> bool {
         self.fields.iter().any(|e| e.reorder)
+    }
+
+    /// Whether merges BP-reorder `reorder`-attributed BMP fields while writing
+    /// the merged segment (index-level SDL option `reorder_on_merge: true`).
+    pub fn reorder_on_merge(&self) -> bool {
+        self.reorder_on_merge
+    }
+
+    /// Index name for metric labels ("unknown" when not set — pre-existing
+    /// metadata or programmatic schemas without a name).
+    pub fn index_label(&self) -> &str {
+        if self.index_name.is_empty() {
+            "unknown"
+        } else {
+            &self.index_name
+        }
+    }
+
+    /// Set the index name used as the metrics `index` label.
+    pub fn set_index_name(&mut self, name: impl Into<String>) {
+        self.index_name = name.into();
     }
 
     /// Get the default fields for query parsing
@@ -443,6 +567,8 @@ pub struct SchemaBuilder {
     fields: Vec<FieldEntry>,
     default_fields: Vec<String>,
     query_routers: Vec<QueryRouterRule>,
+    reorder_on_merge: bool,
+    index_name: String,
 }
 
 impl SchemaBuilder {
@@ -715,6 +841,17 @@ impl SchemaBuilder {
         }
     }
 
+    /// Enable BP reordering of `reorder`-attributed BMP fields inside merges
+    /// (index-level; SDL `reorder_on_merge: true`). Default: disabled.
+    pub fn set_reorder_on_merge(&mut self, on: bool) {
+        self.reorder_on_merge = on;
+    }
+
+    /// Set the index name used as the metrics `index` label.
+    pub fn set_index_name(&mut self, name: impl Into<String>) {
+        self.index_name = name.into();
+    }
+
     /// Set position tracking mode for phrase queries and multi-field element tracking
     pub fn set_positions(&mut self, field: Field, mode: PositionMode) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
@@ -750,6 +887,8 @@ impl SchemaBuilder {
             name_to_field,
             default_fields,
             query_routers: self.query_routers,
+            reorder_on_merge: self.reorder_on_merge,
+            index_name: self.index_name,
         }
     }
 }

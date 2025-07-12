@@ -472,11 +472,6 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
 
-        // Reset per-segment MaxScore thresholds from prior searches
-        for seg in &self.segments {
-            seg.reset_shared_threshold();
-        }
-
         // Use rayon + block_in_place for CPU-bound scoring (sync feature required).
         // Offloads the scoring loop from tokio workers so search doesn't starve
         // other async tasks. Works for any segment count (rayon degrades gracefully
@@ -549,34 +544,50 @@ impl<D: Directory + 'static> Searcher<D> {
         offset: usize,
         collect_positions: bool,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        tokio::task::block_in_place(|| {
+            self.search_internal_sync(query, fetch_limit, offset, collect_positions)
+        })
+    }
+
+    /// Sync body of the parallel search: rayon par_iter over segments.
+    /// Callers must already be off the async reactor (block_in_place or a
+    /// rayon/blocking thread) — safe to nest inside another par_iter
+    /// (rayon work-stealing composes).
+    #[cfg(feature = "sync")]
+    fn search_internal_sync(
+        &self,
+        query: &dyn crate::query::Query,
+        fetch_limit: usize,
+        offset: usize,
+        collect_positions: bool,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         use rayon::prelude::*;
 
-        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> =
-            tokio::task::block_in_place(|| {
-                self.segments
-                    .par_iter()
-                    .map(|segment| {
-                        let sid = segment.meta().id;
-                        let (mut results, segment_seen) = if collect_positions {
-                            crate::query::search_segment_with_positions_and_count_sync(
-                                segment.as_ref(),
-                                query,
-                                fetch_limit,
-                            )?
-                        } else {
-                            crate::query::search_segment_with_count_sync(
-                                segment.as_ref(),
-                                query,
-                                fetch_limit,
-                            )?
-                        };
-                        for r in &mut results {
-                            r.segment_id = sid;
-                        }
-                        Ok((results, segment_seen))
-                    })
-                    .collect()
-            });
+        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> = {
+            self.segments
+                .par_iter()
+                .map(|segment| {
+                    let sid = segment.meta().id;
+                    let (mut results, segment_seen) = if collect_positions {
+                        crate::query::search_segment_with_positions_and_count_sync(
+                            segment.as_ref(),
+                            query,
+                            fetch_limit,
+                        )?
+                    } else {
+                        crate::query::search_segment_with_count_sync(
+                            segment.as_ref(),
+                            query,
+                            fetch_limit,
+                        )?
+                    };
+                    for r in &mut results {
+                        r.segment_id = sid;
+                    }
+                    Ok((results, segment_seen))
+                })
+                .collect()
+        };
 
         let mut total_seen: u32 = 0;
         let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
@@ -637,6 +648,70 @@ impl<D: Directory + 'static> Searcher<D> {
 
         let results = merge_segment_results(sorted_batches, fetch_limit, offset);
         Ok((results, total_seen))
+    }
+
+    /// Hybrid search: run several queries independently and fuse their
+    /// ranked lists (union) into a single top-`limit` result.
+    ///
+    /// Unlike [`Self::search_and_rerank`] — which can only re-score
+    /// documents the first-stage query already found — fusion keeps
+    /// documents found by *any* of the queries. Typical use is sparse
+    /// (BM25/SPLADE) + dense vector hybrid retrieval with
+    /// `FusionMethod::Rrf { k: 60.0 }`.
+    ///
+    /// Fusion happens at **chunk granularity**: per-ordinal scores are
+    /// collected from each sub-query, fused per `(doc, ordinal)` key, then
+    /// combined into a doc score with `combiner`
+    /// (`MultiValueCombiner::Max` recommended — same-chunk corroboration
+    /// across verticals compounds, scattered noise does not). Fused results
+    /// carry per-chunk `positions`.
+    ///
+    /// Each query is paired with a weight scaling its contribution.
+    /// `fetch_limit` is the per-query candidate depth; a common choice is
+    /// `4 * limit` (min 50) for good rank resolution.
+    pub async fn search_fused(
+        &self,
+        queries: &[(&dyn crate::query::Query, f32)],
+        fetch_limit: usize,
+        limit: usize,
+        method: crate::query::FusionMethod,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<crate::query::SearchResult>> {
+        // Sub-queries are independent — fan them out on rayon under a single
+        // block_in_place (each also par_iters its segments; rayon
+        // work-stealing composes the two levels). Sequential fallback for
+        // current_thread runtimes / non-sync builds.
+        #[cfg(feature = "sync")]
+        if !self.segments.is_empty()
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            use rayon::prelude::*;
+            let lists: Vec<Result<(Vec<crate::query::SearchResult>, f32)>> =
+                tokio::task::block_in_place(|| {
+                    queries
+                        .par_iter()
+                        .map(|&(query, weight)| {
+                            let (results, _) =
+                                self.search_internal_sync(query, fetch_limit, 0, true)?;
+                            Ok((results, weight))
+                        })
+                        .collect()
+                });
+            let lists = lists.into_iter().collect::<Result<Vec<_>>>()?;
+            return Ok(crate::query::fuse_ranked_lists_chunked(
+                lists, method, combiner, limit,
+            ));
+        }
+
+        let mut lists = Vec::with_capacity(queries.len());
+        for &(query, weight) in queries {
+            let (results, _) = self.search_with_positions(query, fetch_limit).await?;
+            lists.push((results, weight));
+        }
+        Ok(crate::query::fuse_ranked_lists_chunked(
+            lists, method, combiner, limit,
+        ))
     }
 
     /// Two-stage search: L1 retrieval + L2 dense vector reranking

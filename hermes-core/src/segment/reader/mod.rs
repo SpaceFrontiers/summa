@@ -26,6 +26,11 @@ pub struct SegmentMemoryStats {
     pub dense_index_bytes: usize,
     /// Bloom filter bytes
     pub bloom_filter_bytes: usize,
+    /// Hot metadata bytes actually pinned (mlock/heap-copy) at open
+    pub pinned_metadata_bytes: u64,
+    /// Hot metadata bytes eligible for pinning (gap vs pinned = budget
+    /// exhausted or mlock failures — operator-visible)
+    pub pin_intended_bytes: u64,
 }
 
 impl SegmentMemoryStats {
@@ -153,7 +158,9 @@ pub struct SegmentReader {
     /// Per-segment MaxScore threshold (f32 stored as AtomicU32 bits).
     /// Allows per-field MaxScore groups within a single query to share thresholds:
     /// field A's result seeds field B's pruning on the same segment.
-    shared_threshold: std::sync::atomic::AtomicU32,
+    /// Hot-metadata pin accounting (see `segment::pin`)
+    #[cfg(feature = "native")]
+    pin_report: crate::segment::pin::PinReport,
 }
 
 impl SegmentReader {
@@ -187,6 +194,17 @@ impl SegmentReader {
         let vectors_data = loader::load_vectors_file(dir, &files, &schema).await?;
         let vector_indexes = vectors_data.indexes;
         let flat_vectors = vectors_data.flat_vectors;
+
+        // Fields served by an ANN index only touch flat vectors for scattered
+        // rerank reads — disable readahead for them once at open. Flat-only
+        // fields keep default advice: brute-force scans them sequentially.
+        // Advice is sticky on the mapping, so per-query re-advising is wasted.
+        #[cfg(feature = "native")]
+        for (field_id, lazy_flat) in &flat_vectors {
+            if vector_indexes.contains_key(field_id) {
+                lazy_flat.advise_random_access();
+            }
+        }
 
         // Load sparse vector indexes from .sparse file (MaxScore + BMP)
         let sparse_data = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
@@ -234,7 +252,8 @@ impl SegmentReader {
             log::debug!("{}", parts.join(", "));
         }
 
-        Ok(Self {
+        #[allow(unused_mut)]
+        let mut reader = Self {
             meta,
             term_dict: Arc::new(term_dict),
             postings_handle,
@@ -247,44 +266,79 @@ impl SegmentReader {
             bmp_indexes,
             positions_handle,
             fast_fields,
-            shared_threshold: std::sync::atomic::AtomicU32::new(0),
-        })
+            #[cfg(feature = "native")]
+            pin_report: Default::default(),
+        };
+
+        // Pin hot metadata per the process-wide policy (no-op when disabled)
+        #[cfg(feature = "native")]
+        reader.apply_pin_policy(&crate::segment::pin::pin_policy().to_owned());
+
+        Ok(reader)
     }
 
-    /// Reset the per-segment threshold (call before each new search).
-    #[inline]
-    pub fn reset_shared_threshold(&self) {
-        self.shared_threshold
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
+    /// Pin per-query-mandatory metadata sections in priority order until the
+    /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
+    ///
+    /// Priority: BMP block-offset tables → sparse skip sections → doc-id maps
+    /// → BMP superblock grids. Bulk data (4-bit grid, block data, raw vectors)
+    /// is never pinned. Fail-loud: budget exhaustion and mlock failures are
+    /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
+    /// pinned_metadata_bytes}`.
+    #[cfg(feature = "native")]
+    pub(crate) fn apply_pin_policy(&mut self, policy: &crate::segment::pin::PinPolicy) {
+        use crate::segment::pin::PinReport;
 
-    /// Read the per-segment MaxScore threshold.
-    #[inline]
-    pub fn shared_threshold_f32(&self) -> f32 {
-        f32::from_bits(
-            self.shared_threshold
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-
-    /// Update the threshold if new value is higher (monotonic max).
-    #[inline]
-    pub fn update_shared_threshold(&self, new_threshold: f32) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let new_bits = new_threshold.to_bits();
-        let mut current_bits = self.shared_threshold.load(Relaxed);
-        while new_threshold > f32::from_bits(current_bits) {
-            match self.shared_threshold.compare_exchange_weak(
-                current_bits,
-                new_bits,
-                Relaxed,
-                Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current_bits = actual,
-            }
+        if !policy.is_enabled() {
+            return;
         }
+        let mut remaining = policy.budget_bytes;
+        let mut report = PinReport::default();
+
+        // Priority 1: BMP block-offset tables
+        for bmp in self.bmp_indexes.values_mut() {
+            bmp.pin_block_starts(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 2: sparse skip sections
+        for sparse in self.sparse_indexes.values_mut() {
+            sparse.pin_skip_section(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 3: doc-id maps
+        for flat in self.flat_vectors.values_mut() {
+            flat.pin_doc_ids(policy.mode, &mut remaining, &mut report);
+        }
+        for bmp in self.bmp_indexes.values_mut() {
+            bmp.pin_doc_maps(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 4: BMP superblock grids
+        for bmp in self.bmp_indexes.values_mut() {
+            bmp.pin_sb_grid(policy.mode, &mut remaining, &mut report);
+        }
+
+        if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
+            log::warn!(
+                "[pin] segment {:016x}: pinned {}/{} bytes (budget skipped {}, mlock failed {}) —                  raise HERMES_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
+                self.meta.id,
+                report.pinned_bytes,
+                report.intended_bytes,
+                report.skipped_budget_bytes,
+                report.failed_bytes,
+            );
+        } else if report.pinned_bytes > 0 {
+            log::info!(
+                "[pin] segment {:016x}: pinned {} bytes of hot metadata ({:?})",
+                self.meta.id,
+                report.pinned_bytes,
+                policy.mode,
+            );
+        }
+        self.pin_report = report;
     }
+
+    // NOTE: cross-group MaxScore threshold seeding is query-execution-local
+    // (a Cell in the boolean planner) — it must never live on the shared
+    // SegmentReader, where concurrent queries would leak thresholds into
+    // each other and wrongly prune results.
 
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta
@@ -381,6 +435,12 @@ impl SegmentReader {
             .map(|v| v.estimated_memory_bytes())
             .sum();
 
+        #[cfg(feature = "native")]
+        let (pinned_metadata_bytes, pin_intended_bytes) =
+            (self.pin_report.pinned_bytes, self.pin_report.intended_bytes);
+        #[cfg(not(feature = "native"))]
+        let (pinned_metadata_bytes, pin_intended_bytes) = (0u64, 0u64);
+
         SegmentMemoryStats {
             segment_id: self.meta.id,
             num_docs: self.meta.num_docs,
@@ -389,6 +449,8 @@ impl SegmentReader {
             sparse_index_bytes,
             dense_index_bytes,
             bloom_filter_bytes: term_dict_stats.bloom_filter_size,
+            pinned_metadata_bytes,
+            pin_intended_bytes,
         }
     }
 
@@ -428,7 +490,7 @@ impl SegmentReader {
         if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
             // Build BlockPostingList from inline data (no I/O needed!)
             let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                 posting_list.push(doc_id, tf);
             }
             let block_list = BlockPostingList::from_posting_list(&posting_list)?;
@@ -472,7 +534,7 @@ impl SegmentReader {
         for (_key, term_info) in entries {
             if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
                 let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                     posting_list.push(doc_id, tf);
                 }
                 results.push(BlockPostingList::from_posting_list(&posting_list)?);
@@ -812,6 +874,10 @@ impl SegmentReader {
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
+                VectorIndex::BinaryIvf(_) => {
+                    // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
+                    Vec::new()
+                }
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force from lazy flat vectors (native-precision SIMD scoring)
@@ -861,6 +927,22 @@ impl SegmentReader {
             return Ok(Vec::new());
         };
         let l1_elapsed = t0.elapsed();
+        {
+            let kind = match ann_index {
+                Some(VectorIndex::RaBitQ(_)) => "rabitq",
+                Some(VectorIndex::IVF(_)) => "ivf_rabitq",
+                Some(VectorIndex::ScaNN(_)) => "scann",
+                Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
+                None => "flat",
+            };
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                kind,
+                l1_elapsed.as_secs_f64(),
+                results.len(),
+            );
+        }
         log::debug!(
             "[search_dense] field {}: L1 returned {} candidates in {:.1}ms",
             field.0,
@@ -896,6 +978,13 @@ impl SegmentReader {
                 // Sort by flat_idx for sequential mmap access (better page locality)
                 resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
 
+                // Under memory pressure the candidate pages are likely evicted;
+                // batch-prefetch them so page-ins overlap instead of serializing
+                // as one major fault per vector. (MADV_RANDOM for this region is
+                // set once at segment open.)
+                #[cfg(feature = "native")]
+                lazy_flat.prefetch_vectors(resolved.iter().map(|&(_, flat_idx)| flat_idx));
+
                 // Batch-read raw quantized bytes into contiguous buffer
                 let t_read = std::time::Instant::now();
                 let mut raw_buf = vec![0u8; resolved.len() * vbs];
@@ -921,6 +1010,14 @@ impl SegmentReader {
                     results[ri].2 = scores[buf_idx];
                 }
 
+                crate::observe::dense_rerank(
+                    self.schema.index_label(),
+                    self.schema.get_field_name(field).unwrap_or("?"),
+                    t_rerank.elapsed().as_secs_f64(),
+                    t_resolve.as_secs_f64(),
+                    read_elapsed.as_secs_f64(),
+                    resolved.len(),
+                );
                 log::debug!(
                     "[search_dense] field {}: rerank {} vectors (dim={}, quant={:?}, {}B/vec): resolve={:.1}ms read={:.1}ms score={:.1}ms",
                     field.0,
@@ -949,6 +1046,15 @@ impl SegmentReader {
         Ok(combine_ordinal_results(results, combiner, k))
     }
 
+    /// Query-time nprobe for a binary field from its schema config (None = index default).
+    fn binary_ivf_nprobe(&self, field: Field) -> Option<usize> {
+        self.schema
+            .get_field_entry(field)
+            .and_then(|e| e.binary_dense_vector_config.as_ref())
+            .map(|c| c.nprobe)
+            .filter(|&n| n > 0)
+    }
+
     /// Search binary dense vectors using brute-force Hamming distance.
     ///
     /// Always flat brute-force (no ANN). Returns VectorSearchResult with ordinal tracking.
@@ -959,6 +1065,24 @@ impl SegmentReader {
         k: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
+        let t0 = crate::observe::Timer::start();
+        // Binary IVF index: probe nprobe nearest Hamming clusters (exact
+        // distances within probed clusters — no rerank needed).
+        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
+            && let Some(ivf) = lazy.get()
+        {
+            let nprobe = self.binary_ivf_nprobe(field);
+            let results = ivf.search(query, k, nprobe);
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                "binary_ivf",
+                t0.secs(),
+                results.len(),
+            );
+            return Ok(combine_ordinal_results(results, combiner, k));
+        }
+
         let lazy_flat = match self.flat_vectors.get(&field.0) {
             Some(f) => f,
             None => return Ok(Vec::new()),
@@ -1012,6 +1136,13 @@ impl SegmentReader {
             .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
             .collect();
 
+        crate::observe::dense_l1(
+            self.schema.index_label(),
+            self.schema.get_field_name(field).unwrap_or("?"),
+            "binary_flat",
+            t0.secs(),
+            results.len(),
+        );
         Ok(combine_ordinal_results(results, combiner, k))
     }
 
@@ -1137,7 +1268,7 @@ impl SegmentReader {
         // Check if posting list is inlined
         if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
             let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                 posting_list.push(doc_id, tf);
             }
             let block_list = BlockPostingList::from_posting_list(&posting_list)?;
@@ -1180,7 +1311,7 @@ impl SegmentReader {
         for (_key, term_info) in entries {
             if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
                 let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
                     posting_list.push(doc_id, tf);
                 }
                 results.push(BlockPostingList::from_posting_list(&posting_list)?);
@@ -1306,6 +1437,10 @@ impl SegmentReader {
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
+                VectorIndex::BinaryIvf(_) => {
+                    // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
+                    Vec::new()
+                }
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force (sync mmap reads)
@@ -1391,6 +1526,98 @@ impl SegmentReader {
             results.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
         }
 
+        Ok(combine_ordinal_results(results, combiner, k))
+    }
+
+    /// Synchronous binary dense vector search (mmap/RAM only).
+    ///
+    /// Mirrors [`Self::search_binary_dense_vector`] for the rayon-parallel
+    /// sync scorer path used by multi-threaded runtimes.
+    #[cfg(feature = "sync")]
+    pub fn search_binary_dense_vector_sync(
+        &self,
+        field: Field,
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let t0 = crate::observe::Timer::start();
+        // Binary IVF index: probe nprobe nearest Hamming clusters (exact
+        // distances within probed clusters — no rerank needed).
+        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
+            && let Some(ivf) = lazy.get()
+        {
+            let nprobe = self.binary_ivf_nprobe(field);
+            let results = ivf.search(query, k, nprobe);
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                "binary_ivf",
+                t0.secs(),
+                results.len(),
+            );
+            return Ok(combine_ordinal_results(results, combiner, k));
+        }
+
+        let lazy_flat = match self.flat_vectors.get(&field.0) {
+            Some(f) => f,
+            None => return Ok(Vec::new()),
+        };
+
+        const BRUTE_FORCE_BATCH: usize = 8192; // Binary vectors are tiny, use larger batches
+
+        let dim_bits = lazy_flat.dim;
+        let byte_len = lazy_flat.vector_byte_size();
+        let n = lazy_flat.num_vectors;
+
+        if byte_len != query.len() {
+            return Err(Error::Schema(format!(
+                "Binary query vector byte length {} != field byte length {}",
+                query.len(),
+                byte_len
+            )));
+        }
+
+        let mut collector = crate::query::ScoreCollector::new(k);
+        let mut scores = vec![0f32; BRUTE_FORCE_BATCH];
+
+        for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
+            let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
+            let batch_bytes = lazy_flat
+                .read_vectors_batch_sync(batch_start, batch_count)
+                .map_err(crate::Error::Io)?;
+            let raw = batch_bytes.as_slice();
+
+            crate::structures::simd::batch_hamming_scores(
+                query,
+                raw,
+                byte_len,
+                dim_bits,
+                &mut scores[..batch_count],
+            );
+
+            let threshold = collector.threshold();
+            for (i, &score) in scores.iter().enumerate().take(batch_count) {
+                if score > threshold {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
+                }
+            }
+        }
+
+        let results: Vec<(u32, u16, f32)> = collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
+            .collect();
+
+        crate::observe::dense_l1(
+            self.schema.index_label(),
+            self.schema.get_field_name(field).unwrap_or("?"),
+            "binary_flat",
+            t0.secs(),
+            results.len(),
+        );
         Ok(combine_ordinal_results(results, combiner, k))
     }
 }

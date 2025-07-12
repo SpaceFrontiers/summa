@@ -41,33 +41,42 @@ impl SegmentMerger {
         dir: &D,
         segments: &[SegmentReader],
         files: &SegmentFiles,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let doc_offs = doc_offsets(segments)?;
+        // False iff any merge-time BP pass hit its wall-clock budget.
+        let mut all_converged = true;
 
         // Collect all sparse vector fields from schema
         let sparse_fields: Vec<_> = self
             .schema
             .fields()
             .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
-            .map(|(field, entry)| (field, entry.sparse_vector_config.clone()))
+            .map(|(field, entry)| {
+                (
+                    field,
+                    entry.sparse_vector_config.clone(),
+                    entry.reorder,
+                    entry.name.clone(),
+                )
+            })
             .collect();
 
         if sparse_fields.is_empty() {
-            return Ok(0);
+            return Ok((0, true));
         }
 
-        let mut writer = OffsetWriter::new(dir.streaming_writer(&files.sparse).await?);
+        let mut writer = OffsetWriter::new(dir.streaming_writer_cold(&files.sparse).await?);
 
         // Accumulated per-field data for TOC
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
         // Skip entries written to a temp file to avoid unbounded memory usage.
         // For large indexes (200M+ docs) the skip section can exceed 3 GB.
         let skip_tmp = files.sparse.with_extension("skip.tmp");
-        let mut skip_writer = dir.streaming_writer(&skip_tmp).await?;
+        let mut skip_writer = dir.streaming_writer_cold(&skip_tmp).await?;
         let mut skip_count: u32 = 0;
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
-        for (field, sparse_config) in &sparse_fields {
+        for (field, sparse_config, field_reorder, field_name) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
@@ -90,6 +99,7 @@ impl SegmentMerger {
                         .as_ref()
                         .map(|c| c.bmp_block_size)
                         .unwrap_or(64);
+                    let grid_bits = sparse_config.as_ref().map(|c| c.bmp_grid_bits).unwrap_or(4);
                     let dims = sparse_config
                         .as_ref()
                         .and_then(|c| c.dims)
@@ -109,18 +119,100 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
-                    merge_bmp_field(
-                        &bmp_indexes,
-                        &doc_offs,
-                        field.0,
-                        quantization,
-                        dims,
-                        bmp_block_size,
-                        max_weight_scale,
-                        total_vectors_bmp,
-                        &mut writer,
-                        &mut field_tocs,
-                    )?;
+                    if self.reorder_bmp && !*field_reorder {
+                        // Reorder-on-merge is on, but this field opted out via
+                        // its schema — fall through to block-copy. Loud so an
+                        // operator can see why the merged field stays unordered.
+                        log::info!(
+                            "[merge_bmp] field {}: `reorder` schema attribute not set — block-copy merge",
+                            field.0,
+                        );
+                    }
+                    if self.reorder_bmp && *field_reorder {
+                        // Merge-time BP reorder: write the merged blob in
+                        // permuted order instead of block stacking. The output
+                        // segment needs no standalone reorder pass afterwards.
+                        let sources: Vec<(BmpIndex, u32)> = bmp_indexes
+                            .iter()
+                            .zip(doc_offs.iter())
+                            .filter_map(|(opt, &off)| opt.map(|b| (b.clone(), off)))
+                            .collect();
+                        validate_bmp_sources(
+                            &sources,
+                            dims,
+                            bmp_block_size.min(256),
+                            grid_bits,
+                            max_weight_scale,
+                        )?;
+
+                        let fid = field.0;
+                        let fname = field_name.clone();
+                        let ilabel = self.schema.index_label().to_owned();
+                        let effective_block_size = bmp_block_size.min(256) as usize;
+                        let pool = self.background_pool.clone();
+                        let granularity = self.granularity;
+                        log::info!(
+                            "[merge_bmp] field {}: reorder-on-merge enabled — running BP over {} source(s)",
+                            fid,
+                            sources.len(),
+                        );
+                        let bp_budget = self.bp_budget;
+                        let bp_memory_budget = self.bp_memory_budget;
+                        let out_grid_bits = grid_bits;
+                        let (w, ft, converged) = tokio::task::spawn_blocking(move || {
+                            crate::segment::reorder::reorder_bmp_field(
+                                &sources,
+                                fid,
+                                &ilabel,
+                                &fname,
+                                quantization,
+                                dims,
+                                effective_block_size,
+                                out_grid_bits,
+                                max_weight_scale,
+                                total_vectors_bmp,
+                                bp_memory_budget,
+                                // Wall-clock-bounded so huge merges don't hold
+                                // a merge slot for full BP depth; a truncated
+                                // pass is marked unconverged and the background
+                                // optimizer deepens it (warm-started).
+                                bp_budget,
+                                // Auto unless a source is an unconverged
+                                // partial reorder (then Records, see
+                                // SegmentMerger::granularity).
+                                granularity,
+                                writer,
+                                field_tocs,
+                                pool,
+                            )
+                        })
+                        .await
+                        .map_err(|e| {
+                            crate::Error::Internal(format!("merge-time reorder panicked: {}", e))
+                        })??;
+                        writer = w;
+                        field_tocs = ft;
+                        all_converged &= converged;
+                        continue;
+                    }
+
+                    // GB-scale sync copy loops — migrate this tokio worker's
+                    // queue so the merge doesn't pin a runtime thread.
+                    super::block_in_place_if_multithread(|| {
+                        merge_bmp_field(
+                            &bmp_indexes,
+                            &doc_offs,
+                            field.0,
+                            quantization,
+                            dims,
+                            bmp_block_size,
+                            grid_bits,
+                            max_weight_scale,
+                            total_vectors_bmp,
+                            &mut writer,
+                            &mut field_tocs,
+                        )
+                    })?;
                     continue;
                 }
                 // No BMP data — fall through to MaxScore path
@@ -283,7 +375,7 @@ impl SegmentMerger {
             drop(writer);
             let _ = dir.delete(&files.sparse).await;
             let _ = dir.delete(&skip_tmp).await;
-            return Ok(0);
+            return Ok((0, all_converged));
         }
 
         // Phase 2: Stream-copy skip entries from temp file to main writer (4 MB chunks)
@@ -320,13 +412,13 @@ impl SegmentMerger {
             skip_count,
         );
 
-        Ok(output_size)
+        Ok((output_size, all_converged))
     }
 }
 
-/// Merge BMP fields with **streaming block-copy V13 format**.
+/// Merge BMP fields with **streaming block-copy V14 format**.
 ///
-/// V13 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
+/// V14 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
 /// and `max_weight_scale`, so blocks are self-contained and can be copied directly.
 ///
 /// Phases:
@@ -335,7 +427,7 @@ impl SegmentMerger {
 /// 3. Stream Section D (packed_grid) — one row at a time
 /// 4. Write Section E (sb_grid) — one row at a time
 /// 5. Stream Section F+G (doc_map) — bulk copy with offset patching
-/// 6. Write V13 footer (64 bytes)
+/// 6. Write V14 footer (64 bytes)
 ///
 /// Peak memory: row_buf (~4 MB) + sb_row (~120 KB) + id_buf (256 KB) + tiny Vecs.
 #[allow(clippy::too_many_arguments)]
@@ -346,12 +438,13 @@ fn merge_bmp_field(
     quantization: crate::structures::WeightQuantization,
     dims: u32,
     bmp_block_size: u32,
+    grid_bits: u8,
     max_weight_scale: f32,
     total_vectors: u32,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    use crate::segment::builder::bmp::write_v13_footer;
+    use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
     let effective_block_size = bmp_block_size.min(256);
@@ -386,6 +479,13 @@ fn merge_bmp_field(
                 bmp.bmp_block_size, effective_block_size
             )));
         }
+        if bmp.grid_bits() != grid_bits {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source grid_bits={} != expected {}",
+                bmp.grid_bits(),
+                grid_bits
+            )));
+        }
         if (bmp.max_weight_scale - max_weight_scale).abs() > f32::EPSILON {
             return Err(crate::Error::Corruption(format!(
                 "BMP merge: source max_weight_scale={:.4} != expected {:.4}",
@@ -402,7 +502,7 @@ fn merge_bmp_field(
 
     let num_blocks = total_source_blocks as usize;
     let num_virtual_docs = num_blocks * effective_block_size as usize;
-    let packed_row_size = num_blocks.div_ceil(2);
+    let packed_row_size = crate::segment::builder::bmp::grid_packed_row_size(num_blocks, grid_bits);
     let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
     // Pre-compute aggregate stats (needed for footer, independent of block order)
@@ -511,7 +611,7 @@ fn merge_bmp_field(
                 continue;
             }
             let src_row = &src_grid[src_row_start..src_row_end];
-            copy_nibbles(src_row, src_num_blocks, &mut row_buf, col_offset);
+            copy_cells(src_row, src_num_blocks, &mut row_buf, col_offset, grid_bits);
         }
         writer.write_all(&row_buf).map_err(crate::Error::Io)?;
     }
@@ -605,8 +705,8 @@ fn merge_bmp_field(
         }
     }
 
-    // ── Phase 6: Write V13 footer (64 bytes) ────────────────────────────
-    write_v13_footer(
+    // ── Phase 6: Write V14 footer (64 bytes) ────────────────────────────
+    write_bmp_footer(
         writer,
         total_terms,
         total_postings,
@@ -619,6 +719,7 @@ fn merge_bmp_field(
         max_weight_scale,
         doc_map_offset,
         num_real_docs_total,
+        grid_bits,
     )
     .map_err(crate::Error::Io)?;
 
@@ -632,6 +733,54 @@ fn merge_bmp_field(
         blob_len,
     );
 
+    // The merge flipped source regions to MADV_SEQUENTIAL; sources keep
+    // serving queries until the merged segment is swapped in — restore the
+    // scattered-access advice set at open.
+    #[cfg(feature = "native")]
+    for &(bmp, _) in &sources {
+        bmp.madvise_random_query();
+    }
+
+    Ok(())
+}
+
+/// Validate that all BMP merge sources share `dims`, `block_size`, and
+/// `max_weight_scale` (same invariants as the block-copy path's Phase 0).
+fn validate_bmp_sources(
+    sources: &[(BmpIndex, u32)],
+    dims: u32,
+    effective_block_size: u32,
+    expected_grid_bits: u8,
+    max_weight_scale: f32,
+) -> Result<()> {
+    for (bmp, _) in sources {
+        if bmp.dims() != dims {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source dims={} != expected dims={}",
+                bmp.dims(),
+                dims
+            )));
+        }
+        if bmp.bmp_block_size != effective_block_size {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source block_size={} != expected {}",
+                bmp.bmp_block_size, effective_block_size
+            )));
+        }
+        if bmp.grid_bits() != expected_grid_bits {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source grid_bits={} != expected {}",
+                bmp.grid_bits(),
+                expected_grid_bits
+            )));
+        }
+        if (bmp.max_weight_scale - max_weight_scale).abs() > f32::EPSILON {
+            return Err(crate::Error::Corruption(format!(
+                "BMP merge: source max_weight_scale={:.4} != expected {:.4}",
+                bmp.max_weight_scale, max_weight_scale
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -672,21 +821,13 @@ fn push_bmp_field_toc(
 /// Hot inner loop for grid merge (~8 KB per row).
 /// Source nibbles are packed: low nibble = even block, high nibble = odd block.
 #[inline]
-fn copy_nibbles(src_row: &[u8], src_blocks: usize, dst_row: &mut [u8], offset: usize) {
+fn copy_cells(src_row: &[u8], src_blocks: usize, dst_row: &mut [u8], offset: usize, grid_bits: u8) {
+    use crate::segment::builder::bmp::{grid_get_cell, grid_set_cell};
     for b in 0..src_blocks {
-        let val = if b.is_multiple_of(2) {
-            src_row[b / 2] & 0x0F
-        } else {
-            src_row[b / 2] >> 4
-        };
+        let val = grid_get_cell(src_row, b, grid_bits);
         if val == 0 {
             continue;
         }
-        let out_b = offset + b;
-        if out_b.is_multiple_of(2) {
-            dst_row[out_b / 2] |= val;
-        } else {
-            dst_row[out_b / 2] |= val << 4;
-        }
+        grid_set_cell(dst_row, offset + b, val, grid_bits);
     }
 }

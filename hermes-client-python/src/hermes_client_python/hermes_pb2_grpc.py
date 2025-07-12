@@ -2,7 +2,8 @@
 """Client and server classes corresponding to protobuf-defined services."""
 
 import grpc
-import hermes_pb2 as hermes__pb2
+
+from . import hermes_pb2 as hermes__pb2
 
 GRPC_GENERATED_VERSION = "1.76.0"
 GRPC_VERSION = grpc.__version__
@@ -297,7 +298,7 @@ class IndexServiceServicer:
         raise NotImplementedError("Method not implemented!")
 
     def Reorder(self, request, context):
-        """Reorder BMP blocks by SimHash similarity"""
+        """Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning"""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")

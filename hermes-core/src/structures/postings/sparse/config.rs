@@ -226,21 +226,43 @@ pub struct SparseVectorConfig {
     /// - Major reduction in index size and query latency
     #[serde(default)]
     pub weight_threshold: f32,
+    /// Document-side mass cropping: keep the top-|weight| entries covering
+    /// this fraction of a sparse vector's total |weight| mass; the excessive
+    /// tail is dropped at indexing time.
+    ///
+    /// SPLADE-style vectors concentrate importance in a few head terms; the
+    /// long tail inflates the index and query cost with little relevance
+    /// signal. 0.9-0.95 typically drops 20-40% of postings with <1% nDCG loss.
+    ///
+    /// - None or >= 1.0 = keep all entries (default)
+    /// - Applied after `weight_threshold`; vectors with <= `min_terms`
+    ///   entries are never cropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_mass: Option<f32>,
     /// Block size for posting lists (must be power of 2, default 128 for SIMD)
     /// Larger blocks = better compression, smaller blocks = faster seeks.
     /// Used by MaxScore format only.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
-    /// BMP block size: number of consecutive doc_ids per block (must be power of 2).
-    /// Default 64. Only used when format = Bmp.
-    /// Smaller = better pruning granularity, larger = less overhead.
+    /// BMP block size: number of consecutive doc_ids per block (must be power
+    /// of 2, max 256). Only used when format = Bmp. Uniform across every
+    /// segment of the field — set per field in SDL (`bmp_block_size: N`).
+    /// Smaller = better pruning granularity; larger = smaller grid — the
+    /// dense 4-bit grid is `dims × num_blocks / 2` bytes, so grid memory
+    /// scales as 1/block_size. Default 64; large corpora (10M+ docs at
+    /// 100k-dim vocabularies) should set 256 to bound grid memory
+    /// (docs/bmp-grid-compression.md).
     #[serde(default = "default_bmp_block_size")]
     pub bmp_block_size: u32,
-    /// Maximum BMP grid memory in bytes. If the grid (num_dims × num_blocks)
-    /// would exceed this, bmp_block_size is automatically increased to cap memory.
-    /// Default: 256MB. Set to 0 to disable the cap.
-    #[serde(default = "default_max_bmp_grid_bytes")]
-    pub max_bmp_grid_bytes: u64,
+    /// Bits per BMP block-grid cell: 4 (default) or 2. The grid is
+    /// `dims × num_blocks × bits/8` bytes, so 2 halves grid memory; measured
+    /// pruning cost is ~free (+0.4-2.2% blocks scored — the exact u8 sb_grid
+    /// prunes first and shields the block grid; docs/bmp-grid-compression.md).
+    /// Grid bounds are ceil-quantized, so exact top-k results are unchanged
+    /// at any width. Uniform per field across all segments — set in SDL
+    /// (`bmp_grid_bits: 2`) at index creation.
+    #[serde(default = "default_bmp_grid_bits")]
+    pub bmp_grid_bits: u8,
     /// BMP superblock size: number of consecutive blocks grouped for hierarchical
     /// pruning (Carlson et al., SIGIR 2025). Must be power of 2.
     /// Default 64. Set to 0 to disable superblock pruning (flat BMP scoring).
@@ -303,8 +325,8 @@ fn default_bmp_block_size() -> u32 {
     64
 }
 
-fn default_max_bmp_grid_bytes() -> u64 {
-    0 // disabled by default — masks eliminate DRAM stalls during scoring
+fn default_bmp_grid_bits() -> u8 {
+    4
 }
 
 fn default_bmp_superblock_size() -> u32 {
@@ -322,9 +344,10 @@ impl Default for SparseVectorConfig {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
@@ -358,9 +381,10 @@ impl SparseVectorConfig {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.01, // Remove ~30-50% of low-weight postings
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: Some(0.1), // Keep top 10% per dimension
             query_config: Some(SparseQueryConfig {
@@ -392,9 +416,10 @@ impl SparseVectorConfig {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.01,
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: Some(0.1),
             query_config: Some(SparseQueryConfig {
@@ -428,9 +453,10 @@ impl SparseVectorConfig {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt4,
             weight_threshold: 0.02, // Slightly higher threshold for UInt4
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
@@ -459,9 +485,10 @@ impl SparseVectorConfig {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
@@ -487,9 +514,10 @@ impl SparseVectorConfig {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float16,
             weight_threshold: 0.005, // Minimal pruning
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
@@ -512,6 +540,13 @@ impl SparseVectorConfig {
     /// Set weight threshold (builder pattern)
     pub fn with_weight_threshold(mut self, threshold: f32) -> Self {
         self.weight_threshold = threshold;
+        self
+    }
+
+    /// Set document-side mass cropping fraction (builder pattern)
+    /// e.g., 0.9 = keep top-weight entries covering 90% of each vector's mass
+    pub fn with_doc_mass(mut self, fraction: f32) -> Self {
+        self.doc_mass = Some(fraction.clamp(0.0, 1.0));
         self
     }
 
@@ -556,9 +591,10 @@ impl SparseVectorConfig {
             index_size,
             weight_quantization,
             weight_threshold: 0.0,
+            doc_mass: None,
             block_size: 128,
-            bmp_block_size: 64,
-            max_bmp_grid_bytes: 0,
+            bmp_block_size: default_bmp_block_size(),
+            bmp_grid_bits: 4,
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,

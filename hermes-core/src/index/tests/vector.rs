@@ -21,6 +21,8 @@ async fn test_vector_index_threshold_switch() {
             nprobe: 2,
             build_threshold: Some(50), // Build when we have 50+ vectors
             unit_norm: false,
+            soar: None,
+            rabitq_bits: None,
         },
     );
     let schema = schema_builder.build();
@@ -314,6 +316,8 @@ async fn test_needle_dense_vector_flat() {
             nprobe: 0,
             build_threshold: None,
             unit_norm: false,
+            soar: None,
+            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -674,6 +678,8 @@ async fn test_needle_combined_all_modalities() {
             nprobe: 0,
             build_threshold: None,
             unit_norm: false,
+            soar: None,
+            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -793,5 +799,318 @@ async fn test_needle_combined_all_modalities() {
     assert_eq!(
         sp_doc_id, dn_doc_id,
         "Sparse and dense should find same doc"
+    );
+}
+
+#[tokio::test]
+async fn test_search_fused_hybrid_union() {
+    // current_thread runtime → sequential sub-query fallback path
+    search_fused_hybrid_union_impl().await;
+}
+
+/// Same scenario on a multi-thread runtime: sub-queries fan out on rayon
+/// under one block_in_place (the parallel fusion path) — results must be
+/// identical to the sequential path, including the query-local MaxScore
+/// threshold cell (no cross-sub-query threshold leaking).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_search_fused_hybrid_union_parallel_subqueries() {
+    search_fused_hybrid_union_impl().await;
+}
+
+async fn search_fused_hybrid_union_impl() {
+    use crate::dsl::{DenseVectorConfig, VectorIndexType};
+    use crate::query::{DenseVectorQuery, FusionMethod, TermQuery};
+
+    let dim = 8;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let embedding = sb.add_dense_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        DenseVectorConfig {
+            dim,
+            index_type: VectorIndexType::Flat,
+            quantization: crate::dsl::DenseVectorQuantization::F32,
+            num_clusters: None,
+            nprobe: 0,
+            build_threshold: None,
+            unit_norm: false,
+            soar: None,
+            rabitq_bits: None,
+        },
+    );
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Doc 0: matches text only (orthogonal vector)
+    let mut d = Document::new();
+    d.add_text(title, "zebra quantum");
+    d.add_dense_vector(embedding, vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(d).unwrap();
+
+    // Doc 1: matches vector only
+    let mut d = Document::new();
+    d.add_text(title, "unrelated words here");
+    d.add_dense_vector(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(d).unwrap();
+
+    // Doc 2: matches both (strongest text match via tf=2, near-exact vector)
+    let mut d = Document::new();
+    d.add_text(title, "zebra zebra habitat");
+    d.add_dense_vector(embedding, vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(d).unwrap();
+
+    // Hay
+    for i in 0..20 {
+        let mut d = Document::new();
+        d.add_text(title, format!("filler document number {}", i));
+        d.add_dense_vector(embedding, vec![0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]);
+        writer.add_document(d).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let text_query = TermQuery::text(title, "zebra");
+    let dense_query =
+        DenseVectorQuery::new(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+    let fused = searcher
+        .search_fused(
+            &[(&text_query, 1.0), (&dense_query, 1.0)],
+            10,
+            10,
+            FusionMethod::default(),
+            crate::query::MultiValueCombiner::Max,
+        )
+        .await
+        .unwrap();
+
+    // Union semantics: text-only, dense-only, and both-match docs all present
+    assert!(fused.len() >= 3, "expected at least 3 fused results");
+    assert_eq!(
+        fused[0].doc_id, 2,
+        "doc matching both retrievers should rank first"
+    );
+    let ids: Vec<u32> = fused.iter().map(|r| r.doc_id).collect();
+    assert!(
+        ids.contains(&0),
+        "text-only doc must survive fusion (union)"
+    );
+    assert!(
+        ids.contains(&1),
+        "dense-only doc must survive fusion (union)"
+    );
+
+    // Sanity: neither single retriever alone surfaces all three
+    let text_only = searcher.search(&text_query, 10).await.unwrap();
+    assert!(!text_only.iter().any(|r| r.doc_id == 1));
+}
+
+/// doc_mass cropping: excessive low-weight tail terms of a sparse vector are
+/// dropped at indexing time; head terms covering the mass fraction survive.
+#[tokio::test]
+async fn test_sparse_doc_mass_cropping() {
+    use crate::query::SparseVectorQuery;
+    use crate::structures::SparseVectorConfig;
+
+    let mut sb = SchemaBuilder::default();
+    let mut config = SparseVectorConfig::default().with_doc_mass(0.5);
+    config.min_terms = 0;
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, config);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let idx_config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), idx_config.clone())
+        .await
+        .unwrap();
+
+    // Head term (dim 1) carries most of the mass; dims 3 and 4 are the
+    // excessive tail that doc_mass=0.5 must crop.
+    let mut doc = Document::new();
+    doc.add_sparse_vector(sparse, vec![(1, 10.0), (2, 5.0), (3, 0.1), (4, 0.05)]);
+    writer.add_document(doc).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, idx_config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Head dim survives
+    let r = searcher
+        .search(&SparseVectorQuery::new(sparse, vec![(1, 1.0)]), 10)
+        .await
+        .unwrap();
+    assert_eq!(r.len(), 1, "head term must remain searchable");
+
+    // Tail dims are cropped
+    for dim in [3u32, 4u32] {
+        let r = searcher
+            .search(&SparseVectorQuery::new(sparse, vec![(dim, 1.0)]), 10)
+            .await
+            .unwrap();
+        assert!(
+            r.is_empty(),
+            "tail dim {} should be cropped by doc_mass",
+            dim
+        );
+    }
+}
+
+/// min_terms protects short sparse vectors from doc_mass cropping.
+#[tokio::test]
+async fn test_sparse_doc_mass_respects_min_terms() {
+    use crate::query::SparseVectorQuery;
+    use crate::structures::SparseVectorConfig;
+
+    let mut sb = SchemaBuilder::default();
+    let mut config = SparseVectorConfig::default().with_doc_mass(0.5);
+    config.min_terms = 4; // vector below has exactly 4 entries -> not cropped
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, config);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let idx_config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), idx_config.clone())
+        .await
+        .unwrap();
+
+    let mut doc = Document::new();
+    doc.add_sparse_vector(sparse, vec![(1, 10.0), (2, 5.0), (3, 0.1), (4, 0.05)]);
+    writer.add_document(doc).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, idx_config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let r = searcher
+        .search(&SparseVectorQuery::new(sparse, vec![(4, 1.0)]), 10)
+        .await
+        .unwrap();
+    assert_eq!(r.len(), 1, "short vectors must not be cropped");
+}
+
+/// Regression: BinaryDenseVectorQuery must work on a multi-threaded runtime,
+/// where the searcher routes through the rayon-parallel sync scorer path.
+/// Previously this failed with "sync scorer not supported for this query type".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_dense_search_multi_thread_runtime() {
+    use crate::query::BinaryDenseVectorQuery;
+
+    let byte_len = 8; // 64-bit binary vectors
+    let mut sb = SchemaBuilder::default();
+    let bvec = sb.add_binary_dense_vector_field("bvec", byte_len * 8, true, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Needle: all bits set
+    let needle_vec = vec![0xFF_u8; byte_len];
+    let mut needle = Document::new();
+    needle.add_binary_dense_vector(bvec, needle_vec.clone());
+    writer.add_document(needle).unwrap();
+
+    // Hay: half the bits set
+    for i in 0u8..20 {
+        let mut doc = Document::new();
+        let v: Vec<u8> = (0..byte_len)
+            .map(|d| i.wrapping_add(d as u8) & 0x55)
+            .collect();
+        doc.add_binary_dense_vector(bvec, v);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let query = BinaryDenseVectorQuery::new(bvec, needle_vec);
+    let results = searcher
+        .search(&query, 5)
+        .await
+        .expect("binary search must work on multi-thread runtime (sync scorer path)");
+    assert!(!results.is_empty());
+    assert!(
+        results[0].score >= 0.99,
+        "needle should be an exact Hamming match, got {}",
+        results[0].score
+    );
+}
+
+/// Binary IVF: index built at commit (threshold crossed), searched via IVF path
+/// on both async and sync (multi-thread) paths, recall vs brute force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_ivf_end_to_end() {
+    use crate::dsl::{BinaryDenseVectorConfig, BinaryIndexType};
+    use crate::query::BinaryDenseVectorQuery;
+
+    let dim_bits = 64;
+    let byte_len = dim_bits / 8;
+
+    let mut sb = SchemaBuilder::default();
+    let mut cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
+    cfg.build_threshold = Some(100); // build IVF once we have 100+ vectors
+    let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg.clone());
+    assert_eq!(cfg.index_type, BinaryIndexType::Ivf);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Needle + 199 hay docs (crosses the 100-vector build threshold)
+    let needle_vec = vec![0xFF_u8; byte_len];
+    let mut needle = Document::new();
+    needle.add_binary_dense_vector(bvec, needle_vec.clone());
+    writer.add_document(needle).unwrap();
+
+    for i in 0u32..199 {
+        let mut doc = Document::new();
+        let v: Vec<u8> = (0..byte_len)
+            .map(|d| ((i as u8).wrapping_add(d as u8)) & 0x55)
+            .collect();
+        doc.add_binary_dense_vector(bvec, v);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert!(
+        matches!(
+            segments[0].get_vector_index(bvec),
+            Some(crate::segment::VectorIndex::BinaryIvf(_))
+        ),
+        "binary IVF index should be built at commit"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Multi-thread runtime → sync scorer path through the IVF index
+    let query = BinaryDenseVectorQuery::new(bvec, needle_vec);
+    let results = searcher.search(&query, 5).await.unwrap();
+    assert!(!results.is_empty());
+    assert!(
+        results[0].score >= 0.99,
+        "needle must be found through IVF probing, got {}",
+        results[0].score
     );
 }

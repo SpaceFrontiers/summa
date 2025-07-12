@@ -108,3 +108,16 @@ pnpm install
 pnpm run generate  # regenerate proto stubs
 pnpm run build     # compile TypeScript
 ```
+
+## Timeouts / deadlines
+
+Every RPC accepts an optional trailing `timeoutMs` which sets a real gRPC
+deadline (propagated to the server via `grpc-timeout`); a client-wide default
+can be set in the constructor. On expiry the call rejects with
+`DEADLINE_EXCEEDED`.
+
+```ts
+const client = new HermesClient("localhost:50051", { defaultTimeoutMs: 5000 });
+await client.search("articles", { query: { ... } }, 500); // per-call override
+await client.forceMerge("articles", 3_600_000); // long op, long deadline
+```

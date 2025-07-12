@@ -155,10 +155,27 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     term_cache_blocks: usize,
     /// Maximum number of concurrent background merges
     max_concurrent_merges: usize,
+    /// Run BP reordering of `reorder`-attributed BMP fields inside merges.
+    /// Persisted index configuration (schema-level `reorder_on_merge: true`
+    /// in SDL); merged segments are marked `reordered` and skipped by the
+    /// standalone optimizer pass.
+    reorder_on_merge: bool,
+    /// Wall-clock budget for merge-time BP (from `IndexConfig`); truncated
+    /// passes mark the merged segment `bp_converged = false` so the
+    /// background optimizer deepens it later (warm-started).
+    merge_bp_time_budget: Option<std::time::Duration>,
+    /// Memory budget for the BP forward index (merge-time and background
+    /// reorder). Over-budget passes drop highest-df dims, logged loudly.
+    bp_memory_budget_bytes: usize,
+    /// Bounded rayon pool for background CPU work (merge-time BP, manual
+    /// reorder). Built lazily at ~cores/4 so background passes cannot
+    /// saturate the global rayon pool that query scoring runs on.
+    bg_cpu_pool: std::sync::OnceLock<Arc<rayon::ThreadPool>>,
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Create a new segment manager with existing metadata
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         directory: Arc<D>,
         schema: Arc<crate::dsl::Schema>,
@@ -166,7 +183,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         merge_policy: Box<dyn MergePolicy>,
         term_cache_blocks: usize,
         max_concurrent_merges: usize,
+        merge_bp_time_budget: Option<std::time::Duration>,
+        bp_memory_budget_bytes: usize,
     ) -> Self {
+        // Persisted index option: set via `reorder_on_merge: true` in the SDL
+        // at index creation. Absent = disabled (merges block-copy).
+        let reorder_on_merge = schema.reorder_on_merge();
+        if reorder_on_merge {
+            log::info!("[merge] reorder-on-merge enabled by index schema");
+        }
+
         let tracker = Arc::new(SegmentTracker::new());
         for seg_id in metadata.segment_metas.keys() {
             tracker.register(seg_id);
@@ -207,7 +233,28 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             schema,
             term_cache_blocks,
             max_concurrent_merges: max_concurrent_merges.max(1),
+            reorder_on_merge,
+            merge_bp_time_budget,
+            bp_memory_budget_bytes,
+            bg_cpu_pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bounded rayon pool for background CPU (merge-time BP, manual reorder).
+    /// Query scoring uses the global rayon pool; keeping background BP off it
+    /// prevents a large merge from queueing every search behind gain passes.
+    pub fn background_cpu_pool(&self) -> Arc<rayon::ThreadPool> {
+        Arc::clone(self.bg_cpu_pool.get_or_init(|| {
+            let threads = (num_cpus::get() / 2).max(1);
+            log::info!("[merge] background CPU pool: {} thread(s)", threads);
+            Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|i| format!("hermes-bg-cpu-{}", i))
+                    .build()
+                    .expect("failed to build background CPU pool"),
+            )
+        }))
     }
 
     // ========================================================================
@@ -415,6 +462,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let _guard = guard;
 
             let trained_snap = sm.trained();
+            let granularity = sm.merge_granularity(&ids).await;
             let result = Self::do_merge(
                 sm.directory.as_ref(),
                 &sm.schema,
@@ -422,12 +470,26 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 output_id,
                 sm.term_cache_blocks,
                 trained_snap.as_deref(),
+                sm.reorder_on_merge,
+                granularity,
+                sm.merge_bp_time_budget,
+                sm.bp_memory_budget_bytes,
+                Some(sm.background_cpu_pool()),
             )
             .await;
 
             match result {
-                Ok((new_id, doc_count)) => {
-                    if let Err(e) = sm.replace_segments(&ids, new_id, doc_count, false).await {
+                Ok((new_id, doc_count, bp_converged)) => {
+                    if let Err(e) = sm
+                        .replace_segments(
+                            &ids,
+                            new_id,
+                            doc_count,
+                            sm.reorder_on_merge,
+                            bp_converged,
+                        )
+                        .await
+                    {
                         log::error!("[merge] Failed to replace segments after merge: {:?}", e);
                     }
                 }
@@ -456,11 +518,28 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         new_id: String,
         doc_count: u32,
         reordered: bool,
+        bp_converged: bool,
     ) -> Result<()> {
         self.tracker.register(&new_id);
 
         {
             let mut st = self.state.lock().await;
+            // Every source must still be live: callers hold the inventory
+            // guard, so a missing source means a stale merge/reorder whose
+            // input was already replaced — adding the output would duplicate
+            // its documents. The orphaned output files are swept by
+            // cleanup_orphan_segments.
+            let missing: Vec<&String> = old_ids
+                .iter()
+                .filter(|id| !st.metadata.has_segment(id))
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::Corruption(format!(
+                    "replace_segments: source segment(s) {:?} not in metadata — \
+                     refusing to add output {} (would duplicate documents)",
+                    missing, new_id
+                )));
+            }
             // Compute generation from parents before removing them
             let parent_gen = old_ids
                 .iter()
@@ -473,8 +552,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             for id in old_ids {
                 st.metadata.remove_segment(id);
             }
-            st.metadata
-                .add_merged_segment(new_id, doc_count, ancestors, parent_gen + 1, reordered);
+            st.metadata.add_merged_segment(
+                new_id,
+                doc_count,
+                ancestors,
+                parent_gen + 1,
+                reordered,
+                bp_converged,
+            );
             // Mutation + persist must be atomic — keep under lock
             st.metadata.save(self.directory.as_ref()).await?;
         }
@@ -489,6 +574,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Perform the actual merge operation (pure function — no shared state access).
     /// `output_segment_id` is pre-generated by the caller so it can be tracked in `merge_inventory`.
     /// Returns (new_segment_id_hex, total_doc_count).
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn do_merge(
         directory: &D,
         schema: &Arc<crate::dsl::Schema>,
@@ -496,7 +583,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         output_segment_id: SegmentId,
         term_cache_blocks: usize,
         trained: Option<&TrainedVectorStructures>,
-    ) -> Result<(String, u32)> {
+        reorder_bmp: bool,
+        granularity: crate::segment::reorder::BpGranularity,
+        merge_bp_time_budget: Option<std::time::Duration>,
+        bp_memory_budget_bytes: usize,
+        bg_cpu_pool: Option<Arc<rayon::ThreadPool>>,
+    ) -> Result<(String, u32, bool)> {
         let output_hex = output_segment_id.to_hex();
         let load_start = std::time::Instant::now();
 
@@ -557,7 +649,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             load_start.elapsed().as_secs_f64()
         );
 
-        let merger = SegmentMerger::new(Arc::clone(schema));
+        let merger = SegmentMerger::new(Arc::clone(schema))
+            .with_bmp_reorder(reorder_bmp)
+            .with_granularity(granularity)
+            .with_bp_budget(crate::segment::BpBudget {
+                min_partition_docs: None,
+                time_budget: merge_bp_time_budget,
+            })
+            .with_bp_memory_budget(bp_memory_budget_bytes)
+            .with_background_pool(bg_cpu_pool);
 
         log::info!(
             "[merge] {} segments -> {} (trained={})",
@@ -566,9 +666,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             trained.map_or(0, |t| t.centroids.len()),
         );
 
-        merger
+        let (_merged_meta, merge_stats) = merger
             .merge(directory, &readers, output_segment_id, trained)
             .await?;
+        let bp_converged = merge_stats.bp_converged;
+        if !bp_converged {
+            log::info!(
+                "[merge] merge-time BP hit its wall-clock budget — output marked unconverged;                  the background optimizer deepens it later",
+            );
+        }
 
         log::info!(
             "[merge] total wall-clock: {:.1}s ({} segments, {} docs)",
@@ -583,7 +689,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 total_docs
             )));
         }
-        Ok((output_hex, total_docs as u32))
+        Ok((output_hex, total_docs as u32, bp_converged))
     }
 
     /// Abort all in-flight merge tasks without waiting for completion.
@@ -703,18 +809,30 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
 
             let trained_snap = self.trained();
-            let (new_segment_id, total_docs) = Self::do_merge(
+            let granularity = self.merge_granularity(&batch).await;
+            let (new_segment_id, total_docs, bp_converged) = Self::do_merge(
                 self.directory.as_ref(),
                 &self.schema,
                 &batch,
                 output_id,
                 self.term_cache_blocks,
                 trained_snap.as_deref(),
+                self.reorder_on_merge,
+                granularity,
+                self.merge_bp_time_budget,
+                self.bp_memory_budget_bytes,
+                Some(self.background_cpu_pool()),
             )
             .await?;
 
-            self.replace_segments(&batch, new_segment_id, total_docs, false)
-                .await?;
+            self.replace_segments(
+                &batch,
+                new_segment_id,
+                total_docs,
+                self.reorder_on_merge,
+                bp_converged,
+            )
+            .await?;
 
             // _guard drops here → segments unregistered from inventory
         }
@@ -738,7 +856,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         log::info!("[reorder] reordering {} segments", segment_ids.len());
 
         for seg_id in segment_ids {
-            match self.reorder_single_segment(&seg_id, None).await {
+            match self
+                .reorder_single_segment(&seg_id, None, crate::segment::BpBudget::full())
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => log::warn!("[reorder] segment {} skipped (in merge)", seg_id),
                 Err(e) => return Err(e),
@@ -764,6 +885,61 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .collect()
     }
 
+    /// Segments never reordered, with doc counts — for the optimizer to pick
+    /// a size-appropriate BP budget.
+    pub async fn unreordered_segments(&self) -> Vec<(String, u32)> {
+        let st = self.state.lock().await;
+        let in_merge = self.merge_inventory.snapshot();
+        st.metadata
+            .segment_metas
+            .iter()
+            .filter(|(id, info)| !info.reordered && !in_merge.contains(*id))
+            .map(|(id, info)| (id.clone(), info.num_docs))
+            .collect()
+    }
+
+    /// Segments whose last BP pass hit its wall-clock budget before finishing
+    /// (`bp_converged == false`). A warm-started follow-up pass deepens the
+    /// ordering; the optimizer revisits these at low priority.
+    pub async fn unconverged_segments(&self) -> Vec<(String, u32)> {
+        let st = self.state.lock().await;
+        let in_merge = self.merge_inventory.snapshot();
+        st.metadata
+            .segment_metas
+            .iter()
+            .filter(|(id, info)| info.reordered && !info.bp_converged && !in_merge.contains(*id))
+            .map(|(id, info)| (id.clone(), info.num_docs))
+            .collect()
+    }
+
+    /// Granularity for a BP pass whose sources are `ids`: `Records` when any
+    /// source is an unconverged partial reorder, `Auto` otherwise.
+    ///
+    /// Alignment with the depth budget (docs/block-level-reorder.md): an
+    /// unconverged segment is owed a deepening pass, and the output of this
+    /// pass will be marked `bp_converged`. `Auto` would measure the partial
+    /// pass's residual coherence, potentially take the blockwise path — which
+    /// cannot deepen record clustering — and end the cascade at partial
+    /// quality. Only record-level BP discharges the debt.
+    async fn merge_granularity(&self, ids: &[String]) -> crate::segment::reorder::BpGranularity {
+        let st = self.state.lock().await;
+        let deepening = ids.iter().any(|id| {
+            st.metadata
+                .segment_metas
+                .get(id)
+                .is_some_and(|info| info.reordered && !info.bp_converged)
+        });
+        drop(st);
+        if deepening {
+            log::info!(
+                "[reorder] source segment(s) unconverged — forcing record-level BP (deepening pass)",
+            );
+            crate::segment::reorder::BpGranularity::Records
+        } else {
+            crate::segment::reorder::BpGranularity::Auto
+        }
+    }
+
     /// Reorder a single segment via BP. Returns Ok(true) if reordered, Ok(false) if skipped.
     ///
     /// Non-blocking: uses merge inventory to prevent conflicts with background merges.
@@ -772,11 +948,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self: &Arc<Self>,
         seg_id: &str,
         rayon_pool: Option<Arc<rayon::ThreadPool>>,
+        bp_budget: crate::segment::BpBudget,
     ) -> Result<bool> {
         let source_id = SegmentId::from_hex(seg_id)
             .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", seg_id)))?;
         let output_id = SegmentId::new();
         let output_hex = output_id.to_hex();
+        let source_ids = [seg_id.to_string()];
+        let granularity = self.merge_granularity(&source_ids).await;
 
         let all_ids = vec![seg_id.to_string(), output_hex];
         let _guard = match self.merge_inventory.try_register(all_ids) {
@@ -787,19 +966,49 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
         };
 
-        let (new_id, total_docs) = crate::segment::reorder::reorder_segment(
+        // The inventory guard only excludes CONCURRENT merges. Candidates are
+        // scanned ahead of time and can go stale: a merge may have consumed
+        // this segment since. Its files may even still be on disk (deferred
+        // deletion under a searcher snapshot) — reordering them would
+        // re-insert a duplicate copy of docs the merge output already holds.
+        {
+            let st = self.state.lock().await;
+            if !st.metadata.has_segment(seg_id) {
+                log::info!(
+                    "[optimizer] segment {} no longer in metadata (merged away), skipping reorder",
+                    seg_id
+                );
+                return Ok(false);
+            }
+        }
+
+        let (new_id, total_docs, bp_converged) = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),
             &self.schema,
             source_id,
             output_id,
             self.term_cache_blocks,
-            crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+            self.bp_memory_budget_bytes,
+            bp_budget,
+            granularity,
             rayon_pool,
         )
         .await?;
 
-        self.replace_segments(&[seg_id.to_string()], new_id, total_docs, true)
-            .await?;
+        // A pass with a depth floor above block granularity has, by
+        // definition, not converged to block-level order — record it as
+        // unconverged so the optimizer's deepening ladder revisits it with a
+        // full-depth (warm-started) pass. Depth caps are only used by the
+        // optimizer's first pass on large segments.
+        let ladder_converged = bp_converged && bp_budget.min_partition_docs.is_none();
+        self.replace_segments(
+            &[seg_id.to_string()],
+            new_id,
+            total_docs,
+            true,
+            ladder_converged,
+        )
+        .await?;
 
         Ok(true)
     }

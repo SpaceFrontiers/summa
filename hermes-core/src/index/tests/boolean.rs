@@ -896,3 +896,94 @@ async fn test_must_term_non_fast_should_sparse_bitset_fallback() {
     );
     assert_eq!(results.hits[0].address.doc_id, 25);
 }
+
+// ── Selectivity-aware filter planning ─────────────────────────────────
+
+/// Build an index shaped like the production slow-query case: a `type` field
+/// (text, indexed + fast) where one value covers ~90% of docs, and a `date`
+/// u64 fast field with evenly spread values.
+async fn create_type_date_index() -> (
+    Index<crate::directories::MmapDirectory>,
+    crate::dsl::Field, // doc_type (text, fast)
+    crate::dsl::Field, // date (u64 fast)
+    crate::dsl::Field, // embedding (sparse_vector)
+) {
+    use crate::directories::MmapDirectory;
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = MmapDirectory::new(tmp_dir.path());
+
+    let mut sb = SchemaBuilder::default();
+    let doc_type = sb.add_text_field("doc_type", true, true);
+    sb.set_fast(doc_type, true);
+    let date = sb.add_u64_field("date", false, true);
+    sb.set_fast(date, true);
+    let embedding = sb.add_sparse_vector_field("embedding", true, true);
+    let schema = sb.build();
+
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    const N: u64 = 3000;
+    for i in 0..N {
+        let mut doc = Document::new();
+        // 90% "page" (the wide filter value), 10% "video"
+        let ty = if i % 10 == 0 { "video" } else { "page" };
+        doc.add_text(doc_type, ty);
+        doc.add_u64(date, i);
+        doc.add_sparse_vector(embedding, vec![(0, 0.5)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), N as u32);
+    (index, doc_type, date, embedding)
+}
+
+/// Production slow-query shape: MUST `type = page` (wide — matches ~90% of
+/// docs) AND MUST `date` in a narrow recent window. The planner must seed the
+/// filter from the narrow range estimate and refine the wide term clause by
+/// per-doc fast-field probes — and the result set must be exactly the docs
+/// satisfying both clauses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wide_type_filter_with_narrow_date_range_returns_exact_docs() {
+    let (index, doc_type, date, embedding) = create_type_date_index().await;
+
+    // date in [2900, 2950]: 51 docs, of which those with i % 10 != 0 are "page"
+    let q = BooleanQuery::new()
+        .must(TermQuery::text(doc_type, "page"))
+        .must(RangeQuery::u64(date, Some(2900), Some(2950)))
+        .should(SparseVectorQuery::new(embedding, vec![(0, 1.0)]));
+
+    let results = index.search(&q, 100).await.unwrap();
+    let got: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+    let expected: HashSet<u32> = (2900u32..=2950).filter(|i| i % 10 != 0).collect();
+    assert_eq!(
+        got, expected,
+        "wide term + narrow range must return exactly the conjunction"
+    );
+}
+
+/// Same shape with MUST_NOT: the wide `type = page` exclusion over a narrow
+/// date window must be probe-refined and return exactly the non-page docs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_narrow_range_with_wide_must_not_term_returns_exact_docs() {
+    let (index, doc_type, date, embedding) = create_type_date_index().await;
+
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(date, Some(2000), Some(2100)))
+        .must_not(TermQuery::text(doc_type, "page"))
+        .should(SparseVectorQuery::new(embedding, vec![(0, 1.0)]));
+
+    let results = index.search(&q, 100).await.unwrap();
+    let got: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+    let expected: HashSet<u32> = (2000u32..=2100).filter(|i| i % 10 == 0).collect();
+    assert_eq!(
+        got, expected,
+        "narrow range minus wide MUST_NOT term must return exactly the difference"
+    );
+}

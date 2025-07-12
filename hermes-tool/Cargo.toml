@@ -27,10 +27,9 @@ bincode = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 murmur3 = "0.5"
-chrono = "0.4"
 rayon = "1.11"
 crossbeam-channel = "0.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["stats", "background_threads"] }
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = { version = "0.7", features = ["stats", "background_threads"] }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }

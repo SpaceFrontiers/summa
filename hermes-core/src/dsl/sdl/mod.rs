@@ -95,6 +95,9 @@ pub struct IndexDef {
     pub default_fields: Vec<String>,
     /// Query router rules for routing queries to specific fields
     pub query_routers: Vec<QueryRouterRule>,
+    /// BP-reorder `reorder`-attributed BMP fields inside merges
+    /// (index-level `reorder_on_merge: true`). Absent = disabled.
+    pub reorder_on_merge: bool,
 }
 
 impl IndexDef {
@@ -199,6 +202,22 @@ impl IndexDef {
             builder.set_query_routers(self.query_routers.clone());
         }
 
+        builder.set_index_name(self.name.clone());
+
+        if self.reorder_on_merge {
+            if self.fields.iter().any(|f| f.reorder) {
+                builder.set_reorder_on_merge(true);
+            } else {
+                // Fail loud: the option would silently do nothing without at
+                // least one `reorder`-attributed field.
+                log::warn!(
+                    "index '{}': reorder_on_merge is set but no field has the `reorder` attribute — merges will not reorder anything",
+                    self.name,
+                );
+                builder.set_reorder_on_merge(true);
+            }
+        }
+
         builder.build()
     }
 
@@ -240,13 +259,19 @@ struct IndexConfig {
     num_clusters: Option<usize>,
     nprobe: Option<usize>,
     build_threshold: Option<usize>,
+    soar: Option<crate::structures::SoarConfig>,
+    rabitq_bits: Option<u8>,
+    binary_ivf: bool,
     // Sparse vector index params
     sparse_format: Option<SparseFormat>,
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
+    bmp_block_size: Option<u32>,
+    bmp_grid_bits: Option<u8>,
     pruning: Option<f32>,
     min_terms: Option<usize>,
+    doc_mass: Option<f32>,
     // Sparse vector query-time config
     query_tokenizer: Option<String>,
     query_weighting: Option<QueryWeighting>,
@@ -349,6 +374,11 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
 
     match p.as_rule() {
         Rule::index_type_spec => {
+            if p.as_str() == "ivf" {
+                // Binary dense vector IVF (Hamming clusters)
+                config.binary_ivf = true;
+                return;
+            }
             config.index_type = Some(match p.as_str() {
                 "flat" => VectorIndexType::Flat,
                 "rabitq" => VectorIndexType::RaBitQ,
@@ -360,6 +390,10 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
         Rule::index_type_kwarg => {
             // index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
             if let Some(t) = p.into_inner().next() {
+                if t.as_str() == "ivf" {
+                    config.binary_ivf = true;
+                    return;
+                }
                 config.index_type = Some(match t.as_str() {
                     "flat" => VectorIndexType::Flat,
                     "rabitq" => VectorIndexType::RaBitQ,
@@ -402,6 +436,24 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 }));
             }
         }
+        Rule::bits_kwarg => {
+            // bits_kwarg = { "bits" ~ ":" ~ bits_spec }
+            if let Some(b) = p.into_inner().next() {
+                config.rabitq_bits = Some(b.as_str().parse::<u8>().unwrap_or(1).clamp(1, 8));
+            }
+        }
+        Rule::soar_kwarg => {
+            // soar_kwarg = { "soar" ~ ":" ~ soar_spec }
+            if let Some(s) = p.into_inner().next() {
+                use crate::structures::SoarConfig;
+                config.soar = match s.as_str() {
+                    "selective" => Some(SoarConfig::new()),
+                    "full" => Some(SoarConfig::full()),
+                    "aggressive" => Some(SoarConfig::aggressive()),
+                    _ => None, // "off"
+                };
+            }
+        }
         Rule::quantization_kwarg => {
             // quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
             if let Some(q) = p.into_inner().next() {
@@ -438,11 +490,44 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 }));
             }
         }
+        Rule::bmp_grid_bits_kwarg => {
+            // bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.bmp_grid_bits = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid bmp_grid_bits value '{}', using default 4",
+                        n.as_str()
+                    );
+                    4
+                }));
+            }
+        }
+        Rule::bmp_block_size_kwarg => {
+            // bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.bmp_block_size = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid bmp_block_size value '{}', using default 64",
+                        n.as_str()
+                    );
+                    64
+                }));
+            }
+        }
         Rule::pruning_kwarg => {
             // pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
             if let Some(f) = p.into_inner().next() {
                 config.pruning = Some(f.as_str().parse().unwrap_or_else(|_| {
                     log::warn!("Invalid pruning value '{}', using default 1.0", f.as_str());
+                    1.0
+                }));
+            }
+        }
+        Rule::doc_mass_kwarg => {
+            // doc_mass_kwarg = { "doc_mass" ~ ":" ~ pruning_spec }
+            if let Some(f) = p.into_inner().next() {
+                config.doc_mass = Some(f.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!("Invalid doc_mass value '{}', using 1.0 (off)", f.as_str());
                     1.0
                 }));
             }
@@ -686,7 +771,9 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut positions = None;
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
-        if let Some(ref mut dv_config) = dense_vector_config {
+        if let Some(ref mut bv_config) = binary_dense_vector_config {
+            apply_index_config_to_binary_dense_vector(bv_config, idx_cfg);
+        } else if let Some(ref mut dv_config) = dense_vector_config {
             apply_index_config_to_dense_vector(dv_config, idx_cfg);
         } else if field_type == FieldType::SparseVector {
             // For sparse vectors, create default config if not present and apply index params
@@ -712,6 +799,25 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     })
 }
 
+/// Apply index configuration from indexed<...> to BinaryDenseVectorConfig
+fn apply_index_config_to_binary_dense_vector(
+    config: &mut BinaryDenseVectorConfig,
+    idx_cfg: IndexConfig,
+) {
+    if idx_cfg.binary_ivf {
+        config.index_type = super::schema::BinaryIndexType::Ivf;
+    }
+    if idx_cfg.num_clusters.is_some() {
+        config.num_clusters = idx_cfg.num_clusters;
+    }
+    if let Some(nprobe) = idx_cfg.nprobe {
+        config.nprobe = nprobe;
+    }
+    if idx_cfg.build_threshold.is_some() {
+        config.build_threshold = idx_cfg.build_threshold;
+    }
+}
+
 /// Apply index configuration from indexed<...> to DenseVectorConfig
 fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) {
     // Apply index type if specified
@@ -733,6 +839,31 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
     if idx_cfg.build_threshold.is_some() {
         config.build_threshold = idx_cfg.build_threshold;
     }
+
+    // Apply RaBitQ bit width if specified (IVF-RaBitQ only)
+    if let Some(bits) = idx_cfg.rabitq_bits {
+        if config.index_type == super::schema::VectorIndexType::IvfRaBitQ {
+            config.rabitq_bits = Some(bits);
+        } else {
+            log::warn!(
+                "'bits' requires an ivf_rabitq index; ignoring for index type {:?}",
+                config.index_type
+            );
+        }
+    }
+
+    // Apply SOAR spilling if specified (IVF-based indexes only)
+    if idx_cfg.soar.is_some() {
+        if config.uses_ivf() {
+            config.soar = idx_cfg.soar;
+        } else {
+            log::warn!(
+                "'soar' requires an IVF-based index (ivf_rabitq, scann); \
+                 ignoring for index type {:?}",
+                config.index_type
+            );
+        }
+    }
 }
 
 /// Parse sparse_vector_config - only index_size (positional)
@@ -752,19 +883,8 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
     }
 
     SparseVectorConfig {
-        format: SparseFormat::default(),
         index_size,
-        weight_quantization: WeightQuantization::default(),
-        weight_threshold: 0.0,
-        block_size: 128,
-        bmp_block_size: 64,
-        max_bmp_grid_bytes: 0,
-        bmp_superblock_size: 64,
-        pruning: None,
-        query_config: None,
-        dims: None,
-        max_weight: None,
-        min_terms: 4,
+        ..SparseVectorConfig::default()
     }
 }
 
@@ -790,6 +910,28 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         config.block_size = adjusted;
     }
+    if let Some(bs) = idx_cfg.bmp_block_size {
+        let adjusted = bs.next_power_of_two().clamp(1, 256);
+        if adjusted != bs {
+            log::warn!(
+                "bmp_block_size {} adjusted to power of two in 1..=256: {}",
+                bs,
+                adjusted
+            );
+        }
+        config.bmp_block_size = adjusted;
+    }
+    if let Some(bits) = idx_cfg.bmp_grid_bits {
+        if bits == 2 || bits == 4 {
+            config.bmp_grid_bits = bits;
+        } else {
+            log::warn!(
+                "bmp_grid_bits {} unsupported (must be 2 or 4), using 4",
+                bits
+            );
+            config.bmp_grid_bits = 4;
+        }
+    }
     if let Some(p) = idx_cfg.pruning {
         let clamped = p.clamp(0.0, 1.0);
         if (clamped - p).abs() > f32::EPSILON {
@@ -803,6 +945,17 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
     if let Some(mt) = idx_cfg.min_terms {
         config.min_terms = mt;
+    }
+    if let Some(dm) = idx_cfg.doc_mass {
+        let clamped = dm.clamp(0.0, 1.0);
+        if (clamped - dm).abs() > f32::EPSILON {
+            log::warn!(
+                "doc_mass {} clamped to valid range [0.0, 1.0]: {}",
+                dm,
+                clamped
+            );
+        }
+        config.doc_mass = Some(clamped);
     }
     if let Some(d) = idx_cfg.dims {
         config.dims = Some(d);
@@ -1011,6 +1164,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
     let mut fields = Vec::new();
     let mut default_fields = Vec::new();
     let mut query_routers = Vec::new();
+    let mut reorder_on_merge = false;
 
     for item in inner {
         match item.as_rule() {
@@ -1022,6 +1176,14 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
             }
             Rule::query_router_def => {
                 query_routers.push(parse_query_router_def(item)?);
+            }
+            Rule::reorder_on_merge_def => {
+                let value = item
+                    .into_inner()
+                    .next()
+                    .map(|b| b.as_str() == "true")
+                    .unwrap_or(false);
+                reorder_on_merge = value;
             }
             _ => {}
         }
@@ -1056,6 +1218,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         fields,
         default_fields,
         query_routers,
+        reorder_on_merge,
     })
 }
 
@@ -1460,6 +1623,48 @@ mod tests {
     }
 
     #[test]
+    fn test_sparse_vector_bmp_block_size() {
+        let sdl = r#"
+            index documents {
+                field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, bmp_block_size: 256>]
+                field emb2: sparse_vector<u32> [indexed<format: bmp, dims: 30522>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config1 = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config1.format, SparseFormat::Bmp);
+        assert_eq!(config1.bmp_block_size, 256);
+
+        // Default block size stays 64
+        let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config2.bmp_block_size, 64);
+    }
+
+    /// Regression: `bmp_grid_bits` parsed but was never applied to the field
+    /// config — SDL said 2, segments silently built 4-bit grids.
+    #[test]
+    fn test_sparse_vector_bmp_grid_bits() {
+        let sdl = r#"
+            index documents {
+                field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, bmp_block_size: 256, bmp_grid_bits: 2>]
+                field emb2: sparse_vector<u32> [indexed<format: bmp, dims: 30522>]
+                field emb3: sparse_vector<u32> [indexed<format: bmp, dims: 30522, bmp_grid_bits: 3>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config1 = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config1.bmp_grid_bits, 2);
+        // Default stays 4
+        let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config2.bmp_grid_bits, 4);
+        // Unsupported width falls back to 4 with a warning
+        let config3 = indexes[0].fields[2].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config3.bmp_grid_bits, 4);
+    }
+
+    #[test]
     fn test_sparse_vector_with_weight_threshold() {
         let sdl = r#"
             index documents {
@@ -1502,6 +1707,29 @@ mod tests {
         let config = f.sparse_vector_config.as_ref().unwrap();
         assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
         assert_eq!(config.pruning, Some(0.1));
+    }
+
+    #[test]
+    fn test_sparse_vector_with_doc_mass() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.doc_mass, Some(0.9));
+
+        // Not specified → off
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector [indexed<quantization: uint8>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.doc_mass, None);
     }
 
     #[test]
@@ -1563,6 +1791,105 @@ mod tests {
         assert_eq!(config.dim, 768);
         assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 32); // default
+    }
+
+    #[test]
+    fn test_dense_vector_with_soar() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, soar: selective>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        let soar = config.soar.as_ref().expect("soar should be enabled");
+        assert_eq!(soar.num_secondary, 1);
+        assert!(soar.selective);
+
+        // aggressive preset: 2 secondary clusters, no selectivity
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<scann, soar: aggressive>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        let soar = config.soar.as_ref().expect("soar should be enabled");
+        assert_eq!(soar.num_secondary, 2);
+        assert!(!soar.selective);
+
+        // off keeps soar disabled
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, soar: off>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        assert!(config.soar.is_none());
+    }
+
+    #[test]
+    fn test_binary_dense_vector_with_ivf() {
+        let sdl = r#"
+            index documents {
+                field hash: binary_dense_vector<512> [indexed<ivf, num_clusters: 128, nprobe: 16>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0]
+            .binary_dense_vector_config
+            .as_ref()
+            .unwrap();
+        assert_eq!(config.dim, 512);
+        assert_eq!(
+            config.index_type,
+            super::super::schema::BinaryIndexType::Ivf
+        );
+        assert_eq!(config.num_clusters, Some(128));
+        assert_eq!(config.nprobe, 16);
+
+        // Default stays flat
+        let sdl = r#"
+            index documents {
+                field hash: binary_dense_vector<512> [indexed]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0]
+            .binary_dense_vector_config
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            config.index_type,
+            super::super::schema::BinaryIndexType::Flat
+        );
+    }
+
+    #[test]
+    fn test_dense_vector_with_rabitq_bits() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, bits: 4>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        assert_eq!(config.rabitq_bits, Some(4));
+
+        // Not specified -> classic 1-bit
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_rabitq>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        assert_eq!(config.rabitq_bits, None);
     }
 
     #[test]
@@ -2182,5 +2509,40 @@ mod tests {
 
         let f2 = schema.get_field("embedding2").unwrap();
         assert!(!schema.get_field_entry(f2).unwrap().reorder);
+
+        // Index-level reorder_on_merge absent → disabled (current behaviour)
+        assert!(!schema.reorder_on_merge());
+    }
+
+    #[test]
+    fn test_reorder_on_merge_index_option() {
+        let sdl = r#"
+            index documents {
+                reorder_on_merge: true
+                field embedding: sparse_vector<u16> [indexed<format: bmp>, reorder]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert!(indexes[0].reorder_on_merge);
+        let schema = indexes[0].to_schema();
+        assert!(schema.reorder_on_merge());
+
+        // Explicit false parses and stays disabled
+        let sdl_off = r#"
+            index documents {
+                reorder_on_merge: false
+                field embedding: sparse_vector<u16> [indexed<format: bmp>, reorder]
+            }
+        "#;
+        let indexes = parse_sdl(sdl_off).unwrap();
+        assert!(!indexes[0].reorder_on_merge);
+        assert!(!indexes[0].to_schema().reorder_on_merge());
+
+        // Schema serde roundtrip preserves the flag (persisted in metadata)
+        let schema_on = parse_sdl(sdl).unwrap()[0].to_schema();
+        let json = serde_json::to_string(&schema_on).unwrap();
+        let back: crate::dsl::Schema = serde_json::from_str(&json).unwrap();
+        assert!(back.reorder_on_merge());
     }
 }

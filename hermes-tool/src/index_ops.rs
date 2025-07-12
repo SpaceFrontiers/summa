@@ -1,5 +1,6 @@
 //! Index management operations: create, index, commit, merge, info, warmup
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
@@ -276,7 +277,8 @@ pub async fn show_info(index_path: PathBuf) -> Result<()> {
 
     println!("Index: {:?}", index_path);
     println!("Documents: {}", index.num_docs().await?);
-    println!("Segments: {}", index.segment_readers().await?.len());
+    let segments = index.segment_readers().await?;
+    println!("Segments: {}", segments.len());
     println!();
     println!("Schema:");
     for (_field, entry) in index.schema().fields() {
@@ -284,6 +286,43 @@ pub async fn show_info(index_path: PathBuf) -> Result<()> {
             "  {} ({:?}) - indexed: {}, stored: {}",
             entry.name, entry.field_type, entry.indexed, entry.stored
         );
+    }
+
+    // Per-field sparse vector statistics (postings, avg vector length)
+    let mut sparse_vectors: HashMap<u32, u64> = HashMap::new();
+    let mut sparse_postings: HashMap<u32, u64> = HashMap::new();
+    for segment in &segments {
+        for (&field_id, idx) in segment.sparse_indexes() {
+            *sparse_vectors.entry(field_id).or_default() += idx.total_vectors as u64;
+            *sparse_postings.entry(field_id).or_default() += idx.total_postings();
+        }
+        for (&field_id, idx) in segment.bmp_indexes() {
+            *sparse_vectors.entry(field_id).or_default() += idx.total_vectors as u64;
+            *sparse_postings.entry(field_id).or_default() += idx.total_postings();
+        }
+    }
+    if !sparse_vectors.is_empty() {
+        println!();
+        println!("Sparse vectors:");
+        let mut fields: Vec<_> = sparse_vectors.keys().copied().collect();
+        fields.sort_unstable();
+        for field_id in fields {
+            let name = index
+                .schema()
+                .get_field_name(hermes_core::dsl::Field(field_id))
+                .unwrap_or("unknown");
+            let vectors = sparse_vectors[&field_id];
+            let postings = sparse_postings.get(&field_id).copied().unwrap_or(0);
+            let avg = if vectors > 0 {
+                postings as f64 / vectors as f64
+            } else {
+                0.0
+            };
+            println!(
+                "  {}: {} vectors, {} postings, avg length {:.1} terms/vector",
+                name, vectors, postings, avg
+            );
+        }
     }
 
     Ok(())

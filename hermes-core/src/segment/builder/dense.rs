@@ -162,8 +162,9 @@ pub(super) fn build_vectors_streaming(
                 let blob = match config.index_type {
                     VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(field_id) => {
                         let centroids = &trained.centroids[field_id];
+                        let bits = config.rabitq_bits.unwrap_or(1);
                         let (mut index, codebook) =
-                            super::super::ann_build::new_ivf_rabitq(dim, centroids);
+                            super::super::ann_build::new_ivf_rabitq(dim, centroids, bits);
                         for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
                             let v = &builder.vectors[i * dim..(i + 1) * dim];
                             index.add_vector(centroids, &codebook, *doc_id, *ordinal, v);
@@ -296,6 +297,50 @@ pub(super) fn build_vectors_streaming(
         if pad > 0 {
             writer.write_all(&[0u8; 8][..pad as usize])?;
             current_offset += pad;
+        }
+
+        // Binary IVF index (native only): built at commit when configured
+        // and the segment is large enough for probing to beat brute force.
+        #[cfg(feature = "native")]
+        {
+            let binary_config = schema
+                .get_field_entry(Field(field_id))
+                .and_then(|e| e.binary_dense_vector_config.as_ref());
+            if let Some(cfg) = binary_config
+                && cfg.index_type == crate::dsl::BinaryIndexType::Ivf
+                && num_vectors >= cfg.default_build_threshold()
+            {
+                let num_clusters = cfg.optimal_num_clusters(num_vectors);
+                let ivf_config =
+                    crate::structures::BinaryIvfConfig::new(builder.dim_bits, num_clusters);
+                let index = crate::structures::BinaryIvfIndex::build(
+                    ivf_config,
+                    &builder.vectors,
+                    &builder.doc_ids,
+                );
+                let blob = index.to_bytes().map_err(crate::Error::Io)?;
+                let blob_offset = current_offset;
+                writer.write_all(&blob)?;
+                current_offset += blob.len() as u64;
+                toc.push(DenseVectorTocEntry {
+                    field_id,
+                    index_type: super::super::ann_build::BINARY_IVF_TYPE,
+                    offset: blob_offset,
+                    size: blob.len() as u64,
+                });
+                let pad = (8 - (current_offset % 8)) % 8;
+                if pad > 0 {
+                    writer.write_all(&[0u8; 8][..pad as usize])?;
+                    current_offset += pad;
+                }
+                log::debug!(
+                    "[build_vectors] field {}: binary IVF built ({} vectors, {} clusters, {} bytes)",
+                    field_id,
+                    num_vectors,
+                    num_clusters,
+                    blob.len(),
+                );
+            }
         }
     }
 

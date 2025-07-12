@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V13 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V14 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -25,7 +25,7 @@
 //! - **64-byte footer** (was 72): `block_simhash_offset` field removed
 //! - V12 segments are incompatible — must rebuild
 //!
-//! ## BMP V13 Blob Layout (data-first, block-interleaved)
+//! ## BMP V14 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -37,12 +37,12 @@
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
 //!
 //! Per-block data layout (for non-empty blocks):
-//!   num_terms: u16                                    offset 0
-//!   term_dim_ids: [u32-LE × num_terms]                offset 2
-//!   posting_starts: [u16-LE × (num_terms + 1)]        relative cumulative counts
+//!   num_terms: u32                                    offset 0
+//!   term_dim_ids: [u32-LE × num_terms]                offset 4
+//!   posting_starts: [u32-LE × (num_terms + 1)]        relative cumulative counts
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP V13 Footer (64 bytes):
+//! BMP V14 Footer (64 bytes):
 //!   total_terms: u32              //  0- 3  (stats only)
 //!   total_postings: u32           //  4- 7  (stats only)
 //!   grid_offset: u64              //  8-15  (byte offset of Section D)
@@ -93,10 +93,10 @@ impl VidLookup {
 }
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V13;
+use crate::segment::format::BMP_BLOB_MAGIC_V14;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V13 blob from per-dimension postings.
+/// Build a BMP V14 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -126,6 +126,7 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 pub(crate) fn build_bmp_blob(
     mut postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,
     bmp_block_size: u32,
+    grid_bits: u8,
     weight_threshold: f32,
     pruning_fraction: Option<f32>,
     dims: u32,
@@ -138,7 +139,7 @@ pub(crate) fn build_bmp_blob(
     }
 
     // Phase 0: Prune per-dimension (skip dims with fewer than min_terms postings)
-    for (_dim_id, dim_postings) in postings.iter_mut() {
+    for dim_postings in postings.values_mut() {
         if let Some(fraction) = pruning_fraction
             && dim_postings.len() >= min_terms
             && fraction < 1.0
@@ -374,19 +375,21 @@ pub(crate) fn build_bmp_blob(
             blk_buf.clear();
             let nt = blk_dim_ids.len();
 
-            // num_terms (u16)
-            blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
+            // num_terms (u32)
+            blk_buf.extend_from_slice(&(nt as u32).to_le_bytes());
 
             // term_dim_ids [u32 × nt]
             for &did in &blk_dim_ids {
                 blk_buf.extend_from_slice(&did.to_le_bytes());
             }
 
-            // posting_starts [u16 × (nt + 1)] — relative cumulative
-            let mut cum: u16 = 0;
+            // posting_starts [u32 × (nt + 1)] — relative cumulative.
+            // u32, not u16: a 256-doc block of ~300-dim docs exceeds 65,535
+            // postings, and the old u16 sums wrapped silently (V13 → V14).
+            let mut cum: u32 = 0;
             for &count in &blk_posting_counts {
                 blk_buf.extend_from_slice(&cum.to_le_bytes());
-                cum += count;
+                cum += count as u32;
             }
             blk_buf.extend_from_slice(&cum.to_le_bytes());
 
@@ -409,7 +412,7 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V13 vectors={} padded={} blocks={} dims={} \
+        "[bmp_build] V14 vectors={} padded={} blocks={} dims={} \
          terms={} postings={} grid_entries={}",
         num_real_docs,
         num_virtual_docs,
@@ -443,7 +446,7 @@ pub(crate) fn build_bmp_blob(
     // `dims` rows (not num_dims)
     let grid_offset = bytes_written;
     let (packed_bytes, sb_bytes) =
-        stream_write_grids(&grid_entries, dims as usize, num_blocks, writer)?;
+        stream_write_grids(&grid_entries, dims as usize, num_blocks, grid_bits, writer)?;
     let sb_grid_offset = bytes_written + packed_bytes;
     bytes_written += packed_bytes + sb_bytes;
     drop(grid_entries); // Free grid entries before doc_map write
@@ -472,8 +475,8 @@ pub(crate) fn build_bmp_blob(
 
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V13 Footer (64 bytes)
-    write_v13_footer(
+    // BMP V14 Footer (64 bytes)
+    write_bmp_footer(
         writer,
         total_terms,
         total_postings,
@@ -486,15 +489,16 @@ pub(crate) fn build_bmp_blob(
         max_weight_scale,
         doc_map_offset,
         num_real_docs as u32,
+        grid_bits,
     )?;
     bytes_written += 64;
 
     Ok(bytes_written)
 }
 
-/// Write the BMP V13 footer (64 bytes).
+/// Write the BMP V14 footer (64 bytes).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_v13_footer(
+pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
     total_terms: u32,
     total_postings: u32,
@@ -507,6 +511,7 @@ pub(crate) fn write_v13_footer(
     max_weight_scale: f32,
     doc_map_offset: u64,
     num_real_docs: u32,
+    grid_bits: u8,
 ) -> std::io::Result<()> {
     writer.write_u32::<LittleEndian>(total_terms)?; //  0- 3
     writer.write_u32::<LittleEndian>(total_postings)?; //  4- 7
@@ -519,8 +524,9 @@ pub(crate) fn write_v13_footer(
     writer.write_f32::<LittleEndian>(max_weight_scale)?; // 40-43
     writer.write_u64::<LittleEndian>(doc_map_offset)?; // 44-51
     writer.write_u32::<LittleEndian>(num_real_docs)?; // 52-55
-    writer.write_u32::<LittleEndian>(0)?; // 56-59 reserved
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V13)?; // 60-63
+    // 56-59: grid cell width in bits (0 = legacy 4-bit; else 2 or 4)
+    writer.write_u32::<LittleEndian>(grid_bits as u32)?;
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V14)?; // 60-63
     Ok(())
 }
 
@@ -548,16 +554,66 @@ pub(crate) fn write_u64_slice_le(writer: &mut dyn Write, data: &[u64]) -> std::i
     Ok(data.len() as u64 * 8)
 }
 
-/// Ceiling quantize u8 → u4. Guarantees `u4 * 17 >= original`.
-///
-/// This ensures that 4-bit grid upper bounds are always safe (never
-/// underestimate the true u8 value when unpacked via ×17).
+/// Bytes per grid row for `num_blocks` cells at `bits` per cell (2 or 4).
 #[inline]
-pub(crate) fn quantize_u8_to_u4_ceil(val: u8) -> u8 {
+pub(crate) fn grid_packed_row_size(num_blocks: usize, grid_bits: u8) -> usize {
+    match grid_bits {
+        2 => num_blocks.div_ceil(4),
+        _ => num_blocks.div_ceil(2),
+    }
+}
+
+/// Dequantization multiplier for a grid cell: `cell × scale` recovers a safe
+/// (ceil-quantized) u8 upper bound. 4-bit → 17 (15×17=255); 2-bit → 85.
+#[inline]
+pub(crate) fn grid_dequant_scale(grid_bits: u8) -> u32 {
+    match grid_bits {
+        2 => 85,
+        _ => 17,
+    }
+}
+
+/// Ceiling quantize u8 to a `bits`-wide grid cell. Guarantees
+/// `cell × grid_dequant_scale(bits) >= original` (bounds never underestimate).
+#[inline]
+pub(crate) fn grid_quantize_ceil(val: u8, grid_bits: u8) -> u8 {
     if val == 0 {
         return 0;
     }
-    (val as u16 * 15).div_ceil(255) as u8
+    match grid_bits {
+        2 => (val as u16 * 3).div_ceil(255) as u8,
+        _ => (val as u16 * 15).div_ceil(255) as u8,
+    }
+}
+
+/// OR a quantized cell into a packed grid row at cell index `idx`.
+#[inline]
+pub(crate) fn grid_set_cell(row: &mut [u8], idx: usize, cell: u8, grid_bits: u8) {
+    match grid_bits {
+        2 => row[idx / 4] |= cell << ((idx % 4) * 2),
+        _ => {
+            if idx.is_multiple_of(2) {
+                row[idx / 2] |= cell;
+            } else {
+                row[idx / 2] |= cell << 4;
+            }
+        }
+    }
+}
+
+/// Read a cell from a packed grid row at cell index `idx`.
+#[inline]
+pub(crate) fn grid_get_cell(row: &[u8], idx: usize, grid_bits: u8) -> u8 {
+    match grid_bits {
+        2 => (row[idx / 4] >> ((idx % 4) * 2)) & 0x03,
+        _ => {
+            if idx.is_multiple_of(2) {
+                row[idx / 2] & 0x0F
+            } else {
+                row[idx / 2] >> 4
+            }
+        }
+    }
 }
 
 /// Stream-write 4-bit packed grid (Section D) and 8-bit superblock grid (Section E).
@@ -572,9 +628,10 @@ pub(crate) fn stream_write_grids(
     grid_entries: &[(u32, u32, u8)],
     num_dims: usize,
     num_blocks: usize,
+    grid_bits: u8,
     writer: &mut dyn Write,
 ) -> std::io::Result<(u64, u64)> {
-    let packed_row_size = num_blocks.div_ceil(2);
+    let packed_row_size = grid_packed_row_size(num_blocks, grid_bits);
     let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
     let mut row_buf = vec![0u8; packed_row_size];
@@ -586,12 +643,8 @@ pub(crate) fn stream_write_grids(
         row_buf.fill(0);
         while gi < grid_entries.len() && grid_entries[gi].0 == dim_id {
             let b = grid_entries[gi].1 as usize;
-            let q4 = quantize_u8_to_u4_ceil(grid_entries[gi].2);
-            if b.is_multiple_of(2) {
-                row_buf[b / 2] |= q4;
-            } else {
-                row_buf[b / 2] |= q4 << 4;
-            }
+            let cell = grid_quantize_ceil(grid_entries[gi].2, grid_bits);
+            grid_set_cell(&mut row_buf, b, cell, grid_bits);
             gi += 1;
         }
         writer.write_all(&row_buf)?;
@@ -710,9 +763,10 @@ pub(crate) fn stream_write_grids_merged(
     run_readers: &mut [GridRunReader],
     num_dims: usize,
     num_blocks: usize,
+    grid_bits: u8,
     writer: &mut dyn Write,
 ) -> std::io::Result<(u64, u64)> {
-    let packed_row_size = num_blocks.div_ceil(2);
+    let packed_row_size = grid_packed_row_size(num_blocks, grid_bits);
     let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
     let mut row_buf = vec![0u8; packed_row_size];
@@ -727,12 +781,8 @@ pub(crate) fn stream_write_grids_merged(
                     break;
                 }
                 let b = block_id as usize;
-                let q4 = quantize_u8_to_u4_ceil(impact);
-                if b.is_multiple_of(2) {
-                    row_buf[b / 2] |= q4;
-                } else {
-                    row_buf[b / 2] |= q4 << 4;
-                }
+                let cell = grid_quantize_ceil(impact, grid_bits);
+                grid_set_cell(&mut row_buf, b, cell, grid_bits);
                 reader.advance()?;
             }
         }
@@ -793,7 +843,7 @@ mod tests {
     fn test_build_bmp_blob_empty() {
         let postings = FxHashMap::default();
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert_eq!(size, 0);
         assert!(buf.is_empty());
     }
@@ -807,14 +857,14 @@ mod tests {
         postings.insert(1, vec![(0, 0, 0.8)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
-        // Verify V13 footer magic (last 4 bytes of 64-byte footer)
+        // Verify V14 footer magic (last 4 bytes of 64-byte footer)
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V13);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V14);
     }
 
     #[test]
@@ -824,10 +874,10 @@ mod tests {
         postings.insert(0u32, vec![(0u32, 0u16, 1.0f32), (0, 1, 0.8), (1, 0, 0.5)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify V13 footer: num_virtual_docs should be 64 (padded to block_size)
+        // Verify V14 footer: num_virtual_docs should be 64 (padded to block_size)
         // 3 real docs padded to 64
         let footer_start = buf.len() - 64;
         let fb = &buf[footer_start..];
@@ -849,10 +899,10 @@ mod tests {
         // impact(2.0) = round(2.0/5.0*255) = round(102) = 102
         // impact(1.0) = round(1.0/5.0*255) = round(51) = 51
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify max_weight_scale in V13 footer (bytes 40-43)
+        // Verify max_weight_scale in V14 footer (bytes 40-43)
         let footer_start = buf.len() - 64;
         let fb = &buf[footer_start..];
         let scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
@@ -874,7 +924,7 @@ mod tests {
 
         // Fixed max_weight=5.0: same scale
         let mut buf_a = Vec::new();
-        build_bmp_blob(postings_a, 64, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
+        build_bmp_blob(postings_a, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
         let scale_a = f32::from_le_bytes(
             buf_a[buf_a.len() - 64 + 40..buf_a.len() - 64 + 44]
                 .try_into()
@@ -882,7 +932,7 @@ mod tests {
         );
 
         let mut buf_b = Vec::new();
-        build_bmp_blob(postings_b, 64, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
+        build_bmp_blob(postings_b, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
         let scale_b = f32::from_le_bytes(
             buf_b[buf_b.len() - 64 + 40..buf_b.len() - 64 + 44]
                 .try_into()

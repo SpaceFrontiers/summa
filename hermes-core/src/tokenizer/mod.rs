@@ -284,7 +284,7 @@ impl<T: Tokenizer> StopWordTokenizer<T> {
     /// Create a new stop word tokenizer wrapping the given tokenizer
     pub fn new(inner: T, language: Language) -> Self {
         let stop_words: HashSet<String> = stop_words::get(language.to_stop_words_language())
-            .into_iter()
+            .iter()
             .map(|s| s.to_string())
             .collect();
         Self { inner, stop_words }

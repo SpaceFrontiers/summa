@@ -7,8 +7,10 @@
 //! Only indexes with `reorder` fields in their schema are considered.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use hermes_core::segment::BpBudget;
 use log::{debug, info, warn};
 use tokio::sync::Semaphore;
 
@@ -21,6 +23,20 @@ pub struct OptimizerConfig {
     pub threads: usize,
     /// Interval between scans for unreordered segments.
     pub scan_interval: Duration,
+    /// Segments with at least this many docs get a *budgeted* BP pass
+    /// (depth capped at `partial_min_partition_docs`, wall clock capped at
+    /// `time_budget`) instead of a full-depth pass.
+    pub large_segment_docs: u32,
+    /// Wall-clock budget per BP pass on large segments.
+    pub time_budget: Duration,
+    /// Depth cap for large segments: stop bisection at partitions of this
+    /// many docs. 4096 = superblock granularity (64 blocks × 64 docs), which
+    /// keeps most of the superblock-pruning win at ~⅓ less depth.
+    pub partial_min_partition_docs: usize,
+    /// Minimum wait between follow-up passes on a segment whose previous
+    /// pass hit its wall-clock budget (`bp_converged == false`). Each
+    /// follow-up warm-starts from the previous order and deepens.
+    pub unconverged_cooldown: Duration,
 }
 
 /// Spawn the background optimizer loop.
@@ -45,16 +61,27 @@ pub fn spawn_optimizer(
 
     // Bounded rayon pool for BP computation — prevents optimizer from
     // saturating all CPU cores. Shared across all concurrent reorder tasks.
+    //
+    // Sized at max(threads, cores/2), NOT just `threads`: `threads` bounds
+    // how many segments are rewritten concurrently (the semaphore), while
+    // the pool bounds how wide a SINGLE BP pass can fan out (recursive
+    // bisection halves via rayon::join + parallel gain computation). A lone
+    // deepening pass on a 10M+ doc segment should use the same cores/2 slice
+    // the merge-time BP pool gets, not serialize onto 4 threads.
+    let bp_pool_threads = std::thread::available_parallelism()
+        .map(|c| c.get() / 2)
+        .unwrap_or(config.threads)
+        .max(config.threads);
     let rayon_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(config.threads)
+            .num_threads(bp_pool_threads)
             .thread_name(|idx| format!("optimizer-bp-{}", idx))
             .build()
             .expect("failed to create optimizer rayon pool"),
     );
 
     Some(tokio::spawn(async move {
-        optimizer_loop(registry, semaphore, rayon_pool, config.scan_interval).await;
+        optimizer_loop(registry, semaphore, rayon_pool, config).await;
     }))
 }
 
@@ -63,25 +90,44 @@ async fn optimizer_loop(
     registry: Arc<IndexRegistry>,
     semaphore: Arc<Semaphore>,
     rayon_pool: Arc<rayon::ThreadPool>,
-    scan_interval: Duration,
+    config: OptimizerConfig,
 ) {
     // Initial delay: let the server finish startup before scanning.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
+    // Unix millis of the last budgeted pass that may need a follow-up —
+    // paces warm-started deepening passes (each is a full segment rewrite).
+    let last_partial_pass = Arc::new(AtomicU64::new(0));
+
     loop {
-        if let Err(e) = scan_and_optimize(&registry, &semaphore, &rayon_pool).await {
+        if let Err(e) = scan_and_optimize(
+            &registry,
+            &semaphore,
+            &rayon_pool,
+            &config,
+            &last_partial_pass,
+        )
+        .await
+        {
             warn!("[optimizer] scan failed: {}", e);
         }
 
-        tokio::time::sleep(scan_interval).await;
+        tokio::time::sleep(config.scan_interval).await;
     }
 }
 
-/// One scan cycle: list indexes, find unreordered segments, spawn reorder tasks.
+/// One scan cycle: list indexes, find candidates, spawn reorder tasks.
+///
+/// Priority: never-reordered segments first (small ones full-depth, large
+/// ones budgeted). When none exist, revisit unconverged segments (previous
+/// pass hit its wall-clock budget) after a cooldown — those passes
+/// warm-start and deepen.
 async fn scan_and_optimize(
     registry: &IndexRegistry,
     semaphore: &Arc<Semaphore>,
     rayon_pool: &Arc<rayon::ThreadPool>,
+    config: &OptimizerConfig,
+    last_partial_pass: &Arc<AtomicU64>,
 ) -> Result<(), tonic::Status> {
     let index_names = registry.list_indexes().await?;
 
@@ -114,19 +160,50 @@ async fn scan_and_optimize(
             Arc::clone(w.segment_manager())
         };
 
-        let unreordered = segment_manager.unreordered_segment_ids().await;
+        // Fresh (never-reordered) segments first — they are typically small
+        // memtable flushes that finish in sub-second passes.
+        let fresh = segment_manager.unreordered_segments().await;
+        let mut candidates: Vec<(String, u32, bool)> = fresh
+            .into_iter()
+            .map(|(id, docs)| (id, docs, false))
+            .collect();
 
-        if unreordered.is_empty() {
+        // Deepening is cooldown-paced but NOT starved by fresh work: under
+        // continuous ingestion fresh segments arrive every commit, so a
+        // "only when idle" rule would postpone deepening indefinitely. One
+        // budget-truncated segment per cooldown window (each follow-up is a
+        // full segment rewrite; it warm-starts from the previous order and
+        // deepens toward block-granularity).
+        let unconverged = segment_manager.unconverged_segments().await;
+        if !unconverged.is_empty() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let last = last_partial_pass.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last) >= config.unconverged_cooldown.as_millis() as u64 {
+                last_partial_pass.store(now_ms, Ordering::Relaxed);
+                if let Some((id, docs)) = unconverged.into_iter().next() {
+                    debug!(
+                        "[optimizer] index '{}': deepening unconverged segment {} ({} docs)",
+                        name, id, docs,
+                    );
+                    candidates.push((id, docs, true));
+                }
+            }
+        }
+
+        if candidates.is_empty() {
             continue;
         }
 
         debug!(
-            "[optimizer] index '{}': {} unreordered segment(s)",
+            "[optimizer] index '{}': {} reorder candidate(s)",
             name,
-            unreordered.len()
+            candidates.len()
         );
 
-        for seg_id in unreordered {
+        for (seg_id, num_docs, is_deepening) in candidates {
             // Acquire semaphore permit to bound concurrency
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
@@ -141,11 +218,44 @@ async fn scan_and_optimize(
             let sid = seg_id.clone();
             let pool = Arc::clone(rayon_pool);
 
+            // Size-tiered budget: small segments get full-depth BP (seconds of
+            // work); large ones get a depth- and wall-clock-budgeted FIRST
+            // pass (recorded unconverged), then full-depth deepening passes
+            // (warm-started, wall-clock-bounded) until one beats the clock.
+            let budget = if is_deepening {
+                info!(
+                    "[optimizer] deepening segment {} ({} docs): full depth, time budget {:.0}s",
+                    sid,
+                    num_docs,
+                    config.time_budget.as_secs_f64(),
+                );
+                BpBudget {
+                    min_partition_docs: None,
+                    time_budget: Some(config.time_budget),
+                }
+            } else if num_docs >= config.large_segment_docs {
+                info!(
+                    "[optimizer] segment {} ({} docs) exceeds {} docs — budgeted BP pass \
+                     (min_partition={} docs, time budget {:.0}s)",
+                    sid,
+                    num_docs,
+                    config.large_segment_docs,
+                    config.partial_min_partition_docs,
+                    config.time_budget.as_secs_f64(),
+                );
+                BpBudget {
+                    min_partition_docs: Some(config.partial_min_partition_docs),
+                    time_budget: Some(config.time_budget),
+                }
+            } else {
+                BpBudget::full()
+            };
+
             tokio::spawn(async move {
                 let _permit = permit;
                 let start = std::time::Instant::now();
 
-                match sm.reorder_single_segment(&sid, Some(pool)).await {
+                match sm.reorder_single_segment(&sid, Some(pool), budget).await {
                     Ok(true) => {
                         info!(
                             "[optimizer] reordered segment {} in index '{}' ({:.1}s)",
