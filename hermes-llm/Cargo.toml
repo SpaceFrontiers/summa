@@ -48,12 +48,20 @@ rand = { workspace = true }
 # HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 
+# Remote artifact loading (s3://, gs://, http(s)://) — optional `remote` feature
+object_store = { version = "0.12", default-features = false, features = ["aws", "gcp", "http"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+url = { version = "2", optional = true }
+dirs = { version = "6", optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
-default = ["cpu"]
+default = ["cpu", "remote"]
 cpu = []
+# Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
+remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = [
     "candle-core/metal",

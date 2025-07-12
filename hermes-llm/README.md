@@ -75,6 +75,22 @@ hermes-llm generate \
   --temperature 0.8
 ```
 
+`--checkpoint`, `--config`, and `--tokenizer` each accept a local path **or** a
+remote URI — `s3://bucket/key`, `gs://bucket/key`, `http(s)://…` — which is
+downloaded once and cached under `~/.hermes-cache` (override with
+`$HERMES_CACHE`). Credentials use the standard provider chains (`AWS_*` / IMDS
+for S3, `GOOGLE_APPLICATION_CREDENTIALS` / gcloud ADC / metadata for GCS).
+Remote support is the default `remote` feature; build `--no-default-features`
+to drop the `object_store`/`tokio` dependencies.
+
+```bash
+hermes-llm generate \
+  --checkpoint gs://my-bucket/runs/retriever-100m/weights.safetensors \
+  --config    gs://my-bucket/runs/retriever-100m/config.json \
+  --tokenizer gs://my-bucket/runs/retriever-100m/tokenizer.json \
+  --prompt "Once upon a time"
+```
+
 ### Show model info
 
 ```bash

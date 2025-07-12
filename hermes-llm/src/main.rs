@@ -139,15 +139,21 @@ fn main() -> Result<()> {
             let device = get_device(gpu, 0)?;
             info!("Using device: {:?}", device);
 
+            // Each artifact may be a local path or a remote URI (s3://, gs://,
+            // http(s)://); resolve downloads + caches remote ones.
+            let checkpoint_path = hermes_llm::remote::resolve(&checkpoint)?;
+            let config_path = hermes_llm::remote::resolve(&config_path)?;
+            let tokenizer_path = hermes_llm::remote::resolve(&tokenizer_path)?;
+
             let config = hermes_llm::ModelDef::from_json(&config_path)?;
             let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
 
             let mut var_map = candle_nn::VarMap::new();
             let vb = candle_nn::VarBuilder::from_varmap(&var_map, candle_core::DType::F32, &device);
             let model = hermes_llm::Transformer::new(&config, vb)?;
-            var_map.load(&checkpoint)?;
+            var_map.load(&checkpoint_path)?;
 
-            info!("Loaded model from {}", checkpoint);
+            info!("Loaded model from {}", checkpoint_path.display());
 
             let prompt_tokens = tokenizer.encode(&prompt, false)?;
             info!("Prompt tokens: {:?}", prompt_tokens);

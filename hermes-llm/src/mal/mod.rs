@@ -482,7 +482,7 @@ impl ModelDef {
     }
 
     /// Load from JSON file
-    pub fn from_json(path: &str) -> Result<Self> {
+    pub fn from_json<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&content)?)
     }
