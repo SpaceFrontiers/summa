@@ -5,17 +5,18 @@ the Candle ``VarMap`` names — checkpoints flow both ways with zero conversion:
 
     embedding.weight
     layers.{i}.attention.{q,k,v,o}_proj.weight[/bias]
+    layers.{i}.attention.{q,k}_norm.weight        (when qk_norm)
+    layers.{i}.ssm.{in,x,dt,out}_proj/conv1d/A_log/D  (Mamba blocks)
     layers.{i}.feed_forward.{gate,up,down}_proj.weight[/bias]
     layers.{i}.attn_norm.weight[/bias]
     layers.{i}.ffn_norm.weight[/bias]
     final_norm.weight[/bias]
-    lm_head.weight
+    lm_head.weight                                (absent when tie_weights)
 
 Math parity notes (vs model.rs):
 - RoPE is NeoX-style rotate-half with cos/sin duplicated across the head dim.
 - Norms compute in fp32 and cast back, like the Candle impls.
 - FFN activation mirrors model.rs: SiLU when SwiGLU, exact (erf) GELU otherwise.
-- lm_head is never weight-tied (Candle side keeps it separate).
 """
 
 from __future__ import annotations
@@ -122,8 +123,21 @@ class MultiHeadAttention(nn.Module):
         self.k_proj = nn.Linear(hidden, kv_dim, bias=bias)
         self.v_proj = nn.Linear(hidden, kv_dim, bias=bias)
         self.o_proj = nn.Linear(hidden, hidden, bias=bias)
+        # QK-Norm: per-head RMSNorm over head_dim, pre-RoPE
+        self.q_norm = (
+            RMSNorm(self.head_dim, block.norm_eps) if block.attention.qk_norm else None
+        )
+        self.k_norm = (
+            RMSNorm(self.head_dim, block.norm_eps) if block.attention.qk_norm else None
+        )
 
-    def forward(self, x: Tensor, rope: RotaryEmbedding, start_pos: int = 0) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        rope: RotaryEmbedding,
+        start_pos: int = 0,
+        doc_ids: Tensor | None = None,
+    ) -> Tensor:
         bsz, seq_len, _ = x.shape
 
         q = (
@@ -142,6 +156,9 @@ class MultiHeadAttention(nn.Module):
             .transpose(1, 2)
         )
 
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         q, k = rope(q, k, start_pos)
 
         # GQA: repeat KV heads
@@ -152,13 +169,21 @@ class MultiHeadAttention(nn.Module):
 
         attn_mask = None
         is_causal = self.causal and seq_len > 1
-        if self.window_size is not None and seq_len > 1:
-            # Combined causal + sliding-window additive mask
+        if seq_len > 1 and (self.window_size is not None or doc_ids is not None):
+            # Combined causal + sliding-window + document-boundary mask
             i = torch.arange(seq_len, device=x.device).unsqueeze(1)
             j = torch.arange(seq_len, device=x.device).unsqueeze(0)
-            allowed = (i - j).abs() <= self.window_size
+            allowed = torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)
             if self.causal:
                 allowed &= j <= i
+            if self.window_size is not None:
+                allowed &= (i - j).abs() <= self.window_size
+            if doc_ids is not None:
+                # Block-diagonal: attention never crosses packed-document
+                # boundaries. [B, 1, S, S]
+                same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
+                allowed = allowed.unsqueeze(0) & same_doc
+                allowed = allowed.unsqueeze(1)
             attn_mask = torch.where(allowed, 0.0, float("-inf")).to(q.dtype)
             is_causal = False
 
@@ -245,21 +270,53 @@ class MambaMixer(nn.Module):
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_softplus_dt)
 
-    def forward(self, x: Tensor) -> Tensor:
-        if _selective_scan_fn is not None and x.is_cuda:
-            return self._forward_fused(x)
-        return self._forward_reference(x)
+    _warned_fused_doc_masking = False
 
-    def _forward_reference(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, doc_ids: Tensor | None = None) -> Tensor:
+        if _selective_scan_fn is not None and x.is_cuda:
+            if doc_ids is not None and not MambaMixer._warned_fused_doc_masking:
+                import warnings
+
+                warnings.warn(
+                    "fused selective_scan_fn does not support document-boundary "
+                    "state resets (Mamba-1 kernel has no seq_idx); SSM state "
+                    "crosses packed-document boundaries — attention layers still "
+                    "mask correctly",
+                    stacklevel=2,
+                )
+                MambaMixer._warned_fused_doc_masking = True
+            return self._forward_fused(x)
+        return self._forward_reference(x, doc_ids)
+
+    def _segment_conv(self, xs: Tensor, doc_ids: Tensor) -> Tensor:
+        """Depthwise causal conv that never mixes across document boundaries
+        (reference equivalent of the fused kernels' seq_idx)."""
+        _, _, seq_len = xs.shape
+        w = self.conv1d.weight  # [di, 1, k]
+        out = torch.zeros_like(xs)
+        for j in range(self.conv_kernel):
+            shift = self.conv_kernel - 1 - j  # source offset t-shift
+            x_sh = F.pad(xs, (shift, 0))[..., :seq_len]
+            if shift > 0:
+                same = torch.zeros(doc_ids.shape, dtype=torch.bool, device=xs.device)
+                same[:, shift:] = doc_ids[:, shift:] == doc_ids[:, :-shift]
+                x_sh = x_sh * same.unsqueeze(1)
+            out = out + w[:, 0, j].view(1, -1, 1) * x_sh
+        return out + self.conv1d.bias.view(1, -1, 1)
+
+    def _forward_reference(self, x: Tensor, doc_ids: Tensor | None = None) -> Tensor:
         _, seq_len, _ = x.shape
         in_dtype = x.dtype
 
         xz = self.in_proj(x)
         xs, z = xz.chunk(2, dim=-1)
 
-        # Depthwise causal conv over time
+        # Depthwise causal conv over time (segment-aware under doc masking)
         xs = xs.transpose(1, 2)  # [B, di, L]
-        xs = self.conv1d(F.pad(xs, (self.conv_kernel - 1, 0)))[..., :seq_len]
+        if doc_ids is not None:
+            xs = self._segment_conv(xs, doc_ids)
+        else:
+            xs = self.conv1d(F.pad(xs, (self.conv_kernel - 1, 0)))[..., :seq_len]
         xs = F.silu(xs.transpose(1, 2))  # [B, L, di]
 
         # Input-dependent Δ, B, C — scan in fp32
@@ -276,9 +333,20 @@ class MambaMixer(nn.Module):
         delta_a = torch.exp(delta.unsqueeze(-1) * a)  # [B, L, di, N]
         delta_bx = delta.unsqueeze(-1) * b_mat.unsqueeze(2) * xs_f.unsqueeze(-1)
 
+        # Document-boundary state resets: zero h where a new packed document
+        # starts, so recurrent memory never crosses documents.
+        reset = None
+        if doc_ids is not None:
+            starts = torch.ones_like(doc_ids, dtype=torch.bool)
+            starts[:, 1:] = doc_ids[:, 1:] != doc_ids[:, :-1]
+            starts[:, 0] = False  # h is already zero at t=0
+            reset = (~starts).float().unsqueeze(-1).unsqueeze(-1)  # [B, L, 1, 1]
+
         h = x.new_zeros(x.shape[0], self.d_inner, self.state_dim, dtype=torch.float32)
         ys = []
         for t in range(seq_len):
+            if reset is not None:
+                h = h * reset[:, t]
             h = delta_a[:, t] * h + delta_bx[:, t]
             ys.append((h * c_mat[:, t].unsqueeze(1)).sum(-1))
         y = torch.stack(ys, dim=1)  # [B, L, di]
@@ -339,19 +407,31 @@ class TransformerBlock(nn.Module):
         self.pre_norm = block.norm_position == "Pre"
         self.use_residual = block.residual
 
-    def _mix(self, x: Tensor, rope: RotaryEmbedding, start_pos: int) -> Tensor:
+    def _mix(
+        self,
+        x: Tensor,
+        rope: RotaryEmbedding,
+        start_pos: int,
+        doc_ids: Tensor | None,
+    ) -> Tensor:
         if self.ssm is not None:
-            return self.ssm(x)
-        return self.attention(x, rope, start_pos)
+            return self.ssm(x, doc_ids)
+        return self.attention(x, rope, start_pos, doc_ids)
 
-    def forward(self, x: Tensor, rope: RotaryEmbedding, start_pos: int = 0) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        rope: RotaryEmbedding,
+        start_pos: int = 0,
+        doc_ids: Tensor | None = None,
+    ) -> Tensor:
         if self.pre_norm:
-            h = self._mix(self.attn_norm(x), rope, start_pos)
+            h = self._mix(self.attn_norm(x), rope, start_pos, doc_ids)
             x = x + h if self.use_residual else h
             h = self.feed_forward(self.ffn_norm(x))
             return x + h if self.use_residual else h
         else:
-            h = self._mix(x, rope, start_pos)
+            h = self._mix(x, rope, start_pos, doc_ids)
             x = self.attn_norm(x + h if self.use_residual else h)
             h = self.feed_forward(x)
             return self.ffn_norm(x + h if self.use_residual else h)
@@ -362,6 +442,9 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        # GPT-style init: nn.Embedding's default N(0,1) explodes initial
+        # logits (badly so with tied weights — init loss ~2x ln(V))
+        nn.init.normal_(self.embedding.weight, std=0.02)
 
         # Shared RoPE table: all attention blocks must agree (mirrors model.rs)
         attn_blocks = [
@@ -394,10 +477,15 @@ class Transformer(nn.Module):
         )
         self.rope = RotaryEmbedding(rope_head_dim, config.max_seq_len, rope_theta)
 
-    def forward(self, input_ids: Tensor, start_pos: int = 0) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        start_pos: int = 0,
+        doc_ids: Tensor | None = None,
+    ) -> Tensor:
         x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(x, self.rope, start_pos)
+            x = layer(x, self.rope, start_pos, doc_ids)
         x = self.final_norm(x)
         if self.lm_head is None:
             return F.linear(x, self.embedding.weight)

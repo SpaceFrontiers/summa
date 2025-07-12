@@ -168,6 +168,9 @@ pub struct MultiHeadAttention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    /// Per-head RMSNorm over head_dim, applied to Q/K before RoPE (qk_norm)
+    q_norm: Option<RMSNorm>,
+    k_norm: Option<RMSNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -199,12 +202,22 @@ impl MultiHeadAttention {
                 linear_no_bias(hidden_size, hidden_size, vb.pp("o_proj"))?,
             )
         };
+        let (q_norm, k_norm) = if block.attention.qk_norm {
+            (
+                Some(RMSNorm::new(head_dim, block.norm_eps(), vb.pp("q_norm"))?),
+                Some(RMSNorm::new(head_dim, block.norm_eps(), vb.pp("k_norm"))?),
+            )
+        } else {
+            (None, None)
+        };
         let dropout = Dropout::new(block.dropout as f32);
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -212,6 +225,14 @@ impl MultiHeadAttention {
             window_size: block.attention.window_size,
             causal: block.attention.causal,
         })
+    }
+
+    /// Apply QK-Norm (when configured) to per-head Q/K, pre-RoPE.
+    fn apply_qk_norm(&self, q: Tensor, k: Tensor) -> Result<(Tensor, Tensor)> {
+        match (&self.q_norm, &self.k_norm) {
+            (Some(qn), Some(kn)) => Ok((qn.forward(&q)?, kn.forward(&k)?)),
+            _ => Ok((q, k)),
+        }
     }
 
     pub fn forward(
@@ -236,6 +257,7 @@ impl MultiHeadAttention {
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
+        let (q, k) = self.apply_qk_norm(q, k)?;
         let (q, k) = rope.apply(&q, &k, start_pos)?;
 
         // Repeat KV heads for GQA (Grouped Query Attention)
@@ -344,6 +366,7 @@ impl MultiHeadAttention {
             .transpose(1, 2)?
             .contiguous()?;
 
+        let (q, k) = self.apply_qk_norm(q, k)?;
         let (q, k) = rope.apply(&q, &k, start_pos)?;
 
         // Append to cache (pre-GQA-repeat, [B, n_kv, T, hd])
@@ -1100,6 +1123,65 @@ mod tests {
             assert!(names.contains(&format!("layers.{i}.attention.q_proj.weight")));
             assert!(!names.contains(&format!("layers.{i}.ssm.in_proj.weight")));
         }
+    }
+
+    #[test]
+    fn test_qk_norm_tensors_and_stateful_parity() {
+        let mut config = get_builtin_model("hybrid-tiny").unwrap();
+        config.vocab_size = 128;
+        config.block.attention.qk_norm = true;
+        if let Some(pattern) = config.pattern.as_mut() {
+            for b in pattern.iter_mut() {
+                b.attention.qk_norm = true;
+            }
+        }
+
+        let device = Device::Cpu;
+        let var_map = VarMap::new();
+        let vb = VarBuilder::from_varmap(&var_map, DType::F32, &device);
+        let model = Transformer::new(&config, vb).unwrap();
+
+        let names: std::collections::HashSet<String> =
+            var_map.data().lock().unwrap().keys().cloned().collect();
+        // Attention layers (2, 5 in the [ssm,ssm,attn] pattern) get q/k norms
+        assert!(names.contains("layers.2.attention.q_norm.weight"));
+        assert!(names.contains("layers.5.attention.k_norm.weight"));
+        assert!(!names.contains("layers.0.attention.q_norm.weight")); // ssm layer
+
+        // Stateful decode still matches stateless with qk-norm active
+        let ids: Vec<u32> = (0..10).map(|i| (i * 5 + 1) % 128).collect();
+        let full = Tensor::new(ids.as_slice(), &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let full_logits = model.forward(&full, 0, false).unwrap();
+
+        let mut state = model.make_state(1, &device).unwrap();
+        let prefill = Tensor::new(&ids[..9], &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        model.forward_with_state(&prefill, &mut state).unwrap();
+        let step = Tensor::new(&ids[9..], &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let step_logits = model.forward_with_state(&step, &mut state).unwrap();
+
+        let a: Vec<f32> = step_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = full_logits
+            .narrow(1, 9, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let max_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "qk-norm stateful diverges: {max_diff}");
     }
 
     #[test]

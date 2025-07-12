@@ -13,6 +13,7 @@ attention retr_attn {
     num_heads: 8
     num_kv_heads: 4
     bias: false
+    qk_norm: true
     position_encoding: rope { theta: 100000.0 }
 }
 

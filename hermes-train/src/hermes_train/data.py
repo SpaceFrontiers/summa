@@ -50,9 +50,12 @@ def _iter_texts(lines: Iterator[str]) -> Iterator[str]:
 class Dataset:
     """Flat EOS-joined token stream with fixed-window sampling."""
 
-    def __init__(self, tokens: np.ndarray, seq_len: int) -> None:
+    def __init__(
+        self, tokens: np.ndarray, seq_len: int, eos_token_id: int | None = None
+    ) -> None:
         self.tokens = tokens.astype(np.uint32, copy=False)
         self.seq_len = seq_len
+        self.eos_token_id = eos_token_id
 
     @classmethod
     def _from_lines(
@@ -62,7 +65,11 @@ class Dataset:
         for text in _iter_texts(lines):
             all_tokens.extend(tokenizer.encode(text))
             all_tokens.append(tokenizer.eos_token_id)
-        return cls(np.array(all_tokens, dtype=np.uint32), seq_len)
+        return cls(
+            np.array(all_tokens, dtype=np.uint32),
+            seq_len,
+            eos_token_id=tokenizer.eos_token_id,
+        )
 
     @classmethod
     def from_files(
@@ -87,11 +94,21 @@ class Dataset:
         return max(0, len(self.tokens) - self.seq_len)
 
     def get_batch(
-        self, indices: np.ndarray, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, indices: np.ndarray, device: torch.device, with_doc_ids: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         windows = np.stack([self.tokens[i : i + self.seq_len + 1] for i in indices])
         batch = torch.from_numpy(windows.astype(np.int64)).to(device)
-        return batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
+        inputs = batch[:, :-1].contiguous()
+
+        doc_ids = None
+        if with_doc_ids and self.eos_token_id is not None:
+            # Token t belongs to document number = EOS count before position t
+            # within the window (EOS closes its document).
+            is_eos = (inputs == self.eos_token_id).long()
+            doc_ids = torch.zeros_like(inputs)
+            doc_ids[:, 1:] = is_eos[:, :-1].cumsum(dim=1)
+
+        return inputs, batch[:, 1:].contiguous(), doc_ids
 
 
 class DataLoader:

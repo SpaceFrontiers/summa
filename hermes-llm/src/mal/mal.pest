@@ -64,12 +64,14 @@ attention_prop = {
     bias_prop |
     position_encoding_prop |
     window_size_prop |
-    causal_prop
+    causal_prop |
+    qk_norm_prop
 }
 
 head_dim_prop = { "head_dim" ~ ":" ~ integer }
 window_size_prop = { "window_size" ~ ":" ~ integer }
 causal_prop = { "causal" ~ ":" ~ boolean }
+qk_norm_prop = { "qk_norm" ~ ":" ~ boolean }
 
 // Position encoding: rope, alibi, learned, or none
 position_encoding_prop = { "position_encoding" ~ ":" ~ position_encoding_config }
