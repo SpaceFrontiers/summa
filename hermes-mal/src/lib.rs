@@ -64,7 +64,7 @@ use std::collections::HashMap;
 struct WellKnown;
 
 #[derive(Parser)]
-#[grammar = "mal/mal.pest"]
+#[grammar = "mal.pest"]
 pub struct MalParser;
 
 // ============================================================================
@@ -243,10 +243,6 @@ impl BlockDef {
         self.ffn.hidden_dim.unwrap_or(hidden_size * 4)
     }
 
-    pub fn use_bias(&self) -> bool {
-        self.ffn.bias || self.attention.bias
-    }
-
     pub fn norm_eps(&self) -> f64 {
         if self.norm.eps > 0.0 {
             self.norm.eps
@@ -262,8 +258,11 @@ impl BlockDef {
         }
     }
 
-    pub fn use_swiglu(&self) -> bool {
-        matches!(self.ffn.activation, Activation::SwiGLU)
+    pub fn rope_scaling(&self) -> Option<f64> {
+        match &self.attention.position_encoding {
+            PositionEncoding::Rope { scaling, .. } => *scaling,
+            _ => None,
+        }
     }
 }
 
@@ -440,14 +439,6 @@ impl ModelDef {
         self.block.ffn.hidden_dim.unwrap_or(self.hidden_size * 4)
     }
 
-    pub fn dropout(&self) -> f64 {
-        self.block.dropout
-    }
-
-    pub fn use_bias(&self) -> bool {
-        self.block.ffn.bias || self.block.attention.bias
-    }
-
     pub fn norm_eps(&self) -> f64 {
         if self.block.norm.eps > 0.0 {
             self.block.norm.eps
@@ -463,26 +454,74 @@ impl ModelDef {
         }
     }
 
-    pub fn use_swiglu(&self) -> bool {
-        matches!(self.block.ffn.activation, Activation::SwiGLU)
-    }
-
-    pub fn use_rmsnorm(&self) -> bool {
-        matches!(self.block.norm.norm_type, NormType::RmsNorm)
-    }
-
-    /// Estimate total parameters
+    /// Count trainable parameters implied by the model definition.
     pub fn estimated_params(&self) -> usize {
-        let embed_params = self.vocab_size * self.hidden_size;
-        let attn_params = 4 * self.hidden_size * self.hidden_size;
-        let ff_params = 3 * self.hidden_size * self.intermediate_size();
-        let layer_params = attn_params + ff_params + 2 * self.hidden_size;
-        let head_params = self.hidden_size * self.vocab_size;
-        embed_params + self.num_layers * layer_params + head_params
+        let h = self.hidden_size;
+        let embed_params = self.vocab_size * h;
+        let norm_params = |norm: &NormConfig| match norm.norm_type {
+            NormType::RmsNorm => h,
+            NormType::LayerNorm => 2 * h,
+            NormType::None => 0,
+        };
+
+        let mut layer_params = 0usize;
+        for i in 0..self.num_layers {
+            let block = self.block_for_layer(i);
+            let mixer = match &block.ssm {
+                // Mamba: in_proj + out_proj + conv + x_proj + dt_proj + A + D.
+                Some(ssm) => {
+                    let d_inner = ssm.expand * h;
+                    let dt_rank = self.dt_rank(ssm);
+                    2 * h * d_inner            // in_proj (x, z)
+                        + d_inner * h          // out_proj
+                        + d_inner * ssm.conv_kernel
+                        + d_inner * (dt_rank + 2 * ssm.state_dim) // x_proj
+                        + dt_rank * d_inner + d_inner // dt_proj weight + bias
+                        + d_inner * ssm.state_dim // A_log
+                        + d_inner // D
+                        + d_inner // depthwise conv bias
+                }
+                // Attention: q/k/v/o. Uses GQA kv width when configured.
+                None => {
+                    let q = block.num_heads() * block.head_dim(h);
+                    let kv = block.num_kv_heads() * block.head_dim(h);
+                    let weights = h * q + 2 * h * kv + q * h;
+                    let bias = if block.attention.bias {
+                        2 * q + 2 * kv
+                    } else {
+                        0
+                    };
+                    let qk_norm = if block.attention.qk_norm {
+                        2 * block.head_dim(h)
+                    } else {
+                        0
+                    };
+                    weights + bias + qk_norm
+                }
+            };
+            let intermediate = block.intermediate_size(h);
+            let projections = if block.ffn.gate { 3 } else { 2 };
+            let ff_weights = projections * h * intermediate;
+            let ff_bias = if block.ffn.bias {
+                (if block.ffn.gate { 2 } else { 1 }) * intermediate + h
+            } else {
+                0
+            };
+            layer_params += mixer + ff_weights + ff_bias + 2 * norm_params(&block.norm);
+        }
+
+        let final_norm = self
+            .output
+            .norm
+            .as_ref()
+            .unwrap_or(&self.block_for_layer(0).norm);
+        let head_weights = (!self.embeddings.tie_weights) as usize * h * self.vocab_size;
+        let head_bias = self.output.bias as usize * self.vocab_size;
+        embed_params + layer_params + norm_params(final_norm) + head_weights + head_bias
     }
 
     /// Load from JSON file
-    pub fn from_json(path: &str) -> Result<Self> {
+    pub fn from_json<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&content)?)
     }
@@ -555,9 +594,11 @@ fn parse_model_prop(
                     match child.as_rule() {
                         Rule::identifier => {
                             let name = child.as_str();
-                            if let Some(block) = file.blocks.get(name) {
-                                def.block = block.clone();
-                            }
+                            def.block = file
+                                .blocks
+                                .get(name)
+                                .ok_or_else(|| anyhow!("undefined block '{name}'"))?
+                                .clone();
                         }
                         Rule::inline_block => {
                             let mut block = BlockDef::default();
@@ -604,6 +645,25 @@ fn parse_model_prop(
                             Rule::scale_prop => {
                                 if let Some(val) = child.into_inner().next() {
                                     def.embeddings.scale = Some(val.as_str().parse()?);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Rule::output_prop => {
+                for param in inner.into_inner() {
+                    for child in param.into_inner() {
+                        match child.as_rule() {
+                            Rule::bias_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.output.bias = val.as_str() == "true";
+                                }
+                            }
+                            Rule::norm_prop => {
+                                if let Some(cfg) = child.into_inner().next() {
+                                    def.output.norm = Some(parse_norm_config(cfg)?);
                                 }
                             }
                             _ => {}
@@ -868,6 +928,35 @@ fn parse_ssm_prop(pair: pest::iterators::Pair<Rule>, def: &mut SsmDef) -> Result
 }
 
 /// Parse an FFN definition
+/// Parse a `norm_config` (`rmsnorm { eps: … }` | `layernorm { … }` | `none`)
+/// into a `NormConfig`. An omitted epsilon is represented as zero and resolved
+/// by model construction.
+fn parse_norm_config(pair: pest::iterators::Pair<Rule>) -> Result<NormConfig> {
+    let mut norm = NormConfig::default();
+    match pair.into_inner().next() {
+        // Bare `none` literal produces no inner rule.
+        None => norm.norm_type = NormType::None,
+        Some(cfg) => {
+            norm.norm_type = match cfg.as_rule() {
+                Rule::rmsnorm_config => NormType::RmsNorm,
+                Rule::layernorm_config => NormType::LayerNorm,
+                other => anyhow::bail!("unexpected norm config rule: {other:?}"),
+            };
+            for param in cfg.into_inner() {
+                // norm_param -> norm_eps_prop -> number
+                if let Some(eps) = param
+                    .into_inner()
+                    .next()
+                    .and_then(|p| p.into_inner().next().and_then(|n| n.as_str().parse().ok()))
+                {
+                    norm.eps = eps;
+                }
+            }
+        }
+    }
+    Ok(norm)
+}
+
 fn parse_ffn_def(pair: pest::iterators::Pair<Rule>) -> Result<FfnDef> {
     let mut def = FfnDef::default();
     let mut inner = pair.into_inner();
@@ -952,9 +1041,11 @@ fn parse_block_prop(
                     match child.as_rule() {
                         Rule::identifier => {
                             let name = child.as_str();
-                            if let Some(attn) = file.attentions.get(name) {
-                                def.attention = attn.clone();
-                            }
+                            def.attention = file
+                                .attentions
+                                .get(name)
+                                .ok_or_else(|| anyhow!("undefined attention '{name}'"))?
+                                .clone();
                         }
                         Rule::inline_attention => {
                             let mut attn = AttentionDef::default();
@@ -974,9 +1065,12 @@ fn parse_block_prop(
                     match child.as_rule() {
                         Rule::identifier => {
                             let name = child.as_str();
-                            if let Some(ssm) = file.ssms.get(name) {
-                                def.ssm = Some(ssm.clone());
-                            }
+                            def.ssm = Some(
+                                file.ssms
+                                    .get(name)
+                                    .ok_or_else(|| anyhow!("undefined ssm '{name}'"))?
+                                    .clone(),
+                            );
                         }
                         Rule::inline_ssm => {
                             let mut ssm = SsmDef::default();
@@ -996,9 +1090,11 @@ fn parse_block_prop(
                     match child.as_rule() {
                         Rule::identifier => {
                             let name = child.as_str();
-                            if let Some(ffn) = file.ffns.get(name) {
-                                def.ffn = ffn.clone();
-                            }
+                            def.ffn = file
+                                .ffns
+                                .get(name)
+                                .ok_or_else(|| anyhow!("undefined ffn '{name}'"))?
+                                .clone();
                         }
                         Rule::inline_ffn => {
                             let mut ffn = FfnDef::default();
@@ -1011,6 +1107,12 @@ fn parse_block_prop(
                         }
                         _ => {}
                     }
+                }
+            }
+            Rule::norm_prop => {
+                // norm_prop -> norm_config -> (rmsnorm_config | layernorm_config | "none")
+                if let Some(cfg) = inner.into_inner().next() {
+                    def.norm = parse_norm_config(cfg)?;
                 }
             }
             Rule::norm_position_prop => {
@@ -1170,6 +1272,73 @@ mod tests {
         assert_eq!(def.block.attention.num_kv_heads, Some(4));
         assert_eq!(def.block.ffn.hidden_dim, Some(4096));
         assert!(matches!(def.block.ffn.activation, Activation::GELU));
+        // Regression: `norm:` was silently dropped (no Rule::norm_prop arm),
+        // building every block as the default RMSNorm regardless of config.
+        assert!(matches!(def.block.norm.norm_type, NormType::LayerNorm));
+        assert_eq!(def.block.norm.eps, 1e-6);
+    }
+
+    #[test]
+    fn test_norm_none_and_rmsnorm() {
+        let base = |norm: &str| {
+            format!(
+                r#"
+                block b {{ attention: {{ num_heads: 4 }} ffn: {{ hidden_dim: 64 }} norm: {norm} }}
+                model m {{ vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }}
+                "#
+            )
+        };
+        let d = parse_mal(&base("rmsnorm { eps: 1e-5 }")).unwrap();
+        assert!(matches!(d.block.norm.norm_type, NormType::RmsNorm));
+        let d = parse_mal(&base("none")).unwrap();
+        assert!(matches!(d.block.norm.norm_type, NormType::None));
+    }
+
+    #[test]
+    fn test_embedding_and_output_configuration() {
+        let def = parse_mal(
+            r#"
+            block b { attention: { num_heads: 4 } ffn: { hidden_dim: 64 } }
+            model m {
+                vocab_size: 100
+                max_seq_len: 64
+                hidden_size: 32
+                num_layers: 2
+                block: b
+                embeddings { tie_weights: true dropout: 0.2 scale: 5.5 }
+                output { bias: true norm: none }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert!(def.embeddings.tie_weights);
+        assert_eq!(def.embeddings.dropout, 0.2);
+        assert_eq!(def.embeddings.scale, Some(5.5));
+        assert!(def.output.bias);
+        assert!(matches!(def.output.norm.unwrap().norm_type, NormType::None));
+    }
+
+    #[test]
+    fn test_undefined_refs_error() {
+        // Undefined block/attention/ffn/ssm references must fail loud, not
+        // silently fall back to defaults.
+        let cases = [
+            "model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: nope }",
+            "block b { attention: nope ffn: { hidden_dim: 64 } }\n\
+             model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }",
+            "block b { attention: { num_heads: 4 } ffn: nope }\n\
+             model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }",
+            "block b { ssm: nope ffn: { hidden_dim: 64 } }\n\
+             model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }",
+        ];
+        for mal in cases {
+            let err = parse_mal(mal).unwrap_err().to_string();
+            assert!(
+                err.contains("undefined"),
+                "expected undefined-ref error, got: {err}"
+            );
+        }
     }
 
     #[test]

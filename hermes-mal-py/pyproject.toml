@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hermes-mal"
+version = "1.8.54"
+description = "Python bindings for the Hermes MAL parser (single source of truth, backed by Rust)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "izihawa" }]
+keywords = ["llm", "mal", "parser", "transformer"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[tool.maturin]
+# Workspace lives at the repo root; point maturin at this crate's manifest.
+manifest-path = "Cargo.toml"
+# Produce the `hermes_mal` extension module.
+module-name = "hermes_mal"

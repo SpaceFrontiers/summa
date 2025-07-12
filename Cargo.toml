@@ -2,6 +2,9 @@
 members = [
     "hermes-core",
     "hermes-llm",
+    "hermes-mal",
+    "hermes-mal-py",
+    "hermes-train",
     "hermes-server",
     "hermes-tool",
     "hermes-wasm",
@@ -25,6 +28,8 @@ categories = ["database", "text-processing"]
 [workspace.dependencies]
 # Internal crates
 hermes-core = { version = "1.8.57", path = "hermes-core", default-features = false }
+hermes-mal = { version = "1.8.57", path = "hermes-mal" }
+hermes-llm = { version = "1.8.57", path = "hermes-llm", default-features = false }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
