@@ -1,7 +1,7 @@
 //! Full Burn inference model assembled from the MAL definition.
 
 use anyhow::{Result, bail};
-use burn::module::{Initializer, Param};
+use burn::module::{Initializer, ModuleVisitor, Param, ParamId};
 use burn::prelude::*;
 use burn::tensor::Int;
 use burn_nn::loss::CrossEntropyLossConfig;
@@ -239,6 +239,19 @@ impl<B: MambaBackend> Transformer<B> {
         self.num_params()
     }
 
+    /// Parameter IDs optimized by Muon during training.
+    ///
+    /// This matches the original trainer's split: every 2D parameter inside a
+    /// transformer block uses Muon, while embeddings, the output head, norms,
+    /// biases, and convolution kernels remain on AdamW.
+    pub fn muon_parameter_ids(&self) -> Vec<ParamId> {
+        let mut visitor = MatrixParameterVisitor::default();
+        for layer in &self.layers {
+            layer.visit(&mut visitor);
+        }
+        visitor.ids
+    }
+
     pub fn make_state(&self, batch: usize, device: &Device<B>) -> InferenceState<B> {
         let layers = self
             .layers
@@ -277,5 +290,18 @@ impl<B: MambaBackend> Transformer<B> {
         }
         state.pos += seq_len;
         self.project_logits(self.final_norm.forward(x))
+    }
+}
+
+#[derive(Default)]
+struct MatrixParameterVisitor {
+    ids: Vec<ParamId>,
+}
+
+impl<B: Backend> ModuleVisitor<B> for MatrixParameterVisitor {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        if D == 2 {
+            self.ids.push(param.id);
+        }
     }
 }

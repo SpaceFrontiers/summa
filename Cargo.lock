@@ -1183,8 +1183,7 @@ dependencies = [
 [[package]]
 name = "cubecl"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd203fef6e359472e4cb8f6c0ef3eca062815a1edd560eb6d6c1d5c1397838d9"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "cubecl-core",
  "cubecl-cuda",
@@ -1198,8 +1197,7 @@ dependencies = [
 [[package]]
 name = "cubecl-common"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc956c2dcc993f16f748d03bfdbd900f75cab4d469f4e5d8924f8ee128e861ad"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "backtrace",
  "bytemuck",
@@ -1239,8 +1237,7 @@ dependencies = [
 [[package]]
 name = "cubecl-core"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7522e7acf25d7848032c7b5270780f9f2abe84e13c7ed6345aa27ba70c312ca"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
@@ -1266,8 +1263,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cpp"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "411af04828cbf4583ecd388579fb30cd7a644eec19a334bb8f0d9d08522e1458"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1283,8 +1279,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b0a69ff45688d322ad8e92c8bf645167b9ca490fa8fa087fc6adac8c5e46be"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1301,8 +1296,7 @@ dependencies = [
 [[package]]
 name = "cubecl-ir"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d28a897a40c8ee6c57a8b8d76d8823ba2e97f4c2b83db9338f17a0752132d486"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "cubecl-common",
  "cubecl-macros-internal",
@@ -1323,8 +1317,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77aa6df563e8e6a0926d2e9eeacb968737940a0e1ae9be819f6a65a341006e12"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "cubecl-common",
  "darling 0.23.0",
@@ -1340,8 +1333,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros-internal"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a515651a5a91e25d87f71f311f80a088e6cf815798b9922560a97636da6b8740"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -1352,8 +1344,7 @@ dependencies = [
 [[package]]
 name = "cubecl-opt"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a599c6c3efefdcee8636994c90e58ef696c7efbed2d18b5b5ad8d5f29923abb"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -1370,8 +1361,7 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b68491bf5b3e997ae36bdc4e63b4ccd6d2f0e86b3b596a5d7a48d2b9e92622a0"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "ahash",
  "async-channel",
@@ -1400,8 +1390,7 @@ dependencies = [
 [[package]]
 name = "cubecl-std"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b391b584a4897683dd9fc0767f96337ac712b733126ce0f68a9ee8a2df073d2d"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -1417,8 +1406,7 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3663c6e1a86187172b2cee495b6b533e7d91a2cb37e26f421649e315fe4c3a"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "async-channel",
  "bytemuck",
@@ -1442,8 +1430,7 @@ dependencies = [
 [[package]]
 name = "cubecl-zspace"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04054d95698afab785a4dda9f949e297831dd9e4cc6d036a93e6603f88e88b07"
+source = "git+https://github.com/ppodolsky/cubecl.git?rev=42d1938b4e6a3fd5ef649fecd3ac841339df4f53#42d1938b4e6a3fd5ef649fecd3ac841339df4f53"
 dependencies = [
  "derive-new",
  "serde",
@@ -2728,6 +2715,7 @@ dependencies = [
  "burn-optim",
  "clap",
  "hermes-llm",
+ "rand 0.9.5",
  "serde_json",
  "tempfile",
  "tracing-subscriber",

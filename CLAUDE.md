@@ -164,7 +164,7 @@ Full SDL reference: `docs/schema.md`
 
 ## Development Requirements
 
-- Rust 1.92+ (nightly, see `rust-toolchain.toml`)
+- Rust 1.97+ (see `rust-toolchain.toml`)
 - Python 3.12+ (for Python bindings)
 - Node.js 20+ (for WASM and web)
 - wasm-pack (for WASM builds)

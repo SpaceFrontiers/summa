@@ -18,9 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-07-07
+          toolchain: 1.97.0
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -84,9 +84,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-07-07
+          toolchain: 1.97.0
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo

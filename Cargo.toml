@@ -14,7 +14,7 @@ resolver = "2"
 [workspace.package]
 version = "1.8.59"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/SpaceFrontiers/hermes"
 homepage = "https://github.com/SpaceFrontiers/hermes"
@@ -22,6 +22,23 @@ documentation = "https://docs.rs/hermes-core"
 authors = ["izihawa"]
 keywords = ["search", "full-text-search", "indexing", "ir"]
 categories = ["database", "text-processing"]
+
+# Burn 0.21 uses CubeCL 0.10. Pin the aligned CubeCL graph to the Metal
+# scalar-reduction and atomic-address-space fixes already present on CubeCL main.
+[patch.crates-io]
+cubecl = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-common = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-core = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-cpp = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-cuda = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-ir = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-macros = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-macros-internal = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-opt = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-runtime = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-std = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-wgpu = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
+cubecl-zspace = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d1938b4e6a3fd5ef649fecd3ac841339df4f53" }
 
 # Python bindings
 

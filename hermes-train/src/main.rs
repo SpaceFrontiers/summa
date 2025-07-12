@@ -3,16 +3,20 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use burn::module::AutodiffModule;
+use burn::module::{AutodiffModule, Module, ModuleVisitor, Param};
 use burn::tensor::backend::Backend as _;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
-use burn_optim::grad_clipping::GradientClippingConfig;
-use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
+use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams, MuonConfig, Optimizer};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_llm::{Backend, ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 
 type TrainBackend = Autodiff<Backend>;
+
+const MUON_LR_SCALE: f64 = 20.0;
 
 #[derive(Parser)]
 #[command(name = "hermes-train", about = "Burn-native Hermes model training")]
@@ -43,7 +47,10 @@ struct TrainArgs {
     /// Text or JSONL, optionally Zstandard-compressed. Repeat for more files.
     #[arg(short = 'd', long, required = true)]
     data: Vec<PathBuf>,
-    #[arg(short = 'o', long, default_value = "checkpoints")]
+    /// Number of token sequences held for deterministic streaming shuffle; 0 disables shuffling.
+    #[arg(long, default_value_t = 8192)]
+    shuffle_buffer: usize,
+    #[arg(short = 'o', long, default_value = "checkpoint")]
     output: PathBuf,
     #[arg(short = 'b', long, default_value_t = 8)]
     batch_size: usize,
@@ -95,6 +102,37 @@ fn open_data(path: &Path) -> Result<Box<dyn BufRead>> {
     }
 }
 
+struct ShuffleBuffer {
+    samples: Vec<Vec<i64>>,
+    rng: StdRng,
+    capacity: usize,
+}
+
+impl ShuffleBuffer {
+    fn new(capacity: usize, seed: u64) -> Self {
+        assert!(capacity > 0);
+        Self {
+            samples: Vec::with_capacity(capacity),
+            rng: StdRng::seed_from_u64(seed),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, sample: Vec<i64>) -> Option<Vec<i64>> {
+        if self.samples.len() < self.capacity {
+            self.samples.push(sample);
+            return None;
+        }
+        let index = self.rng.random_range(0..self.samples.len());
+        Some(std::mem::replace(&mut self.samples[index], sample))
+    }
+
+    fn finish(mut self) -> Vec<Vec<i64>> {
+        self.samples.shuffle(&mut self.rng);
+        self.samples
+    }
+}
+
 fn visit_document(
     document: &str,
     tokenizer: &Tokenizer,
@@ -114,7 +152,7 @@ fn visit_document(
 }
 
 /// Visit fixed-length next-token samples without retaining the corpus in RAM.
-fn visit_samples(
+fn visit_samples_in_order(
     paths: &[PathBuf],
     tokenizer: &Tokenizer,
     seq_len: usize,
@@ -167,8 +205,39 @@ fn visit_samples(
     Ok(count)
 }
 
+fn visit_samples(
+    paths: &[PathBuf],
+    tokenizer: &Tokenizer,
+    seq_len: usize,
+    shuffle_buffer: usize,
+    seed: u64,
+    mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
+) -> Result<usize> {
+    if shuffle_buffer == 0 {
+        return visit_samples_in_order(paths, tokenizer, seq_len, visit);
+    }
+
+    let mut shuffler = ShuffleBuffer::new(shuffle_buffer, seed);
+    let mut keep_going = true;
+    let count = visit_samples_in_order(paths, tokenizer, seq_len, |sample| {
+        if let Some(sample) = shuffler.push(sample) {
+            keep_going = visit(sample)?;
+        }
+        Ok(keep_going)
+    })?;
+
+    if keep_going {
+        for sample in shuffler.finish() {
+            if !visit(sample)? {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+
 fn count_samples(paths: &[PathBuf], tokenizer: &Tokenizer, seq_len: usize) -> Result<usize> {
-    visit_samples(paths, tokenizer, seq_len, |_| Ok(true))
+    visit_samples_in_order(paths, tokenizer, seq_len, |_| Ok(true))
 }
 
 fn make_batch(
@@ -186,6 +255,75 @@ fn make_batch(
         Tensor::from_data(TensorData::new(inputs, [samples.len(), seq_len]), device),
         Tensor::from_data(TensorData::new(targets, [samples.len(), seq_len]), device),
     )
+}
+
+struct SquaredGradientNorm<'a> {
+    grads: &'a GradientsParams,
+    sum: Option<Tensor<Backend, 1>>,
+}
+
+impl ModuleVisitor<TrainBackend> for SquaredGradientNorm<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TrainBackend, D>>) {
+        let Some(grad) = self.grads.get::<Backend, D>(param.id) else {
+            return;
+        };
+        let squared = grad.square().sum();
+        self.sum = Some(match self.sum.take() {
+            Some(sum) => sum + squared,
+            None => squared,
+        });
+    }
+}
+
+struct GradientScaler<'a> {
+    grads: &'a mut GradientsParams,
+    scale: f32,
+}
+
+impl ModuleVisitor<TrainBackend> for GradientScaler<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TrainBackend, D>>) {
+        let Some(grad) = self.grads.remove::<Backend, D>(param.id) else {
+            return;
+        };
+        self.grads
+            .register::<Backend, D>(param.id, grad.mul_scalar(self.scale));
+    }
+}
+
+fn gradient_norm_and_clip(
+    model: &Transformer<TrainBackend>,
+    muon_grads: &mut GradientsParams,
+    adamw_grads: &mut GradientsParams,
+    max_norm: f32,
+) -> Result<f32> {
+    let mut muon_norm = SquaredGradientNorm {
+        grads: muon_grads,
+        sum: None,
+    };
+    model.visit(&mut muon_norm);
+    let mut adamw_norm = SquaredGradientNorm {
+        grads: adamw_grads,
+        sum: None,
+    };
+    model.visit(&mut adamw_norm);
+    let sum = match (muon_norm.sum, adamw_norm.sum) {
+        (Some(muon), Some(adamw)) => muon + adamw,
+        (Some(sum), None) | (None, Some(sum)) => sum,
+        (None, None) => return Ok(0.0),
+    };
+    let norm = sum.sqrt().into_data().to_vec::<f32>()?[0];
+    if max_norm > 0.0 && norm > max_norm {
+        let scale = max_norm / norm;
+        model.visit(&mut GradientScaler {
+            grads: muon_grads,
+            scale,
+        });
+        model.visit(&mut GradientScaler {
+            grads: adamw_grads,
+            scale,
+        });
+    }
+    Ok(norm)
 }
 
 fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
@@ -209,7 +347,7 @@ fn save_checkpoint<B: hermes_llm::MambaBackend>(
     model: &Transformer<B>,
     output: &Path,
 ) -> Result<()> {
-    let temporary = output.with_extension("weights.safetensors.tmp");
+    let temporary = output.join("weights.safetensors.tmp");
     save_safetensors(model, &temporary)?;
     fs::rename(temporary, output.join("weights.safetensors"))?;
     Ok(())
@@ -259,13 +397,20 @@ fn train(args: TrainArgs) -> Result<()> {
     if let Some(path) = &args.checkpoint {
         load_safetensors(&mut initial_model, path)?;
     }
-    let mut optimizer = AdamWConfig::new()
+    let muon_parameter_ids = initial_model.muon_parameter_ids();
+    ensure!(
+        !muon_parameter_ids.is_empty(),
+        "model has no hidden matrix parameters for Muon"
+    );
+    let mut muon_optimizer = MuonConfig::new().init();
+    let mut adamw_optimizer = AdamWConfig::new()
+        .with_beta_1(0.9)
+        .with_beta_2(0.95)
+        .with_epsilon(1e-8)
         .with_weight_decay(args.weight_decay)
-        .with_grad_clipping(
-            (args.grad_clip > 0.0).then_some(GradientClippingConfig::Norm(args.grad_clip)),
-        )
         .init();
-    let mut accumulator = GradientsAccumulator::new();
+    let mut muon_accumulator = GradientsAccumulator::new();
+    let mut adamw_accumulator = GradientsAccumulator::new();
     // Optimizer::step consumes the module; Option lets the streaming callback
     // move it out and replace it without cloning model parameters.
     let mut model = Some(initial_model);
@@ -274,77 +419,100 @@ fn train(args: TrainArgs) -> Result<()> {
     let mut loss_sum = 0.0f32;
 
     println!(
-        "model={} params={} device={device:?} samples={} steps={total_steps}",
+        "model={} params={} muon_matrices={} device={device:?} samples={} steps={total_steps} shuffle_buffer={}",
         config.name,
         model.as_ref().unwrap().num_parameters(),
-        sample_count.map_or_else(|| "streaming".to_owned(), |count| count.to_string())
+        muon_parameter_ids.len(),
+        sample_count.map_or_else(|| "streaming".to_owned(), |count| count.to_string()),
+        args.shuffle_buffer,
     );
 
     'epochs: for epoch in 0..args.epochs {
         let mut batch = Vec::with_capacity(args.batch_size);
-        visit_samples(&args.data, &tokenizer, args.seq_len, |sample| {
-            batch.push(sample);
-            if batch.len() < args.batch_size {
-                return Ok(true);
-            }
-
-            let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
-            batch.clear();
-            let current = model.as_ref().unwrap();
-            let loss = current.forward_loss(inputs, targets);
-            let loss_value = loss.clone().into_data().to_vec::<f32>()?[0];
-            if !loss_value.is_finite() {
-                bail!(
-                    "non-finite loss before optimizer step {}: {loss_value}",
-                    step + 1
-                );
-            }
-            let grads = GradientsParams::from_grads(
-                loss.div_scalar(args.grad_accum as f64).backward(),
-                current,
-            );
-            accumulator.accumulate(current, grads);
-            micro_step += 1;
-            loss_sum += loss_value;
-
-            if micro_step == args.grad_accum {
-                let lr = learning_rate(&args, step + 1, total_steps);
-                let current = model.take().unwrap();
-                model = Some(optimizer.step(lr, current, accumulator.grads()));
-                step += 1;
-                let loss = loss_sum / args.grad_accum as f32;
-                println!(
-                    "epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e}",
-                    epoch + 1,
-                    loss
-                );
-                serde_json::to_writer(
-                    &mut metrics,
-                    &serde_json::json!({
-                        "step": step,
-                        "epoch": epoch + 1,
-                        "loss": loss,
-                        "lr": lr,
-                        "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
-                    }),
-                )?;
-                metrics.write_all(b"\n")?;
-                metrics.flush()?;
-                if args.checkpoint_every > 0 && step % args.checkpoint_every == 0 {
-                    save_checkpoint(&model.as_ref().unwrap().clone().valid(), &args.output)?;
-                    println!("checkpointed {}", args.output.display());
+        visit_samples(
+            &args.data,
+            &tokenizer,
+            args.seq_len,
+            args.shuffle_buffer,
+            args.seed.wrapping_add(epoch as u64),
+            |sample| {
+                batch.push(sample);
+                if batch.len() < args.batch_size {
+                    return Ok(true);
                 }
-                micro_step = 0;
-                loss_sum = 0.0;
-            }
-            Ok(step < total_steps)
-        })?;
+
+                let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
+                batch.clear();
+                let current = model.as_ref().unwrap();
+                let loss = current.forward_loss(inputs, targets);
+                let loss_value = loss.clone().into_data().to_vec::<f32>()?[0];
+                if !loss_value.is_finite() {
+                    bail!(
+                        "non-finite loss before optimizer step {}: {loss_value}",
+                        step + 1
+                    );
+                }
+                let mut grads = loss.div_scalar(args.grad_accum as f64).backward();
+                let muon_grads =
+                    GradientsParams::from_params(&mut grads, current, &muon_parameter_ids);
+                let adamw_grads = GradientsParams::from_module(&mut grads, current);
+                muon_accumulator.accumulate(current, muon_grads);
+                adamw_accumulator.accumulate(current, adamw_grads);
+                micro_step += 1;
+                loss_sum += loss_value;
+
+                if micro_step == args.grad_accum {
+                    let lr = learning_rate(&args, step + 1, total_steps);
+                    let muon_lr = lr * MUON_LR_SCALE;
+                    let mut muon_grads = muon_accumulator.grads();
+                    let mut adamw_grads = adamw_accumulator.grads();
+                    let grad_norm = gradient_norm_and_clip(
+                        current,
+                        &mut muon_grads,
+                        &mut adamw_grads,
+                        args.grad_clip,
+                    )?;
+                    let current = model.take().unwrap();
+                    let current = muon_optimizer.step(muon_lr, current, muon_grads);
+                    model = Some(adamw_optimizer.step(lr, current, adamw_grads));
+                    step += 1;
+                    let loss = loss_sum / args.grad_accum as f32;
+                    println!(
+                        "epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3}",
+                        epoch + 1,
+                        loss
+                    );
+                    serde_json::to_writer(
+                        &mut metrics,
+                        &serde_json::json!({
+                            "step": step,
+                            "epoch": epoch + 1,
+                            "loss": loss,
+                            "lr": lr,
+                            "muon_lr": muon_lr,
+                            "grad_norm": grad_norm,
+                            "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
+                        }),
+                    )?;
+                    metrics.write_all(b"\n")?;
+                    metrics.flush()?;
+                    if args.checkpoint_every > 0 && step % args.checkpoint_every == 0 {
+                        save_checkpoint(&model.as_ref().unwrap().clone().valid(), &args.output)?;
+                        println!("checkpointed {}", args.output.display());
+                    }
+                    micro_step = 0;
+                    loss_sum = 0.0;
+                }
+                Ok(step < total_steps)
+            },
+        )?;
         if step >= total_steps {
             break 'epochs;
         }
         // An optimizer step always consists of exactly grad_accum microbatches.
         if micro_step != 0 {
-            accumulator = GradientsAccumulator::new();
+            muon_accumulator = GradientsAccumulator::new();
+            adamw_accumulator = GradientsAccumulator::new();
             micro_step = 0;
             loss_sum = 0.0;
         }
@@ -398,7 +566,15 @@ mod tests {
         let device = hermes_llm::default_device();
         Backend::seed(&device, 41);
         let mut model = Transformer::<TrainBackend>::new(&config, &device).unwrap();
-        let mut optimizer = AdamWConfig::new().with_weight_decay(0.0).init();
+        let muon_parameter_ids = model.muon_parameter_ids();
+        assert!(!muon_parameter_ids.is_empty());
+        assert!(muon_parameter_ids.len() < burn::module::list_param_ids(&model).len());
+        let mut muon_optimizer = MuonConfig::new().init();
+        let mut adamw_optimizer = AdamWConfig::new()
+            .with_beta_2(0.95)
+            .with_epsilon(1e-8)
+            .with_weight_decay(0.0)
+            .init();
         let inputs = vec![1_i64, 7, 3, 9, 2, 5, 4, 6, 8, 3];
         let targets = vec![7_i64, 3, 9, 2, 5, 4, 6, 8, 3, 1];
         let batch = || {
@@ -415,12 +591,19 @@ mod tests {
         };
 
         let mut losses = Vec::new();
-        for _ in 0..12 {
+        for _ in 0..20 {
             let (input, target) = batch();
             let loss = model.forward_loss(input, target);
             losses.push(loss.clone().into_data().to_vec::<f32>().unwrap()[0]);
-            let grads = GradientsParams::from_grads(loss.backward(), &model);
-            model = optimizer.step(1e-2, model, grads);
+            let mut grads = loss.backward();
+            let mut muon_grads =
+                GradientsParams::from_params(&mut grads, &model, &muon_parameter_ids);
+            let mut adamw_grads = GradientsParams::from_module(&mut grads, &model);
+            let norm =
+                gradient_norm_and_clip(&model, &mut muon_grads, &mut adamw_grads, 1.0).unwrap();
+            assert!(norm.is_finite());
+            model = muon_optimizer.step(2e-2, model, muon_grads);
+            model = adamw_optimizer.step(1e-3, model, adamw_grads);
         }
         assert!(
             losses.last().unwrap() < &losses[0],
@@ -462,5 +645,28 @@ mod tests {
         let mut decoded = String::new();
         reader.read_to_string(&mut decoded).unwrap();
         assert_eq!(decoded.as_bytes(), source);
+    }
+
+    #[test]
+    fn streaming_shuffle_is_bounded_and_deterministic() {
+        let shuffle = |seed| {
+            let mut buffer = ShuffleBuffer::new(4, seed);
+            let mut output = Vec::new();
+            for value in 0..32_i64 {
+                if let Some(sample) = buffer.push(vec![value]) {
+                    output.push(sample[0]);
+                }
+                assert!(buffer.samples.len() <= 4);
+            }
+            output.extend(buffer.finish().into_iter().map(|sample| sample[0]));
+            output
+        };
+
+        let first = shuffle(7);
+        assert_eq!(first, shuffle(7));
+        assert_ne!(first, (0..32_i64).collect::<Vec<_>>());
+        let mut sorted = first;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..32_i64).collect::<Vec<_>>());
     }
 }

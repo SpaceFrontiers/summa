@@ -5,7 +5,7 @@
 # trixie (glibc 2.38), the binary stopped loading on the bookworm runtime
 # ("GLIBC_2.38 not found", prod CrashLoopBackOff 2026-07-15). The server
 # needs no nightly features; it builds on stable.
-FROM rust:1.96-slim-bookworm AS builder
+FROM rust:1.97.0-slim-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

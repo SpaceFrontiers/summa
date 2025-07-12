@@ -15,6 +15,7 @@ burn-autodiff = { version = "0.21", default-features = false, features = ["std"]
 burn-optim = { version = "0.21", default-features = false, features = ["std"] }
 clap.workspace = true
 hermes-llm.workspace = true
+rand.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true

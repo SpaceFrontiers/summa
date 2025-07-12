@@ -1,4 +1,4 @@
-FROM rust:1.96
+FROM rust:1.97.0
 
 # System deps
 RUN apt-get update && apt-get install -y \
@@ -19,9 +19,6 @@ ENV PATH="/home/rustuser/.cargo/bin:$PATH"
 
 USER rustuser
 WORKDIR /app
-
-# Setup rustup
-RUN rustup default stable
 
 # Install wasm-pack
 RUN cargo install wasm-pack

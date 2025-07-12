@@ -1,5 +1,5 @@
 # Build artifacts
-/target/
+target/
 /dist/
 
 # Data files (generated indexes, processed data)

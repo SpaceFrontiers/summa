@@ -25,7 +25,6 @@ pub use weights::{load_safetensors, save_safetensors};
 mod tests {
     use burn::module::Module;
     use burn::prelude::*;
-    use burn::tensor::backend::Backend as _;
     use burn::tensor::{Int, TensorData};
     use burn_ndarray::NdArray;
     use burn_nn::RotaryEncodingConfig;

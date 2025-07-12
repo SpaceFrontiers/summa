@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Hermes. This guide will help you 
 
 ### Prerequisites
 
-- **Rust nightly** (see `rust-toolchain.toml` for the exact version; 1.92+ required)
+- **Rust 1.97+** (see `rust-toolchain.toml` for the exact version)
 - **protoc** (Protocol Buffers compiler, for gRPC builds)
 - **Node.js 20+** (for WASM and web UI development)
 - **Python 3.12+** (for Python bindings)

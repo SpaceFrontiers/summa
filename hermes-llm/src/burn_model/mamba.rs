@@ -11,7 +11,7 @@ use burn_nn::{Linear, LinearConfig};
 
 use crate::mal::{ModelDef, SsmDef};
 
-use super::MambaBackend;
+use super::scan::{MambaBackend, selective_scan};
 
 /// Recurrent state for one Mamba layer.
 #[derive(Debug, Clone)]
@@ -164,7 +164,7 @@ impl<B: MambaBackend> MambaMixer<B> {
             Some(s) => s.h.clone(),
             None => Tensor::zeros([batch, self.d_inner, self.state_dim], &xs.device()),
         };
-        let (y, h) = B::selective_scan(delta, xs, b_mat, c_mat, a, self.d.val(), h, self.state_dim);
+        let (y, h) = selective_scan(delta, xs, b_mat, c_mat, a, self.d.val(), h, self.state_dim);
         if let Some(s) = state {
             s.h = h;
         }

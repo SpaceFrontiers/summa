@@ -17,8 +17,8 @@ burn = { package = "burn-core", version = "0.21", default-features = false, feat
 burn-autodiff = { version = "0.21", default-features = false, features = ["std"] }
 burn-nn = { version = "0.21", default-features = false, features = ["std"] }
 burn-ndarray = { version = "0.21", default-features = false, features = ["std"] }
-burn-wgpu = { version = "0.21", optional = true, default-features = false, features = ["std", "metal"] }
-burn-cuda = { version = "0.21", optional = true, default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.21", optional = true, default-features = false, features = ["std", "metal", "autotune"] }
+burn-cuda = { version = "0.21", optional = true, default-features = false, features = ["std", "autotune"] }
 burn-store = { version = "0.21", default-features = false, features = [
     "safetensors",
     "std",
