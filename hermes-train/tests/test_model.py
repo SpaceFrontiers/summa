@@ -273,6 +273,47 @@ def test_qk_norm(hybrid_config):
     assert out.isfinite().all()
 
 
+def test_tokenizer_special_name_resolution(tmp_path):
+    """EOS/PAD must resolve from family-specific special-token names, not
+    fall back to arbitrary ids (breaks doc masking + generation stop)."""
+    from hermes_train.tokenizer import Tokenizer
+    from tokenizers import Tokenizer as HfTok
+    from tokenizers import decoders, models, pre_tokenizers, trainers
+
+    # Build a small tokenizer whose specials use GPT-NeoX-style names
+    hf = HfTok(models.BPE())
+    hf.pre_tokenizer = pre_tokenizers.ByteLevel()
+    hf.decoder = decoders.ByteLevel()
+    tr = trainers.BpeTrainer(
+        vocab_size=300, special_tokens=["<|endoftext|>", "<|padding|>"]
+    )
+    hf.train_from_iterator(["lorem ipsum dolor sit amet " * 50], tr)
+    path = tmp_path / "neox.json"
+    hf.save(str(path))
+
+    tok = Tokenizer.from_file(path)
+    assert tok.eos_token_id == hf.token_to_id("<|endoftext|>")
+    assert tok.pad_token_id == hf.token_to_id("<|padding|>")
+
+
+def test_train_bpe_extracts_jsonl_text(tmp_path):
+    """train_bpe must tokenize the `text` field, not raw JSON syntax."""
+    import json as _json
+
+    from hermes_train.tokenizer import train_bpe
+
+    src = tmp_path / "corpus.jsonl"
+    with open(src, "w") as f:
+        for _ in range(50):
+            f.write(_json.dumps({"text": "the quick brown fox " * 20}) + "\n")
+    tok = train_bpe([str(src)], str(tmp_path / "tok.json"), vocab_size=280)
+    vocab = tok.inner.get_vocab()
+    # JSON structural tokens must not dominate the learned vocab
+    assert not any(t.strip("Ġ") in ('{"text":', '"text"') for t in vocab)
+    ids = tok.encode("the quick brown fox")
+    assert 0 < len(ids) < 10  # merged well, not char-level
+
+
 def test_wsd_schedule():
     from hermes_train.train import get_lr_wsd
 
