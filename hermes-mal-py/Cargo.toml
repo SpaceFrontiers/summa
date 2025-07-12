@@ -1,0 +1,21 @@
+[package]
+name = "hermes-mal-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Python (PyO3) bindings for the Hermes MAL parser — thin wrapper over hermes-mal"
+publish = false
+
+[lib]
+name = "hermes_mal"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Renamed to `mal` to avoid colliding with this crate's own `hermes_mal` lib
+# name (the Python extension module must itself be named `hermes_mal`).
+mal = { path = "../hermes-mal", package = "hermes-mal" }
+serde_json = { workspace = true }
+pyo3.workspace = true

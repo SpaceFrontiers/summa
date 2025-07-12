@@ -2,15 +2,15 @@
 //!
 //! Inference and model-definition library for Hermes LLMs.
 //!
-//! Training lives in the `hermes-train` Python package (PyTorch); this crate
-//! covers everything needed to define and serve models:
+//! Burn Autodiff training lives in the `hermes-train` crate; this crate owns the
+//! shared model and everything needed for inference:
 //!
 //! - **Model Architecture Language (MAL)**: Define any transformer architecture using a composable DSL
 //! - **Generation**: Text generation with temperature, top-k sampling
-//! - **Tokenization**: HuggingFace tokenizer loading (local file or HF hub)
-//! - **Export**: MAL → JSON model config consumed by `hermes-train`
+//! - **Tokenization**: HuggingFace `tokenizer.json` loading
+//! - **Export**: MAL → JSON model config
 //!
-//! Checkpoints are plain safetensors with a stable tensor-naming contract
+//! Checkpoints are Burn-native safetensors with a single tensor-naming contract
 //! (`embedding.*`, `layers.{i}.attention.*`, `layers.{i}.feed_forward.*`,
 //! `final_norm.*`, `lm_head.*`) shared with `hermes-train`.
 //!
@@ -56,13 +56,19 @@
 //! }
 //! ```
 
+pub mod burn_model;
 pub mod generate;
-pub mod mal;
-pub mod model;
+/// Model Architecture Language (MAL) — re-exported from the standalone
+/// `hermes-mal` crate, which is the single source of truth.
+pub use hermes_mal as mal;
+pub mod remote;
 pub mod tokenizer;
 
 // Core types
-pub use model::Transformer;
+pub use burn_model::{
+    Backend, Device, InferenceState, MambaBackend, Transformer, default_device, load_safetensors,
+    save_safetensors,
+};
 
 // Generation
 pub use generate::TextGenerator;

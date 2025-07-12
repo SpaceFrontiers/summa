@@ -6,30 +6,34 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "LLM inference and model definition (MAL) using Candle; training lives in hermes-train"
+description = "Burn-based LLM inference and model definition; training lives in hermes-train"
 keywords = ["llm", "transformer", "deep-learning", "gpt", "inference"]
 categories = ["science"]
 
 [dependencies]
-# Candle ML framework
-candle-core = "0.11"
-candle-nn = "0.11"
-candle-transformers = "0.11"
-candle-flash-attn = { version = "0.11", optional = true }
+# Burn is the sole inference runtime. CPU uses ndarray; GPU backends and the
+# custom selective-scan op use Burn's CubeCL tensor/runtime directly.
+burn = { package = "burn-core", version = "0.21", default-features = false, features = ["std"] }
+burn-autodiff = { version = "0.21", default-features = false, features = ["std"] }
+burn-nn = { version = "0.21", default-features = false, features = ["std"] }
+burn-ndarray = { version = "0.21", default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.21", optional = true, default-features = false, features = ["std", "metal"] }
+burn-cuda = { version = "0.21", optional = true, default-features = false, features = ["std"] }
+burn-store = { version = "0.21", default-features = false, features = [
+    "safetensors",
+    "std",
+] }
+burn-cubecl = { version = "0.21", optional = true, default-features = false, features = ["std"] }
+cubecl = { version = "=0.10.0", optional = true, default-features = false, features = ["std"] }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
 tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
 
 # Serialization
-serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Parser for Model Architecture Language (MAL)
-pest = "2.8"
-pest_derive = "2.8"
-
-# Embed well-known model files
-rust-embed = { version = "8", features = ["include-exclude"] }
+# Model Architecture Language (MAL) parser — single source of truth
+hermes-mal = { workspace = true }
 
 # CLI and logging
 clap = { workspace = true }
@@ -42,24 +46,26 @@ anyhow = { workspace = true }
 # Utilities
 rand = { workspace = true }
 
-# HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
-hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
-
-[dev-dependencies]
-tempfile = { workspace = true }
+# Remote artifact loading (s3://, gs://, http(s)://). The pinned upstream
+# 0.14.1 revision includes the quick-xml security update not in crates.io 0.14.0.
+# `version` is the crates.io fallback Cargo uses when packaging this crate.
+object_store = { version = "0.14", git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c7316d29face118e7409eead0cda098f38589428", default-features = false, features = ["aws", "gcp", "http"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+url = { version = "2", optional = true }
+dirs = { version = "6", optional = true }
 
 [features]
-default = ["cpu"]
-cpu = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-flash-attn = ["cuda", "candle-flash-attn"]
+default = ["remote"]
+# Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
+remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
+metal = ["dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl"]
 
 [[bin]]
 name = "hermes-llm"
 path = "src/main.rs"
 
 [package.metadata.cargo-machete]
-# candle-transformers is referenced by the cuda/metal/accelerate feature definitions
-ignored = ["candle-transformers"]
+# `#[cube]` macro expansion requires the direct crate even though static source
+# analysis only sees it behind the GPU feature gates.
+ignored = ["cubecl"]

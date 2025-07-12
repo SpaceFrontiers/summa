@@ -1,16 +1,13 @@
-use anyhow::Result;
-use candle_core::Device;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing::{Level, info, warn};
+use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 use hermes_llm::tokenizer::Tokenizer;
 
 #[derive(Parser)]
 #[command(name = "hermes-llm")]
-#[command(
-    about = "Hermes LLM inference and model definition tool (training lives in hermes-train)"
-)]
+#[command(about = "Hermes LLM inference and model definition tool")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -48,9 +45,13 @@ enum Commands {
         #[arg(long)]
         top_k: Option<usize>,
 
-        /// Use GPU (Metal on macOS, CUDA on Linux/Windows); pass `--gpu false` for CPU
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        gpu: bool,
+        /// RNG seed for reproducible sampling (random if unset)
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Keep generating for the full --max-tokens instead of stopping at EOS
+        #[arg(long, default_value_t = false)]
+        no_eos: bool,
     },
 
     /// Show model info
@@ -60,7 +61,7 @@ enum Commands {
         model: String,
     },
 
-    /// Export a MAL model definition as JSON (consumed by hermes-train)
+    /// Export a MAL model definition as JSON
     Export {
         /// Model configuration: preset name (nano, tiny, gpt2-small, llama-7b) or path to .mal file
         #[arg(short, long)]
@@ -72,42 +73,17 @@ enum Commands {
     },
 }
 
-#[allow(unused_variables)]
-fn get_device(use_gpu: bool, gpu_id: usize) -> Result<Device> {
-    if use_gpu {
-        #[cfg(feature = "metal")]
-        {
-            return Ok(Device::new_metal(gpu_id)?);
-        }
-        #[cfg(feature = "cuda")]
-        {
-            return Ok(Device::new_cuda(gpu_id)?);
-        }
-        #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        {
-            tracing::warn!(
-                "No GPU feature enabled, using CPU. Build with --features metal or --features cuda"
-            );
-            return Ok(Device::Cpu);
-        }
-    }
-    Ok(Device::Cpu)
-}
-
 fn get_model_def(name: &str) -> Result<hermes_llm::ModelDef> {
     // First try builtin models
     if let Some(model_def) = hermes_llm::get_builtin_model(name) {
         return Ok(model_def);
     }
 
-    // Try to load from .mal file if it exists
+    // Try to load from .mal file if it exists — surface the real parse error
+    // rather than a misleading "unknown model".
     if std::path::Path::new(name).exists() {
-        match hermes_llm::parse_mal_file(name) {
-            Ok(model_def) => return Ok(model_def),
-            Err(e) => {
-                warn!("Failed to parse MAL file '{}': {}", name, e);
-            }
-        }
+        return hermes_llm::parse_mal_file(name)
+            .with_context(|| format!("failed to parse MAL file '{name}'"));
     }
 
     anyhow::bail!(
@@ -134,27 +110,44 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             top_k,
-            gpu,
+            seed,
+            no_eos,
         } => {
-            let device = get_device(gpu, 0)?;
+            let device = hermes_llm::default_device();
             info!("Using device: {:?}", device);
+
+            // Each artifact may be a local path or a remote URI (s3://, gs://,
+            // http(s)://); resolve downloads + caches remote ones.
+            let checkpoint_path = hermes_llm::remote::resolve(&checkpoint)?;
+            let config_path = hermes_llm::remote::resolve(&config_path)?;
+            let tokenizer_path = hermes_llm::remote::resolve(&tokenizer_path)?;
 
             let config = hermes_llm::ModelDef::from_json(&config_path)?;
             let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+            anyhow::ensure!(
+                config.vocab_size == tokenizer.vocab_size(),
+                "model vocab_size {} does not match tokenizer vocab_size {}",
+                config.vocab_size,
+                tokenizer.vocab_size()
+            );
 
-            let mut var_map = candle_nn::VarMap::new();
-            let vb = candle_nn::VarBuilder::from_varmap(&var_map, candle_core::DType::F32, &device);
-            let model = hermes_llm::Transformer::new(&config, vb)?;
-            var_map.load(&checkpoint)?;
+            let mut model = hermes_llm::Transformer::<hermes_llm::Backend>::new(&config, &device)?;
+            hermes_llm::load_safetensors(&mut model, &checkpoint_path)?;
 
-            info!("Loaded model from {}", checkpoint);
+            info!("Loaded model from {}", checkpoint_path.display());
 
             let prompt_tokens = tokenizer.encode(&prompt, false)?;
             info!("Prompt tokens: {:?}", prompt_tokens);
 
             let generator = hermes_llm::TextGenerator::new(&model, &device);
-            let output_tokens =
-                generator.generate(&prompt_tokens, max_tokens, temperature, top_k)?;
+            let sampling = hermes_llm::generate::SamplingConfig {
+                max_new_tokens: max_tokens,
+                temperature,
+                top_k,
+                eos_token: (!no_eos).then(|| tokenizer.eos_token_id()),
+                seed,
+            };
+            let output_tokens = generator.generate(&prompt_tokens, &sampling)?;
 
             let output_text = tokenizer.decode(&output_tokens, true)?;
             println!("\n{}", output_text);
