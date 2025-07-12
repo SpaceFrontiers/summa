@@ -32,8 +32,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Fused Mamba-2 selective-scan kernels (CUDA only)
-mamba = ["mamba-ssm>=2.2"]
+# Fused Mamba-2 selective-scan kernels (CUDA only).
+# mamba-ssm pulls in transformers transitively; pin it forward so the lock
+# can't drift back to the vulnerable 4.17.0 (GHSA-3863-2447-669p et al.).
+mamba = ["mamba-ssm>=2.2", "transformers>=5.5.0"]
 # Live training-curve dashboard (enabled at runtime via WANDB_API_KEY)
 wandb = ["wandb>=0.18"]
 

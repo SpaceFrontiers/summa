@@ -24,8 +24,19 @@
     "eslint-plugin-vue": "^10.7.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
-    "vite": "^7.3.1",
+    "vite": "^7.3.6",
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.5.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "rollup": "^4.62.2",
+      "postcss": "^8.5.19",
+      "picomatch": "^4.0.5",
+      "flatted": "^3.4.2",
+      "uuid": "^11.1.1",
+      "js-yaml@4": "^4.3.0",
+      "minimatch@3": "^3.1.5"
+    }
   }
 }
