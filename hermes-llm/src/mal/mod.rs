@@ -583,6 +583,30 @@ fn parse_model_prop(
                     def.pattern = Some(blocks);
                 }
             }
+            Rule::embeddings_prop => {
+                for param in inner.into_inner() {
+                    for child in param.into_inner() {
+                        match child.as_rule() {
+                            Rule::tie_weights_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.embeddings.tie_weights = val.as_str() == "true";
+                                }
+                            }
+                            Rule::dropout_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.embeddings.dropout = val.as_str().parse()?;
+                                }
+                            }
+                            Rule::scale_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.embeddings.scale = Some(val.as_str().parse()?);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             Rule::description_prop => {
                 if let Some(val) = inner.into_inner().next() {
                     let s = val.as_str();
@@ -685,6 +709,57 @@ fn parse_attention_def(pair: pest::iterators::Pair<Rule>) -> Result<AttentionDef
     Ok(def)
 }
 
+/// Parse a position-encoding config (rope { theta, scaling } | alibi | learned | none)
+fn parse_position_encoding(pair: pest::iterators::Pair<Rule>) -> Result<PositionEncoding> {
+    // position_encoding_config contains one of the variant configs; the bare
+    // "none" literal produces no inner pair.
+    let Some(config) = pair.into_inner().next() else {
+        return Ok(PositionEncoding::None);
+    };
+    match config.as_rule() {
+        Rule::rope_config => {
+            let mut theta = 10000.0;
+            let mut scaling = None;
+            for param in config.into_inner() {
+                for inner in param.into_inner() {
+                    match inner.as_rule() {
+                        Rule::rope_theta_prop | Rule::rope_base_prop => {
+                            if let Some(val) = inner.into_inner().next() {
+                                theta = val.as_str().parse()?;
+                            }
+                        }
+                        Rule::rope_scaling_prop => {
+                            if let Some(val) = inner.into_inner().next() {
+                                scaling = Some(val.as_str().parse()?);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(PositionEncoding::Rope { theta, scaling })
+        }
+        Rule::alibi_config => {
+            let learned_slopes = config.as_str().contains("learned");
+            Ok(PositionEncoding::Alibi { learned_slopes })
+        }
+        Rule::learned_config => {
+            let mut max_positions = 0;
+            for param in config.into_inner() {
+                for inner in param.into_inner() {
+                    if inner.as_rule() == Rule::max_positions_prop
+                        && let Some(val) = inner.into_inner().next()
+                    {
+                        max_positions = val.as_str().parse()?;
+                    }
+                }
+            }
+            Ok(PositionEncoding::Learned { max_positions })
+        }
+        _ => Ok(PositionEncoding::None),
+    }
+}
+
 /// Parse attention properties
 fn parse_attention_prop(pair: pest::iterators::Pair<Rule>, def: &mut AttentionDef) -> Result<()> {
     for inner in pair.into_inner() {
@@ -722,6 +797,11 @@ fn parse_attention_prop(pair: pest::iterators::Pair<Rule>, def: &mut AttentionDe
             Rule::window_size_prop => {
                 if let Some(val) = inner.into_inner().next() {
                     def.window_size = Some(val.as_str().parse()?);
+                }
+            }
+            Rule::position_encoding_prop => {
+                if let Some(config) = inner.into_inner().next() {
+                    def.position_encoding = parse_position_encoding(config)?;
                 }
             }
             _ => {}
@@ -1132,6 +1212,71 @@ mod tests {
 
         let def = parse_mal(mal).unwrap();
         assert_eq!(def.vocab_size, 1000);
+    }
+
+    #[test]
+    fn test_parse_position_encoding_and_tie_weights() {
+        let mal = r#"
+            attention pe_attn {
+                num_heads: 8
+                position_encoding: rope { theta: 100000.0 }
+            }
+
+            ffn pe_ffn {
+                hidden_dim: 1024
+            }
+
+            block pe_block {
+                attention: pe_attn
+                ffn: pe_ffn
+            }
+
+            model pe_test {
+                vocab_size: 1000
+                hidden_size: 256
+                num_layers: 2
+                block: pe_block
+                embeddings {
+                    tie_weights: true
+                }
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.rope_theta(), 100000.0, "theta must not be dropped");
+        assert!(
+            def.embeddings.tie_weights,
+            "tie_weights must not be dropped"
+        );
+
+        // Alternate spellings and variants
+        let mal2 = r#"
+            attention a { rope_theta: 500000.0 }
+        "#;
+        // rope_theta at attention level requires position_encoding wrapper;
+        // bare form is not part of the grammar — this should fail to parse
+        assert!(
+            parse_mal_full(mal2).is_err() || {
+                let f = parse_mal_full(mal2).unwrap();
+                f.attentions.is_empty()
+            }
+        );
+
+        let mal3 = r#"
+            attention nopos { position_encoding: none }
+            ffn f { hidden_dim: 64 }
+            block b { attention: nopos
+                      ffn: f }
+            model m { vocab_size: 100
+                      hidden_size: 64
+                      num_layers: 1
+                      block: b }
+        "#;
+        let def3 = parse_mal(mal3).unwrap();
+        assert!(matches!(
+            def3.block.attention.position_encoding,
+            PositionEncoding::None
+        ));
     }
 
     #[test]
