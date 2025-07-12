@@ -118,6 +118,39 @@ impl Drop for MergeGuard {
     }
 }
 
+/// Deletes an uncommitted merge/reorder output if its task unwinds.
+///
+/// Normal `Result::Err` paths delete outputs synchronously so callers observe
+/// a clean directory before returning. This guard covers the path those
+/// branches cannot: a panic after output files have been created. The cleanup
+/// callback re-checks metadata before deleting, so a panic after a successful
+/// metadata commit cannot remove a live segment.
+struct OutputCleanupGuard {
+    segment_id: SegmentId,
+    cleanup: Option<Arc<dyn Fn(SegmentId) + Send + Sync>>,
+}
+
+impl OutputCleanupGuard {
+    fn new(segment_id: SegmentId, cleanup: Arc<dyn Fn(SegmentId) + Send + Sync>) -> Self {
+        Self {
+            segment_id,
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl Drop for OutputCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup(self.segment_id);
+        }
+    }
+}
+
 /// All mutable state behind the single async Mutex.
 struct ManagerState {
     metadata: IndexMetadata,
@@ -255,6 +288,50 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .expect("failed to build background CPU pool"),
             )
         }))
+    }
+
+    /// Arm unwind cleanup for an output that is not visible in metadata yet.
+    fn output_cleanup_guard(self: &Arc<Self>, output_id: SegmentId) -> OutputCleanupGuard {
+        let manager = Arc::clone(self);
+        let cleanup: Arc<dyn Fn(SegmentId) + Send + Sync> = Arc::new(move |segment_id| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                log::warn!(
+                    "[segment_cleanup] runtime unavailable; partial output {} will be swept on startup",
+                    segment_id.to_hex(),
+                );
+                return;
+            };
+
+            let manager = Arc::clone(&manager);
+            handle.spawn(async move {
+                manager
+                    .delete_output_if_unregistered(segment_id, "task unwind")
+                    .await;
+            });
+        });
+
+        OutputCleanupGuard::new(output_id, cleanup)
+    }
+
+    /// Delete a failed output only if metadata did not make it live.
+    ///
+    /// `replace_segments` can fail while saving metadata. Rechecking under
+    /// `state` prevents cleanup from deleting an output that the in-memory
+    /// metadata already committed despite the reported I/O error.
+    async fn delete_output_if_unregistered(&self, output_id: SegmentId, reason: &str) {
+        let output_hex = output_id.to_hex();
+        let st = self.state.lock().await;
+        if st.metadata.has_segment(&output_hex) {
+            return;
+        }
+
+        log::warn!(
+            "[segment_cleanup] deleting uncommitted output {} after {}",
+            output_hex,
+            reason,
+        );
+        let _ = crate::segment::delete_segment(self.directory.as_ref(), output_id).await;
+        drop(st);
     }
 
     // ========================================================================
@@ -460,6 +537,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         Some(tokio::spawn(async move {
             let _guard = guard;
+            let mut output_cleanup = sm.output_cleanup_guard(output_id);
 
             let trained_snap = sm.trained();
             let granularity = sm.merge_granularity(&ids).await;
@@ -480,7 +558,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             match result {
                 Ok((new_id, doc_count, bp_converged)) => {
-                    if let Err(e) = sm
+                    match sm
                         .replace_segments(
                             &ids,
                             new_id,
@@ -490,7 +568,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         )
                         .await
                     {
-                        log::error!("[merge] Failed to replace segments after merge: {:?}", e);
+                        Ok(()) => output_cleanup.disarm(),
+                        Err(e) => {
+                            sm.delete_output_if_unregistered(output_id, "replacement failure")
+                                .await;
+                            output_cleanup.disarm();
+                            log::error!("[merge] Failed to replace segments after merge: {:?}", e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -502,6 +586,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     // Delete whatever the failed merge wrote — partial
                     // outputs are invisible to metadata and leak disk.
                     let _ = crate::segment::delete_segment(sm.directory.as_ref(), output_id).await;
+                    output_cleanup.disarm();
                 }
             }
             // _guard drops here → segment IDs unregistered from inventory
@@ -523,9 +608,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         reordered: bool,
         bp_converged: bool,
     ) -> Result<()> {
-        self.tracker.register(&new_id);
-
-        {
+        let ready_to_delete = {
             let mut st = self.state.lock().await;
             // Every source must still be live: callers hold the inventory
             // guard, so a missing source means a stale merge/reorder whose
@@ -543,6 +626,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     missing, new_id
                 )));
             }
+
+            // Register while holding `state`: snapshot acquisition follows
+            // the same state -> tracker lock order, so no reader can observe
+            // the new metadata ID before the tracker knows about it.
+            self.tracker.register(&new_id);
+
             // Compute generation from parents before removing them
             let parent_gen = old_ids
                 .iter()
@@ -565,9 +654,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             );
             // Mutation + persist must be atomic — keep under lock
             st.metadata.save(self.directory.as_ref()).await?;
-        }
 
-        let ready_to_delete = self.tracker.mark_for_deletion(old_ids);
+            // Keep `state` locked until retired sources enter the tracker.
+            // Otherwise orphan cleanup can observe them in the gap where they
+            // are absent from metadata but not yet marked as snapshot-deferred.
+            self.tracker.mark_for_deletion(old_ids)
+        };
+
         for segment_id in ready_to_delete {
             let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
         }
@@ -799,10 +892,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let output_id = SegmentId::new();
             let output_hex = output_id.to_hex();
 
-            // Register batch + output in inventory so maybe_merge skips them.
+            // Register batch + output under `state`, matching orphan cleanup's
+            // deletion barrier and preventing a stale batch from starting.
             let mut all_ids = batch.clone();
             all_ids.push(output_hex);
-            let _guard = match self.merge_inventory.try_register(all_ids) {
+            let guard = {
+                let st = self.state.lock().await;
+                batch
+                    .iter()
+                    .all(|id| st.metadata.has_segment(id))
+                    .then(|| self.merge_inventory.try_register(all_ids))
+                    .flatten()
+            };
+            let _guard = match guard {
                 Some(g) => g,
                 None => {
                     // A background merge slipped in — wait for it, then retry the loop
@@ -810,6 +912,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     continue;
                 }
             };
+            let mut output_cleanup = self.output_cleanup_guard(output_id);
 
             let trained_snap = self.trained();
             let granularity = self.merge_granularity(&batch).await;
@@ -833,18 +936,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     // Delete the failed merge's partial output (leaks disk).
                     let _ =
                         crate::segment::delete_segment(self.directory.as_ref(), output_id).await;
+                    output_cleanup.disarm();
                     return Err(e);
                 }
             };
 
-            self.replace_segments(
-                &batch,
-                new_segment_id,
-                total_docs,
-                self.reorder_on_merge,
-                bp_converged,
-            )
-            .await?;
+            if let Err(e) = self
+                .replace_segments(
+                    &batch,
+                    new_segment_id,
+                    total_docs,
+                    self.reorder_on_merge,
+                    bp_converged,
+                )
+                .await
+            {
+                self.delete_output_if_unregistered(output_id, "replacement failure")
+                    .await;
+                output_cleanup.disarm();
+                return Err(e);
+            }
+            output_cleanup.disarm();
 
             // _guard drops here → segments unregistered from inventory
         }
@@ -969,21 +1081,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let source_ids = [seg_id.to_string()];
         let granularity = self.merge_granularity(&source_ids).await;
 
+        // Register while holding `state`, matching orphan cleanup's deletion
+        // barrier. Candidates are scanned ahead of time and can go stale: a
+        // merge may have consumed this segment since. Its files may even still
+        // be on disk (deferred deletion under a searcher snapshot) — reordering
+        // them would re-insert a duplicate copy of docs the merge output holds.
         let all_ids = vec![seg_id.to_string(), output_hex];
-        let _guard = match self.merge_inventory.try_register(all_ids) {
-            Some(g) => g,
-            None => {
-                log::debug!("[optimizer] segment {} in active merge, skipping", seg_id);
-                return Ok(false);
-            }
-        };
-
-        // The inventory guard only excludes CONCURRENT merges. Candidates are
-        // scanned ahead of time and can go stale: a merge may have consumed
-        // this segment since. Its files may even still be on disk (deferred
-        // deletion under a searcher snapshot) — reordering them would
-        // re-insert a duplicate copy of docs the merge output already holds.
-        {
+        let _guard = {
             let st = self.state.lock().await;
             if !st.metadata.has_segment(seg_id) {
                 log::info!(
@@ -992,7 +1096,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 );
                 return Ok(false);
             }
-        }
+
+            match self.merge_inventory.try_register(all_ids) {
+                Some(guard) => guard,
+                None => {
+                    log::debug!("[optimizer] segment {} in active merge, skipping", seg_id);
+                    return Ok(false);
+                }
+            }
+        };
+
+        let mut output_cleanup = self.output_cleanup_guard(output_id);
 
         let reorder_result = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),
@@ -1014,6 +1128,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 // overnight in production) — delete the output before
                 // propagating.
                 let _ = crate::segment::delete_segment(self.directory.as_ref(), output_id).await;
+                output_cleanup.disarm();
                 return Err(e);
             }
         };
@@ -1024,38 +1139,32 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // full-depth (warm-started) pass. Depth caps are only used by the
         // optimizer's first pass on large segments.
         let ladder_converged = bp_converged && bp_budget.min_partition_docs.is_none();
-        self.replace_segments(
-            &[seg_id.to_string()],
-            new_id,
-            total_docs,
-            true,
-            ladder_converged,
-        )
-        .await?;
+        if let Err(e) = self
+            .replace_segments(
+                &[seg_id.to_string()],
+                new_id,
+                total_docs,
+                true,
+                ladder_converged,
+            )
+            .await
+        {
+            self.delete_output_if_unregistered(output_id, "replacement failure")
+                .await;
+            output_cleanup.disarm();
+            return Err(e);
+        }
+        output_cleanup.disarm();
 
         Ok(true)
     }
 
     /// Clean up orphan segment files not registered in metadata.
     ///
-    /// Non-blocking: reads both metadata and `merge_inventory` to determine which
-    /// segments are legitimate. In-flight merge outputs are protected by the inventory.
+    /// Non-blocking: reads metadata, `merge_inventory`, and snapshot-deferred
+    /// deletions to determine which segments are legitimate. In-flight outputs
+    /// and retired sources still held by readers are both protected.
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
-        // Read BOTH sets under the same state lock to prevent TOCTOU:
-        // without this, a merge completing between the two reads could make
-        // its output segment invisible to both sets → wrongly deleted.
-        let (registered_set, in_merge_set) = {
-            let st = self.state.lock().await;
-            let registered = st
-                .metadata
-                .segment_metas
-                .keys()
-                .cloned()
-                .collect::<HashSet<String>>();
-            let in_merge = self.merge_inventory.snapshot();
-            (registered, in_merge)
-        };
-
         let mut orphan_ids: HashSet<String> = HashSet::new();
 
         if let Ok(entries) = self.directory.list_files(std::path::Path::new("")).await {
@@ -1063,20 +1172,36 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 let filename = entry.to_string_lossy();
                 if filename.starts_with("seg_") && filename.len() > 37 {
                     let hex_part = &filename[4..36];
-                    if !registered_set.contains(hex_part) && !in_merge_set.contains(hex_part) {
-                        orphan_ids.insert(hex_part.to_string());
-                    }
+                    orphan_ids.insert(hex_part.to_string());
                 }
             }
         }
 
         let mut deleted = 0;
         for hex_id in &orphan_ids {
-            if let Some(segment_id) = SegmentId::from_hex(hex_id)
-                && crate::segment::delete_segment(self.directory.as_ref(), segment_id)
+            // Revalidate immediately before deletion and keep `state` locked
+            // through the delete. All merge/reorder output registration also
+            // follows state -> inventory, so no new output can appear between
+            // this check and deletion.
+            let st = self.state.lock().await;
+            if st.metadata.has_segment(hex_id)
+                || self.merge_inventory.contains(hex_id)
+                || self.tracker.is_pending_deletion(hex_id)
+            {
+                continue;
+            }
+
+            let removed = if let Some(segment_id) = SegmentId::from_hex(hex_id) {
+                crate::segment::delete_segment(self.directory.as_ref(), segment_id)
                     .await
                     .is_ok()
-            {
+            } else {
+                false
+            };
+            // Make the deletion barrier explicit: output registration cannot
+            // proceed until the filesystem operation above has completed.
+            drop(st);
+            if removed {
                 deleted += 1;
             }
         }
@@ -1088,6 +1213,43 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn output_cleanup_guard_runs_during_panic_unwind() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_in_callback = Arc::clone(&cleaned);
+        let cleanup: Arc<dyn Fn(SegmentId) + Send + Sync> = Arc::new(move |_| {
+            cleaned_in_callback.store(true, Ordering::SeqCst);
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = OutputCleanupGuard::new(SegmentId::new(), cleanup);
+            panic!("simulated reorder panic");
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "partial output cleanup must run during unwind"
+        );
+    }
+
+    #[test]
+    fn output_cleanup_guard_disarms_after_commit() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_in_callback = Arc::clone(&cleaned);
+        let cleanup: Arc<dyn Fn(SegmentId) + Send + Sync> = Arc::new(move |_| {
+            cleaned_in_callback.store(true, Ordering::SeqCst);
+        });
+
+        {
+            let mut guard = OutputCleanupGuard::new(SegmentId::new(), cleanup);
+            guard.disarm();
+        }
+
+        assert!(!cleaned.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn test_inventory_guard_drop_unregisters() {

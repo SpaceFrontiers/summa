@@ -2733,6 +2733,24 @@ async fn test_reorder_skips_segment_consumed_by_merge() {
 
     writer.force_merge().await.unwrap();
 
+    // The replaced sources are absent from metadata but still protected by
+    // `_searcher`. Orphan cleanup must not bypass that deferred-deletion
+    // lifetime (production used to sweep these and log them as failed output).
+    let swept = index
+        .segment_manager()
+        .cleanup_orphan_segments()
+        .await
+        .unwrap();
+    assert_eq!(swept, 0, "snapshot-deferred sources are not orphans");
+    use crate::directories::Directory;
+    let files = dir.list_files(std::path::Path::new("")).await.unwrap();
+    assert!(
+        files
+            .iter()
+            .any(|path| path.to_string_lossy().contains(&victim)),
+        "snapshot must keep the retired source files alive"
+    );
+
     // Stale candidate: reorder the segment the merge just consumed.
     let reordered = index
         .segment_manager()

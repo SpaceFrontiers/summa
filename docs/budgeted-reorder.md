@@ -40,12 +40,14 @@ cold-IO writer, so at least they no longer evict the cache.
 - Larger: budgeted pass — depth capped at
   `--optimizer-partial-min-partition-docs` (default 4096) and wall-clock
   capped at `--optimizer-time-budget-secs` (default 600).
-- Unconverged segments (deadline fired) are revisited only when no
-  never-reordered work exists, at most one per
-  `--optimizer-unconverged-cooldown-secs` (default 1800) — each follow-up is
-  a full segment rewrite, so deepening is deliberately paced.
-- Merge-time reorder stays unbudgeted: the merge already pays the rewrite
-  and BP warm-starts from the (usually ordered) inputs.
+- Unconverged segments (deadline fired) are revisited alongside fresh work,
+  with at most one deepening pass active globally. After it completes, the
+  next pass waits `--optimizer-unconverged-cooldown-secs` (default 600).
+  Starting cooldown at completion is important because a full sparse rewrite
+  can outlast the BP deadline; starting it at launch caused the replacement
+  segment to be requeued immediately.
+- Merge-time reorder uses its own `--merge-bp-budget-secs` deadline. A
+  truncated output joins the same paced deepening ladder.
 
 Observability: `converged` in reorder logs, `bp_converged` in metadata, and
 the Grafana superblock/block skip-ratio panels are the quality metric — a
@@ -87,6 +89,10 @@ Semantics change for aggressive continuous background reordering:
   alongside fresh work. Deepening passes run **full depth** with the wall
   clock budget — warm-starting makes already-ordered prefixes nearly free,
   so each pass pushes deeper until one beats the clock and converges.
+  Only one deepening pass runs at a time, and its cooldown starts when the
+  complete rewrite finishes (success, error, cancellation, or panic), not
+  when it starts. This prevents long passes from continuously replacing and
+  immediately requeueing their own unconverged output.
 
 - **Merge fan-in default raised** (`TieredMergePolicy::large_scale()`
   `max_merge_at_once: 10 → 24`, baked in — no tuning flags): wide fan-in
