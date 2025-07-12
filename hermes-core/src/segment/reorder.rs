@@ -28,6 +28,26 @@ use crate::structures::SparseFormat;
 /// `IndexConfig::default().bp_memory_budget_bytes`.
 pub const DEFAULT_MEMORY_BUDGET: usize = 24 * 1024 * 1024 * 1024;
 
+/// Unique prefix for a pass's spilled grid-run temp files.
+///
+/// MUST be unique per pass, not per (process, field): in a container the
+/// server is always PID 1 and every index's sparse field tends to share the
+/// same field id, so the old `pid_field` scheme collided across concurrent
+/// reorders (documents + social both spilling field 3) — passes overwrote
+/// each other's runs and deleted them on completion, failing the other pass
+/// with ENOENT after it had already copied tens of GB (orphaned outputs
+/// filled the production disk overnight).
+fn grid_run_prefix(field_id: u32) -> String {
+    static GRID_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = GRID_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "hermes_grid_run_{}_{}_{}",
+        std::process::id(),
+        field_id,
+        seq
+    )
+}
+
 /// Reorder granularity (see docs/block-level-reorder.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BpGranularity {
@@ -1071,7 +1091,7 @@ pub(crate) fn reorder_bmp_field(
     let est_entries = total_source_terms.min(max_entries_in_memory);
     let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_entries);
     let mut run_files: Vec<std::path::PathBuf> = Vec::new();
-    let run_prefix = format!("hermes_grid_run_{}_{}", std::process::id(), field_id);
+    let run_prefix = grid_run_prefix(field_id);
 
     // Encode one output block: gather its records from source blocks and
     // serialize the V14 block layout. Pure function of `perm` + read-only
@@ -1396,4 +1416,20 @@ pub(crate) fn reorder_bmp_field(
     );
 
     Ok((writer, field_tocs, converged))
+}
+
+#[cfg(test)]
+mod grid_run_prefix_tests {
+    /// Regression: run prefixes were `pid_field` — identical for every pass
+    /// in a container (PID 1) reordering the same field id, so concurrent
+    /// passes clobbered and deleted each other's spill files (prod ENOENT).
+    #[test]
+    fn test_grid_run_prefix_unique_per_pass() {
+        let a = super::grid_run_prefix(3);
+        let b = super::grid_run_prefix(3);
+        assert_ne!(
+            a, b,
+            "two passes over the same field must not share spill files"
+        );
+    }
 }

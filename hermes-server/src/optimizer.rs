@@ -141,11 +141,6 @@ async fn scan_and_optimize(
             }
         };
 
-        // Skip indexes without reorder fields
-        if !index.schema().has_reorder_fields() {
-            continue;
-        }
-
         let writer = match registry.get_writer(&name).await {
             Ok(w) => w,
             Err(e) => {
@@ -159,6 +154,24 @@ async fn scan_and_optimize(
             let w = writer.read().await;
             Arc::clone(w.segment_manager())
         };
+
+        // Sweep orphan segment files (outputs of failed/panicked merges and
+        // reorders — observed leaking 1.7 TB overnight). In-flight outputs
+        // are protected by the merge inventory. Runs for every index, not
+        // just reorder-enabled ones: merges can fail anywhere.
+        match segment_manager.cleanup_orphan_segments().await {
+            Ok(0) => {}
+            Ok(n) => warn!(
+                "[optimizer] swept {} orphan segment(s) in '{}' (failed merge/reorder outputs)",
+                n, name
+            ),
+            Err(e) => debug!("[optimizer] orphan sweep failed for '{}': {}", name, e),
+        }
+
+        // Skip indexes without reorder fields
+        if !index.schema().has_reorder_fields() {
+            continue;
+        }
 
         // Fresh (never-reordered) segments first — they are typically small
         // memtable flushes that finish in sub-second passes.

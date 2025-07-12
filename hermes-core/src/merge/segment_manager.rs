@@ -499,6 +499,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         ids,
                         e
                     );
+                    // Delete whatever the failed merge wrote — partial
+                    // outputs are invisible to metadata and leak disk.
+                    let _ = crate::segment::delete_segment(sm.directory.as_ref(), output_id).await;
                 }
             }
             // _guard drops here → segment IDs unregistered from inventory
@@ -810,7 +813,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             let trained_snap = self.trained();
             let granularity = self.merge_granularity(&batch).await;
-            let (new_segment_id, total_docs, bp_converged) = Self::do_merge(
+            let merge_result = Self::do_merge(
                 self.directory.as_ref(),
                 &self.schema,
                 &batch,
@@ -823,7 +826,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 self.bp_memory_budget_bytes,
                 Some(self.background_cpu_pool()),
             )
-            .await?;
+            .await;
+            let (new_segment_id, total_docs, bp_converged) = match merge_result {
+                Ok(v) => v,
+                Err(e) => {
+                    // Delete the failed merge's partial output (leaks disk).
+                    let _ =
+                        crate::segment::delete_segment(self.directory.as_ref(), output_id).await;
+                    return Err(e);
+                }
+            };
 
             self.replace_segments(
                 &batch,
@@ -982,7 +994,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
         }
 
-        let (new_id, total_docs, bp_converged) = crate::segment::reorder::reorder_segment(
+        let reorder_result = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),
             &self.schema,
             source_id,
@@ -993,7 +1005,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             granularity,
             rayon_pool,
         )
-        .await?;
+        .await;
+        let (new_id, total_docs, bp_converged) = match reorder_result {
+            Ok(v) => v,
+            Err(e) => {
+                // A failed pass may have copied tens of GB of files before
+                // dying (panicked BP passes leaked 1.7 TB of partial outputs
+                // overnight in production) — delete the output before
+                // propagating.
+                let _ = crate::segment::delete_segment(self.directory.as_ref(), output_id).await;
+                return Err(e);
+            }
+        };
 
         // A pass with a depth floor above block granularity has, by
         // definition, not converged to block-level order — record it as

@@ -2753,3 +2753,96 @@ async fn test_reorder_skips_segment_consumed_by_merge() {
         "reordering a merged-away segment duplicated its documents"
     );
 }
+
+/// Regression: failed merge/reorder passes leaked their partial output
+/// files — a panicking deepening pass copied ~66 GiB per attempt and the
+/// files were never deleted (1.7 TB of orphans accumulated overnight in
+/// production; 108 orphan segments vs 7 live). Pins both defenses:
+/// a failed reorder deletes its output, and `cleanup_orphan_segments`
+/// sweeps stray segment files while leaving live segments intact.
+#[tokio::test]
+async fn test_failed_reorder_leaves_no_orphan_files() {
+    use crate::directories::Directory;
+
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+    let index = Index::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    for i in 0..200u32 {
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, vec![(i, 1.0), (50_000 + i % 5, 0.5)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    async fn seg_files(dir: &RamDirectory) -> Vec<String> {
+        let mut ids: Vec<String> = dir
+            .list_files(std::path::Path::new(""))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|p| {
+                let n = p.to_string_lossy().to_string();
+                n.starts_with("seg_").then(|| n[4..36].to_string())
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    let victim = {
+        let segs = index.segment_readers().await.unwrap();
+        crate::segment::SegmentId(segs[0].meta().id).to_hex()
+    };
+
+    // Failed pass must not leave output files: delete the source's files
+    // (still in metadata — prod's ENOENT state) and reorder it.
+    crate::segment::delete_segment(&dir, crate::segment::SegmentId::from_hex(&victim).unwrap())
+        .await
+        .unwrap();
+    let before = seg_files(&dir).await;
+    let err = index
+        .segment_manager()
+        .reorder_single_segment(&victim, None, crate::segment::BpBudget::full())
+        .await;
+    assert!(err.is_err(), "reorder of a fileless segment must fail");
+    assert_eq!(
+        seg_files(&dir).await,
+        before,
+        "failed reorder must delete its partial output files"
+    );
+
+    // Sweep: stray segment files (failed-pass leftovers) are deleted...
+    let orphan_hex = "00000000000000000000000000000abc";
+    use crate::directories::DirectoryWriter;
+    dir.write(
+        std::path::Path::new(&format!("seg_{orphan_hex}.store")),
+        b"junk",
+    )
+    .await
+    .unwrap();
+    dir.write(
+        std::path::Path::new(&format!("seg_{orphan_hex}.sparse")),
+        b"junk",
+    )
+    .await
+    .unwrap();
+    let swept = index
+        .segment_manager()
+        .cleanup_orphan_segments()
+        .await
+        .unwrap();
+    assert!(swept >= 1, "orphan sweep must delete stray segment files");
+    let after = seg_files(&dir).await;
+    assert!(
+        !after.contains(&orphan_hex.to_string()),
+        "orphan files must be gone"
+    );
+}
