@@ -58,6 +58,7 @@
 
 pub mod generate;
 pub mod mal;
+pub mod metal_scan;
 pub mod model;
 pub mod tokenizer;
 

@@ -638,9 +638,26 @@ impl MambaMixer {
                 .narrow(2, total - (self.conv_kernel - 1), self.conv_kernel - 1)?
                 .contiguous()?;
         }
-        let conv = padded.conv1d(&self.conv1d_weight, 0, 1, 1, self.d_inner)?;
+        let conv = if crate::metal_scan::fused_supported(x.device(), x.dtype(), self.state_dim) {
+            // Candle lowers grouped conv1d to one conv per group — ~16k
+            // dispatches per decoded token with groups == d_inner (measured
+            // 98% of Metal decode time). Fused: one dispatch, bias included.
+            let op = crate::metal_scan::FusedDepthwiseConv1d {
+                batch,
+                d_inner: self.d_inner,
+                l_in: padded.dim(2)?,
+                kernel: self.conv_kernel,
+            };
+            padded.apply_op3_no_bwd(
+                &self.conv1d_weight.flatten_all()?.contiguous()?,
+                &self.conv1d_bias,
+                &op,
+            )?
+        } else {
+            let conv = padded.conv1d(&self.conv1d_weight, 0, 1, 1, self.d_inner)?;
+            conv.broadcast_add(&self.conv1d_bias.reshape((1, self.d_inner, 1))?)?
+        };
         let conv = conv.narrow(2, 0, seq_len)?;
-        let conv = conv.broadcast_add(&self.conv1d_bias.reshape((1, self.d_inner, 1))?)?;
         let xs = candle_nn::ops::silu(&conv.transpose(1, 2)?.contiguous()?)?; // [B, L, di]
 
         // Input-dependent Δ, B, C. The narrows are made contiguous: Metal's
@@ -657,30 +674,55 @@ impl MambaMixer {
 
         let a = self.a_log.exp()?.neg()?; // [di, N]
 
-        // Sequential selective scan over time, resuming from stored h
-        let mut h = match &state {
+        let h = match &state {
             Some(s) => s.h.clone(),
             None => Tensor::zeros((batch, self.d_inner, self.state_dim), x.dtype(), x.device())?,
         };
-        let mut ys = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let dt = delta.narrow(1, t, 1)?.squeeze(1)?; // [B, di]
-            let xt = xs.narrow(1, t, 1)?.squeeze(1)?; // [B, di]
-            let bt = b_mat.narrow(1, t, 1)?.squeeze(1)?; // [B, N]
-            let ct = c_mat.narrow(1, t, 1)?.squeeze(1)?; // [B, N]
+        let (y, h) = if crate::metal_scan::fused_supported(x.device(), x.dtype(), self.state_dim) {
+            // Single-dispatch fused scan (docs/metal-selective-scan.md);
+            // inputs/outputs packed to fit CustomOp3's 3-in/1-out shape.
+            let xd = Tensor::cat(&[&xs, &delta], 2)?.contiguous()?;
+            let bc = Tensor::cat(&[&b_mat, &c_mat], 2)?.contiguous()?;
+            let adh =
+                Tensor::cat(&[&a.flatten_all()?, &self.d, &h.flatten_all()?], 0)?.contiguous()?;
+            let op = crate::metal_scan::FusedSelectiveScan {
+                batch,
+                seq_len,
+                d_inner: self.d_inner,
+                state_dim: self.state_dim,
+            };
+            let out = xd.apply_op3_no_bwd(&bc, &adh, &op)?;
+            let y_len = batch * seq_len * self.d_inner;
+            let y = out
+                .narrow(0, 0, y_len)?
+                .reshape((batch, seq_len, self.d_inner))?;
+            let h = out
+                .narrow(0, y_len, batch * self.d_inner * self.state_dim)?
+                .reshape((batch, self.d_inner, self.state_dim))?;
+            (y, h)
+        } else {
+            // Reference per-timestep scan (CUDA / non-f32 / oversized state)
+            let mut h = h;
+            let mut ys = Vec::with_capacity(seq_len);
+            for t in 0..seq_len {
+                let dt = delta.narrow(1, t, 1)?.squeeze(1)?; // [B, di]
+                let xt = xs.narrow(1, t, 1)?.squeeze(1)?; // [B, di]
+                let bt = b_mat.narrow(1, t, 1)?.squeeze(1)?; // [B, N]
+                let ct = c_mat.narrow(1, t, 1)?.squeeze(1)?; // [B, N]
 
-            let dt_e = dt.unsqueeze(2)?; // [B, di, 1]
-            let da = dt_e.broadcast_mul(&a.unsqueeze(0)?)?.exp()?; // [B, di, N]
-            let dbx = dt_e
-                .broadcast_mul(&bt.unsqueeze(1)?)? // [B, di, N]
-                .broadcast_mul(&xt.unsqueeze(2)?)?;
-            h = (h.mul(&da)? + dbx)?;
+                let dt_e = dt.unsqueeze(2)?; // [B, di, 1]
+                let da = dt_e.broadcast_mul(&a.unsqueeze(0)?)?.exp()?; // [B, di, N]
+                let dbx = dt_e
+                    .broadcast_mul(&bt.unsqueeze(1)?)? // [B, di, N]
+                    .broadcast_mul(&xt.unsqueeze(2)?)?;
+                h = (h.mul(&da)? + dbx)?;
 
-            let yt = h.broadcast_mul(&ct.unsqueeze(1)?)?.sum(2)?; // [B, di]
-            let yt = (yt + xt.broadcast_mul(&self.d.unsqueeze(0)?)?)?;
-            ys.push(yt.unsqueeze(1)?);
-        }
-        let y = Tensor::cat(&ys, 1)?; // [B, L, di]
+                let yt = h.broadcast_mul(&ct.unsqueeze(1)?)?.sum(2)?; // [B, di]
+                let yt = (yt + xt.broadcast_mul(&self.d.unsqueeze(0)?)?)?;
+                ys.push(yt.unsqueeze(1)?);
+            }
+            (Tensor::cat(&ys, 1)?, h) // [B, L, di]
+        };
 
         // Persist the final SSM state
         if let Some(s) = state {

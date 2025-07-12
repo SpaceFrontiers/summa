@@ -16,6 +16,9 @@ candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
 candle-flash-attn = { version = "0.11", optional = true }
+# Fused Metal selective-scan kernel (docs/metal-selective-scan.md)
+candle-metal-kernels = { version = "0.11", optional = true }
+objc2-metal = { version = "0.3", optional = true }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
 tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
@@ -52,7 +55,13 @@ tempfile = { workspace = true }
 default = ["cpu"]
 cpu = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 flash-attn = ["cuda", "candle-flash-attn"]
 
