@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use candle_core::Device;
 use clap::{Parser, Subcommand};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -8,9 +7,7 @@ use hermes_llm::tokenizer::Tokenizer;
 
 #[derive(Parser)]
 #[command(name = "hermes-llm")]
-#[command(
-    about = "Hermes LLM inference and model definition tool (training lives in hermes-train)"
-)]
+#[command(about = "Hermes LLM inference and model definition tool")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -55,10 +52,6 @@ enum Commands {
         /// Keep generating for the full --max-tokens instead of stopping at EOS
         #[arg(long, default_value_t = false)]
         no_eos: bool,
-
-        /// Use GPU (Metal on macOS, CUDA on Linux/Windows); pass `--gpu false` for CPU
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        gpu: bool,
     },
 
     /// Show model info
@@ -68,7 +61,7 @@ enum Commands {
         model: String,
     },
 
-    /// Export a MAL model definition as JSON (consumed by hermes-train)
+    /// Export a MAL model definition as JSON
     Export {
         /// Model configuration: preset name (nano, tiny, gpt2-small, llama-7b) or path to .mal file
         #[arg(short, long)]
@@ -78,28 +71,6 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
-}
-
-#[allow(unused_variables)]
-fn get_device(use_gpu: bool, gpu_id: usize) -> Result<Device> {
-    if use_gpu {
-        #[cfg(feature = "metal")]
-        {
-            return Ok(Device::new_metal(gpu_id)?);
-        }
-        #[cfg(feature = "cuda")]
-        {
-            return Ok(Device::new_cuda(gpu_id)?);
-        }
-        #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        {
-            tracing::warn!(
-                "No GPU feature enabled, using CPU. Build with --features metal or --features cuda"
-            );
-            return Ok(Device::Cpu);
-        }
-    }
-    Ok(Device::Cpu)
 }
 
 fn get_model_def(name: &str) -> Result<hermes_llm::ModelDef> {
@@ -141,9 +112,8 @@ fn main() -> Result<()> {
             top_k,
             seed,
             no_eos,
-            gpu,
         } => {
-            let device = get_device(gpu, 0)?;
+            let device = hermes_llm::default_device();
             info!("Using device: {:?}", device);
 
             // Each artifact may be a local path or a remote URI (s3://, gs://,
@@ -154,11 +124,15 @@ fn main() -> Result<()> {
 
             let config = hermes_llm::ModelDef::from_json(&config_path)?;
             let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+            anyhow::ensure!(
+                config.vocab_size == tokenizer.vocab_size(),
+                "model vocab_size {} does not match tokenizer vocab_size {}",
+                config.vocab_size,
+                tokenizer.vocab_size()
+            );
 
-            let mut var_map = candle_nn::VarMap::new();
-            let vb = candle_nn::VarBuilder::from_varmap(&var_map, candle_core::DType::F32, &device);
-            let model = hermes_llm::Transformer::new(&config, vb)?;
-            var_map.load(&checkpoint_path)?;
+            let mut model = hermes_llm::Transformer::<hermes_llm::Backend>::new(&config, &device)?;
+            hermes_llm::load_safetensors(&mut model, &checkpoint_path)?;
 
             info!("Loaded model from {}", checkpoint_path.display());
 

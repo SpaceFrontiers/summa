@@ -6,33 +6,30 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "LLM inference and model definition (MAL) using Candle; training lives in hermes-train"
+description = "Burn-based LLM inference and model definition; training lives in hermes-train"
 keywords = ["llm", "transformer", "deep-learning", "gpt", "inference"]
 categories = ["science"]
 
 [dependencies]
-# Candle ML framework
-candle-core = "0.11"
-candle-nn = "0.11"
-candle-transformers = "0.11"
-candle-flash-attn = { version = "0.11", optional = true }
-# Fused Metal selective-scan kernel (docs/metal-selective-scan.md)
-candle-metal-kernels = { version = "0.11", optional = true }
-objc2-metal = { version = "0.3", optional = true }
-# CubeCL — one #[cube] kernel targets CUDA + Metal(wgpu) + CPU. OFF by default;
-# the wgpu runtime is pure Rust (Metal on macOS). See docs/cubecl-migration.md.
-# Pinned to 0.10.0. cubecl-cpu is intentionally NOT pulled in: it depends on
-# tracel-llvm (bundled LLVM/MLIR), a heavy system build — see the migration doc.
-cubecl = { version = "=0.10.0", default-features = false, features = [
-    "wgpu",
+# Burn is the sole inference runtime. CPU uses ndarray; GPU backends and the
+# custom selective-scan op use Burn's CubeCL tensor/runtime directly.
+burn = { package = "burn-core", version = "0.21", default-features = false, features = ["std"] }
+burn-autodiff = { version = "0.21", default-features = false, features = ["std"] }
+burn-nn = { version = "0.21", default-features = false, features = ["std"] }
+burn-ndarray = { version = "0.21", default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.21", optional = true, default-features = false, features = ["std", "metal"] }
+burn-cuda = { version = "0.21", optional = true, default-features = false, features = ["std"] }
+burn-store = { version = "0.21", default-features = false, features = [
+    "safetensors",
     "std",
-], optional = true }
+] }
+burn-cubecl = { version = "0.21", optional = true, default-features = false, features = ["std"] }
+cubecl = { version = "=0.10.0", optional = true, default-features = false, features = ["std"] }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
 tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
 
 # Serialization
-serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Model Architecture Language (MAL) parser — single source of truth
@@ -49,42 +46,19 @@ anyhow = { workspace = true }
 # Utilities
 rand = { workspace = true }
 
-# HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
-hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
-
 # Remote artifact loading (s3://, gs://, http(s)://) — optional `remote` feature
 object_store = { version = "0.12", default-features = false, features = ["aws", "gcp", "http"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 url = { version = "2", optional = true }
 dirs = { version = "6", optional = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
-
 [features]
-default = ["cpu", "remote"]
-cpu = []
+default = ["remote"]
 # Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
 remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = [
-    "candle-core/metal",
-    "candle-nn/metal",
-    "candle-transformers/metal",
-    "dep:candle-metal-kernels",
-    "dep:objc2-metal",
-]
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-flash-attn = ["cuda", "candle-flash-attn"]
-# Portable Mamba kernels (depthwise conv1d + selective scan) via CubeCL. OFF by
-# default; adds the wgpu (Metal/Vulkan/DX) runtime. Enable CUDA too via cubecl-cuda.
-cubecl = ["dep:cubecl"]
-cubecl-cuda = ["cubecl", "cubecl/cuda"]
+metal = ["dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl"]
 
 [[bin]]
 name = "hermes-llm"
 path = "src/main.rs"
-
-[package.metadata.cargo-machete]
-# candle-transformers is referenced by the cuda/metal/accelerate feature definitions
-ignored = ["candle-transformers"]

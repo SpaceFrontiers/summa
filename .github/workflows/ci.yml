@@ -138,32 +138,6 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
 
-  # hermes-train tests (CPU-only torch via the pytorch-cpu index in pyproject)
-  hermes-train:
-    name: Hermes Train Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # hermes-train depends on `hermes-mal` (the Rust MAL parser via PyO3),
-      # which uv builds with maturin during `uv sync` — so a Rust toolchain is
-      # required here even though this is a Python job.
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-07-07
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: "hermes-train/uv.lock"
-
-      - name: Run tests
-        working-directory: hermes-train
-        run: |
-          uv sync
-          uv run pytest
-
   # TypeScript client - build check
   typescript:
     name: TypeScript Client

@@ -99,8 +99,7 @@ jobs:
       - name: Update pyproject.toml versions
         run: |
           sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-client-python/pyproject.toml
-          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-train/pyproject.toml
-          echo "Updated pyproject.toml files to version ${{ steps.bump.outputs.new_version }}"
+          echo "Updated pyproject.toml to version ${{ steps.bump.outputs.new_version }}"
 
       - name: Update TypeScript client version
         run: |
@@ -113,7 +112,7 @@ jobs:
 
       - name: Commit and push
         run: |
-          git add Cargo.toml Cargo.lock hermes-client-python/pyproject.toml hermes-train/pyproject.toml hermes-client-typescript/package.json
+          git add Cargo.toml Cargo.lock hermes-client-python/pyproject.toml hermes-client-typescript/package.json
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
           git push
 
@@ -150,6 +149,13 @@ jobs:
 
       - name: Publish hermes-llm
         run: cargo publish -p hermes-llm --no-verify
+        continue-on-error: true
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish hermes-train
+        run: cargo publish -p hermes-train --no-verify
         continue-on-error: true
 
       - name: Wait for crates.io index
@@ -262,18 +268,6 @@ jobs:
       - name: Publish to PyPI
         run: |
           cd hermes-client-python
-          uv publish
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
-
-      - name: Build hermes-train
-        run: |
-          cd hermes-train
-          uv build
-
-      - name: Publish hermes-train to PyPI
-        run: |
-          cd hermes-train
           uv publish
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}

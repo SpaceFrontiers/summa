@@ -7,7 +7,3 @@ nccl_id.txt
 checkpoints/
 corpus.jsonl
 corpus.jsonl.gz
-
-# Python
-__pycache__/
-*.pyc

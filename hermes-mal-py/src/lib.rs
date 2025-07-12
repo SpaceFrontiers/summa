@@ -3,8 +3,7 @@
 //! This is a thin PyO3 wrapper around the [`hermes_mal`] crate, which is the
 //! single source of truth for parsing the Model Architecture Language (MAL).
 //! It exposes exactly one function, [`parse_mal`], returning the same JSON that
-//! `hermes-llm export` emits (serde JSON of `hermes_mal::ModelDef`), i.e. the
-//! dict `hermes_train.config.ModelDef.from_dict` consumes.
+//! `hermes-llm export` emits (serde JSON of `hermes_mal::ModelDef`).
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;

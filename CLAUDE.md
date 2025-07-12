@@ -43,16 +43,16 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-tool**: CLI for index management and data processing pipelines
 - **hermes-server**: gRPC server for remote search operations
 - **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
-- **hermes-llm**: LLM inference + MAL architecture DSL (Candle; training lives in hermes-train)
-- **hermes-train**: PyTorch training for hermes-llm models (Python, uv; bf16, Muon+AdamW, DDP, DPO)
+- **hermes-llm**: Shared Burn Transformer/Mamba model, inference, generation, and MAL integration
+- **hermes-train**: Burn Autodiff training for the shared hermes-llm model
 - **hermes-client-python**: Python gRPC client
 - **hermes-web**: Vue.js web UI
 
-LLM pipeline: `hermes-train train --config <.mal|.json>` (accepts a MAL file directly, or JSON from `hermes-llm export --model <preset|.mal>`) produces safetensors → `hermes-llm generate` serves them. Tensor names are a shared contract (`embedding.*`, `layers.{i}.attention.*` or `layers.{i}.ssm.*`, `layers.{i}.feed_forward.*`, `final_norm.*`, `lm_head.*` — absent when embeddings.tie_weights) — keep hermes-train/src/hermes_train/{config,model}.py in lockstep with hermes-mal/src/lib.rs and hermes-llm/src/model/.
+LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same generic `hermes_llm::Transformer` used by inference, saves a Burn-native safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
 
-**MAL parser is a single source of truth:** the pest grammar + AST live in the standalone `hermes-mal` crate (`hermes-mal/src/{lib.rs,mal.pest}`, embeds `hermes-mal/well-known/*.mal`). hermes-llm re-exports it as `crate::mal`; Python (`hermes-train`) parses `.mal` through the PyO3 wheel `hermes-mal-py` (module `hermes_mal`) — there is NO separate Python parser. Change the grammar/AST in one place.
+**MAL parser is a single source of truth:** the pest grammar + AST live in the standalone `hermes-mal` crate (`hermes-mal/src/{lib.rs,mal.pest}`, embeds `hermes-mal/well-known/*.mal`). `hermes-llm` re-exports it as `crate::mal`; `hermes-train` consumes that re-export. Change the grammar/AST in one place.
 
-MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `hermes-mal/well-known/hybrid_tiny.mal`). Both sides implement Mamba-1: PyTorch trains with a reference fp32 scan (fused mamba-ssm kernels optional on CUDA), Candle serves with a sequential scan.
+MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `hermes-mal/well-known/hybrid_tiny.mal`). Burn Autodiff training uses the differentiable tensor scan; GPU inference uses the custom CubeCL selective-scan kernel.
 
 ## Build Commands
 
@@ -74,7 +74,7 @@ cd hermes-wasm && bash build.sh
 cd hermes-core-python && maturin build --release
 
 # hermes-train (LLM training) tests
-cd hermes-train && uv sync && uv run pytest
+cargo test -p hermes-train
 
 # Run pre-commit hooks (rustfmt, clippy, ruff, prettier)
 pre-commit run --all-files
@@ -184,7 +184,7 @@ gh run list --workflow=ci.yml --limit=5
 
 **Workflows:**
 
-- **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python lint, hermes-train tests, TypeScript build, cargo audit.
+- **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python client lint, TypeScript build, cargo audit.
 - **publish.yml**: Manual trigger (`workflow_dispatch`). Bumps version, publishes to crates.io, NPM (WASM + TS client), PyPI, and GHCR Docker.
 
 ## Key Dependencies
@@ -193,5 +193,4 @@ gh run list --workflow=ci.yml --limit=5
 - **zstd**: Compression
 - **pest**: SDL parsing
 - **tonic/prost**: gRPC
-- **candle**: ML framework (hermes-llm inference)
-- **torch**: LLM training (hermes-train, Python)
+- **Burn + CubeCL**: ML runtime and GPU kernels (`hermes-llm` inference)

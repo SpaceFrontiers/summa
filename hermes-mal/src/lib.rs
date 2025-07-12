@@ -243,10 +243,6 @@ impl BlockDef {
         self.ffn.hidden_dim.unwrap_or(hidden_size * 4)
     }
 
-    pub fn use_bias(&self) -> bool {
-        self.ffn.bias || self.attention.bias
-    }
-
     pub fn norm_eps(&self) -> f64 {
         if self.norm.eps > 0.0 {
             self.norm.eps
@@ -267,10 +263,6 @@ impl BlockDef {
             PositionEncoding::Rope { scaling, .. } => *scaling,
             _ => None,
         }
-    }
-
-    pub fn use_swiglu(&self) -> bool {
-        matches!(self.ffn.activation, Activation::SwiGLU)
     }
 }
 
@@ -447,14 +439,6 @@ impl ModelDef {
         self.block.ffn.hidden_dim.unwrap_or(self.hidden_size * 4)
     }
 
-    pub fn dropout(&self) -> f64 {
-        self.block.dropout
-    }
-
-    pub fn use_bias(&self) -> bool {
-        self.block.ffn.bias || self.block.attention.bias
-    }
-
     pub fn norm_eps(&self) -> f64 {
         if self.block.norm.eps > 0.0 {
             self.block.norm.eps
@@ -470,22 +454,15 @@ impl ModelDef {
         }
     }
 
-    pub fn use_swiglu(&self) -> bool {
-        matches!(self.block.ffn.activation, Activation::SwiGLU)
-    }
-
-    pub fn use_rmsnorm(&self) -> bool {
-        matches!(self.block.norm.norm_type, NormType::RmsNorm)
-    }
-
-    /// Estimate total parameters
-    /// Rough parameter count. Accounts for per-layer mixer type (attention vs
-    /// Mamba SSM) and weight tying, so hybrid/tied presets aren't over-counted.
+    /// Count trainable parameters implied by the model definition.
     pub fn estimated_params(&self) -> usize {
         let h = self.hidden_size;
         let embed_params = self.vocab_size * h;
-        let ff_params = 3 * h * self.intermediate_size();
-        let norm_params = 2 * h;
+        let norm_params = |norm: &NormConfig| match norm.norm_type {
+            NormType::RmsNorm => h,
+            NormType::LayerNorm => 2 * h,
+            NormType::None => 0,
+        };
 
         let mut layer_params = 0usize;
         for i in 0..self.num_layers {
@@ -499,23 +476,48 @@ impl ModelDef {
                         + d_inner * h          // out_proj
                         + d_inner * ssm.conv_kernel
                         + d_inner * (dt_rank + 2 * ssm.state_dim) // x_proj
-                        + dt_rank * d_inner    // dt_proj
+                        + dt_rank * d_inner + d_inner // dt_proj weight + bias
                         + d_inner * ssm.state_dim // A_log
                         + d_inner // D
+                        + d_inner // depthwise conv bias
                 }
                 // Attention: q/k/v/o. Uses GQA kv width when configured.
-                None => 2 * h * h + 2 * h * (self.num_kv_heads() * self.head_dim()),
+                None => {
+                    let q = block.num_heads() * block.head_dim(h);
+                    let kv = block.num_kv_heads() * block.head_dim(h);
+                    let weights = h * q + 2 * h * kv + q * h;
+                    let bias = if block.attention.bias {
+                        2 * q + 2 * kv
+                    } else {
+                        0
+                    };
+                    let qk_norm = if block.attention.qk_norm {
+                        2 * block.head_dim(h)
+                    } else {
+                        0
+                    };
+                    weights + bias + qk_norm
+                }
             };
-            layer_params += mixer + ff_params + norm_params;
+            let intermediate = block.intermediate_size(h);
+            let projections = if block.ffn.gate { 3 } else { 2 };
+            let ff_weights = projections * h * intermediate;
+            let ff_bias = if block.ffn.bias {
+                (if block.ffn.gate { 2 } else { 1 }) * intermediate + h
+            } else {
+                0
+            };
+            layer_params += mixer + ff_weights + ff_bias + 2 * norm_params(&block.norm);
         }
 
-        // lm_head is absent when embeddings are tied.
-        let head_params = if self.embeddings.tie_weights {
-            0
-        } else {
-            h * self.vocab_size
-        };
-        embed_params + layer_params + head_params
+        let final_norm = self
+            .output
+            .norm
+            .as_ref()
+            .unwrap_or(&self.block_for_layer(0).norm);
+        let head_weights = (!self.embeddings.tie_weights) as usize * h * self.vocab_size;
+        let head_bias = self.output.bias as usize * self.vocab_size;
+        embed_params + layer_params + norm_params(final_norm) + head_weights + head_bias
     }
 
     /// Load from JSON file
@@ -643,6 +645,25 @@ fn parse_model_prop(
                             Rule::scale_prop => {
                                 if let Some(val) = child.into_inner().next() {
                                     def.embeddings.scale = Some(val.as_str().parse()?);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Rule::output_prop => {
+                for param in inner.into_inner() {
+                    for child in param.into_inner() {
+                        match child.as_rule() {
+                            Rule::bias_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.output.bias = val.as_str() == "true";
+                                }
+                            }
+                            Rule::norm_prop => {
+                                if let Some(cfg) = child.into_inner().next() {
+                                    def.output.norm = Some(parse_norm_config(cfg)?);
                                 }
                             }
                             _ => {}
@@ -908,8 +929,8 @@ fn parse_ssm_prop(pair: pest::iterators::Pair<Rule>, def: &mut SsmDef) -> Result
 
 /// Parse an FFN definition
 /// Parse a `norm_config` (`rmsnorm { eps: … }` | `layernorm { … }` | `none`)
-/// into a `NormConfig`. `eps` defaults to 0.0 here and is resolved to 1e-5 by
-/// `norm_eps()` when unset.
+/// into a `NormConfig`. An omitted epsilon is represented as zero and resolved
+/// by model construction.
 fn parse_norm_config(pair: pest::iterators::Pair<Rule>) -> Result<NormConfig> {
     let mut norm = NormConfig::default();
     match pair.into_inner().next() {
@@ -1271,6 +1292,31 @@ mod tests {
         assert!(matches!(d.block.norm.norm_type, NormType::RmsNorm));
         let d = parse_mal(&base("none")).unwrap();
         assert!(matches!(d.block.norm.norm_type, NormType::None));
+    }
+
+    #[test]
+    fn test_embedding_and_output_configuration() {
+        let def = parse_mal(
+            r#"
+            block b { attention: { num_heads: 4 } ffn: { hidden_dim: 64 } }
+            model m {
+                vocab_size: 100
+                max_seq_len: 64
+                hidden_size: 32
+                num_layers: 2
+                block: b
+                embeddings { tie_weights: true dropout: 0.2 scale: 5.5 }
+                output { bias: true norm: none }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert!(def.embeddings.tie_weights);
+        assert_eq!(def.embeddings.dropout, 0.2);
+        assert_eq!(def.embeddings.scale, Some(5.5));
+        assert!(def.output.bias);
+        assert!(matches!(def.output.norm.unwrap().norm_type, NormType::None));
     }
 
     #[test]

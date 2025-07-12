@@ -12,5 +12,5 @@ json_str = parse_mal(source)  # -> str (serde JSON of ModelDef)
 ```
 
 The returned JSON is byte-for-byte identical to what `hermes-llm export`
-emits, i.e. the dict consumed by `hermes_train.config.ModelDef.from_dict`.
+emits and can be consumed by any serde-compatible tool.
 Syntax errors, unknown keys, and undefined references raise `ValueError`.
