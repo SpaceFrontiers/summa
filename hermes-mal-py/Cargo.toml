@@ -18,4 +18,4 @@ crate-type = ["cdylib"]
 # name (the Python extension module must itself be named `hermes_mal`).
 mal = { path = "../hermes-mal", package = "hermes-mal" }
 serde_json = { workspace = true }
-pyo3 = { version = "0.27", features = ["extension-module"] }
+pyo3.workspace = true
