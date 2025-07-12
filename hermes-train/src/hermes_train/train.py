@@ -128,6 +128,32 @@ class Trainer:
                 f"world_size={self.world_size}"
             )
 
+        # Optional Weights & Biases live curves — enabled only when
+        # WANDB_API_KEY is set (main rank). No key → silently off.
+        self.wandb = None
+        if self.is_main and os.environ.get("WANDB_API_KEY"):
+            try:
+                import wandb
+
+                wandb.init(
+                    project=os.environ.get("WANDB_PROJECT", "hermes-retriever"),
+                    name=os.environ.get("WANDB_NAME", config.name),
+                    config={
+                        "params": self.model.num_parameters(),
+                        "hidden_size": config.hidden_size,
+                        "num_layers": config.num_layers,
+                        "vocab_size": config.vocab_size,
+                        "lr": lr,
+                        "schedule": schedule,
+                        "grad_accum_steps": grad_accum_steps,
+                        "world_size": self.world_size,
+                    },
+                )
+                self.wandb = wandb
+                print(f"wandb: logging to {wandb.run.url}")
+            except Exception as e:  # noqa: BLE001 — never let logging break training
+                print(f"wandb disabled ({e})")
+
         signal.signal(signal.SIGINT, self._on_interrupt)
 
     def _on_interrupt(self, signum, frame) -> None:
@@ -240,9 +266,12 @@ class Trainer:
 
                 if micro_step % self.grad_accum_steps == 0:
                     lr = self._set_lr(total_steps)
+                    grad_norm = 0.0
                     if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.grad_clip
+                        grad_norm = float(
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.grad_clip
+                            )
                         )
                     for opt in self.optimizers:
                         opt.step()
@@ -252,6 +281,23 @@ class Trainer:
                     avg_loss = accumulated_loss / self.grad_accum_steps
                     accumulated_loss = 0.0
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+                    if self.wandb:
+                        tokens = (
+                            input_ids.shape[0]
+                            * input_ids.shape[1]
+                            * self.grad_accum_steps
+                            * self.world_size
+                        )
+                        self.wandb.log(
+                            {
+                                "loss": avg_loss,
+                                "lr": lr,
+                                "grad_norm": grad_norm,
+                                "tokens": self.global_step * tokens,
+                                "epoch": epoch + micro_step / max(len(train_loader), 1),
+                            },
+                            step=self.global_step,
+                        )
 
                     if max_steps is not None and self.global_step >= max_steps:
                         pbar.close()
@@ -259,6 +305,8 @@ class Trainer:
                             path = Path(checkpoint_dir) / "checkpoint_final.safetensors"
                             self.save_checkpoint(path)
                             print(f"Reached max_steps={max_steps}, saved {path}")
+                        if self.wandb:
+                            self.wandb.finish()
                         return True
 
                 pbar.update(1)
@@ -274,6 +322,8 @@ class Trainer:
             if self.world_size > 1:
                 dist.barrier()
 
+        if self.wandb:
+            self.wandb.finish()
         return True
 
     # ------------------------------------------------------------------

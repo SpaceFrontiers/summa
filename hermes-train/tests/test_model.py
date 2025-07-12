@@ -314,6 +314,21 @@ def test_train_bpe_extracts_jsonl_text(tmp_path):
     assert 0 < len(ids) < 10  # merged well, not char-level
 
 
+def test_wandb_disabled_without_key(config, monkeypatch):
+    """Training must run identically with no WANDB_API_KEY (hook stays off)."""
+    from hermes_train.data import DataLoader, Dataset
+    from hermes_train.train import Trainer
+
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    trainer = Trainer(config, lr=1e-2, warmup_steps=2, device=torch.device("cpu"))
+    assert trainer.wandb is None
+
+    tokens = (np.arange(5000) % config.vocab_size).astype(np.uint32)
+    loader = DataLoader(Dataset(tokens, seq_len=16, eos_token_id=0), batch_size=4)
+    completed = trainer.train(loader, epochs=1, max_steps=3)
+    assert completed and trainer.global_step >= 3
+
+
 def test_wsd_schedule():
     from hermes_train.train import get_lr_wsd
 
