@@ -6,9 +6,8 @@
 //!
 //! Only indexes with `reorder` fields in their schema are considered.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hermes_core::segment::BpBudget;
 use log::{debug, info, warn};
@@ -39,6 +38,57 @@ pub struct OptimizerConfig {
     pub unconverged_cooldown: Duration,
 }
 
+/// Global gate for expensive full-depth deepening passes.
+///
+/// Segment IDs change after every successful rewrite, so a per-ID cooldown
+/// cannot follow a segment lineage. The gate enforces the documented policy
+/// directly: at most one deepening pass is active, followed by a cooldown
+/// measured from completion. Measuring from start caused passes longer than
+/// the cooldown to requeue their replacement immediately and overlap another
+/// lineage, keeping background BP busy continuously.
+#[derive(Default)]
+struct DeepeningGate {
+    state: Mutex<DeepeningGateState>,
+}
+
+#[derive(Default)]
+struct DeepeningGateState {
+    in_flight: bool,
+    last_finished: Option<Instant>,
+}
+
+impl DeepeningGate {
+    fn try_acquire(self: &Arc<Self>, cooldown: Duration) -> Option<DeepeningPermit> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.in_flight
+            || state
+                .last_finished
+                .is_some_and(|finished| finished.elapsed() < cooldown)
+        {
+            return None;
+        }
+
+        state.in_flight = true;
+        Some(DeepeningPermit {
+            gate: Arc::clone(self),
+        })
+    }
+}
+
+/// Completion-based permit. Drop runs on success, error, cancellation, and
+/// panic unwind, so the gate cannot become permanently wedged.
+struct DeepeningPermit {
+    gate: Arc<DeepeningGate>,
+}
+
+impl Drop for DeepeningPermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.last_finished = Some(Instant::now());
+        state.in_flight = false;
+    }
+}
+
 /// Spawn the background optimizer loop.
 ///
 /// Returns a `JoinHandle` that runs until the server shuts down.
@@ -59,8 +109,8 @@ pub fn spawn_optimizer(
 
     let semaphore = Arc::new(Semaphore::new(config.threads));
 
-    // Bounded rayon pool for BP computation — prevents optimizer from
-    // saturating all CPU cores. Shared across all concurrent reorder tasks.
+    // Dedicated bounded rayon pool for BP computation, shared across all
+    // concurrent reorder tasks.
     //
     // Sized at max(threads, cores/2), NOT just `threads`: `threads` bounds
     // how many segments are rewritten concurrently (the semaphore), while
@@ -95,19 +145,13 @@ async fn optimizer_loop(
     // Initial delay: let the server finish startup before scanning.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Unix millis of the last budgeted pass that may need a follow-up —
-    // paces warm-started deepening passes (each is a full segment rewrite).
-    let last_partial_pass = Arc::new(AtomicU64::new(0));
+    // A timed-out pass replaces its source with a new unconverged segment ID.
+    // Gate that lineage globally and start its cooldown only when work ends.
+    let deepening_gate = Arc::new(DeepeningGate::default());
 
     loop {
-        if let Err(e) = scan_and_optimize(
-            &registry,
-            &semaphore,
-            &rayon_pool,
-            &config,
-            &last_partial_pass,
-        )
-        .await
+        if let Err(e) =
+            scan_and_optimize(&registry, &semaphore, &rayon_pool, &config, &deepening_gate).await
         {
             warn!("[optimizer] scan failed: {}", e);
         }
@@ -127,7 +171,7 @@ async fn scan_and_optimize(
     semaphore: &Arc<Semaphore>,
     rayon_pool: &Arc<rayon::ThreadPool>,
     config: &OptimizerConfig,
-    last_partial_pass: &Arc<AtomicU64>,
+    deepening_gate: &Arc<DeepeningGate>,
 ) -> Result<(), tonic::Status> {
     let index_names = registry.list_indexes().await?;
 
@@ -176,9 +220,9 @@ async fn scan_and_optimize(
         // Fresh (never-reordered) segments first — they are typically small
         // memtable flushes that finish in sub-second passes.
         let fresh = segment_manager.unreordered_segments().await;
-        let mut candidates: Vec<(String, u32, bool)> = fresh
+        let mut candidates: Vec<(String, u32, Option<DeepeningPermit>)> = fresh
             .into_iter()
-            .map(|(id, docs)| (id, docs, false))
+            .map(|(id, docs)| (id, docs, None))
             .collect();
 
         // Deepening is cooldown-paced but NOT starved by fresh work: under
@@ -188,22 +232,14 @@ async fn scan_and_optimize(
         // full segment rewrite; it warm-starts from the previous order and
         // deepens toward block-granularity).
         let unconverged = segment_manager.unconverged_segments().await;
-        if !unconverged.is_empty() {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let last = last_partial_pass.load(Ordering::Relaxed);
-            if now_ms.saturating_sub(last) >= config.unconverged_cooldown.as_millis() as u64 {
-                last_partial_pass.store(now_ms, Ordering::Relaxed);
-                if let Some((id, docs)) = unconverged.into_iter().next() {
-                    debug!(
-                        "[optimizer] index '{}': deepening unconverged segment {} ({} docs)",
-                        name, id, docs,
-                    );
-                    candidates.push((id, docs, true));
-                }
-            }
+        if let Some((id, docs)) = unconverged.into_iter().next()
+            && let Some(permit) = deepening_gate.try_acquire(config.unconverged_cooldown)
+        {
+            debug!(
+                "[optimizer] index '{}': deepening unconverged segment {} ({} docs)",
+                name, id, docs,
+            );
+            candidates.push((id, docs, Some(permit)));
         }
 
         if candidates.is_empty() {
@@ -216,7 +252,8 @@ async fn scan_and_optimize(
             candidates.len()
         );
 
-        for (seg_id, num_docs, is_deepening) in candidates {
+        for (seg_id, num_docs, deepening_permit) in candidates {
+            let is_deepening = deepening_permit.is_some();
             // Acquire semaphore permit to bound concurrency
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
@@ -266,6 +303,9 @@ async fn scan_and_optimize(
 
             tokio::spawn(async move {
                 let _permit = permit;
+                // Starts cooldown when the task finishes, not when it was
+                // queued. Also releases the in-flight gate on panic unwind.
+                let _deepening_permit = deepening_permit;
                 let start = std::time::Instant::now();
 
                 match sm.reorder_single_segment(&sid, Some(pool), budget).await {
@@ -295,4 +335,32 @@ async fn scan_and_optimize(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deepening_gate_blocks_overlap_and_cools_down_from_completion() {
+        let gate = Arc::new(DeepeningGate::default());
+
+        let first = gate
+            .try_acquire(Duration::from_secs(60))
+            .expect("first pass should start");
+        assert!(
+            gate.try_acquire(Duration::ZERO).is_none(),
+            "a second deepening pass must not overlap"
+        );
+
+        drop(first);
+        assert!(
+            gate.try_acquire(Duration::from_secs(60)).is_none(),
+            "cooldown must begin when the pass completes"
+        );
+        assert!(
+            gate.try_acquire(Duration::ZERO).is_some(),
+            "the gate should reopen after its cooldown"
+        );
+    }
 }
