@@ -182,6 +182,13 @@ class DataLoader:
     def num_batches(self) -> int:
         return self.max_batches
 
+    def __len__(self) -> int:
+        # Load-bearing: the wandb logging path computes fractional epoch as
+        # micro_step / len(train_loader). Without __len__ that path raises
+        # TypeError only once wandb is enabled (dead code otherwise), so the
+        # crash hides until a live run. Keep len() == the yielded batch count.
+        return self.max_batches
+
     def reset(self, seed: int | None = None) -> None:
         if seed is not None:
             self.shuffle_seed = seed

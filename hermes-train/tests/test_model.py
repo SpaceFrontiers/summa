@@ -329,6 +329,39 @@ def test_wandb_disabled_without_key(config, monkeypatch):
     assert completed and trainer.global_step >= 3
 
 
+def test_wandb_logging_path_len(config):
+    """Regression: the wandb log path computes micro_step / len(train_loader).
+
+    DataLoader had no __len__, so a live (wandb-enabled) run crashed at the
+    first log with TypeError — invisible in every disabled run because that
+    branch is dead code. Exercise the enabled branch with a capturing stub.
+    """
+    from hermes_train.data import DataLoader, Dataset
+    from hermes_train.train import Trainer
+
+    tokens = (np.arange(5000) % config.vocab_size).astype(np.uint32)
+    loader = DataLoader(Dataset(tokens, seq_len=16, eos_token_id=0), batch_size=4)
+    assert len(loader) == loader.num_batches()
+
+    class _WandbStub:
+        def __init__(self):
+            self.logs = []
+
+        def log(self, data, step=None):
+            self.logs.append((step, data))
+
+        def finish(self):
+            pass
+
+    trainer = Trainer(config, lr=1e-2, warmup_steps=2, device=torch.device("cpu"))
+    trainer.wandb = _WandbStub()
+    completed = trainer.train(loader, epochs=1, max_steps=3)
+    assert completed
+    assert trainer.wandb.logs, "wandb.log was never called on the logging path"
+    for _step, data in trainer.wandb.logs:
+        assert 0.0 <= data["epoch"] < 1.0
+
+
 def test_wsd_schedule():
     from hermes_train.train import get_lr_wsd
 
