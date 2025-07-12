@@ -46,8 +46,10 @@ anyhow = { workspace = true }
 # Utilities
 rand = { workspace = true }
 
-# Remote artifact loading (s3://, gs://, http(s)://) — optional `remote` feature
-object_store = { version = "0.12", default-features = false, features = ["aws", "gcp", "http"], optional = true }
+# Remote artifact loading (s3://, gs://, http(s)://). The pinned upstream
+# 0.14.1 revision includes the quick-xml security update not in crates.io 0.14.0.
+# `version` is the crates.io fallback Cargo uses when packaging this crate.
+object_store = { version = "0.14", git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c7316d29face118e7409eead0cda098f38589428", default-features = false, features = ["aws", "gcp", "http"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 url = { version = "2", optional = true }
 dirs = { version = "6", optional = true }

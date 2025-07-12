@@ -7,7 +7,7 @@
 //!
 //! - **Model Architecture Language (MAL)**: Define any transformer architecture using a composable DSL
 //! - **Generation**: Text generation with temperature, top-k sampling
-//! - **Tokenization**: HuggingFace tokenizer loading (local file or HF hub)
+//! - **Tokenization**: HuggingFace `tokenizer.json` loading
 //! - **Export**: MAL → JSON model config
 //!
 //! Checkpoints are Burn-native safetensors with a single tensor-naming contract

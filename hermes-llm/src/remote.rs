@@ -95,7 +95,7 @@ mod imp {
     }
 
     fn fetch(uri: &str) -> Result<Vec<u8>> {
-        use object_store::ObjectStore;
+        use object_store::{ObjectStore, ObjectStoreExt};
 
         let url = url::Url::parse(uri).with_context(|| format!("parsing URI {uri}"))?;
         let (store, path): (Box<dyn ObjectStore>, object_store::path::Path) =

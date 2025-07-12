@@ -23,7 +23,7 @@ authors = ["izihawa"]
 keywords = ["search", "full-text-search", "indexing", "ir"]
 categories = ["database", "text-processing"]
 
-# Enable Python bindings now that pyo3 0.27 supports Python 3.14
+# Python bindings
 
 [workspace.dependencies]
 # Internal crates
@@ -82,7 +82,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Python bindings
-pyo3 = { version = "0.27", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
 
 # WASM
 wasm-bindgen = "0.2"
