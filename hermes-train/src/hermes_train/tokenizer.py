@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from tokenizers import Tokenizer as HfTokenizer
@@ -11,16 +12,26 @@ SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
 
 class Tokenizer:
+    # Common special-token spellings across tokenizer families
+    _EOS_NAMES = ("<eos>", "<|endoftext|>", "</s>", "<|end_of_text|>", "<|eot_id|>")
+    _PAD_NAMES = ("<pad>", "<|padding|>", "<|pad|>")
+    _BOS_NAMES = ("<bos>", "<|begin_of_text|>", "<s>", "<|startoftext|>")
+
     def __init__(self, inner: HfTokenizer) -> None:
         self.inner = inner
         vocab_size = inner.get_vocab_size(True)
-        self.pad_token_id = self._special_id("<pad>", 0)
-        self.bos_token_id = self._special_id("<bos>", 1)
-        self.eos_token_id = self._special_id("<eos>", min(2, vocab_size - 1))
+        # EOS is load-bearing (document joins, doc-masking boundaries, stop):
+        # resolve it from known names before falling back to a raw id.
+        self.eos_token_id = self._first_id(self._EOS_NAMES, min(2, vocab_size - 1))
+        self.pad_token_id = self._first_id(self._PAD_NAMES, self.eos_token_id)
+        self.bos_token_id = self._first_id(self._BOS_NAMES, self.eos_token_id)
 
-    def _special_id(self, token: str, default: int) -> int:
-        token_id = self.inner.token_to_id(token)
-        return token_id if token_id is not None else default
+    def _first_id(self, names: tuple[str, ...], default: int) -> int:
+        for name in names:
+            token_id = self.inner.token_to_id(name)
+            if token_id is not None:
+                return token_id
+        return default
 
     @classmethod
     def from_file(cls, path: str | Path) -> Tokenizer:
@@ -60,11 +71,23 @@ def train_bpe(
         special_tokens=special_tokens or SPECIAL_TOKENS,
     )
 
-    def line_iterator():
+    def text_iterator():
+        # Accept JSONL ({"text": ...}) or plain text, streamed line by line so
+        # a multi-GB corpus never loads into memory at once.
         for path in inputs:
             with open_text(path) as f:
-                yield from (line for line in f if line.strip())
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line[0] == "{":
+                        try:
+                            yield json.loads(line).get("text", "")
+                            continue
+                        except json.JSONDecodeError:
+                            pass
+                    yield line
 
-    tokenizer.train_from_iterator(line_iterator(), trainer)
+    tokenizer.train_from_iterator(text_iterator(), trainer)
     tokenizer.save(output_path, pretty=True)
     return Tokenizer.from_file(output_path)

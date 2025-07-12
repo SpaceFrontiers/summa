@@ -46,8 +46,8 @@ block mamba_block {
 }
 
 model retriever-100m {
-    description: "Hybrid Mamba+attention retriever model, ~107M params (tied embeddings)"
-    vocab_size: 32768
+    description: "Hybrid Mamba+attention retriever model, ~115M params (tied embeddings, GPT-NeoX 50K vocab)"
+    vocab_size: 50277
     max_seq_len: 8192
     hidden_size: 512
     num_layers: 24
