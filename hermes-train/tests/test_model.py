@@ -258,6 +258,33 @@ def test_hybrid_forward_and_train_step(hybrid_config):
     )
 
 
+def test_tied_embeddings(hybrid_config, tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    hybrid_config.embeddings.tie_weights = True
+    model = Transformer(hybrid_config)
+    keys = model.state_dict().keys()
+    assert not any(k.startswith("lm_head") for k in keys)
+
+    ids = torch.randint(0, hybrid_config.vocab_size, (1, 8))
+    logits = model(ids)
+    assert logits.shape == (1, 8, hybrid_config.vocab_size)
+
+    # Roundtrip without lm_head tensor
+    path = tmp_path / "tied.safetensors"
+    save_file({k: v.contiguous() for k, v in model.state_dict().items()}, str(path))
+    model2 = Transformer(hybrid_config)
+    model2.load_state_dict(load_file(str(path)), strict=True)
+    model.eval(), model2.eval()
+    with torch.no_grad():
+        assert torch.allclose(model(ids), model2(ids))
+
+    # Gradients flow to the shared matrix from both ends
+    loss = cross_entropy_loss(model(ids), ids)
+    loss.backward()
+    assert model.embedding.weight.grad is not None
+
+
 def test_fused_kernel_dispatch(hybrid_config):
     """Off-CUDA the reference scan must be used; fused path needs mamba-ssm."""
     from hermes_train import model as model_mod

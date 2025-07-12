@@ -859,7 +859,9 @@ pub struct Transformer {
     embedding: Embedding,
     layers: Vec<TransformerBlock>,
     final_norm: Norm,
-    lm_head: Linear,
+    /// None when embeddings.tie_weights: logits are projected through the
+    /// embedding matrix and no lm_head.weight tensor exists in checkpoints.
+    lm_head: Option<Linear>,
     rope: RotaryEmbedding,
     config: ModelDef,
 }
@@ -910,7 +912,15 @@ impl Transformer {
             norm_block.use_bias(),
             vb.pp("final_norm"),
         )?;
-        let lm_head = linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
+        let lm_head = if config.embeddings.tie_weights {
+            None
+        } else {
+            Some(linear_no_bias(
+                config.hidden_size,
+                config.vocab_size,
+                vb.pp("lm_head"),
+            )?)
+        };
         let rope =
             RotaryEmbedding::new(rope_head_dim, config.max_seq_len, rope_theta, vb.device())?;
         Ok(Self {
@@ -949,7 +959,21 @@ impl Transformer {
         }
 
         let x = self.final_norm.forward(&x)?;
-        self.lm_head.forward(&x)
+        self.project_logits(&x)
+    }
+
+    /// Project hidden states to vocab logits — through lm_head, or through
+    /// the (live, load-aware) embedding matrix when weights are tied.
+    fn project_logits(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.lm_head {
+            Some(head) => head.forward(x),
+            None => {
+                let (b, l, h) = x.dims3()?;
+                let w = self.embedding.embeddings(); // [V, h]
+                let logits = x.reshape((b * l, h))?.matmul(&w.t()?)?;
+                logits.reshape((b, l, w.dim(0)?))
+            }
+        }
     }
 
     pub fn config(&self) -> &ModelDef {
@@ -997,7 +1021,7 @@ impl Transformer {
         state.pos += seq_len;
 
         let x = self.final_norm.forward(&x)?;
-        self.lm_head.forward(&x)
+        self.project_logits(&x)
     }
 }
 
@@ -1076,6 +1100,26 @@ mod tests {
             assert!(names.contains(&format!("layers.{i}.attention.q_proj.weight")));
             assert!(!names.contains(&format!("layers.{i}.ssm.in_proj.weight")));
         }
+    }
+
+    #[test]
+    fn test_tied_embeddings() {
+        let mut config = get_builtin_model("hybrid-tiny").unwrap();
+        config.vocab_size = 128;
+        config.embeddings.tie_weights = true;
+
+        let device = Device::Cpu;
+        let var_map = VarMap::new();
+        let vb = VarBuilder::from_varmap(&var_map, DType::F32, &device);
+        let model = Transformer::new(&config, vb).unwrap();
+
+        // No lm_head tensor when tied
+        let names: Vec<String> = var_map.data().lock().unwrap().keys().cloned().collect();
+        assert!(!names.iter().any(|n| n.starts_with("lm_head")));
+
+        let ids = Tensor::zeros((1, 6), DType::U32, &device).unwrap();
+        let logits = model.forward(&ids, 0, false).unwrap();
+        assert_eq!(logits.dims3().unwrap(), (1, 6, 128));
     }
 
     #[test]

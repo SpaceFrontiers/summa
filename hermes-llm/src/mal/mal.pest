@@ -214,7 +214,7 @@ num_heads_prop = { ("num_heads" | "n_heads" | "attention_heads") ~ ":" ~ integer
 num_kv_heads_prop = { ("num_kv_heads" | "kv_heads") ~ ":" ~ integer }
 
 // RoPE configuration
-rope_theta_prop = { "rope_theta" ~ ":" ~ number }
+rope_theta_prop = { ("rope_theta" | "theta") ~ ":" ~ number }
 rope_scaling_prop = { "rope_scaling" ~ ":" ~ number }
 
 // Normalization

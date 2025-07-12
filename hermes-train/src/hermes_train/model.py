@@ -385,14 +385,23 @@ class Transformer(nn.Module):
             for i in range(config.num_layers)
         )
         self.final_norm = make_norm(config, config.block_for_layer(0))
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Tied embeddings: no lm_head parameter at all (matches the Candle
+        # side — tied checkpoints contain no lm_head.weight tensor)
+        self.lm_head = (
+            None
+            if config.embeddings.tie_weights
+            else nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        )
         self.rope = RotaryEmbedding(rope_head_dim, config.max_seq_len, rope_theta)
 
     def forward(self, input_ids: Tensor, start_pos: int = 0) -> Tensor:
         x = self.embedding(input_ids)
         for layer in self.layers:
             x = layer(x, self.rope, start_pos)
-        return self.lm_head(self.final_norm(x))
+        x = self.final_norm(x)
+        if self.lm_head is None:
+            return F.linear(x, self.embedding.weight)
+        return self.lm_head(x)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

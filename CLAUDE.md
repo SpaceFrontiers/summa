@@ -48,7 +48,7 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-client-python**: Python gRPC client
 - **hermes-web**: Vue.js web UI
 
-LLM pipeline: `hermes-llm export --model <preset|.mal>` emits a JSON config → `hermes-train train` produces safetensors → `hermes-llm generate` serves them. Tensor names are a shared contract (`embedding.*`, `layers.{i}.attention.*` or `layers.{i}.ssm.*`, `layers.{i}.feed_forward.*`, `final_norm.*`, `lm_head.*`) — keep hermes-train/src/hermes_train/{config,model}.py in lockstep with hermes-llm/src/{mal/mod.rs,model.rs}.
+LLM pipeline: `hermes-llm export --model <preset|.mal>` emits a JSON config → `hermes-train train` produces safetensors → `hermes-llm generate` serves them. Tensor names are a shared contract (`embedding.*`, `layers.{i}.attention.*` or `layers.{i}.ssm.*`, `layers.{i}.feed_forward.*`, `final_norm.*`, `lm_head.*` — absent when embeddings.tie_weights) — keep hermes-train/src/hermes_train/{config,model}.py in lockstep with hermes-llm/src/{mal/mod.rs,model.rs}.
 
 MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `well-known/hybrid_tiny.mal`). Both sides implement Mamba-1: PyTorch trains with a reference fp32 scan (fused mamba-ssm kernels optional on CUDA), Candle serves with a sequential scan.
 
