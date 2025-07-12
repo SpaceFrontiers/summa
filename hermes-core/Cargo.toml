@@ -51,18 +51,18 @@ uuid = { workspace = true, optional = true }
 kentro = { version = "0.2", optional = true }
 ndarray = { version = "0.16", optional = true }
 nalgebra = { version = "0.34", optional = true }
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
+hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 
 # Native tokenizers with onig (C library) for full regex support
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
-version = "0.22"
+version = "0.23"
 default-features = false
 features = ["onig", "http"]
 optional = true
 
 # WASM tokenizers with fancy-regex (pure Rust, no C dependencies)
 [target.'cfg(target_arch = "wasm32")'.dependencies.tokenizers]
-version = "0.22"
+version = "0.23"
 default-features = false
 features = ["fancy-regex"]
 optional = true

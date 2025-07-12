@@ -17,9 +17,14 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-tool**: CLI for index management and data processing pipelines
 - **hermes-server**: gRPC server for remote search operations
 - **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
-- **hermes-llm**: LLM training framework (Candle ML, separate module)
+- **hermes-llm**: LLM inference + MAL architecture DSL (Candle; training lives in hermes-train)
+- **hermes-train**: PyTorch training for hermes-llm models (Python, uv; bf16, Muon+AdamW, DDP, DPO)
 - **hermes-client-python**: Python gRPC client
 - **hermes-web**: Vue.js web UI
+
+LLM pipeline: `hermes-llm export --model <preset|.mal>` emits a JSON config → `hermes-train train` produces safetensors → `hermes-llm generate` serves them. Tensor names are a shared contract (`embedding.*`, `layers.{i}.attention.*` or `layers.{i}.ssm.*`, `layers.{i}.feed_forward.*`, `final_norm.*`, `lm_head.*`) — keep hermes-train/src/hermes_train/{config,model}.py in lockstep with hermes-llm/src/{mal/mod.rs,model.rs}.
+
+MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `well-known/hybrid_tiny.mal`). Both sides implement Mamba-1: PyTorch trains with a reference fp32 scan (fused mamba-ssm kernels optional on CUDA), Candle serves with a sequential scan.
 
 ## Build Commands
 
@@ -39,6 +44,9 @@ cd hermes-wasm && bash build.sh
 
 # Build Python wheel
 cd hermes-core-python && maturin build --release
+
+# hermes-train (LLM training) tests
+cd hermes-train && uv sync && uv run pytest
 
 # Run pre-commit hooks (rustfmt, clippy, ruff, prettier)
 pre-commit run --all-files
@@ -148,7 +156,7 @@ gh run list --workflow=ci.yml --limit=5
 
 **Workflows:**
 
-- **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python lint, TypeScript build, cargo audit.
+- **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python lint, hermes-train tests, TypeScript build, cargo audit.
 - **publish.yml**: Manual trigger (`workflow_dispatch`). Bumps version, publishes to crates.io, NPM (WASM + TS client), PyPI, and GHCR Docker.
 
 ## Key Dependencies
@@ -157,4 +165,5 @@ gh run list --workflow=ci.yml --limit=5
 - **zstd**: Compression
 - **pest**: SDL parsing
 - **tonic/prost**: gRPC
-- **candle**: ML framework (hermes-llm)
+- **candle**: ML framework (hermes-llm inference)
+- **torch**: LLM training (hermes-train, Python)

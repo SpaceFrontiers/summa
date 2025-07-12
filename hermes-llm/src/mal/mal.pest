@@ -48,7 +48,7 @@
 file = { SOI ~ definition+ ~ EOI }
 
 // Top-level definitions
-definition = { attention_def | ffn_def | block_def | model_def }
+definition = { attention_def | ffn_def | ssm_def | block_def | model_def }
 
 // ============================================================================
 // ATTENTION DEFINITION
@@ -110,13 +110,32 @@ hidden_dim_prop = { ("hidden_dim" | "intermediate_size") ~ ":" ~ integer }
 gate_prop = { "gate" ~ ":" ~ boolean }
 
 // ============================================================================
+// SSM (MAMBA) DEFINITION
+// ============================================================================
+// Defines a selective state-space (Mamba) mixer
+ssm_def = { "ssm" ~ identifier ~ "{" ~ ssm_prop* ~ "}" }
+
+ssm_prop = {
+    state_dim_prop |
+    conv_kernel_prop |
+    expand_prop |
+    dt_rank_prop
+}
+
+state_dim_prop = { ("state_dim" | "d_state") ~ ":" ~ integer }
+conv_kernel_prop = { ("conv_kernel" | "d_conv") ~ ":" ~ integer }
+expand_prop = { "expand" ~ ":" ~ integer }
+dt_rank_prop = { "dt_rank" ~ ":" ~ integer }
+
+// ============================================================================
 // BLOCK DEFINITION
 // ============================================================================
-// Defines a transformer block combining attention and FFN
+// Defines a block: a mixer (attention OR ssm) + FFN
 block_def = { "block" ~ identifier ~ "{" ~ block_prop* ~ "}" }
 
 block_prop = {
     attention_ref_prop |
+    ssm_ref_prop |
     ffn_ref_prop |
     norm_prop |
     norm_position_prop |
@@ -124,12 +143,14 @@ block_prop = {
     dropout_prop
 }
 
-// Reference to defined attention/ffn or inline definition
+// Reference to defined attention/ssm/ffn or inline definition
 attention_ref_prop = { "attention" ~ ":" ~ (identifier | inline_attention) }
+ssm_ref_prop = { "ssm" ~ ":" ~ (identifier | inline_ssm) }
 ffn_ref_prop = { "ffn" ~ ":" ~ (identifier | inline_ffn) }
 
 // Inline definitions (anonymous)
 inline_attention = { "{" ~ attention_prop* ~ "}" }
+inline_ssm = { "{" ~ ssm_prop* ~ "}" }
 inline_ffn = { "{" ~ ffn_prop* ~ "}" }
 
 // Normalization configuration
@@ -153,6 +174,7 @@ model_prop = {
     max_seq_len_prop |
     hidden_size_prop |
     block_ref_prop |
+    pattern_prop |
     num_layers_prop |
     embeddings_prop |
     output_prop |
@@ -162,6 +184,10 @@ model_prop = {
 // Block reference or inline block definition (required for model)
 block_ref_prop = { "block" ~ ":" ~ (identifier | inline_block) }
 inline_block = { "{" ~ block_prop* ~ "}" }
+
+// Layer pattern: named blocks repeated cyclically across num_layers
+// e.g. pattern: [mamba_block, mamba_block, attn_block]
+pattern_prop = { "pattern" ~ ":" ~ "[" ~ identifier ~ ("," ~ identifier)* ~ ","? ~ "]" }
 
 // Embeddings configuration
 embeddings_prop = { "embeddings" ~ "{" ~ embedding_param* ~ "}" }

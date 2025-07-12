@@ -6,28 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "LLM training from scratch using Candle"
-keywords = ["llm", "transformer", "deep-learning", "gpt", "training"]
+description = "LLM inference and model definition (MAL) using Candle; training lives in hermes-train"
+keywords = ["llm", "transformer", "deep-learning", "gpt", "inference"]
 categories = ["science"]
 
 [dependencies]
 # Candle ML framework
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
-candle-flash-attn = { version = "0.9", optional = true }
-cudarc = { version = "0.19", optional = true, features = ["nccl", "cuda-version-from-build-system"] }
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+candle-flash-attn = { version = "0.11", optional = true }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
-tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Parser for Model Architecture Language (MAL)
-pest = "2.7"
-pest_derive = "2.7"
+pest = "2.8"
+pest_derive = "2.8"
 
 # Embed well-known model files
 rust-embed = { version = "8", features = ["include-exclude"] }
@@ -43,20 +42,9 @@ thiserror = { workspace = true }
 
 # Utilities
 rand = { workspace = true }
-rayon = { workspace = true }
-
-# Progress bar
-indicatif = "0.18"
-
-# Signal handling for graceful shutdown (pin to 3.4.x - 3.5.x has dispatch2/objc2 that fails on Linux CI)
-ctrlc = "~3.4"
 
 # HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
-
-# Compression support
-flate2 = "1.1"
-zstd = "0.13"
+hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -68,7 +56,6 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 flash-attn = ["cuda", "candle-flash-attn"]
-nccl = ["cuda", "dep:cudarc"]
 
 [[bin]]
 name = "hermes-llm"

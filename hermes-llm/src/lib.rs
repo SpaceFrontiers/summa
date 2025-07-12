@@ -1,19 +1,23 @@
 //! # Hermes LLM
 //!
-//! A Rust library for training and running Large Language Models from scratch.
+//! Inference and model-definition library for Hermes LLMs.
 //!
-//! ## Features
+//! Training lives in the `hermes-train` Python package (PyTorch); this crate
+//! covers everything needed to define and serve models:
 //!
 //! - **Model Architecture Language (MAL)**: Define any transformer architecture using a composable DSL
-//! - **Training**: Distributed training with NCCL, gradient accumulation, checkpointing
 //! - **Generation**: Text generation with temperature, top-k sampling
-//! - **Tokenization**: BPE tokenizer training and inference
-//! - **DPO**: Direct Preference Optimization for RLHF
+//! - **Tokenization**: HuggingFace tokenizer loading (local file or HF hub)
+//! - **Export**: MAL → JSON model config consumed by `hermes-train`
+//!
+//! Checkpoints are plain safetensors with a stable tensor-naming contract
+//! (`embedding.*`, `layers.{i}.attention.*`, `layers.{i}.feed_forward.*`,
+//! `final_norm.*`, `lm_head.*`) shared with `hermes-train`.
 //!
 //! ## Quick Start
 //!
 //! ```ignore
-//! use hermes_llm::{Transformer, Trainer, get_builtin_model};
+//! use hermes_llm::{Transformer, get_builtin_model};
 //!
 //! // Load a predefined model architecture
 //! let model_def = get_builtin_model("tiny").unwrap();
@@ -52,29 +56,16 @@
 //! }
 //! ```
 
-pub mod config;
-pub mod data;
-pub mod distributed;
-pub mod dpo;
 pub mod generate;
-pub mod io;
 pub mod mal;
 pub mod model;
 pub mod tokenizer;
-pub mod training;
 
 // Core types
-pub use config::TrainingConfig;
 pub use model::Transformer;
 
-// Training
-pub use training::{Trainer, TrainingState, create_progress_bar};
-
 // Generation
-pub use generate::{TextGenerator, get_lr_with_warmup};
-
-// Distributed
-pub use distributed::{DistributedConfig, NcclCommunicator};
+pub use generate::TextGenerator;
 
 // Model Architecture Language (MAL)
 pub use mal::{
@@ -83,8 +74,5 @@ pub use mal::{
     parse_mal_file, parse_mal_full,
 };
 
-// Data loading
-pub use data::{DataLoader, Dataset};
-
 // Tokenization
-pub use tokenizer::{BPETrainer, Tokenizer};
+pub use tokenizer::Tokenizer;

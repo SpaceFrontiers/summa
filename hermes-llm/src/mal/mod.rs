@@ -147,6 +147,32 @@ pub enum Activation {
     GELUTanh,
 }
 
+/// Selective state-space (Mamba) mixer definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsmDef {
+    pub name: String,
+    /// SSM state dimension N (default 16)
+    pub state_dim: usize,
+    /// Depthwise causal conv kernel width (default 4)
+    pub conv_kernel: usize,
+    /// Inner expansion factor: d_inner = expand * hidden_size (default 2)
+    pub expand: usize,
+    /// Δ projection rank (default ceil(hidden_size / 16))
+    pub dt_rank: Option<usize>,
+}
+
+impl Default for SsmDef {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            state_dim: 16,
+            conv_kernel: 4,
+            expand: 2,
+            dt_rank: None,
+        }
+    }
+}
+
 /// Feed-forward network definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FfnDef {
@@ -172,15 +198,69 @@ impl Default for FfnDef {
 }
 
 /// Transformer block definition
+///
+/// The mixer is attention by default; when `ssm` is set the block is a
+/// Mamba block (attention settings are ignored).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockDef {
     pub name: String,
     pub attention: AttentionDef,
+    #[serde(default)]
+    pub ssm: Option<SsmDef>,
     pub ffn: FfnDef,
     pub norm: NormConfig,
     pub norm_position: NormPosition,
     pub residual: bool,
     pub dropout: f64,
+}
+
+impl BlockDef {
+    pub fn is_ssm(&self) -> bool {
+        self.ssm.is_some()
+    }
+
+    // Per-block computed properties (pattern-aware model construction)
+
+    pub fn num_heads(&self) -> usize {
+        self.attention.num_heads.unwrap_or(12)
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        self.attention.num_kv_heads.unwrap_or(self.num_heads())
+    }
+
+    pub fn head_dim(&self, hidden_size: usize) -> usize {
+        self.attention
+            .head_dim
+            .unwrap_or(hidden_size / self.num_heads())
+    }
+
+    pub fn intermediate_size(&self, hidden_size: usize) -> usize {
+        self.ffn.hidden_dim.unwrap_or(hidden_size * 4)
+    }
+
+    pub fn use_bias(&self) -> bool {
+        self.ffn.bias || self.attention.bias
+    }
+
+    pub fn norm_eps(&self) -> f64 {
+        if self.norm.eps > 0.0 {
+            self.norm.eps
+        } else {
+            1e-5
+        }
+    }
+
+    pub fn rope_theta(&self) -> f64 {
+        match &self.attention.position_encoding {
+            PositionEncoding::Rope { theta, .. } => *theta,
+            _ => 10000.0,
+        }
+    }
+
+    pub fn use_swiglu(&self) -> bool {
+        matches!(self.ffn.activation, Activation::SwiGLU)
+    }
 }
 
 /// Normalization position in block
@@ -196,6 +276,7 @@ impl Default for BlockDef {
         Self {
             name: "default".to_string(),
             attention: AttentionDef::default(),
+            ssm: None,
             ffn: FfnDef::default(),
             norm: NormConfig {
                 norm_type: NormType::RmsNorm,
@@ -233,6 +314,10 @@ pub struct ModelDef {
     pub hidden_size: usize,
     pub num_layers: usize,
     pub block: BlockDef,
+    /// Optional heterogeneous layer pattern, repeated cyclically across
+    /// num_layers (e.g. [mamba, mamba, attn]). Overrides `block` when set.
+    #[serde(default)]
+    pub pattern: Option<Vec<BlockDef>>,
     pub embeddings: EmbeddingsConfig,
     pub output: OutputConfig,
 }
@@ -247,6 +332,7 @@ impl Default for ModelDef {
             hidden_size: 768,
             num_layers: 12,
             block: BlockDef::default(),
+            pattern: None,
             embeddings: EmbeddingsConfig::default(),
             output: OutputConfig::default(),
         }
@@ -313,6 +399,20 @@ impl ModelDef {
     // ========================================================================
     // Computed properties for model construction
     // ========================================================================
+
+    /// Block definition for layer `i`: cycles through `pattern` when set,
+    /// otherwise the homogeneous `block`.
+    pub fn block_for_layer(&self, i: usize) -> &BlockDef {
+        match &self.pattern {
+            Some(p) if !p.is_empty() => &p[i % p.len()],
+            _ => &self.block,
+        }
+    }
+
+    /// Effective Δ rank for an SSM mixer (paper default: ceil(hidden/16))
+    pub fn dt_rank(&self, ssm: &SsmDef) -> usize {
+        ssm.dt_rank.unwrap_or(self.hidden_size.div_ceil(16))
+    }
 
     pub fn num_heads(&self) -> usize {
         self.block.attention.num_heads.unwrap_or(12)
@@ -395,6 +495,7 @@ impl ModelDef {
 #[derive(Debug, Clone, Default)]
 pub struct MalFile {
     pub attentions: HashMap<String, AttentionDef>,
+    pub ssms: HashMap<String, SsmDef>,
     pub ffns: HashMap<String, FfnDef>,
     pub blocks: HashMap<String, BlockDef>,
     pub models: HashMap<String, ModelDef>,
@@ -467,6 +568,21 @@ fn parse_model_prop(
                     }
                 }
             }
+            Rule::pattern_prop => {
+                let mut blocks = Vec::new();
+                for child in inner.into_inner() {
+                    if child.as_rule() == Rule::identifier {
+                        let name = child.as_str();
+                        let block = file.blocks.get(name).ok_or_else(|| {
+                            anyhow!("pattern references undefined block '{}'", name)
+                        })?;
+                        blocks.push(block.clone());
+                    }
+                }
+                if !blocks.is_empty() {
+                    def.pattern = Some(blocks);
+                }
+            }
             Rule::description_prop => {
                 if let Some(val) = inner.into_inner().next() {
                     let s = val.as_str();
@@ -527,6 +643,10 @@ pub fn parse_mal_full(input: &str) -> Result<MalFile> {
                             Rule::attention_def => {
                                 let attn = parse_attention_def(def)?;
                                 file.attentions.insert(attn.name.clone(), attn);
+                            }
+                            Rule::ssm_def => {
+                                let ssm = parse_ssm_def(def)?;
+                                file.ssms.insert(ssm.name.clone(), ssm);
                             }
                             Rule::ffn_def => {
                                 let ffn = parse_ffn_def(def)?;
@@ -602,6 +722,54 @@ fn parse_attention_prop(pair: pest::iterators::Pair<Rule>, def: &mut AttentionDe
             Rule::window_size_prop => {
                 if let Some(val) = inner.into_inner().next() {
                     def.window_size = Some(val.as_str().parse()?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse an SSM (Mamba) definition
+fn parse_ssm_def(pair: pest::iterators::Pair<Rule>) -> Result<SsmDef> {
+    let mut def = SsmDef::default();
+    let mut inner = pair.into_inner();
+
+    if let Some(name) = inner.next() {
+        def.name = name.as_str().to_string();
+    }
+
+    for prop in inner {
+        if prop.as_rule() == Rule::ssm_prop {
+            parse_ssm_prop(prop, &mut def)?;
+        }
+    }
+
+    Ok(def)
+}
+
+/// Parse SSM properties
+fn parse_ssm_prop(pair: pest::iterators::Pair<Rule>, def: &mut SsmDef) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::state_dim_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.state_dim = val.as_str().parse()?;
+                }
+            }
+            Rule::conv_kernel_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.conv_kernel = val.as_str().parse()?;
+                }
+            }
+            Rule::expand_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.expand = val.as_str().parse()?;
+                }
+            }
+            Rule::dt_rank_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.dt_rank = Some(val.as_str().parse()?);
                 }
             }
             _ => {}
@@ -707,6 +875,28 @@ fn parse_block_prop(
                                 }
                             }
                             def.attention = attn;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::ssm_ref_prop => {
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            if let Some(ssm) = file.ssms.get(name) {
+                                def.ssm = Some(ssm.clone());
+                            }
+                        }
+                        Rule::inline_ssm => {
+                            let mut ssm = SsmDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::ssm_prop {
+                                    parse_ssm_prop(prop, &mut ssm)?;
+                                }
+                            }
+                            def.ssm = Some(ssm);
                         }
                         _ => {}
                     }
@@ -942,6 +1132,85 @@ mod tests {
 
         let def = parse_mal(mal).unwrap();
         assert_eq!(def.vocab_size, 1000);
+    }
+
+    #[test]
+    fn test_parse_hybrid_ssm_pattern() {
+        let mal = r#"
+            attention h_attn {
+                num_heads: 4
+                bias: false
+            }
+
+            ssm h_ssm {
+                state_dim: 16
+                conv_kernel: 4
+                expand: 2
+            }
+
+            ffn h_ffn {
+                hidden_dim: 512
+                activation: swiglu
+                bias: false
+            }
+
+            block attn_block {
+                attention: h_attn
+                ffn: h_ffn
+                norm: rmsnorm { eps: 1e-5 }
+                norm_position: pre
+            }
+
+            block mamba_block {
+                ssm: h_ssm
+                ffn: h_ffn
+                norm: rmsnorm { eps: 1e-5 }
+                norm_position: pre
+            }
+
+            model hybrid {
+                vocab_size: 1000
+                max_seq_len: 128
+                hidden_size: 64
+                num_layers: 6
+                block: attn_block
+                pattern: [mamba_block, mamba_block, attn_block]
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.num_layers, 6);
+
+        let pattern = def.pattern.as_ref().unwrap();
+        assert_eq!(pattern.len(), 3);
+        assert!(pattern[0].is_ssm());
+        assert!(pattern[1].is_ssm());
+        assert!(!pattern[2].is_ssm());
+
+        // Cyclic layer assignment
+        assert!(def.block_for_layer(0).is_ssm());
+        assert!(!def.block_for_layer(2).is_ssm());
+        assert!(def.block_for_layer(3).is_ssm());
+        assert!(!def.block_for_layer(5).is_ssm());
+
+        let ssm = pattern[0].ssm.as_ref().unwrap();
+        assert_eq!(ssm.state_dim, 16);
+        assert_eq!(ssm.conv_kernel, 4);
+        assert_eq!(ssm.expand, 2);
+        assert_eq!(def.dt_rank(ssm), 4); // ceil(64/16)
+
+        // JSON roundtrip keeps the hybrid structure
+        let json = serde_json::to_string(&def).unwrap();
+        let back: ModelDef = serde_json::from_str(&json).unwrap();
+        assert!(back.pattern.as_ref().unwrap()[0].is_ssm());
+
+        // Legacy JSON without ssm/pattern still deserializes
+        let legacy: ModelDef = serde_json::from_str(
+            &serde_json::to_string(&get_builtin_model("tiny").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.pattern.is_none());
+        assert!(!legacy.block.is_ssm());
     }
 
     #[test]

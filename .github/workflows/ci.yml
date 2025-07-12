@@ -123,6 +123,25 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
 
+  # hermes-train tests (CPU-only torch via the pytorch-cpu index in pyproject)
+  hermes-train:
+    name: Hermes Train Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "hermes-train/uv.lock"
+
+      - name: Run tests
+        working-directory: hermes-train
+        run: |
+          uv sync
+          uv run pytest
+
   # TypeScript client - build check
   typescript:
     name: TypeScript Client

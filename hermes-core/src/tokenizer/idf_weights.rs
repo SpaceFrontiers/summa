@@ -228,10 +228,18 @@ impl IdfWeightsCache {
     /// Load idf.json bytes, preferring the HF hub's local cache (no network)
     /// and only downloading if not already cached.
     fn download_idf_json(&self, model_name: &str) -> Result<Vec<u8>> {
+        let client = hf_hub::HFClientSync::new()
+            .map_err(|e| Error::Tokenizer(format!("Failed to create HF hub client: {}", e)))?;
+        let (owner, name) = hf_hub::split_id(model_name);
+        let repo = client.model(owner, name);
+
         // Check HF hub's disk cache first — no network request
-        let cache = hf_hub::Cache::from_env();
-        let cache_repo = cache.model(model_name.to_string());
-        if let Some(cached_path) = cache_repo.get("idf.json") {
+        if let Ok(cached_path) = repo
+            .download_file()
+            .filename("idf.json")
+            .local_files_only(true)
+            .send()
+        {
             debug!(
                 "Loaded idf.json from HF cache: {:?} for model '{}'",
                 cached_path, model_name
@@ -245,15 +253,16 @@ impl IdfWeightsCache {
         }
 
         // Not in cache — download via API
-        let api = hf_hub::api::sync::Api::new()
-            .map_err(|e| Error::Tokenizer(format!("Failed to create HF hub API: {}", e)))?;
-        let repo = api.model(model_name.to_string());
-        let idf_path = repo.get("idf.json").map_err(|e| {
-            Error::Tokenizer(format!(
-                "Failed to download idf.json from '{}': {}",
-                model_name, e
-            ))
-        })?;
+        let idf_path = repo
+            .download_file()
+            .filename("idf.json")
+            .send()
+            .map_err(|e| {
+                Error::Tokenizer(format!(
+                    "Failed to download idf.json from '{}': {}",
+                    model_name, e
+                ))
+            })?;
 
         debug!(
             "Downloaded idf.json from '{}' to {:?}",

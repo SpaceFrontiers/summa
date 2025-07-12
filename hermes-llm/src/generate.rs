@@ -4,7 +4,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use rand::Rng;
 
-use crate::model::Transformer;
+use crate::model::{InferenceState, Transformer};
 
 /// Text generator for autoregressive text generation.
 pub struct TextGenerator<'a> {
@@ -17,7 +17,28 @@ impl<'a> TextGenerator<'a> {
         Self { model, device }
     }
 
+    /// Prefill `context` into a fresh inference state and return the
+    /// last-position logits.
+    fn prefill(&self, context: &[u32]) -> Result<(InferenceState, Tensor)> {
+        let mut state = self.model.make_state(1, self.device)?;
+        let input = Tensor::new(context, self.device)?
+            .unsqueeze(0)?
+            .to_dtype(DType::U32)?;
+        let logits = self.model.forward_with_state(&input, &mut state)?;
+        let last = logits
+            .narrow(1, context.len() - 1, 1)?
+            .squeeze(1)?
+            .squeeze(0)?;
+        Ok((state, last))
+    }
+
     /// Generate tokens autoregressively from a prompt.
+    ///
+    /// Incremental inference: the prompt is prefilled once, then each new
+    /// token is a single forward step — Mamba layers advance an O(1)
+    /// recurrent state, attention layers extend a KV cache. When the context
+    /// window fills up, generation re-prefills from the last half window
+    /// (amortized, replacing the old full-recompute-per-token behavior).
     ///
     /// # Arguments
     /// * `prompt_tokens` - Initial token sequence
@@ -31,38 +52,40 @@ impl<'a> TextGenerator<'a> {
         temperature: f64,
         top_k: Option<usize>,
     ) -> Result<Vec<u32>> {
+        let max_seq_len = self.model.config().max_seq_len;
         let mut tokens = prompt_tokens.to_vec();
         let mut rng = rand::rng();
 
+        let context_len = tokens.len().min(max_seq_len);
+        let (mut state, mut last_logits) = self.prefill(&tokens[tokens.len() - context_len..])?;
+
         for _ in 0..max_new_tokens {
-            let context_len = tokens.len().min(self.model.config().max_seq_len);
-            let context: Vec<u32> = tokens[tokens.len() - context_len..].to_vec();
-
-            let input = Tensor::new(context.as_slice(), self.device)?
-                .unsqueeze(0)?
-                .to_dtype(DType::U32)?;
-
-            let logits = self.model.forward(&input, 0, false)?;
-            // Shape: [1, seq_len, vocab] -> [1, 1, vocab] -> [vocab]
-            let logits = logits
-                .narrow(1, context_len - 1, 1)?
-                .squeeze(1)?
-                .squeeze(0)?;
-
             let logits = if temperature != 1.0 {
-                logits.affine(1.0 / temperature, 0.0)?
+                last_logits.affine(1.0 / temperature, 0.0)?
             } else {
-                logits
+                last_logits.clone()
             };
-
             let logits = if let Some(k) = top_k {
                 top_k_filter(&logits, k, self.device)?
             } else {
                 logits
             };
-
             let next_token = sample_from_logits(&logits, &mut rng)?;
             tokens.push(next_token);
+
+            if state.pos() >= max_seq_len {
+                // Context full: rebuild state from the last half window
+                let keep = max_seq_len / 2;
+                let (new_state, logits) = self.prefill(&tokens[tokens.len() - keep..])?;
+                state = new_state;
+                last_logits = logits;
+            } else {
+                let input = Tensor::new(&[next_token], self.device)?
+                    .unsqueeze(0)?
+                    .to_dtype(DType::U32)?;
+                let logits = self.model.forward_with_state(&input, &mut state)?;
+                last_logits = logits.squeeze(1)?.squeeze(0)?;
+            }
         }
 
         Ok(tokens)
@@ -100,21 +123,4 @@ fn sample_from_logits(logits: &Tensor, rng: &mut impl Rng) -> Result<u32> {
     let next_token = cumsum.iter().position(|&p| p > r).unwrap_or(0) as u32;
 
     Ok(next_token)
-}
-
-/// Cosine learning rate schedule with warmup.
-pub fn get_lr_with_warmup(
-    step: usize,
-    warmup_steps: usize,
-    max_lr: f64,
-    min_lr: f64,
-    total_steps: usize,
-) -> f64 {
-    if step < warmup_steps {
-        max_lr * (step as f64 / warmup_steps as f64)
-    } else {
-        let decay_ratio = (step - warmup_steps) as f64 / (total_steps - warmup_steps) as f64;
-        let coeff = 0.5 * (1.0 + (std::f64::consts::PI * decay_ratio).cos());
-        min_lr + coeff * (max_lr - min_lr)
-    }
 }
