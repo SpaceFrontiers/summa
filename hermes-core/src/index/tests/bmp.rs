@@ -2837,8 +2837,12 @@ async fn test_failed_reorder_leaves_no_orphan_files() {
         "failed reorder must delete its partial output files"
     );
 
-    // Sweep: stray segment files (failed-pass leftovers) are deleted...
+    // A deletion handed to the async callback must remain protected until
+    // that filesystem attempt completes. Production previously let the
+    // sweeper race the callback and report successfully replaced sources as
+    // failed-output orphans.
     let orphan_hex = "00000000000000000000000000000abc";
+    let orphan_id = crate::segment::SegmentId::from_hex(orphan_hex).unwrap();
     use crate::directories::DirectoryWriter;
     dir.write(
         std::path::Path::new(&format!("seg_{orphan_hex}.store")),
@@ -2852,6 +2856,30 @@ async fn test_failed_reorder_leaves_no_orphan_files() {
     )
     .await
     .unwrap();
+
+    let tracker = index.segment_manager().tracker();
+    tracker.register(orphan_hex);
+    let scheduled = tracker.mark_for_deletion(&[orphan_hex.to_string()]);
+    assert_eq!(scheduled, vec![orphan_id]);
+    assert!(tracker.is_deletion_protected(orphan_hex));
+
+    let swept = index
+        .segment_manager()
+        .cleanup_orphan_segments()
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 0,
+        "orphan sweep must not race an already scheduled deletion"
+    );
+    assert!(
+        seg_files(&dir).await.contains(&orphan_hex.to_string()),
+        "scheduled files must remain untouched by the sweeper"
+    );
+
+    // If the async filesystem attempt failed, completing the handoff allows
+    // the next sweep to retry and remove the actual orphan.
+    tracker.complete_deletion(&scheduled);
     let swept = index
         .segment_manager()
         .cleanup_orphan_segments()

@@ -233,21 +233,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = {
             let dir = Arc::clone(&directory);
+            let tracker = Arc::clone(&tracker);
             Arc::new(move |segment_ids| {
                 // Guard: if the tokio runtime is gone (program exit), skip async
                 // deletion. Segment files become orphans cleaned up on next startup.
                 let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    // Release in-process protection as well: if the process is
+                    // still alive, a later sweep must be able to retry.
+                    tracker.complete_deletion(&segment_ids);
                     return;
                 };
                 let dir = Arc::clone(&dir);
+                let tracker = Arc::clone(&tracker);
                 handle.spawn(async move {
-                    for segment_id in segment_ids {
+                    for &segment_id in &segment_ids {
                         log::info!(
                             "[segment_cleanup] deleting deferred segment {}",
                             segment_id.0
                         );
                         let _ = crate::segment::delete_segment(dir.as_ref(), segment_id).await;
                     }
+                    tracker.complete_deletion(&segment_ids);
                 });
             })
         };
@@ -661,9 +667,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.tracker.mark_for_deletion(old_ids)
         };
 
-        for segment_id in ready_to_delete {
+        for &segment_id in &ready_to_delete {
             let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
         }
+        self.tracker.complete_deletion(&ready_to_delete);
         Ok(())
     }
 
@@ -1186,7 +1193,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let st = self.state.lock().await;
             if st.metadata.has_segment(hex_id)
                 || self.merge_inventory.contains(hex_id)
-                || self.tracker.is_pending_deletion(hex_id)
+                || self.tracker.is_deletion_protected(hex_id)
             {
                 continue;
             }

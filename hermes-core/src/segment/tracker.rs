@@ -7,7 +7,7 @@
 //!
 //! Uses a single `parking_lot::Mutex` for all state (sub-μs holds, needed for sync Drop).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -18,6 +18,8 @@ use crate::segment::SegmentId;
 struct TrackerInner {
     ref_counts: HashMap<String, usize>,
     pending_deletions: HashMap<String, SegmentId>,
+    /// IDs handed to a deletion callback but not finished on disk yet.
+    scheduled_deletions: HashSet<String>,
 }
 
 /// Tracks segment references and pending deletions
@@ -32,6 +34,7 @@ impl SegmentTracker {
             inner: Mutex::new(TrackerInner {
                 ref_counts: HashMap::new(),
                 pending_deletions: HashMap::new(),
+                scheduled_deletions: HashSet::new(),
             }),
         }
     }
@@ -48,7 +51,7 @@ impl SegmentTracker {
         let mut inner = self.inner.lock();
         let mut acquired = Vec::with_capacity(segment_ids.len());
         for id in segment_ids {
-            if inner.pending_deletions.contains_key(id) {
+            if inner.pending_deletions.contains_key(id) || inner.scheduled_deletions.contains(id) {
                 continue;
             }
             *inner.ref_counts.entry(id.clone()).or_insert(0) += 1;
@@ -71,6 +74,7 @@ impl SegmentTracker {
                     && let Some(segment_id) = inner.pending_deletions.remove(id)
                 {
                     inner.ref_counts.remove(id);
+                    inner.scheduled_deletions.insert(id.clone());
                     ready_for_deletion.push(segment_id);
                 }
             }
@@ -98,6 +102,7 @@ impl SegmentTracker {
 
             if ref_count == 0 {
                 inner.ref_counts.remove(id_str);
+                inner.scheduled_deletions.insert(id_str.clone());
                 ready_for_deletion.push(segment_id);
             } else {
                 inner.pending_deletions.insert(id_str.clone(), segment_id);
@@ -110,6 +115,29 @@ impl SegmentTracker {
     /// Check if a segment is pending deletion
     pub fn is_pending_deletion(&self, segment_id: &str) -> bool {
         self.inner.lock().pending_deletions.contains_key(segment_id)
+    }
+
+    /// Whether files must remain protected from orphan sweeping.
+    ///
+    /// This covers both segments waiting for readers and segments whose last
+    /// reader released them but whose asynchronous filesystem deletion has
+    /// not completed yet. Moving between those states is atomic under the
+    /// tracker lock, so the sweeper cannot race the deletion callback.
+    pub fn is_deletion_protected(&self, segment_id: &str) -> bool {
+        let inner = self.inner.lock();
+        inner.pending_deletions.contains_key(segment_id)
+            || inner.scheduled_deletions.contains(segment_id)
+    }
+
+    /// Finish the scheduled-deletion lifecycle after the filesystem attempt.
+    ///
+    /// Failed deletes are also completed here so a later orphan sweep can
+    /// retry them instead of protecting the files forever.
+    pub fn complete_deletion(&self, segment_ids: &[SegmentId]) {
+        let mut inner = self.inner.lock();
+        for segment_id in segment_ids {
+            inner.scheduled_deletions.remove(&segment_id.to_hex());
+        }
     }
 
     /// Get the number of active references for a segment
@@ -246,6 +274,10 @@ mod tests {
         let ready = tracker.mark_for_deletion(&[SEG1.to_string()]);
         assert_eq!(ready.len(), 1);
         assert!(!tracker.is_pending_deletion(SEG1));
+        assert!(tracker.is_deletion_protected(SEG1));
+
+        tracker.complete_deletion(&ready);
+        assert!(!tracker.is_deletion_protected(SEG1));
     }
 
     #[test]
@@ -262,6 +294,10 @@ mod tests {
         let deleted = tracker.release(&[SEG1.to_string()]);
         assert_eq!(deleted.len(), 1);
         assert!(!tracker.is_pending_deletion(SEG1));
+        assert!(tracker.is_deletion_protected(SEG1));
+
+        tracker.complete_deletion(&deleted);
+        assert!(!tracker.is_deletion_protected(SEG1));
     }
 
     #[test]
@@ -328,5 +364,14 @@ mod tests {
         assert_eq!(delete_count.load(Ordering::SeqCst), 2);
         assert!(!tracker.is_pending_deletion(SEG1));
         assert!(!tracker.is_pending_deletion(SEG2));
+        assert!(tracker.is_deletion_protected(SEG1));
+        assert!(tracker.is_deletion_protected(SEG2));
+
+        tracker.complete_deletion(&[
+            SegmentId::from_hex(SEG1).unwrap(),
+            SegmentId::from_hex(SEG2).unwrap(),
+        ]);
+        assert!(!tracker.is_deletion_protected(SEG1));
+        assert!(!tracker.is_deletion_protected(SEG2));
     }
 }
