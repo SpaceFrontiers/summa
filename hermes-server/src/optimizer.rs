@@ -1,6 +1,6 @@
 //! Background segment optimizer — reorders unreordered segments via BP.
 //!
-//! Runs as a set of tokio tasks bounded by a semaphore. Periodically scans
+//! Runs as a set of tokio tasks bounded by a whole-pass semaphore. Periodically scans
 //! all indexes for segments that haven't been reordered and applies Recursive
 //! Graph Bisection (BP) to improve BMP block clustering.
 //!
@@ -11,15 +11,19 @@ use std::time::{Duration, Instant};
 
 use hermes_core::segment::BpBudget;
 use log::{debug, info, warn};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::registry::IndexRegistry;
 
 /// Background optimizer configuration.
 #[derive(Debug, Clone)]
 pub struct OptimizerConfig {
-    /// Number of concurrent optimizer threads (0 = disabled).
+    /// Width of the shared BP Rayon pool (0 = optimizer disabled).
     pub threads: usize,
+    /// Number of whole-segment optimizer tasks admitted at once. A second,
+    /// application-wide gate shared with merge-time/manual BP enforces the
+    /// same limit across every producer.
+    pub concurrent_passes: usize,
     /// Interval between scans for unreordered segments.
     pub scan_interval: Duration,
     /// Segments with at least this many docs get a *budgeted* BP pass
@@ -102,36 +106,16 @@ pub fn spawn_optimizer(
     }
 
     info!(
-        "Starting background optimizer: {} threads, {:.0}s scan interval",
+        "Starting background optimizer: {} shared BP threads, {} concurrent pass(es), {:.0}s scan interval",
         config.threads,
+        config.concurrent_passes,
         config.scan_interval.as_secs_f64(),
     );
 
-    let semaphore = Arc::new(Semaphore::new(config.threads));
-
-    // Dedicated bounded rayon pool for BP computation, shared across all
-    // concurrent reorder tasks.
-    //
-    // Sized at max(threads, cores/2), NOT just `threads`: `threads` bounds
-    // how many segments are rewritten concurrently (the semaphore), while
-    // the pool bounds how wide a SINGLE BP pass can fan out (recursive
-    // bisection halves via rayon::join + parallel gain computation). A lone
-    // deepening pass on a 10M+ doc segment should use the same cores/2 slice
-    // the merge-time BP pool gets, not serialize onto 4 threads.
-    let bp_pool_threads = std::thread::available_parallelism()
-        .map(|c| c.get() / 2)
-        .unwrap_or(config.threads)
-        .max(config.threads);
-    let rayon_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(bp_pool_threads)
-            .thread_name(|idx| format!("optimizer-bp-{}", idx))
-            .build()
-            .expect("failed to create optimizer rayon pool"),
-    );
+    let semaphore = Arc::new(Semaphore::new(config.concurrent_passes.max(1)));
 
     Some(tokio::spawn(async move {
-        optimizer_loop(registry, semaphore, rayon_pool, config).await;
+        optimizer_loop(registry, semaphore, config).await;
     }))
 }
 
@@ -139,7 +123,6 @@ pub fn spawn_optimizer(
 async fn optimizer_loop(
     registry: Arc<IndexRegistry>,
     semaphore: Arc<Semaphore>,
-    rayon_pool: Arc<rayon::ThreadPool>,
     config: OptimizerConfig,
 ) {
     // Initial delay: let the server finish startup before scanning.
@@ -148,10 +131,17 @@ async fn optimizer_loop(
     // A timed-out pass replaces its source with a new unconverged segment ID.
     // Gate that lineage globally and start its cooldown only when work ends.
     let deepening_gate = Arc::new(DeepeningGate::default());
+    let mut next_index = 0usize;
 
     loop {
-        if let Err(e) =
-            scan_and_optimize(&registry, &semaphore, &rayon_pool, &config, &deepening_gate).await
+        if let Err(e) = scan_and_optimize(
+            &registry,
+            &semaphore,
+            &config,
+            &deepening_gate,
+            &mut next_index,
+        )
+        .await
         {
             warn!("[optimizer] scan failed: {}", e);
         }
@@ -162,18 +152,24 @@ async fn optimizer_loop(
 
 /// One scan cycle: list indexes, find candidates, spawn reorder tasks.
 ///
-/// Priority: never-reordered segments first (small ones full-depth, large
-/// ones budgeted). When none exist, revisit unconverged segments (previous
-/// pass hit its wall-clock budget) after a cooldown — those passes
-/// warm-start and deepen.
+/// Priority: one cooldown-eligible unconverged segment first so continuous
+/// ingestion cannot starve deepening, then never-reordered segments ordered
+/// small-first. Deepening passes warm-start from the previous layout.
 async fn scan_and_optimize(
     registry: &IndexRegistry,
     semaphore: &Arc<Semaphore>,
-    rayon_pool: &Arc<rayon::ThreadPool>,
     config: &OptimizerConfig,
     deepening_gate: &Arc<DeepeningGate>,
+    next_index: &mut usize,
 ) -> Result<(), tonic::Status> {
-    let index_names = registry.list_indexes().await?;
+    let mut index_names = registry.list_indexes().await?;
+    // A busy first index used to consume every slot on every scan. Rotate the
+    // starting point so continuously ingesting indexes cannot starve peers.
+    if !index_names.is_empty() {
+        let start = *next_index % index_names.len();
+        index_names.rotate_left(start);
+        *next_index = (start + 1) % index_names.len();
+    }
 
     for name in index_names {
         // Open index (cheap if already cached)
@@ -218,10 +214,13 @@ async fn scan_and_optimize(
 
         // Fresh (never-reordered) segments first — they are typically small
         // memtable flushes that finish in sub-second passes.
-        let fresh = segment_manager.unreordered_segments().await;
-        let mut candidates: Vec<(String, u32, Option<DeepeningPermit>)> = fresh
+        let mut fresh = segment_manager.unreordered_segments().await;
+        // Short passes first increase throughput and release memory quickly;
+        // ID is a deterministic tie-break for reproducible scheduling.
+        fresh.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut candidates: Vec<(String, u32, bool)> = fresh
             .into_iter()
-            .map(|(id, docs)| (id, docs, None))
+            .map(|(id, docs)| (id, docs, false))
             .collect();
 
         // Deepening is cooldown-paced but NOT starved by fresh work: under
@@ -230,15 +229,14 @@ async fn scan_and_optimize(
         // budget-truncated segment per cooldown window (each follow-up is a
         // full segment rewrite; it warm-starts from the previous order and
         // deepens toward block-granularity).
-        let unconverged = segment_manager.unconverged_segments().await;
-        if let Some((id, docs)) = unconverged.into_iter().next()
-            && let Some(permit) = deepening_gate.try_acquire(config.unconverged_cooldown)
-        {
-            debug!(
-                "[optimizer] index '{}': deepening unconverged segment {} ({} docs)",
-                name, id, docs,
-            );
-            candidates.push((id, docs, Some(permit)));
+        let mut unconverged = segment_manager.unconverged_segments().await;
+        unconverged.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some((id, docs)) = unconverged.into_iter().next() {
+            // Put deepening first so an endless stream of fresh flushes cannot
+            // consume every slot. The cooldown gate is acquired only after a
+            // scheduler slot exists; merely discovering a candidate must not
+            // start its cooldown.
+            candidates.insert(0, (id, docs, true));
         }
 
         if candidates.is_empty() {
@@ -251,21 +249,36 @@ async fn scan_and_optimize(
             candidates.len()
         );
 
-        for (seg_id, num_docs, deepening_permit) in candidates {
-            let is_deepening = deepening_permit.is_some();
-            // Acquire semaphore permit to bound concurrency
-            let permit = match semaphore.clone().acquire_owned().await {
+        for (seg_id, num_docs, is_deepening) in candidates {
+            // Never stall the entire index scan behind long-running tasks.
+            // Filled capacity is normal; the next periodic scan retries.
+            let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => {
-                    // Semaphore closed — shutting down
-                    return Ok(());
+                Err(TryAcquireError::NoPermits) => break,
+                Err(TryAcquireError::Closed) => return Ok(()),
+            };
+            let deepening_permit = if is_deepening {
+                match deepening_gate.try_acquire(config.unconverged_cooldown) {
+                    Some(permit) => {
+                        debug!(
+                            "[optimizer] index '{}': deepening unconverged segment {} ({} docs)",
+                            name, seg_id, num_docs,
+                        );
+                        Some(permit)
+                    }
+                    None => {
+                        drop(permit);
+                        continue;
+                    }
                 }
+            } else {
+                None
             };
 
             let sm = Arc::clone(&segment_manager);
             let idx_name = name.clone();
             let sid = seg_id.clone();
-            let pool = Arc::clone(rayon_pool);
+            let pool = segment_manager.background_cpu_pool();
 
             // Size-tiered budget: small segments get full-depth BP (seconds of
             // work); large ones get a depth- and wall-clock-budgeted FIRST

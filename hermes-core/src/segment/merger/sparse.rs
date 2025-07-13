@@ -14,6 +14,7 @@
 //! The raw block bytes are copied directly from mmap.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use super::OffsetWriter;
 use super::SegmentMerger;
@@ -24,7 +25,7 @@ use crate::dsl::FieldType;
 use crate::segment::BmpIndex;
 use crate::segment::SparseIndex;
 use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
-use crate::segment::reader::SegmentReader;
+use crate::segment::reader::{DimRawData, SegmentReader};
 use crate::segment::types::SegmentFiles;
 use crate::structures::{SparseFormat, SparseSkipEntry};
 
@@ -94,7 +95,12 @@ impl SegmentMerger {
                     let total_vectors_bmp: u32 = bmp_indexes
                         .iter()
                         .filter_map(|bi| bi.map(|idx| idx.total_vectors))
-                        .sum();
+                        .try_fold(0u32, |total, vectors| total.checked_add(vectors))
+                        .ok_or_else(|| {
+                            crate::Error::Internal(
+                                "merged BMP vector count exceeds the V14 u32 format limit".into(),
+                            )
+                        })?;
                     let bmp_block_size = sparse_config
                         .as_ref()
                         .map(|c| c.bmp_block_size)
@@ -140,7 +146,7 @@ impl SegmentMerger {
                         validate_bmp_sources(
                             &sources,
                             dims,
-                            bmp_block_size.min(256),
+                            bmp_block_size.clamp(1, 256),
                             grid_bits,
                             max_weight_scale,
                         )?;
@@ -148,7 +154,7 @@ impl SegmentMerger {
                         let fid = field.0;
                         let fname = field_name.clone();
                         let ilabel = self.schema.index_label().to_owned();
-                        let effective_block_size = bmp_block_size.min(256) as usize;
+                        let effective_block_size = bmp_block_size.clamp(1, 256) as usize;
                         let pool = self.background_pool.clone();
                         let granularity = self.granularity;
                         log::info!(
@@ -159,6 +165,16 @@ impl SegmentMerger {
                         let bp_budget = self.bp_budget;
                         let bp_memory_budget = self.bp_memory_budget;
                         let out_grid_bits = grid_bits;
+                        let _reorder_permit = match &self.reorder_permits {
+                            Some(permits) => {
+                                Some(Arc::clone(permits).acquire_owned().await.map_err(|_| {
+                                    crate::Error::Internal(
+                                        "background reorder scheduler is closed".into(),
+                                    )
+                                })?)
+                            }
+                            None => None,
+                        };
                         let (w, ft, converged) = tokio::task::spawn_blocking(move || {
                             crate::segment::reorder::reorder_bmp_field(
                                 &sources,
@@ -248,7 +264,12 @@ impl SegmentMerger {
             let total_vectors: u32 = sparse_indexes
                 .iter()
                 .filter_map(|si| si.map(|idx| idx.total_vectors))
-                .sum();
+                .try_fold(0u32, |total, vectors| total.checked_add(vectors))
+                .ok_or_else(|| {
+                    crate::Error::Internal(
+                        "merged sparse vector count exceeds the V3 u32 format limit".into(),
+                    )
+                })?;
 
             log::debug!(
                 "[merge] sparse field {}: {} unique dims across {} segments, total_vectors={}",
@@ -276,15 +297,38 @@ impl SegmentMerger {
                 }
 
                 // Compute merged metadata
-                let total_docs: u32 = sources.iter().map(|(r, _)| r.doc_count).sum();
+                let total_docs: u32 = sources
+                    .iter()
+                    .map(|(raw, _)| raw.doc_count)
+                    .try_fold(0u32, |total, docs| total.checked_add(docs))
+                    .ok_or_else(|| {
+                        crate::Error::Internal(
+                            "merged sparse dimension doc count exceeds u32::MAX".into(),
+                        )
+                    })?;
                 let global_max: f32 = sources
                     .iter()
                     .map(|(r, _)| r.global_max_weight)
                     .fold(f32::NEG_INFINITY, f32::max);
                 let total_blocks: u32 = sources
                     .iter()
-                    .map(|(r, _)| r.skip_entries.len() as u32)
-                    .sum();
+                    .map(|(raw, _)| u32::try_from(raw.skip_entries.len()))
+                    .try_fold(0u32, |total, blocks| total.checked_add(blocks.ok()?))
+                    .ok_or_else(|| {
+                        crate::Error::Internal(
+                            "merged sparse dimension block count exceeds u32::MAX".into(),
+                        )
+                    })?;
+
+                // Validate every source before writing any bytes for this
+                // dimension. These checks are cheap relative to copying the
+                // blocks and turn corrupt skip tables into an ordinary merge
+                // error instead of an indexing panic or a partially patched
+                // output. This used to live behind the diagnostics feature
+                // and its contiguity calculation was never enforced.
+                for (source_index, (raw, _)) in sources.iter().enumerate() {
+                    validate_sparse_merge_source(dim_id, source_index, raw)?;
+                }
 
                 // Phase 1: Write block data only (no header, no skip entries)
                 let block_data_offset = writer.offset();
@@ -293,23 +337,37 @@ impl SegmentMerger {
                 let skip_start = skip_count;
                 let mut cumulative_block_offset = 0u64;
 
-                // Block header layout: count(2) + doc_id_bits(1) + ordinal_bits(1)
-                //   + weight_quant(1) + pad(1) + pad(2) + first_doc_id(4, LE) + max_weight(4)
-                const FIRST_DOC_ID_OFFSET: usize = 8;
-                for (src_idx, (raw, doc_offset)) in sources.iter().enumerate() {
-                    let _ = src_idx; // used by diagnostics feature
+                for (raw, doc_offset) in &sources {
                     let data = raw.raw_block_data.as_slice();
-
-                    #[cfg(feature = "diagnostics")]
-                    super::diagnostics::validate_merge_source(dim_id, src_idx, raw)?;
 
                     // Serialize adjusted skip entries to temp file (batched write)
                     for entry in &raw.skip_entries {
                         skip_entry_buf.clear();
+                        let first_doc =
+                            entry.first_doc.checked_add(*doc_offset).ok_or_else(|| {
+                                crate::Error::Corruption(format!(
+                                    "sparse first-doc offset overflow: {} + {}",
+                                    entry.first_doc, doc_offset
+                                ))
+                            })?;
+                        let last_doc =
+                            entry.last_doc.checked_add(*doc_offset).ok_or_else(|| {
+                                crate::Error::Corruption(format!(
+                                    "sparse last-doc offset overflow: {} + {}",
+                                    entry.last_doc, doc_offset
+                                ))
+                            })?;
+                        let block_offset = cumulative_block_offset
+                            .checked_add(entry.offset)
+                            .ok_or_else(|| {
+                                crate::Error::Internal(
+                                    "merged sparse block-data offset exceeds u64::MAX".into(),
+                                )
+                            })?;
                         SparseSkipEntry::new(
-                            entry.first_doc + doc_offset,
-                            entry.last_doc + doc_offset,
-                            cumulative_block_offset + entry.offset,
+                            first_doc,
+                            last_doc,
+                            block_offset,
                             entry.length,
                             entry.max_weight,
                         )
@@ -317,11 +375,22 @@ impl SegmentMerger {
                         skip_writer
                             .write_all(&skip_entry_buf)
                             .map_err(crate::Error::Io)?;
-                        skip_count += 1;
+                        skip_count = skip_count.checked_add(1).ok_or_else(|| {
+                            crate::Error::Internal(
+                                "merged sparse skip-entry count exceeds u32::MAX".into(),
+                            )
+                        })?;
                     }
                     // Advance cumulative offset by this source's total block data size
                     if let Some(last) = raw.skip_entries.last() {
-                        cumulative_block_offset += last.offset + last.length as u64;
+                        cumulative_block_offset = cumulative_block_offset
+                            .checked_add(last.offset)
+                            .and_then(|offset| offset.checked_add(last.length as u64))
+                            .ok_or_else(|| {
+                                crate::Error::Internal(
+                                    "merged sparse block-data size exceeds u64::MAX".into(),
+                                )
+                            })?;
                     }
 
                     // Write raw block data, patching first_doc_id when doc_offset > 0
@@ -336,14 +405,20 @@ impl SegmentMerger {
                                 data.len()
                             };
                             let block = &data[start..end];
-                            writer.write_all(&block[..FIRST_DOC_ID_OFFSET])?;
+                            writer.write_all(&block[..SPARSE_FIRST_DOC_ID_OFFSET])?;
                             let old = u32::from_le_bytes(
-                                block[FIRST_DOC_ID_OFFSET..FIRST_DOC_ID_OFFSET + 4]
+                                block[SPARSE_FIRST_DOC_ID_OFFSET..SPARSE_FIRST_DOC_ID_OFFSET + 4]
                                     .try_into()
                                     .unwrap(),
                             );
-                            writer.write_all(&(old + doc_offset).to_le_bytes())?;
-                            writer.write_all(&block[FIRST_DOC_ID_OFFSET + 4..])?;
+                            let adjusted = old.checked_add(*doc_offset).ok_or_else(|| {
+                                crate::Error::Corruption(format!(
+                                    "sparse block doc-id offset overflow: {} + {}",
+                                    old, doc_offset
+                                ))
+                            })?;
+                            writer.write_all(&adjusted.to_le_bytes())?;
+                            writer.write_all(&block[SPARSE_FIRST_DOC_ID_OFFSET + 4..])?;
                         }
                     }
                 }
@@ -416,6 +491,87 @@ impl SegmentMerger {
     }
 }
 
+const SPARSE_BLOCK_HEADER_SIZE: usize = 16;
+const SPARSE_FIRST_DOC_ID_OFFSET: usize = 8;
+
+/// Validate the raw/skip relationship required by byte-level block stacking.
+/// Reader construction validates the outer sparse-file layout; this verifies
+/// per-dimension offsets before any unchecked slices or header patches.
+fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawData) -> Result<()> {
+    let data = raw.raw_block_data.as_slice();
+    let data_len = data.len() as u64;
+    let mut expected_offset = 0u64;
+    let mut previous_last_doc = None;
+
+    for (block_index, entry) in raw.skip_entries.iter().enumerate() {
+        if entry.offset != expected_offset {
+            return Err(crate::Error::Corruption(format!(
+                "sparse dim {} source {} block {} is non-contiguous: offset={}, expected={}",
+                dim_id, source_index, block_index, entry.offset, expected_offset,
+            )));
+        }
+        if entry.length < SPARSE_BLOCK_HEADER_SIZE as u32 {
+            return Err(crate::Error::Corruption(format!(
+                "sparse dim {} source {} block {} is shorter than its header: {} bytes",
+                dim_id, source_index, block_index, entry.length,
+            )));
+        }
+        let end = entry
+            .offset
+            .checked_add(u64::from(entry.length))
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "sparse dim {} source {} block {} range overflows u64",
+                    dim_id, source_index, block_index,
+                ))
+            })?;
+        if end > data_len {
+            return Err(crate::Error::Corruption(format!(
+                "sparse dim {} source {} block {} ends at {}, beyond {}-byte data",
+                dim_id, source_index, block_index, end, data_len,
+            )));
+        }
+        if entry.first_doc > entry.last_doc
+            || previous_last_doc.is_some_and(|previous| entry.first_doc < previous)
+        {
+            return Err(crate::Error::Corruption(format!(
+                "sparse dim {} source {} block {} has non-monotonic doc range {}..={}",
+                dim_id, source_index, block_index, entry.first_doc, entry.last_doc,
+            )));
+        }
+
+        let start = usize::try_from(entry.offset).map_err(|_| {
+            crate::Error::Corruption(format!(
+                "sparse dim {} source {} block {} offset exceeds usize",
+                dim_id, source_index, block_index,
+            ))
+        })?;
+        let count = u16::from_le_bytes(data[start..start + 2].try_into().unwrap());
+        let header_first_doc = u32::from_le_bytes(
+            data[start + SPARSE_FIRST_DOC_ID_OFFSET..start + SPARSE_FIRST_DOC_ID_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if count == 0 || header_first_doc != entry.first_doc {
+            return Err(crate::Error::Corruption(format!(
+                "sparse dim {} source {} block {} header mismatch: count={}, header_first={}, skip_first={}",
+                dim_id, source_index, block_index, count, header_first_doc, entry.first_doc,
+            )));
+        }
+
+        expected_offset = end;
+        previous_last_doc = Some(entry.last_doc);
+    }
+
+    if expected_offset != data_len {
+        return Err(crate::Error::Corruption(format!(
+            "sparse dim {} source {} skip table covers {} of {} data bytes",
+            dim_id, source_index, expected_offset, data_len,
+        )));
+    }
+    Ok(())
+}
+
 /// Merge BMP fields with **streaming block-copy V14 format**.
 ///
 /// V14 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
@@ -447,7 +603,7 @@ fn merge_bmp_field(
     use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-    let effective_block_size = bmp_block_size.min(256);
+    let effective_block_size = bmp_block_size.clamp(1, 256);
 
     // Pre-build source list: (&BmpIndex, doc_offset). Filters out None segments.
     let sources: Vec<(&BmpIndex, u32)> = bmp_indexes
@@ -492,8 +648,20 @@ fn merge_bmp_field(
                 bmp.max_weight_scale, max_weight_scale
             )));
         }
-        total_source_blocks += bmp.num_blocks;
-        num_real_docs_total += bmp.num_real_docs();
+        total_source_blocks = total_source_blocks
+            .checked_add(bmp.num_blocks)
+            .ok_or_else(|| {
+                crate::Error::Internal(
+                    "merged BMP block count exceeds the V14 u32 format limit".into(),
+                )
+            })?;
+        num_real_docs_total = num_real_docs_total
+            .checked_add(bmp.num_real_docs())
+            .ok_or_else(|| {
+                crate::Error::Internal(
+                    "merged BMP real-document count exceeds the V14 u32 format limit".into(),
+                )
+            })?;
     }
 
     if total_source_blocks == 0 {
@@ -501,33 +669,38 @@ fn merge_bmp_field(
     }
 
     let num_blocks = total_source_blocks as usize;
-    let num_virtual_docs = num_blocks * effective_block_size as usize;
+    let num_virtual_docs = num_blocks
+        .checked_mul(effective_block_size as usize)
+        .filter(|&count| count <= u32::MAX as usize)
+        .ok_or_else(|| {
+            crate::Error::Internal(
+                "merged BMP virtual-document count exceeds the V14 u32 format limit".into(),
+            )
+        })?;
     let packed_row_size = crate::segment::builder::bmp::grid_packed_row_size(num_blocks, grid_bits);
     let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
     // Pre-compute aggregate stats (needed for footer, independent of block order)
-    let mut total_terms: u32 = 0;
-    let mut total_postings: u32 = 0;
+    let mut total_terms: u64 = 0;
+    let mut total_postings: u64 = 0;
     for &(bmp, _) in &sources {
-        total_terms += bmp.total_terms() as u32;
-        total_postings += bmp.total_postings() as u32;
+        total_terms = total_terms.saturating_add(bmp.total_terms());
+        total_postings = total_postings.saturating_add(bmp.total_postings());
     }
-    if total_terms == 0 {
-        return Ok(());
-    }
-
     // Pre-compute per-source block offsets (first global block id for each source)
     let mut block_offsets: Vec<u32> = Vec::with_capacity(sources.len());
     {
         let mut cumulative: u32 = 0;
         for &(bmp, _) in &sources {
             block_offsets.push(cumulative);
-            cumulative += bmp.num_blocks;
+            cumulative = cumulative.checked_add(bmp.num_blocks).ok_or_else(|| {
+                crate::Error::Internal("merged BMP block offset exceeds u32::MAX".into())
+            })?;
         }
     }
 
     log::debug!(
-        "[merge_bmp_v13] field {}: dims={}, {} sources, {} total_blocks, \
+        "[merge_bmp_v14] field {}: dims={}, {} sources, {} total_blocks, \
          block_size={}, max_weight_scale={:.4}",
         field_id,
         dims,
@@ -537,11 +710,9 @@ fn merge_bmp_field(
         max_weight_scale,
     );
 
-    // Hint sequential access on all source mmaps before reading
-    #[cfg(feature = "native")]
-    for &(bmp, _) in &sources {
-        bmp.madvise_sequential();
-    }
+    // Restores query advice and drops scan-faulted mmap pages on every exit.
+    let _source_pages =
+        crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| *bmp));
 
     let blob_start = writer.offset();
 
@@ -687,7 +858,12 @@ fn merge_bmp_field(
                     let off = i * 4;
                     let doc_id = u32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
                     if doc_id != u32::MAX {
-                        let adjusted = doc_id + doc_offset;
+                        let adjusted = doc_id.checked_add(doc_offset).ok_or_else(|| {
+                            crate::Error::Corruption(format!(
+                                "BMP doc-id offset overflow: {} + {}",
+                                doc_id, doc_offset
+                            ))
+                        })?;
                         dst[off..off + 4].copy_from_slice(&adjusted.to_le_bytes());
                     }
                 }
@@ -732,14 +908,6 @@ fn merge_bmp_field(
         blob_start,
         blob_len,
     );
-
-    // The merge flipped source regions to MADV_SEQUENTIAL; sources keep
-    // serving queries until the merged segment is swapped in — restore the
-    // scattered-access advice set at open.
-    #[cfg(feature = "native")]
-    for &(bmp, _) in &sources {
-        bmp.madvise_random_query();
-    }
 
     Ok(())
 }
@@ -829,5 +997,35 @@ fn copy_cells(src_row: &[u8], src_blocks: usize, dst_row: &mut [u8], offset: usi
             continue;
         }
         grid_set_cell(dst_row, offset + b, val, grid_bits);
+    }
+}
+
+#[cfg(test)]
+mod sparse_source_validation_tests {
+    use super::*;
+    use crate::directories::OwnedBytes;
+
+    fn raw_source(offset: u64) -> DimRawData {
+        let mut block = vec![0u8; SPARSE_BLOCK_HEADER_SIZE];
+        block[..2].copy_from_slice(&1u16.to_le_bytes());
+        block[SPARSE_FIRST_DOC_ID_OFFSET..SPARSE_FIRST_DOC_ID_OFFSET + 4]
+            .copy_from_slice(&7u32.to_le_bytes());
+        DimRawData {
+            skip_entries: vec![SparseSkipEntry::new(7, 7, offset, 16, 1.0)],
+            doc_count: 1,
+            global_max_weight: 1.0,
+            raw_block_data: OwnedBytes::new(block),
+        }
+    }
+
+    #[test]
+    fn accepts_contiguous_block() {
+        validate_sparse_merge_source(3, 0, &raw_source(0)).unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_offset_before_slicing() {
+        let error = validate_sparse_merge_source(3, 0, &raw_source(1)).unwrap_err();
+        assert!(matches!(error, crate::Error::Corruption(_)));
     }
 }

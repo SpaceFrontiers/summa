@@ -184,8 +184,9 @@ impl SegmentMerger {
 
     /// Merge a single term's postings + positions from one or more source segments.
     ///
-    /// Fast path: when all sources are external and there are multiple,
-    /// uses block-level concatenation (O(blocks) instead of O(postings)).
+    /// Fast path: when all sources are external, uses block-level
+    /// concatenation (O(blocks) instead of O(postings)), including the
+    /// single-source case.
     /// Otherwise: full decode → remap doc IDs → re-encode.
     async fn merge_term(
         &self,
@@ -205,7 +206,7 @@ impl SegmentMerger {
             .all(|(_, ti, _)| ti.external_info().is_some());
 
         // === Merge postings ===
-        let (posting_offset, posting_len, doc_count) = if all_external && sources.len() > 1 {
+        let (posting_offset, posting_len, doc_count) = if all_external {
             // Fast path: streaming merge (blocks → output writer, no buffering)
             // Read all segments' postings in parallel
             let read_futs: Vec<_> = sources

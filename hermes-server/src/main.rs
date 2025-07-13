@@ -64,9 +64,16 @@ struct Args {
     #[arg(long)]
     doctor: bool,
 
-    /// Number of background optimizer threads for BP reordering (0 = disabled)
+    /// Rayon worker threads shared by all BP reorder passes (0 = optimizer disabled;
+    /// merge-time BP uses its default cores/2 pool)
     #[arg(long, default_value = "0")]
     optimizer_threads: usize,
+
+    /// Maximum simultaneous whole-segment BP passes across optimizer,
+    /// merge-time, and manual reorders. Each pass can use all optimizer threads
+    /// and up to the full BP memory budget, so keep this small.
+    #[arg(long, default_value = "2")]
+    optimizer_concurrent_passes: usize,
 
     /// Interval in seconds between optimizer scans for unreordered segments
     #[arg(long, default_value = "60")]
@@ -181,14 +188,46 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .indexing_threads
         .unwrap_or_else(|| (num_cpus::get() / 4).max(1));
 
+    let max_indexing_memory_bytes = args
+        .max_indexing_memory_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--max-indexing-memory-mb is too large"))?;
+    let bp_memory_budget_bytes = args
+        .bp_memory_budget_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--bp-memory-budget-mb is too large"))?;
+    let concurrent_reorder_passes = args.optimizer_concurrent_passes.max(1);
+    if args.optimizer_concurrent_passes == 0 {
+        warn!("--optimizer-concurrent-passes=0 is invalid; using 1");
+    }
+
+    // One application-owned pool is cloned into every index. Optimizer and
+    // merge-time BP therefore share a fixed number of OS threads instead of
+    // multiplying pools per index and per subsystem.
+    let background_reorder_pool = if args.optimizer_threads > 0 {
+        Some(Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(args.optimizer_threads)
+                .thread_name(|idx| format!("hermes-bp-{}", idx))
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to create BP thread pool: {}", e))?,
+        ))
+    } else {
+        None
+    };
+
     let config = IndexConfig {
-        max_indexing_memory_bytes: args.max_indexing_memory_mb * 1024 * 1024,
+        max_indexing_memory_bytes,
         num_indexing_threads,
         reload_interval_ms: args.reload_interval_ms,
         merge_policy: Box::new(hermes_core::merge::TieredMergePolicy::large_scale()),
         merge_bp_time_budget: (args.merge_bp_budget_secs > 0)
             .then(|| Duration::from_secs(args.merge_bp_budget_secs)),
-        bp_memory_budget_bytes: args.bp_memory_budget_mb * 1024 * 1024,
+        bp_memory_budget_bytes,
+        background_reorder_permits: Arc::new(tokio::sync::Semaphore::new(
+            concurrent_reorder_passes,
+        )),
+        background_reorder_pool,
         ..Default::default()
     };
 
@@ -214,6 +253,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         Arc::clone(&registry),
         optimizer::OptimizerConfig {
             threads: args.optimizer_threads,
+            concurrent_passes: concurrent_reorder_passes,
             scan_interval: Duration::from_secs(args.optimizer_scan_interval_secs),
             large_segment_docs: args.optimizer_large_segment_docs,
             time_budget: Duration::from_secs(args.optimizer_time_budget_secs),
@@ -231,8 +271,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Reload interval: {} ms", args.reload_interval_ms);
     if args.optimizer_threads > 0 {
         info!(
-            "Optimizer: {} threads, {}s scan interval",
-            args.optimizer_threads, args.optimizer_scan_interval_secs,
+            "Optimizer: {} shared BP threads, {} concurrent pass(es), {}s scan interval",
+            args.optimizer_threads, concurrent_reorder_passes, args.optimizer_scan_interval_secs,
         );
     }
 

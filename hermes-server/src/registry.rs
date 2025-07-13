@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::RwLock;
 use tonic::Status;
@@ -19,12 +19,75 @@ pub struct IndexHandle {
     pub writer: Arc<tokio::sync::RwLock<IndexWriter<MmapDirectory>>>,
 }
 
+/// Exclusive per-name lease held for the complete delete transaction. It
+/// serializes deletion with an index already being opened or created, closing
+/// the race where an in-flight opener could reinsert a handle after eviction.
+pub struct IndexDeleteLease {
+    index_path: PathBuf,
+    handle: Option<IndexHandle>,
+    _open_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl IndexDeleteLease {
+    /// Finish deletion independently of the requesting RPC.
+    ///
+    /// Once the registry entry is evicted and `.deleting` is visible, no new
+    /// raw handle can be issued. Wait for previously issued search/writer Arcs
+    /// before shutting down lifecycle work and unlinking the directory.
+    pub async fn complete(mut self) -> Result<(), Status> {
+        if let Some(handle) = self.handle.take() {
+            let mut next_log = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let index_users = Arc::strong_count(&handle.index).saturating_sub(1);
+                let writer_users = Arc::strong_count(&handle.writer).saturating_sub(1);
+                if index_users == 0 && writer_users == 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= next_log {
+                    log::debug!(
+                        "[index_delete] waiting for {} search and {} writer handle(s)",
+                        index_users,
+                        writer_users,
+                    );
+                    next_log += std::time::Duration::from_secs(30);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let segment_manager = {
+                let mut writer = handle.writer.write().await;
+                let manager = Arc::clone(writer.segment_manager());
+                writer
+                    .shutdown()
+                    .await
+                    .map_err(crate::error::hermes_error_to_status)?;
+                manager
+            };
+
+            // Cached readers and the writer disappear before the lifecycle
+            // drain. Blocking merge phases cannot be canceled by aborting
+            // their async wrapper, so wait for actual ownership to finish.
+            drop(handle);
+            segment_manager.wait_for_shutdown().await;
+        }
+
+        if self.index_path.exists() {
+            let index_path = self.index_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&index_path))
+                .await
+                .map_err(|e| Status::internal(format!("Delete task failed: {}", e)))?
+                .map_err(|e| Status::internal(format!("Failed to delete index: {}", e)))?;
+        }
+        Ok(())
+    }
+}
+
 /// Index registry holding all open indexes
 pub struct IndexRegistry {
     /// Single map: name → handle (index + writer together)
     handles: RwLock<HashMap<String, IndexHandle>>,
     /// Per-index open locks to prevent concurrent Index::open for the same name
-    open_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    open_locks: RwLock<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     pub(crate) data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -37,6 +100,20 @@ impl IndexRegistry {
             data_dir,
             config,
         }
+    }
+
+    fn open_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.open_locks.write();
+        // The registry must not retain one mutex and name forever for every
+        // typo/404 ever requested. Weak entries still unify concurrent calls;
+        // expired entries are pruned opportunistically under the same lock.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(name).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(name.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Validate index name to prevent path traversal and other issues.
@@ -85,14 +162,7 @@ impl IndexRegistry {
         }
 
         // Get or create per-index open lock
-        let lock = {
-            let mut locks = self.open_locks.write();
-            Arc::clone(
-                locks
-                    .entry(name.to_string())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
+        let lock = self.open_lock(name);
 
         // Serialize open attempts for the same index name
         let _guard = lock.lock().await;
@@ -112,6 +182,22 @@ impl IndexRegistry {
         let index = Index::open(dir, self.config.clone())
             .await
             .map_err(crate::error::hermes_error_to_status)?;
+
+        // This registry lock guarantees there is no second server-side
+        // producer for the index while crash leftovers are swept. Keep this
+        // out of the read-only core `Index::open` API: opening a search handle
+        // must not delete files owned by an independently opened writer.
+        let swept = index
+            .segment_manager()
+            .cleanup_orphan_segments()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+        if swept > 0 {
+            warn!(
+                "[segment_cleanup] swept {} crash-leftover segment(s) while opening '{}'",
+                swept, name
+            );
+        }
 
         let index = Arc::new(index);
         let mut w = index.writer();
@@ -135,6 +221,7 @@ impl IndexRegistry {
     /// Create a new index
     pub async fn create_index(&self, name: &str, schema: Schema) -> Result<(), Status> {
         Self::validate_index_name(name)?;
+        let _open_guard = self.open_lock(name).lock_owned().await;
         let index_path = self.data_dir.join(name);
 
         if index_path.exists() {
@@ -195,7 +282,7 @@ impl IndexRegistry {
     /// that use `IdfFile` weighting. Runs in background threads so it doesn't
     /// block index open/create. On success the file is saved to the index
     /// directory; on failure a warning is logged (non-fatal).
-    fn precache_idf_files(index: &Index<MmapDirectory>) {
+    fn precache_idf_files(index: &Arc<Index<MmapDirectory>>) {
         let index_dir = index.directory().root().to_path_buf();
 
         // Collect model names that need IDF files
@@ -214,19 +301,37 @@ impl IndexRegistry {
 
         for name in models {
             let dir = index_dir.clone();
+            // Keep this write visible to index deletion's issued-handle drain.
+            // Capturing only the path let an untracked downloader write into a
+            // directory after the registry had removed it.
+            let index_lease = Arc::clone(index);
             std::thread::spawn(move || {
+                let _index_lease = index_lease;
                 hermes_core::tokenizer::idf_weights_cache().get_or_load(&name, Some(&dir));
             });
         }
     }
 
-    /// Evict an index from the registry atomically.
-    ///
-    /// Returns the handle so the caller can flush/wait on it before deleting files.
-    /// Once evicted, no new operations can obtain references to this index.
-    pub fn evict(&self, name: &str) -> Option<IndexHandle> {
-        self.open_locks.write().remove(name);
-        self.handles.write().remove(name)
+    /// Begin an index delete while holding the same per-name lock used by
+    /// open/create. The marker is installed before eviction and the returned
+    /// lease keeps the lock until filesystem removal completes.
+    pub async fn begin_delete(&self, name: &str) -> Result<IndexDeleteLease, Status> {
+        Self::validate_index_name(name)?;
+        let open_guard = self.open_lock(name).lock_owned().await;
+        let index_path = self.data_dir.join(name);
+
+        if index_path.exists() {
+            std::fs::File::create(index_path.join(".deleting")).map_err(|error| {
+                Status::internal(format!("Failed to mark index for deletion: {}", error))
+            })?;
+        }
+
+        let handle = self.handles.write().remove(name);
+        Ok(IndexDeleteLease {
+            index_path,
+            handle,
+            _open_guard: open_guard,
+        })
     }
 
     /// Remove index directories left over from incomplete deletes.
@@ -404,5 +509,50 @@ impl IndexRegistry {
         })
         .await
         .map_err(|e| Status::internal(format!("list_indexes task failed: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_waits_for_previously_issued_index_handle() {
+        let root = std::env::temp_dir().join(format!(
+            "hermes_registry_delete_{}",
+            SegmentId::new().to_hex()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = IndexRegistry::new(
+            root.clone(),
+            IndexConfig {
+                num_indexing_threads: 1,
+                ..Default::default()
+            },
+        );
+        registry
+            .create_index("held", hermes_core::SchemaBuilder::default().build())
+            .await
+            .unwrap();
+
+        let issued = registry.get_or_open_index("held").await.unwrap();
+        let lease = registry.begin_delete("held").await.unwrap();
+        let completion = tokio::spawn(async move { lease.complete().await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !completion.is_finished(),
+            "filesystem deletion raced a previously issued search handle"
+        );
+        assert!(root.join("held").exists());
+
+        drop(issued);
+        tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+            .await
+            .expect("delete did not resume after the final search handle dropped")
+            .unwrap()
+            .unwrap();
+        assert!(!root.join("held").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

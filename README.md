@@ -99,6 +99,36 @@ cargo install hermes-server
 hermes-server --addr 0.0.0.0:50051 --data-dir ./data
 ```
 
+For production indexes, BP reorder resources are controlled independently:
+
+```bash
+hermes-server --data-dir /data \
+  --optimizer-threads 16 \
+  --optimizer-concurrent-passes 1 \
+  --bp-memory-budget-mb 24576
+```
+
+- `--optimizer-threads` is the width of one process-wide Rayon pool shared by
+  every index and BP path. An active pass intentionally keeps that pool busy;
+  lower this value when search or indexing needs more CPU. `0` disables the
+  periodic optimizer, while merge-time and manual BP use the bounded fallback
+  pool.
+- `--optimizer-concurrent-passes` limits whole-segment passes across the
+  optimizer, merge-time reorder, and manual reorder. It is not a thread count;
+  keep it small because each pass can use the shared pool and its own memory
+  budget.
+- `--bp-memory-budget-mb` caps the forward index of one pass rather than total
+  process RSS. Worst-case reorder working memory is approximately concurrent
+  passes times this cap, plus readers, mmap pages, merge buffers, and indexing.
+
+Segment publication, replacement, reader retirement, orphan cleanup, failure
+backoff, and index deletion follow one ownership protocol. Missing files that
+are still referenced by metadata are quarantined instead of being retried in a
+tight merge loop; start once with `--doctor` only when you intentionally want
+to remove those corrupt metadata entries. See
+[Segment lifecycle and recovery](docs/segment-lifecycle.md) and the full
+[server options](hermes-server/README.md#background-merge-and-reorder).
+
 Python client:
 
 ```python

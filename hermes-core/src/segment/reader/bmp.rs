@@ -165,9 +165,12 @@ impl BmpIndex {
         }
 
         // Read the footer (last 64 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
+        let blob_end = blob_offset
+            .checked_add(blob_len)
+            .ok_or_else(|| crate::Error::Corruption("BMP blob range overflows u64".into()))?;
+        let footer_start = blob_end - BMP_BLOB_FOOTER_SIZE_V14 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V14 as u64)
+            .read_bytes_range_sync(footer_start..blob_end)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -207,6 +210,12 @@ impl BmpIndex {
 
         // Handle empty index
         if num_blocks == 0 {
+            if num_virtual_docs != 0 || num_real_docs != 0 {
+                return Err(crate::Error::Corruption(format!(
+                    "empty BMP index has non-zero document counts (virtual={}, real={})",
+                    num_virtual_docs, num_real_docs
+                )));
+            }
             return Ok(Self {
                 bmp_block_size,
                 num_blocks,
@@ -232,42 +241,156 @@ impl BmpIndex {
             });
         }
 
+        if !(1..=256).contains(&bmp_block_size) {
+            return Err(crate::Error::Corruption(format!(
+                "invalid BMP block size {} (expected 1..=256)",
+                bmp_block_size
+            )));
+        }
+        let expected_virtual_docs = u64::from(num_blocks) * u64::from(bmp_block_size);
+        if expected_virtual_docs != u64::from(num_virtual_docs) {
+            return Err(crate::Error::Corruption(format!(
+                "BMP block/document mismatch: {} blocks × {} != {} virtual docs",
+                num_blocks, bmp_block_size, num_virtual_docs
+            )));
+        }
+        if num_real_docs > num_virtual_docs {
+            return Err(crate::Error::Corruption(format!(
+                "BMP real document count {} exceeds virtual count {}",
+                num_real_docs, num_virtual_docs
+            )));
+        }
+        if !max_weight_scale.is_finite() || max_weight_scale <= 0.0 {
+            return Err(crate::Error::Corruption(format!(
+                "invalid BMP max-weight scale {}",
+                max_weight_scale
+            )));
+        }
+
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
         let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
+        let data_len_usize = usize::try_from(data_len).map_err(|_| {
+            crate::Error::Corruption("BMP blob is too large for this platform".into())
+        })?;
         let blob = handle
-            .read_bytes_range_sync(blob_offset..blob_offset + data_len)
+            .read_bytes_range_sync(blob_offset..footer_start)
             .map_err(crate::Error::Io)?;
 
         // Layout: Section B (block_data) at offset 0, Section A (block_data_starts)
         // immediately before grid. Derive Section A position from grid_offset.
-        let section_a_size = (num_blocks as usize + 1) * 8;
-        let bds_start = grid_offset as usize - section_a_size;
+        let num_blocks_usize = num_blocks as usize;
+        let section_a_size = num_blocks_usize
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(8))
+            .ok_or_else(|| {
+                crate::Error::Corruption("BMP block-offset table size overflows usize".into())
+            })?;
+        let grid_start = usize::try_from(grid_offset).map_err(|_| {
+            crate::Error::Corruption("BMP grid offset is too large for this platform".into())
+        })?;
+        let bds_start = grid_start.checked_sub(section_a_size).ok_or_else(|| {
+            crate::Error::Corruption(format!(
+                "BMP grid offset {} precedes {}-byte block-offset table",
+                grid_offset, section_a_size
+            ))
+        })?;
+        if grid_start > data_len_usize {
+            return Err(crate::Error::Corruption(format!(
+                "BMP grid offset {} exceeds data length {}",
+                grid_start, data_len_usize
+            )));
+        }
 
         // Section B: block_data [0..bds_start) (includes padding before Section A)
         let block_data_bytes = blob.slice(0..bds_start);
         // Section A: block_data_starts [bds_start..grid_offset)
-        let block_data_starts_bytes = blob.slice(bds_start..grid_offset as usize);
+        let block_data_starts_bytes = blob.slice(bds_start..grid_start);
 
         // Sections D+E: grid, sb_grid, doc_map
         let packed_row_size =
             crate::segment::builder::bmp::grid_packed_row_size(num_blocks as usize, grid_bits)
                 as u32;
-        let grid_start = grid_offset as usize;
-        let grid_end = grid_start + dims as usize * packed_row_size as usize;
+        let grid_size = (dims as usize)
+            .checked_mul(packed_row_size as usize)
+            .ok_or_else(|| crate::Error::Corruption("BMP grid size overflows usize".into()))?;
+        let grid_end = grid_start.checked_add(grid_size).ok_or_else(|| {
+            crate::Error::Corruption("BMP grid end offset overflows usize".into())
+        })?;
 
         let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
-        let sb_grid_start = sb_grid_offset as usize;
-        let sb_grid_end = sb_grid_start + dims as usize * num_superblocks as usize;
+        let sb_grid_start = usize::try_from(sb_grid_offset).map_err(|_| {
+            crate::Error::Corruption("BMP superblock-grid offset is too large".into())
+        })?;
+        if sb_grid_start != grid_end {
+            return Err(crate::Error::Corruption(format!(
+                "BMP section order mismatch: superblock grid starts at {}, expected {}",
+                sb_grid_start, grid_end
+            )));
+        }
+        let sb_grid_size = (dims as usize)
+            .checked_mul(num_superblocks as usize)
+            .ok_or_else(|| {
+                crate::Error::Corruption("BMP superblock-grid size overflows usize".into())
+            })?;
+        let sb_grid_end = sb_grid_start.checked_add(sb_grid_size).ok_or_else(|| {
+            crate::Error::Corruption("BMP superblock-grid end overflows usize".into())
+        })?;
 
-        let dm_start = doc_map_offset as usize;
-        let dm_ids_end = dm_start + num_virtual_docs as usize * 4;
-        let dm_ords_end = dm_ids_end + num_virtual_docs as usize * 2;
+        let dm_start = usize::try_from(doc_map_offset)
+            .map_err(|_| crate::Error::Corruption("BMP document-map offset is too large".into()))?;
+        if dm_start != sb_grid_end {
+            return Err(crate::Error::Corruption(format!(
+                "BMP section order mismatch: document map starts at {}, expected {}",
+                dm_start, sb_grid_end
+            )));
+        }
+        let dm_ids_len = (num_virtual_docs as usize).checked_mul(4).ok_or_else(|| {
+            crate::Error::Corruption("BMP document-id map size overflows usize".into())
+        })?;
+        let dm_ords_len = (num_virtual_docs as usize).checked_mul(2).ok_or_else(|| {
+            crate::Error::Corruption("BMP ordinal map size overflows usize".into())
+        })?;
+        let dm_ids_end = dm_start.checked_add(dm_ids_len).ok_or_else(|| {
+            crate::Error::Corruption("BMP document-id map end overflows usize".into())
+        })?;
+        let dm_ords_end = dm_ids_end.checked_add(dm_ords_len).ok_or_else(|| {
+            crate::Error::Corruption("BMP ordinal map end overflows usize".into())
+        })?;
+        if dm_ords_end != data_len_usize {
+            return Err(crate::Error::Corruption(format!(
+                "BMP data length mismatch: sections end at {}, blob data ends at {}",
+                dm_ords_end, data_len_usize
+            )));
+        }
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
         let grid_bytes = blob.slice(grid_start..grid_end);
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
+
+        // This compact table is cheap to validate in full and is the trust
+        // boundary for every later raw-pointer block access.
+        let starts = block_data_starts_bytes.as_slice();
+        let mut previous = 0u64;
+        for index in 0..=num_blocks_usize {
+            let offset = index * 8;
+            let current = u64::from_le_bytes(starts[offset..offset + 8].try_into().unwrap());
+            if (index == 0 && current != 0) || current < previous || current > bds_start as u64 {
+                return Err(crate::Error::Corruption(format!(
+                    "invalid BMP block offset at {}: {} (previous={}, data_limit={})",
+                    index, current, previous, bds_start
+                )));
+            }
+            if current > previous && current - previous < 8 {
+                return Err(crate::Error::Corruption(format!(
+                    "BMP block {} is too small for a header ({} bytes)",
+                    index - 1,
+                    current - previous
+                )));
+            }
+            previous = current;
+        }
 
         // Query-time access to block data, the doc map, AND the block grid is
         // scattered. Default kernel readahead pulls in 128KB per fault around
@@ -350,6 +473,9 @@ impl BmpIndex {
     /// (only called for top-k results which are valid compact virtual IDs).
     #[inline(always)]
     pub fn virtual_to_doc(&self, virtual_id: u32) -> (u32, u16) {
+        if virtual_id >= self.num_virtual_docs {
+            return (u32::MAX, 0);
+        }
         let ids = self.doc_map_ids_bytes.as_slice();
         let ords = self.doc_map_ordinals_bytes.as_slice();
         debug_assert!((virtual_id as usize + 1) * 4 <= ids.len());
@@ -366,6 +492,9 @@ impl BmpIndex {
     /// Used in the predicate filter path — hot loop, unchecked reads.
     #[inline(always)]
     pub fn doc_id_for_virtual(&self, virtual_id: u32) -> u32 {
+        if virtual_id >= self.num_virtual_docs {
+            return u32::MAX;
+        }
         let d = self.doc_map_ids_bytes.as_slice();
         debug_assert!((virtual_id as usize + 1) * 4 <= d.len());
         unsafe { read_u32_unchecked(d.as_ptr(), virtual_id as usize) }
@@ -472,17 +601,28 @@ impl BmpIndex {
         }
     }
 
-    /// Parse a block header: returns (num_terms, dim_ptr, ps_ptr, post_ptr).
+    /// Parse a block header: returns
+    /// (num_terms, dim_ptr, ps_ptr, post_ptr, total_block_postings).
     /// All pointers are within block_data_bytes — guaranteed contiguous.
     ///
     /// Always 4-byte (u32) dim IDs.
     ///
-    /// Returns `(0, null, null, null)` for empty blocks.
+    /// Returns zero terms and null section pointers for empty blocks.
     #[inline(always)]
-    pub(crate) fn parse_block(&self, block_id: u32) -> (u32, *const u8, *const u8, *const u8) {
+    pub(crate) fn parse_block(&self, block_id: u32) -> (u32, *const u8, *const u8, *const u8, u32) {
+        if block_id >= self.num_blocks {
+            return (0, std::ptr::null(), std::ptr::null(), std::ptr::null(), 0);
+        }
         let (start, end) = self.block_data_range(block_id);
         if start == end {
-            return (0, std::ptr::null(), std::ptr::null(), std::ptr::null());
+            return (0, std::ptr::null(), std::ptr::null(), std::ptr::null(), 0);
+        }
+        let invalid = || (0, std::ptr::null(), std::ptr::null(), std::ptr::null(), 0);
+        let Ok(block_len) = usize::try_from(end - start) else {
+            return invalid();
+        };
+        if block_len < 8 {
+            return invalid();
         }
         let base = unsafe {
             self.block_data_bytes
@@ -491,12 +631,38 @@ impl BmpIndex {
                 .add(start as usize)
         };
         let num_terms = unsafe { u32::from_le((base as *const u32).read_unaligned()) };
+        let Some(header_len) = (num_terms as usize)
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(8))
+        else {
+            return invalid();
+        };
+        if header_len > block_len || !(block_len - header_len).is_multiple_of(2) {
+            return invalid();
+        }
+        let total_block_postings = (block_len - header_len) / 2;
+        let Ok(total_block_postings_u32) = u32::try_from(total_block_postings) else {
+            return invalid();
+        };
         let dim_ptr = unsafe { base.add(4) };
         // Always u32 dim IDs (4 bytes each)
         let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * 4) };
         // u32 prefix sums (V14): u16 wrapped past 65,535 postings per block
         let post_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 4) };
-        (num_terms, dim_ptr, ps_ptr, post_ptr)
+        let first = unsafe { u32::from_le((ps_ptr as *const u32).read_unaligned()) };
+        let last = unsafe {
+            u32::from_le((ps_ptr.add(num_terms as usize * 4) as *const u32).read_unaligned())
+        };
+        if first != 0 || last != total_block_postings_u32 {
+            return invalid();
+        }
+        (
+            num_terms,
+            dim_ptr,
+            ps_ptr,
+            post_ptr,
+            total_block_postings_u32,
+        )
     }
 
     /// Get a raw pointer to block_data_starts at the given block.
@@ -516,12 +682,13 @@ impl BmpIndex {
     ///
     /// Reads u32 dim_id directly from block data (no dim_idx→dim_id lookup).
     pub fn iter_block_terms(&self, block_id: u32) -> BlockTermIter<'_> {
-        let (num_terms, dim_ptr, ps_ptr, post_ptr) = self.parse_block(block_id);
+        let (num_terms, dim_ptr, ps_ptr, post_ptr, total_postings) = self.parse_block(block_id);
         BlockTermIter {
             dim_ptr,
             ps_ptr,
             post_ptr,
             num_terms,
+            total_postings,
             current: 0,
             _marker: std::marker::PhantomData,
         }
@@ -681,6 +848,8 @@ impl BmpIndex {
     #[cfg(feature = "native")]
     pub fn madvise_random_query(&self) {
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_RANDOM);
+        Self::madvise_owned(&self.grid_bytes, libc::MADV_RANDOM);
+        Self::madvise_owned(&self.sb_grid_bytes, libc::MADV_RANDOM);
         Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_RANDOM);
         Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_RANDOM);
     }
@@ -690,6 +859,15 @@ impl BmpIndex {
     pub fn madvise_dontneed_grids(&self) {
         Self::madvise_owned(&self.grid_bytes, libc::MADV_DONTNEED);
         Self::madvise_owned(&self.sb_grid_bytes, libc::MADV_DONTNEED);
+    }
+
+    /// Release document-map pages faulted by a full reorder scan. They remain
+    /// mmap-backed and refault on demand for any reader that still references
+    /// the source segment during publication.
+    #[cfg(feature = "native")]
+    pub fn madvise_dontneed_doc_maps(&self) {
+        Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_DONTNEED);
+        Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_DONTNEED);
     }
 
     /// Call `madvise` only when the backing store is mmap.
@@ -704,6 +882,46 @@ impl BmpIndex {
     }
 }
 
+/// Kernel page-advice lifecycle for exhaustive background scans.
+///
+/// Construction marks source mappings sequential. Drop releases the large
+/// block/grid/doc-map regions and restores random query advice, including on
+/// `?` and panic unwind. The mappings stay valid and refault for readers that
+/// still reference a source during publication.
+#[cfg(feature = "native")]
+pub(crate) struct BmpScanPageGuard<'a> {
+    indexes: Vec<&'a BmpIndex>,
+}
+
+#[cfg(feature = "native")]
+impl<'a> BmpScanPageGuard<'a> {
+    pub(crate) fn new(indexes: impl IntoIterator<Item = &'a BmpIndex>) -> Self {
+        let indexes: Vec<_> = indexes.into_iter().collect();
+        for index in &indexes {
+            index.madvise_sequential();
+        }
+        Self { indexes }
+    }
+
+    pub(crate) fn switch_to_random(&self) {
+        for index in &self.indexes {
+            index.madvise_random_query();
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for BmpScanPageGuard<'_> {
+    fn drop(&mut self) {
+        for index in &self.indexes {
+            index.madvise_dontneed_block_data();
+            index.madvise_dontneed_grids();
+            index.madvise_dontneed_doc_maps();
+            index.madvise_random_query();
+        }
+    }
+}
+
 /// Iterator over terms in a block. Returns `(dim_id, &[BmpPosting])` per term.
 ///
 /// Reads u32 dim_id directly from block data (no dim_idx→dim_id lookup).
@@ -712,6 +930,7 @@ pub struct BlockTermIter<'a> {
     ps_ptr: *const u8,
     post_ptr: *const u8,
     num_terms: u32,
+    total_postings: u32,
     current: u32,
     // lifetime marker for the underlying BmpIndex data
     _marker: std::marker::PhantomData<&'a ()>,
@@ -737,7 +956,8 @@ impl<'a> Iterator for BlockTermIter<'a> {
         let dim_id = unsafe { read_u32_unchecked(self.dim_ptr, i as usize) };
 
         // Get postings from block-local ps_ptr/post_ptr
-        let postings = unsafe { block_term_postings(self.ps_ptr, self.post_ptr, i) };
+        let postings =
+            unsafe { block_term_postings(self.ps_ptr, self.post_ptr, i, self.total_postings) };
         Some((dim_id, postings))
     }
 
@@ -797,6 +1017,7 @@ pub(crate) unsafe fn block_term_postings<'a>(
     ps_ptr: *const u8,
     post_ptr: *const u8,
     local_term: u32,
+    total_block_postings: u32,
 ) -> &'a [BmpPosting] {
     let start_p = ps_ptr.add(local_term as usize * 4);
     let end_p = ps_ptr.add((local_term as usize + 1) * 4);
@@ -805,8 +1026,7 @@ pub(crate) unsafe fn block_term_postings<'a>(
     // Prefix sums are cumulative — a non-monotonic pair means the block is
     // corrupt. Never build a wild slice from it (`end - start` underflow on
     // wrapped V13 data was a production SIGSEGV).
-    debug_assert!(end >= start, "corrupt BMP block: prefix sums not monotonic");
-    if end <= start {
+    if end <= start || end > total_block_postings as usize {
         return &[];
     }
     let count = end - start;
@@ -818,75 +1038,217 @@ pub(crate) unsafe fn block_term_postings<'a>(
 // ============================================================================
 // SIMD-accelerated helpers for BMP scoring
 // ============================================================================
+// Packed grid accumulation
 // ============================================================================
-// 4-bit grid accumulation
-// ============================================================================
-/// Accumulate 4-bit packed grid values into f32 output.
+/// Add one packed grid row to exact integer block-bound accumulators.
 ///
-/// Internally unpacks u4 → u8 (×17) then does FMA, so the caller can use the
-/// same `/255.0` weight scale as for u8 grids.
-///
-/// `packed[i/2]`: low nibble = even element, high nibble = odd element.
+/// The query quantizer proves that the sum over all rows fits `u32`. Keeping
+/// this loop in integer units makes the final f32 conversion monotonic with
+/// document scoring. Rows are unpacked a byte at a time to avoid per-cell
+/// division and repeated packed-byte loads.
 #[inline]
-/// Bits-dispatching grid accumulate: 4-bit takes the SIMD path
-/// (`accumulate_u4_weighted`); 2-bit uses an unrolled scalar kernel
-/// (dequant ×85). SIMD u2 variants are a follow-up — 2-bit is opt-in per
-/// field and the block grid is probed only inside surviving superblocks.
-pub(crate) fn accumulate_grid_weighted(
+pub(crate) fn accumulate_grid_u32(
     packed: &[u8],
     grid_bits: u8,
     elem_offset: usize,
     count: usize,
-    weight: f32,
-    out: &mut [f32],
+    weight: u32,
+    out: &mut [u32],
 ) {
+    debug_assert!(out.len() >= count);
     if grid_bits == 2 {
-        accumulate_u2_weighted(packed, elem_offset, count, weight, out);
-    } else {
-        accumulate_u4_weighted(packed, elem_offset, count, weight, out);
+        let scaled_weight = weight * 85;
+        let mut index = 0usize;
+        while index < count && !(elem_offset + index).is_multiple_of(4) {
+            let absolute = elem_offset + index;
+            let cell =
+                (unsafe { *packed.get_unchecked(absolute / 4) } >> ((absolute % 4) * 2)) & 0x03;
+            unsafe { *out.get_unchecked_mut(index) += u32::from(cell) * scaled_weight };
+            index += 1;
+        }
+        while index + 4 <= count {
+            let byte = unsafe { *packed.get_unchecked((elem_offset + index) / 4) };
+            unsafe {
+                *out.get_unchecked_mut(index) += u32::from(byte & 0x03) * scaled_weight;
+                *out.get_unchecked_mut(index + 1) += u32::from((byte >> 2) & 0x03) * scaled_weight;
+                *out.get_unchecked_mut(index + 2) += u32::from((byte >> 4) & 0x03) * scaled_weight;
+                *out.get_unchecked_mut(index + 3) += u32::from(byte >> 6) * scaled_weight;
+            }
+            index += 4;
+        }
+        while index < count {
+            let absolute = elem_offset + index;
+            let cell =
+                (unsafe { *packed.get_unchecked(absolute / 4) } >> ((absolute % 4) * 2)) & 0x03;
+            unsafe { *out.get_unchecked_mut(index) += u32::from(cell) * scaled_weight };
+            index += 1;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if elem_offset.is_multiple_of(2) {
+        unsafe { accumulate_u4_u32_neon(packed, elem_offset, count, weight, out) };
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if elem_offset.is_multiple_of(2) && is_x86_feature_detected!("sse4.1") {
+        unsafe { accumulate_u4_u32_sse41(packed, elem_offset, count, weight, out) };
+        return;
+    }
+
+    let scaled_weight = weight * 17;
+    let mut index = 0usize;
+    if !elem_offset.is_multiple_of(2) && count > 0 {
+        let byte = unsafe { *packed.get_unchecked(elem_offset / 2) };
+        unsafe { *out.get_unchecked_mut(0) += u32::from(byte >> 4) * scaled_weight };
+        index = 1;
+    }
+    while index + 2 <= count {
+        let byte = unsafe { *packed.get_unchecked((elem_offset + index) / 2) };
+        unsafe {
+            *out.get_unchecked_mut(index) += u32::from(byte & 0x0f) * scaled_weight;
+            *out.get_unchecked_mut(index + 1) += u32::from(byte >> 4) * scaled_weight;
+        }
+        index += 2;
+    }
+    if index < count {
+        let byte = unsafe { *packed.get_unchecked((elem_offset + index) / 2) };
+        unsafe { *out.get_unchecked_mut(index) += u32::from(byte & 0x0f) * scaled_weight };
     }
 }
 
-/// Scalar 2-bit accumulate: `out[i] += cell(elem_offset + i) * 85 * weight`.
-/// Processes 4 cells per source byte.
-pub(crate) fn accumulate_u2_weighted(
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn accumulate_u4_u32_neon(
     packed: &[u8],
     elem_offset: usize,
     count: usize,
-    weight: f32,
-    out: &mut [f32],
+    weight: u32,
+    out: &mut [u32],
 ) {
-    let w85 = 85.0 * weight;
-    let mut i = 0usize;
-    // Head: unaligned cells until byte boundary
-    while i < count && !(elem_offset + i).is_multiple_of(4) {
-        let abs = elem_offset + i;
-        let cell = (unsafe { *packed.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
-        unsafe { *out.get_unchecked_mut(i) += cell as f32 * w85 };
-        i += 1;
-    }
-    // Body: whole bytes, 4 cells each
-    while i + 4 <= count {
-        let byte = unsafe { *packed.get_unchecked((elem_offset + i) / 4) };
-        if byte != 0 {
-            unsafe {
-                *out.get_unchecked_mut(i) += (byte & 0x03) as f32 * w85;
-                *out.get_unchecked_mut(i + 1) += ((byte >> 2) & 0x03) as f32 * w85;
-                *out.get_unchecked_mut(i + 2) += ((byte >> 4) & 0x03) as f32 * w85;
-                *out.get_unchecked_mut(i + 3) += (byte >> 6) as f32 * w85;
-            }
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0f);
+    let scale = vdupq_n_u8(17);
+    let packed_ptr = packed.as_ptr().add(elem_offset / 2);
+    let out_ptr = out.as_mut_ptr();
+    let chunks = count / 32;
+
+    for chunk in 0..chunks {
+        let bytes = vld1q_u8(packed_ptr.add(chunk * 16));
+        let low = vmulq_u8(vandq_u8(bytes, mask), scale);
+        let high = vmulq_u8(vshrq_n_u8::<4>(bytes), scale);
+        let first = vzip1q_u8(low, high);
+        let second = vzip2q_u8(low, high);
+        let output = out_ptr.add(chunk * 32);
+
+        let first_low = vmovl_u8(vget_low_u8(first));
+        let first_high = vmovl_u8(vget_high_u8(first));
+        let second_low = vmovl_u8(vget_low_u8(second));
+        let second_high = vmovl_u8(vget_high_u8(second));
+        let vectors = [
+            vmovl_u16(vget_low_u16(first_low)),
+            vmovl_u16(vget_high_u16(first_low)),
+            vmovl_u16(vget_low_u16(first_high)),
+            vmovl_u16(vget_high_u16(first_high)),
+            vmovl_u16(vget_low_u16(second_low)),
+            vmovl_u16(vget_high_u16(second_low)),
+            vmovl_u16(vget_low_u16(second_high)),
+            vmovl_u16(vget_high_u16(second_high)),
+        ];
+        for (vector_index, values) in vectors.into_iter().enumerate() {
+            let destination = output.add(vector_index * 4);
+            let accumulated = vld1q_u32(destination);
+            vst1q_u32(destination, vmlaq_n_u32(accumulated, values, weight));
         }
-        i += 4;
     }
-    // Tail
-    while i < count {
-        let abs = elem_offset + i;
-        let cell = (unsafe { *packed.get_unchecked(abs / 4) } >> ((abs % 4) * 2)) & 0x03;
-        unsafe { *out.get_unchecked_mut(i) += cell as f32 * w85 };
-        i += 1;
+
+    let base = chunks * 32;
+    let scaled_weight = weight * 17;
+    for index in base..count {
+        let absolute = elem_offset + index;
+        let byte = *packed.get_unchecked(absolute / 2);
+        let cell = if absolute.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        *out.get_unchecked_mut(index) += u32::from(cell) * scaled_weight;
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn accumulate_u4_u32_sse41(
+    packed: &[u8],
+    elem_offset: usize,
+    count: usize,
+    weight: u32,
+    out: &mut [u32],
+) {
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let zero = _mm_setzero_si128();
+    let weight_vector = _mm_set1_epi32(weight as i32);
+    let packed_ptr = packed.as_ptr().add(elem_offset / 2);
+    let out_ptr = out.as_mut_ptr();
+    let chunks = count / 32;
+
+    for chunk in 0..chunks {
+        let bytes = _mm_loadu_si128(packed_ptr.add(chunk * 16) as *const __m128i);
+        let low = _mm_and_si128(bytes, mask);
+        let high = _mm_and_si128(_mm_srli_epi16::<4>(bytes), mask);
+        let low = _mm_add_epi8(_mm_slli_epi16::<4>(low), low);
+        let high = _mm_add_epi8(_mm_slli_epi16::<4>(high), high);
+        let first = _mm_unpacklo_epi8(low, high);
+        let second = _mm_unpackhi_epi8(low, high);
+        let output = out_ptr.add(chunk * 32);
+
+        let first_low = _mm_unpacklo_epi8(first, zero);
+        let first_high = _mm_unpackhi_epi8(first, zero);
+        let second_low = _mm_unpacklo_epi8(second, zero);
+        let second_high = _mm_unpackhi_epi8(second, zero);
+        let vectors = [
+            _mm_unpacklo_epi16(first_low, zero),
+            _mm_unpackhi_epi16(first_low, zero),
+            _mm_unpacklo_epi16(first_high, zero),
+            _mm_unpackhi_epi16(first_high, zero),
+            _mm_unpacklo_epi16(second_low, zero),
+            _mm_unpackhi_epi16(second_low, zero),
+            _mm_unpacklo_epi16(second_high, zero),
+            _mm_unpackhi_epi16(second_high, zero),
+        ];
+        for (vector_index, values) in vectors.into_iter().enumerate() {
+            let destination = output.add(vector_index * 4) as *mut __m128i;
+            let accumulated = _mm_loadu_si128(destination);
+            let contribution = _mm_mullo_epi32(values, weight_vector);
+            _mm_storeu_si128(destination, _mm_add_epi32(accumulated, contribution));
+        }
+    }
+
+    let base = chunks * 32;
+    let scaled_weight = weight * 17;
+    for index in base..count {
+        let absolute = elem_offset + index;
+        let byte = *packed.get_unchecked(absolute / 2);
+        let cell = if absolute.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        *out.get_unchecked_mut(index) += u32::from(cell) * scaled_weight;
+    }
+}
+
+/// Legacy f32 SIMD kernel retained only by the grid-layout microbenchmark.
+/// Production pruning accumulates integer bound units in `query::bmp`; f32
+/// term-by-term addition can round below the matching integer document score.
+#[cfg(test)]
 pub(crate) fn accumulate_u4_weighted(
     packed: &[u8],
     elem_offset: usize,
@@ -929,7 +1291,7 @@ pub(crate) fn accumulate_u4_weighted(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn accumulate_u4_weighted_neon(
@@ -1037,7 +1399,7 @@ unsafe fn accumulate_u4_weighted_neon(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.1")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn accumulate_u4_weighted_sse41(
@@ -1164,6 +1526,13 @@ pub(crate) fn compute_block_masks(
     count: usize,
     masks: &mut [u64],
 ) {
+    // Presence masks have 64 bits. For wider queries, disable this optional
+    // shortcut (all blocks appear present) and let binary search decide per
+    // dimension; shifting by q>=64 used to panic in debug and wrap in release.
+    if query_dims.len() > 64 {
+        masks[..count].fill(u64::MAX);
+        return;
+    }
     if grid_bits == 2 {
         compute_block_masks_2bit(grid, prs, query_dims, block_start, count, masks);
     } else {
@@ -1181,6 +1550,10 @@ pub(crate) fn compute_block_masks_2bit(
     masks: &mut [u64],
 ) {
     debug_assert!(masks.len() >= count);
+    if query_dims.len() > 64 {
+        masks[..count].fill(u64::MAX);
+        return;
+    }
     masks[..count].fill(0);
     for (q, &(dim_idx, _)) in query_dims.iter().enumerate() {
         let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
@@ -1204,6 +1577,10 @@ pub(crate) fn compute_block_masks_4bit(
     masks: &mut [u64],
 ) {
     debug_assert!(masks.len() >= count);
+    if query_dims.len() > 64 {
+        masks[..count].fill(u64::MAX);
+        return;
+    }
     masks[..count].fill(0);
 
     #[cfg(target_arch = "aarch64")]
@@ -1390,6 +1767,50 @@ unsafe fn compute_block_masks_range_sse41(
     }
 }
 
+#[cfg(test)]
+mod safety_tests {
+    use super::BmpIndex;
+    use crate::directories::{FileHandle, OwnedBytes};
+    use rustc_hash::FxHashMap;
+
+    fn test_blob() -> Vec<u8> {
+        let mut postings = FxHashMap::default();
+        postings.insert(3, vec![(0, 0, 1.0), (1, 0, 0.5)]);
+        let mut blob = Vec::new();
+        crate::segment::builder::bmp::build_bmp_blob(
+            postings, 64, 4, 0.0, None, 16, 5.0, 0, &mut blob,
+        )
+        .unwrap();
+        blob
+    }
+
+    fn parse(blob: Vec<u8>) -> crate::Result<BmpIndex> {
+        let len = blob.len() as u64;
+        BmpIndex::parse(FileHandle::from_bytes(OwnedBytes::new(blob)), 0, len, 2, 2)
+    }
+
+    #[test]
+    fn parse_rejects_footer_section_underflow_without_panicking() {
+        let mut blob = test_blob();
+        let footer = blob.len() - 64;
+        blob[footer + 8..footer + 16].copy_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(parse(blob), Err(crate::Error::Corruption(_))));
+    }
+
+    #[test]
+    fn parse_rejects_nonzero_first_block_offset() {
+        let mut blob = test_blob();
+        let footer = blob.len() - 64;
+        let grid_offset =
+            u64::from_le_bytes(blob[footer + 8..footer + 16].try_into().unwrap()) as usize;
+        let num_blocks =
+            u32::from_le_bytes(blob[footer + 24..footer + 28].try_into().unwrap()) as usize;
+        let starts = grid_offset - (num_blocks + 1) * 8;
+        blob[starts..starts + 8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(matches!(parse(blob), Err(crate::Error::Corruption(_))));
+    }
+}
+
 /// Microbenchmark: dense 4-bit grid (SIMD nibble sweep, the current layout)
 /// vs a CSR superblock-run grid, on Zipfian SPLADE-like block occupancy.
 /// Run: cargo test --release -p hermes-core --features native --lib -- \
@@ -1397,7 +1818,7 @@ unsafe fn compute_block_masks_range_sse41(
 /// See docs/bmp-grid-compression.md for measured results.
 #[cfg(test)]
 mod grid_bench {
-    use super::accumulate_u4_weighted;
+    use super::{accumulate_u4_weighted, compute_block_masks};
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -1414,6 +1835,15 @@ mod grid_bench {
         fn next_f64(&mut self) -> f64 {
             (self.next() >> 11) as f64 / (1u64 << 53) as f64
         }
+    }
+
+    #[test]
+    fn wide_query_disables_u64_presence_mask_without_shifting() {
+        let query_dims: Vec<(usize, f32)> = (0..65).map(|dim| (dim, 1.0)).collect();
+        let grid = vec![0x11; query_dims.len()];
+        let mut masks = [0u64; 2];
+        compute_block_masks(&grid, 4, 1, &query_dims, 0, 2, &mut masks);
+        assert_eq!(masks, [u64::MAX; 2]);
     }
 
     /// CSR grid: per dim, runs of present superblocks with (slot, nibble)

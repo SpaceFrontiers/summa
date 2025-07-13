@@ -52,9 +52,8 @@ field embedding: sparse_vector<u32> [indexed<format: bmp, dims: 105879,
 ### 2-bit grid impacts — MEASURED, IMPLEMENTED (`bmp_grid_bits: 2`)
 
 Halve the dense grid (dims × blocks / 4) by quantizing block UBs to 2 bits
-(ceil-quantized, recall-safe like `quantize_u8_to_u4_ceil`). Same layout,
-same SIMD shape, no probe-pattern change, no format fork beyond a footer
-flag.
+(ceil-quantized, recall-safe like `quantize_u8_to_u4_ceil`). Same layout and
+probe pattern, with no format fork beyond a footer flag.
 
 | grid            | topical queries (blocks/q) | background-only queries (blocks/q) |
 | --------------- | -------------------------- | ---------------------------------- |
@@ -68,7 +67,7 @@ grid ≈ free** (grid 10 GB → 5 GB at 50M docs / block 64; combine with
 `bmp_block_size: 256` for 2.5 GB).
 
 **Implemented**: SDL `indexed<bmp_grid_bits: 2>` (default 4; per field,
-uniform across segments — merge/blockwise validate loudly). The V13 blob
+uniform across segments — merge/blockwise validate loudly). The V14 blob
 footer's reserved field carries the cell width (0 = legacy 4-bit), so
 existing segments stay readable. 2-bit currently uses an unrolled scalar
 accumulate/mask kernel (4 cells/byte); SIMD u2 variants are a follow-up if
@@ -76,6 +75,8 @@ profiling asks for them — the block grid is probed only inside surviving
 superblocks. Exactness is pinned by
 `test_bmp_grid_bits_2_exact_parity_and_roundtrip` (identical top-k vs a
 4-bit index over the same corpus, through block-copy merge and BP reorder).
+
+### Exact integer bounds (implemented 2026-07-15)
 
 ### 4-bit posting weights — MEASURED, REJECTED
 

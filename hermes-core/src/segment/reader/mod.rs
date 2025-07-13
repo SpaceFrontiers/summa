@@ -5,8 +5,7 @@ pub(crate) mod loader;
 mod types;
 
 pub use bmp::BmpIndex;
-#[cfg(feature = "diagnostics")]
-pub use types::DimRawData;
+pub(crate) use types::DimRawData;
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
 
 /// Memory statistics for a single segment

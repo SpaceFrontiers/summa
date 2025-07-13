@@ -25,6 +25,17 @@ struct SearcherState<D: DirectoryWriter + 'static> {
     segment_ids: Vec<String>,
 }
 
+/// Cancellation-safe ownership of the reload flag. Async reload checks may be
+/// dropped at any await point; resetting manually only on normal return leaves
+/// every future reload disabled after request cancellation or panic.
+struct ReloadGuard<'a>(&'a AtomicBool);
+
+impl Drop for ReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub struct IndexReader<D: DirectoryWriter + 'static> {
     /// Schema
     schema: Arc<Schema>,
@@ -123,10 +134,9 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                let _reload_guard = ReloadGuard(&self.reloading);
                 // We won the race — do the reload check
-                let result = self.do_reload_check().await;
-                self.reloading.store(false, Ordering::Release);
-                result?;
+                self.do_reload_check().await?;
             }
             // Otherwise another reload is in progress — just return current searcher
         }
@@ -181,6 +191,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             }
             tokio::task::yield_now().await;
         }
+        let _reload_guard = ReloadGuard(&self.reloading);
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
 
         // Fast path: skip reload if segments haven't changed
@@ -189,14 +200,12 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             state.segment_ids != new_segment_ids
         };
 
-        let result = if segments_changed {
+        if segments_changed {
             self.reload_with_segments(new_segment_ids).await
         } else {
             log::debug!("[reload] segments unchanged, skipping");
             Ok(())
-        };
-        self.reloading.store(false, Ordering::Release);
-        result
+        }
     }
 
     /// Internal reload with specific segment IDs.
@@ -239,5 +248,21 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     /// Get schema
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_guard_releases_flag_on_unwind() {
+        let reloading = AtomicBool::new(true);
+        let result = std::panic::catch_unwind(|| {
+            let _guard = ReloadGuard(&reloading);
+            panic!("cancel reload");
+        });
+        assert!(result.is_err());
+        assert!(!reloading.load(Ordering::Acquire));
     }
 }

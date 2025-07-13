@@ -732,11 +732,25 @@ impl SparseIndex {
         }
         // Total block data size: last entry's (offset + length)
         let last = &skip[skip.len() - 1];
-        let total_bytes = last.offset + last.length as u64;
+        let total_bytes = last
+            .offset
+            .checked_add(u64::from(last.length))
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "sparse dimension {} block range overflows u64",
+                    dim_id
+                ))
+            })?;
         let base = self.dims.block_offsets[idx];
+        let range_end = base.checked_add(total_bytes).ok_or_else(|| {
+            crate::Error::Corruption(format!(
+                "sparse dimension {} file range overflows u64",
+                dim_id
+            ))
+        })?;
         let raw = self
             .handle
-            .read_bytes_range(base..base + total_bytes)
+            .read_bytes_range(base..range_end)
             .await
             .map_err(crate::Error::Io)?;
         Ok(Some(DimRawData {

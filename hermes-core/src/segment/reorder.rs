@@ -4,11 +4,12 @@
 //! and rebuilds the sparse file with reordered BMP blocks. Non-BMP sparse
 //! fields (MaxScore) are identity-copied.
 //!
-//! This module is decoupled from the merge path: merge never reorders,
-//! and reorder never merges multiple segments.
+//! Background optimization is decoupled from the merge path. Merge-time
+//! reordering is optional; when enabled, both paths share the same bounded
+//! CPU pool and whole-pass concurrency gate.
 
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::Result;
@@ -22,7 +23,7 @@ use crate::structures::SparseFormat;
 
 /// Default memory budget for forward index during BP (24 GB). A cap, not an
 /// allocation — usage is proportional to the segment being reordered
-/// (~4 B/posting + ~28 B/doc). Sized from prod evidence: a 58M-doc /
+/// (~4 B/posting + ~32 B/doc). Sized from prod evidence: a 58M-doc /
 /// 5B-posting pass estimated 20.1 GB, which smaller budgets trimmed by
 /// dropping highest-df dims. Mirrored by
 /// `IndexConfig::default().bp_memory_budget_bytes`.
@@ -38,14 +39,60 @@ pub const DEFAULT_MEMORY_BUDGET: usize = 24 * 1024 * 1024 * 1024;
 /// with ENOENT after it had already copied tens of GB (orphaned outputs
 /// filled the production disk overnight).
 fn grid_run_prefix(field_id: u32) -> String {
-    static GRID_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = GRID_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!(
         "hermes_grid_run_{}_{}_{}",
         std::process::id(),
         field_id,
-        seq
+        SegmentId::new().to_hex(),
     )
+}
+
+/// Owns spill paths from before their first write. Drop removes complete and
+/// partially-written files on success, `?`, and panic unwind. UUID prefixes
+/// also avoid colliding with leftovers from a prior process using the same
+/// PID (common for PID 1 in containers).
+struct GridRunFiles {
+    prefix: String,
+    paths: Vec<PathBuf>,
+}
+
+impl GridRunFiles {
+    fn new(field_id: u32) -> Self {
+        Self {
+            prefix: grid_run_prefix(field_id),
+            paths: Vec::new(),
+        }
+    }
+
+    fn allocate(&mut self) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{}_{}.tmp", self.prefix, self.paths.len()));
+        self.paths.push(path.clone());
+        path
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PathBuf> {
+        self.paths.iter()
+    }
+}
+
+impl Drop for GridRunFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("[reorder_bmp] failed to remove spill {:?}: {}", path, error);
+            }
+        }
+    }
 }
 
 /// Reorder granularity (see docs/block-level-reorder.md).
@@ -134,7 +181,7 @@ fn block_coherence(
 
     let stride = total_blocks.div_ceil(MAX_COHERENCE_SCAN_BLOCKS).max(1);
     // dim → (record count, block count) within the sampled blocks
-    let mut df: rustc_hash::FxHashMap<u32, (u32, u32)> = rustc_hash::FxHashMap::default();
+    let mut df: rustc_hash::FxHashMap<u32, (u64, u64)> = rustc_hash::FxHashMap::default();
     let mut scanned_blocks = 0usize;
     let mut global_block = 0usize;
     for (bmp, _) in sources {
@@ -143,7 +190,7 @@ fn block_coherence(
                 scanned_blocks += 1;
                 for (dim_id, posts) in bmp.iter_block_terms(block_id) {
                     let e = df.entry(dim_id).or_insert((0, 0));
-                    e.0 += posts.len() as u32;
+                    e.0 += posts.len() as u64;
                     e.1 += 1;
                 }
             }
@@ -161,10 +208,10 @@ fn block_coherence(
         if records < 2 {
             continue; // singleton: inert for clustering, see above
         }
-        postings += records as u64;
-        terms += blocks as u64;
+        postings += records;
+        terms += blocks;
         expected_rand_pairs += b * (1.0 - keep.powf(records as f64));
-        min_pairs += (records as u64).div_ceil(block_size as u64);
+        min_pairs += records.div_ceil(block_size as u64);
     }
     if terms == 0 || postings == 0 {
         // No dim shared by ≥2 records: BP has no signal at any granularity.
@@ -414,7 +461,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                     .as_ref()
                     .map(|c| c.bmp_block_size)
                     .unwrap_or(64)
-                    .min(256) as usize;
+                    .clamp(1, 256) as usize;
                 let dims = sparse_config
                     .as_ref()
                     .and_then(|c| c.dims)
@@ -540,10 +587,32 @@ fn reorder_bmp_field_blockwise(
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
     let bmp_refs: Vec<&crate::segment::BmpIndex> = sources.iter().map(|(b, _)| b).collect();
-    let num_blocks_total: usize = bmp_refs.iter().map(|b| b.num_blocks as usize).sum();
+    let source_pages =
+        crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| bmp));
+    let num_blocks_total = bmp_refs
+        .iter()
+        .try_fold(0usize, |total, bmp| {
+            total.checked_add(bmp.num_blocks as usize)
+        })
+        .ok_or_else(|| {
+            crate::Error::Internal("reordered BMP block count overflows usize".into())
+        })?;
     if num_blocks_total == 0 {
         return Ok((writer, field_tocs, true));
     }
+    if num_blocks_total > u32::MAX as usize {
+        return Err(crate::Error::Internal(
+            "reordered BMP block count exceeds the V14 u32 format limit".into(),
+        ));
+    }
+    let num_virtual_docs = num_blocks_total
+        .checked_mul(effective_block_size)
+        .filter(|&count| count <= u32::MAX as usize)
+        .ok_or_else(|| {
+            crate::Error::Internal(
+                "reordered BMP virtual-document count exceeds the V14 u32 format limit".into(),
+            )
+        })?;
 
     // Global block idx → source: prefix sums.
     let block_base: Vec<usize> = std::iter::once(0)
@@ -563,16 +632,25 @@ fn reorder_bmp_field_blockwise(
     // The budget's depth cap is in DOCS but BP entities here are BLOCKS —
     // convert units, or the optimizer's partial cap (e.g. 4096 docs) would
     // be read as 4096 blocks and silently stop BP above superblock depth.
-    let block_budget = crate::segment::BpBudget {
-        min_partition_docs: bp_budget
-            .min_partition_docs
-            .map(|docs| (docs / effective_block_size).max(1)),
-        time_budget: bp_budget.time_budget,
-    };
+    let block_min_partition = bp_budget
+        .min_partition_docs
+        .map(|docs| (docs / effective_block_size).max(1));
     // Forward-index build is parallel too — keep it on the bounded pool.
     let run_bp = || {
+        if bp_budget.time_budget.is_some_and(|budget| budget.is_zero()) {
+            return ((0..num_blocks_total as u32).collect(), false);
+        }
         let fwd = build_forward_index_from_blocks(&bmp_refs, memory_budget);
         if fwd.num_terms > 0 && num_blocks_total > sb {
+            // The user-visible time budget covers the forward-index build as
+            // well as graph refinement. Previously a multi-minute build ran
+            // before a fresh full budget started, defeating the lifecycle cap.
+            let block_budget = crate::segment::BpBudget {
+                min_partition_docs: block_min_partition,
+                time_budget: bp_budget
+                    .time_budget
+                    .map(|budget| budget.saturating_sub(bp_start.elapsed())),
+            };
             graph_bisection(&fwd, sb, 20, block_budget)
         } else {
             ((0..num_blocks_total as u32).collect(), true)
@@ -583,6 +661,17 @@ fn reorder_bmp_field_blockwise(
     } else {
         run_bp()
     };
+    // Resolving a global block through source prefix sums is cheap once, but
+    // catastrophic inside the `dims × blocks` grid rewrite below (billions
+    // of calls on production-sized fields). Cache the compact source/local
+    // pair once per output block; this is 8 bytes/block.
+    let permuted_blocks: Vec<(u32, u32)> = perm
+        .iter()
+        .map(|&old_global| {
+            let (source, local_block) = resolve(old_global as usize);
+            (source as u32, local_block as u32)
+        })
+        .collect();
     log::info!(
         "[reorder_bmp] field {}: blockwise BP over {} blocks in {:.1}ms (converged={})",
         field_id,
@@ -590,6 +679,7 @@ fn reorder_bmp_field_blockwise(
         bp_start.elapsed().as_secs_f64() * 1000.0,
         converged,
     );
+    source_pages.switch_to_random();
 
     // ── Write blob: permuted block copy ─────────────────────────────────
     let blob_start = writer.offset();
@@ -600,15 +690,14 @@ fn reorder_bmp_field_blockwise(
     let mut total_terms: u64 = 0;
     let mut total_postings: u64 = 0;
     for b in &bmp_refs {
-        total_terms += b.total_terms();
-        total_postings += b.total_postings();
+        total_terms = total_terms.saturating_add(b.total_terms());
+        total_postings = total_postings.saturating_add(b.total_postings());
     }
-    for &new_pos in perm.iter() {
-        let (src, lb) = resolve(new_pos as usize);
-        let bmp = bmp_refs[src];
-        let start = bmp.block_data_start(lb as u32) as usize;
-        let end = if (lb as u32) + 1 < bmp.num_blocks {
-            bmp.block_data_start(lb as u32 + 1) as usize
+    for &(src, lb) in &permuted_blocks {
+        let bmp = bmp_refs[src as usize];
+        let start = bmp.block_data_start(lb) as usize;
+        let end = if lb + 1 < bmp.num_blocks {
+            bmp.block_data_start(lb + 1) as usize
         } else {
             bmp.block_data_sentinel() as usize
         };
@@ -640,17 +729,25 @@ fn reorder_bmp_field_blockwise(
         crate::segment::builder::bmp::grid_packed_row_size(num_blocks_total, grid_bits);
     let num_superblocks = num_blocks_total.div_ceil(sb);
     let mut out_row = vec![0u8; packed_row_size];
-    let mut sb_rows: Vec<Vec<u8>> = vec![vec![0u8; num_superblocks]; dims as usize];
+    let mut sb_row = vec![0u8; num_superblocks];
+    // Section E follows every Section D row on disk. Keeping all E rows until
+    // then was O(dims × superblocks) RAM (tens of GB at production scale).
+    // Spill E linearly while computing D; the RAII owner removes partial files
+    // on every exit path.
+    let mut sb_spill_files = GridRunFiles::new(field_id);
+    let sb_spill_path = sb_spill_files.allocate();
+    let sb_spill = std::fs::File::create(&sb_spill_path).map_err(crate::Error::Io)?;
+    let mut sb_spill_writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, sb_spill);
     let dequant = crate::segment::builder::bmp::grid_dequant_scale(grid_bits);
 
-    for (dim, sb_row) in sb_rows.iter_mut().enumerate() {
+    for dim in 0..dims as usize {
         out_row.fill(0);
-        for (new_pos, &old_global) in perm.iter().enumerate() {
-            let (src, lb) = resolve(old_global as usize);
-            let bmp = bmp_refs[src];
+        sb_row.fill(0);
+        for (new_pos, &(src, lb)) in permuted_blocks.iter().enumerate() {
+            let bmp = bmp_refs[src as usize];
             let prs = bmp.packed_row_size();
             let row = &bmp.grid_slice()[dim * prs..dim * prs + prs];
-            let cell = crate::segment::builder::bmp::grid_get_cell(row, lb, grid_bits);
+            let cell = crate::segment::builder::bmp::grid_get_cell(row, lb as usize, grid_bits);
             if cell == 0 {
                 continue;
             }
@@ -666,25 +763,49 @@ fn reorder_bmp_field_blockwise(
             }
         }
         writer.write_all(&out_row).map_err(crate::Error::Io)?;
+        sb_spill_writer
+            .write_all(&sb_row)
+            .map_err(crate::Error::Io)?;
     }
     drop(out_row);
+    drop(sb_row);
+    sb_spill_writer.flush().map_err(crate::Error::Io)?;
+    drop(sb_spill_writer);
 
     let sb_grid_offset = writer.offset() - blob_start;
-    for sb_row in &sb_rows {
-        writer.write_all(sb_row).map_err(crate::Error::Io)?;
+    let mut sb_spill_reader = std::fs::File::open(&sb_spill_path).map_err(crate::Error::Io)?;
+    let mut copy_buffer = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let read = sb_spill_reader
+            .read(&mut copy_buffer)
+            .map_err(crate::Error::Io)?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&copy_buffer[..read])
+            .map_err(crate::Error::Io)?;
     }
-    drop(sb_rows);
+    drop(copy_buffer);
+    drop(sb_spill_reader);
 
     // Sections F + G: doc maps copied per block chunk, ids offset-patched
     let doc_map_offset = writer.offset() - blob_start;
     let bs = effective_block_size;
     let mut num_real_docs: u32 = 0;
     for b in &bmp_refs {
-        num_real_docs += b.num_real_docs();
+        num_real_docs = num_real_docs
+            .checked_add(b.num_real_docs())
+            .ok_or_else(|| {
+                crate::Error::Internal(
+                    "reordered BMP real-document count exceeds the V14 u32 format limit".into(),
+                )
+            })?;
     }
     let mut id_chunk = vec![0u8; bs * 4];
-    for &old_global in perm.iter() {
-        let (src, lb) = resolve(old_global as usize);
+    for &(src, lb) in &permuted_blocks {
+        let src = src as usize;
+        let lb = lb as usize;
         let (bmp, doc_offset) = (&sources[src].0, sources[src].1);
         let ids = bmp.doc_map_ids_slice();
         id_chunk.copy_from_slice(&ids[lb * bs * 4..(lb + 1) * bs * 4]);
@@ -693,14 +814,23 @@ fn reorder_bmp_field_blockwise(
             for e in chunks {
                 let doc_id = u32::from_le_bytes(*e);
                 if doc_id != u32::MAX {
-                    *e = (doc_id + doc_offset).to_le_bytes();
+                    *e = doc_id
+                        .checked_add(doc_offset)
+                        .ok_or_else(|| {
+                            crate::Error::Corruption(format!(
+                                "BMP doc-id offset overflow: {} + {}",
+                                doc_id, doc_offset
+                            ))
+                        })?
+                        .to_le_bytes();
                 }
             }
         }
         writer.write_all(&id_chunk).map_err(crate::Error::Io)?;
     }
-    for &old_global in perm.iter() {
-        let (src, lb) = resolve(old_global as usize);
+    for &(src, lb) in &permuted_blocks {
+        let src = src as usize;
+        let lb = lb as usize;
         let ords = bmp_refs[src].doc_map_ordinals_slice();
         writer
             .write_all(&ords[lb * bs * 2..(lb + 1) * bs * 2])
@@ -710,14 +840,14 @@ fn reorder_bmp_field_blockwise(
     // Footer
     write_bmp_footer(
         &mut writer,
-        total_terms as u32,
-        total_postings as u32,
+        total_terms,
+        total_postings,
         grid_offset,
         sb_grid_offset,
         num_blocks_total as u32,
         dims,
         effective_block_size as u32,
-        (num_blocks_total * bs) as u32,
+        num_virtual_docs as u32,
         max_weight_scale,
         doc_map_offset,
         num_real_docs,
@@ -901,12 +1031,18 @@ pub(crate) fn reorder_bmp_field(
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
+    if !(1..=256).contains(&effective_block_size) {
+        return Err(crate::Error::Internal(format!(
+            "invalid BMP reorder block size {} (expected 1..=256)",
+            effective_block_size
+        )));
+    }
     use crate::segment::builder::bmp::{
         GridRunReader, stream_write_grids, stream_write_grids_merged, write_bmp_footer,
         write_grid_run,
     };
     use crate::segment::builder::graph_bisection::{
-        build_forward_index_from_bmps, build_vid_maps, graph_bisection,
+        build_forward_index_from_bmps_with_maps, build_vid_maps, graph_bisection,
     };
 
     if sources.is_empty() {
@@ -978,23 +1114,41 @@ pub(crate) fn reorder_bmp_field(
         );
     }
 
+    let source_pages =
+        crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| bmp));
+
     // ── Phase 1: Build forward index and run BP ─────────────────────────
     let bp_start = std::time::Instant::now();
 
     let bmp_refs: Vec<&crate::segment::BmpIndex> = sources.iter().map(|(b, _)| b).collect();
-    // Real→virtual maps per source (padding-aware; doc map is ground truth).
-    let real_to_virtual: Vec<Vec<u32>> = bmp_refs.iter().map(|b| build_vid_maps(b).1).collect();
+    // Build padding-aware maps once. Forward-index construction needs both
+    // directions; output encoding reuses real→virtual instead of rescanning
+    // every source document map.
+    let mut vid_maps: Vec<(Vec<u32>, Vec<u32>)> =
+        bmp_refs.iter().map(|bmp| build_vid_maps(bmp)).collect();
     // Prefix sums of real doc counts: source s owns global real ids
     // real_base[s]..real_base[s+1].
-    let real_base: Vec<usize> = std::iter::once(0)
-        .chain(real_to_virtual.iter().scan(0usize, |acc, r2v| {
-            *acc += r2v.len();
-            Some(*acc)
-        }))
-        .collect();
+    let mut real_base = Vec::with_capacity(vid_maps.len() + 1);
+    real_base.push(0usize);
+    for (_, real_to_virtual) in &vid_maps {
+        let next = real_base
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(real_to_virtual.len())
+            .ok_or_else(|| {
+                crate::Error::Internal("reordered BMP real-document count overflows usize".into())
+            })?;
+        real_base.push(next);
+    }
     let num_real_docs = *real_base.last().unwrap();
     if num_real_docs == 0 {
         return Ok((writer, field_tocs, true));
+    }
+    if num_real_docs > u32::MAX as usize {
+        return Err(crate::Error::Internal(
+            "reordered BMP real-document count exceeds the V14 u32 format limit".into(),
+        ));
     }
 
     log::info!(
@@ -1025,60 +1179,92 @@ pub(crate) fn reorder_bmp_field(
         // already drops the highest-df dims when the forward index overflows.
         let min_doc_freq = (num_real_docs / 5000).clamp(2, 128);
 
-        // Forward-index build is parallel too — run the whole phase on the
-        // bounded rayon pool if provided, keeping background CPU off the
-        // global (query) pool.
-        let run_bp = || {
-            let (fwd, _source_doc_counts) = build_forward_index_from_bmps(
+        // Forward-index build is parallel too — keep it on the bounded pool.
+        let build_forward = || {
+            build_forward_index_from_bmps_with_maps(
                 &bmp_refs,
+                &vid_maps,
                 min_doc_freq,
                 max_doc_freq.max(1),
                 memory_budget,
-            );
-
-            log::info!(
-                "[reorder_bmp] field {}: forward index built in {:.1}ms ({} terms, {} postings)",
-                field_id,
-                bp_start.elapsed().as_secs_f64() * 1000.0,
-                fwd.num_terms,
-                fwd.total_postings(),
-            );
-
-            if fwd.num_terms > 0 && num_real_docs > effective_block_size {
-                let bp_start = std::time::Instant::now();
-                let (perm, converged) = graph_bisection(&fwd, effective_block_size, 20, bp_budget);
-                log::info!(
-                    "[reorder_bmp] field {}: BP completed in {:.1}ms (converged={})",
-                    field_id,
-                    bp_start.elapsed().as_secs_f64() * 1000.0,
-                    converged,
-                );
-                (perm, converged)
-            } else {
-                ((0..num_real_docs as u32).collect(), true)
-            }
+            )
         };
-        if let Some(ref pool) = rayon_pool {
-            pool.install(run_bp)
+        let (fwd, _source_doc_counts) = if let Some(ref pool) = rayon_pool {
+            pool.install(build_forward)
         } else {
-            run_bp()
+            build_forward()
+        };
+
+        log::info!(
+            "[reorder_bmp] field {}: forward index built in {:.1}ms ({} terms, {} postings)",
+            field_id,
+            bp_start.elapsed().as_secs_f64() * 1000.0,
+            fwd.num_terms,
+            fwd.total_postings(),
+        );
+
+        // Forward construction no longer needs virtual→real. Release those
+        // potentially hundreds of MB before graph scratch reaches its peak;
+        // retain real→virtual for output encoding.
+        for (virtual_to_real, _) in &mut vid_maps {
+            *virtual_to_real = Vec::new();
+        }
+
+        if fwd.num_terms > 0 && num_real_docs > effective_block_size {
+            let graph_start = std::time::Instant::now();
+            let graph_budget = crate::segment::BpBudget {
+                min_partition_docs: bp_budget.min_partition_docs,
+                time_budget: bp_budget
+                    .time_budget
+                    .map(|budget| budget.saturating_sub(bp_start.elapsed())),
+            };
+            let run_graph = || graph_bisection(&fwd, effective_block_size, 20, graph_budget);
+            let (perm, converged) = if let Some(ref pool) = rayon_pool {
+                pool.install(run_graph)
+            } else {
+                run_graph()
+            };
+            log::info!(
+                "[reorder_bmp] field {}: BP completed in {:.1}ms (converged={})",
+                field_id,
+                graph_start.elapsed().as_secs_f64() * 1000.0,
+                converged,
+            );
+            (perm, converged)
+        } else {
+            ((0..num_real_docs as u32).collect(), true)
         }
     };
+
+    let real_to_virtual: Vec<Vec<u32>> = vid_maps.into_iter().map(|(_, real)| real).collect();
 
     log::info!(
         "[reorder_bmp] field {}: writing reordered blob ({} blocks)",
         field_id,
         num_real_docs.div_ceil(effective_block_size),
     );
+    source_pages.switch_to_random();
 
     // ── Phase 2: Write new blob with records in permuted order ──────────
     let new_num_blocks = num_real_docs.div_ceil(effective_block_size);
-    let new_num_virtual_docs = new_num_blocks * effective_block_size;
+    if new_num_blocks > u32::MAX as usize {
+        return Err(crate::Error::Internal(
+            "reordered BMP block count exceeds the V14 u32 format limit".into(),
+        ));
+    }
+    let new_num_virtual_docs = new_num_blocks
+        .checked_mul(effective_block_size)
+        .filter(|&count| count <= u32::MAX as usize)
+        .ok_or_else(|| {
+            crate::Error::Internal(
+                "reordered BMP virtual-document count exceeds the V14 u32 format limit".into(),
+            )
+        })?;
 
     let blob_start = writer.offset();
     let mut block_data_starts: Vec<u64> = Vec::with_capacity(new_num_blocks + 1);
-    let mut total_terms: u32 = 0;
-    let mut total_postings: u32 = 0;
+    let mut total_terms: u64 = 0;
+    let mut total_postings: u64 = 0;
     let mut cumulative_bytes: u64 = 0;
 
     // Grid entries with external merge sort: accumulate in memory up to budget,
@@ -1087,11 +1273,12 @@ pub(crate) fn reorder_bmp_field(
     const GRID_ENTRY_MEM_SIZE: usize = std::mem::size_of::<(u32, u32, u8)>(); // 12 bytes
     let max_entries_in_memory = GRID_ENTRIES_BUDGET / GRID_ENTRY_MEM_SIZE;
 
-    let total_source_terms: usize = bmp_refs.iter().map(|b| b.total_terms() as usize).sum();
+    let total_source_terms = bmp_refs.iter().fold(0usize, |total, bmp| {
+        total.saturating_add(bmp.total_terms() as usize)
+    });
     let est_entries = total_source_terms.min(max_entries_in_memory);
     let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_entries);
-    let mut run_files: Vec<std::path::PathBuf> = Vec::new();
-    let run_prefix = grid_run_prefix(field_id);
+    let mut run_files = GridRunFiles::new(field_id);
 
     // Encode one output block: gather its records from source blocks and
     // serialize the V14 block layout. Pure function of `perm` + read-only
@@ -1104,7 +1291,7 @@ pub(crate) fn reorder_bmp_field(
     // source footer is the ground truth for parsing source blocks).
     // (serialized block bytes, its (dim, out_block, max_impact) grid entries)
     type EncodedBlock = (Vec<u8>, Vec<(u32, u32, u8)>);
-    let encode_block = |out_block: usize| -> EncodedBlock {
+    let encode_block = |out_block: usize| -> Result<EncodedBlock> {
         let new_vid_start = out_block * effective_block_size;
         let new_vid_end = ((out_block + 1) * effective_block_size).min(num_real_docs);
         let slots_count = new_vid_end - new_vid_start;
@@ -1151,7 +1338,7 @@ pub(crate) fn reorder_bmp_field(
         }
 
         if dim_postings.is_empty() {
-            return (Vec::new(), Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut sorted_dims: Vec<u32> = dim_postings.keys().copied().collect();
@@ -1159,7 +1346,9 @@ pub(crate) fn reorder_bmp_field(
         let nt = sorted_dims.len();
 
         let mut blk_buf: Vec<u8> = Vec::with_capacity(4 + nt * 8 + 4);
-        blk_buf.extend_from_slice(&(nt as u32).to_le_bytes());
+        let nt_u32 = u32::try_from(nt)
+            .map_err(|_| crate::Error::Internal("BMP block term count exceeds u32::MAX".into()))?;
+        blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
 
         for &dim_id in &sorted_dims {
             blk_buf.extend_from_slice(&dim_id.to_le_bytes());
@@ -1169,7 +1358,12 @@ pub(crate) fn reorder_bmp_field(
         let mut cum: u32 = 0;
         for &dim_id in &sorted_dims {
             blk_buf.extend_from_slice(&cum.to_le_bytes());
-            cum += dim_postings[&dim_id].len() as u32;
+            let posting_count = u32::try_from(dim_postings[&dim_id].len()).map_err(|_| {
+                crate::Error::Internal("BMP block/dimension posting count exceeds u32::MAX".into())
+            })?;
+            cum = cum.checked_add(posting_count).ok_or_else(|| {
+                crate::Error::Internal("BMP block posting prefix exceeds u32::MAX".into())
+            })?;
         }
         blk_buf.extend_from_slice(&cum.to_le_bytes());
 
@@ -1184,19 +1378,48 @@ pub(crate) fn reorder_bmp_field(
             }
             grid.push((dim_id, out_block as u32, max_impact));
         }
-        (blk_buf, grid)
+        Ok((blk_buf, grid))
     };
 
     // Encode blocks in parallel per bounded window (blob order is fixed, so
     // the write itself stays serial; the window caps buffered bytes).
-    const ENCODE_WINDOW: usize = 4096;
-    let mut encoded: Vec<EncodedBlock> = Vec::new();
-    for window_start in (0..new_num_blocks).step_by(ENCODE_WINDOW) {
-        let window_end = (window_start + ENCODE_WINDOW).min(new_num_blocks);
+    const ENCODE_WINDOW_BUDGET: usize = 256 * 1024 * 1024;
+    let source_block_bytes = bmp_refs
+        .iter()
+        .map(|bmp| bmp.block_data_slice().len())
+        .fold(0usize, usize::saturating_add);
+    let source_blocks = bmp_refs
+        .iter()
+        .map(|bmp| bmp.num_blocks as usize)
+        .fold(0usize, usize::saturating_add);
+    // Encoded bytes and grid tuples coexist. Twice the average source block
+    // size is a conservative estimate; the byte budget prevents a pathological
+    // high-dimensional corpus from buffering several GB merely because the
+    // old fixed window admitted 4096 blocks.
+    let estimated_bytes_per_block = source_block_bytes
+        .checked_div(source_blocks.max(1))
+        .unwrap_or(0)
+        .saturating_mul(2)
+        .max(1);
+    // More queued blocks than workers cannot improve parallelism, but their
+    // variable-size buffers all remain live until the serial write phase.
+    // Two waves keep workers fed while imposing a hard small-count ceiling on
+    // estimation error from heavily skewed blocks.
+    let parallel_width = rayon_pool
+        .as_ref()
+        .map(|pool| pool.current_num_threads())
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1);
+    let max_parallel_window = parallel_width.saturating_mul(2);
+    let encode_window =
+        (ENCODE_WINDOW_BUDGET / estimated_bytes_per_block).clamp(1, max_parallel_window);
+    let mut encoded: Vec<Result<EncodedBlock>> = Vec::new();
+    for window_start in (0..new_num_blocks).step_by(encode_window) {
+        let window_end = (window_start + encode_window).min(new_num_blocks);
         encoded.clear();
         {
             use rayon::prelude::*;
-            let run = |out: &mut Vec<EncodedBlock>| {
+            let run = |out: &mut Vec<Result<EncodedBlock>>| {
                 (window_start..window_end)
                     .into_par_iter()
                     .map(encode_block)
@@ -1209,26 +1432,25 @@ pub(crate) fn reorder_bmp_field(
             }
         }
 
-        for (blk_buf, grid) in &encoded {
+        for encoded_block in encoded.drain(..) {
+            let (blk_buf, grid) = encoded_block?;
             block_data_starts.push(cumulative_bytes);
             if blk_buf.is_empty() {
                 continue;
             }
-            total_terms += grid.len() as u32;
+            total_terms += grid.len() as u64;
             // layout: 4 (nt) + nt*4 (dims) + (nt+1)*4 (prefix) + postings*2
-            total_postings += ((blk_buf.len() - 8 - grid.len() * 8) / 2) as u32;
-            grid_entries.extend_from_slice(grid);
-            writer.write_all(blk_buf).map_err(crate::Error::Io)?;
+            total_postings += ((blk_buf.len() - 8 - grid.len() * 8) / 2) as u64;
+            grid_entries.extend_from_slice(&grid);
+            writer.write_all(&blk_buf).map_err(crate::Error::Io)?;
             cumulative_bytes += blk_buf.len() as u64;
         }
 
         // Spill grid entries to disk when memory budget exceeded
         if grid_entries.len() >= max_entries_in_memory {
             grid_entries.sort_unstable();
-            let run_path =
-                std::env::temp_dir().join(format!("{}_{}.tmp", run_prefix, run_files.len()));
+            let run_path = run_files.allocate();
             write_grid_run(&grid_entries, &run_path).map_err(crate::Error::Io)?;
-            run_files.push(run_path);
             grid_entries.clear();
             log::debug!(
                 "[reorder_bmp] field {}: spilled grid run {} to disk",
@@ -1243,10 +1465,6 @@ pub(crate) fn reorder_bmp_field(
     block_data_starts.push(cumulative_bytes);
 
     if total_terms == 0 {
-        // Clean up any run files
-        for path in &run_files {
-            let _ = std::fs::remove_file(path);
-        }
         return Ok((writer, field_tocs, converged));
     }
 
@@ -1288,16 +1506,14 @@ pub(crate) fn reorder_bmp_field(
     } else {
         // Flush remaining in-memory entries as the final run if non-empty
         if !grid_entries.is_empty() {
-            let run_path =
-                std::env::temp_dir().join(format!("{}_{}.tmp", run_prefix, run_files.len()));
+            let run_path = run_files.allocate();
             write_grid_run(&grid_entries, &run_path).map_err(crate::Error::Io)?;
-            run_files.push(run_path);
         }
         drop(grid_entries);
 
         // Open run readers for K-way merge
         let mut run_readers: Vec<GridRunReader> = Vec::with_capacity(run_files.len());
-        for path in &run_files {
+        for path in run_files.iter() {
             run_readers.push(GridRunReader::open(path).map_err(crate::Error::Io)?);
         }
 
@@ -1310,11 +1526,8 @@ pub(crate) fn reorder_bmp_field(
         )
         .map_err(crate::Error::Io)?;
 
-        // Clean up run files
+        // Readers must close before the RAII owner removes the run files.
         drop(run_readers);
-        for path in &run_files {
-            let _ = std::fs::remove_file(path);
-        }
 
         result
     };
@@ -1339,7 +1552,13 @@ pub(crate) fn reorder_bmp_field(
         let (src, vid) = resolve(global_real as usize);
         let ids = sources[src].0.doc_map_ids_slice();
         let off = vid * 4;
-        let doc_id = u32::from_le_bytes(ids[off..off + 4].try_into().unwrap()) + sources[src].1;
+        let source_doc_id = u32::from_le_bytes(ids[off..off + 4].try_into().unwrap());
+        let doc_id = source_doc_id.checked_add(sources[src].1).ok_or_else(|| {
+            crate::Error::Corruption(format!(
+                "BMP doc-id offset overflow: {} + {}",
+                source_doc_id, sources[src].1
+            ))
+        })?;
         writer
             .write_all(&doc_id.to_le_bytes())
             .map_err(crate::Error::Io)?;
@@ -1430,6 +1649,21 @@ mod grid_run_prefix_tests {
         assert_ne!(
             a, b,
             "two passes over the same field must not share spill files"
+        );
+    }
+
+    #[test]
+    fn grid_run_files_remove_partial_spills_on_drop() {
+        let path = {
+            let mut runs = super::GridRunFiles::new(7);
+            let path = runs.allocate();
+            std::fs::write(&path, b"partial run").unwrap();
+            assert!(path.exists());
+            path
+        };
+        assert!(
+            !path.exists(),
+            "spill owner must remove files on unwind/drop"
         );
     }
 }

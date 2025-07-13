@@ -71,7 +71,7 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Segments flushed to disk but not yet registered in metadata. Each item
     /// owns an active-operation guard, so orphan sweeping cannot delete it.
-    flushed_segments: Vec<PreparedSegment>,
+    flushed_segments: Vec<PreparedSegment<D>>,
     /// Primary key dedup index (None if schema has no primary field)
     primary_key_index: Option<super::primary_key::PrimaryKeyIndex>,
 }
@@ -88,7 +88,13 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Segments built by workers, collected by `prepare_commit()`. Their RAII
     /// guards protect both in-progress and completed-uncommitted files.
-    built_segments: parking_lot::Mutex<Vec<PreparedSegment>>,
+    built_segments: parking_lot::Mutex<Vec<PreparedSegment<D>>>,
+    /// First failure in the current flush generation. Worker-side indexing is
+    /// asynchronous, so `prepare_commit` is the only sound place to surface
+    /// it to the caller. A failed generation is aborted as a unit; publishing
+    /// only its successful segments would silently lose documents.
+    cycle_error: parking_lot::Mutex<Option<String>>,
+    cycle_failed: AtomicBool,
 
     // === Worker lifecycle synchronization ===
     // Workers survive across commits. On prepare_commit the channel is closed;
@@ -115,18 +121,55 @@ struct WorkerState<D: DirectoryWriter + 'static> {
 
 /// A completed indexing segment that has not been published in metadata yet.
 ///
-/// `_operation` is intentionally data, not a side-channel set update: moving
+/// `operation` is intentionally data, not a side-channel set update: moving
 /// this value through worker → prepared commit → commit/abort moves lifecycle
 /// ownership with it, and every unwind/drop path releases ownership safely.
-struct PreparedSegment {
+struct PreparedSegment<D: DirectoryWriter + 'static> {
     id: String,
+    segment_id: SegmentId,
     num_docs: u32,
-    _operation: crate::merge::SegmentOperationGuard,
+    segment_manager: Arc<crate::merge::SegmentManager<D>>,
+    operation: Option<crate::merge::SegmentOperationGuard>,
+    runtime: tokio::runtime::Handle,
+    published: bool,
 }
 
-impl PreparedSegment {
+impl<D: DirectoryWriter + 'static> PreparedSegment<D> {
     fn metadata_entry(&self) -> (String, u32) {
         (self.id.clone(), self.num_docs)
+    }
+
+    fn mark_published(&mut self) {
+        self.published = true;
+        // Metadata + SegmentTracker are now the durable lifecycle owners.
+        drop(self.operation.take());
+    }
+}
+
+impl<D: DirectoryWriter + 'static> WorkerState<D> {
+    fn record_cycle_error(&self, error: impl Into<String>) {
+        let mut first_error = self.cycle_error.lock();
+        if first_error.is_none() {
+            *first_error = Some(error.into());
+        }
+        drop(first_error);
+        self.cycle_failed.store(true, Ordering::Release);
+    }
+}
+
+impl<D: DirectoryWriter + 'static> Drop for PreparedSegment<D> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let Some(operation) = self.operation.take() else {
+            return;
+        };
+        self.segment_manager.schedule_unpublished_segment_cleanup(
+            self.segment_id,
+            operation,
+            self.runtime.clone(),
+        );
     }
 }
 
@@ -156,8 +199,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            Arc::clone(&config.background_merge_permits),
             config.merge_bp_time_budget,
             config.bp_memory_budget_bytes,
+            Arc::clone(&config.background_reorder_permits),
+            config.background_reorder_pool.clone(),
         ));
         segment_manager.update_metadata(|_| {}).await?;
 
@@ -170,7 +216,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         ))
     }
 
-    /// Open an existing index for writing
+    /// Open an existing index for exclusive writing.
+    ///
+    /// Multiple independent writers for the same directory are unsupported:
+    /// this path removes crash-leftover outputs before starting its workers.
+    /// Use [`Index::writer`](super::Index::writer) to share lifecycle state
+    /// with an already-open search index.
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
         Self::open_with_config(directory, config, SegmentBuilderConfig::default()).await
     }
@@ -194,9 +245,19 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            Arc::clone(&config.background_merge_permits),
             config.merge_bp_time_budget,
             config.bp_memory_budget_bytes,
+            Arc::clone(&config.background_reorder_permits),
+            config.background_reorder_pool.clone(),
         ));
+        let swept = segment_manager.cleanup_orphan_segments().await?;
+        if swept > 0 {
+            log::warn!(
+                "[segment_cleanup] swept {} orphan segment(s) while opening writer",
+                swept
+            );
+        }
         segment_manager.load_and_publish_trained().await;
 
         Ok(Self::new_with_parts(
@@ -253,6 +314,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             memory_budget_per_worker: config.max_indexing_memory_bytes / num_workers,
             segment_manager: Arc::clone(&segment_manager),
             built_segments: parking_lot::Mutex::new(Vec::new()),
+            cycle_error: parking_lot::Mutex::new(None),
+            cycle_failed: AtomicBool::new(false),
             flush_count: AtomicUsize::new(0),
             flush_mutex: parking_lot::Mutex::new(()),
             flush_cvar: parking_lot::Condvar::new(),
@@ -475,6 +538,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// `Document` is moved into the channel (zero-copy). Workers compete to pull it.
     /// Returns `Error::QueueFull` when the queue is at capacity — caller must back off.
     pub fn add_document(&self, doc: Document) -> Result<()> {
+        if self.worker_state.shutdown.load(Ordering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
         if let Some(ref pk_index) = self.primary_key_index {
             pk_index.check_and_insert(&doc)?;
         }
@@ -541,6 +607,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 let mut builder: Option<SegmentBuilder> = None;
 
                 while let Ok(doc) = receiver.recv_blocking() {
+                    if state.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Another worker already invalidated this generation.
+                    // Drain the shared queue so prepare_commit can complete,
+                    // but do not spend CPU/RAM building outputs that must be
+                    // discarded transactionally.
+                    if state.cycle_failed.load(Ordering::Acquire) {
+                        continue;
+                    }
                     // Initialize builder if needed
                     if builder.is_none() {
                         match SegmentBuilder::new(
@@ -555,6 +631,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             }
                             Err(e) => {
                                 log::error!("Failed to create segment builder: {:?}", e);
+                                state.record_cycle_error(format!(
+                                    "failed to create segment builder: {e}"
+                                ));
                                 continue;
                             }
                         }
@@ -563,6 +642,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     let b = builder.as_mut().unwrap();
                     if let Err(e) = b.add_document(doc) {
                         log::error!("Failed to index document: {:?}", e);
+                        state.record_cycle_error(format!("failed to index document: {e}"));
                         continue;
                     }
 
@@ -599,7 +679,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 }
 
                 // Channel closed — flush current builder
-                if let Some(b) = builder.take()
+                if !state.cycle_failed.load(Ordering::Acquire)
+                    && let Some(b) = builder.take()
                     && b.num_docs() > 0
                 {
                     Self::build_segment_inline(&state, b, &handle);
@@ -610,6 +691,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 log::error!(
                     "[worker] panic during indexing cycle — documents in this cycle may be lost"
                 );
+                state.record_cycle_error("indexing worker panicked while building the batch");
             }
 
             // Signal flush completion (always, even after panic — prevents
@@ -667,6 +749,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     segment_hex,
                     e,
                 );
+                state.record_cycle_error(format!(
+                    "failed to claim segment {segment_hex} for building: {e}"
+                ));
                 return;
             }
         };
@@ -681,12 +766,25 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             trained.is_some()
         );
 
+        // Construct the cleanup owner before building. It keeps lifecycle
+        // ownership through async deletion on ordinary error, abort, and
+        // panic unwind; crash recovery is the only path left to the sweeper.
+        let mut prepared = PreparedSegment {
+            id: segment_hex.clone(),
+            segment_id,
+            num_docs: doc_count,
+            segment_manager: Arc::clone(&state.segment_manager),
+            operation: Some(operation),
+            runtime: handle.clone(),
+            published: false,
+        };
+
         match handle.block_on(builder.build(
             state.directory.as_ref(),
             segment_id,
             trained.as_deref(),
         )) {
-            Ok(meta) if meta.num_docs > 0 => {
+            Ok(meta) if meta.num_docs == doc_count && meta.num_docs > 0 => {
                 let duration_ms = build_start.elapsed().as_millis() as u64;
                 log::info!(
                     "[segment_build_done] segment_id={} doc_count={} duration_ms={}",
@@ -694,29 +792,26 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     meta.num_docs,
                     duration_ms,
                 );
-                state.built_segments.lock().push(PreparedSegment {
-                    id: segment_hex,
-                    num_docs: meta.num_docs,
-                    _operation: operation,
-                });
+                prepared.num_docs = meta.num_docs;
+                state.built_segments.lock().push(prepared);
             }
-            Ok(_) => {}
+            Ok(meta) => {
+                let error = format!(
+                    "segment {segment_hex} built {} docs from a {doc_count}-document builder",
+                    meta.num_docs
+                );
+                log::error!("[segment_build_failed] {error}");
+                state.record_cycle_error(error);
+            }
             Err(e) => {
                 log::error!(
                     "[segment_build_failed] segment_id={} error={:?}",
                     segment_hex,
                     e
                 );
-                if let Err(delete_error) = handle.block_on(crate::segment::delete_segment(
-                    state.directory.as_ref(),
-                    segment_id,
-                )) {
-                    log::warn!(
-                        "[segment_cleanup] failed deleting partial indexing segment {}: {}",
-                        segment_hex,
-                        delete_error,
-                    );
-                }
+                // `prepared` owns the lifecycle claim and schedules one
+                // tracked, idempotent cleanup pass when this scope ends.
+                state.record_cycle_error(format!("failed to build segment {segment_hex}: {e}"));
             }
         }
     }
@@ -730,9 +825,42 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.maybe_merge().await;
     }
 
-    /// Cancel all in-flight merge tasks and wait for lifecycle cleanup.
+    /// Drain all in-flight merge tasks.
+    /// Blocking merge phases cannot be cancelled safely once started.
     pub async fn abort_merges(&self) {
         self.segment_manager.abort_merges().await;
+    }
+
+    /// Stop accepting lifecycle work, stop and join indexing workers, and
+    /// discard unpublished segments. Index deletion calls this while holding
+    /// the registry writer lock so in-flight requests finish first and stale
+    /// writer Arcs cannot restart work afterward.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.segment_manager.begin_shutdown();
+        self.signal_worker_shutdown();
+
+        let workers = std::mem::take(&mut self.workers);
+        let panicked = tokio::task::spawn_blocking(move || {
+            workers
+                .into_iter()
+                .map(|worker| worker.join().is_err())
+                .filter(|panicked| *panicked)
+                .count()
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("failed to join index workers: {}", error)))?;
+        if panicked > 0 {
+            log::error!("[index_shutdown] {} indexing worker(s) panicked", panicked);
+        }
+
+        // No commit is possible after shutdown. Dropping these RAII values
+        // releases their lifecycle ownership before directory deletion.
+        self.flushed_segments.clear();
+        self.worker_state.built_segments.lock().clear();
+        if let Some(pk_index) = &mut self.primary_key_index {
+            pk_index.clear_uncommitted();
+        }
+        Ok(())
     }
 
     /// Wait for the in-flight background merge to complete (if any).
@@ -771,6 +899,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///
     /// `add_document` will return `Closed` error until commit/abort resumes workers.
     pub async fn prepare_commit(&mut self) -> Result<PreparedCommit<'_, D>> {
+        if self.worker_state.shutdown.load(Ordering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
         // 1. Close channel → workers drain remaining docs and flush builders
         self.doc_sender.close();
 
@@ -803,12 +934,34 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         .map_err(|e| Error::Internal(format!("Failed to wait for workers: {}", e)))?;
 
         if !all_flushed {
-            // Resume workers so the system isn't stuck, then return error
-            self.resume_workers();
+            // Keep this commit cycle paused. Resetting flush_count and handing
+            // out a new receiver while an old worker is still building lets
+            // that late worker increment the *next* cycle's counter. A later
+            // prepare can then return before all of its workers flushed and
+            // publish an incomplete set of segments. The caller may retry
+            // prepare_commit; it will observe the same generation and collect
+            // every completed output once the lagging worker finishes.
             return Err(Error::Internal(format!(
-                "prepare_commit timed out: {}/{} workers flushed",
+                "prepare_commit timed out: {}/{} workers flushed; writer remains paused, retry commit",
                 self.worker_state.flush_count.load(Ordering::Acquire),
                 self.worker_state.num_workers
+            )));
+        }
+
+        let cycle_error = { self.worker_state.cycle_error.lock().take() };
+        if let Some(error) = cycle_error {
+            // No partial publication: some documents in this generation no
+            // longer exist in a worker builder, so successful sibling outputs
+            // cannot be committed without violating commit's all-prior-docs
+            // guarantee. Their RAII drops retain ownership through deletion.
+            self.flushed_segments.clear();
+            self.worker_state.built_segments.lock().clear();
+            if let Some(pk_index) = &mut self.primary_key_index {
+                pk_index.clear_uncommitted();
+            }
+            self.resume_workers();
+            return Err(Error::Internal(format!(
+                "indexing generation failed; no documents from this batch were committed: {error}"
             )));
         }
 
@@ -856,6 +1009,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Workers are already alive — just give them a new channel and wake them.
     /// If the tokio runtime has shut down (e.g., program exit), this is a no-op.
     fn resume_workers(&mut self) {
+        if self.worker_state.shutdown.load(Ordering::Acquire) {
+            return;
+        }
         if tokio::runtime::Handle::try_current().is_err() {
             // Runtime is gone — signal permanent shutdown so workers don't
             // hang forever on resume_cvar.
@@ -866,6 +1022,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         // Reset flush count for next cycle
         self.worker_state.flush_count.store(0, Ordering::Release);
+        *self.worker_state.cycle_error.lock() = None;
+        self.worker_state
+            .cycle_failed
+            .store(false, Ordering::Release);
 
         // Create new channel
         let (sender, receiver) = async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
@@ -882,18 +1042,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.worker_state.resume_cvar.notify_all();
     }
 
+    fn signal_worker_shutdown(&self) {
+        self.worker_state.shutdown.store(true, Ordering::Release);
+        self.doc_sender.close();
+        self.worker_state.resume_cvar.notify_all();
+    }
+
     // Vector index methods (build_vector_index, etc.) are in vector_builder.rs
 }
 
 impl<D: DirectoryWriter + 'static> Drop for IndexWriter<D> {
     fn drop(&mut self) {
-        // 1. Signal permanent shutdown
-        self.worker_state.shutdown.store(true, Ordering::Release);
-        // 2. Close channel to wake workers blocked on recv_blocking
-        self.doc_sender.close();
-        // 3. Wake workers that might be waiting on resume_cvar
-        self.worker_state.resume_cvar.notify_all();
-        // 4. Join worker threads
+        self.signal_worker_shutdown();
         for w in std::mem::take(&mut self.workers) {
             let _ = w.join();
         }
@@ -919,7 +1079,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     ///
     /// Returns `true` if new segments were committed, `false` if nothing changed.
     pub async fn commit(mut self) -> Result<bool> {
-        let segments = std::mem::take(&mut self.writer.flushed_segments);
+        let mut segments = std::mem::take(&mut self.writer.flushed_segments);
 
         // Fast path: nothing to commit
         if segments.is_empty() {
@@ -935,17 +1095,21 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
             .collect();
         if let Err(error) = self.writer.segment_manager.commit(&metadata_entries).await {
             // Publication is transactional, so these guarded files remain a
-            // valid prepared commit. Preserve them for the caller's next
-            // commit instead of leaking ownership or wedging the workers.
+            // valid prepared commit. Preserve them and keep this generation
+            // paused for the caller's next commit/abort. Resuming here allowed
+            // a later worker generation to mix with the retained outputs; a
+            // failure in that generation then discarded documents from both.
             self.writer.flushed_segments = segments;
             self.is_resolved = true;
-            self.writer.resume_workers();
             return Err(error);
         }
         self.is_published = true;
 
         // Metadata + tracker now own the IDs; releasing indexing ownership is
         // the final transition from prepared to live.
+        for segment in &mut segments {
+            segment.mark_published();
+        }
         drop(segments);
 
         // Refresh primary key index: only load fast fields for NEW segments.
@@ -1000,8 +1164,8 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
         post_publish_result.map(|()| true)
     }
 
-    /// Abort: discard prepared segments, resume workers.
-    /// Segment files become orphans (cleaned up by `cleanup_orphan_segments`).
+    /// Abort: discard prepared segments, delete their files asynchronously,
+    /// and resume workers. Lifecycle ownership is held until deletion ends.
     pub fn abort(mut self) {
         self.is_resolved = true;
         self.writer.flushed_segments.clear();

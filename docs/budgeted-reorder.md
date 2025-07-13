@@ -107,9 +107,10 @@ background via warm-started passes; `bp_converged` now means
 ## Single-pass parallelism (2026-07-14)
 
 A single reorder pass has three phases; all three are now parallel and all
-three run on the bounded background pool (`cores/2` threads — merge-time
-pool in `SegmentManager::background_cpu_pool`, optimizer pool sized
-`max(--optimizer-threads, cores/2)`), keeping background CPU off the global
+three run on one process-wide, bounded background pool. In `hermes-server`,
+`--optimizer-threads` sets its width when the periodic optimizer is enabled;
+otherwise merge-time and manual BP share the `cores/2` fallback pool. There is
+never a pool per index or per pass, and background CPU stays off the global
 query pool:
 
 1. **Forward-index build** (was fully serial). Real doc ids are assigned in
@@ -131,7 +132,27 @@ query pool:
   merge-time BP is wall-clock budgeted, so the policy is safe at any scale.
 - `bp_memory_budget_bytes` default 2 GB → 24 GB (`--bp-memory-budget-mb`
   default 24576). It is a cap, not an allocation — memory use is proportional
-  to the segment actually being reordered (~4 B/posting + ~28 B/doc). Sized
+  to the segment actually being reordered (~4 B/posting + ~32 B/doc). Sized
   from prod evidence: a 58M-doc / 5B-posting pass estimated 20.1 GB; smaller
   budgets trimmed it by dropping highest-df dims (2 GB dropped ~10% of
   eligible dims on 18M-doc merges).
+
+## Process-level resource bounds (2026-07-15)
+
+Thread width and operation concurrency are intentionally independent:
+
+- `--optimizer-threads` controls CPU parallelism inside the shared pool. A
+  running BP pass is expected to keep up to that many cores busy.
+- `--optimizer-concurrent-passes` (default 2) gates complete reorder passes
+  across every index and every entry point: optimizer, merge-time, and manual.
+  Concurrent passes share the CPU pool, but each may consume its own forward
+  index budget and rewrite buffers.
+- `--bp-memory-budget-mb` is therefore a **per-pass** cap. A conservative
+  process estimate starts with `concurrent passes × memory budget`, then adds
+  indexing builders, merge structures, readers, and mmap/page-cache residency.
+
+The gate is acquired before expensive forward-index construction. Scheduler
+permits are nonblocking, indexes are visited with a rotating start point, fresh
+segments are ordered small-first, and at most one unconverged candidate is
+selected first. This prevents a quiet index or repeated deepening candidate
+from monopolizing capacity.

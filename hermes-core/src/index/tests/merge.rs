@@ -1,6 +1,25 @@
-use crate::directories::RamDirectory;
+use crate::directories::{Directory, RamDirectory};
 use crate::dsl::{Document, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
+
+async fn wait_for_no_segment_files(dir: &RamDirectory) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let has_segment_files = dir
+                .list_files(std::path::Path::new(""))
+                .await
+                .unwrap()
+                .iter()
+                .any(|path| path.to_string_lossy().starts_with("seg_"));
+            if !has_segment_files {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tracked indexing cleanup did not finish");
+}
 
 /// A failed sparse merge can leave its segment-scoped skip table behind.
 /// Cleanup must remove that temporary file along with the normal segment
@@ -26,7 +45,12 @@ async fn test_orphan_sweep_removes_sparse_skip_temp_once() {
 
     let orphan_id = SegmentId::new();
     let temp_path = SegmentFiles::new(orphan_id.0).sparse_skip_temp();
+    let legacy_partial =
+        std::path::PathBuf::from(format!("seg_{}.legacy-partial", orphan_id.to_hex()));
     dir.write(&temp_path, b"partial skip table").await.unwrap();
+    dir.write(&legacy_partial, b"partial old-format output")
+        .await
+        .unwrap();
 
     assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 1);
     assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 0);
@@ -36,6 +60,36 @@ async fn test_orphan_sweep_removes_sparse_skip_temp_once() {
             .unwrap()
             .contains(&temp_path)
     );
+    assert!(!dir.exists(&legacy_partial).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_orphan_sweep_ignores_malformed_unicode_segment_name() {
+    use crate::directories::DirectoryWriter;
+
+    let dir = RamDirectory::new();
+    let index = Index::create(
+        dir.clone(),
+        SchemaBuilder::default().build(),
+        IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let malformed = std::path::Path::new("seg_€€€€€€€€€€€€€€€€.partial");
+    dir.write(malformed, b"not a segment").await.unwrap();
+
+    assert_eq!(
+        index
+            .segment_manager()
+            .cleanup_orphan_segments()
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(dir.exists(malformed).await.unwrap());
 }
 
 /// Regression for the production lifecycle race: the optimizer's orphan
@@ -80,9 +134,7 @@ async fn test_prepared_indexing_segments_are_protected_from_orphan_sweep() {
 }
 
 #[tokio::test]
-async fn test_aborted_indexing_segments_become_sweepable() {
-    use crate::directories::Directory;
-
+async fn test_aborted_indexing_segments_are_deleted_without_sweeper() {
     let mut schema_builder = SchemaBuilder::default();
     let title = schema_builder.add_text_field("title", true, true);
     let dir = RamDirectory::new();
@@ -103,9 +155,10 @@ async fn test_aborted_indexing_segments_become_sweepable() {
     assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 0);
     prepared.abort();
 
+    wait_for_no_segment_files(&dir).await;
     assert!(
-        manager.cleanup_orphan_segments().await.unwrap() >= 1,
-        "dropping prepared ownership on abort must expose the files to sweeping"
+        manager.cleanup_orphan_segments().await.unwrap() == 0,
+        "ordinary abort cleanup must not rely on the orphan sweeper"
     );
     assert!(
         dir.list_files(std::path::Path::new(""))
@@ -114,6 +167,45 @@ async fn test_aborted_indexing_segments_become_sweepable() {
             .iter()
             .all(|path| !path.to_string_lossy().starts_with("seg_"))
     );
+}
+
+/// A document rejected inside an asynchronous worker must fail the whole
+/// flush generation. Logging and committing successful siblings would make
+/// `commit()` acknowledge documents that were never persisted.
+#[tokio::test]
+async fn test_worker_build_failure_aborts_generation_and_writer_recovers() {
+    let mut schema_builder = SchemaBuilder::default();
+    let dense = schema_builder.add_dense_vector_field("dense", 3, true, true);
+    let dir = RamDirectory::new();
+    let index = Index::create(
+        dir.clone(),
+        schema_builder.build(),
+        IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+
+    let mut invalid = Document::new();
+    invalid.add_dense_vector(dense, vec![1.0, 2.0]);
+    writer.add_document(invalid).unwrap();
+    let error = writer.commit().await.unwrap_err();
+    assert!(
+        error.to_string().contains("indexing generation failed"),
+        "unexpected error: {error}"
+    );
+    assert!(writer.segment_manager().get_segment_ids().await.is_empty());
+    wait_for_no_segment_files(&dir).await;
+
+    // The failed generation is fully resolved and workers start a fresh one.
+    let mut valid = Document::new();
+    valid.add_dense_vector(dense, vec![1.0, 2.0, 3.0]);
+    writer.add_document(valid).unwrap();
+    assert!(writer.commit().await.unwrap());
+    assert_eq!(index.num_docs().await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -154,10 +246,18 @@ async fn test_commit_refuses_to_publish_missing_segment_files() {
     );
     assert!(manager.get_segment_ids().await.is_empty());
 
+    // A pre-publication error retains one prepared generation and therefore
+    // keeps workers paused. New documents cannot be mixed into it before the
+    // caller explicitly retries or aborts.
+    let mut later = Document::new();
+    later.add_text(title, "must not enter a second generation");
+    assert!(writer.add_document(later).is_err());
+
     // The failed commit preserved prepared ownership for retry. Resolve it as
-    // an abort, then verify the remaining partial files are reclaimable.
+    // an abort, then verify tracked cleanup removes the remaining files.
     writer.prepare_commit().await.unwrap().abort();
-    assert!(manager.cleanup_orphan_segments().await.unwrap() >= 1);
+    wait_for_no_segment_files(&dir).await;
+    assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -209,6 +309,50 @@ async fn test_missing_merge_source_is_quarantined_instead_of_retried() {
     // same failing candidate or burn a merge slot in a tight loop.
     writer.maybe_merge().await;
     manager.wait_for_all_merges().await;
+}
+
+/// An index whose candidate was denied by the application-wide merge gate
+/// must resume when another index releases capacity. Depending on a later
+/// commit for this wakeup strands quiet indexes indefinitely.
+#[tokio::test]
+async fn test_global_merge_capacity_release_wakes_waiting_index() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let occupied = std::sync::Arc::clone(&gate).acquire_owned().await.unwrap();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::TieredMergePolicy::aggressive()),
+        max_concurrent_merges: 1,
+        background_merge_permits: gate,
+        ..Default::default()
+    };
+    let index = Index::create(RamDirectory::new(), schema_builder.build(), config)
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+
+    for segment in 0..3 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("capacity wakeup segment {segment}"));
+        writer.add_document(doc).unwrap();
+        writer.commit().await.unwrap();
+    }
+    assert_eq!(manager.get_segment_ids().await.len(), 3);
+
+    drop(occupied);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if manager.get_segment_ids().await.len() < 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("waiting index was not woken when global merge capacity returned");
+    manager.wait_for_all_merges().await;
+    assert_eq!(manager.get_segment_ids().await.len(), 1);
 }
 
 /// Multi-round merge: flush many small segments, merge, add more, merge again.

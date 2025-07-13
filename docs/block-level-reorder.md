@@ -28,6 +28,14 @@ list (no posting decode needed):
   chunk (doc-id offsets patched for multi-source). No record unpacking, no
   per-block hashmaps, no padding changes.
 
+The row-major grid rewrite is bounded independently of field size: each row
+is spilled and consumed in order instead of retaining `dimensions ×
+superblocks` in RAM. Source/local-block ownership is resolved once per block
+and reused for every dimension, avoiding a prefix search in the
+`dimensions × blocks` inner loop. Record-level output encoding likewise uses
+bounded windows (at most twice the BP pool width) rather than buffering the
+entire rewritten blob.
+
 What it cannot do: tighten block upper bounds (block composition is fixed).
 That remains record-level BP's job.
 

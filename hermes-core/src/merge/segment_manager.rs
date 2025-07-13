@@ -31,18 +31,22 @@
 //!   2. active_operations   — parking_lot::Mutex (sync), sub-μs hold, RAII guard
 //!   3. tracker.inner       — parking_lot::Mutex (sync), sub-μs hold
 //!
-//! Lock-free state:
-//!   trained                — arc_swap::ArcSwapOption, no ordering constraint
-//!   merge_handles          — tokio::sync::Mutex, never held with state
+//! Independent bookkeeping (never held with `state`):
+//!   trained                — arc_swap::ArcSwapOption, lock-free
+//!   merge_handles          — parking_lot::Mutex, synchronous short hold
+//!   lifecycle_handles      — parking_lot::Mutex, synchronous short hold
+//!   merge/reorder permits  — tokio semaphores shared by configuration
 //! ```
 //!
 //! **Rule:** Never hold a sync lock while `.await`-ing.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwapOption;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::directories::DirectoryWriter;
@@ -65,14 +69,26 @@ use super::{MergePolicy, SegmentInfo};
 /// Merge/reorder guards include both sources and output, providing mutual
 /// exclusion as well as orphan-sweep protection. Indexing guards contain the
 /// new output only and live from before the first write through commit/abort.
+struct ActiveOperationState {
+    segment_ids: HashSet<String>,
+    accepting: bool,
+}
+
 struct ActiveSegmentOperations {
-    inner: parking_lot::Mutex<HashSet<String>>,
+    inner: parking_lot::Mutex<ActiveOperationState>,
+    idle: Notify,
+    shutdown: Notify,
 }
 
 impl ActiveSegmentOperations {
     fn new() -> Self {
         Self {
-            inner: parking_lot::Mutex::new(HashSet::new()),
+            inner: parking_lot::Mutex::new(ActiveOperationState {
+                segment_ids: HashSet::new(),
+                accepting: true,
+            }),
+            idle: Notify::new(),
+            shutdown: Notify::new(),
         }
     }
 
@@ -80,13 +96,17 @@ impl ActiveSegmentOperations {
     /// if any requested ID is already owned by another active operation.
     fn try_register(self: &Arc<Self>, segment_ids: Vec<String>) -> Option<SegmentOperationGuard> {
         let mut inner = self.inner.lock();
+        if !inner.accepting {
+            log::debug!("[segment_lifecycle] rejected operation during shutdown");
+            return None;
+        }
         // Check for overlap with any active lifecycle operation.
         for id in &segment_ids {
-            if inner.contains(id) {
+            if inner.segment_ids.contains(id) {
                 log::debug!(
                     "[segment_lifecycle] rejected: {} overlaps with an active operation ({} active IDs)",
                     id,
-                    inner.len()
+                    inner.segment_ids.len()
                 );
                 return None;
             }
@@ -94,10 +114,10 @@ impl ActiveSegmentOperations {
         log::debug!(
             "[segment_lifecycle] registered {} IDs (total active: {})",
             segment_ids.len(),
-            inner.len() + segment_ids.len()
+            inner.segment_ids.len() + segment_ids.len()
         );
         for id in &segment_ids {
-            inner.insert(id.clone());
+            inner.segment_ids.insert(id.clone());
         }
         Some(SegmentOperationGuard {
             active_operations: Arc::clone(self),
@@ -107,12 +127,47 @@ impl ActiveSegmentOperations {
 
     /// Snapshot of all IDs owned by active operations.
     fn snapshot(&self) -> HashSet<String> {
-        self.inner.lock().clone()
+        self.inner.lock().segment_ids.clone()
     }
 
-    /// Check if a specific segment is currently involved in a merge.
-    fn contains(&self, segment_id: &str) -> bool {
-        self.inner.lock().contains(segment_id)
+    /// Atomically prevent new lifecycle work from starting. Existing guards
+    /// remain valid and can be drained with [`Self::wait_until_idle`].
+    fn stop_accepting(&self) {
+        let mut inner = self.inner.lock();
+        inner.accepting = false;
+        self.shutdown.notify_waiters();
+        if inner.segment_ids.is_empty() {
+            self.idle.notify_waiters();
+        }
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.inner.lock().accepting
+    }
+
+    /// Wait until every operation that started before shutdown has released
+    /// its ownership. Register/check and notification are ordered to avoid a
+    /// missed wakeup between observing a non-empty set and awaiting.
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.inner.lock().segment_ids.is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Resolve when shutdown starts, without missing a notification between
+    /// checking the state and registering the waiter.
+    async fn wait_for_shutdown(&self) {
+        loop {
+            let notified = self.shutdown.notified();
+            if !self.inner.lock().accepting {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -128,9 +183,56 @@ impl Drop for SegmentOperationGuard {
     fn drop(&mut self) {
         let mut inner = self.active_operations.inner.lock();
         for id in &self.segment_ids {
-            inner.remove(id);
+            inner.segment_ids.remove(id);
+        }
+        if inner.segment_ids.is_empty() {
+            self.active_operations.idle.notify_waiters();
         }
     }
+}
+
+/// Merge-time/manual BP pools are shared by every index in this process.
+/// A pool per `SegmentManager` multiplied a 96-core host into two 48-thread
+/// merge pools plus the optimizer pool (200+ process threads in production).
+static BACKGROUND_CPU_POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
+
+const MERGE_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+const MERGE_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+#[derive(Default)]
+struct MergeRetryState {
+    retry_after: Option<std::time::Instant>,
+    consecutive_failures: u32,
+}
+
+fn merge_retry_delay(consecutive_failures: u32) -> std::time::Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(16);
+    MERGE_RETRY_BASE_DELAY
+        .checked_mul(1u32 << shift)
+        .unwrap_or(MERGE_RETRY_MAX_DELAY)
+        .min(MERGE_RETRY_MAX_DELAY)
+}
+
+/// Spawn and register auxiliary lifecycle work as one synchronous operation.
+///
+/// Registering *after* `spawn` left a small deletion race: shutdown could
+/// observe an empty handle list while the newly spawned filesystem task was
+/// already running. Holding the handle-list mutex across `Handle::spawn`
+/// makes task creation visible to the drain before either side can proceed.
+fn try_spawn_lifecycle<F>(
+    handles: &parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    runtime: &tokio::runtime::Handle,
+    future: F,
+) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut handles = handles.lock();
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(runtime.spawn(future));
+    }))
+    .is_ok()
 }
 
 /// Deletes an uncommitted merge/reorder output if its task unwinds.
@@ -175,7 +277,7 @@ struct ManagerState {
 #[cfg(feature = "native")]
 struct MergeTaskError {
     error: Error,
-    unavailable_segment: Option<String>,
+    unavailable_segments: Vec<String>,
 }
 
 #[cfg(feature = "native")]
@@ -183,7 +285,14 @@ impl MergeTaskError {
     fn source(segment_id: String, error: Error) -> Self {
         Self {
             error,
-            unavailable_segment: Some(segment_id),
+            unavailable_segments: vec![segment_id],
+        }
+    }
+
+    fn sources(segment_ids: Vec<String>, error: Error) -> Self {
+        Self {
+            error,
+            unavailable_segments: segment_ids,
         }
     }
 }
@@ -193,8 +302,26 @@ impl From<Error> for MergeTaskError {
     fn from(error: Error) -> Self {
         Self {
             error,
-            unavailable_segment: None,
+            unavailable_segments: Vec::new(),
         }
+    }
+}
+
+#[cfg(feature = "native")]
+fn is_deterministic_source_error(error: &Error) -> bool {
+    matches!(error, Error::Corruption(_) | Error::Serialization(_))
+        || matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+#[cfg(feature = "native")]
+fn classify_source_error(segment_id: String, error: Error) -> MergeTaskError {
+    if is_deterministic_source_error(&error) {
+        MergeTaskError::source(segment_id, error)
+    } else {
+        // Timeouts, interrupted reads, permission changes, and other generic
+        // I/O failures may be transient. Back them off instead of quarantining
+        // a healthy metadata segment for the rest of the process lifetime.
+        MergeTaskError::from(error)
     }
 }
 
@@ -206,22 +333,38 @@ type MergeTaskResult<T> = std::result::Result<T, MergeTaskError>;
 /// SOLE owner of `metadata.json`. All metadata mutations go through `state` Mutex.
 pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Serializes ALL metadata mutations.
-    state: AsyncMutex<ManagerState>,
+    state: Arc<AsyncMutex<ManagerState>>,
 
     /// RAII ownership for every in-flight segment lifecycle operation.
     active_operations: Arc<ActiveSegmentOperations>,
 
-    /// Metadata-live segments that failed to open. They stay searchable (and
-    /// operator-visible) but are excluded from merges for this process lifetime,
-    /// preventing a corrupt input from creating an immediate retry loop.
+    /// Metadata-live segments involved in a deterministic source/corruption
+    /// failure. They stay searchable (and operator-visible) but are excluded
+    /// from merges for this process lifetime, preventing a bad candidate from
+    /// consuming full rewrite capacity on every retry.
     quarantined_segments: parking_lot::Mutex<HashSet<String>>,
 
     /// Generic merge failures pause scheduling briefly. Source-specific open
     /// failures use `quarantined_segments` instead so healthy work can continue.
-    merge_retry_after: parking_lot::Mutex<Option<std::time::Instant>>,
+    merge_retry: parking_lot::Mutex<MergeRetryState>,
+
+    /// Per-source backoff for non-deterministic standalone reorder failures.
+    /// Optimizer scans are periodic, but a pass can outlast the scan interval;
+    /// without completion-based backoff it would restart almost immediately.
+    reorder_retries: parking_lot::Mutex<HashMap<String, MergeRetryState>>,
 
     /// In-flight merge JoinHandles — supports multiple concurrent merges.
-    merge_handles: AsyncMutex<Vec<JoinHandle<()>>>,
+    merge_handles: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+
+    /// At most one task per index waits for application-wide merge capacity.
+    /// Without this wakeup, an index denied by another index can remain idle
+    /// forever when no later commit happens to re-run merge policy evaluation.
+    global_merge_wakeup_pending: AtomicBool,
+
+    /// Auxiliary lifecycle tasks: metadata transactions, deferred deletes,
+    /// and capacity wakeups. Handles registered here are drained before index
+    /// removal.
+    lifecycle_handles: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
 
     /// Trained vector structures — lock-free reads via ArcSwap.
     trained: ArcSwapOption<TrainedVectorStructures>,
@@ -238,8 +381,16 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     schema: Arc<crate::dsl::Schema>,
     /// Term cache blocks for segment readers during merge
     term_cache_blocks: usize,
-    /// Maximum number of concurrent background merges
-    max_concurrent_merges: usize,
+    /// Hard concurrency limit for background merges. A semaphore permit is
+    /// acquired before lifecycle ownership, closing the old handle-count race
+    /// where concurrent schedulers could exceed the configured maximum.
+    merge_permits: Arc<Semaphore>,
+    /// Application-wide merge limit shared across index managers.
+    global_merge_permits: Arc<Semaphore>,
+    /// Shared across every index opened from the same `IndexConfig`. This
+    /// bounds whole BP rewrites (optimizer + merge-time + manual) separately
+    /// from Rayon thread width, preventing N × memory-budget amplification.
+    reorder_permits: Arc<Semaphore>,
     /// Run BP reordering of `reorder`-attributed BMP fields inside merges.
     /// Persisted index configuration (schema-level `reorder_on_merge: true`
     /// in SDL); merged segments are marked `reordered` and skipped by the
@@ -252,10 +403,9 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Memory budget for the BP forward index (merge-time and background
     /// reorder). Over-budget passes drop highest-df dims, logged loudly.
     bp_memory_budget_bytes: usize,
-    /// Bounded rayon pool for background CPU work (merge-time BP, manual
-    /// reorder). Built lazily at ~cores/4 so background passes cannot
-    /// saturate the global rayon pool that query scoring runs on.
-    bg_cpu_pool: std::sync::OnceLock<Arc<rayon::ThreadPool>>,
+    /// Application-owned shared pool, when configured. This is the server
+    /// path and ensures optimizer and merge-time work use the same threads.
+    background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
@@ -268,8 +418,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         merge_policy: Box<dyn MergePolicy>,
         term_cache_blocks: usize,
         max_concurrent_merges: usize,
+        global_merge_permits: Arc<Semaphore>,
         merge_bp_time_budget: Option<std::time::Duration>,
         bp_memory_budget_bytes: usize,
+        reorder_permits: Arc<Semaphore>,
+        background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
     ) -> Self {
         // Persisted index option: set via `reorder_on_merge: true` in the SDL
         // at index creation. Absent = disabled (merges block-copy).
@@ -283,9 +436,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             tracker.register(seg_id);
         }
 
+        let lifecycle_handles: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
         let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = {
             let dir = Arc::clone(&directory);
             let tracker = Arc::clone(&tracker);
+            let lifecycle_handles = Arc::clone(&lifecycle_handles);
             Arc::new(move |segment_ids| {
                 // Guard: if the tokio runtime is gone (program exit), skip async
                 // deletion. Segment files become orphans cleaned up on next startup.
@@ -296,8 +452,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     return;
                 };
                 let dir = Arc::clone(&dir);
-                let tracker = Arc::clone(&tracker);
-                handle.spawn(async move {
+                let task_tracker = Arc::clone(&tracker);
+                let cleanup_ids = segment_ids.clone();
+                let future = async move {
                     for &segment_id in &segment_ids {
                         log::info!(
                             "[segment_cleanup] deleting deferred segment {}",
@@ -313,31 +470,45 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                             );
                         }
                     }
-                    tracker.complete_deletion(&segment_ids);
-                });
+                    task_tracker.complete_deletion(&segment_ids);
+                };
+                if !try_spawn_lifecycle(&lifecycle_handles, &handle, future) {
+                    // Spawning can fail only during runtime teardown. Release
+                    // the scheduled-deletion claim so an in-process sweep can
+                    // retry; crash recovery handles a process exit.
+                    tracker.complete_deletion(&cleanup_ids);
+                    log::warn!(
+                        "[segment_cleanup] runtime rejected deferred deletion; files will be swept later"
+                    );
+                }
             })
         };
 
         Self {
-            state: AsyncMutex::new(ManagerState {
+            state: Arc::new(AsyncMutex::new(ManagerState {
                 metadata,
                 merge_policy,
-            }),
+            })),
             active_operations: Arc::new(ActiveSegmentOperations::new()),
             quarantined_segments: parking_lot::Mutex::new(HashSet::new()),
-            merge_retry_after: parking_lot::Mutex::new(None),
-            merge_handles: AsyncMutex::new(Vec::new()),
+            merge_retry: parking_lot::Mutex::new(MergeRetryState::default()),
+            reorder_retries: parking_lot::Mutex::new(HashMap::new()),
+            merge_handles: parking_lot::Mutex::new(Vec::new()),
+            global_merge_wakeup_pending: AtomicBool::new(false),
+            lifecycle_handles,
             trained: ArcSwapOption::new(None),
             tracker,
             delete_fn,
             directory,
             schema,
             term_cache_blocks,
-            max_concurrent_merges: max_concurrent_merges.max(1),
+            merge_permits: Arc::new(Semaphore::new(max_concurrent_merges.max(1))),
+            global_merge_permits,
+            reorder_permits,
             reorder_on_merge,
             merge_bp_time_budget,
             bp_memory_budget_bytes,
-            bg_cpu_pool: std::sync::OnceLock::new(),
+            background_reorder_pool,
         }
     }
 
@@ -345,9 +516,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Query scoring uses the global rayon pool; keeping background BP off it
     /// prevents a large merge from queueing every search behind gain passes.
     pub fn background_cpu_pool(&self) -> Arc<rayon::ThreadPool> {
-        Arc::clone(self.bg_cpu_pool.get_or_init(|| {
+        if let Some(pool) = &self.background_reorder_pool {
+            return Arc::clone(pool);
+        }
+        Arc::clone(BACKGROUND_CPU_POOL.get_or_init(|| {
             let threads = (num_cpus::get() / 2).max(1);
-            log::info!("[merge] background CPU pool: {} thread(s)", threads);
+            log::info!(
+                "[merge] process-wide background CPU pool: {} thread(s)",
+                threads
+            );
             Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
@@ -356,6 +533,41 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .expect("failed to build background CPU pool"),
             )
         }))
+    }
+
+    /// Stop new indexing/merge/reorder operations from claiming segment IDs.
+    /// Used as the first half of index deletion; the writer then joins its
+    /// workers before [`Self::wait_for_shutdown`] drains remaining ownership.
+    pub fn begin_shutdown(&self) {
+        self.active_operations.stop_accepting();
+    }
+
+    /// Run a lifecycle mutation independently of its requesting future.
+    ///
+    /// Metadata writes contain an atomic rename. If an RPC is cancelled while
+    /// awaiting that I/O, dropping the request must not abandon the matching
+    /// in-memory/tracker transition. The spawned transaction is tracked for
+    /// index shutdown; the oneshot only reports its result to a caller that is
+    /// still interested.
+    async fn run_lifecycle_transaction<T, F>(&self, transaction: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let future = async move {
+            let result = transaction.await;
+            let _ = result_tx.send(result);
+        };
+        let runtime = tokio::runtime::Handle::current();
+        if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
+            return Err(Error::Internal(
+                "runtime rejected lifecycle metadata transaction".into(),
+            ));
+        }
+        result_rx.await.map_err(|_| {
+            Error::Internal("lifecycle metadata transaction terminated unexpectedly".into())
+        })?
     }
 
     /// Arm unwind cleanup for an output that is not visible in metadata yet.
@@ -370,15 +582,49 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 return;
             };
 
-            let manager = Arc::clone(&manager);
-            handle.spawn(async move {
-                manager
+            let cleanup_manager = Arc::clone(&manager);
+            let future = async move {
+                cleanup_manager
                     .delete_output_if_unregistered(segment_id, "task unwind")
                     .await;
-            });
+            };
+            if !try_spawn_lifecycle(&manager.lifecycle_handles, &handle, future) {
+                log::warn!(
+                    "[segment_cleanup] runtime rejected output cleanup; {} will be swept on startup",
+                    segment_id.to_hex(),
+                );
+            }
         });
 
         OutputCleanupGuard::new(output_id, cleanup)
+    }
+
+    /// Delete an abandoned indexing output while retaining its lifecycle
+    /// claim until the last file operation completes. The explicit runtime
+    /// handle makes this safe from dedicated indexing OS threads, which are
+    /// outside Tokio's entered context.
+    pub(crate) fn schedule_unpublished_segment_cleanup(
+        self: &Arc<Self>,
+        output_id: SegmentId,
+        operation: SegmentOperationGuard,
+        runtime: tokio::runtime::Handle,
+    ) {
+        let manager = Arc::clone(self);
+        let output_hex = output_id.to_hex();
+        let future = async move {
+            manager
+                .delete_output_if_unregistered(output_id, "indexing abort or failure")
+                .await;
+            drop(operation);
+        };
+        if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
+            // The dropped future releases operation ownership. Startup sweep
+            // handles its output if the runtime is already tearing down.
+            log::warn!(
+                "[segment_cleanup] runtime unavailable; indexing output {} will be swept on startup",
+                output_hex,
+            );
+        }
     }
 
     /// Claim a newly generated indexing segment before its first file write.
@@ -387,14 +633,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// publication or abort. UUID collisions are treated as corruption rather
     /// than silently sharing lifecycle ownership.
     pub(crate) fn protect_new_segment(&self, segment_id: String) -> Result<SegmentOperationGuard> {
-        self.active_operations
+        match self
+            .active_operations
             .try_register(vec![segment_id.clone()])
-            .ok_or_else(|| {
-                Error::Corruption(format!(
-                    "new segment ID {} is already owned by an active operation",
-                    segment_id
-                ))
-            })
+        {
+            Some(operation) => Ok(operation),
+            None if !self.active_operations.is_accepting() => Err(Error::IndexClosed),
+            None => Err(Error::Corruption(format!(
+                "new segment ID {} is already owned by an active operation",
+                segment_id
+            ))),
+        }
     }
 
     /// Validate the small, mandatory core of a completed segment before it can
@@ -452,7 +701,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .insert(segment_id.to_string());
         if inserted {
             log::error!(
-                "[merge] quarantined metadata-live segment {} after open/validation failure: {}. \
+                "[merge] quarantined metadata-live segment {} after deterministic source/validation failure: {}. \
                  It remains metadata-live for explicit repair but is excluded from merges until restart",
                 segment_id,
                 error,
@@ -460,25 +709,107 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    fn pause_merge_retries(&self, error: &Error) {
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-        *self.merge_retry_after.lock() = Some(std::time::Instant::now() + RETRY_DELAY);
+    fn pause_merge_retries(&self, error: &Error) -> std::time::Duration {
+        let mut retry = self.merge_retry.lock();
+        retry.consecutive_failures = retry.consecutive_failures.saturating_add(1);
+        let delay = merge_retry_delay(retry.consecutive_failures);
+        retry.retry_after = std::time::Instant::now().checked_add(delay);
         log::warn!(
-            "[merge] pausing background merge scheduling for {:.0}s after failure: {}",
-            RETRY_DELAY.as_secs_f64(),
+            "[merge] pausing background merge scheduling for {:.0}s after consecutive failure #{}: {}",
+            delay.as_secs_f64(),
+            retry.consecutive_failures,
+            error,
+        );
+        delay
+    }
+
+    fn clear_merge_retry_backoff(&self) {
+        *self.merge_retry.lock() = MergeRetryState::default();
+    }
+
+    fn merge_retry_is_paused(&self) -> bool {
+        let mut retry = self.merge_retry.lock();
+        match retry.retry_after {
+            Some(deadline) if deadline > std::time::Instant::now() => true,
+            Some(_) => {
+                retry.retry_after = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn pause_reorder_retries(&self, segment_id: &str, error: &Error) {
+        let mut retries = self.reorder_retries.lock();
+        let retry = retries.entry(segment_id.to_string()).or_default();
+        retry.consecutive_failures = retry.consecutive_failures.saturating_add(1);
+        let delay = merge_retry_delay(retry.consecutive_failures);
+        retry.retry_after = std::time::Instant::now().checked_add(delay);
+        log::warn!(
+            "[reorder] pausing optimizer retries for segment {} for {:.0}s after failure #{}: {}",
+            segment_id,
+            delay.as_secs_f64(),
+            retry.consecutive_failures,
             error,
         );
     }
 
-    fn merge_retry_is_paused(&self) -> bool {
-        let mut retry_after = self.merge_retry_after.lock();
-        match *retry_after {
-            Some(deadline) if deadline > std::time::Instant::now() => true,
-            Some(_) => {
-                *retry_after = None;
-                false
+    fn clear_reorder_retry(&self, segment_id: &str) {
+        self.reorder_retries.lock().remove(segment_id);
+    }
+
+    fn paused_reorder_segments(&self) -> HashSet<String> {
+        let now = std::time::Instant::now();
+        let mut retries = self.reorder_retries.lock();
+        let mut paused = HashSet::new();
+        for (segment_id, retry) in retries.iter_mut() {
+            match retry.retry_after {
+                Some(deadline) if deadline > now => {
+                    paused.insert(segment_id.clone());
+                }
+                Some(_) => retry.retry_after = None,
+                None => {}
             }
-            None => false,
+        }
+        paused
+    }
+
+    /// Re-evaluate this index when another index releases application-wide
+    /// merge capacity. The atomic flag bounds this to one waiter per index and
+    /// the tracked handle makes index shutdown drain it deterministically.
+    fn schedule_global_merge_wakeup(self: &Arc<Self>) {
+        if self
+            .global_merge_wakeup_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let manager = Arc::clone(self);
+        let future = async move {
+            let capacity = tokio::select! {
+                biased;
+                () = manager.active_operations.wait_for_shutdown() => None,
+                permit = Arc::clone(&manager.global_merge_permits).acquire_owned() => permit.ok(),
+            };
+
+            manager
+                .global_merge_wakeup_pending
+                .store(false, Ordering::Release);
+            if let Some(permit) = capacity {
+                // This task is only a notification. The normal scheduler must
+                // acquire both global and per-index permits atomically enough
+                // for its own candidate selection.
+                drop(permit);
+                manager.maybe_merge().await;
+            }
+        };
+        let runtime = tokio::runtime::Handle::current();
+        if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
+            self.global_merge_wakeup_pending
+                .store(false, Ordering::Release);
+            log::warn!("[merge] runtime rejected global-capacity wakeup task");
         }
     }
 
@@ -493,12 +824,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// successful publication of the same output.
     async fn delete_output_if_unregistered(&self, output_id: SegmentId, reason: &str) {
         let output_hex = output_id.to_hex();
-        let st = self.state.lock().await;
-        if st.metadata.has_segment(&output_hex) {
-            return;
+        {
+            let st = self.state.lock().await;
+            if st.metadata.has_segment(&output_hex) {
+                return;
+            }
         }
 
-        log::warn!(
+        // UUIDs are generated per producer and cannot be adopted by another
+        // publisher after this check. Never hold the metadata mutex while a
+        // multi-GB filesystem deletion runs.
+        log::info!(
             "[segment_cleanup] deleting uncommitted output {} after {}",
             output_hex,
             reason,
@@ -511,7 +847,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 error,
             );
         }
-        drop(st);
     }
 
     // ========================================================================
@@ -559,16 +894,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Update metadata with a closure and persist atomically
-    pub(crate) async fn update_metadata<F>(&self, f: F) -> Result<()>
+    pub(crate) async fn update_metadata<F>(self: &Arc<Self>, f: F) -> Result<()>
     where
         F: FnOnce(&mut IndexMetadata),
     {
-        let mut st = self.state.lock().await;
+        let mut st = Arc::clone(&self.state).lock_owned().await;
         let mut next = st.metadata.clone();
         f(&mut next);
-        next.save(self.directory.as_ref()).await?;
-        st.metadata = next;
-        Ok(())
+        let directory = Arc::clone(&self.directory);
+        self.run_lifecycle_transaction(async move {
+            next.save(directory.as_ref()).await?;
+            st.metadata = next;
+            Ok(())
+        })
+        .await
     }
 
     /// Acquire a snapshot of current segments for reading.
@@ -605,7 +944,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 #[cfg(feature = "native")]
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Atomic commit: register new segments + persist metadata.
-    pub async fn commit(&self, new_segments: &[(String, u32)]) -> Result<()> {
+    pub async fn commit(self: &Arc<Self>, new_segments: &[(String, u32)]) -> Result<()> {
         // Indexing guards still own these IDs here, so the orphan sweeper
         // cannot remove files between validation and metadata publication.
         for (segment_id, num_docs) in new_segments {
@@ -613,7 +952,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .await?;
         }
 
-        let mut st = self.state.lock().await;
+        let mut st = Arc::clone(&self.state).lock_owned().await;
         let mut next = st.metadata.clone();
         let mut added = Vec::new();
         for (segment_id, num_docs) in new_segments {
@@ -625,12 +964,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         // Durable-before-visible: a save failure leaves both in-memory metadata
         // and tracker unchanged, so callers can retry the prepared commit.
-        next.save(self.directory.as_ref()).await?;
-        for segment_id in &added {
-            self.tracker.register(segment_id);
-        }
-        st.metadata = next;
-        Ok(())
+        // The tracked transaction continues if the requesting RPC is cancelled;
+        // unpublished cleanup waits on this owned state guard before deciding
+        // whether the files became metadata-live.
+        let directory = Arc::clone(&self.directory);
+        let tracker = Arc::clone(&self.tracker);
+        self.run_lifecycle_transaction(async move {
+            next.save(directory.as_ref()).await?;
+            for segment_id in &added {
+                tracker.register(segment_id);
+            }
+            st.metadata = next;
+            Ok(())
+        })
+        .await
     }
 
     /// Evaluate merge policy and spawn background merges for all eligible candidates.
@@ -641,26 +988,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// `spawn_merge` is non-blocking (just `try_register` + `tokio::spawn`), so
     /// holding the state lock through it is safe and sub-microsecond.
     ///
-    /// Note: `max_concurrent_merges` is a soft limit — concurrent auto-triggers
-    /// may briefly exceed it by one or two due to TOCTOU between slot counting
-    /// and handle registration.
+    /// The hard merge semaphore is acquired before lifecycle ownership, so
+    /// concurrent triggers cannot exceed configured merge capacity.
     pub async fn maybe_merge(self: &Arc<Self>) {
+        if !self.active_operations.is_accepting() {
+            log::debug!("[maybe_merge] manager is shutting down, skipping");
+            return;
+        }
         if self.merge_retry_is_paused() {
             log::debug!("[maybe_merge] retry backoff active, skipping");
             return;
         }
 
-        // Drain completed handles and check how many slots are available
-        let slots_available = {
-            let mut handles = self.merge_handles.lock().await;
+        // Finished handles no longer need to be retained. Concurrency itself
+        // is enforced by `merge_permits`, not this bookkeeping vector.
+        {
+            let mut handles = self.merge_handles.lock();
             handles.retain(|h| !h.is_finished());
-            self.max_concurrent_merges.saturating_sub(handles.len())
-        };
-
-        if slots_available == 0 {
-            log::debug!("[maybe_merge] at max concurrent merges, skipping");
-            return;
         }
+        let local_slots = self.merge_permits.available_permits();
+        let global_slots = self.global_merge_permits.available_permits();
+        let slots_available = local_slots.min(global_slots);
 
         // Hold state lock through spawn_merge to make filter + register atomic.
         // This closes the TOCTOU window where concurrent maybe_merge calls could
@@ -668,6 +1016,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let new_handles = {
             let st = self.state.lock().await;
             let quarantined = self.quarantined_segments.lock().clone();
+            let active_ids = self.active_operations.snapshot();
 
             // Exclude segments owned by another operation, pending retirement,
             // or quarantined after a persistent open/validation failure.
@@ -677,7 +1026,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .iter()
                 .filter(|(id, _)| {
                     !self.tracker.is_pending_deletion(id)
-                        && !self.active_operations.contains(id)
+                        && !active_ids.contains(*id)
                         && !quarantined.contains(*id)
                 })
                 .map(|(id, info)| SegmentInfo {
@@ -691,6 +1040,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let candidates = st.merge_policy.find_merges(&segments);
 
             if candidates.is_empty() {
+                return;
+            }
+
+            // Register a capacity waiter only for an index that actually has
+            // eligible work. Scheduling one waiter for every idle index while
+            // the process gate was full caused an avoidable wakeup stampede.
+            if slots_available == 0 {
+                if local_slots > 0 && global_slots == 0 {
+                    self.schedule_global_merge_wakeup();
+                }
+                log::debug!("[maybe_merge] at max concurrent merges, skipping");
                 return;
             }
 
@@ -714,7 +1074,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
 
         if !new_handles.is_empty() {
-            self.merge_handles.lock().await.extend(new_handles);
+            // Synchronous insertion is part of spawning: there must be no
+            // cancellation point where a live task exists but shutdown and
+            // force-merge draining cannot see its JoinHandle.
+            self.merge_handles.lock().extend(new_handles);
         }
     }
 
@@ -727,6 +1090,21 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// On completion, the task auto-triggers `maybe_merge` to evaluate cascading merges.
     /// Returns the JoinHandle if the merge was spawned, None if it was skipped.
     fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) -> Option<JoinHandle<()>> {
+        let global_merge_permit = match Arc::clone(&self.global_merge_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                log::debug!("[spawn_merge] skipped: global merge capacity is full");
+                self.schedule_global_merge_wakeup();
+                return None;
+            }
+        };
+        let merge_permit = match Arc::clone(&self.merge_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                log::debug!("[spawn_merge] skipped: no merge permit available");
+                return None;
+            }
+        };
         let output_id = SegmentId::new();
         let output_hex = output_id.to_hex();
 
@@ -747,6 +1125,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Some(tokio::spawn(async move {
             let mut output_cleanup = sm.output_cleanup_guard(output_id);
             let mut reevaluate = false;
+            let mut retry_delay = None;
 
             let trained_snap = sm.trained();
             let granularity = sm.merge_granularity(&ids).await;
@@ -761,6 +1140,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 granularity,
                 sm.merge_bp_time_budget,
                 sm.bp_memory_budget_bytes,
+                Arc::clone(&sm.reorder_permits),
                 Some(sm.background_cpu_pool()),
             )
             .await;
@@ -779,34 +1159,37 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     {
                         Ok(()) => {
                             output_cleanup.disarm();
+                            sm.clear_merge_retry_backoff();
                             reevaluate = true;
                         }
                         Err(e) => {
                             sm.delete_output_if_unregistered(output_id, "replacement failure")
                                 .await;
                             output_cleanup.disarm();
-                            sm.pause_merge_retries(&e);
+                            retry_delay = Some(sm.pause_merge_retries(&e));
                             log::error!("[merge] failed to publish merged segment: {}", e);
                         }
                     }
                 }
                 Err(MergeTaskError {
                     error,
-                    unavailable_segment,
+                    unavailable_segments,
                 }) => {
                     log::error!(
                         "[merge] background merge failed for segments {:?}: {}",
                         ids,
                         error
                     );
-                    if let Some(segment_id) = unavailable_segment {
-                        sm.quarantine_segment(&segment_id, &error);
+                    if !unavailable_segments.is_empty() {
+                        for segment_id in &unavailable_segments {
+                            sm.quarantine_segment(segment_id, &error);
+                        }
                         // Recompute without this known-bad input. This is not a
                         // retry of the same candidate because policy filtering
-                        // excludes the quarantined ID.
+                        // excludes every quarantined ID.
                         reevaluate = true;
                     } else {
-                        sm.pause_merge_retries(&error);
+                        retry_delay = Some(sm.pause_merge_retries(&error));
                     }
                     sm.delete_output_if_unregistered(output_id, "merge failure")
                         .await;
@@ -816,9 +1199,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             // Release source/output ownership before re-evaluating policy, so
             // the completed operation cannot artificially hide candidates.
             drop(guard);
+            // A failed merge must not reserve capacity during its retry delay.
+            drop(merge_permit);
+            drop(global_merge_permit);
 
             if reevaluate {
                 sm.maybe_merge().await;
+            } else if let Some(retry_delay) = retry_delay {
+                // A backoff without a wakeup can strand eligible segments
+                // forever when no later commit happens. Keep this sleep inside
+                // the tracked merge task so shutdown can await it safely.
+                tokio::select! {
+                    () = tokio::time::sleep(retry_delay) => {
+                        sm.maybe_merge().await;
+                    }
+                    () = sm.active_operations.wait_for_shutdown() => {}
+                }
             }
         }))
     }
@@ -827,7 +1223,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Computes merge generation as max(parent gens) + 1 and records ancestors.
     /// `reordered` marks whether the new segment was BP-reordered.
     async fn replace_segments(
-        &self,
+        self: &Arc<Self>,
         old_ids: &[String],
         new_id: String,
         doc_count: u32,
@@ -838,75 +1234,73 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // below replaces that ownership with metadata + tracker atomically.
         self.validate_completed_segment(&new_id, doc_count).await?;
 
-        let ready_to_delete = {
-            let mut st = self.state.lock().await;
-            // Every source must still be live: callers hold operation ownership,
-            // guard, so a missing source means a stale merge/reorder whose
-            // input was already replaced — adding the output would duplicate
-            // its documents. The orphaned output files are swept by
-            // cleanup_orphan_segments.
-            let missing: Vec<&String> = old_ids
-                .iter()
-                .filter(|id| !st.metadata.has_segment(id))
-                .collect();
-            if !missing.is_empty() {
-                return Err(Error::Corruption(format!(
-                    "replace_segments: source segment(s) {:?} not in metadata — \
-                     refusing to add output {} (would duplicate documents)",
-                    missing, new_id
-                )));
-            }
+        let mut st = Arc::clone(&self.state).lock_owned().await;
+        // Every source must still be live: callers hold operation ownership,
+        // so a missing source means a stale merge/reorder whose input was
+        // already replaced. Adding the output would duplicate its documents.
+        let missing: Vec<&String> = old_ids
+            .iter()
+            .filter(|id| !st.metadata.has_segment(id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Corruption(format!(
+                "replace_segments: source segment(s) {:?} not in metadata — \
+                 refusing to add output {} (would duplicate documents)",
+                missing, new_id
+            )));
+        }
 
-            // Compute generation from parents before removing them
-            let parent_gen = old_ids
-                .iter()
-                .filter_map(|id| st.metadata.segment_metas.get(id))
-                .map(|info| info.generation)
-                .max()
-                .unwrap_or(0);
-            let ancestors: Vec<String> = old_ids.to_vec();
+        let parent_generation = old_ids
+            .iter()
+            .filter_map(|id| st.metadata.segment_metas.get(id))
+            .map(|info| info.generation)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::Corruption("merge generation exceeds u32::MAX".into()))?;
+        let retired_ids = old_ids.to_vec();
+        let mut next = st.metadata.clone();
+        for id in old_ids {
+            next.remove_segment(id);
+        }
+        next.add_merged_segment(
+            new_id.clone(),
+            doc_count,
+            retired_ids.clone(),
+            parent_generation,
+            reordered,
+            bp_converged,
+        );
 
-            let mut next = st.metadata.clone();
-            for id in old_ids {
-                next.remove_segment(id);
-            }
-            next.add_merged_segment(
-                new_id.clone(),
-                doc_count,
-                ancestors,
-                parent_gen + 1,
-                reordered,
-                bp_converged,
-            );
-
-            // Durable-before-visible. If persistence fails, the old metadata
-            // and tracker remain intact and source deletion is never armed.
-            next.save(self.directory.as_ref()).await?;
-
-            // Snapshot acquisition uses the same state -> tracker order. Install
-            // tracker ownership before publishing the new in-memory metadata.
-            self.tracker.register(&new_id);
+        let directory = Arc::clone(&self.directory);
+        let tracker = Arc::clone(&self.tracker);
+        self.run_lifecycle_transaction(async move {
+            // Durable-before-visible. If persistence fails, old metadata and
+            // tracker ownership stay intact and source deletion is never armed.
+            next.save(directory.as_ref()).await?;
+            tracker.register(&new_id);
             st.metadata = next;
 
-            // Keep `state` locked until retired sources enter the tracker.
-            // Otherwise orphan cleanup can observe them in the gap where they
-            // are absent from metadata but not yet marked as snapshot-deferred.
-            self.tracker.mark_for_deletion(old_ids)
-        };
-
-        for &segment_id in &ready_to_delete {
-            if let Err(error) =
-                crate::segment::delete_segment(self.directory.as_ref(), segment_id).await
-            {
-                log::warn!(
-                    "[segment_cleanup] immediate delete failed for {}: {}",
-                    segment_id.to_hex(),
-                    error,
-                );
+            // Keep state locked until retired sources enter the tracker. The
+            // transaction itself also performs deletion, so cancellation of
+            // the requesting merge cannot strand pending-deletion ownership.
+            let ready_to_delete = tracker.mark_for_deletion(&retired_ids);
+            drop(st);
+            for &segment_id in &ready_to_delete {
+                if let Err(error) =
+                    crate::segment::delete_segment(directory.as_ref(), segment_id).await
+                {
+                    log::warn!(
+                        "[segment_cleanup] immediate delete failed for {}: {}",
+                        segment_id.to_hex(),
+                        error,
+                    );
+                }
             }
-        }
-        self.tracker.complete_deletion(&ready_to_delete);
-        Ok(())
+            tracker.complete_deletion(&ready_to_delete);
+            Ok(())
+        })
+        .await
     }
 
     /// Perform the actual merge operation (pure function — no shared state access).
@@ -925,6 +1319,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         granularity: crate::segment::reorder::BpGranularity,
         merge_bp_time_budget: Option<std::time::Duration>,
         bp_memory_budget_bytes: usize,
+        reorder_permits: Arc<Semaphore>,
         bg_cpu_pool: Option<Arc<rayon::ThreadPool>>,
     ) -> MergeTaskResult<(String, u32, bool)> {
         let output_hex = output_segment_id.to_hex();
@@ -945,23 +1340,33 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // waits for all healthy multi-GB inputs to load even when one source's
         // `.meta` is already absent, turning a known-corrupt candidate into a
         // large CPU/IO spike before it can be quarantined.
+        let mut unavailable_sources = Vec::new();
+        let mut missing_files = Vec::new();
         for (id_str, id) in segment_ids_to_merge.iter().zip(&segment_ids) {
             let files = SegmentFiles::new(id.0);
+            let mut source_unavailable = false;
             for path in files.mandatory_paths() {
                 let exists = directory
                     .exists(path)
                     .await
-                    .map_err(|error| MergeTaskError::source(id_str.clone(), Error::Io(error)))?;
+                    .map_err(|error| MergeTaskError::from(Error::Io(error)))?;
                 if !exists {
-                    return Err(MergeTaskError::source(
-                        id_str.clone(),
-                        Error::Corruption(format!(
-                            "merge source {} is missing mandatory file {:?}",
-                            id_str, path
-                        )),
-                    ));
+                    source_unavailable = true;
+                    missing_files.push(format!("{}:{:?}", id_str, path));
                 }
             }
+            if source_unavailable {
+                unavailable_sources.push(id_str.clone());
+            }
+        }
+        if !unavailable_sources.is_empty() {
+            return Err(MergeTaskError::sources(
+                unavailable_sources,
+                Error::Corruption(format!(
+                    "merge sources are missing mandatory files: {}",
+                    missing_files.join(", ")
+                )),
+            ));
         }
 
         let schema_arc = Arc::clone(schema);
@@ -988,9 +1393,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         segment_ids_to_merge[i],
                         e
                     );
-                    return Err(MergeTaskError::source(segment_ids_to_merge[i].clone(), e));
+                    return Err(classify_source_error(segment_ids_to_merge[i].clone(), e));
                 }
             }
+        }
+        if total_docs > u32::MAX as u64 {
+            return Err(Error::Internal(format!(
+                "Merged segment doc count ({}) exceeds u32::MAX",
+                total_docs
+            ))
+            .into());
         }
 
         // Pre-merge validation: verify each source segment's store doc count
@@ -1024,6 +1436,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 time_budget: merge_bp_time_budget,
             })
             .with_bp_memory_budget(bp_memory_budget_bytes)
+            .with_reorder_permits(reorder_permits)
             .with_background_pool(bg_cpu_pool);
 
         log::info!(
@@ -1035,7 +1448,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let (_merged_meta, merge_stats) = merger
             .merge(directory, &readers, output_segment_id, trained)
-            .await?;
+            .await
+            .map_err(|error| {
+                if matches!(error, Error::Corruption(_) | Error::Serialization(_)) {
+                    // The merge has already opened every input successfully;
+                    // a structural/serialization failure is deterministic for
+                    // this candidate. Attribute all inputs rather than running
+                    // the same multi-GB rewrite forever. This is deliberately
+                    // not used for I/O errors, which may be transient/output-side.
+                    MergeTaskError::sources(segment_ids_to_merge.to_vec(), error)
+                } else {
+                    MergeTaskError::from(error)
+                }
+            })?;
         let bp_converged = merge_stats.bp_converged;
         if !bp_converged {
             log::info!(
@@ -1051,36 +1476,35 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             total_docs,
         );
 
-        if total_docs > u32::MAX as u64 {
-            return Err(Error::Internal(format!(
-                "Merged segment doc count ({}) exceeds u32::MAX",
-                total_docs
-            ))
-            .into());
-        }
         Ok((output_hex, total_docs as u32, bp_converged))
     }
 
-    /// Cancel all in-flight merge tasks and wait for their guards to unwind.
-    /// Used during index deletion so no writer can outlive directory removal.
+    /// Drain all in-flight merge tasks safely.
+    ///
+    /// Tokio cannot abort a `spawn_blocking` closure once it has started. The
+    /// old implementation aborted only the async wrapper and returned while
+    /// merge-time BP still owned an `OffsetWriter`, allowing index deletion or
+    /// orphan cleanup to race a live writer. Awaiting is the only sound generic
+    /// behavior until every merge phase supports cooperative cancellation.
     pub async fn abort_merges(&self) {
-        let handles: Vec<JoinHandle<()>> =
-            { std::mem::take(&mut *self.merge_handles.lock().await) };
-        for h in &handles {
-            h.abort();
-        }
-        for h in handles {
-            // Await cancellation so the task future is dropped, all file
-            // writers stop, and lifecycle/output guards run before callers
-            // remove the index directory.
-            let _ = h.await;
+        loop {
+            let handles: Vec<JoinHandle<()>> = { std::mem::take(&mut *self.merge_handles.lock()) };
+            if handles.is_empty() {
+                return;
+            }
+            for handle in handles {
+                if let Err(error) = handle.await
+                    && error.is_panic()
+                {
+                    log::error!("[merge] background task panicked while draining: {}", error);
+                }
+            }
         }
     }
 
     /// Wait for all current in-flight merges to complete.
     pub async fn wait_for_merging_thread(self: &Arc<Self>) {
-        let handles: Vec<JoinHandle<()>> =
-            { std::mem::take(&mut *self.merge_handles.lock().await) };
+        let handles: Vec<JoinHandle<()>> = { std::mem::take(&mut *self.merge_handles.lock()) };
         for h in handles {
             let _ = h.await;
         }
@@ -1093,13 +1517,34 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// so by the time `h.await` returns all cascading handles are registered.
     pub async fn wait_for_all_merges(self: &Arc<Self>) {
         loop {
-            let handles: Vec<JoinHandle<()>> =
-                { std::mem::take(&mut *self.merge_handles.lock().await) };
+            let handles: Vec<JoinHandle<()>> = { std::mem::take(&mut *self.merge_handles.lock()) };
             if handles.is_empty() {
                 break;
             }
             for h in handles {
                 let _ = h.await;
+            }
+        }
+    }
+
+    /// Complete the second half of shutdown after the owning `IndexWriter`
+    /// has been dropped. This drains tracked merges and then waits for every
+    /// remaining guard, including optimizer reorders that are intentionally
+    /// launched outside the writer lock.
+    pub async fn wait_for_shutdown(self: &Arc<Self>) {
+        self.wait_for_all_merges().await;
+        self.active_operations.wait_until_idle().await;
+        loop {
+            let handles = { std::mem::take(&mut *self.lifecycle_handles.lock()) };
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                if let Err(error) = handle.await
+                    && error.is_panic()
+                {
+                    log::error!("[segment_cleanup] task panicked while draining: {}", error);
+                }
             }
         }
     }
@@ -1125,6 +1570,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.wait_for_all_merges().await;
 
         loop {
+            if !self.active_operations.is_accepting() {
+                return Err(Error::IndexClosed);
+            }
             // Get segment IDs with their doc counts, sorted ascending by size
             let mut segments: Vec<(String, u32)> = {
                 let st = self.state.lock().await;
@@ -1168,6 +1616,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 batch_docs
             );
 
+            let _global_merge_permit = tokio::select! {
+                biased;
+                () = self.active_operations.wait_for_shutdown() => {
+                    return Err(Error::IndexClosed);
+                }
+                permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
+                    permit.map_err(|_| {
+                        Error::Internal("global background merge scheduler is closed".into())
+                    })?
+                }
+            };
+
             let output_id = SegmentId::new();
             let output_hex = output_id.to_hex();
 
@@ -1185,6 +1645,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
             let _guard = match guard {
                 Some(g) => g,
+                None if !self.active_operations.is_accepting() => {
+                    return Err(Error::IndexClosed);
+                }
                 None => {
                     // A background merge slipped in — wait for it, then retry the loop
                     self.wait_for_merging_thread().await;
@@ -1206,6 +1669,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 granularity,
                 self.merge_bp_time_budget,
                 self.bp_memory_budget_bytes,
+                Arc::clone(&self.reorder_permits),
                 Some(self.background_cpu_pool()),
             )
             .await;
@@ -1213,10 +1677,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 Ok(v) => v,
                 Err(MergeTaskError {
                     error,
-                    unavailable_segment,
+                    unavailable_segments,
                 }) => {
-                    if let Some(segment_id) = unavailable_segment {
-                        self.quarantine_segment(&segment_id, &error);
+                    for segment_id in &unavailable_segments {
+                        self.quarantine_segment(segment_id, &error);
                     }
                     self.delete_output_if_unregistered(output_id, "force-merge failure")
                         .await;
@@ -1293,12 +1757,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Segments never reordered, with doc counts — for the optimizer to pick
     /// a size-appropriate BP budget.
     pub async fn unreordered_segments(&self) -> Vec<(String, u32)> {
+        let quarantined = self.quarantined_segments.lock().clone();
+        let paused = self.paused_reorder_segments();
         let st = self.state.lock().await;
         let active_ids = self.active_operations.snapshot();
         st.metadata
             .segment_metas
             .iter()
-            .filter(|(id, info)| !info.reordered && !active_ids.contains(*id))
+            .filter(|(id, info)| {
+                !info.reordered
+                    && !active_ids.contains(*id)
+                    && !quarantined.contains(*id)
+                    && !paused.contains(*id)
+            })
             .map(|(id, info)| (id.clone(), info.num_docs))
             .collect()
     }
@@ -1307,12 +1778,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// (`bp_converged == false`). A warm-started follow-up pass deepens the
     /// ordering; the optimizer revisits these at low priority.
     pub async fn unconverged_segments(&self) -> Vec<(String, u32)> {
+        let quarantined = self.quarantined_segments.lock().clone();
+        let paused = self.paused_reorder_segments();
         let st = self.state.lock().await;
         let active_ids = self.active_operations.snapshot();
         st.metadata
             .segment_metas
             .iter()
-            .filter(|(id, info)| info.reordered && !info.bp_converged && !active_ids.contains(*id))
+            .filter(|(id, info)| {
+                info.reordered
+                    && !info.bp_converged
+                    && !active_ids.contains(*id)
+                    && !quarantined.contains(*id)
+                    && !paused.contains(*id)
+            })
             .map(|(id, info)| (id.clone(), info.num_docs))
             .collect()
     }
@@ -1357,6 +1836,29 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ) -> Result<bool> {
         let source_id = SegmentId::from_hex(seg_id)
             .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", seg_id)))?;
+        if self.quarantined_segments.lock().contains(seg_id) {
+            return Err(Error::Corruption(format!(
+                "segment {} is quarantined after a deterministic source failure; repair it and restart before reordering",
+                seg_id
+            )));
+        }
+
+        // Whole-pass concurrency is independent from Rayon width. One pass
+        // can already use every configured BP worker; this permit bounds the
+        // much larger forward-index and rewrite working set across indexes,
+        // optimizer tasks, and merge-time BP.
+        let _reorder_permit = tokio::select! {
+            biased;
+            () = self.active_operations.wait_for_shutdown() => {
+                return Err(Error::IndexClosed);
+            }
+            permit = Arc::clone(&self.reorder_permits).acquire_owned() => {
+                permit.map_err(|_| {
+                    Error::Internal("background reorder scheduler is closed".into())
+                })?
+            }
+        };
+
         let output_id = SegmentId::new();
         let output_hex = output_id.to_hex();
         let source_ids = [seg_id.to_string()];
@@ -1368,24 +1870,41 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // be on disk (deferred deletion under a searcher snapshot) — reordering
         // them would re-insert a duplicate copy of docs the merge output holds.
         let all_ids = vec![seg_id.to_string(), output_hex];
-        let _guard = {
+        let (_guard, source_docs) = {
             let st = self.state.lock().await;
-            if !st.metadata.has_segment(seg_id) {
+            let Some(source_meta) = st.metadata.segment_metas.get(seg_id) else {
                 log::info!(
                     "[optimizer] segment {} no longer in metadata (merged away), skipping reorder",
                     seg_id
                 );
+                self.clear_reorder_retry(seg_id);
                 return Ok(false);
-            }
+            };
 
             match self.active_operations.try_register(all_ids) {
-                Some(guard) => guard,
+                Some(guard) => (guard, source_meta.num_docs),
+                None if !self.active_operations.is_accepting() => {
+                    return Err(Error::IndexClosed);
+                }
                 None => {
                     log::debug!("[optimizer] segment {} in active merge, skipping", seg_id);
                     return Ok(false);
                 }
             }
         };
+
+        // Fail before allocating a forward index or creating output files.
+        // Missing mandatory files are deterministic and should remove this
+        // segment from future optimizer scans, not consume the same CPU every
+        // interval. Other I/O failures remain retryable.
+        if let Err(error) = self.validate_completed_segment(seg_id, source_docs).await {
+            if is_deterministic_source_error(&error) {
+                self.quarantine_segment(seg_id, &error);
+            } else if !matches!(&error, Error::IndexClosed) {
+                self.pause_reorder_retries(seg_id, &error);
+            }
+            return Err(error);
+        }
 
         let mut output_cleanup = self.output_cleanup_guard(output_id);
 
@@ -1409,6 +1928,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 self.delete_output_if_unregistered(output_id, "reorder failure")
                     .await;
                 output_cleanup.disarm();
+                if is_deterministic_source_error(&e) {
+                    self.quarantine_segment(seg_id, &e);
+                } else if !matches!(&e, Error::IndexClosed) {
+                    self.pause_reorder_retries(seg_id, &e);
+                }
                 return Err(e);
             }
         };
@@ -1432,64 +1956,93 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.delete_output_if_unregistered(output_id, "replacement failure")
                 .await;
             output_cleanup.disarm();
+            if !matches!(&e, Error::IndexClosed) {
+                self.pause_reorder_retries(seg_id, &e);
+            }
             return Err(e);
         }
         output_cleanup.disarm();
+        self.clear_reorder_retry(seg_id);
 
         Ok(true)
     }
 
     /// Clean up orphan segment files not registered in metadata.
     ///
-    /// Non-blocking: reads metadata, active-operation ownership, and snapshot-deferred
-    /// deletions to determine which segments are legitimate. In-flight outputs
-    /// and retired sources still held by readers are both protected.
+    /// Reads metadata, active-operation ownership, and snapshot-deferred
+    /// deletions to determine which segments are legitimate. Filesystem
+    /// deletion is asynchronous; in-flight outputs and retired sources still
+    /// held by readers are both protected.
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
-        let mut orphan_ids: HashSet<String> = HashSet::new();
+        let mut orphan_files: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
 
         if let Ok(entries) = self.directory.list_files(std::path::Path::new("")).await {
             for entry in entries {
-                let filename = entry.to_string_lossy();
-                if filename.starts_with("seg_") && filename.len() > 37 {
-                    let hex_part = &filename[4..36];
-                    orphan_ids.insert(hex_part.to_string());
+                let Some(filename) = entry.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Some(rest) = filename.strip_prefix("seg_") else {
+                    continue;
+                };
+                let Some(hex_id) = rest.get(..32) else {
+                    continue;
+                };
+                if !hex_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    continue;
                 }
+                orphan_files
+                    .entry(hex_id.to_ascii_lowercase())
+                    .or_default()
+                    .push(entry);
             }
         }
 
         let mut deleted = 0;
-        for hex_id in &orphan_ids {
-            // Revalidate immediately before deletion and keep `state` locked
-            // through the delete. Merge/reorder registration follows
-            // state -> active_operations. Indexing registers its fresh UUID
-            // before writing the first file, so an ID already discovered by
-            // this scan cannot become a new indexing output after this check.
-            let st = self.state.lock().await;
-            if st.metadata.has_segment(hex_id)
-                || self.active_operations.contains(hex_id)
-                || self.tracker.is_deletion_protected(hex_id)
-            {
-                continue;
-            }
-
-            let removed = if let Some(segment_id) = SegmentId::from_hex(hex_id) {
-                match crate::segment::delete_segment(self.directory.as_ref(), segment_id).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        log::warn!(
-                            "[segment_cleanup] failed sweeping orphan segment {}: {}",
-                            hex_id,
-                            error,
-                        );
-                        false
-                    }
+        for (hex_id, paths) in &orphan_files {
+            // Revalidate and atomically claim deletion under the same
+            // state -> active_operations -> tracker order used by publishers.
+            // The claim lets us release `state` before filesystem I/O: deleting
+            // a multi-GB orphan must not freeze commits and snapshot acquisition.
+            let deletion_guard = {
+                let st = self.state.lock().await;
+                if st.metadata.has_segment(hex_id) {
+                    continue;
                 }
-            } else {
-                false
+                let Some(guard) = self
+                    .active_operations
+                    .try_register(vec![hex_id.to_string()])
+                else {
+                    continue;
+                };
+                if self.tracker.is_deletion_protected(hex_id) {
+                    drop(guard);
+                    continue;
+                }
+                guard
             };
-            // Make the deletion barrier explicit: output registration cannot
-            // proceed until the filesystem operation above has completed.
-            drop(st);
+
+            // Delete what was actually discovered, not only the currently
+            // known SegmentFiles extensions. This also removes partial files
+            // left by older formats instead of reporting the same orphan on
+            // every startup forever.
+            let results =
+                futures::future::join_all(paths.iter().map(|path| self.directory.delete(path)))
+                    .await;
+            let removed = results.into_iter().all(|result| match result {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    log::warn!(
+                        "[segment_cleanup] failed sweeping orphan segment {}: {}",
+                        hex_id,
+                        error,
+                    );
+                    false
+                }
+            });
+            // Releasing this claim is the deletion barrier. No producer can
+            // adopt the ID while its files are being removed.
+            drop(deletion_guard);
             if removed {
                 deleted += 1;
                 log::info!("[segment_cleanup] swept orphan segment {}", hex_id);
@@ -1504,6 +2057,24 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn lifecycle_test_manager() -> Arc<SegmentManager<crate::directories::RamDirectory>> {
+        let schema = crate::dsl::SchemaBuilder::default().build();
+        let metadata = IndexMetadata::new(schema.clone());
+        Arc::new(SegmentManager::new(
+            Arc::new(crate::directories::RamDirectory::new()),
+            Arc::new(schema),
+            metadata,
+            Box::new(crate::merge::NoMergePolicy),
+            0,
+            1,
+            Arc::new(Semaphore::new(1)),
+            None,
+            1024,
+            Arc::new(Semaphore::new(1)),
+            None,
+        ))
+    }
 
     #[test]
     fn output_cleanup_guard_runs_during_panic_unwind() {
@@ -1585,5 +2156,97 @@ mod tests {
         assert!(snap.contains("x"));
         assert!(snap.contains("y"));
         assert!(!snap.contains("z"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_work_and_waits_for_existing_guard() {
+        let active = Arc::new(ActiveSegmentOperations::new());
+        let guard = active.try_register(vec!["live".into()]).unwrap();
+        active.stop_accepting();
+        assert!(active.try_register(vec!["new".into()]).is_none());
+
+        let waiter = {
+            let active = Arc::clone(&active);
+            tokio::spawn(async move { active.wait_until_idle().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown waiter missed the final guard notification")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transaction_survives_request_cancellation_and_is_drained() {
+        let manager = lifecycle_test_manager();
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let request = {
+            let manager = Arc::clone(&manager);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let completed = Arc::clone(&completed);
+            tokio::spawn(async move {
+                manager
+                    .run_lifecycle_transaction(async move {
+                        started.add_permits(1);
+                        let _permit = release.acquire().await.unwrap();
+                        completed.store(true, Ordering::Release);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+
+        let _started = started.acquire().await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        release.add_permits(1);
+
+        manager.begin_shutdown();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.wait_for_shutdown(),
+        )
+        .await
+        .expect("shutdown did not drain detached lifecycle transaction");
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn merge_retry_backoff_is_exponential_and_capped() {
+        assert_eq!(merge_retry_delay(1), std::time::Duration::from_secs(30));
+        assert_eq!(merge_retry_delay(2), std::time::Duration::from_secs(60));
+        assert_eq!(merge_retry_delay(3), std::time::Duration::from_secs(120));
+        assert_eq!(merge_retry_delay(100), MERGE_RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn only_deterministic_source_errors_are_quarantined() {
+        assert!(is_deterministic_source_error(&Error::Corruption(
+            "bad footer".into()
+        )));
+        assert!(is_deterministic_source_error(&Error::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(!is_deterministic_source_error(&Error::Io(
+            std::io::Error::from(std::io::ErrorKind::TimedOut)
+        )));
+        assert!(!is_deterministic_source_error(&Error::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        )));
+    }
+
+    #[test]
+    fn transient_reorder_failure_is_backed_off_until_cleared() {
+        let manager = lifecycle_test_manager();
+        manager.pause_reorder_retries("source", &Error::Internal("transient".into()));
+        assert!(manager.paused_reorder_segments().contains("source"));
+        manager.clear_reorder_retry("source");
+        assert!(!manager.paused_reorder_segments().contains("source"));
     }
 }

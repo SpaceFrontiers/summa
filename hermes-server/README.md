@@ -35,6 +35,55 @@ Options:
 - `-a, --addr`: Address to bind to (default: `0.0.0.0:50051`)
 - `-d, --data-dir`: Directory for storing indexes (default: `./data`)
 
+### Background merge and reorder
+
+The server uses one BP CPU pool and one whole-pass gate across all indexes.
+These are deliberately separate controls:
+
+| Option                                   |   Default | Meaning                                                                                                                                  |
+| ---------------------------------------- | --------: | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `--optimizer-threads`                    |       `0` | Threads in the shared BP pool. `0` disables periodic optimizer scans; merge-time and manual BP still use the process-wide fallback pool. |
+| `--optimizer-concurrent-passes`          |       `2` | Maximum simultaneous whole-segment BP passes across background, merge-time, and manual reorder. `0` is invalid and is clamped to `1`.    |
+| `--optimizer-scan-interval-secs`         |      `60` | Interval between background scans.                                                                                                       |
+| `--optimizer-large-segment-docs`         | `5000000` | Document threshold for partial/budgeted first passes.                                                                                    |
+| `--optimizer-time-budget-secs`           |     `600` | Wall-clock budget for an optimizer pass on a large segment.                                                                              |
+| `--optimizer-partial-min-partition-docs` |    `4096` | Initial depth floor for large segments.                                                                                                  |
+| `--optimizer-unconverged-cooldown-secs`  |     `600` | Delay after a rewrite finishes before another deepening pass.                                                                            |
+| `--merge-bp-budget-secs`                 |     `600` | Wall-clock budget for BP performed inside a merge; `0` means unbudgeted.                                                                 |
+| `--bp-memory-budget-mb`                  |   `24576` | Per-pass forward-index cap, not a reservation and not a total RSS limit.                                                                 |
+
+An active BP pass is CPU-bound and is expected to occupy up to
+`--optimizer-threads` cores. Concurrent passes share that same pool, so raising
+the pass limit primarily raises simultaneous working sets and outstanding IO;
+it does not create another pool per pass or per index. For predictable service
+latency, start with one pass and a CPU width that leaves capacity for query and
+indexing work.
+
+The forward index is roughly `4 bytes/posting + 32 bytes/document` before
+format-specific rewrite buffers. At the process level, budget for up to
+`concurrent-passes * bp-memory-budget`, plus indexing builders, merge state,
+mmap/page-cache residency, and open readers. The memory limit drops
+highest-frequency dimensions from BP when necessary; it does not truncate or
+drop stored postings.
+
+Merge failures use exponential retry backoff (30 seconds through 30 minutes).
+A deterministic missing/corrupt source is quarantined for the process lifetime
+so the same candidate cannot consume all cores in an immediate loop. The
+metadata entry remains visible—Hermes never silently removes documents. To
+explicitly remove corrupt entries and their files, stop normal traffic and run:
+
+```bash
+hermes-server --data-dir ./data --doctor
+```
+
+`--doctor` is destructive recovery: it validates every metadata-live segment
+and removes entries that cannot be opened. Normal startup/writer-open cleanup
+only deletes true unowned files and cannot delete metadata-live, actively
+written, or reader-retained segments. Standalone reorder failures are also
+backed off per source from pass completion, so a pass that outlasts the scan
+interval cannot restart continuously. Details and invariants are in
+[Segment lifecycle and recovery](../docs/segment-lifecycle.md).
+
 ## gRPC API
 
 The server exposes two services: `SearchService` and `IndexService`.

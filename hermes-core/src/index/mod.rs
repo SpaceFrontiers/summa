@@ -71,8 +71,13 @@ pub struct IndexConfig {
     pub optimization: crate::structures::IndexOptimization,
     /// Reload interval in milliseconds for IndexReader (how often to check for new segments)
     pub reload_interval_ms: u64,
-    /// Maximum number of concurrent background merges (default: 4)
+    /// Maximum number of concurrent background merges per index (default: 4)
     pub max_concurrent_merges: usize,
+    /// Application-wide background merge gate shared by clones of this
+    /// config. The per-index limit alone multiplied large merge working sets
+    /// by the number of active indexes.
+    #[cfg(feature = "native")]
+    pub background_merge_permits: Arc<tokio::sync::Semaphore>,
     /// Wall-clock budget for merge-time BP reorder per field (only applies
     /// when the index has `reorder_on_merge`). A truncated pass still writes
     /// a valid, better-ordered segment; it is marked `bp_converged = false`
@@ -84,9 +89,21 @@ pub struct IndexConfig {
     /// (merge-time and background). When a large segment's forward index
     /// would exceed this, the highest-df dims are dropped from BP's input
     /// (logged loudly) — clustering quality degrades gracefully. Production
-    /// evidence: 18M-doc merges exceed the 2 GB default and drop ~10% of
-    /// eligible dims; hosts with headroom should raise this.
+    /// evidence: 18M-doc merges exceeded the former 2 GB default and dropped
+    /// ~10% of eligible dims; hosts with less headroom may lower this.
     pub bp_memory_budget_bytes: usize,
+    /// Hard limit on simultaneous whole-segment BP rewrites. This is shared
+    /// by all indexes opened from clones of this config and applies to
+    /// optimizer, merge-time, and manual reorder passes. It is deliberately
+    /// separate from the Rayon pool width: one pass can already use every
+    /// background CPU thread and consume the full BP memory budget.
+    #[cfg(feature = "native")]
+    pub background_reorder_permits: Arc<tokio::sync::Semaphore>,
+    /// Optional process/application-owned Rayon pool for BP work. Supplying
+    /// one lets every index and the optimizer share the same worker threads;
+    /// `None` lazily uses one process-wide cores/2 fallback pool.
+    #[cfg(feature = "native")]
+    pub background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl Default for IndexConfig {
@@ -116,11 +133,13 @@ impl Default for IndexConfig {
             optimization: crate::structures::IndexOptimization::default(),
             reload_interval_ms: 1000, // 1 second default
             max_concurrent_merges: 4,
+            #[cfg(feature = "native")]
+            background_merge_permits: Arc::new(tokio::sync::Semaphore::new(4)),
             merge_bp_time_budget: Some(std::time::Duration::from_secs(600)),
             // 24 GB — mirrors segment::reorder::DEFAULT_MEMORY_BUDGET (that
             // module is native-only; IndexConfig also compiles for wasm).
             // A cap, not an allocation: usage is proportional to the segment
-            // being reordered (~4 B/posting + ~28 B/doc). Sized from prod
+            // being reordered (~4 B/posting + ~32 B/doc). Sized from prod
             // evidence: a 58M-doc/5B-posting pass estimated 20.1 GB, which
             // 8/16 GB budgets trimmed by dropping highest-df dims.
             // 24 GB overflows 32-bit usize (wasm32) — reorder never runs
@@ -129,6 +148,10 @@ impl Default for IndexConfig {
             bp_memory_budget_bytes: 24 * 1024 * 1024 * 1024,
             #[cfg(not(target_pointer_width = "64"))]
             bp_memory_budget_bytes: usize::MAX,
+            #[cfg(feature = "native")]
+            background_reorder_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(feature = "native")]
+            background_reorder_pool: None,
         }
     }
 }
@@ -169,8 +192,11 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            Arc::clone(&config.background_merge_permits),
             config.merge_bp_time_budget,
             config.bp_memory_budget_bytes,
+            Arc::clone(&config.background_reorder_permits),
+            config.background_reorder_pool.clone(),
         ));
 
         // Save initial metadata
@@ -202,8 +228,11 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
             config.max_concurrent_merges,
+            Arc::clone(&config.background_merge_permits),
             config.merge_bp_time_budget,
             config.bp_memory_budget_bytes,
+            Arc::clone(&config.background_reorder_permits),
+            config.background_reorder_pool.clone(),
         ));
 
         // Load trained structures into SegmentManager's ArcSwap

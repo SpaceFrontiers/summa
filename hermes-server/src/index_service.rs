@@ -349,35 +349,16 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<DeleteIndexResponse>, Status> {
         let req = request.into_inner();
 
-        // 1. Place .deleting marker so list_indexes() filters out this index
-        //    immediately, even before the directory is actually removed.
-        let index_path = self.registry.data_dir.join(&req.index_name);
-        let marker = index_path.join(".deleting");
-        if index_path.exists() {
-            let _ = std::fs::File::create(&marker);
-        }
-
-        // 2. Evict from registry — prevents new operations from reaching this index.
-        let handle = self.registry.evict(&req.index_name);
-
-        // 3. Stop all background work before deleting files:
-        //    - Abort in-flight merge tasks (they could write new segment files)
-        //    - Drop the handle, which joins indexing worker threads (sync)
-        //    No commit — we're about to delete everything.
-        if let Some(handle) = handle {
-            handle.writer.write().await.abort_merges().await;
-            drop(handle);
-        }
-
-        // 4. Delete directory — safe because:
-        //    - No new operations can obtain the index (evicted from registry)
-        //    - Merge tasks aborted, worker threads joined
-        if index_path.exists() {
-            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&index_path))
-                .await
-                .map_err(|e| Status::internal(format!("Delete task failed: {}", e)))?
-                .map_err(|e| Status::internal(format!("Failed to delete index: {}", e)))?;
-        }
+        // Serialize the entire transaction with open/create. The lease places
+        // `.deleting` before eviction, so an opener that was already in flight
+        // cannot resurrect the registry entry after this point.
+        let lease = self.registry.begin_delete(&req.index_name).await?;
+        // Dropping a JoinHandle detaches its task. If the client cancels this
+        // RPC after `.deleting` is installed, shutdown and removal must still
+        // complete instead of leaving a live, unreachable writer behind.
+        tokio::spawn(async move { lease.complete().await })
+            .await
+            .map_err(|e| Status::internal(format!("Delete lifecycle task failed: {}", e)))??;
 
         info!("Deleted index: {}", req.index_name);
 

@@ -118,7 +118,7 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 /// Block data uses u32 dim_id directly (not dim_idx). Grid has `dims` rows.
 /// num_virtual_docs is padded to block_size alignment.
 ///
-/// `bmp_block_size` is clamped to 256 max (u8 local_slot).
+/// `bmp_block_size` is clamped to 1..=256 (u8 local_slot).
 ///
 /// BP reorder is NOT done at build time — it's handled by the background
 /// optimizer or explicit reorder command.
@@ -193,16 +193,35 @@ pub(crate) fn build_bmp_blob(
     let mut vid_pairs: Vec<(DocId, u16)> = vid_set.into_iter().collect();
     vid_pairs.sort_unstable();
     let num_real_docs = vid_pairs.len();
+    if num_real_docs > u32::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BMP real document count exceeds the V14 u32 format limit",
+        ));
+    }
 
     // Build O(1) lookup table from (doc_id, ordinal) → virtual_id.
     let vid_lookup = VidLookup::from_sorted_pairs(&vid_pairs);
 
     // Safety: local_slot is u8, so block_size must not exceed 256
-    let effective_block_size = bmp_block_size.min(256);
+    let effective_block_size = bmp_block_size.clamp(1, 256);
 
     // Pad num_virtual_docs to block_size alignment
-    let num_virtual_docs =
-        num_real_docs.div_ceil(effective_block_size as usize) * effective_block_size as usize;
+    let num_virtual_docs = num_real_docs
+        .div_ceil(effective_block_size as usize)
+        .checked_mul(effective_block_size as usize)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP padded document count overflows usize",
+            )
+        })?;
+    if num_virtual_docs > u32::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BMP padded document count exceeds the V14 u32 format limit",
+        ));
+    }
     let num_blocks = num_virtual_docs / effective_block_size as usize;
 
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
@@ -269,15 +288,15 @@ pub(crate) fn build_bmp_blob(
     // (O(total_terms) = ~66 MB) are buffered.
     let mut block_data_starts: Vec<u64> = Vec::with_capacity(num_blocks + 1);
     let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new();
-    let mut total_terms: u32 = 0;
-    let mut total_postings: u32 = 0;
+    let mut total_terms: u64 = 0;
+    let mut total_postings: u64 = 0;
     let mut cumulative_bytes: u64 = 0;
     let mut last_block_filled: i64 = -1;
 
     // Per-block scratch (reused per block, bounded by one block's data ~4 KB)
     let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut blk_dim_ids: Vec<u32> = Vec::new();
-    let mut blk_posting_counts: Vec<u16> = Vec::new();
+    let mut blk_posting_counts: Vec<u32> = Vec::new();
     let mut blk_postings: Vec<u8> = Vec::new();
 
     while let Some(&Reverse((block_id, _, _))) = heap.peek() {
@@ -306,7 +325,7 @@ pub(crate) fn build_bmp_blob(
             let mut pos = cursors[dim_idx];
             let mut max_impact = 0u8;
             let mut next_block: Option<u32> = None;
-            let mut term_posting_count: u16 = 0;
+            let mut term_posting_count: u32 = 0;
 
             blk_dim_ids.push(dim_id);
 
@@ -334,14 +353,19 @@ pub(crate) fn build_bmp_blob(
                 let local_slot = (virtual_id % bs64) as u8;
                 blk_postings.push(local_slot);
                 blk_postings.push(impact);
-                term_posting_count += 1;
+                term_posting_count = term_posting_count.checked_add(1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "BMP postings for one block/dimension exceed u32::MAX",
+                    )
+                })?;
                 max_impact = max_impact.max(impact);
                 pos += 1;
             }
 
             blk_posting_counts.push(term_posting_count);
-            total_postings += term_posting_count as u32;
-            total_terms += 1;
+            total_postings = total_postings.saturating_add(u64::from(term_posting_count));
+            total_terms = total_terms.saturating_add(1);
 
             // Grid entry — indexed by dim_id directly
             grid_entries.push((dim_id, block_id, max_impact));
@@ -376,7 +400,13 @@ pub(crate) fn build_bmp_blob(
             let nt = blk_dim_ids.len();
 
             // num_terms (u32)
-            blk_buf.extend_from_slice(&(nt as u32).to_le_bytes());
+            let nt_u32 = u32::try_from(nt).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP block term count exceeds the V14 u32 format limit",
+                )
+            })?;
+            blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
 
             // term_dim_ids [u32 × nt]
             for &did in &blk_dim_ids {
@@ -389,7 +419,12 @@ pub(crate) fn build_bmp_blob(
             let mut cum: u32 = 0;
             for &count in &blk_posting_counts {
                 blk_buf.extend_from_slice(&cum.to_le_bytes());
-                cum += count as u32;
+                cum = cum.checked_add(count).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "BMP block posting prefix exceeds u32::MAX",
+                    )
+                })?;
             }
             blk_buf.extend_from_slice(&cum.to_le_bytes());
 
@@ -500,8 +535,8 @@ pub(crate) fn build_bmp_blob(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
-    total_terms: u32,
-    total_postings: u32,
+    total_terms: u64,
+    total_postings: u64,
     grid_offset: u64,
     sb_grid_offset: u64,
     num_blocks: u32,
@@ -513,8 +548,17 @@ pub(crate) fn write_bmp_footer(
     num_real_docs: u32,
     grid_bits: u8,
 ) -> std::io::Result<()> {
-    writer.write_u32::<LittleEndian>(total_terms)?; //  0- 3
-    writer.write_u32::<LittleEndian>(total_postings)?; //  4- 7
+    // These two fields are diagnostics only; structural navigation uses the
+    // section offsets. Saturate instead of wrapping a valid large V14 index.
+    if total_terms > u32::MAX as u64 || total_postings > u32::MAX as u64 {
+        log::warn!(
+            "[bmp] footer statistics exceed u32 and will be saturated: terms={}, postings={}",
+            total_terms,
+            total_postings,
+        );
+    }
+    writer.write_u32::<LittleEndian>(total_terms.min(u32::MAX as u64) as u32)?; //  0- 3
+    writer.write_u32::<LittleEndian>(total_postings.min(u32::MAX as u64) as u32)?; //  4- 7
     writer.write_u64::<LittleEndian>(grid_offset)?; //  8-15
     writer.write_u64::<LittleEndian>(sb_grid_offset)?; // 16-23
     writer.write_u32::<LittleEndian>(num_blocks)?; // 24-27

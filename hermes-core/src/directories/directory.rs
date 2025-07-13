@@ -949,7 +949,13 @@ impl DirectoryWriter for FsDirectory {
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let from_path = self.resolve(from);
         let to_path = self.resolve(to);
-        tokio::fs::rename(&from_path, &to_path).await
+        // Metadata publication is the only rename user. Keep the atomic
+        // filesystem operation in a single future poll: tokio::fs::rename is
+        // backed by a cancellable await around spawn_blocking, so a dropped
+        // commit future could observe neither completion nor failure even
+        // though the rename later succeeded. The caller must update its
+        // in-memory metadata in the same poll after this returns.
+        std::fs::rename(&from_path, &to_path)
     }
 
     async fn sync(&self) -> io::Result<()> {

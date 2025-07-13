@@ -284,8 +284,20 @@ impl IndexMetadata {
         let mut writer = dir.streaming_writer(tmp_path).await.map_err(Error::Io)?;
         writer.write_all(bytes).map_err(Error::Io)?;
         writer.finish().map_err(Error::Io)?;
+        // Rename is the logical commit point: after it succeeds, readers can
+        // observe the new generation and callers must publish the matching
+        // in-memory/tracker state. Directory fsync only strengthens crash
+        // durability. It cannot safely turn an already-visible rename into a
+        // reported pre-commit failure, because cleanup could then delete files
+        // referenced by the metadata now on disk.
         dir.rename(tmp_path, final_path).await.map_err(Error::Io)?;
-        dir.sync().await.map_err(Error::Io)?;
+        if let Err(error) = dir.sync().await {
+            log::error!(
+                "[metadata] directory fsync failed after committed rename: {}. \
+                 Continuing with the renamed generation; crash durability is not guaranteed",
+                error,
+            );
+        }
         Ok(())
     }
 
@@ -439,6 +451,66 @@ impl IndexMetadata {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct SyncFailDirectory(crate::directories::RamDirectory);
+
+    #[async_trait::async_trait]
+    impl crate::directories::Directory for SyncFailDirectory {
+        async fn exists(&self, path: &Path) -> std::io::Result<bool> {
+            self.0.exists(path).await
+        }
+
+        async fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+            self.0.file_size(path).await
+        }
+
+        async fn open_read(&self, path: &Path) -> std::io::Result<crate::directories::FileHandle> {
+            self.0.open_read(path).await
+        }
+
+        async fn read_range(
+            &self,
+            path: &Path,
+            range: std::ops::Range<u64>,
+        ) -> std::io::Result<crate::directories::OwnedBytes> {
+            self.0.read_range(path, range).await
+        }
+
+        async fn list_files(&self, prefix: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+            self.0.list_files(prefix).await
+        }
+
+        async fn open_lazy(&self, path: &Path) -> std::io::Result<crate::directories::FileHandle> {
+            self.0.open_lazy(path).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::directories::DirectoryWriter for SyncFailDirectory {
+        async fn write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.0.write(path, data).await
+        }
+
+        async fn delete(&self, path: &Path) -> std::io::Result<()> {
+            self.0.delete(path).await
+        }
+
+        async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.0.rename(from, to).await
+        }
+
+        async fn sync(&self) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected directory fsync failure"))
+        }
+
+        async fn streaming_writer(
+            &self,
+            path: &Path,
+        ) -> std::io::Result<Box<dyn crate::directories::StreamingWriter>> {
+            self.0.streaming_writer(path).await
+        }
+    }
+
     fn test_schema() -> Schema {
         Schema::default()
     }
@@ -453,6 +525,18 @@ mod tests {
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
         assert!(!meta.is_field_built(0));
         assert!(meta.vector_fields.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn save_treats_post_rename_sync_failure_as_committed() {
+        let directory = SyncFailDirectory::default();
+        let mut metadata = IndexMetadata::new(test_schema());
+        metadata.add_segment("committed".to_string(), 7);
+
+        metadata.save(&directory).await.unwrap();
+
+        let loaded = IndexMetadata::load(&directory).await.unwrap();
+        assert_eq!(loaded.segment_doc_count("committed"), Some(7));
     }
 
     #[test]

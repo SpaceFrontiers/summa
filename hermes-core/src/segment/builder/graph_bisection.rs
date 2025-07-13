@@ -6,11 +6,59 @@
 //! Directly optimizes log-gap cost: docs sharing dimensions end up in the
 //! same BMP blocks, producing tight upper bounds and effective pruning.
 //!
-//! Memory: forward index ~200 bytes/doc (temporary) + degree arrays ~840 KB.
+//! Memory is budgeted: CSR terms plus roughly 32 bytes/document of graph
+//! scratch, with lazily initialized direct-index term-degree arrays.
 
 #[cfg(feature = "native")]
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+
+/// Per-partition left/right term degrees with direct compact-term indexing.
+///
+/// Recursive BP used to zero two `num_terms`-long vectors at every node. At
+/// 100k vocabulary terms and hundreds of thousands of fine partitions, that
+/// turns into a large amount of memory traffic unrelated to actual postings.
+/// A one-bit initialization map lets us retain array-speed lookups while only
+/// touching degree slots present in the current partition.
+struct TermDegrees {
+    values: Vec<std::mem::MaybeUninit<[u32; 2]>>,
+    initialized: Vec<u64>,
+}
+
+impl TermDegrees {
+    fn new(num_terms: usize) -> Self {
+        let mut values = Vec::with_capacity(num_terms);
+        values.resize_with(num_terms, std::mem::MaybeUninit::uninit);
+        Self {
+            values,
+            initialized: vec![0; num_terms.div_ceil(64)],
+        }
+    }
+
+    #[inline]
+    fn entry_mut(&mut self, term: usize) -> &mut [u32; 2] {
+        let word = term / 64;
+        let mask = 1u64 << (term % 64);
+        if self.initialized[word] & mask == 0 {
+            self.values[term].write([0, 0]);
+            self.initialized[word] |= mask;
+        }
+        // SAFETY: the bit above is set only after writing this exact slot.
+        unsafe { self.values[term].assume_init_mut() }
+    }
+
+    #[inline]
+    fn get(&self, term: usize) -> [u32; 2] {
+        let word = term / 64;
+        let mask = 1u64 << (term % 64);
+        if self.initialized[word] & mask == 0 {
+            return [0, 0];
+        }
+        // SAFETY: an initialized bit is published only after the slot write;
+        // scoring reads degrees after construction, with no concurrent writes.
+        unsafe { *self.values[term].assume_init_ref() }
+    }
+}
 
 // ── Forward index (CSR) ──────────────────────────────────────────────────
 
@@ -168,14 +216,34 @@ fn merge_df_maps(
 /// for huge segments at the cost of slightly reduced reorder quality.
 ///
 /// Remaps term IDs to compact range for flat-array degree tracking.
+#[cfg(test)]
 pub(crate) fn build_forward_index_from_bmps(
     bmps: &[&crate::segment::reader::bmp::BmpIndex],
     min_doc_freq: usize,
     max_doc_freq: usize,
     memory_budget_bytes: usize,
 ) -> (ForwardIndex, Vec<usize>) {
-    // Per-source virtual→real maps (padding-aware realness from the doc map).
     let vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmps.iter().map(|b| build_vid_maps(b)).collect();
+    build_forward_index_from_bmps_with_maps(
+        bmps,
+        &vid_maps,
+        min_doc_freq,
+        max_doc_freq,
+        memory_budget_bytes,
+    )
+}
+
+/// Variant for reorder callers that already need the virtual/real maps during
+/// output encoding. Reusing them avoids a second full document-map scan and a
+/// duplicate real-to-virtual allocation on very large segments.
+pub(crate) fn build_forward_index_from_bmps_with_maps(
+    bmps: &[&crate::segment::reader::bmp::BmpIndex],
+    vid_maps: &[(Vec<u32>, Vec<u32>)],
+    min_doc_freq: usize,
+    max_doc_freq: usize,
+    memory_budget_bytes: usize,
+) -> (ForwardIndex, Vec<usize>) {
+    debug_assert_eq!(bmps.len(), vid_maps.len());
     let source_doc_counts: Vec<usize> = vid_maps.iter().map(|(_, r2v)| r2v.len()).collect();
     let total_docs: usize = source_doc_counts.iter().sum();
 
@@ -194,7 +262,7 @@ pub(crate) fn build_forward_index_from_bmps(
     // ascending vid order (see build_vid_maps), so each block owns a
     // contiguous real-id range — every phase below can process blocks in
     // parallel, writing disjoint slices.
-    let jobs = build_block_jobs(bmps, &vid_maps);
+    let jobs = build_block_jobs(bmps, vid_maps);
 
     // Phase 1: count doc freq per dimension across all sources + assign compact IDs
     let count_block_df = |job: &BlockJob, acc: &mut FxHashMap<u32, usize>| {
@@ -243,23 +311,34 @@ pub(crate) fn build_forward_index_from_bmps(
     // Peak ≈ 4*total_postings (terms array) + 32*total_docs (u64 offsets,
     //   counts, docs, gains, indices, new_left, new_right) + 8*num_terms
     //   (degree arrays).
-    let total_postings_est: usize = eligible.iter().map(|(_, df)| *df).sum();
-    let estimated_bytes = total_postings_est * 4 + total_docs * 32 + eligible.len() * 8;
+    let total_postings_est = eligible
+        .iter()
+        .fold(0usize, |total, (_, df)| total.saturating_add(*df));
+    let entity_scratch_bytes = total_docs.saturating_mul(32);
+    let estimated_bytes = total_postings_est
+        .saturating_mul(4)
+        .saturating_add(entity_scratch_bytes)
+        .saturating_add(eligible.len().saturating_mul(8));
 
     if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
         // Sort by df ascending — keep discriminative low-df dims first,
         // drop highest-df dims which contribute the most postings.
         eligible.sort_by_key(|&(_, df)| df);
 
-        let target_postings =
-            memory_budget_bytes.saturating_sub(total_docs * 32 + eligible.len() * 8) / 4;
+        // Account for each retained term together with its postings. The old
+        // calculation charged the eight-byte degree slot for every candidate
+        // before deciding how many to retain; a large rare-term vocabulary
+        // could therefore make the target zero even when a useful subset fit.
+        let mut used_bytes = entity_scratch_bytes;
         let mut cum = 0usize;
         let mut keep_count = 0;
         for &(_, df) in &eligible {
-            if cum + df > target_postings {
+            let term_bytes = df.saturating_mul(4).saturating_add(8);
+            if term_bytes > memory_budget_bytes.saturating_sub(used_bytes) {
                 break;
             }
-            cum += df;
+            used_bytes = used_bytes.saturating_add(term_bytes);
+            cum = cum.saturating_add(df);
             keep_count += 1;
         }
 
@@ -273,6 +352,21 @@ pub(crate) fn build_forward_index_from_bmps(
             dropped,
             keep_count,
             cum,
+        );
+    }
+
+    if eligible.is_empty() {
+        // The caller emits an identity permutation when there is no graph
+        // signal. Avoid allocating per-document counts and u64 offsets only
+        // to discover that the terms array is empty, especially when the
+        // configured budget is below the fixed document scratch cost.
+        return (
+            ForwardIndex {
+                terms: Vec::new(),
+                offsets: Vec::new(),
+                num_terms: 0,
+            },
+            source_doc_counts,
         );
     }
 
@@ -444,18 +538,26 @@ pub(crate) fn build_forward_index_from_blocks(
         .collect();
     drop(dim_bf);
 
-    let total_postings_est: usize = eligible.iter().map(|(_, bf)| *bf).sum();
-    let estimated_bytes = total_postings_est * 4 + total_blocks * 32 + eligible.len() * 8;
+    let total_postings_est = eligible
+        .iter()
+        .fold(0usize, |total, (_, bf)| total.saturating_add(*bf));
+    let entity_scratch_bytes = total_blocks.saturating_mul(32);
+    let estimated_bytes = total_postings_est
+        .saturating_mul(4)
+        .saturating_add(entity_scratch_bytes)
+        .saturating_add(eligible.len().saturating_mul(8));
     if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
         eligible.sort_by_key(|&(_, bf)| bf);
-        let target = memory_budget_bytes.saturating_sub(total_blocks * 32 + eligible.len() * 8) / 4;
+        let mut used_bytes = entity_scratch_bytes;
         let mut cum = 0usize;
         let mut keep = 0;
         for &(_, bf) in &eligible {
-            if cum + bf > target {
+            let term_bytes = bf.saturating_mul(4).saturating_add(8);
+            if term_bytes > memory_budget_bytes.saturating_sub(used_bytes) {
                 break;
             }
-            cum += bf;
+            used_bytes = used_bytes.saturating_add(term_bytes);
+            cum = cum.saturating_add(bf);
             keep += 1;
         }
         log::warn!(
@@ -463,6 +565,14 @@ pub(crate) fn build_forward_index_from_blocks(
             eligible.len() - keep,
         );
         eligible.truncate(keep);
+    }
+
+    if eligible.is_empty() {
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+        };
     }
 
     let mut term_remap: FxHashMap<u32, u32> = FxHashMap::default();
@@ -599,7 +709,10 @@ pub(crate) fn graph_bisection(
     );
 
     #[cfg(feature = "native")]
-    let deadline = budget.time_budget.map(|d| std::time::Instant::now() + d);
+    let deadline = budget.time_budget.map(|duration| {
+        let now = std::time::Instant::now();
+        now.checked_add(duration).unwrap_or(now)
+    });
     #[cfg(not(feature = "native"))]
     let deadline: Option<()> = None;
     #[cfg(not(feature = "native"))]
@@ -686,20 +799,14 @@ fn bisect(
         max_iters
     };
 
-    // Flat degree arrays: left_deg[term] and right_deg[term].
-    // Allocated per bisection level; freed on return before recursion uses the
-    // memory for sub-problems. Peak = O(num_terms × log2(n/min_partition_size)).
-    let mut left_deg = vec![0u32; nt];
-    let mut right_deg = vec![0u32; nt];
+    // Compact term IDs permit direct indexing. Slots are initialized lazily so
+    // deep partitions do not zero the full vocabulary on every recursive node.
+    let mut degrees = TermDegrees::new(nt);
 
     for (i, &doc) in docs.iter().enumerate() {
-        let target = if i < mid {
-            &mut left_deg
-        } else {
-            &mut right_deg
-        };
+        let side = usize::from(i >= mid);
         for &term in fwd.doc_terms(doc as usize) {
-            target[term as usize] += 1;
+            degrees.entry_mut(term as usize)[side] += 1;
         }
     }
 
@@ -720,15 +827,13 @@ fn bisect(
         }
         // Compute gain for each document (approx_1 from Dhulipala et al.)
         // Parallelized for large partitions where per-doc work dominates.
-        compute_gains(docs, fwd, mid, &left_deg, &right_deg, log_table, &mut gains);
+        compute_gains(docs, fwd, mid, &degrees, log_table, &mut gains);
 
         // Partition: the `mid` LOWEST keys (strongest left affinity) go left
         indices.clear();
         indices.extend(0..n);
         indices.select_nth_unstable_by(mid, |&a, &b| {
-            gains[a]
-                .partial_cmp(&gains[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            gains[a].total_cmp(&gains[b]).then_with(|| a.cmp(&b))
         });
 
         // Apply partition, update degree arrays for swapped docs
@@ -750,13 +855,13 @@ fn bisect(
             if was_left != now_left {
                 swap_count += 1;
                 for &term in fwd.doc_terms(doc as usize) {
-                    let t = term as usize;
+                    let degree = degrees.entry_mut(term as usize);
                     if was_left {
-                        left_deg[t] -= 1;
-                        right_deg[t] += 1;
+                        degree[0] -= 1;
+                        degree[1] += 1;
                     } else {
-                        right_deg[t] -= 1;
-                        left_deg[t] += 1;
+                        degree[1] -= 1;
+                        degree[0] += 1;
                     }
                 }
             }
@@ -776,16 +881,18 @@ fn bisect(
 
         // Cooling: break early if gains are negligible
         if iter > 5 {
-            let max_gain = gains.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            if max_gain.abs() < 0.001 {
+            let max_abs_gain = gains
+                .iter()
+                .copied()
+                .fold(0.0f32, |max_gain, gain| max_gain.max(gain.abs()));
+            if max_abs_gain < 0.001 {
                 break;
             }
         }
     }
 
     // Drop scratch before recursion to free memory for sub-problems
-    drop(left_deg);
-    drop(right_deg);
+    drop(degrees);
     drop(gains);
     drop(indices);
     drop(new_left);
@@ -850,8 +957,7 @@ fn compute_gains(
     docs: &[u32],
     fwd: &ForwardIndex,
     mid: usize,
-    left_deg: &[u32],
-    right_deg: &[u32],
+    degrees: &TermDegrees,
     log_table: &[f32],
     gains: &mut [f32],
 ) {
@@ -868,11 +974,11 @@ fn compute_gains(
         let in_left = i < mid;
         let mut g = 0.0f32;
         for &term in fwd.doc_terms(doc) {
-            let t = term as usize;
+            let [left, right] = degrees.get(term as usize);
             let (from, to) = if in_left {
-                (left_deg[t], right_deg[t])
+                (left, right)
             } else {
-                (right_deg[t], left_deg[t])
+                (right, left)
             };
             let move_gain = fast_log2_lookup(to as usize + 2, log_table)
                 - fast_log2_lookup(from as usize, log_table)
@@ -929,6 +1035,24 @@ fn fast_log2_lookup(val: usize, table: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_term_degrees_initialize_only_on_first_write() {
+        let mut degrees = TermDegrees::new(130);
+        assert_eq!(degrees.get(65), [0, 0]);
+        degrees.entry_mut(65)[0] += 3;
+        degrees.entry_mut(65)[1] += 2;
+        assert_eq!(degrees.get(65), [3, 2]);
+        assert_eq!(degrees.get(64), [0, 0]);
+        assert_eq!(
+            degrees
+                .initialized
+                .iter()
+                .map(|w| w.count_ones())
+                .sum::<u32>(),
+            1
+        );
+    }
 
     /// Regression: CSR offsets were u32 and wrapped past 4.29B postings —
     /// a 58M-doc / ~85-dims-per-doc prod reorder pass (~4.9B postings)

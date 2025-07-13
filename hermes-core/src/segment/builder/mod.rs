@@ -823,6 +823,18 @@ impl SegmentBuilder {
         vector: &[f32],
     ) -> Result<()> {
         let dim = vector.len();
+        let expected_dim = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|entry| entry.dense_vector_config.as_ref())
+            .map(|config| config.dim)
+            .ok_or_else(|| crate::Error::Schema("DenseVector field missing config".to_string()))?;
+        if dim != expected_dim {
+            return Err(crate::Error::Schema(format!(
+                "Dense vector dimension mismatch: schema expects {}, got {}",
+                expected_dim, dim
+            )));
+        }
 
         let builder = self
             .dense_vectors

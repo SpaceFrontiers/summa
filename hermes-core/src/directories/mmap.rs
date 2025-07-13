@@ -150,7 +150,10 @@ impl DirectoryWriter for MmapDirectory {
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let from_path = self.resolve(from);
         let to_path = self.resolve(to);
-        tokio::fs::rename(&from_path, &to_path).await
+        // This is the metadata commit point. A synchronous rename completes
+        // in one future poll, preventing cancellation from detaching the
+        // filesystem rename from the following in-memory publication.
+        std::fs::rename(&from_path, &to_path)
     }
 
     async fn sync(&self) -> io::Result<()> {

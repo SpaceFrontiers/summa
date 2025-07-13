@@ -28,7 +28,7 @@
 //! - **Integer scoring**: u32 accumulators with u16 quantized query weights (~20% faster)
 //! - **Superblock pruning**: Skip entire groups of blocks via coarse UBs
 //! - **L1 cache locality**: SaaT loop keeps c=64 blocks' grid data in L1
-//! - **SIMD UB computation**: NEON-accelerated for both superblock and block levels
+//! - **Integer-consistent UBs**: bounds and document scores share exact accumulator units
 //! - **Pre-scaled weights**: `weight * scale` computed once, not per-block
 //! - **Bitmask skip**: Register-level mask check replaces grid DRAM lookups
 //! - **Bucket sort**: O(n) superblock ordering by UB descending
@@ -39,8 +39,8 @@
 
 use super::scoring::{ScoreCollector, ScoredDoc};
 use crate::segment::{
-    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_grid_weighted, block_term_postings,
-    compute_block_masks, find_dim_in_block_data,
+    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_grid_u32, block_term_postings, compute_block_masks,
+    find_dim_in_block_data,
 };
 
 // dim_id is used directly as grid row index. No dim_idx indirection.
@@ -92,10 +92,12 @@ struct BmpScratch {
     sb_suffix_max: Vec<f32>,
     // Block-level (reused per superblock, sized to BMP_SUPERBLOCK_SIZE)
     local_block_ubs: Vec<f32>,
+    local_block_ub_units: Vec<u32>,
     local_block_masks: Vec<u64>,
     local_block_order: Vec<u32>,
     // Two-phase block scoring: phase1 block UBs (sized to BMP_SUPERBLOCK_SIZE)
     phase1_local_block_ubs: Vec<f32>,
+    phase1_local_block_ub_units: Vec<u32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
     // Compact grid buffers: query-relevant dim rows copied contiguously for L1 locality.
@@ -123,6 +125,9 @@ impl BmpScratch {
         if self.local_block_ubs.len() < sb_size {
             self.local_block_ubs.resize(sb_size, 0.0);
         }
+        if self.local_block_ub_units.len() < sb_size {
+            self.local_block_ub_units.resize(sb_size, 0);
+        }
         if self.local_block_masks.len() < sb_size {
             self.local_block_masks.resize(sb_size, 0u64);
         }
@@ -132,8 +137,15 @@ impl BmpScratch {
         if self.phase1_local_block_ubs.len() < sb_size {
             self.phase1_local_block_ubs.resize(sb_size, 0.0);
         }
-        if self.acc.len() < block_size {
-            self.acc.resize(block_size, 0);
+        if self.phase1_local_block_ub_units.len() < sb_size {
+            self.phase1_local_block_ub_units.resize(sb_size, 0);
+        }
+        // On-disk local slots are u8. Keep all 256 addresses valid even if a
+        // corrupt block contains a slot beyond its declared logical size;
+        // the scorer still rejects such a posting explicitly.
+        let safe_acc_size = block_size.max(256);
+        if self.acc.len() < safe_acc_size {
+            self.acc.resize(safe_acc_size, 0);
         }
     }
 }
@@ -223,7 +235,7 @@ fn execute_bmp_inner(
     max_superblocks: usize,
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    if query_terms.is_empty() || index.num_blocks == 0 {
+    if query_terms.is_empty() || index.num_blocks == 0 || k == 0 {
         return Ok(Vec::new());
     }
 
@@ -236,7 +248,7 @@ fn execute_bmp_inner(
     let block_size = index.bmp_block_size as usize;
     let num_superblocks_total = index.num_superblocks as usize;
 
-    // ── Phase 1: Resolve query dims and pre-scale weights ──────────────
+    // ── Phase 1: Resolve query dimensions and quantize weights ────────
     // dim_id is used directly as grid row index (no dim_idx indirection).
     // Build combined info, sort by dim_id, then split into resolved + query_by_dim_u16.
     // Both arrays MUST have the same ordering so mask bit `q` corresponds to the
@@ -247,9 +259,12 @@ fn execute_bmp_inner(
 
     for &(dim_id, weight) in query_terms {
         // dim_id IS the grid row index — just check bounds
-        if dim_id < dims {
-            let scaled = weight * scale;
-            query_info.push((dim_id, dim_id as usize, scaled));
+        if dim_id < dims && weight.is_finite() && weight != 0.0 {
+            // BMP stores absolute document impacts. Upper bounds and integer
+            // scoring must use the same absolute query weight; keeping the
+            // sign only in the grid path could under-estimate a block and
+            // prune a result that the scorer later treated as positive.
+            query_info.push((dim_id, dim_id as usize, weight.abs()));
         }
     }
 
@@ -260,15 +275,22 @@ fn execute_bmp_inner(
     // Sort by dim_id for binary search within blocks (blocks store dim_id directly).
     query_info.sort_unstable_by_key(|&(dim_id, _, _)| dim_id);
 
-    // Split into parallel arrays with matching order
-    // resolved: (dim_id_as_grid_row, f32_weight) — for grid UB computation
-    let resolved: Vec<(usize, f32)> = query_info.iter().map(|&(_, idx, w)| (idx, w)).collect();
-
-    // Integer scoring: quantize query weights to u16 for u32 accumulator path
-    // Max accumulator = 16383 × 255 × num_dims. At 1024 dims: 4.27B < u32::MAX.
-    let max_scaled = query_info.iter().map(|q| q.2.abs()).fold(0.0f32, f32::max);
-    let (quant_scale, dequant) = if max_scaled > 0.0 {
-        (16383.0 / max_scaled, max_scaled / 16383.0)
+    // Integer scoring: adapt the quantizer to query width so the documented
+    // u32 accumulator bound remains true for queries wider than 1024 dims.
+    let max_query_weight = query_info.iter().map(|q| q.2).fold(0.0f32, f32::max);
+    let accumulator_denominator = 255u64.saturating_mul(query_info.len() as u64);
+    let max_quantized_weight = ((u32::MAX as u64) / accumulator_denominator).min(16_383);
+    if max_quantized_weight == 0 {
+        return Err(crate::Error::Query(format!(
+            "BMP query has too many resolved dimensions ({})",
+            query_info.len()
+        )));
+    }
+    let (quant_scale, dequant) = if max_query_weight > 0.0 {
+        (
+            max_quantized_weight as f32 / max_query_weight,
+            (max_query_weight / max_quantized_weight as f32) * scale,
+        )
     } else {
         (0.0, 0.0)
     };
@@ -278,9 +300,26 @@ fn execute_bmp_inner(
         .map(|&(dim_id, _, w)| {
             (
                 dim_id,
-                (w.abs() * quant_scale).round().clamp(0.0, 16383.0) as u16,
+                (w.abs() * quant_scale)
+                    .round()
+                    .clamp(0.0, max_quantized_weight as f32) as u16,
             )
         })
+        .collect();
+    if !dequant.is_finite() {
+        return Err(crate::Error::Query(
+            "BMP query score scale exceeds the finite f32 range".into(),
+        ));
+    }
+
+    // Block and superblock bounds use the exact integer-scoring weight
+    // (quantized query × common dequantizer), not the original f32 weight.
+    // Otherwise rounding a query weight upward could make a scored document
+    // slightly exceed its block bound and be pruned incorrectly.
+    let resolved: Vec<(usize, f32)> = query_info
+        .iter()
+        .zip(&query_by_dim_u16)
+        .map(|(&(.., grid_index, _), &(_, weight))| (grid_index, weight as f32 * dequant))
         .collect();
 
     // ── Two-phase lazy block scoring setup ────────────────────────────
@@ -289,7 +328,7 @@ fn execute_bmp_inner(
     // For ≤5 dims: full scoring directly (zero overhead).
     const PHASE1_DIMS: usize = 3;
     const MIN_DIMS_FOR_TWO_PHASE: usize = 6;
-    let two_phase_active = query_by_dim_u16.len() >= MIN_DIMS_FOR_TWO_PHASE;
+    let two_phase_active = (MIN_DIMS_FOR_TWO_PHASE..=64).contains(&query_by_dim_u16.len());
     // phase1_mask: bitmask of which query dim indices are in phase1
     let phase1_mask: u64 = if two_phase_active {
         let mut weight_indices: Vec<(u16, usize)> = query_by_dim_u16
@@ -322,7 +361,7 @@ fn execute_bmp_inner(
     } else {
         1
     };
-    let collector_k = (k * ordinals_per_doc).min(k * 10);
+    let collector_k = k.saturating_mul(ordinals_per_doc).min(k.saturating_mul(10));
 
     let t_start = std::time::Instant::now();
 
@@ -344,9 +383,9 @@ fn execute_bmp_inner(
         // For large segments: use mmap-backed grid directly (zero alloc)
         // to avoid multi-MB thread-local scratch that never shrinks.
         const COMPACT_GRID_MAX: usize = 128 * 1024; // 128KB — fits L2 comfortably
-        let compact_sb_size = resolved.len() * num_superblocks_total;
-        let compact_grid_size = resolved.len() * prs;
-        let use_compact = compact_sb_size + compact_grid_size <= COMPACT_GRID_MAX;
+        let compact_sb_size = resolved.len().saturating_mul(num_superblocks_total);
+        let compact_grid_size = resolved.len().saturating_mul(prs);
+        let use_compact = compact_sb_size.saturating_add(compact_grid_size) <= COMPACT_GRID_MAX;
 
         // grid_dims: (dim_index_into_grid, weight) — local for compact, global for direct
         let grid_dims: Vec<(usize, f32)>;
@@ -384,6 +423,15 @@ fn execute_bmp_inner(
                 scratch.compact_grid = Vec::new();
             }
         }
+
+        let phase1_int_weights: Vec<(usize, u16)> = if two_phase_active {
+            phase1_grid_indices
+                .iter()
+                .map(|&index| sb_int_weights[index])
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Phase 2: Compute SUPERBLOCK UBs using integer weights (matching scoring path)
         compute_sb_ubs_int(
@@ -475,13 +523,15 @@ fn execute_bmp_inner(
             }
 
             // Compute block UBs + masks from grid
-            compute_block_ubs_compact(
+            compute_block_ubs_int(
                 grid_slice,
                 index.grid_bits(),
                 prs,
-                &grid_dims,
+                &sb_int_weights,
                 block_start,
                 block_end,
+                dequant,
+                &mut scratch.local_block_ub_units,
                 &mut scratch.local_block_ubs,
             );
             compute_block_masks(
@@ -496,17 +546,15 @@ fn execute_bmp_inner(
 
             // Two-phase: compute phase1 block UBs (only top-3 dims)
             if two_phase_active {
-                let phase1_dims: Vec<(usize, f32)> = phase1_grid_indices
-                    .iter()
-                    .map(|&i| grid_dims[i])
-                    .collect();
-                compute_block_ubs_compact(
+                compute_block_ubs_int(
                     grid_slice,
                     index.grid_bits(),
                     prs,
-                    &phase1_dims,
+                    &phase1_int_weights,
                     block_start,
                     block_end,
+                    dequant,
+                    &mut scratch.phase1_local_block_ub_units,
                     &mut scratch.phase1_local_block_ubs,
                 );
             }
@@ -691,21 +739,24 @@ fn score_block_bsearch_int(
     block_mask: u64,
     acc: &mut [u32],
     touched: &mut [u64; 4],
+    block_size: usize,
+    total_block_postings: u32,
 ) {
     for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
         // Bitmask skip: if this query dim has zero max in this block, skip
-        if block_mask & (1u64 << q) == 0 {
+        if q < 64 && block_mask & (1u64 << q) == 0 {
             continue;
         }
         // find_dim_in_block_data always uses u32 dim_ids
         if let Some(local_term) = find_dim_in_block_data(dim_ptr, num_terms, dim_id) {
-            let postings = unsafe { block_term_postings(ps_ptr, post_ptr, local_term) };
+            let postings =
+                unsafe { block_term_postings(ps_ptr, post_ptr, local_term, total_block_postings) };
             for p in postings {
                 let slot = p.local_slot as usize;
-                // SAFETY: local_slot < block_size = acc.len()
-                unsafe {
-                    *acc.get_unchecked_mut(slot) += w as u32 * p.impact as u32;
+                if slot >= block_size {
+                    continue;
                 }
+                acc[slot] = acc[slot].saturating_add(w as u32 * p.impact as u32);
                 touched[slot / 64] |= 1u64 << (slot % 64);
             }
         }
@@ -812,7 +863,8 @@ fn score_superblock_blocks(
             }
         }
 
-        let (num_terms, dim_ptr, ps_ptr, post_ptr) = index.parse_block(block_id);
+        let (num_terms, dim_ptr, ps_ptr, post_ptr, total_block_postings) =
+            index.parse_block(block_id);
         let mask = local_masks[local_idx as usize];
         let mut touched = [0u64; 4];
         if num_terms > 0 {
@@ -827,6 +879,8 @@ fn score_superblock_blocks(
                     mask & phase1_mask,
                     acc,
                     &mut touched,
+                    block_size,
+                    total_block_postings,
                 );
 
                 // Check if phase2 can be skipped:
@@ -852,6 +906,8 @@ fn score_superblock_blocks(
                     mask & !phase1_mask,
                     acc,
                     &mut touched,
+                    block_size,
+                    total_block_postings,
                 );
             } else {
                 // Single-phase: score all dims at once
@@ -864,6 +920,8 @@ fn score_superblock_blocks(
                     mask,
                     acc,
                     &mut touched,
+                    block_size,
+                    total_block_postings,
                 );
             }
         }
@@ -1025,32 +1083,109 @@ fn compute_sb_ubs_int(
     }
 }
 
-/// Compute block UBs from compact 4-bit grid for blocks `[block_start..block_end)`.
+/// Compute block UBs in the same integer units as document scoring.
 ///
-/// Operates on compact (query-local) grid where dim rows are contiguous
-/// in memory (L1-cache friendly).
+/// Grid cells are ceiling-quantized upper bounds. Accumulating `u16 × u8` in
+/// `u32`, then applying the common dequantizer once, preserves the monotonic
+/// relationship `block_ub >= document_score` under f32 conversion. Summing
+/// already-dequantized f32 terms can round downward (measurably even at 64
+/// dimensions) and made exact-mode pruning unsafe near the heap threshold.
 #[inline]
-fn compute_block_ubs_compact(
+#[allow(clippy::too_many_arguments)]
+fn compute_block_ubs_int(
     compact_grid: &[u8],
     grid_bits: u8,
     prs: usize,
-    compact_dims: &[(usize, f32)],
+    int_weights: &[(usize, u16)],
     block_start: usize,
     block_end: usize,
+    dequant: f32,
+    units: &mut [u32],
     out: &mut [f32],
 ) {
     let count = block_end - block_start;
+    debug_assert!(units.len() >= count);
     debug_assert!(out.len() >= count);
-    out[..count].fill(0.0);
-    for &(local_idx, weight) in compact_dims {
+    units[..count].fill(0);
+    for &(local_idx, weight) in int_weights {
         let row = &compact_grid[local_idx * prs..(local_idx + 1) * prs];
-        accumulate_grid_weighted(
+        accumulate_grid_u32(
             row,
             grid_bits,
             block_start,
             count,
-            weight,
-            &mut out[..count],
+            u32::from(weight),
+            &mut units[..count],
         );
+    }
+    for (bound, &integer_units) in out[..count].iter_mut().zip(&units[..count]) {
+        *bound = integer_units as f32 * dequant;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_block_ubs_int;
+
+    #[test]
+    fn integer_block_bound_cannot_round_below_integer_score() {
+        // Repeated f32 accumulation underestimates this 64-dimension sum on
+        // common targets. The block bound and document score now convert the
+        // same integer units exactly once.
+        let dimensions = 64usize;
+        let grid = vec![0x0f; dimensions]; // one 4-bit cell (= 255) per row
+        let weights: Vec<(usize, u16)> =
+            (0..dimensions).map(|dimension| (dimension, 160)).collect();
+        let dequant = 0.123_456_7f32;
+        let mut units = [0u32; 1];
+        let mut bounds = [0.0f32; 1];
+
+        compute_block_ubs_int(
+            &grid,
+            4,
+            1,
+            &weights,
+            0,
+            1,
+            dequant,
+            &mut units,
+            &mut bounds,
+        );
+
+        let score_units = 160u32 * 255 * dimensions as u32;
+        let score = score_units as f32 * dequant;
+        assert!(bounds[0] >= score);
+        assert_eq!(units[0], score_units);
+    }
+
+    #[test]
+    fn packed_integer_bound_kernel_matches_every_4bit_cell() {
+        let blocks = 64usize;
+        let grid: Vec<u8> = (0..blocks / 2)
+            .map(|pair| {
+                let low = (pair * 2 % 16) as u8;
+                let high = ((pair * 2 + 1) % 16) as u8;
+                low | (high << 4)
+            })
+            .collect();
+        let mut units = [0u32; 64];
+        let mut bounds = [0.0f32; 64];
+
+        compute_block_ubs_int(
+            &grid,
+            4,
+            grid.len(),
+            &[(0, 123)],
+            0,
+            blocks,
+            1.0,
+            &mut units,
+            &mut bounds,
+        );
+
+        for block in 0..blocks {
+            assert_eq!(units[block], (block % 16) as u32 * 17 * 123);
+            assert_eq!(bounds[block], units[block] as f32);
+        }
     }
 }

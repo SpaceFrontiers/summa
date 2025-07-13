@@ -1,0 +1,137 @@
+# Segment Lifecycle and Recovery
+
+Status: design and operational contract (2026-07-15), implemented.
+
+Hermes treats publication, replacement, cleanup, and deletion as one segment
+ownership protocol. This document defines that protocol and the operator-facing
+failure behavior. The central rule is simple:
+
+> Every on-disk `seg_<id>.*` file set must have at least one lifecycle owner.
+> Cleanup may delete an ID only after every owner is absent.
+
+## Owners and transitions
+
+| Owner            | Protects                                                                     | Released when                                                                    |
+| ---------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| metadata         | A live, searchable segment in `metadata.json`                                | An atomic replacement generation is published                                    |
+| active operation | Indexing output, merge/reorder sources, and its unpublished output           | Publication or the operation finishes; ordinary aborts retain it through cleanup |
+| segment tracker  | Retired files still reachable by an existing reader, plus scheduled deletion | The last reader drops and deletion completes                                     |
+
+The required transitions are:
+
+```text
+indexing: active(output) -> metadata + tracker -> release active
+
+rewrite:  metadata(sources) + active(sources, output)
+          -> metadata(output) + tracker(output, retired sources)
+          -> release active -> delete sources after last reader
+
+abort:    active(output) -> tracked deletion -> release active
+panic:    active(output) -> release active + tracked idempotent cleanup/sweep
+```
+
+The next owner is installed before the previous owner is released. Merge and
+reorder also claim all sources, which prevents overlapping rewrites of the same
+segment. Newly generated outputs are claimed before their first file write, so
+partial builders are protected from an orphan sweep too.
+
+## Metadata is the commit point
+
+Metadata mutations are serialized. A generation is written and fsynced as
+`metadata.json.tmp`, then atomically renamed over `metadata.json`. The rename is
+the logical commit point. The matching in-memory state and tracker transition
+continues even if the requesting RPC is canceled; shutdown tracks and drains
+that transaction.
+
+A directory-fsync error after a successful rename is reported as degraded
+crash durability, not as a rolled-back commit. Returning a pre-commit error at
+that point would be unsafe: disk readers could already observe metadata that
+references an output which an error path then deletes.
+
+Indexing flush generations are all-or-nothing. The first worker build error or
+panic marks the generation failed, the other workers drain their queues, every
+successful sibling output is abandoned through the same tracked cleanup path,
+and no partial generation is published. A timeout leaves the writer paused on
+the same generation so a late worker cannot acknowledge the next commit by
+mistake; the caller retries commit.
+
+## Cancellation and shutdown
+
+Tokio cannot cancel a `spawn_blocking` closure after it has started. Dropping or
+aborting only its async wrapper while deleting an index would let filesystem
+writes continue into a removed directory. Hermes therefore drains blocking
+merge/reorder work instead of pretending to cancel it.
+
+Index deletion follows this order:
+
+1. Acquire the per-index registry lease and create `.deleting`, serializing
+   against open/create.
+2. Stop accepting new lifecycle claims.
+3. Drain search and writer handles already issued by the registry.
+4. Signal and join indexing OS threads.
+5. Drop unpublished prepared segments and cached readers/writer handles.
+6. Drain merge/reorder operations, metadata transactions, and deferred deletes.
+7. Remove the index directory.
+
+The delete transaction is detached from the requesting RPC after the marker is
+installed, so client cancellation does not abandon a live writer. If the
+process exits during step 7, the `.deleting` marker causes the remaining
+directory to be removed on the next server startup.
+
+## Orphans versus corruption
+
+An orphan is a segment ID absent from metadata, active operations, and the
+reader/deletion tracker. Exclusive writer open and the background optimizer may
+sweep it. The sweep deletes every discovered path belonging to that ID,
+including unknown legacy or partial suffixes, and safely ignores malformed
+names. Read-only `Index::open` does not mutate the directory.
+
+A missing file for a **metadata-live** segment is not an orphan. Normal cleanup
+must never make the metadata internally consistent by silently dropping its
+documents. Merge preflight validates every mandatory source file before costly
+CPU work; deterministic missing/corrupt sources are quarantined for the process
+lifetime and excluded from candidate selection. The entry remains visible for
+diagnosis and explicit recovery.
+
+Other merge failures back off exponentially from 30 seconds to 30 minutes and
+schedule their own wakeup. A failed output is deleted only after rechecking
+under the metadata lock that it was not published. This prevents both an
+immediate retry/core-saturation loop and cleanup of an already committed output.
+Standalone optimizer failures use the same exponential delay per source,
+measured from pass completion; otherwise a pass longer than the scan interval
+would restart almost immediately. Deterministic reorder corruption enters the
+same process-lifetime quarantine as a corrupt merge source.
+
+## Operator recovery
+
+Repeated “quarantined metadata-live segment” or mandatory-file errors mean the
+index already has a broken metadata reference. Preserve/copy the directory
+before repair if the documents are not reproducible. Then stop normal traffic
+and run the server once with:
+
+```bash
+hermes-server --data-dir /data --doctor
+```
+
+Doctor opens every metadata-live segment, removes entries that cannot be
+validated, atomically saves the repaired metadata, and deletes their remaining
+files. This is intentionally destructive and may reduce the document count; it
+is not part of normal startup cleanup.
+
+For BP CPU and memory sizing, see [Budgeted reordering](budgeted-reorder.md).
+For page-cache behavior during lifecycle rewrites, see [Cold IO](cold-io.md).
+
+## Maintainer checklist
+
+Any new segment-producing or deleting path must answer all of these:
+
+- Is the output claimed before the first write?
+- Does ownership survive success, error, cancellation, and panic?
+- Is publication one durable metadata transaction with matching tracker state?
+- Does abandoned-output cleanup recheck metadata before deletion?
+- Are blocking tasks registered before shutdown can observe the task list empty?
+- Does index deletion drain the task rather than only aborting its wrapper?
+- Can the normal orphan sweep prove that metadata, active operations, and
+  readers/deferred deletion no longer own the ID?
+- Is a deterministic corrupt source quarantined while transient failures back
+  off and wake themselves?

@@ -1,8 +1,6 @@
 //! Segment merger for combining multiple segments
 
 mod dense;
-#[cfg(feature = "diagnostics")]
-mod diagnostics;
 mod fast_fields;
 mod postings;
 mod sparse;
@@ -117,6 +115,9 @@ pub struct SegmentMerger {
     bp_budget: crate::segment::BpBudget,
     /// Memory budget for the BP forward index during merge-time reorder.
     bp_memory_budget: usize,
+    /// Shared whole-pass concurrency limit. Tests and low-level callers may
+    /// omit it; SegmentManager always supplies the application-wide gate.
+    reorder_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl SegmentMerger {
@@ -128,6 +129,7 @@ impl SegmentMerger {
             granularity: crate::segment::reorder::BpGranularity::Auto,
             bp_budget: crate::segment::BpBudget::full(),
             bp_memory_budget: crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
+            reorder_permits: None,
         }
     }
 
@@ -161,6 +163,12 @@ impl SegmentMerger {
         self
     }
 
+    /// Share the application-wide whole-segment reorder gate.
+    pub fn with_reorder_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
+        self.reorder_permits = Some(permits);
+        self
+    }
+
     /// Merge segments into one, streaming postings/positions/store directly to files.
     ///
     /// If `trained` is provided, dense vectors use O(1) cluster merge when possible
@@ -177,6 +185,19 @@ impl SegmentMerger {
         new_segment_id: SegmentId,
         trained: Option<&TrainedVectorStructures>,
     ) -> Result<(SegmentMeta, MergeStats)> {
+        // Reject an unrepresentable merge before creating any output files.
+        // The previous late check left a complete orphan output behind after
+        // doing all expensive phases.
+        let total_docs: u32 = segments
+            .iter()
+            .try_fold(0u32, |acc, segment| acc.checked_add(segment.num_docs()))
+            .ok_or_else(|| {
+                crate::Error::Internal(format!(
+                    "Total document count exceeds u32::MAX ({})",
+                    u32::MAX
+                ))
+            })?;
+
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
 
@@ -185,7 +206,8 @@ impl SegmentMerger {
         // Stage 1: postings + store + fast_fields (concurrent)
         //   Touches .term_dict, .postings, .positions, .store, .fast files.
         //
-        // Stage 2: sparse + dense vectors (concurrent)
+        // Stage 2: sparse + dense vectors. Block-copy sparse work runs with
+        // dense vectors; BP sparse work runs first to bound peak memory.
         //   Touches .sparse, .vectors files.
         //
         // Running all phases concurrently caused OOM on large merges because
@@ -267,8 +289,16 @@ impl SegmentMerger {
                 .await
         };
 
-        let ((sparse_bytes, bp_converged), vectors_bytes) =
-            tokio::try_join!(sparse_fut, dense_fut)?;
+        // Merge-time BP constructs a potentially budget-sized forward index.
+        // Do not overlap that allocation and its heavy source-file scan with
+        // an ANN rebuild. Block-copy sparse merges remain concurrent with ANN.
+        let ((sparse_bytes, bp_converged), vectors_bytes) = if self.reorder_bmp {
+            let sparse = sparse_fut.await?;
+            let dense = dense_fut.await?;
+            (sparse, dense)
+        } else {
+            tokio::try_join!(sparse_fut, dense_fut)?
+        };
         let (store_bytes, store_num_docs) = store_result;
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
@@ -289,20 +319,26 @@ impl SegmentMerger {
         for segment in segments {
             for (&field_id, field_stats) in &segment.meta().field_stats {
                 let entry = merged_field_stats.entry(field_id).or_default();
-                entry.total_tokens += field_stats.total_tokens;
-                entry.doc_count += field_stats.doc_count;
+                entry.total_tokens = entry
+                    .total_tokens
+                    .checked_add(field_stats.total_tokens)
+                    .ok_or_else(|| {
+                        crate::Error::Corruption(format!(
+                            "field {} total-token count overflow while merging",
+                            field_id
+                        ))
+                    })?;
+                entry.doc_count = entry
+                    .doc_count
+                    .checked_add(field_stats.doc_count)
+                    .ok_or_else(|| {
+                        crate::Error::Corruption(format!(
+                            "field {} document count overflow while merging",
+                            field_id
+                        ))
+                    })?;
             }
         }
-
-        let total_docs: u32 = segments
-            .iter()
-            .try_fold(0u32, |acc, s| acc.checked_add(s.num_docs()))
-            .ok_or_else(|| {
-                crate::Error::Internal(format!(
-                    "Total document count exceeds u32::MAX ({})",
-                    u32::MAX
-                ))
-            })?;
 
         // Verify store doc count matches metadata — a mismatch here means
         // some store blocks were lost (e.g., compression thread panic) or

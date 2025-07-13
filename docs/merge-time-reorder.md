@@ -80,8 +80,10 @@ output always has tail-only padding.
 ## Cost
 
 - Extra merge CPU: forward-index build + BP. Bounded by the same
-  `memory_budget` df-dropping as standalone reorder (2 GB default). BP runs
-  in `spawn_blocking`; rayon parallelism uses the global pool.
+  `memory_budget` df-dropping as standalone reorder (24 GB default). BP runs
+  in `spawn_blocking`; Rayon parallelism uses the process-wide background
+  pool. The server's `--optimizer-concurrent-passes` gate covers this path too,
+  so merge-time and standalone passes cannot multiply without bound.
 - Saved: one full segment rewrite per merge (the optimizer pass), including
   its read traffic against the page cache.
 - Merge wall-clock grows; for latency-sensitive ingest keep the flag off and
