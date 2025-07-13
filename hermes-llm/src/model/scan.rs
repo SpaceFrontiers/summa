@@ -562,6 +562,28 @@ mod gpu {
         }
     }
 
+    #[cube]
+    fn half_plane_sum(value: f32, lane: usize) -> f32 {
+        let mut sum = value;
+        let other = plane_shuffle_down(sum, 8);
+        if lane < 8 {
+            sum += other;
+        }
+        let other = plane_shuffle_down(sum, 4);
+        if lane < 4 {
+            sum += other;
+        }
+        let other = plane_shuffle_down(sum, 2);
+        if lane < 2 {
+            sum += other;
+        }
+        let other = plane_shuffle_down(sum, 1);
+        if lane == 0 {
+            sum += other;
+        }
+        sum
+    }
+
     #[cube(launch)]
     fn softplus_forward(input: &Tensor<f32>, output: &mut Tensor<f32>) {
         let idx = ABSOLUTE_POS;
@@ -720,8 +742,6 @@ mod gpu {
         let shared_len = BACKWARD_CHANNELS * state_dim;
         let mut grad_dt_shared = Shared::new_slice(shared_len);
         let mut grad_x_shared = Shared::new_slice(shared_len);
-        let mut grad_b_shared = Shared::new_slice(shared_len);
-        let mut grad_c_shared = Shared::new_slice(shared_len);
         let mut adjoint = 0.0f32;
         let mut grad_a_local = 0.0f32;
         let mut grad_d_local = 0.0f32;
@@ -755,8 +775,8 @@ mod gpu {
             let g = adjoint + dy * cv;
             grad_dt_shared[shared_index] = g * (h_prev * alpha * av + bv * x);
             grad_x_shared[shared_index] = g * dt * bv;
-            grad_b_shared[shared_index] = g * dt * x;
-            grad_c_shared[shared_index] = dy * h_t;
+            let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
+            let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
             sync_cube();
 
             if n == 0 && active_channel {
@@ -772,13 +792,6 @@ mod gpu {
                 grad_d_local += dy * x;
             }
             if local_channel == 0 {
-                let mut grad_b_sum = 0.0f32;
-                let mut grad_c_sum = 0.0f32;
-                for offset in 0..BACKWARD_CHANNELS {
-                    let index = n * BACKWARD_CHANNELS + offset;
-                    grad_b_sum += grad_b_shared[index];
-                    grad_c_sum += grad_c_shared[index];
-                }
                 atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
                 atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
             }
