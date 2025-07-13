@@ -29,7 +29,8 @@ converge to full-BP quality.
   fan-out). Hitting it ends the pass cleanly with `converged = false`.
 
 Per-segment metadata gains `bp_converged` (serde-default true for old
-metadata). What you cannot budget: each pass still rewrites the whole sparse
+metadata) and `bp_unconverged_passes` (serde-default zero). What you cannot
+budget away: each pass still rewrites the whole sparse
 blob (the 4-bit grid is row-major — any permutation rewrites every row), so
 partial reorder bounds CPU/memory, not per-pass IO. Passes go through the
 cold-IO writer, so at least they no longer evict the cache.
@@ -46,6 +47,13 @@ cold-IO writer, so at least they no longer evict the cache.
   Starting cooldown at completion is important because a full sparse rewrite
   can outlast the BP deadline; starting it at launch caused the replacement
   segment to be requeued immediately.
+- The optimizer deepens a replacement lineage only while its consecutive
+  budget-exhausted rewrite count is below
+  `--optimizer-max-unconverged-passes` (default 3, including its initial
+  partial pass). The counter follows replacement IDs, includes a partial
+  merge-time BP pass, and resets after convergence or a non-reordered merge.
+  `0` disables optimizer follow-up deepening; it does not disable explicitly
+  configured merge-time reorder.
 - Merge-time reorder uses its own `--merge-bp-budget-secs` deadline. A
   truncated output joins the same paced deepening ladder.
 
@@ -115,15 +123,16 @@ query pool:
 
 1. **Forward-index build** (was fully serial). Real doc ids are assigned in
    ascending vid order, so each BMP block owns a contiguous real-id range —
-   df counting is a rayon fold/reduce over blocks, and the CSR count/fill
-   phases write disjoint per-block slices (safe `split_at_mut` carving, no
-   locks). Also df counting aggregates per (block, dim) instead of per
-   posting, which speeds up the serial path too.
+   df counting uses one dense atomic vocabulary table shared by the bounded
+   pool, and the CSR count/fill phases write disjoint per-block slices (safe
+   `split_at_mut` carving, no locks). This avoids one vocabulary-sized hash map
+   per worker. Candidate discovery retains only a budgeted low-frequency set.
 2. **Graph bisection** (already parallel: `rayon::join` halves + parallel
    gain passes, wall-clock budgeted).
 3. **Permuted blob write** (was fully serial). Output blocks encode
-   independently; they are encoded in parallel in 4096-block windows and
-   written serially in blob order (the window bounds buffered bytes).
+   independently; they are encoded in parallel in memory-derived windows and
+   written serially in blob order. Grid spill and encoded-window budgets share
+   the remaining per-pass allowance after persistent document maps.
 
 ## Default changes (2026-07-14, follow-up)
 
@@ -147,9 +156,19 @@ Thread width and operation concurrency are intentionally independent:
   across every index and every entry point: optimizer, merge-time, and manual.
   Concurrent passes share the CPU pool, but each may consume its own forward
   index budget and rewrite buffers.
-- `--bp-memory-budget-mb` is therefore a **per-pass** cap. A conservative
-  process estimate starts with `concurrent passes × memory budget`, then adds
-  indexing builders, merge structures, readers, and mmap/page-cache residency.
+- `--bp-memory-budget-mb` is therefore a **per-pass algorithmic working-set
+  bound**. It covers record maps, forward CSR, candidate/remap storage,
+  vocabulary degree arrays (including parallel recursion), and rewrite
+  grid/encode windows. It does not include source/output mmap pages, directory
+  implementation buffers, unrelated merge structures, or indexing. A
+  conservative process estimate starts with `concurrent passes × memory
+budget`, then adds those external consumers.
+
+When the dense vocabulary table itself cannot fit, the pass emits identity or
+block order and remains explicitly unconverged. Recursion parallelism is
+reduced to the number of vocabulary-sized degree arrays that fit. Memory
+pressure can therefore reduce reorder quality or parallelism, but cannot be
+misreported as convergence and trigger an unbounded immediate loop.
 
 The gate is acquired before expensive forward-index construction. Scheduler
 permits are nonblocking, indexes are visited with a rotating start point, fresh

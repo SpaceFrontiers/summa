@@ -40,6 +40,11 @@ pub struct OptimizerConfig {
     /// pass hit its wall-clock budget (`bp_converged == false`). Each
     /// follow-up warm-starts from the previous order and deepens.
     pub unconverged_cooldown: Duration,
+    /// Optimizer follow-up threshold for budget-exhausted rewrites in one
+    /// replacement lineage. Without it, a segment that can never beat
+    /// `time_budget` is rewritten forever by the optimizer, continually
+    /// consuming all BP workers and disk I/O.
+    pub max_unconverged_passes: u32,
 }
 
 /// Global gate for expensive full-depth deepening passes.
@@ -106,10 +111,11 @@ pub fn spawn_optimizer(
     }
 
     info!(
-        "Starting background optimizer: {} shared BP threads, {} concurrent pass(es), {:.0}s scan interval",
+        "Starting background optimizer: {} shared BP threads, {} concurrent pass(es), {:.0}s scan interval, {}-pass unconverged follow-up threshold",
         config.threads,
         config.concurrent_passes,
         config.scan_interval.as_secs_f64(),
+        config.max_unconverged_passes,
     );
 
     let semaphore = Arc::new(Semaphore::new(config.concurrent_passes.max(1)));
@@ -229,13 +235,19 @@ async fn scan_and_optimize(
         // budget-truncated segment per cooldown window (each follow-up is a
         // full segment rewrite; it warm-starts from the previous order and
         // deepens toward block-granularity).
-        let mut unconverged = segment_manager.unconverged_segments().await;
+        let mut unconverged = segment_manager
+            .unconverged_segments_below(config.max_unconverged_passes)
+            .await;
         unconverged.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        if let Some((id, docs)) = unconverged.into_iter().next() {
+        if let Some((id, docs, attempts)) = unconverged.into_iter().next() {
             // Put deepening first so an endless stream of fresh flushes cannot
             // consume every slot. The cooldown gate is acquired only after a
             // scheduler slot exists; merely discovering a candidate must not
             // start its cooldown.
+            debug!(
+                "[optimizer] segment {} has used {}/{} unconverged pass(es)",
+                id, attempts, config.max_unconverged_passes,
+            );
             candidates.insert(0, (id, docs, true));
         }
 

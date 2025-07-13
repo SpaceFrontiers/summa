@@ -55,6 +55,15 @@ and no partial generation is published. A timeout leaves the writer paused on
 the same generation so a late worker cannot acknowledge the next commit by
 mistake; the caller retries commit.
 
+Once a prepared indexing commit starts, an owned finalizer—not the requesting
+RPC—holds its segment guards. It completes metadata publication, refreshes the
+primary-key view, and resumes workers in that order even if the request is
+canceled. Ingestion receives explicit backpressure until the finalizer ends.
+If publication fails before the atomic rename, the same prepared segments stay
+owned and workers remain paused for a lossless retry; a new indexing generation
+cannot be mixed into them. After the rename, optional cache-refresh failures
+are fail-closed and cannot turn a durable commit into an apparent abort.
+
 ## Cancellation and shutdown
 
 Tokio cannot cancel a `spawn_blocking` closure after it has started. Dropping or
@@ -101,6 +110,18 @@ Standalone optimizer failures use the same exponential delay per source,
 measured from pass completion; otherwise a pass longer than the scan interval
 would restart almost immediately. Deterministic reorder corruption enters the
 same process-lifetime quarantine as a corrupt merge source.
+
+Reorder copies distinguish absent optional files from failures: only a genuine
+`NotFound` for a file the source reader did not observe is skipped. Required
+files, permission/storage errors, short copies, and invalid optional formats
+fail the output. Before replacement publication, Hermes opens the complete
+output segment and verifies its document count; metadata is never switched to
+an output that only passed a shallow `.meta` check.
+
+Budget-truncated BP is a successful lifecycle transition, not a failure retry.
+Its replacement metadata carries `bp_unconverged_passes`; the optimizer admits
+only lineages below `--optimizer-max-unconverged-passes`. Thus both failure
+retries and successful deepening have explicit, finite scheduling bounds.
 
 ## Operator recovery
 

@@ -105,6 +105,7 @@ For production indexes, BP reorder resources are controlled independently:
 hermes-server --data-dir /data \
   --optimizer-threads 16 \
   --optimizer-concurrent-passes 1 \
+  --optimizer-max-unconverged-passes 3 \
   --bp-memory-budget-mb 24576
 ```
 
@@ -117,9 +118,16 @@ hermes-server --data-dir /data \
   optimizer, merge-time reorder, and manual reorder. It is not a thread count;
   keep it small because each pass can use the shared pool and its own memory
   budget.
-- `--bp-memory-budget-mb` caps the forward index of one pass rather than total
-  process RSS. Worst-case reorder working memory is approximately concurrent
-  passes times this cap, plus readers, mmap pages, merge buffers, and indexing.
+- `--optimizer-max-unconverged-passes` is a hard eligibility bound for
+  optimizer follow-up on one budget-truncated replacement lineage (the default
+  `3` includes the initial partial pass). This prevents a segment that cannot
+  converge within its budget from keeping the optimizer BP pool busy forever.
+- `--bp-memory-budget-mb` bounds the main per-pass algorithmic working set:
+  document maps, the BP forward graph and degree arrays, and record-rewrite
+  grid/encode windows. Over-budget record passes fall back to block order and
+  graph dimensions are trimmed. It is not a total-process RSS cap: readers,
+  mmap/page-cache residency, output buffering, merge state, and indexing are
+  additional.
 
 Segment publication, replacement, reader retirement, orphan cleanup, failure
 backoff, and index deletion follow one ownership protocol. Missing files that
@@ -128,6 +136,11 @@ tight merge loop; start once with `--doctor` only when you intentionally want
 to remove those corrupt metadata entries. See
 [Segment lifecycle and recovery](docs/segment-lifecycle.md) and the full
 [server options](hermes-server/README.md#background-merge-and-reorder).
+
+Commit publication is cancellation-safe: after workers flush, an owned
+finalizer carries metadata publication, primary-key refresh, and worker resume
+to completion even if the client disconnects. A pre-publication storage error
+keeps that generation paused and retryable instead of mixing it with new input.
 
 Python client:
 

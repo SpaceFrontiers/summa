@@ -129,7 +129,7 @@ async fn write_flat_entry(
                     .read_bytes_range(base_offset + chunk_start..base_offset + chunk_end)
                     .await
                     .map_err(crate::Error::Io)?;
-                writer.write_all(bytes.as_slice())?;
+                super::block_in_place_if_multithread(|| writer.write_all(bytes.as_slice()))?;
             }
         }
     }
@@ -148,7 +148,7 @@ async fn write_flat_entry(
                     buf.extend_from_slice(&(offset + doc_id).to_le_bytes());
                     buf.extend_from_slice(&ordinal.to_le_bytes());
                 }
-                writer.write_all(&buf)?;
+                super::block_in_place_if_multithread(|| writer.write_all(&buf))?;
             }
         }
     }
@@ -245,17 +245,36 @@ impl SegmentMerger {
             let config = entry.dense_vector_config.as_ref();
 
             // ── ANN entry (written first, index_type != FLAT_TYPE) ───────
-            let ann_blob = if entry.field_type == FieldType::BinaryDenseVector {
-                self.try_build_binary_ivf(field, entry, segments, &doc_offs, fi.total_vectors)
+            if entry.field_type == FieldType::BinaryDenseVector {
+                if let Some(index) = self
+                    .try_build_binary_ivf(field, entry, segments, &doc_offs, fi.total_vectors)
                     .await?
-            } else {
-                self.try_build_ann(field, config, segments, &doc_offs, trained)
-                    .await?
-            };
-
-            if let Some((index_type, bytes)) = ann_blob {
+                {
+                    let data_offset = writer.offset();
+                    super::block_in_place_if_multithread(|| index.write_to(&mut writer))
+                        .map_err(crate::Error::Io)?;
+                    let data_size = writer.offset() - data_offset;
+                    toc.push(DenseVectorTocEntry {
+                        field_id: field.0,
+                        index_type: crate::segment::ann_build::BINARY_IVF_TYPE,
+                        offset: data_offset,
+                        size: data_size,
+                    });
+                    // Drop the in-memory index before streaming the Flat entry.
+                    drop(index);
+                    let pad = (8 - (writer.offset() % 8)) % 8;
+                    if pad > 0 {
+                        super::block_in_place_if_multithread(|| {
+                            writer.write_all(&[0u8; 8][..pad as usize])
+                        })?;
+                    }
+                }
+            } else if let Some((index_type, bytes)) = self
+                .try_build_ann(field, config, segments, &doc_offs, trained)
+                .await?
+            {
                 let data_offset = writer.offset();
-                writer.write_all(&bytes)?;
+                super::block_in_place_if_multithread(|| writer.write_all(&bytes))?;
                 let data_size = writer.offset() - data_offset;
                 toc.push(DenseVectorTocEntry {
                     field_id: field.0,
@@ -266,7 +285,9 @@ impl SegmentMerger {
                 // Pad to 8-byte boundary
                 let pad = (8 - (writer.offset() % 8)) % 8;
                 if pad > 0 {
-                    writer.write_all(&[0u8; 8][..pad as usize])?;
+                    super::block_in_place_if_multithread(|| {
+                        writer.write_all(&[0u8; 8][..pad as usize])
+                    })?;
                 }
                 // `bytes` dropped here — frees the ANN blob immediately
             }
@@ -293,7 +314,9 @@ impl SegmentMerger {
             // Pad to 8-byte boundary
             let pad = (8 - (writer.offset() % 8)) % 8;
             if pad > 0 {
-                writer.write_all(&[0u8; 8][..pad as usize])?;
+                super::block_in_place_if_multithread(|| {
+                    writer.write_all(&[0u8; 8][..pad as usize])
+                })?;
             }
         }
 
@@ -302,7 +325,7 @@ impl SegmentMerger {
         write_dense_toc_and_footer(&mut writer, toc_offset, &toc)?;
 
         let output_size = writer.offset() as usize;
-        writer.finish()?;
+        super::block_in_place_if_multithread(move || writer.finish())?;
         log::info!(
             "[merge_vectors] file written: {} ({} entries) in {:.1}s",
             super::format_bytes(output_size),
@@ -329,7 +352,7 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         doc_offs: &[u32],
         total_vectors: usize,
-    ) -> Result<Option<(u8, Vec<u8>)>> {
+    ) -> Result<Option<crate::structures::BinaryIvfIndex>> {
         let Some(cfg) = entry.binary_dense_vector_config.as_ref() else {
             return Ok(None);
         };
@@ -340,7 +363,10 @@ impl SegmentMerger {
         }
 
         let byte_len = cfg.dim.div_ceil(8);
-        let mut codes: Vec<u8> = Vec::with_capacity(total_vectors * byte_len);
+        let code_capacity = total_vectors.checked_mul(byte_len).ok_or_else(|| {
+            crate::Error::Internal("binary IVF code capacity exceeds usize".into())
+        })?;
+        let mut codes: Vec<u8> = Vec::with_capacity(code_capacity);
         let mut labels: Vec<(u32, u16)> = Vec::with_capacity(total_vectors);
 
         const CODE_BATCH: usize = 65536;
@@ -359,7 +385,12 @@ impl SegmentMerger {
                 codes.extend_from_slice(bytes.as_slice());
                 for i in 0..batch_count {
                     let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                    labels.push((doc_id + offset, ordinal));
+                    let merged_doc_id = doc_id.checked_add(offset).ok_or_else(|| {
+                        crate::Error::Corruption(format!(
+                            "binary IVF doc-id offset overflow: {doc_id} + {offset}"
+                        ))
+                    })?;
+                    labels.push((merged_doc_id, ordinal));
                 }
             }
         }
@@ -368,18 +399,44 @@ impl SegmentMerger {
             return Ok(None);
         }
 
-        let num_clusters = cfg.optimal_num_clusters(labels.len());
+        if codes.len() != labels.len().saturating_mul(byte_len) {
+            return Err(crate::Error::Corruption(format!(
+                "binary IVF code/label mismatch: {} bytes for {} labels × {} bytes",
+                codes.len(),
+                labels.len(),
+                byte_len,
+            )));
+        }
+
+        let vector_count = labels.len();
+        let num_clusters = cfg.optimal_num_clusters(vector_count);
         let ivf_config = crate::structures::BinaryIvfConfig::new(cfg.dim, num_clusters);
-        let index = crate::structures::BinaryIvfIndex::build(ivf_config, &codes, &labels);
-        let bytes = index.to_bytes().map_err(crate::Error::Io)?;
+        let pool = self.background_pool.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            let build = || crate::structures::BinaryIvfIndex::build(ivf_config, &codes, &labels);
+            let index = if let Some(pool) = pool {
+                pool.install(build)
+            } else {
+                build()
+            };
+            // The built clusters now own the only code copy needed by the
+            // serializer. Release the raw merge inputs before returning.
+            drop(codes);
+            drop(labels);
+            index
+        })
+        .await
+        .map_err(|error| {
+            crate::Error::Internal(format!("binary IVF build task failed: {error}"))
+        })?;
         log::debug!(
-            "[merge_vectors] field {}: binary IVF rebuilt ({} vectors, {} clusters, {} bytes)",
+            "[merge_vectors] field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {} bytes)",
             field.0,
-            labels.len(),
+            vector_count,
             num_clusters,
-            bytes.len(),
+            index.estimated_memory_bytes(),
         );
-        Ok(Some((crate::segment::ann_build::BINARY_IVF_TYPE, bytes)))
+        Ok(Some(index))
     }
 
     async fn try_build_ann(
@@ -540,7 +597,9 @@ impl SegmentMerger {
                     total_fed,
                     ann_start.elapsed().as_secs_f64()
                 );
-                let bytes = crate::segment::ann_build::serialize_ivf_rabitq(index, codebook)?;
+                let bytes = super::block_in_place_if_multithread(|| {
+                    crate::segment::ann_build::serialize_ivf_rabitq(index, codebook)
+                })?;
                 (crate::segment::ann_build::IVF_RABITQ_TYPE, bytes)
             }
             VectorIndexType::ScaNN => {
@@ -573,7 +632,9 @@ impl SegmentMerger {
                     total_fed,
                     ann_start.elapsed().as_secs_f64()
                 );
-                let bytes = crate::segment::ann_build::serialize_scann(index, codebook)?;
+                let bytes = super::block_in_place_if_multithread(|| {
+                    crate::segment::ann_build::serialize_scann(index, codebook)
+                })?;
                 (crate::segment::ann_build::SCANN_TYPE, bytes)
             }
         };

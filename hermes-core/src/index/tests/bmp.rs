@@ -948,6 +948,29 @@ async fn test_bmp_merge_large() {
     );
 }
 
+/// A schema-level sparse field may have no values in a particular segment.
+#[tokio::test]
+async fn test_bmp_reorder_accepts_segment_without_sparse_values() {
+    let (schema, title, _sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    let mut doc = Document::new();
+    doc.add_text(title, "text only");
+    writer.add_document(doc).unwrap();
+    writer.commit().await.unwrap();
+
+    // A sparse field in the schema does not imply that every segment owns a
+    // `.sparse` file. Reorder must preserve this valid optional-file case.
+    writer.reorder().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), 1);
+}
+
 /// BMP standalone reorder: build 1 segment, call writer.reorder(), verify all docs findable.
 ///
 /// Tests the record-level BP reorder path where individual ordinals are
@@ -1806,6 +1829,7 @@ async fn test_budgeted_reorder_marks_unconverged_and_stays_searchable() {
         !info.bp_converged,
         "zero-budget pass must be marked unconverged for the optimizer to deepen"
     );
+    assert_eq!(info.bp_unconverged_passes, 1);
 
     // All docs still searchable after the partial pass
     let index = Index::open(dir.clone(), config.clone()).await.unwrap();
@@ -1817,9 +1841,22 @@ async fn test_budgeted_reorder_marks_unconverged_and_stays_searchable() {
         assert_eq!(results.len(), 1, "dim {} lost after budgeted reorder", i);
     }
 
-    // Pass 2: full budget → warm-started pass converges
+    // Pass 2: another truncated rewrite inherits and increments the lineage
+    // counter even though replacement gives it a new segment ID.
     let new_seg_id = metadata.segment_ids()[0].clone();
     let sm = std::sync::Arc::clone(index.segment_manager());
+    let reordered = sm
+        .reorder_single_segment(&new_seg_id, None, budget)
+        .await
+        .unwrap();
+    assert!(reordered);
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let info = metadata.segment_metas.values().next().unwrap();
+    assert!(!info.bp_converged);
+    assert_eq!(info.bp_unconverged_passes, 2);
+
+    // Pass 3: a completed full-depth pass clears the retry lineage.
+    let new_seg_id = metadata.segment_ids()[0].clone();
     let reordered = sm
         .reorder_single_segment(&new_seg_id, None, BpBudget::full())
         .await
@@ -1831,6 +1868,7 @@ async fn test_budgeted_reorder_marks_unconverged_and_stays_searchable() {
         info.bp_converged,
         "full-budget follow-up pass must converge"
     );
+    assert_eq!(info.bp_unconverged_passes, 0);
 }
 
 /// Small-segment reorder must still cluster: with a fixed min_doc_freq=128,
@@ -2680,7 +2718,8 @@ async fn test_bmp_block_posting_overflow_256() {
     // BP forward-index build over the oversized block must not read wild
     // slices (this is the exact prod crash path).
     let (fwd, _) =
-        crate::segment::build_forward_index_from_bmps(&[bmp], 2, 1_000_000, 2 * 1024 * 1024 * 1024);
+        crate::segment::build_forward_index_from_bmps(&[bmp], 2, 1_000_000, 2 * 1024 * 1024 * 1024)
+            .unwrap();
     // Needle dims have df=1 and are correctly filtered by min_doc_freq=2;
     // the 300 shared dims × 256 docs must all survive — reading them walks
     // every posting slice past the old u16 wrap point.

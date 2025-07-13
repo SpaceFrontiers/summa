@@ -96,16 +96,21 @@ struct Args {
     #[arg(long, default_value = "600")]
     optimizer_unconverged_cooldown_secs: u64,
 
+    /// Maximum consecutive budget-exhausted rewrites that remain eligible for
+    /// optimizer follow-up, including the initial partial pass. 0 disables
+    /// follow-up deepening.
+    #[arg(long, default_value = "3")]
+    optimizer_max_unconverged_passes: u32,
+
     /// Wall-clock budget in seconds for merge-time BP reorder (0 = unbudgeted).
     /// A truncated pass still produces a valid, better-ordered segment; it is
     /// marked unconverged and the background optimizer deepens it later.
     #[arg(long, default_value = "600")]
     merge_bp_budget_secs: u64,
 
-    /// Memory budget (MB) for the BP forward index during reorder passes
-    /// (merge-time and background). A cap, not an allocation — usage is
-    /// proportional to the segment being reordered. Over-budget passes drop
-    /// highest-df dims from BP's input with a loud warning.
+    /// Memory budget (MB) for the main BP/rewrite working set of one pass
+    /// (merge-time and background). A cap, not an allocation. Over-budget
+    /// record passes fall back to blockwise order and/or drop graph dimensions.
     #[arg(long, default_value = "24576")]
     bp_memory_budget_mb: usize,
 
@@ -259,6 +264,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             time_budget: Duration::from_secs(args.optimizer_time_budget_secs),
             partial_min_partition_docs: args.optimizer_partial_min_partition_docs,
             unconverged_cooldown: Duration::from_secs(args.optimizer_unconverged_cooldown_secs),
+            max_unconverged_passes: args.optimizer_max_unconverged_passes,
         },
     );
 
@@ -271,8 +277,11 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Reload interval: {} ms", args.reload_interval_ms);
     if args.optimizer_threads > 0 {
         info!(
-            "Optimizer: {} shared BP threads, {} concurrent pass(es), {}s scan interval",
-            args.optimizer_threads, concurrent_reorder_passes, args.optimizer_scan_interval_secs,
+            "Optimizer: {} shared BP threads, {} concurrent pass(es), {}s scan interval, {}-pass unconverged follow-up threshold",
+            args.optimizer_threads,
+            concurrent_reorder_passes,
+            args.optimizer_scan_interval_secs,
+            args.optimizer_max_unconverged_passes,
         );
     }
 

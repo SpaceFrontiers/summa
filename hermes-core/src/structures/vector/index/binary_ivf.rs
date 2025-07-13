@@ -91,7 +91,10 @@ impl BinaryIvfIndex {
         debug_assert_eq!(codes.len(), n * byte_len);
 
         // Can't have more clusters than vectors
-        config.num_clusters = config.num_clusters.clamp(1, n.max(1));
+        config.num_clusters = config
+            .num_clusters
+            .clamp(1, n.max(1))
+            .min(u32::MAX as usize);
         let k = config.num_clusters;
 
         let centroids = train_k_majority(&config, codes, n);
@@ -106,7 +109,7 @@ impl BinaryIvfIndex {
         // Phase 1: nearest-centroid assignment — embarrassingly parallel,
         // dominates build time at O(n × k) Hamming comparisons.
         #[cfg(feature = "native")]
-        let assignments: Vec<usize> = {
+        let assignments: Vec<u32> = {
             use rayon::prelude::*;
             (0..n)
                 .into_par_iter()
@@ -114,25 +117,40 @@ impl BinaryIvfIndex {
                     || vec![0f32; index.config.num_clusters],
                     |scores, i| {
                         index.nearest_centroid(&codes[i * byte_len..(i + 1) * byte_len], scores)
+                            as u32
                     },
                 )
                 .collect()
         };
         #[cfg(not(feature = "native"))]
-        let assignments: Vec<usize> = {
+        let assignments: Vec<u32> = {
             let mut scores = vec![0f32; index.config.num_clusters];
             (0..n)
                 .map(|i| {
                     index.nearest_centroid(&codes[i * byte_len..(i + 1) * byte_len], &mut scores)
+                        as u32
                 })
                 .collect()
         };
+
+        // Reserve exact cluster payload sizes before copying. Geometric Vec
+        // growth otherwise keeps substantial over-capacity for large clusters
+        // while the complete input code buffer is still resident.
+        let mut cluster_sizes = vec![0usize; k];
+        for &assignment in &assignments {
+            cluster_sizes[assignment as usize] += 1;
+        }
+        for (cluster, count) in index.clusters.iter_mut().zip(cluster_sizes) {
+            cluster.doc_ids.reserve_exact(count);
+            cluster.ordinals.reserve_exact(count);
+            cluster.codes.reserve_exact(count.saturating_mul(byte_len));
+        }
 
         // Phase 2: sequential append into SoA cluster storage
         for i in 0..n {
             let code = &codes[i * byte_len..(i + 1) * byte_len];
             let (doc_id, ordinal) = doc_id_ordinals[i];
-            let c = &mut index.clusters[assignments[i]];
+            let c = &mut index.clusters[assignments[i] as usize];
             c.doc_ids.push(doc_id);
             c.ordinals.push(ordinal);
             c.codes.extend_from_slice(code);
@@ -270,6 +288,13 @@ impl BinaryIvfIndex {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
+    /// Serialize directly into an output stream without materializing a second
+    /// complete ANN blob in memory.
+    pub fn write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<usize> {
+        bincode::serde::encode_into_std_write(self, writer, bincode::config::standard())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
         bincode::serde::decode_from_slice(data, bincode::config::standard())
@@ -300,9 +325,8 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
     // Bound training cost: iterate over a sample, assign everything later
-    let mut sample: Vec<usize> = (0..n).collect();
-    sample.shuffle(&mut rng);
-    sample.truncate(config.max_train_samples.max(k));
+    let sample_len = config.max_train_samples.max(k).min(n);
+    let sample = rand::seq::index::sample(&mut rng, n, sample_len).into_vec();
     let n = sample.len();
     let vec_at = |i: usize| -> &[u8] {
         let vi = sample[i];
@@ -508,6 +532,10 @@ mod tests {
 
         let index = BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes, &labels);
         let bytes = index.to_bytes().unwrap();
+        let mut streamed = Vec::new();
+        let written = index.write_to(&mut streamed).unwrap();
+        assert_eq!(written, streamed.len());
+        assert_eq!(streamed, bytes);
         let back = BinaryIvfIndex::from_bytes(&bytes).unwrap();
         assert_eq!(back.len(), index.len());
 

@@ -318,16 +318,19 @@ pub(super) fn build_vectors_streaming(
                     &builder.vectors,
                     &builder.doc_ids,
                 );
-                let blob = index.to_bytes().map_err(crate::Error::Io)?;
                 let blob_offset = current_offset;
-                writer.write_all(&blob)?;
-                current_offset += blob.len() as u64;
+                let mut output = &mut *writer;
+                let blob_len = index.write_to(&mut output).map_err(crate::Error::Io)? as u64;
+                current_offset = current_offset.checked_add(blob_len).ok_or_else(|| {
+                    crate::Error::Internal("binary IVF output offset exceeds u64".into())
+                })?;
                 toc.push(DenseVectorTocEntry {
                     field_id,
                     index_type: super::super::ann_build::BINARY_IVF_TYPE,
                     offset: blob_offset,
-                    size: blob.len() as u64,
+                    size: blob_len,
                 });
+                drop(index);
                 let pad = (8 - (current_offset % 8)) % 8;
                 if pad > 0 {
                     writer.write_all(&[0u8; 8][..pad as usize])?;
@@ -338,7 +341,7 @@ pub(super) fn build_vectors_streaming(
                     field_id,
                     num_vectors,
                     num_clusters,
-                    blob.len(),
+                    blob_len,
                 );
             }
         }
