@@ -24,6 +24,20 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 #[cfg(feature = "cuda")]
 use super::matmul::{matmul_4, matmul_input};
 
+#[cfg(feature = "cuda")]
+struct CachedCausalMask {
+    device: Device,
+    sequence: usize,
+    mask: Tensor<4, Bool>,
+}
+
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static CAUSAL_MASK_CACHE: std::cell::RefCell<Option<CachedCausalMask>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Backend capability used by full-sequence Transformer attention.
 #[cfg_attr(feature = "cuda", backend_extension(Cuda, Autodiff))]
 #[cfg_attr(
@@ -122,21 +136,23 @@ fn causal_mask(sequence: usize, device: &Device) -> Tensor<4, Bool> {
 }
 
 #[cfg(feature = "cuda")]
-fn causal_chunk_mask(
-    sequence: usize,
-    row_start: usize,
-    rows: usize,
-    device: &Device,
-) -> Tensor<4, Bool> {
-    let mut values = vec![false; rows * sequence];
-    for row in 0..rows {
-        let global_row = row_start + row;
-        for column in global_row + 1..sequence {
-            values[row * sequence + column] = true;
+fn cached_causal_mask(sequence: usize, device: &Device) -> Tensor<4, Bool> {
+    CAUSAL_MASK_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.sequence == sequence
+            && cached.device == *device
+        {
+            return cached.mask.clone();
         }
-    }
-    Tensor::<2, Bool>::from_data(TensorData::new(values, [rows, sequence]), device)
-        .reshape([1, 1, rows, sequence])
+        let mask = causal_mask(sequence, device);
+        *cache = Some(CachedCausalMask {
+            device: device.clone(),
+            sequence,
+            mask: mask.clone(),
+        });
+        mask
+    })
 }
 
 fn attention_probabilities(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Tensor<4> {
@@ -272,13 +288,13 @@ where
     let value_transposed = matmul_input(value.clone().transpose());
     let grad_output_compute = matmul_input(grad_output.clone());
     let scale = 1.0 / (head_dim as f32).sqrt();
+    let causal_mask = causal.then(|| cached_causal_mask(sequence, &device));
     let mut query_gradients = Vec::with_capacity(sequence.div_ceil(chunk_size));
     let mut key_gradient = Tensor::zeros([batch, heads, sequence, head_dim], &device);
     let mut value_gradient = Tensor::zeros([batch, heads, sequence, head_dim], &device);
 
     for start in (0..sequence).step_by(chunk_size) {
         let end = (start + chunk_size).min(sequence);
-        let rows = end - start;
         let query_chunk = query
             .clone()
             .slice([0..batch, 0..heads, start..end, 0..head_dim]);
@@ -294,9 +310,9 @@ where
                 .clone()
                 .slice([0..batch, 0..heads, start..end, 0..head_dim]);
         let mut scores = matmul_4(query_chunk.clone(), key_transposed.clone()) * scale;
-        if causal {
+        if let Some(mask) = causal_mask.as_ref() {
             scores = scores.mask_fill(
-                causal_chunk_mask(sequence, start, rows, &device),
+                mask.clone().slice([0..1, 0..1, start..end, 0..sequence]),
                 f32::NEG_INFINITY,
             );
         }
