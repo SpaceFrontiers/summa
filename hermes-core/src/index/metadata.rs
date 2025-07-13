@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use crate::dsl::{Schema, VectorIndexType};
@@ -276,8 +277,13 @@ impl IndexMetadata {
     ) -> Result<()> {
         let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
         let final_path = Path::new(INDEX_META_FILENAME);
-        dir.write(tmp_path, bytes).await.map_err(Error::Io)?;
-        dir.sync().await.map_err(Error::Io)?;
+        // Metadata is tiny, but `DirectoryWriter::write` does not guarantee
+        // the file contents themselves are fsynced. Finish the streaming
+        // writer first (filesystem implementations call `File::sync_all`),
+        // then atomically publish the durable temp file by rename.
+        let mut writer = dir.streaming_writer(tmp_path).await.map_err(Error::Io)?;
+        writer.write_all(bytes).map_err(Error::Io)?;
+        writer.finish().map_err(Error::Io)?;
         dir.rename(tmp_path, final_path).await.map_err(Error::Io)?;
         dir.sync().await.map_err(Error::Io)?;
         Ok(())

@@ -2,6 +2,179 @@ use crate::directories::RamDirectory;
 use crate::dsl::{Document, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
 
+/// Regression for the production lifecycle race: the optimizer's orphan
+/// sweep ran while indexing workers had finished files but had not yet
+/// published metadata. The sweep deleted those files and commit subsequently
+/// made their IDs live, producing endless ENOENT merge retries.
+#[tokio::test]
+async fn test_prepared_indexing_segments_are_protected_from_orphan_sweep() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        num_indexing_threads: 2,
+        ..Default::default()
+    };
+
+    let index = Index::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+
+    for i in 0..200 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("protected document {}", i));
+        writer.add_document(doc).unwrap();
+    }
+
+    let prepared = writer.prepare_commit().await.unwrap();
+    assert_eq!(
+        manager.cleanup_orphan_segments().await.unwrap(),
+        0,
+        "completed but uncommitted indexing outputs are active, not orphans"
+    );
+    prepared.commit().await.unwrap();
+
+    let reopened = Index::open(dir, config).await.unwrap();
+    assert_eq!(reopened.num_docs().await.unwrap(), 200);
+    assert!(!reopened.segment_readers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_aborted_indexing_segments_become_sweepable() {
+    use crate::directories::Directory;
+
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let index = Index::create(dir.clone(), schema_builder.build(), config)
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+
+    let mut doc = Document::new();
+    doc.add_text(title, "abort me");
+    writer.add_document(doc).unwrap();
+    let prepared = writer.prepare_commit().await.unwrap();
+    assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 0);
+    prepared.abort();
+
+    assert!(
+        manager.cleanup_orphan_segments().await.unwrap() >= 1,
+        "dropping prepared ownership on abort must expose the files to sweeping"
+    );
+    assert!(
+        dir.list_files(std::path::Path::new(""))
+            .await
+            .unwrap()
+            .iter()
+            .all(|path| !path.to_string_lossy().starts_with("seg_"))
+    );
+}
+
+#[tokio::test]
+async fn test_commit_refuses_to_publish_missing_segment_files() {
+    use crate::directories::{Directory, DirectoryWriter};
+
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let index = Index::create(dir.clone(), schema_builder.build(), config)
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+
+    let mut doc = Document::new();
+    doc.add_text(title, "must not become a dangling metadata entry");
+    writer.add_document(doc).unwrap();
+    let prepared = writer.prepare_commit().await.unwrap();
+
+    let meta_path = dir
+        .list_files(std::path::Path::new(""))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|path| path.to_string_lossy().ends_with(".meta"))
+        .expect("prepared segment metadata file");
+    dir.delete(&meta_path).await.unwrap();
+
+    let error = prepared.commit().await.unwrap_err();
+    assert!(
+        error.to_string().contains("cannot be published"),
+        "unexpected error: {error}"
+    );
+    assert!(manager.get_segment_ids().await.is_empty());
+
+    // The failed commit preserved prepared ownership for retry. Resolve it as
+    // an abort, then verify the remaining partial files are reclaimable.
+    writer.prepare_commit().await.unwrap().abort();
+    assert!(manager.cleanup_orphan_segments().await.unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn test_missing_merge_source_is_quarantined_instead_of_retried() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let no_merge = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+
+    let mut writer = IndexWriter::create(dir.clone(), schema, no_merge.clone())
+        .await
+        .unwrap();
+    for i in 0..3 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("segment {}", i));
+        writer.add_document(doc).unwrap();
+        writer.commit().await.unwrap();
+    }
+    let victim = writer.segment_manager().get_segment_ids().await[0].clone();
+    drop(writer);
+
+    crate::segment::delete_segment(&dir, crate::segment::SegmentId::from_hex(&victim).unwrap())
+        .await
+        .unwrap();
+
+    let merge_config = IndexConfig {
+        merge_policy: Box::new(crate::merge::TieredMergePolicy::aggressive()),
+        ..Default::default()
+    };
+    let writer = IndexWriter::open(dir, merge_config).await.unwrap();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    writer.maybe_merge().await;
+    manager.wait_for_all_merges().await;
+
+    assert!(
+        manager.is_segment_quarantined(&victim),
+        "a source that cannot open must be removed from merge eligibility"
+    );
+    assert!(
+        manager.get_segment_ids().await.contains(&victim),
+        "quarantine must be fail-safe and must not silently drop metadata/docs"
+    );
+
+    // Re-evaluation sees only two healthy segments, so it cannot respawn the
+    // same failing candidate or burn a merge slot in a tight loop.
+    writer.maybe_merge().await;
+    manager.wait_for_all_merges().await;
+}
+
 /// Multi-round merge: flush many small segments, merge, add more, merge again.
 /// Verifies search correctness (term + phrase queries) through multiple merge rounds.
 #[tokio::test]
