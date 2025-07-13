@@ -2689,7 +2689,7 @@ async fn test_bmp_block_posting_overflow_256() {
 
 /// Regression: the optimizer's reorder candidates are scanned long before the
 /// pass runs (hours behind under load). If a merge consumes the candidate in
-/// the meantime, the reorder must SKIP it — the inventory guard only covers
+/// the meantime, the reorder must SKIP it — operation ownership only covers
 /// concurrent work, not stale candidates. Before the fix, a stale reorder of
 /// a merged-away segment (files still on disk, held by a searcher snapshot)
 /// succeeded and re-inserted a duplicate copy of its docs next to the merge

@@ -1,7 +1,7 @@
 //! Segment types and metadata
 
 use std::io::{self, Cursor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rustc_hash::FxHashMap;
@@ -170,11 +170,6 @@ pub struct SegmentFiles {
     pub vectors: PathBuf,
     /// Sparse vector posting lists (per field, per dimension)
     pub sparse: PathBuf,
-    /// Temporary sparse skip table used while streaming large merges.
-    ///
-    /// This is segment-scoped so abort and orphan cleanup must treat it as
-    /// part of the segment lifecycle, even though readers never open it.
-    pub sparse_skip_temp: PathBuf,
     /// Token positions for phrase queries (fields with record_positions=true)
     pub positions: PathBuf,
     /// Fast-field columnar storage for O(1) doc→value access
@@ -191,9 +186,41 @@ impl SegmentFiles {
             meta: PathBuf::from(format!("{}.meta", prefix)),
             vectors: PathBuf::from(format!("{}.vectors", prefix)),
             sparse: PathBuf::from(format!("{}.sparse", prefix)),
-            sparse_skip_temp: PathBuf::from(format!("{}.skip.tmp", prefix)),
             positions: PathBuf::from(format!("{}.pos", prefix)),
             fast: PathBuf::from(format!("{}.fast", prefix)),
         }
+    }
+
+    /// Files every readable segment must contain.
+    pub(crate) fn mandatory_paths(&self) -> [&Path; 4] {
+        [
+            self.meta.as_path(),
+            self.term_dict.as_path(),
+            self.postings.as_path(),
+            self.store.as_path(),
+        ]
+    }
+
+    /// Temporary sparse skip table used while streaming large merges.
+    ///
+    /// Readers never open it, but abort and orphan cleanup must treat it as a
+    /// segment-owned artifact.
+    pub(crate) fn sparse_skip_temp(&self) -> PathBuf {
+        self.sparse.with_extension("skip.tmp")
+    }
+
+    /// Every permanent or temporary path owned by this segment ID.
+    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 9] {
+        [
+            self.term_dict.clone(),
+            self.postings.clone(),
+            self.store.clone(),
+            self.meta.clone(),
+            self.vectors.clone(),
+            self.sparse.clone(),
+            self.sparse_skip_temp(),
+            self.positions.clone(),
+            self.fast.clone(),
+        ]
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Architecture:
 //! - **Single mutation queue**: All metadata mutations serialize through `tokio::sync::Mutex<ManagerState>`.
-//! - **Active-operation inventory**: Every segment that is being built, merged,
+//! - **Active-operation ownership**: Every segment that is being built, merged,
 //!   or reordered is registered before its first file is written and remains
 //!   registered until it is either published in metadata or abandoned.
 //! - **Concurrent merges**: Multiple non-overlapping merges can run in parallel.
@@ -80,7 +80,7 @@ impl ActiveSegmentOperations {
     /// if any requested ID is already owned by another active operation.
     fn try_register(self: &Arc<Self>, segment_ids: Vec<String>) -> Option<SegmentOperationGuard> {
         let mut inner = self.inner.lock();
-        // Check for overlap with any active merge
+        // Check for overlap with any active lifecycle operation.
         for id in &segment_ids {
             if inner.contains(id) {
                 log::debug!(
@@ -100,7 +100,7 @@ impl ActiveSegmentOperations {
             inner.insert(id.clone());
         }
         Some(SegmentOperationGuard {
-            inventory: Arc::clone(self),
+            active_operations: Arc::clone(self),
             segment_ids,
         })
     }
@@ -120,13 +120,13 @@ impl ActiveSegmentOperations {
 /// Dropping on success, error, cancellation, or panic makes abandoned outputs
 /// eligible for sweeping automatically.
 pub(crate) struct SegmentOperationGuard {
-    inventory: Arc<ActiveSegmentOperations>,
+    active_operations: Arc<ActiveSegmentOperations>,
     segment_ids: Vec<String>,
 }
 
 impl Drop for SegmentOperationGuard {
     fn drop(&mut self) {
-        let mut inner = self.inventory.inner.lock();
+        let mut inner = self.active_operations.inner.lock();
         for id in &self.segment_ids {
             inner.remove(id);
         }
@@ -406,6 +406,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         })?;
         let files = SegmentFiles::new(id.0);
 
+        for path in files.mandatory_paths() {
+            if !self.directory.exists(path).await.map_err(Error::Io)? {
+                return Err(Error::Corruption(format!(
+                    "segment {} cannot be published: mandatory file {:?} is missing",
+                    segment_id, path
+                )));
+            }
+        }
+
         let meta_slice = self.directory.open_read(&files.meta).await.map_err(|e| {
             Error::Corruption(format!(
                 "segment {} cannot be published: missing/unreadable {:?}: {}",
@@ -433,15 +442,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )));
         }
 
-        for path in [&files.term_dict, &files.postings, &files.store] {
-            if !self.directory.exists(path).await.map_err(Error::Io)? {
-                return Err(Error::Corruption(format!(
-                    "segment {} cannot be published: mandatory file {:?} is missing",
-                    segment_id, path
-                )));
-            }
-        }
-
         Ok(())
     }
 
@@ -453,7 +453,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         if inserted {
             log::error!(
                 "[merge] quarantined metadata-live segment {} after open/validation failure: {}. \
-                 It will remain searchable but excluded from merges until repaired or restart",
+                 It remains metadata-live for explicit repair but is excluded from merges until restart",
                 segment_id,
                 error,
             );
@@ -489,9 +489,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Delete a failed output only if metadata did not make it live.
     ///
-    /// `replace_segments` can fail while saving metadata. Rechecking under
-    /// `state` prevents cleanup from deleting an output that the in-memory
-    /// metadata already committed despite the reported I/O error.
+    /// Rechecking under `state` also makes unwind cleanup safe if it races
+    /// successful publication of the same output.
     async fn delete_output_if_unregistered(&self, output_id: SegmentId, reason: &str) {
         let output_hex = output_id.to_hex();
         let st = self.state.lock().await;
@@ -638,7 +637,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ///
     /// **Atomicity**: The entire filter → find_merges → spawn_merge sequence runs
     /// under the `state` lock to prevent a TOCTOU race where concurrent callers
-    /// both see segments as eligible before either registers them in the inventory.
+    /// both see segments as eligible before either claims operation ownership.
     /// `spawn_merge` is non-blocking (just `try_register` + `tokio::spawn`), so
     /// holding the state lock through it is safe and sub-microsecond.
     ///
@@ -711,7 +710,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             }
             handles
-            // state lock released here — after spawn_merge registered IDs in inventory
+            // State lock released after spawn_merge claimed operation ownership.
         };
 
         if !new_handles.is_empty() {
@@ -737,7 +736,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let guard = match self.active_operations.try_register(all_ids) {
             Some(g) => g,
             None => {
-                log::debug!("[spawn_merge] skipped: segments overlap with active merge");
+                log::debug!("[spawn_merge] skipped: segments overlap with an active operation");
                 return None;
             }
         };
@@ -809,17 +808,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     } else {
                         sm.pause_merge_retries(&error);
                     }
-                    // Delete whatever the failed merge wrote — partial
-                    // outputs are invisible to metadata and leak disk.
-                    if let Err(delete_error) =
-                        crate::segment::delete_segment(sm.directory.as_ref(), output_id).await
-                    {
-                        log::warn!(
-                            "[segment_cleanup] failed deleting merge output {}: {}",
-                            output_id.to_hex(),
-                            delete_error,
-                        );
-                    }
+                    sm.delete_output_if_unregistered(output_id, "merge failure")
+                        .await;
                     output_cleanup.disarm();
                 }
             }
@@ -850,7 +840,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let ready_to_delete = {
             let mut st = self.state.lock().await;
-            // Every source must still be live: callers hold the inventory
+            // Every source must still be live: callers hold operation ownership,
             // guard, so a missing source means a stale merge/reorder whose
             // input was already replaced — adding the output would duplicate
             // its documents. The orphaned output files are swept by
@@ -957,7 +947,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // large CPU/IO spike before it can be quarantined.
         for (id_str, id) in segment_ids_to_merge.iter().zip(&segment_ids) {
             let files = SegmentFiles::new(id.0);
-            for path in [&files.meta, &files.term_dict, &files.postings, &files.store] {
+            for path in files.mandatory_paths() {
                 let exists = directory
                     .exists(path)
                     .await
@@ -1049,7 +1039,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let bp_converged = merge_stats.bp_converged;
         if !bp_converged {
             log::info!(
-                "[merge] merge-time BP hit its wall-clock budget — output marked unconverged;                  the background optimizer deepens it later",
+                "[merge] merge-time BP hit its wall-clock budget — output marked unconverged; \
+                 the background optimizer deepens it later",
             );
         }
 
@@ -1070,8 +1061,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok((output_hex, total_docs as u32, bp_converged))
     }
 
-    /// Abort all in-flight merge tasks without waiting for completion.
-    /// Used during index deletion to stop background work immediately.
+    /// Cancel all in-flight merge tasks and wait for their guards to unwind.
+    /// Used during index deletion so no writer can outlive directory removal.
     pub async fn abort_merges(&self) {
         let handles: Vec<JoinHandle<()>> =
             { std::mem::take(&mut *self.merge_handles.lock().await) };
@@ -1227,16 +1218,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     if let Some(segment_id) = unavailable_segment {
                         self.quarantine_segment(&segment_id, &error);
                     }
-                    // Delete the failed merge's partial output.
-                    if let Err(delete_error) =
-                        crate::segment::delete_segment(self.directory.as_ref(), output_id).await
-                    {
-                        log::warn!(
-                            "[segment_cleanup] failed deleting force-merge output {}: {}",
-                            output_id.to_hex(),
-                            delete_error,
-                        );
-                    }
+                    self.delete_output_if_unregistered(output_id, "force-merge failure")
+                        .await;
                     output_cleanup.disarm();
                     return Err(error);
                 }
@@ -1259,7 +1242,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
             output_cleanup.disarm();
 
-            // _guard drops here → segments unregistered from inventory
+            // _guard drops here, releasing operation ownership.
         }
     }
 
@@ -1268,7 +1251,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Each segment is individually rebuilt with reordered BMP blocks.
     /// Non-BMP fields are copied unchanged via streaming file copy.
     ///
-    /// Uses the active-operation inventory to prevent concurrent operations on the same segment.
+    /// Uses active-operation ownership to prevent concurrent work on the same segment.
     pub async fn reorder_segments(self: &Arc<Self>) -> Result<()> {
         self.wait_for_all_merges().await;
         let segment_ids = self.get_segment_ids().await;
@@ -1300,13 +1283,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Excludes segments currently involved in a merge or reorder operation
     /// to avoid wasted work (the optimizer would skip them anyway).
     pub async fn unreordered_segment_ids(&self) -> Vec<String> {
-        let st = self.state.lock().await;
-        let in_merge = self.active_operations.snapshot();
-        st.metadata
-            .segment_metas
-            .iter()
-            .filter(|(id, info)| !info.reordered && !in_merge.contains(*id))
-            .map(|(id, _)| id.clone())
+        self.unreordered_segments()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -1314,11 +1294,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// a size-appropriate BP budget.
     pub async fn unreordered_segments(&self) -> Vec<(String, u32)> {
         let st = self.state.lock().await;
-        let in_merge = self.active_operations.snapshot();
+        let active_ids = self.active_operations.snapshot();
         st.metadata
             .segment_metas
             .iter()
-            .filter(|(id, info)| !info.reordered && !in_merge.contains(*id))
+            .filter(|(id, info)| !info.reordered && !active_ids.contains(*id))
             .map(|(id, info)| (id.clone(), info.num_docs))
             .collect()
     }
@@ -1328,11 +1308,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// ordering; the optimizer revisits these at low priority.
     pub async fn unconverged_segments(&self) -> Vec<(String, u32)> {
         let st = self.state.lock().await;
-        let in_merge = self.active_operations.snapshot();
+        let active_ids = self.active_operations.snapshot();
         st.metadata
             .segment_metas
             .iter()
-            .filter(|(id, info)| info.reordered && !info.bp_converged && !in_merge.contains(*id))
+            .filter(|(id, info)| info.reordered && !info.bp_converged && !active_ids.contains(*id))
             .map(|(id, info)| (id.clone(), info.num_docs))
             .collect()
     }
@@ -1367,7 +1347,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Reorder a single segment via BP. Returns Ok(true) if reordered, Ok(false) if skipped.
     ///
-    /// Non-blocking: uses merge inventory to prevent conflicts with background merges.
+    /// Non-blocking: operation ownership prevents conflicts with background merges.
     /// Copies unchanged files and rebuilds only the sparse file with reordered BMP data.
     pub async fn reorder_single_segment(
         self: &Arc<Self>,
@@ -1424,19 +1404,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let (new_id, total_docs, bp_converged) = match reorder_result {
             Ok(v) => v,
             Err(e) => {
-                // A failed pass may have copied tens of GB of files before
-                // dying (panicked BP passes leaked 1.7 TB of partial outputs
-                // overnight in production) — delete the output before
-                // propagating.
-                if let Err(delete_error) =
-                    crate::segment::delete_segment(self.directory.as_ref(), output_id).await
-                {
-                    log::warn!(
-                        "[segment_cleanup] failed deleting reorder output {}: {}",
-                        output_id.to_hex(),
-                        delete_error,
-                    );
-                }
+                // A failed pass may have copied tens of GB before dying;
+                // delete the uncommitted output before propagating.
+                self.delete_output_if_unregistered(output_id, "reorder failure")
+                    .await;
                 output_cleanup.disarm();
                 return Err(e);
             }
@@ -1571,51 +1542,46 @@ mod tests {
     }
 
     #[test]
-    fn test_inventory_guard_drop_unregisters() {
-        let inv = Arc::new(ActiveSegmentOperations::new());
+    fn test_active_operation_guard_releases_ownership() {
+        let active = Arc::new(ActiveSegmentOperations::new());
         {
-            let _guard = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
-            let snap = inv.snapshot();
+            let _guard = active.try_register(vec!["a".into(), "b".into()]).unwrap();
+            let snap = active.snapshot();
             assert!(snap.contains("a"));
             assert!(snap.contains("b"));
         }
-        // Guard dropped → segments unregistered
-        assert!(inv.snapshot().is_empty());
+        assert!(active.snapshot().is_empty());
     }
 
     #[test]
-    fn test_inventory_concurrent_non_overlapping_merges() {
-        let inv = Arc::new(ActiveSegmentOperations::new());
-        let _g1 = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
-        // Non-overlapping merge succeeds concurrently
-        let _g2 = inv.try_register(vec!["c".into(), "d".into()]).unwrap();
-        let snap = inv.snapshot();
+    fn test_non_overlapping_operations_can_run_concurrently() {
+        let active = Arc::new(ActiveSegmentOperations::new());
+        let first = active.try_register(vec!["a".into(), "b".into()]).unwrap();
+        let _second = active.try_register(vec!["c".into(), "d".into()]).unwrap();
+        let snap = active.snapshot();
         assert_eq!(snap.len(), 4);
 
-        // Drop first guard — only its segments are removed
-        drop(_g1);
-        let snap = inv.snapshot();
+        drop(first);
+        let snap = active.snapshot();
         assert_eq!(snap.len(), 2);
         assert!(snap.contains("c"));
         assert!(snap.contains("d"));
     }
 
     #[test]
-    fn test_inventory_overlapping_merge_rejected() {
-        let inv = Arc::new(ActiveSegmentOperations::new());
-        let _g1 = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
-        // Overlapping merge rejected (shares "b")
-        assert!(inv.try_register(vec!["b".into(), "c".into()]).is_none());
-        // After drop, the overlapping merge succeeds
-        drop(_g1);
-        assert!(inv.try_register(vec!["b".into(), "c".into()]).is_some());
+    fn test_overlapping_operation_is_rejected_until_release() {
+        let active = Arc::new(ActiveSegmentOperations::new());
+        let first = active.try_register(vec!["a".into(), "b".into()]).unwrap();
+        assert!(active.try_register(vec!["b".into(), "c".into()]).is_none());
+        drop(first);
+        assert!(active.try_register(vec!["b".into(), "c".into()]).is_some());
     }
 
     #[test]
-    fn test_inventory_snapshot() {
-        let inv = Arc::new(ActiveSegmentOperations::new());
-        let _g = inv.try_register(vec!["x".into(), "y".into()]).unwrap();
-        let snap = inv.snapshot();
+    fn test_active_operation_snapshot() {
+        let active = Arc::new(ActiveSegmentOperations::new());
+        let _guard = active.try_register(vec!["x".into(), "y".into()]).unwrap();
+        let snap = active.snapshot();
         assert!(snap.contains("x"));
         assert!(snap.contains("y"));
         assert!(!snap.contains("z"));
