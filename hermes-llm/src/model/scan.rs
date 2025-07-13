@@ -740,8 +740,10 @@ mod gpu {
         let a_index = channel * state_dim + n;
         let shared_index = n * BACKWARD_CHANNELS + local_channel;
         let shared_len = BACKWARD_CHANNELS * state_dim;
-        let mut grad_dt_shared = Shared::new_slice(shared_len);
-        let mut grad_x_shared = Shared::new_slice(shared_len);
+        // Ping-pong buffers avoid a second barrier; the intervening step's
+        // barrier completes before either buffer is reused.
+        let mut grad_dt_shared = Shared::new_slice(2 * shared_len);
+        let mut grad_x_shared = Shared::new_slice(2 * shared_len);
         let mut adjoint = 0.0f32;
         let mut grad_a_local = 0.0f32;
         let mut grad_d_local = 0.0f32;
@@ -773,8 +775,9 @@ mod gpu {
                 0.0f32
             };
             let g = adjoint + dy * cv;
-            grad_dt_shared[shared_index] = g * (h_prev * alpha * av + bv * x);
-            grad_x_shared[shared_index] = g * dt * bv;
+            let shared_offset = (step % 2) * shared_len;
+            grad_dt_shared[shared_offset + shared_index] = g * (h_prev * alpha * av + bv * x);
+            grad_x_shared[shared_offset + shared_index] = g * dt * bv;
             let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
             let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
             sync_cube();
@@ -783,7 +786,7 @@ mod gpu {
                 let mut grad_dt = 0.0f32;
                 let mut grad_x = 0.0f32;
                 for state in 0..state_dim {
-                    let index = state * BACKWARD_CHANNELS + local_channel;
+                    let index = shared_offset + state * BACKWARD_CHANNELS + local_channel;
                     grad_dt += grad_dt_shared[index];
                     grad_x += grad_x_shared[index];
                 }
@@ -797,7 +800,6 @@ mod gpu {
             }
             grad_a_local += g * h_prev * alpha * dt;
             adjoint = g * alpha;
-            sync_cube();
         }
 
         if active {
