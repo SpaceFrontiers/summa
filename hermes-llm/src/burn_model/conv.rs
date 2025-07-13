@@ -156,6 +156,7 @@ mod gpu {
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
     use super::{DepthwiseConv1dBackend, DepthwiseConv1dGradients};
+    use crate::burn_model::cube_tensor::{empty_like, into_contiguous};
 
     const ELEMENTWISE_THREADS: u32 = 256;
     const REDUCTION_THREADS: u32 = 32;
@@ -268,19 +269,6 @@ mod gpu {
         }
     }
 
-    fn contiguous<R: CubeRuntime>(tensor: CubeTensor<R>) -> CubeTensor<R> {
-        burn_cubecl::kernel::into_contiguous(tensor)
-    }
-
-    fn empty<R: CubeRuntime>(like: &CubeTensor<R>, shape: Shape) -> CubeTensor<R> {
-        burn_cubecl::ops::numeric::empty_device_contiguous_dtype(
-            like.client.clone(),
-            like.device.clone(),
-            shape,
-            like.dtype,
-        )
-    }
-
     impl<R, I, BT> DepthwiseConv1dBackend for CubeBackend<R, f32, I, BT>
     where
         R: CubeRuntime,
@@ -298,10 +286,10 @@ mod gpu {
             assert_eq!(group_channels, 1);
             assert!(input_len >= kernel_size);
             let output_len = input_len - kernel_size + 1;
-            let input = contiguous(input);
-            let weight = contiguous(weight);
-            let bias = contiguous(bias);
-            let output = empty(&input, Shape::new([batch, channels, output_len]));
+            let input = into_contiguous(input);
+            let weight = into_contiguous(weight);
+            let bias = into_contiguous(bias);
+            let output = empty_like(&input, Shape::new([batch, channels, output_len]));
             let total = (batch * channels * output_len) as u32;
             let client = input.client.clone();
             depthwise_conv1d_forward::launch::<R>(
@@ -329,12 +317,12 @@ mod gpu {
             let [_, _, kernel_size] = weight.meta.shape.dims();
             let [_, _, output_len] = grad.meta.shape.dims();
             assert_eq!(output_len, input_len - kernel_size + 1);
-            let input = contiguous(input);
-            let weight = contiguous(weight);
-            let grad = contiguous(grad);
-            let grad_input = empty(&input, Shape::new([batch, channels, input_len]));
-            let grad_weight = empty(&weight, Shape::new([channels, 1, kernel_size]));
-            let grad_bias = empty(&weight, Shape::new([channels]));
+            let input = into_contiguous(input);
+            let weight = into_contiguous(weight);
+            let grad = into_contiguous(grad);
+            let grad_input = empty_like(&input, Shape::new([batch, channels, input_len]));
+            let grad_weight = empty_like(&weight, Shape::new([channels, 1, kernel_size]));
+            let grad_bias = empty_like(&weight, Shape::new([channels]));
             let client = input.client.clone();
 
             let input_total = (batch * channels * input_len) as u32;
@@ -382,19 +370,7 @@ mod tests {
     use burn_wgpu::Wgpu;
 
     use super::depthwise_conv1d;
-
-    fn values(len: usize, scale: f32) -> Vec<f32> {
-        (0..len).map(|i| (i as f32 * scale).sin() * 0.25).collect()
-    }
-
-    fn max_diff(lhs: TensorData, rhs: TensorData) -> f32 {
-        lhs.to_vec::<f32>()
-            .unwrap()
-            .into_iter()
-            .zip(rhs.to_vec::<f32>().unwrap())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
-    }
+    use crate::burn_model::test_support::{max_diff, values};
 
     #[test]
     fn fused_depthwise_conv1d_matches_ndarray_forward_and_backward() {
@@ -404,10 +380,10 @@ mod tests {
         let gpu = Default::default();
         let (batch, channels, input_len, kernel_size) = (2, 3, 7, 3);
         let output_len = input_len - kernel_size + 1;
-        let input_data = values(batch * channels * input_len, 0.13);
-        let weight_data = values(channels * kernel_size, 0.19);
-        let bias_data = values(channels, 0.23);
-        let output_weights = values(batch * channels * output_len, 0.29);
+        let input_data = values(batch * channels * input_len, 0.13, 0.0);
+        let weight_data = values(channels * kernel_size, 0.19, 0.0);
+        let bias_data = values(channels, 0.23, 0.0);
+        let output_weights = values(batch * channels * output_len, 0.29, 0.0);
 
         macro_rules! run {
             ($backend:ty, $device:expr) => {{

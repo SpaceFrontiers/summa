@@ -66,33 +66,41 @@ impl<B: MambaBackend> TransformerBlock<B> {
         }
     }
 
+    fn forward_with_mixer(
+        &self,
+        x: Tensor<B, 3>,
+        mut mix: impl FnMut(Tensor<B, 3>) -> Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        let x = match self.norm_position {
+            NormPosition::Pre => {
+                let branch = mix(self.attn_norm.forward(x.clone()));
+                self.residual(x, branch)
+            }
+            NormPosition::Post => {
+                let branch = mix(x.clone());
+                self.attn_norm.forward(self.residual(x, branch))
+            }
+        };
+
+        match self.norm_position {
+            NormPosition::Pre => {
+                let branch = self.feed_forward.forward(self.ffn_norm.forward(x.clone()));
+                self.residual(x, branch)
+            }
+            NormPosition::Post => {
+                let branch = self.feed_forward.forward(x.clone());
+                self.ffn_norm.forward(self.residual(x, branch))
+            }
+        }
+    }
+
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
         rope: &RotaryEncoding<B>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
-        let x = match self.norm_position {
-            NormPosition::Pre => {
-                let h = self.mix(self.attn_norm.forward(x.clone()), rope, start_pos);
-                self.residual(x, h)
-            }
-            NormPosition::Post => {
-                let h = self.mix(x.clone(), rope, start_pos);
-                self.attn_norm.forward(self.residual(x, h))
-            }
-        };
-
-        match self.norm_position {
-            NormPosition::Pre => {
-                let h = self.feed_forward.forward(self.ffn_norm.forward(x.clone()));
-                self.residual(x, h)
-            }
-            NormPosition::Post => {
-                let h = self.feed_forward.forward(x.clone());
-                self.ffn_norm.forward(self.residual(x, h))
-            }
-        }
+        self.forward_with_mixer(x, |x| self.mix(x, rope, start_pos))
     }
 
     pub fn make_state(&self, batch: usize, device: &Device<B>) -> LayerState<B> {
@@ -110,39 +118,13 @@ impl<B: MambaBackend> TransformerBlock<B> {
         start_pos: usize,
         state: &mut LayerState<B>,
     ) -> Tensor<B, 3> {
-        let mix = |h: Tensor<B, 3>, state: &mut LayerState<B>| match (
-            &self.attention,
-            &self.ssm,
-            state,
-        ) {
+        self.forward_with_mixer(x, |x| match (&self.attention, &self.ssm, &mut *state) {
             (Some(attention), None, LayerState::Attn(cache)) => {
-                attention.forward_cached(h, rope, start_pos, cache)
+                attention.forward_cached(x, rope, start_pos, cache)
             }
-            (None, Some(ssm), LayerState::Mamba(mamba)) => ssm.forward_with_state(h, Some(mamba)),
+            (None, Some(ssm), LayerState::Mamba(mamba)) => ssm.forward_with_state(x, Some(mamba)),
             _ => panic!("layer state type does not match the configured mixer type"),
-        };
-
-        let x = match self.norm_position {
-            NormPosition::Pre => {
-                let h = mix(self.attn_norm.forward(x.clone()), state);
-                self.residual(x, h)
-            }
-            NormPosition::Post => {
-                let h = mix(x.clone(), state);
-                self.attn_norm.forward(self.residual(x, h))
-            }
-        };
-
-        match self.norm_position {
-            NormPosition::Pre => {
-                let h = self.feed_forward.forward(self.ffn_norm.forward(x.clone()));
-                self.residual(x, h)
-            }
-            NormPosition::Post => {
-                let h = self.feed_forward.forward(x.clone());
-                self.ffn_norm.forward(self.residual(x, h))
-            }
-        }
+        })
     }
 }
 

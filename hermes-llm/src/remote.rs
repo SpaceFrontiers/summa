@@ -82,8 +82,8 @@ mod imp {
             return Ok(dest);
         }
         tracing::info!("downloading {} …", uri);
-        // Atomic publish: write to a temp sibling then rename, so a concurrent
-        // or interrupted run never observes a partial cache file.
+        // Publish only after the complete object has been written and synced, so
+        // an interrupted run never exposes a partial cache file.
         let tmp = dest.with_extension("part");
         let size = download(uri, &tmp)?;
         std::fs::rename(&tmp, &dest)
@@ -146,22 +146,23 @@ pub use imp::resolve;
 /// The remote scheme of `uri` (`s3`, `gs`, `http`, `https`), or `None` for a
 /// local path or `file://`. Bare Windows drive letters (`C:\…`) are local.
 fn remote_scheme(uri: &str) -> Option<&'static str> {
-    let lower = uri.to_ascii_lowercase();
-    for scheme in ["s3://", "gs://", "gcs://", "http://", "https://"] {
-        if lower.starts_with(scheme) {
-            return Some(match scheme {
-                "s3://" => "s3",
-                "gs://" | "gcs://" => "gs",
-                "http://" => "http",
-                _ => "https",
-            });
-        }
-    }
-    None
+    [
+        ("s3://", "s3"),
+        ("gs://", "gs"),
+        ("gcs://", "gs"),
+        ("http://", "http"),
+        ("https://", "https"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, scheme)| {
+        uri.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            .then_some(scheme)
+    })
 }
 
-fn strip_file_scheme(uri: &str) -> String {
-    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+fn strip_file_scheme(uri: &str) -> &str {
+    uri.strip_prefix("file://").unwrap_or(uri)
 }
 
 #[cfg(test)]

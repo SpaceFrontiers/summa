@@ -15,11 +15,6 @@ const NS_COEFFICIENTS: (f64, f64, f64) = (3.4445, -4.775, 2.0315);
 const NS_STEPS: usize = 5;
 const EPSILON: f64 = 1e-7;
 
-struct GroupState {
-    ids: Vec<ParamId>,
-    velocity: Tensor<Backend, 3>,
-}
-
 /// Muon with Burn's update and hyperparameters, batched by matrix shape.
 ///
 /// Burn's generic optimizer visits every parameter separately. Transformer
@@ -29,14 +24,14 @@ struct GroupState {
 /// compute dtype, while parameters and momentum remain FP32.
 pub struct BatchedMuon {
     parameter_ids: Vec<ParamId>,
-    groups: BTreeMap<[usize; 2], GroupState>,
+    velocities: BTreeMap<[usize; 2], Tensor<Backend, 3>>,
 }
 
 impl BatchedMuon {
     pub fn new(parameter_ids: Vec<ParamId>) -> Self {
         Self {
             parameter_ids,
-            groups: BTreeMap::new(),
+            velocities: BTreeMap::new(),
         }
     }
 
@@ -61,21 +56,11 @@ impl BatchedMuon {
 
         let mut updates = GradientsParams::new();
         for (shape, batch) in batches {
-            let ids = batch.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-            let gradients = batch
-                .into_iter()
-                .map(|(_, gradient)| gradient)
-                .collect::<Vec<_>>();
+            let (ids, gradients): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
             let gradients = Tensor::stack::<3>(gradients, 0);
 
-            let velocity = match self.groups.remove(&shape) {
-                Some(state) => {
-                    ensure!(
-                        state.ids == ids,
-                        "Muon parameter order changed for shape {shape:?}"
-                    );
-                    gradients.clone() + state.velocity.mul_scalar(MOMENTUM)
-                }
+            let velocity = match self.velocities.remove(&shape) {
+                Some(velocity) => gradients.clone() + velocity.mul_scalar(MOMENTUM),
                 None => gradients.clone(),
             };
             let momentum_update = velocity.clone().mul_scalar(MOMENTUM) + gradients;
@@ -83,18 +68,18 @@ impl BatchedMuon {
             let adjusted_lr = lr * ((shape[0] as f64 / shape[1] as f64).max(1.0)).sqrt();
             let deltas = orthogonal.mul_scalar(adjusted_lr);
 
-            for (index, id) in ids.iter().enumerate() {
+            for (index, id) in ids.into_iter().enumerate() {
                 let delta = deltas
                     .clone()
                     .slice([index..index + 1, 0..shape[0], 0..shape[1]])
                     .reshape(shape);
-                updates.register::<Backend, 2>(*id, delta);
+                updates.register::<Backend, 2>(id, delta);
             }
-            self.groups.insert(shape, GroupState { ids, velocity });
+            self.velocities.insert(shape, velocity);
         }
 
         ensure!(
-            !self.groups.is_empty(),
+            !self.velocities.is_empty(),
             "Muon has no matrix groups to optimize"
         );
         let mut mapper = MuonUpdateMapper {

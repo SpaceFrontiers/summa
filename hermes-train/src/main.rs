@@ -279,6 +279,15 @@ impl ModuleVisitor<TrainBackend> for SquaredGradientNorm<'_> {
     }
 }
 
+fn squared_gradient_norm(
+    model: &Transformer<TrainBackend>,
+    grads: &GradientsParams,
+) -> Option<Tensor<Backend, 1>> {
+    let mut visitor = SquaredGradientNorm { grads, sum: None };
+    model.visit(&mut visitor);
+    visitor.sum
+}
+
 struct GradientScaler<'a> {
     grads: &'a mut GradientsParams,
     scale: f32,
@@ -294,23 +303,20 @@ impl ModuleVisitor<TrainBackend> for GradientScaler<'_> {
     }
 }
 
+fn scale_gradients(model: &Transformer<TrainBackend>, grads: &mut GradientsParams, scale: f32) {
+    model.visit(&mut GradientScaler { grads, scale });
+}
+
 fn gradient_norm_and_clip(
     model: &Transformer<TrainBackend>,
     muon_grads: &mut GradientsParams,
     adamw_grads: &mut GradientsParams,
     max_norm: f32,
 ) -> Result<f32> {
-    let mut muon_norm = SquaredGradientNorm {
-        grads: muon_grads,
-        sum: None,
-    };
-    model.visit(&mut muon_norm);
-    let mut adamw_norm = SquaredGradientNorm {
-        grads: adamw_grads,
-        sum: None,
-    };
-    model.visit(&mut adamw_norm);
-    let sum = match (muon_norm.sum, adamw_norm.sum) {
+    let sum = match (
+        squared_gradient_norm(model, muon_grads),
+        squared_gradient_norm(model, adamw_grads),
+    ) {
         (Some(muon), Some(adamw)) => muon + adamw,
         (Some(sum), None) | (None, Some(sum)) => sum,
         (None, None) => return Ok(0.0),
@@ -318,14 +324,8 @@ fn gradient_norm_and_clip(
     let norm = sum.sqrt().into_data().to_vec::<f32>()?[0];
     if max_norm > 0.0 && norm > max_norm {
         let scale = max_norm / norm;
-        model.visit(&mut GradientScaler {
-            grads: muon_grads,
-            scale,
-        });
-        model.visit(&mut GradientScaler {
-            grads: adamw_grads,
-            scale,
-        });
+        scale_gradients(model, muon_grads, scale);
+        scale_gradients(model, adamw_grads, scale);
     }
     Ok(norm)
 }

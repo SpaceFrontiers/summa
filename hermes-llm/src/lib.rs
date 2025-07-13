@@ -10,9 +10,8 @@
 //! - **Tokenization**: HuggingFace `tokenizer.json` loading
 //! - **Export**: MAL → JSON model config
 //!
-//! Checkpoints are Burn-native safetensors with a single tensor-naming contract
-//! (`embedding.*`, `layers.{i}.attention.*`, `layers.{i}.feed_forward.*`,
-//! `final_norm.*`, `lm_head.*`) shared with `hermes-train`.
+//! Checkpoints are Burn-native safetensors written directly from the same
+//! [`Transformer`] module tree used by `hermes-train`, with no conversion layer.
 //!
 //! ## Quick Start
 //!
