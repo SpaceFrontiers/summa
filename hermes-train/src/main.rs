@@ -1,12 +1,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::{AutodiffModule, Module, ModuleVisitor, Param, ParamId};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::backend::Backend as _;
-use burn::tensor::{Device, Int, Tensor, TensorData};
+use burn::tensor::{Device, ElementConversion, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
 use burn_optim::adaptor::OptimizerAdaptor;
 use burn_optim::record::AdaptorRecord;
@@ -31,7 +32,7 @@ const MUON_LR_SCALE: f64 = 20.0;
 const TOKENIZE_BATCH: usize = 1_000;
 
 #[derive(Parser)]
-#[command(name = "hermes-train", about = "Burn-native Hermes model training")]
+#[command(name = "hermes-train", about = "Hermes model training")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -88,7 +89,7 @@ struct TrainArgs {
     /// Atomically replace weights.safetensors every N optimizer steps; 0 disables it.
     #[arg(long, default_value_t = 100)]
     checkpoint_every: usize,
-    /// Burn-native checkpoint to fine-tune from.
+    /// Safetensors checkpoint to fine-tune from.
     #[arg(long, conflicts_with = "resume")]
     checkpoint: Option<PathBuf>,
     /// Resume weights, optimizer state, schedule, and corpus position from --output.
@@ -408,13 +409,17 @@ fn gradient_norm_and_clip(
         (Some(sum), None) | (None, Some(sum)) => sum,
         (None, None) => return Ok(0.0),
     };
-    let norm = sum.sqrt().into_data().to_vec::<f32>()?[0];
+    let norm = scalar_value(sum.sqrt())?;
     if max_norm > 0.0 && norm > max_norm {
         let scale = max_norm / norm;
         scale_gradients(model, muon_grads, scale);
         scale_gradients(model, adamw_grads, scale);
     }
     Ok(norm)
+}
+
+fn scalar_value<B: burn::tensor::backend::Backend>(tensor: Tensor<B, 1>) -> Result<f32> {
+    Ok(tensor.into_data().to_vec::<B::FloatElem>()?[0].elem())
 }
 
 fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
@@ -434,7 +439,7 @@ fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
     min_lr + cosine * (args.lr - min_lr)
 }
 
-fn save_weights<B: hermes_llm::MambaBackend>(model: &Transformer<B>, output: &Path) -> Result<()> {
+fn save_weights<B: hermes_llm::ModelBackend>(model: &Transformer<B>, output: &Path) -> Result<()> {
     let temporary = output.join("weights.safetensors.tmp");
     save_safetensors(model, &temporary)?;
     fs::rename(temporary, output.join("weights.safetensors"))?;
@@ -622,7 +627,8 @@ fn train(args: TrainArgs) -> Result<()> {
     let mut model = Some(initial_model);
     let mut step = resume_state.as_ref().map_or(0, |state| state.step);
     let mut micro_step = 0;
-    let mut loss_sum = 0.0f32;
+    let mut loss_sum: Option<Tensor<TrainBackend, 1>> = None;
+    let mut optimizer_step_started = Instant::now();
     let mut training_state = resume_state.clone().unwrap_or(TrainingState {
         step: 0,
         stage: 0,
@@ -697,14 +703,15 @@ fn train(args: TrainArgs) -> Result<()> {
                     let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
                     batch.clear();
                     let current = model.as_ref().unwrap();
-                    let loss = current.forward_loss(inputs, targets);
-                    let loss_value = loss.clone().into_data().to_vec::<f32>()?[0];
-                    if !loss_value.is_finite() {
-                        bail!(
-                            "non-finite loss before optimizer step {}: {loss_value}",
-                            step + 1
-                        );
+                    if micro_step == 0 {
+                        optimizer_step_started = Instant::now();
                     }
+                    let loss = current.forward_loss(inputs, targets);
+                    let detached_loss = loss.clone().detach();
+                    loss_sum = Some(match loss_sum.take() {
+                        Some(sum) => sum + detached_loss,
+                        None => detached_loss,
+                    });
                     let mut grads = loss.div_scalar(args.grad_accum as f64).backward();
                     let muon_grads =
                         GradientsParams::from_params(&mut grads, current, &muon_parameter_ids);
@@ -712,7 +719,6 @@ fn train(args: TrainArgs) -> Result<()> {
                     muon_accumulator.accumulate(current, muon_grads);
                     adamw_accumulator.accumulate(current, adamw_grads);
                     micro_step += 1;
-                    loss_sum += loss_value;
 
                     if micro_step == args.grad_accum {
                         let lr = learning_rate(&args, step + 1, total_steps);
@@ -730,9 +736,19 @@ fn train(args: TrainArgs) -> Result<()> {
                         model = Some(adamw_optimizer.step(lr, current, adamw_grads));
                         step += 1;
                         training_state.step = step;
-                        let loss = loss_sum / args.grad_accum as f32;
+                        let loss = loss_sum
+                            .take()
+                            .expect("an optimizer step must contain a loss")
+                            .div_scalar(args.grad_accum as f32);
+                        let loss = scalar_value(loss)?;
+                        if !loss.is_finite() {
+                            bail!("non-finite loss at optimizer step {step}: {loss}");
+                        }
+                        let step_seconds = optimizer_step_started.elapsed().as_secs_f64();
+                        let step_tokens = args.batch_size * args.grad_accum * args.seq_len;
+                        let tokens_per_second = step_tokens as f64 / step_seconds;
                         println!(
-                            "stage={}/{} epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3}",
+                            "stage={}/{} epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3} tokens_per_second={tokens_per_second:.0}",
                             stage + 1,
                             args.data.len(),
                             epoch + 1,
@@ -748,6 +764,8 @@ fn train(args: TrainArgs) -> Result<()> {
                                 "lr": lr,
                                 "muon_lr": muon_lr,
                                 "grad_norm": grad_norm,
+                                "step_seconds": step_seconds,
+                                "tokens_per_second": tokens_per_second,
                                 "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
                             }),
                         )?;
@@ -764,7 +782,6 @@ fn train(args: TrainArgs) -> Result<()> {
                             println!("checkpointed {}", args.output.display());
                         }
                         micro_step = 0;
-                        loss_sum = 0.0;
                     }
                     Ok(step < total_steps)
                 },
@@ -777,7 +794,7 @@ fn train(args: TrainArgs) -> Result<()> {
                 muon_accumulator = GradientsAccumulator::new();
                 adamw_accumulator = GradientsAccumulator::new();
                 micro_step = 0;
-                loss_sum = 0.0;
+                loss_sum = None;
             }
         }
     }
@@ -830,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_training_decreases_loss_and_checkpoint_roundtrips() {
+    fn training_decreases_loss_and_checkpoint_roundtrips() {
         let config = small_hybrid();
         let device = hermes_llm::default_device();
         Backend::seed(&device, 41);

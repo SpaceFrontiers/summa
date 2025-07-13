@@ -1,14 +1,18 @@
-//! Burn inference stack. GPU tensor operations use Burn's CubeCL backend; the
-//! custom Mamba selective scan runs directly on the same CubeCL tensors.
+//! Shared language-model stack for training and inference.
 
 mod attention;
 pub mod backend;
 mod block;
 mod conv;
+#[cfg(feature = "cuda")]
+mod cube_attention;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 mod cube_tensor;
 mod ffn;
+mod fused_attention;
+mod linear_cross_entropy;
 mod mamba;
+mod matmul;
 mod norm;
 mod scan;
 mod transformer;
@@ -18,13 +22,20 @@ pub use attention::{AttnCache, MultiHeadAttention};
 pub use backend::{Backend, Device, default_device};
 pub use block::{InferenceState, LayerState, TransformerBlock};
 pub use ffn::FeedForward;
+pub use fused_attention::AttentionBackend;
+pub use linear_cross_entropy::LinearCrossEntropyBackend;
 pub use mamba::{MambaMixer, MambaState};
 pub use norm::Norm;
 pub use scan::MambaBackend;
 pub use transformer::Transformer;
 pub use weights::{load_safetensors, save_safetensors};
 
-#[cfg(all(test, feature = "metal"))]
+/// Backend capabilities required by the complete hybrid language model.
+pub trait ModelBackend: MambaBackend + AttentionBackend + LinearCrossEntropyBackend {}
+
+impl<B: MambaBackend + AttentionBackend + LinearCrossEntropyBackend> ModelBackend for B {}
+
+#[cfg(all(test, any(feature = "metal", feature = "cuda")))]
 mod test_support {
     use burn::tensor::TensorData;
 
@@ -35,10 +46,11 @@ mod test_support {
     }
 
     pub(super) fn max_diff(lhs: TensorData, rhs: TensorData) -> f32 {
-        lhs.to_vec::<f32>()
+        lhs.convert::<f32>()
+            .to_vec::<f32>()
             .unwrap()
             .into_iter()
-            .zip(rhs.to_vec::<f32>().unwrap())
+            .zip(rhs.convert::<f32>().to_vec::<f32>().unwrap())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0, f32::max)
     }
@@ -67,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_norm_parameters_and_identity() {
+    fn test_norm_parameters_and_identity() {
         let device = Default::default();
         let layer_norm = Norm::<TestBackend>::new(NormType::LayerNorm, 8, 1e-5, &device);
         let identity = Norm::<TestBackend>::new(NormType::None, 8, 1e-5, &device);
@@ -77,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_attention_cached_matches_stateless() {
+    fn test_attention_cached_matches_stateless() {
         let mut config = get_builtin_model("tiny").unwrap();
         config.hidden_size = 16;
         config.max_seq_len = 16;
@@ -117,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_attention_respects_disabled_position_encoding() {
+    fn test_attention_respects_disabled_position_encoding() {
         let mut config = get_builtin_model("tiny").unwrap();
         config.hidden_size = 16;
         config.block.attention.num_heads = Some(4);
@@ -140,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_mamba_stateful_matches_stateless() {
+    fn test_mamba_stateful_matches_stateless() {
         let mut config = get_builtin_model("hybrid-tiny").unwrap();
         config.hidden_size = 8;
         let block = config.block_for_layer(0).clone();
@@ -172,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_hybrid_transformer_stateful_matches_stateless() {
+    fn test_hybrid_transformer_stateful_matches_stateless() {
         let mut config = get_builtin_model("hybrid-tiny").unwrap();
         config.vocab_size = 32;
         config.hidden_size = 8;
@@ -218,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_tied_embeddings_remove_lm_head_parameters() {
+    fn test_tied_embeddings_remove_lm_head_parameters() {
         let mut untied = get_builtin_model("tiny").unwrap();
         untied.vocab_size = 32;
         untied.hidden_size = 8;
@@ -238,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_output_bias_is_counted_for_tied_and_untied_heads() {
+    fn test_output_bias_is_counted_for_tied_and_untied_heads() {
         let mut config = get_builtin_model("tiny").unwrap();
         config.vocab_size = 32;
         config.hidden_size = 8;

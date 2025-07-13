@@ -43,16 +43,16 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-tool**: CLI for index management and data processing pipelines
 - **hermes-server**: gRPC server for remote search operations
 - **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
-- **hermes-llm**: Shared Burn Transformer/Mamba model, inference, generation, and MAL integration
-- **hermes-train**: Burn Autodiff training for the shared hermes-llm model
+- **hermes-llm**: Shared Transformer/Mamba model, inference, generation, and MAL integration
+- **hermes-train**: Autodiff training for the shared hermes-llm model
 - **hermes-client-python**: Python gRPC client
 - **hermes-web**: Vue.js web UI
 
-LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same generic `hermes_llm::Transformer` used by inference, saves a Burn-native safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
+LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same generic `hermes_llm::Transformer` used by inference, saves a safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
 
 **MAL parser is a single source of truth:** the pest grammar + AST live in the standalone `hermes-mal` crate (`hermes-mal/src/{lib.rs,mal.pest}`, embeds `hermes-mal/well-known/*.mal`). `hermes-llm` re-exports it as `crate::mal`; `hermes-train` consumes that re-export. Change the grammar/AST in one place.
 
-MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `hermes-mal/well-known/hybrid_tiny.mal`). Burn Autodiff training uses the differentiable tensor scan; GPU inference uses the custom CubeCL selective-scan kernel.
+MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `hermes-mal/well-known/hybrid_tiny.mal`). GPU training and inference use the custom CubeCL selective-scan kernel.
 
 ## Build Commands
 

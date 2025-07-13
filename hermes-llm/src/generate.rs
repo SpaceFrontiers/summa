@@ -1,7 +1,7 @@
 //! Autoregressive text generation.
 
 use anyhow::{Result, bail};
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -78,7 +78,13 @@ impl<'a> TextGenerator<'a> {
         let (mut state, mut last_logits) = self.prefill(&tokens[tokens.len() - context_len..]);
 
         for _ in 0..config.max_new_tokens {
-            let values = last_logits.clone().into_data().to_vec::<f32>()?;
+            let values = last_logits
+                .clone()
+                .into_data()
+                .to_vec::<<Backend as burn::tensor::backend::BackendTypes>::FloatElem>()?
+                .into_iter()
+                .map(|value| value.elem::<f32>())
+                .collect::<Vec<f32>>();
             let next_token = if config.temperature <= 0.0 {
                 argmax(&values)
             } else {

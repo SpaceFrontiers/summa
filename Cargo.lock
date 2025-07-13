@@ -2627,6 +2627,7 @@ dependencies = [
  "burn-wgpu",
  "clap",
  "cubecl",
+ "cubek",
  "dirs",
  "hermes-mal",
  "object_store",

@@ -1,18 +1,20 @@
-//! Full Burn inference model assembled from the MAL definition.
+//! Full language model assembled from the MAL definition.
 
 use anyhow::{Result, bail};
 use burn::module::{Initializer, ModuleVisitor, Param, ParamId};
 use burn::prelude::*;
 use burn::tensor::Int;
-use burn_nn::loss::CrossEntropyLossConfig;
 use burn_nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
 
 use crate::mal::{BlockDef, ModelDef, PositionEncoding};
 
-use super::{InferenceState, MambaBackend, Norm, TransformerBlock};
+use super::linear_cross_entropy::linear_cross_entropy;
+use super::matmul::matmul_2;
+use super::{InferenceState, ModelBackend, Norm, TransformerBlock};
 
 const EMBEDDING_STD: f64 = 0.02;
+const LOSS_CHUNK_TOKENS: usize = 512;
 
 #[derive(Module, Debug)]
 pub struct Transformer<B: Backend> {
@@ -31,7 +33,7 @@ pub struct Transformer<B: Backend> {
     config: ModelDef,
 }
 
-impl<B: MambaBackend> Transformer<B> {
+impl<B: ModelBackend> Transformer<B> {
     pub fn new(config: &ModelDef, device: &Device<B>) -> Result<Self> {
         if config.num_layers == 0 {
             bail!("model must contain at least one layer");
@@ -183,6 +185,10 @@ impl<B: MambaBackend> Transformer<B> {
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>, start_pos: usize) -> Tensor<B, 3> {
+        self.project_logits(self.forward_hidden(input_ids, start_pos))
+    }
+
+    fn forward_hidden(&self, input_ids: Tensor<B, 2, Int>, start_pos: usize) -> Tensor<B, 3> {
         let [_, seq_len] = input_ids.dims();
         assert!(
             start_pos + seq_len <= self.config.max_seq_len,
@@ -194,40 +200,54 @@ impl<B: MambaBackend> Transformer<B> {
         for layer in &self.layers {
             x = layer.forward(x, &self.rope, start_pos);
         }
-        self.project_logits(self.final_norm.forward(x))
+        self.final_norm.forward(x)
     }
 
-    /// Next-token cross-entropy for training. Inputs and targets have shape
-    /// `[batch, sequence]`; logits are flattened without materializing copies.
+    /// Next-token cross-entropy for training. The output projection is chunked
+    /// so full-vocabulary logits are never retained for every input token.
     pub fn forward_loss(
         &self,
         input_ids: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
     ) -> Tensor<B, 1> {
         let [batch, seq_len] = targets.dims();
-        let logits = self
-            .forward(input_ids, 0)
-            .reshape([batch * seq_len, self.config.vocab_size]);
-        CrossEntropyLossConfig::new()
-            .init(&targets.device())
-            .forward(logits, targets.reshape([batch * seq_len]))
+        let hidden = self
+            .forward_hidden(input_ids, 0)
+            .reshape([batch * seq_len, self.config.hidden_size]);
+        let (weight, bias) = self.output_parameters();
+        linear_cross_entropy(
+            hidden,
+            weight,
+            bias,
+            targets.reshape([batch * seq_len]),
+            LOSS_CHUNK_TOKENS,
+        )
     }
 
     fn project_logits(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq_len, hidden] = x.dims();
+        let (weight, bias) = self.output_parameters();
+        let logits = matmul_2(x.reshape([batch * seq_len, hidden]), weight.transpose()).reshape([
+            batch,
+            seq_len,
+            self.config.vocab_size,
+        ]);
+        match bias {
+            Some(bias) => logits + bias.reshape([1, 1, self.config.vocab_size]),
+            None => logits,
+        }
+    }
+
+    fn output_parameters(&self) -> (Tensor<B, 2>, Option<Tensor<B, 1>>) {
         match &self.lm_head {
-            Some(head) => head.forward(x),
-            None => {
-                let [batch, seq_len, hidden] = x.dims();
-                let weights = self.embedding.weight.val();
-                let logits = x
-                    .reshape([batch * seq_len, hidden])
-                    .matmul(weights.transpose())
-                    .reshape([batch, seq_len, self.config.vocab_size]);
-                match &self.tied_output_bias {
-                    Some(bias) => logits + bias.val().reshape([1, 1, self.config.vocab_size]),
-                    None => logits,
-                }
-            }
+            Some(head) => (
+                head.weight.val().transpose(),
+                head.bias.as_ref().map(Param::val),
+            ),
+            None => (
+                self.embedding.weight.val(),
+                self.tied_output_bias.as_ref().map(Param::val),
+            ),
         }
     }
 

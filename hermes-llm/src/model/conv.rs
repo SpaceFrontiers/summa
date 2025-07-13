@@ -15,9 +15,9 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct DepthwiseConv1dGradients<B: Backend> {
-    input: FloatTensor<B>,
-    weight: FloatTensor<B>,
-    bias: FloatTensor<B>,
+    pub(super) input: FloatTensor<B>,
+    pub(super) weight: FloatTensor<B>,
+    pub(super) bias: FloatTensor<B>,
 }
 
 pub trait DepthwiseConv1dBackend: Backend {
@@ -151,12 +151,12 @@ impl<B: DepthwiseConv1dBackend, C: CheckpointStrategy> DepthwiseConv1dBackend fo
 mod gpu {
     use burn::tensor::Shape;
     use burn_cubecl::cubecl::prelude::*;
-    use burn_cubecl::element::{BoolElement, IntElement};
+    use burn_cubecl::element::{BoolElement, FloatElement, IntElement};
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
     use super::{DepthwiseConv1dBackend, DepthwiseConv1dGradients};
-    use crate::burn_model::cube_tensor::{empty_like, into_contiguous};
+    use crate::model::cube_tensor::{empty_like, into_contiguous};
 
     const ELEMENTWISE_THREADS: u32 = 256;
     const REDUCTION_THREADS: u32 = 32;
@@ -269,9 +269,10 @@ mod gpu {
         }
     }
 
-    impl<R, I, BT> DepthwiseConv1dBackend for CubeBackend<R, f32, I, BT>
+    impl<R, F, I, BT> DepthwiseConv1dBackend for CubeBackend<R, F, I, BT>
     where
         R: CubeRuntime,
+        F: FloatElement,
         I: IntElement,
         BT: BoolElement,
     {
@@ -370,7 +371,7 @@ mod tests {
     use burn_wgpu::Wgpu;
 
     use super::depthwise_conv1d;
-    use crate::burn_model::test_support::{max_diff, values};
+    use crate::model::test_support::{max_diff, values};
 
     #[test]
     fn fused_depthwise_conv1d_matches_ndarray_forward_and_backward() {

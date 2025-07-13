@@ -1,4 +1,4 @@
-//! Grouped-query attention with optional QK-Norm, causal + sliding-window
+//! Grouped-query attention with optional QK-Norm, causal and sliding-window
 //! masking, and a KV cache for O(context) incremental decode.
 
 use burn::prelude::*;
@@ -12,6 +12,9 @@ use burn_nn::{
 
 use crate::mal::{BlockDef, ModelDef};
 
+use super::fused_attention::{AttentionBackend, fused_attention, repeat_kv};
+use super::matmul::linear;
+
 /// KV cache for one attention layer: [B, n_kv, T, head_dim], pre-GQA-repeat.
 #[derive(Debug, Clone, Default)]
 pub struct AttnCache<B: Backend> {
@@ -21,9 +24,7 @@ pub struct AttnCache<B: Backend> {
 
 #[derive(Module, Debug)]
 pub struct MultiHeadAttention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
+    qkv_proj: Linear<B>,
     o_proj: Linear<B>,
     /// Per-head RMSNorm over head_dim, applied to Q/K before RoPE (qk_norm).
     q_norm: Option<RmsNorm<B>>,
@@ -43,7 +44,7 @@ pub struct MultiHeadAttention<B: Backend> {
     attention_dropout: Dropout,
 }
 
-impl<B: Backend> MultiHeadAttention<B> {
+impl<B: AttentionBackend> MultiHeadAttention<B> {
     pub fn new(config: &ModelDef, block: &BlockDef, device: &Device<B>) -> Self {
         let num_heads = block.num_heads();
         let num_kv_heads = block.num_kv_heads();
@@ -69,9 +70,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         };
 
         Self {
-            q_proj: lin(hidden, hidden),
-            k_proj: lin(hidden, kv_dim),
-            v_proj: lin(hidden, kv_dim),
+            qkv_proj: lin(hidden, hidden + 2 * kv_dim),
             o_proj: lin(hidden, hidden),
             q_norm,
             k_norm,
@@ -98,9 +97,22 @@ impl<B: Backend> MultiHeadAttention<B> {
         let [b, s, _] = x.dims();
         let split =
             |t: Tensor<B, 3>, heads: usize| t.reshape([b, s, heads, self.head_dim]).swap_dims(1, 2);
-        let q = split(self.q_proj.forward(x.clone()), self.num_heads);
-        let k = split(self.k_proj.forward(x.clone()), self.num_kv_heads);
-        let v = split(self.v_proj.forward(x), self.num_kv_heads);
+        let qkv = linear(&self.qkv_proj, x);
+        let query_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let q = split(
+            qkv.clone().slice([0..b, 0..s, 0..query_dim]),
+            self.num_heads,
+        );
+        let k = split(
+            qkv.clone()
+                .slice([0..b, 0..s, query_dim..query_dim + kv_dim]),
+            self.num_kv_heads,
+        );
+        let v = split(
+            qkv.slice([0..b, 0..s, query_dim + kv_dim..query_dim + 2 * kv_dim]),
+            self.num_kv_heads,
+        );
         let (q, k) = match (&self.q_norm, &self.k_norm) {
             (Some(q_norm), Some(k_norm)) => (q_norm.forward(q), k_norm.forward(k)),
             _ => (q, k),
@@ -111,18 +123,6 @@ impl<B: Backend> MultiHeadAttention<B> {
             (q, k)
         };
         (q, k, v)
-    }
-
-    /// Repeat KV heads to match query heads (GQA).
-    fn repeat_kv(&self, t: Tensor<B, 4>) -> Tensor<B, 4> {
-        if self.num_kv_heads == self.num_heads {
-            return t;
-        }
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let [b, n_kv, s, hd] = t.dims();
-        t.unsqueeze_dim::<5>(2)
-            .repeat_dim(2, n_rep)
-            .reshape([b, n_kv * n_rep, s, hd])
     }
 
     /// Scaled-dot-product attention over K/V ([B, H, T, hd]) for queries at
@@ -138,6 +138,8 @@ impl<B: Backend> MultiHeadAttention<B> {
         let [_, _, seq_q, _] = q.dims();
         let total = k.dims()[2];
         if B::ad_enabled(&device) && self.attention_dropout.prob > 0.0 {
+            let k = repeat_kv(k, self.num_heads);
+            let v = repeat_kv(v, self.num_heads);
             let mut scores = q
                 .matmul(k.transpose())
                 .div_scalar((self.head_dim as f32).sqrt());
@@ -148,9 +150,8 @@ impl<B: Backend> MultiHeadAttention<B> {
             return weights.matmul(v);
         }
 
-        // Burn's CubeCL backend dispatches its fused attention kernel when it
-        // can express causality directly. Cached/offset and sliding-window
-        // attention use our explicit global-position mask instead.
+        // Full-sequence attention has a custom fused backward on CUDA. Cached,
+        // offset, and sliding-window attention retain Burn's mask-capable path.
         let fused_causal =
             self.causal && self.window_size.is_none() && q_start == 0 && seq_q == total;
         let mask = if fused_causal {
@@ -158,18 +159,22 @@ impl<B: Backend> MultiHeadAttention<B> {
         } else {
             self.build_mask(seq_q, total, q_start, &device)
         };
-        attention(
-            q,
-            k,
-            v,
-            mask,
-            None,
-            AttentionModuleOptions {
-                scale: None,
-                softcap: None,
-                is_causal: fused_causal,
-            },
-        )
+        if mask.is_none() {
+            fused_attention(q, k, v, fused_causal)
+        } else {
+            attention(
+                q,
+                repeat_kv(k, self.num_heads),
+                repeat_kv(v, self.num_heads),
+                mask,
+                None,
+                AttentionModuleOptions {
+                    scale: None,
+                    softcap: None,
+                    is_causal: false,
+                },
+            )
+        }
     }
 
     /// Bool mask [1, 1, S, T] (true = blocked), or None when nothing is masked.
@@ -216,8 +221,8 @@ impl<B: Backend> MultiHeadAttention<B> {
         start_pos: usize,
     ) -> Tensor<B, 3> {
         let (q, k, v) = self.project_qkv(x, rope, start_pos);
-        let out = self.sdpa(q, self.repeat_kv(k), self.repeat_kv(v), start_pos);
-        self.o_proj.forward(self.merge_heads(out))
+        let out = self.sdpa(q, k, v, start_pos);
+        linear(&self.o_proj, self.merge_heads(out))
     }
 
     /// Incremental attention over a KV cache. `x` holds S new tokens at global
@@ -243,7 +248,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         cache.k = Some(k.clone());
         cache.v = Some(v.clone());
 
-        let out = self.sdpa(q, self.repeat_kv(k), self.repeat_kv(v), start_pos);
-        self.o_proj.forward(self.merge_heads(out))
+        let out = self.sdpa(q, k, v, start_pos);
+        linear(&self.o_proj, self.merge_heads(out))
     }
 }

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Burn-based LLM inference and model definition; training lives in hermes-train"
+description = "LLM inference and model definition; training lives in hermes-train"
 keywords = ["llm", "transformer", "deep-learning", "gpt", "inference"]
 categories = ["science"]
 
@@ -25,6 +25,7 @@ burn-store = { version = "0.21", default-features = false, features = [
 ] }
 burn-cubecl = { version = "0.21", optional = true, default-features = false, features = ["std"] }
 cubecl = { version = "=0.10.0", optional = true, default-features = false, features = ["std"] }
+cubek = { version = "=0.2.0", optional = true, default-features = false, features = ["attention", "stdlib"] }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
 tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
@@ -59,7 +60,7 @@ default = ["remote"]
 # Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
 remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
 metal = ["dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl"]
-cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cubek"]
 
 [[bin]]
 name = "hermes-llm"
@@ -68,4 +69,4 @@ path = "src/main.rs"
 [package.metadata.cargo-machete]
 # `#[cube]` macro expansion requires the direct crate even though static source
 # analysis only sees it behind the GPU feature gates.
-ignored = ["cubecl"]
+ignored = ["cubecl", "cubek"]

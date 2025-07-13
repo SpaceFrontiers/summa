@@ -1,14 +1,14 @@
-//! Burn-native safetensors checkpoints shared by training and inference.
+//! Safetensors checkpoints shared by training and inference.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn_store::{ApplyResult, ModuleSnapshot, SafetensorsStore};
 
-use super::{MambaBackend, Transformer};
+use super::{ModelBackend, Transformer};
 
 /// Load strictly: missing, unexpected, and shape-mismatched tensors are errors.
-pub fn load_safetensors<B: MambaBackend>(
+pub fn load_safetensors<B: ModelBackend>(
     model: &mut Transformer<B>,
     path: impl AsRef<Path>,
 ) -> Result<ApplyResult> {
@@ -16,10 +16,10 @@ pub fn load_safetensors<B: MambaBackend>(
     let mut store = SafetensorsStore::from_file(path).skip_enum_variants(true);
     model
         .load_from(&mut store)
-        .with_context(|| format!("failed to load Burn weights from {}", path.display()))
+        .with_context(|| format!("failed to load weights from {}", path.display()))
 }
 
-pub fn save_safetensors<B: MambaBackend>(
+pub fn save_safetensors<B: ModelBackend>(
     model: &Transformer<B>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
@@ -27,5 +27,5 @@ pub fn save_safetensors<B: MambaBackend>(
     let mut store = SafetensorsStore::from_file(path).skip_enum_variants(true);
     model
         .save_into(&mut store)
-        .with_context(|| format!("failed to save Burn weights to {}", path.display()))
+        .with_context(|| format!("failed to save weights to {}", path.display()))
 }

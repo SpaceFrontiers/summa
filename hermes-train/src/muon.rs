@@ -159,7 +159,7 @@ fn to_compute_dtype(tensor: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
 
 #[cfg(feature = "cuda")]
 fn from_compute_dtype(tensor: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
-    tensor.cast(FloatDType::F32)
+    tensor.cast(FloatDType::Flex32)
 }
 
 #[cfg(not(feature = "cuda"))]

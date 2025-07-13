@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Burn-native training for MAL-defined Hermes language models"
+description = "Training for MAL-defined Hermes language models"
 
 [dependencies]
 anyhow.workspace = true

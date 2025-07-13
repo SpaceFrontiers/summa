@@ -1,4 +1,4 @@
-//! Compile-time Burn backend selection.
+//! Compile-time tensor backend selection.
 //!
 //! One compute stack, three targets, chosen at compile time by cargo feature:
 //! - `metal`   → wgpu (Metal on macOS, Vulkan/DX elsewhere)
@@ -11,7 +11,7 @@
 pub type Backend = burn_wgpu::Wgpu;
 
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
-pub type Backend = burn_cuda::Cuda;
+pub type Backend = burn_cuda::Cuda<cubecl::flex32>;
 
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
 pub type Backend = burn_ndarray::NdArray;

@@ -1,4 +1,4 @@
-//! Hybrid Transformer/Mamba block assembly.
+//! Hybrid Transformer and Mamba block assembly.
 
 use burn::prelude::*;
 use burn_nn::{Dropout, DropoutConfig, RotaryEncoding};
@@ -6,7 +6,7 @@ use burn_nn::{Dropout, DropoutConfig, RotaryEncoding};
 use crate::mal::{BlockDef, ModelDef, NormPosition};
 
 use super::{
-    AttnCache, FeedForward, MambaBackend, MambaMixer, MambaState, MultiHeadAttention, Norm,
+    AttnCache, FeedForward, MambaMixer, MambaState, ModelBackend, MultiHeadAttention, Norm,
 };
 
 #[derive(Module, Debug)]
@@ -23,7 +23,7 @@ pub struct TransformerBlock<B: Backend> {
     use_residual: bool,
 }
 
-impl<B: MambaBackend> TransformerBlock<B> {
+impl<B: ModelBackend> TransformerBlock<B> {
     pub fn new(config: &ModelDef, block: &BlockDef, device: &Device<B>) -> Self {
         let (attention, ssm) = match &block.ssm {
             Some(ssm) => (None, Some(MambaMixer::new(config, ssm, device))),

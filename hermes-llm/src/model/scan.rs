@@ -1,9 +1,10 @@
-//! Fused Mamba selective scan for Burn backends.
+//! Fused Mamba selective scan.
 //!
 //! CPU uses a tensor-op reference. GPU inference and training use CubeCL
 //! forward and backward kernels directly on Burn's resident tensors.
 
 use burn::prelude::*;
+use burn::tensor::activation::{relu, sigmoid};
 use burn::tensor::{TensorPrimitive, ops::FloatTensor};
 use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy};
@@ -12,27 +13,31 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
 use super::conv::DepthwiseConv1dBackend;
 
+fn stable_softplus<B: Backend, const D: usize>(value: Tensor<B, D>) -> Tensor<B, D> {
+    relu(value.clone()) + (-value.abs()).exp().add_scalar(1.0).log()
+}
+
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct ScanOutput<B: Backend> {
-    y: FloatTensor<B>,
-    h: FloatTensor<B>,
-    states: Option<FloatTensor<B>>,
+    pub(super) y: FloatTensor<B>,
+    pub(super) h: FloatTensor<B>,
+    pub(super) states: Option<FloatTensor<B>>,
 }
 
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct ScanGradients<B: Backend> {
-    delta: FloatTensor<B>,
-    xs: FloatTensor<B>,
-    b_mat: FloatTensor<B>,
-    c_mat: FloatTensor<B>,
-    a: FloatTensor<B>,
-    d: FloatTensor<B>,
-    h: FloatTensor<B>,
+    pub(super) delta: FloatTensor<B>,
+    pub(super) xs: FloatTensor<B>,
+    pub(super) b_mat: FloatTensor<B>,
+    pub(super) c_mat: FloatTensor<B>,
+    pub(super) a: FloatTensor<B>,
+    pub(super) d: FloatTensor<B>,
+    pub(super) h: FloatTensor<B>,
 }
 
-/// Backend capability required by the Burn Mamba mixer.
+/// Backend capability required by the Mamba mixer.
 pub trait MambaBackend: Backend + DepthwiseConv1dBackend {
     #[allow(clippy::too_many_arguments)]
     fn selective_scan_inner(
@@ -108,7 +113,9 @@ fn reference_selective_scan<B: Backend>(
     state_dim: usize,
     save_states: bool,
 ) -> ScanOutput<B> {
-    let delta = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(delta));
+    let delta = stable_softplus(Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(
+        delta,
+    )));
     let xs = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(xs));
     let b_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(b_mat));
     let c_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(c_mat));
@@ -172,7 +179,9 @@ fn reference_selective_scan_backward<B: Backend>(
     grad_y: FloatTensor<B>,
     state_dim: usize,
 ) -> ScanGradients<B> {
-    let delta = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(delta));
+    let delta_raw = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(delta));
+    let delta_derivative = sigmoid(delta_raw.clone());
+    let delta = stable_softplus(delta_raw);
     let xs = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(xs));
     let b_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(b_mat));
     let c_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(c_mat));
@@ -270,7 +279,9 @@ fn reference_selective_scan_backward<B: Backend>(
     grad_b.reverse();
     grad_c.reverse();
     ScanGradients {
-        delta: Tensor::cat(grad_delta, 1).into_primitive().tensor(),
+        delta: (Tensor::cat(grad_delta, 1) * delta_derivative)
+            .into_primitive()
+            .tensor(),
         xs: Tensor::cat(grad_xs, 1).into_primitive().tensor(),
         b_mat: Tensor::cat(grad_b, 1).into_primitive().tensor(),
         c_mat: Tensor::cat(grad_c, 1).into_primitive().tensor(),
@@ -421,22 +432,51 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
 mod gpu {
     use burn::tensor::{Shape, TensorMetadata};
     use burn_cubecl::cubecl::prelude::*;
-    use burn_cubecl::element::{BoolElement, IntElement};
+    use burn_cubecl::element::{BoolElement, FloatElement, IntElement};
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
     use super::{MambaBackend, ScanGradients, ScanOutput};
-    use crate::burn_model::cube_tensor::{empty_like, into_contiguous, zeros_like};
+    use crate::model::cube_tensor::{empty_like, into_contiguous, zeros_like};
 
-    const THREADS_PER_CUBE: u32 = 64;
+    const THREADS_PER_CUBE: u32 = 128;
+    const PLANE_WIDTH: u32 = 32;
+    const PLANES_PER_CUBE: u32 = THREADS_PER_CUBE / PLANE_WIDTH;
 
     #[cube]
     fn atomic_add_f32(target: &mut Atomic<f32>, value: f32) {
         target.fetch_add(value);
     }
 
+    #[cube]
+    fn stable_softplus(value: f32) -> f32 {
+        if value > 0.0 {
+            value + ((-value).exp() + 1.0).ln()
+        } else {
+            (value.exp() + 1.0).ln()
+        }
+    }
+
+    #[cube]
+    fn stable_sigmoid(value: f32) -> f32 {
+        if value >= 0.0 {
+            1.0 / (1.0 + (-value).exp())
+        } else {
+            let exp_value = value.exp();
+            exp_value / (1.0 + exp_value)
+        }
+    }
+
     #[cube(launch)]
-    fn selective_scan_forward(
+    fn softplus_forward(input: &Array<f32>, output: &mut Array<f32>) {
+        let idx = ABSOLUTE_POS;
+        if idx < input.len() {
+            output[idx] = stable_softplus(input[idx]);
+        }
+    }
+
+    #[cube(launch)]
+    fn selective_scan_step(
         delta: &Array<f32>,
         xs: &Array<f32>,
         b_mat: &Array<f32>,
@@ -446,16 +486,12 @@ mod gpu {
         h_in: &Array<f32>,
         y: &mut Array<f32>,
         h_out: &mut Array<f32>,
-        states: &mut Array<f32>,
         channels: u32,
-        seq_len: u32,
         #[comptime] state_dim: usize,
-        #[comptime] save_states: bool,
     ) {
         let channels = channels as usize;
-        let seq_len = seq_len as usize;
         let idx = ABSOLUTE_POS;
-        let total = xs.len() / seq_len;
+        let total = xs.len();
         if idx < total {
             let batch = idx / channels;
             let channel = idx % channels;
@@ -466,33 +502,151 @@ mod gpu {
                 state[n] = h_in[state_base + n];
             }
 
-            for t in 0..seq_len {
-                let btc = (batch * seq_len + t) * channels + channel;
-                let btn = (batch * seq_len + t) * state_dim;
-                let dt = delta[btc];
-                let x = xs[btc];
-                let mut out = 0.0f32;
-                for n in 0..state_dim {
-                    let da = (dt * a[a_base + n]).exp();
-                    let next = state[n] * da + dt * b_mat[btn + n] * x;
-                    state[n] = next;
-                    out += next * c_mat[btn + n];
-                    if save_states {
-                        states[btc * state_dim + n] = next;
-                    }
-                }
-                y[btc] = out + x * d[channel];
-            }
+            let btn = batch * state_dim;
+            let dt = delta[idx];
+            let x = xs[idx];
+            let mut out = 0.0f32;
             for n in 0..state_dim {
+                let da = (dt * a[a_base + n]).exp();
+                state[n] = state[n] * da + dt * b_mat[btn + n] * x;
+                out += state[n] * c_mat[btn + n];
                 h_out[state_base + n] = state[n];
             }
+            y[idx] = out + x * d[channel];
+        }
+    }
+
+    /// Parallelize the recurrent state dimension. Each thread still follows
+    /// one exact scalar recurrence through time, while a separate kernel
+    /// reduces the small state dimension into the output.
+    #[cube(launch)]
+    fn selective_scan_states(
+        delta: &Array<f32>,
+        xs: &Array<f32>,
+        b_mat: &Array<f32>,
+        a: &Array<f32>,
+        h_in: &Array<f32>,
+        states: &mut Array<f32>,
+        h_out: &mut Array<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let idx = ABSOLUTE_POS;
+        if idx < h_out.len() {
+            let n = idx % state_dim;
+            let batch_channel = idx / state_dim;
+            let batch = batch_channel / channels;
+            let channel = batch_channel % channels;
+            let mut state = h_in[idx];
+            let av = a[channel * state_dim + n];
+
+            for t in 0..seq_len {
+                let btc = (batch * seq_len + t) * channels + channel;
+                let btn = (batch * seq_len + t) * state_dim + n;
+                let dt = delta[btc];
+                let x = xs[btc];
+                state = state * (dt * av).exp() + dt * b_mat[btn] * x;
+                states[btc * state_dim + n] = state;
+            }
+            h_out[idx] = state;
+        }
+    }
+
+    #[cube(launch)]
+    fn selective_scan_output(
+        xs: &Array<f32>,
+        c_mat: &Array<f32>,
+        d: &Array<f32>,
+        states: &Array<f32>,
+        y: &mut Array<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let btc = ABSOLUTE_POS;
+        if btc < xs.len() {
+            let channel = btc % channels;
+            let batch_time = btc / channels;
+            let batch = batch_time / seq_len;
+            let t = batch_time % seq_len;
+            let btn = (batch * seq_len + t) * state_dim;
+            let mut out = 0.0f32;
+            for n in 0..state_dim {
+                out += states[btc * state_dim + n] * c_mat[btn + n];
+            }
+            y[btc] = out + xs[btc] * d[channel];
         }
     }
 
     #[allow(clippy::useless_conversion)]
     #[cube(launch)]
-    fn selective_scan_backward(
+    fn selective_scan_bc_backward(
         delta: &Array<f32>,
+        xs: &Array<f32>,
+        c_mat: &Array<f32>,
+        a: &Array<f32>,
+        h_in: &Array<f32>,
+        states: &Array<f32>,
+        grad_y: &Array<f32>,
+        grad_b: &mut Array<Atomic<f32>>,
+        grad_c: &mut Array<Atomic<f32>>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let state_group = ABSOLUTE_POS_Y as usize;
+        let channel = ABSOLUTE_POS_X as usize;
+        let total_state_groups = h_in.len() / channels;
+        let active = channel < channels && state_group < total_state_groups;
+        let n = state_group % state_dim;
+        let batch = state_group / state_dim;
+        let a_index = channel * state_dim + n;
+        let mut adjoint = 0.0f32;
+
+        for step in 0..seq_len {
+            let t = seq_len - step - 1;
+            let btc = (batch * seq_len + t) * channels + channel;
+            let btn = (batch * seq_len + t) * state_dim;
+            let dt = if active { delta[btc] } else { 0.0f32.into() };
+            let x = if active { xs[btc] } else { 0.0f32.into() };
+            let dy = if active { grad_y[btc] } else { 0.0f32.into() };
+            let av = if active { a[a_index] } else { 0.0f32.into() };
+            let cv = if active {
+                c_mat[btn + n]
+            } else {
+                0.0f32.into()
+            };
+            let alpha = (dt * av).exp();
+            let h_t = if active {
+                states[btc * state_dim + n]
+            } else {
+                0.0f32.into()
+            };
+            let g = adjoint + dy * cv;
+            let grad_b_sum = plane_sum(g * dt * x);
+            let grad_c_sum = plane_sum(dy * h_t);
+            if UNIT_POS_PLANE == 0 && state_group < total_state_groups {
+                atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
+                atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
+            }
+            adjoint = g * alpha;
+        }
+    }
+
+    /// A plane owns one (batch, channel) recurrence and reduces its state
+    /// lanes without global atomics for the per-token input gradients.
+    #[allow(clippy::useless_conversion)]
+    #[cube(launch)]
+    fn selective_scan_input_backward(
+        delta: &Array<f32>,
+        delta_raw: &Array<f32>,
         xs: &Array<f32>,
         b_mat: &Array<f32>,
         c_mat: &Array<f32>,
@@ -503,8 +657,6 @@ mod gpu {
         grad_y: &Array<f32>,
         grad_delta: &mut Array<f32>,
         grad_xs: &mut Array<f32>,
-        grad_b: &mut Array<Atomic<f32>>,
-        grad_c: &mut Array<Atomic<f32>>,
         grad_a: &mut Array<Atomic<f32>>,
         grad_d: &mut Array<Atomic<f32>>,
         grad_h: &mut Array<f32>,
@@ -514,85 +666,77 @@ mod gpu {
     ) {
         let channels = channels as usize;
         let seq_len = seq_len as usize;
-        let batch = ABSOLUTE_POS_Y as usize;
-        let channel = ABSOLUTE_POS_X as usize;
-        let active = channel < channels;
-        let state_base = (batch * channels + channel) * state_dim;
-        let a_base = channel * state_dim;
-        let mut adjoint = Array::<f32>::new(state_dim);
-        let mut grad_a_local = Array::<f32>::new(state_dim);
+        let batch_channel = ABSOLUTE_POS_Y as usize;
+        let n = UNIT_POS_PLANE as usize;
+        let total_batch_channels = h_in.len() / state_dim;
+        let active_channel = batch_channel < total_batch_channels;
+        let active = active_channel && n < state_dim;
+        let batch = batch_channel / channels;
+        let channel = batch_channel % channels;
+        let state_index = batch_channel * state_dim + n;
+        let a_index = channel * state_dim + n;
+        let mut adjoint = 0.0f32;
+        let mut grad_a_local = 0.0f32;
         let mut grad_d_local = 0.0f32;
-        for n in 0..state_dim {
-            adjoint[n] = 0.0;
-            grad_a_local[n] = 0.0;
-        }
 
         for step in 0..seq_len {
             let t = seq_len - step - 1;
             let btc = (batch * seq_len + t) * channels + channel;
             let btn = (batch * seq_len + t) * state_dim;
             let dt = if active { delta[btc] } else { 0.0f32.into() };
-            let x = if active { xs[btc] } else { 0.0f32.into() };
-            let dy = if active { grad_y[btc] } else { 0.0f32.into() };
-            let mut grad_dt = 0.0f32;
-            let mut grad_x = if active {
-                dy * d[channel]
+            let raw_dt = if active {
+                delta_raw[btc]
             } else {
                 0.0f32.into()
             };
-            grad_d_local += dy * x;
-
-            for n in 0..state_dim {
-                let av = if active { a[a_base + n] } else { 0.0f32.into() };
-                let bv = b_mat[btn + n];
-                let cv = c_mat[btn + n];
-                let alpha = (dt * av).exp();
-                let h_t = if active {
-                    states[btc * state_dim + n]
+            let x = if active { xs[btc] } else { 0.0f32.into() };
+            let dy = if active { grad_y[btc] } else { 0.0f32.into() };
+            let av = if active { a[a_index] } else { 0.0f32.into() };
+            let bv = if active {
+                b_mat[btn + n]
+            } else {
+                0.0f32.into()
+            };
+            let cv = if active {
+                c_mat[btn + n]
+            } else {
+                0.0f32.into()
+            };
+            let alpha = (dt * av).exp();
+            let h_prev = if active {
+                if t == 0 {
+                    h_in[state_index]
                 } else {
-                    0.0f32.into()
-                };
-                let h_prev = if active {
-                    if t == 0 {
-                        h_in[state_base + n]
-                    } else {
-                        states[((batch * seq_len + t - 1) * channels + channel) * state_dim + n]
-                    }
-                } else {
-                    0.0f32.into()
-                };
-                let g = adjoint[n] + dy * cv;
-                let grad_b_value = g * dt * x;
-                let grad_c_value = dy * h_t;
-                let grad_b_sum = plane_sum(grad_b_value);
-                let grad_c_sum = plane_sum(grad_c_value);
-                if UNIT_POS_PLANE == 0 {
-                    atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
-                    atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
+                    states[((batch * seq_len + t - 1) * channels + channel) * state_dim + n]
                 }
-                grad_dt += g * (h_prev * alpha * av + bv * x);
-                grad_x += g * dt * bv;
-                grad_a_local[n] += g * h_prev * alpha * dt;
-                adjoint[n] = g * alpha;
+            } else {
+                0.0f32.into()
+            };
+            let g = adjoint + dy * cv;
+            let grad_dt = plane_sum(g * (h_prev * alpha * av + bv * x));
+            let grad_x = plane_sum(g * dt * bv);
+            if UNIT_POS_PLANE == 0 && active_channel {
+                grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
+                grad_xs[btc] = dy * d[channel] + grad_x;
+                grad_d_local += dy * x;
             }
-            if active {
-                grad_delta[btc] = grad_dt;
-                grad_xs[btc] = grad_x;
-            }
+            grad_a_local += g * h_prev * alpha * dt;
+            adjoint = g * alpha;
         }
 
         if active {
+            atomic_add_f32(&mut grad_a[a_index], grad_a_local);
+            grad_h[state_index] = adjoint;
+        }
+        if UNIT_POS_PLANE == 0 && active_channel {
             atomic_add_f32(&mut grad_d[channel], grad_d_local);
-            for n in 0..state_dim {
-                atomic_add_f32(&mut grad_a[a_base + n], grad_a_local[n]);
-                grad_h[state_base + n] = adjoint[n];
-            }
         }
     }
 
-    impl<R, I, BT> MambaBackend for CubeBackend<R, f32, I, BT>
+    impl<R, F, I, BT> MambaBackend for CubeBackend<R, F, I, BT>
     where
         R: CubeRuntime,
+        F: FloatElement,
         I: IntElement,
         BT: BoolElement,
     {
@@ -608,7 +752,7 @@ mod gpu {
             save_states: bool,
         ) -> ScanOutput<Self> {
             let [batch, seq_len, channels] = xs.shape().dims();
-            let delta = into_contiguous(delta);
+            let delta_raw = into_contiguous(delta);
             let xs = into_contiguous(xs);
             let b_mat = into_contiguous(b_mat);
             let c_mat = into_contiguous(c_mat);
@@ -617,32 +761,73 @@ mod gpu {
             let h = into_contiguous(h);
             let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let h_out = empty_like(&xs, Shape::new([batch, channels, state_dim]));
-            let states = if save_states {
+            let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let parallel_scan = save_states || seq_len > 1;
+            let states = if parallel_scan {
                 empty_like(&xs, Shape::new([batch, seq_len, channels, state_dim]))
             } else {
                 h_out.clone()
             };
 
-            let total = (batch * channels) as u32;
-            selective_scan_forward::launch::<R>(
-                &xs.client,
-                CubeCount::Static(total.div_ceil(THREADS_PER_CUBE), 1, 1),
+            let client = xs.client.clone();
+            let delta_total = (batch * seq_len * channels) as u32;
+            softplus_forward::launch::<R>(
+                &client,
+                CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
                 CubeDim::new_1d(THREADS_PER_CUBE),
-                delta.into_array_arg(),
-                xs.clone().into_array_arg(),
-                b_mat.into_array_arg(),
-                c_mat.into_array_arg(),
-                a.into_array_arg(),
-                d.into_array_arg(),
-                h.into_array_arg(),
-                y.clone().into_array_arg(),
-                h_out.clone().into_array_arg(),
-                states.clone().into_array_arg(),
-                channels as u32,
-                seq_len as u32,
-                state_dim,
-                save_states,
+                delta_raw.into_array_arg(),
+                delta.clone().into_array_arg(),
             );
+            if parallel_scan {
+                let state_total = (batch * channels * state_dim) as u32;
+                selective_scan_states::launch::<R>(
+                    &client,
+                    CubeCount::Static(state_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta.clone().into_array_arg(),
+                    xs.clone().into_array_arg(),
+                    b_mat.clone().into_array_arg(),
+                    a.clone().into_array_arg(),
+                    h.clone().into_array_arg(),
+                    states.clone().into_array_arg(),
+                    h_out.clone().into_array_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                );
+                let output_total = (batch * seq_len * channels) as u32;
+                selective_scan_output::launch::<R>(
+                    &client,
+                    CubeCount::Static(output_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    xs.clone().into_array_arg(),
+                    c_mat.into_array_arg(),
+                    d.into_array_arg(),
+                    states.clone().into_array_arg(),
+                    y.clone().into_array_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                );
+            } else {
+                let total = (batch * channels) as u32;
+                selective_scan_step::launch::<R>(
+                    &client,
+                    CubeCount::Static(total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta.into_array_arg(),
+                    xs.clone().into_array_arg(),
+                    b_mat.into_array_arg(),
+                    c_mat.into_array_arg(),
+                    a.into_array_arg(),
+                    d.into_array_arg(),
+                    h.into_array_arg(),
+                    y.clone().into_array_arg(),
+                    h_out.clone().into_array_arg(),
+                    channels as u32,
+                    state_dim,
+                );
+            }
 
             ScanOutput {
                 y,
@@ -664,7 +849,11 @@ mod gpu {
             state_dim: usize,
         ) -> ScanGradients<Self> {
             let [batch, seq_len, channels] = xs.shape().dims();
-            let delta = into_contiguous(delta);
+            assert!(
+                state_dim <= PLANE_WIDTH as usize,
+                "GPU selective scan supports at most {PLANE_WIDTH} states"
+            );
+            let delta_raw = into_contiguous(delta);
             let xs = into_contiguous(xs);
             let b_mat = into_contiguous(b_mat);
             let c_mat = into_contiguous(c_mat);
@@ -680,17 +869,49 @@ mod gpu {
             let grad_a = zeros_like(&xs, Shape::new([channels, state_dim]));
             let grad_d = zeros_like(&xs, Shape::new([channels]));
             let grad_h = empty_like(&xs, Shape::new([batch, channels, state_dim]));
+            let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let client = xs.client.clone();
 
-            selective_scan_backward::launch::<R>(
+            let delta_total = (batch * seq_len * channels) as u32;
+            softplus_forward::launch::<R>(
+                &client,
+                CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                CubeDim::new_1d(THREADS_PER_CUBE),
+                delta_raw.clone().into_array_arg(),
+                delta.clone().into_array_arg(),
+            );
+
+            selective_scan_bc_backward::launch::<R>(
                 &client,
                 CubeCount::Static(
-                    (channels as u32).div_ceil(THREADS_PER_CUBE),
-                    batch as u32,
+                    (channels as u32).div_ceil(PLANE_WIDTH),
+                    (batch as u32 * state_dim as u32).div_ceil(PLANES_PER_CUBE),
                     1,
                 ),
-                CubeDim::new_1d(THREADS_PER_CUBE),
+                CubeDim::new_2d(PLANE_WIDTH, PLANES_PER_CUBE),
+                delta.clone().into_array_arg(),
+                xs.clone().into_array_arg(),
+                c_mat.clone().into_array_arg(),
+                a.clone().into_array_arg(),
+                h.clone().into_array_arg(),
+                states.clone().into_array_arg(),
+                grad_y.clone().into_array_arg(),
+                grad_b.clone().into_array_arg(),
+                grad_c.clone().into_array_arg(),
+                channels as u32,
+                seq_len as u32,
+                state_dim,
+            );
+            selective_scan_input_backward::launch::<R>(
+                &client,
+                CubeCount::Static(
+                    1,
+                    (batch as u32 * channels as u32).div_ceil(PLANES_PER_CUBE),
+                    1,
+                ),
+                CubeDim::new_2d(PLANE_WIDTH, PLANES_PER_CUBE),
                 delta.into_array_arg(),
+                delta_raw.into_array_arg(),
                 xs.into_array_arg(),
                 b_mat.into_array_arg(),
                 c_mat.into_array_arg(),
@@ -701,8 +922,6 @@ mod gpu {
                 grad_y.into_array_arg(),
                 grad_delta.clone().into_array_arg(),
                 grad_xs.clone().into_array_arg(),
-                grad_b.clone().into_array_arg(),
-                grad_c.clone().into_array_arg(),
                 grad_a.clone().into_array_arg(),
                 grad_d.clone().into_array_arg(),
                 grad_h.clone().into_array_arg(),
@@ -724,20 +943,26 @@ mod gpu {
     }
 }
 
-#[cfg(all(test, feature = "metal"))]
+#[cfg(all(test, any(feature = "metal", feature = "cuda")))]
 mod tests {
     use burn::tensor::{Tensor, TensorData};
     use burn_autodiff::Autodiff;
+    #[cfg(all(feature = "cuda", not(feature = "metal")))]
+    use burn_cuda::Cuda as Gpu;
     use burn_ndarray::NdArray;
+    #[cfg(feature = "metal")]
     use burn_wgpu::Wgpu;
 
     use super::selective_scan;
-    use crate::burn_model::test_support::{max_diff, values};
+    use crate::model::test_support::{max_diff, values};
 
     #[test]
     fn test_cubecl_selective_scan_matches_ndarray_reference() {
         type Cpu = NdArray;
-        type Gpu = Wgpu;
+        #[cfg(feature = "metal")]
+        type GpuBackend = Wgpu;
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        type GpuBackend = Gpu<cubecl::flex32>;
         let cpu = Default::default();
         let gpu = Default::default();
         let (batch, seq_len, channels, state_dim) = (2, 5, 3, 4);
@@ -767,13 +992,13 @@ mod tests {
             state_dim,
         );
         let (gpu_y, gpu_h) = selective_scan(
-            tensor!(Gpu, &gpu, delta, [batch, seq_len, channels]),
-            tensor!(Gpu, &gpu, xs, [batch, seq_len, channels]),
-            tensor!(Gpu, &gpu, b_mat, [batch, seq_len, state_dim]),
-            tensor!(Gpu, &gpu, c_mat, [batch, seq_len, state_dim]),
-            tensor!(Gpu, &gpu, a, [channels, state_dim]),
-            tensor!(Gpu, &gpu, d, [channels]),
-            tensor!(Gpu, &gpu, h, [batch, channels, state_dim]),
+            tensor!(GpuBackend, &gpu, delta, [batch, seq_len, channels]),
+            tensor!(GpuBackend, &gpu, xs, [batch, seq_len, channels]),
+            tensor!(GpuBackend, &gpu, b_mat, [batch, seq_len, state_dim]),
+            tensor!(GpuBackend, &gpu, c_mat, [batch, seq_len, state_dim]),
+            tensor!(GpuBackend, &gpu, a, [channels, state_dim]),
+            tensor!(GpuBackend, &gpu, d, [channels]),
+            tensor!(GpuBackend, &gpu, h, [batch, channels, state_dim]),
             state_dim,
         );
 
@@ -784,7 +1009,10 @@ mod tests {
     #[test]
     fn test_cubecl_selective_scan_backward_matches_ndarray() {
         type Cpu = Autodiff<NdArray>;
-        type Gpu = Autodiff<Wgpu>;
+        #[cfg(feature = "metal")]
+        type GpuBackend = Autodiff<Wgpu>;
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        type GpuBackend = Autodiff<Gpu<cubecl::flex32>>;
         let cpu = Default::default();
         let gpu = Default::default();
         let (batch, seq_len, channels, state_dim) = (2, 4, 3, 4);
@@ -870,9 +1098,14 @@ mod tests {
         }
 
         let cpu_grads = run!(Cpu, &cpu);
-        let gpu_grads = run!(Gpu, &gpu);
-        for (cpu, gpu) in cpu_grads.into_iter().zip(gpu_grads) {
-            assert!(max_diff(cpu, gpu) < 2e-4);
+        let gpu_grads = run!(GpuBackend, &gpu);
+        for ((name, cpu), gpu) in ["delta", "xs", "b", "c", "a", "d", "h"]
+            .into_iter()
+            .zip(cpu_grads)
+            .zip(gpu_grads)
+        {
+            let difference = max_diff(cpu, gpu);
+            assert!(difference < 2e-4, "{name} gradient max diff: {difference}");
         }
     }
 }
