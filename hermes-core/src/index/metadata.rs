@@ -363,6 +363,7 @@ impl IndexMetadata {
     }
 
     /// Fallible schema-aware loader used for lifecycle publication.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub(crate) async fn try_load_trained_from_fields<D: crate::directories::Directory>(
         vector_fields: &HashMap<u32, FieldVectorMeta>,
         schema: &Schema,

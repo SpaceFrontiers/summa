@@ -337,6 +337,7 @@ pub(super) fn build_vectors_streaming(
     // Stream binary dense vector fields (packed bits, Hamming distance)
     for ((field_id, builder), data_size) in binary_fields.into_iter().zip(binary_field_sizes) {
         let data_offset = current_offset;
+        #[cfg(feature = "native")]
         let num_vectors = builder.len();
 
         FlatVectorData::serialize_binary_from_bits_streaming(

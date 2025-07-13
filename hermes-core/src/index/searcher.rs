@@ -480,16 +480,17 @@ impl<D: Directory + 'static> Searcher<D> {
     }
 
     /// Run a bounded piece of CPU work inside this index's shared search pool.
-    /// Async-only/WASM builds execute inline because Rayon is not available.
+    #[cfg(feature = "sync")]
     pub(crate) fn install_search_cpu<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
-        #[cfg(feature = "sync")]
-        {
-            self.search_pool.install(operation)
-        }
-        #[cfg(not(feature = "sync"))]
-        {
-            operation()
-        }
+        self.search_pool.install(operation)
+    }
+
+    /// Async-only/WASM builds execute inline because Rayon is not available.
+    /// Keeping this overload free of `Send` bounds allows browser-backed file
+    /// handles, whose callbacks are deliberately thread-local, to be scored.
+    #[cfg(not(feature = "sync"))]
+    pub(crate) fn install_search_cpu<R>(&self, operation: impl FnOnce() -> R) -> R {
+        operation()
     }
 
     /// Get number of segments
