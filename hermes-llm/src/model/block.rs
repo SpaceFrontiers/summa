@@ -104,6 +104,16 @@ impl TransformerBlock {
         }
     }
 
+    pub(crate) fn prepare_inference(&mut self) {
+        if let Some(attention) = &mut self.attention {
+            attention.prepare_inference();
+        }
+        if let Some(ssm) = &mut self.ssm {
+            ssm.prepare_inference();
+        }
+        self.feed_forward.prepare_inference();
+    }
+
     pub fn forward_with_state(
         &self,
         x: Tensor<3>,

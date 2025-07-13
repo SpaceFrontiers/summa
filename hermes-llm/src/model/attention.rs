@@ -13,7 +13,7 @@ use burn_nn::{
 use crate::mal::{BlockDef, ModelDef};
 
 use super::fused_attention::{fused_attention, repeat_kv};
-use super::matmul::linear;
+use super::matmul::{linear, prepare_linear_for_inference};
 
 /// Preallocated KV cache for one attention layer, before GQA head expansion.
 #[derive(Debug, Clone)]
@@ -108,6 +108,11 @@ impl MultiHeadAttention {
             v: Some(Tensor::zeros(shape, device)),
             len: 0,
         }
+    }
+
+    pub(crate) fn prepare_inference(&mut self) {
+        prepare_linear_for_inference(&mut self.qkv_proj);
+        prepare_linear_for_inference(&mut self.o_proj);
     }
 
     /// Project and position per-head Q, K, and V tensors.

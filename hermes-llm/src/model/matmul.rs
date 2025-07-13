@@ -5,11 +5,40 @@ use burn::prelude::*;
 use burn::tensor::{DType, FloatDType};
 use burn_nn::Linear;
 
+#[cfg(feature = "cuda")]
+fn matmul_dtype(device: &Device) -> Option<FloatDType> {
+    // BF16 keeps FP32's exponent range during training; decode uses F16 for
+    // compact prepared weights and equally fast A100 tensor-core matmuls.
+    #[cfg(feature = "training-fusion")]
+    let (dtype, float_dtype) = (DType::BF16, FloatDType::BF16);
+    #[cfg(not(feature = "training-fusion"))]
+    let (dtype, float_dtype) = (DType::F16, FloatDType::F16);
+
+    device.supports_dtype(dtype).then_some(float_dtype)
+}
+
+pub(super) fn prepare_linear_for_inference(layer: &mut Linear) {
+    #[cfg(feature = "cuda")]
+    {
+        let Some(dtype) = matmul_dtype(&layer.weight.val().device()) else {
+            return;
+        };
+        layer.weight = layer.weight.clone().map(|weight| weight.cast(dtype));
+        layer.bias = layer
+            .bias
+            .take()
+            .map(|bias| bias.map(|value| value.cast(dtype)));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    let _ = layer;
+}
+
 pub(super) fn matmul_input<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     #[cfg(feature = "cuda")]
     {
-        if tensor.device().supports_dtype(DType::F16) {
-            return tensor.cast(FloatDType::F16);
+        if let Some(dtype) = matmul_dtype(&tensor.device()) {
+            return tensor.cast(dtype);
         }
     }
 
@@ -19,13 +48,13 @@ pub(super) fn matmul_input<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
 pub(super) fn linear<const D: usize>(layer: &Linear, input: Tensor<D>) -> Tensor<D> {
     #[cfg(feature = "cuda")]
     {
-        if input.device().supports_dtype(DType::F16) {
+        if matmul_dtype(&input.device()).is_some() {
             return burn::tensor::module::linear(
                 matmul_input(input),
                 matmul_input(layer.weight.val()),
                 layer.bias.as_ref().map(|bias| matmul_input(bias.val())),
             )
-            .cast(FloatDType::Flex32);
+            .cast(FloatDType::F32);
         }
     }
 
@@ -35,22 +64,22 @@ pub(super) fn linear<const D: usize>(layer: &Linear, input: Tensor<D>) -> Tensor
 pub(super) fn matmul_2(lhs: Tensor<2>, rhs: Tensor<2>) -> Tensor<2> {
     #[cfg(feature = "cuda")]
     {
-        if lhs.device().supports_dtype(DType::F16) {
+        if matmul_dtype(&lhs.device()).is_some() {
             return matmul_input(lhs)
                 .matmul(matmul_input(rhs))
-                .cast(FloatDType::Flex32);
+                .cast(FloatDType::F32);
         }
     }
 
     lhs.matmul(rhs)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "training-fusion")]
 pub(super) fn matmul_4(lhs: Tensor<4>, rhs: Tensor<4>) -> Tensor<4> {
-    if lhs.device().supports_dtype(DType::F16) {
+    if matmul_dtype(&lhs.device()).is_some() {
         return matmul_input(lhs)
             .matmul(matmul_input(rhs))
-            .cast(FloatDType::Flex32);
+            .cast(FloatDType::F32);
     }
 
     lhs.matmul(rhs)

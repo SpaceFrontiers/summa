@@ -22,6 +22,34 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
 use super::conv::DepthwiseConv1dBackend;
 
+#[cfg(any(feature = "metal", feature = "cuda", test))]
+const CHECKPOINTED_SCAN_INTERVAL: usize = 32;
+#[cfg(any(feature = "metal", feature = "cuda", test))]
+const MAX_FULL_STATE_BATCH: usize = 2;
+#[cfg(any(feature = "metal", feature = "cuda", test))]
+const MAX_FULL_STATE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Keep every recurrent state when a small training batch fits a bounded
+/// per-layer budget; larger batches trade one recurrence recompute for memory.
+#[cfg(any(feature = "metal", feature = "cuda", test))]
+pub(super) fn scan_checkpoint_interval(
+    batch: usize,
+    seq_len: usize,
+    channels: usize,
+    state_dim: usize,
+) -> usize {
+    let state_bytes = batch
+        .saturating_mul(seq_len)
+        .saturating_mul(channels)
+        .saturating_mul(state_dim)
+        .saturating_mul(size_of::<f32>());
+    if batch <= MAX_FULL_STATE_BATCH && state_bytes <= MAX_FULL_STATE_BYTES {
+        1
+    } else {
+        CHECKPOINTED_SCAN_INTERVAL
+    }
+}
+
 fn stable_softplus<const D: usize>(value: Tensor<D>) -> Tensor<D> {
     relu(value.clone()) + (-value.abs()).exp().add_scalar(1.0).log()
 }
@@ -531,11 +559,15 @@ mod gpu {
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
-    use super::MambaBackend;
+    use super::{MambaBackend, scan_checkpoint_interval};
     use crate::model::cube_tensor::{empty_like, into_contiguous, zeros_like};
 
     const THREADS_PER_CUBE: u32 = 128;
     const PLANE_WIDTH: u32 = 32;
+    const FORWARD_CHANNELS: u32 = THREADS_PER_CUBE / PLANE_WIDTH;
+    // A100 measurements favor serial recurrence once this many independent
+    // blocks are available; smaller grids benefit from parallel state lanes.
+    const SERIAL_SCAN_MIN_BLOCKS: u32 = 128;
     const BACKWARD_CHANNELS: usize = 16;
 
     #[cube]
@@ -633,70 +665,131 @@ mod gpu {
         }
     }
 
-    /// Parallelize the recurrent state dimension. Each thread still follows
-    /// one exact scalar recurrence through time, while a separate kernel
-    /// reduces the small state dimension into the output.
+    /// One thread owns a batch/channel pair. This avoids a plane reduction
+    /// when the batch/channel grid already has enough blocks to fill the GPU.
+    #[allow(clippy::manual_div_ceil)]
     #[cube(launch)]
-    fn selective_scan_states(
+    fn selective_scan_forward_serial(
         delta: &Tensor<f32>,
         xs: &Tensor<f32>,
         b_mat: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
         a: &Tensor<f32>,
+        d: &Tensor<f32>,
         h_in: &Tensor<f32>,
-        states: &mut Tensor<f32>,
+        y: &mut Tensor<f32>,
+        checkpoints: &mut Tensor<f32>,
         h_out: &mut Tensor<f32>,
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
+        #[comptime] checkpoint_interval: usize,
+        #[comptime] save_checkpoints: bool,
     ) {
         let channels = channels as usize;
         let seq_len = seq_len as usize;
         let idx = ABSOLUTE_POS;
-        if idx < h_out.len() {
-            let n = idx % state_dim;
-            let batch_channel = idx / state_dim;
-            let batch = batch_channel / channels;
-            let channel = batch_channel % channels;
-            let mut state = h_in[idx];
-            let av = a[channel * state_dim + n];
+        let batch_channels = xs.len() / seq_len;
+        if idx < batch_channels {
+            let batch = idx / channels;
+            let channel = idx % channels;
+            let state_base = idx * state_dim;
+            let a_base = channel * state_dim;
+            let checkpoint_count = (seq_len + checkpoint_interval - 1) / checkpoint_interval;
+            let mut state = Array::<f32>::new(state_dim);
+            for n in 0..state_dim {
+                state[n] = h_in[state_base + n];
+            }
 
             for t in 0..seq_len {
                 let btc = (batch * seq_len + t) * channels + channel;
-                let btn = (batch * seq_len + t) * state_dim + n;
+                let btn = (batch * seq_len + t) * state_dim;
                 let dt = delta[btc];
                 let x = xs[btc];
-                state = state * (dt * av).exp() + dt * b_mat[btn] * x;
-                states[btc * state_dim + n] = state;
+                let mut out = 0.0f32;
+                for n in 0..state_dim {
+                    state[n] = state[n] * (dt * a[a_base + n]).exp() + dt * b_mat[btn + n] * x;
+                    out += state[n] * c_mat[btn + n];
+                }
+                y[btc] = out + x * d[channel];
+
+                if save_checkpoints && ((t + 1) % checkpoint_interval == 0 || t + 1 == seq_len) {
+                    let checkpoint = t / checkpoint_interval;
+                    let checkpoint_base =
+                        ((batch * checkpoint_count + checkpoint) * channels + channel) * state_dim;
+                    for n in 0..state_dim {
+                        checkpoints[checkpoint_base + n] = state[n];
+                    }
+                }
             }
-            h_out[idx] = state;
+            for n in 0..state_dim {
+                h_out[state_base + n] = state[n];
+            }
         }
     }
 
+    /// One plane owns a batch/channel pair. This exposes the state dimension
+    /// as parallel work when a small batch would otherwise underfill the GPU.
+    #[allow(clippy::manual_div_ceil)]
     #[cube(launch)]
-    fn selective_scan_output(
+    fn selective_scan_forward_parallel(
+        delta: &Tensor<f32>,
         xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
         c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
         d: &Tensor<f32>,
-        states: &Tensor<f32>,
+        h_in: &Tensor<f32>,
         y: &mut Tensor<f32>,
+        checkpoints: &mut Tensor<f32>,
+        h_out: &mut Tensor<f32>,
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
+        #[comptime] checkpoint_interval: usize,
+        #[comptime] save_checkpoints: bool,
     ) {
         let channels = channels as usize;
         let seq_len = seq_len as usize;
-        let btc = ABSOLUTE_POS;
-        if btc < xs.len() {
-            let channel = btc % channels;
-            let batch_time = btc / channels;
-            let batch = batch_time / seq_len;
-            let t = batch_time % seq_len;
+        let n = UNIT_POS_X as usize;
+        let local_channel = UNIT_POS_Y as usize;
+        let batch = CUBE_POS_Y as usize;
+        let channel = CUBE_POS_X as usize * FORWARD_CHANNELS as usize + local_channel;
+        let active_channel = channel < channels;
+        let active = active_channel && n < state_dim;
+        let state_base = (batch * channels + channel) * state_dim;
+        let a_base = channel * state_dim;
+        let checkpoint_count = (seq_len + checkpoint_interval - 1) / checkpoint_interval;
+        let mut state = if active { h_in[state_base + n] } else { 0.0f32 };
+
+        for t in 0..seq_len {
+            let btc = (batch * seq_len + t) * channels + channel;
             let btn = (batch * seq_len + t) * state_dim;
-            let mut out = 0.0f32;
-            for n in 0..state_dim {
-                out += states[btc * state_dim + n] * c_mat[btn + n];
+            let dt = if active_channel { delta[btc] } else { 0.0f32 };
+            let x = if active_channel { xs[btc] } else { 0.0f32 };
+            let contribution = if active {
+                state = state * (dt * a[a_base + n]).exp() + dt * b_mat[btn + n] * x;
+                state * c_mat[btn + n]
+            } else {
+                0.0f32
+            };
+            let out = plane_sum(contribution);
+            if n == 0 && active_channel {
+                y[btc] = out + x * d[channel];
             }
-            y[btc] = out + xs[btc] * d[channel];
+
+            if active
+                && save_checkpoints
+                && ((t + 1) % checkpoint_interval == 0 || t + 1 == seq_len)
+            {
+                let checkpoint = t / checkpoint_interval;
+                let checkpoint_base =
+                    ((batch * checkpoint_count + checkpoint) * channels + channel) * state_dim;
+                checkpoints[checkpoint_base + n] = state;
+            }
+        }
+        if active {
+            h_out[state_base + n] = state;
         }
     }
 
@@ -704,7 +797,7 @@ mod gpu {
     /// gradient while following the reverse recurrence exactly once. The
     /// channel and state reductions share the per-token contributions in
     /// workgroup memory instead of launching a second recurrent kernel.
-    #[allow(clippy::useless_conversion)]
+    #[allow(clippy::manual_div_ceil, clippy::useless_conversion)]
     #[cube(launch)]
     fn selective_scan_backward_fused(
         delta: &Tensor<f32>,
@@ -715,7 +808,7 @@ mod gpu {
         a: &Tensor<f32>,
         d: &Tensor<f32>,
         h_in: &Tensor<f32>,
-        states: &Tensor<f32>,
+        checkpoints: &Tensor<f32>,
         grad_y: &Tensor<f32>,
         grad_delta: &mut Tensor<f32>,
         grad_xs: &mut Tensor<f32>,
@@ -727,6 +820,7 @@ mod gpu {
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
+        #[comptime] checkpoint_interval: usize,
     ) {
         let channels = channels as usize;
         let seq_len = seq_len as usize;
@@ -747,59 +841,98 @@ mod gpu {
         let mut adjoint = 0.0f32;
         let mut grad_a_local = 0.0f32;
         let mut grad_d_local = 0.0f32;
+        let checkpoint_count = (seq_len + checkpoint_interval - 1) / checkpoint_interval;
 
-        for step in 0..seq_len {
-            let t = seq_len - step - 1;
-            let btc = (batch * seq_len + t) * channels + channel;
-            let btn = (batch * seq_len + t) * state_dim;
-            let dt = if active { delta[btc] } else { 0.0f32 };
-            let raw_dt = if active { delta_raw[btc] } else { 0.0f32 };
-            let x = if active { xs[btc] } else { 0.0f32 };
-            let dy = if active { grad_y[btc] } else { 0.0f32 };
-            let av = if active { a[a_index] } else { 0.0f32 };
-            let bv = if active { b_mat[btn + n] } else { 0.0f32 };
-            let cv = if active { c_mat[btn + n] } else { 0.0f32 };
-            let alpha = (dt * av).exp();
-            let h_prev = if active {
-                if t == 0 {
+        for checkpoint_step in 0..checkpoint_count {
+            let checkpoint = checkpoint_count - checkpoint_step - 1;
+            let start = checkpoint * checkpoint_interval;
+            let mut end = start + checkpoint_interval;
+            if end > seq_len {
+                end = seq_len;
+            }
+            let chunk_len = end - start;
+            let state_before = if active {
+                if checkpoint == 0 {
                     h_in[state_index]
                 } else {
-                    states[((batch * seq_len + t - 1) * channels + channel) * state_dim + n]
+                    checkpoints[((batch * checkpoint_count + checkpoint - 1) * channels + channel)
+                        * state_dim
+                        + n]
                 }
             } else {
                 0.0f32
             };
-            let h_t = if active {
-                states[btc * state_dim + n]
-            } else {
-                0.0f32
-            };
-            let g = adjoint + dy * cv;
-            let shared_offset = (step % 2) * shared_len;
-            grad_dt_shared[shared_offset + shared_index] = g * (h_prev * alpha * av + bv * x);
-            grad_x_shared[shared_offset + shared_index] = g * dt * bv;
-            let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
-            let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
-            sync_cube();
+            let av = if active { a[a_index] } else { 0.0f32 };
+            let mut state = state_before;
+            let mut chunk_states = Array::<f32>::new(checkpoint_interval);
 
-            if n == 0 && active_channel {
-                let mut grad_dt = 0.0f32;
-                let mut grad_x = 0.0f32;
-                for state in 0..state_dim {
-                    let index = shared_offset + state * BACKWARD_CHANNELS + local_channel;
-                    grad_dt += grad_dt_shared[index];
-                    grad_x += grad_x_shared[index];
+            if checkpoint_interval == 1 {
+                chunk_states[0] = if active {
+                    checkpoints[((batch * checkpoint_count + checkpoint) * channels + channel)
+                        * state_dim
+                        + n]
+                } else {
+                    0.0f32
+                };
+            } else {
+                for offset in 0..chunk_len {
+                    let t = start + offset;
+                    let btc = (batch * seq_len + t) * channels + channel;
+                    let btn = (batch * seq_len + t) * state_dim;
+                    let dt = if active { delta[btc] } else { 0.0f32 };
+                    let x = if active { xs[btc] } else { 0.0f32 };
+                    let bv = if active { b_mat[btn + n] } else { 0.0f32 };
+                    state = state * (dt * av).exp() + dt * bv * x;
+                    chunk_states[offset] = state;
                 }
-                grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
-                grad_xs[btc] = dy * d[channel] + grad_x;
-                grad_d_local += dy * x;
             }
-            if local_channel == 0 {
-                atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
-                atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
+
+            for reverse_offset in 0..chunk_len {
+                let offset = chunk_len - reverse_offset - 1;
+                let t = start + offset;
+                let btc = (batch * seq_len + t) * channels + channel;
+                let btn = (batch * seq_len + t) * state_dim;
+                let dt = if active { delta[btc] } else { 0.0f32 };
+                let raw_dt = if active { delta_raw[btc] } else { 0.0f32 };
+                let x = if active { xs[btc] } else { 0.0f32 };
+                let dy = if active { grad_y[btc] } else { 0.0f32 };
+                let bv = if active { b_mat[btn + n] } else { 0.0f32 };
+                let cv = if active { c_mat[btn + n] } else { 0.0f32 };
+                let alpha = (dt * av).exp();
+                let h_prev = if offset == 0 {
+                    state_before
+                } else {
+                    chunk_states[offset - 1]
+                };
+                let h_t = chunk_states[offset];
+                let g = adjoint + dy * cv;
+                let step = seq_len - t - 1;
+                let shared_offset = (step % 2) * shared_len;
+                grad_dt_shared[shared_offset + shared_index] = g * (h_prev * alpha * av + bv * x);
+                grad_x_shared[shared_offset + shared_index] = g * dt * bv;
+                let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
+                let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
+                sync_cube();
+
+                if n == 0 && active_channel {
+                    let mut grad_dt = 0.0f32;
+                    let mut grad_x = 0.0f32;
+                    for state in 0..state_dim {
+                        let index = shared_offset + state * BACKWARD_CHANNELS + local_channel;
+                        grad_dt += grad_dt_shared[index];
+                        grad_x += grad_x_shared[index];
+                    }
+                    grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
+                    grad_xs[btc] = dy * d[channel] + grad_x;
+                    grad_d_local += dy * x;
+                }
+                if local_channel == 0 {
+                    atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
+                    atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
+                }
+                grad_a_local += g * h_prev * alpha * dt;
+                adjoint = g * alpha;
             }
-            grad_a_local += g * h_prev * alpha * dt;
-            adjoint = g * alpha;
         }
 
         if active {
@@ -824,6 +957,10 @@ mod gpu {
             save_states: bool,
         ) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
             let [batch, seq_len, channels] = xs.shape().dims();
+            assert!(
+                state_dim <= PLANE_WIDTH as usize,
+                "GPU selective scan supports at most {PLANE_WIDTH} states"
+            );
             let delta_raw = into_contiguous(delta);
             let xs = into_contiguous(xs);
             let b_mat = into_contiguous(b_mat);
@@ -834,9 +971,18 @@ mod gpu {
             let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let h_out = empty_like(&xs, Shape::new([batch, channels, state_dim]));
             let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
-            let parallel_scan = save_states || seq_len > 1;
-            let states = if parallel_scan {
-                empty_like(&xs, Shape::new([batch, seq_len, channels, state_dim]))
+            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+            let full_sequence_scan = save_states || seq_len > 1;
+            let states = if save_states {
+                empty_like(
+                    &xs,
+                    Shape::new([
+                        batch,
+                        seq_len.div_ceil(checkpoint_interval),
+                        channels,
+                        state_dim,
+                    ]),
+                )
             } else {
                 h_out.clone()
             };
@@ -850,37 +996,55 @@ mod gpu {
                 delta_raw.into_tensor_arg(),
                 delta.clone().into_tensor_arg(),
             );
-            if parallel_scan {
-                let state_total = (batch * channels * state_dim) as u32;
-                selective_scan_states::launch::<R>(
-                    &client,
-                    CubeCount::Static(state_total.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    delta.clone().into_tensor_arg(),
-                    xs.clone().into_tensor_arg(),
-                    b_mat.clone().into_tensor_arg(),
-                    a.clone().into_tensor_arg(),
-                    h.clone().into_tensor_arg(),
-                    states.clone().into_tensor_arg(),
-                    h_out.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                );
-                let output_total = (batch * seq_len * channels) as u32;
-                selective_scan_output::launch::<R>(
-                    &client,
-                    CubeCount::Static(output_total.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    xs.clone().into_tensor_arg(),
-                    c_mat.into_tensor_arg(),
-                    d.into_tensor_arg(),
-                    states.clone().into_tensor_arg(),
-                    y.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                );
+            if full_sequence_scan {
+                let serial_blocks = ((batch * channels) as u32).div_ceil(THREADS_PER_CUBE);
+                if serial_blocks >= SERIAL_SCAN_MIN_BLOCKS {
+                    selective_scan_forward_serial::launch::<R>(
+                        &client,
+                        CubeCount::Static(serial_blocks, 1, 1),
+                        CubeDim::new_1d(THREADS_PER_CUBE),
+                        delta.clone().into_tensor_arg(),
+                        xs.clone().into_tensor_arg(),
+                        b_mat.clone().into_tensor_arg(),
+                        c_mat.into_tensor_arg(),
+                        a.clone().into_tensor_arg(),
+                        d.into_tensor_arg(),
+                        h.clone().into_tensor_arg(),
+                        y.clone().into_tensor_arg(),
+                        states.clone().into_tensor_arg(),
+                        h_out.clone().into_tensor_arg(),
+                        channels as u32,
+                        seq_len as u32,
+                        state_dim,
+                        checkpoint_interval,
+                        save_states,
+                    );
+                } else {
+                    selective_scan_forward_parallel::launch::<R>(
+                        &client,
+                        CubeCount::Static(
+                            (channels as u32).div_ceil(FORWARD_CHANNELS),
+                            batch as u32,
+                            1,
+                        ),
+                        CubeDim::new_2d(PLANE_WIDTH, FORWARD_CHANNELS),
+                        delta.clone().into_tensor_arg(),
+                        xs.clone().into_tensor_arg(),
+                        b_mat.clone().into_tensor_arg(),
+                        c_mat.into_tensor_arg(),
+                        a.clone().into_tensor_arg(),
+                        d.into_tensor_arg(),
+                        h.clone().into_tensor_arg(),
+                        y.clone().into_tensor_arg(),
+                        states.clone().into_tensor_arg(),
+                        h_out.clone().into_tensor_arg(),
+                        channels as u32,
+                        seq_len as u32,
+                        state_dim,
+                        checkpoint_interval,
+                        save_states,
+                    );
+                }
             } else {
                 let total = (batch * channels) as u32;
                 selective_scan_step::launch::<R>(
@@ -946,6 +1110,7 @@ mod gpu {
             let grad_d = zeros_like(&xs, Shape::new([channels]));
             let grad_h = empty_like(&xs, Shape::new([batch, channels, state_dim]));
             let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
             let client = xs.client.clone();
 
             let delta_total = (batch * seq_len * channels) as u32;
@@ -985,10 +1150,29 @@ mod gpu {
                 channels as u32,
                 seq_len as u32,
                 state_dim,
+                checkpoint_interval,
             );
 
             (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h)
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{CHECKPOINTED_SCAN_INTERVAL, scan_checkpoint_interval};
+
+    #[test]
+    fn full_states_are_limited_to_small_bounded_batches() {
+        assert_eq!(scan_checkpoint_interval(2, 4096, 1024, 16), 1);
+        assert_eq!(
+            scan_checkpoint_interval(16, 1024, 1024, 16),
+            CHECKPOINTED_SCAN_INTERVAL
+        );
+        assert_eq!(
+            scan_checkpoint_interval(2, 8192, 1024, 16),
+            CHECKPOINTED_SCAN_INTERVAL
+        );
     }
 }
 
@@ -1011,7 +1195,7 @@ mod tests {
     fn test_cubecl_selective_scan_matches_ndarray_reference() {
         let cpu = Device::ndarray();
         let gpu = gpu_device();
-        let (batch, seq_len, channels, state_dim) = (2, 5, 3, 4);
+        let (batch, seq_len, channels, state_dim) = (2, 35, 3, 4);
 
         let delta = values(batch * seq_len * channels, 0.13, 0.08);
         let xs = values(batch * seq_len * channels, 0.17, -0.03);
@@ -1052,11 +1236,10 @@ mod tests {
         assert!(max_diff(cpu_h.into_data(), gpu_h.into_data()) < 1e-5);
     }
 
-    #[test]
-    fn test_cubecl_selective_scan_backward_matches_ndarray() {
+    fn assert_cubecl_selective_scan_backward(batch: usize) {
         let cpu = Device::ndarray().autodiff();
         let gpu = gpu_device().autodiff();
-        let (batch, seq_len, channels, state_dim) = (2, 4, 3, 4);
+        let (seq_len, channels, state_dim) = (37, 3, 4);
         let shapes = (
             [batch, seq_len, channels],
             [batch, seq_len, state_dim],
@@ -1128,5 +1311,15 @@ mod tests {
             let difference = max_diff(cpu, gpu);
             assert!(difference < 2e-4, "{name} gradient max diff: {difference}");
         }
+    }
+
+    #[test]
+    fn test_cubecl_selective_scan_full_state_backward_matches_ndarray() {
+        assert_cubecl_selective_scan_backward(2);
+    }
+
+    #[test]
+    fn test_cubecl_selective_scan_checkpointed_backward_matches_ndarray() {
+        assert_cubecl_selective_scan_backward(3);
     }
 }

@@ -133,6 +133,7 @@ fn main() -> Result<()> {
 
             let mut model = hermes_llm::Transformer::new(&config, &device)?;
             hermes_llm::load_safetensors(&mut model, &checkpoint_path)?;
+            model.prepare_inference();
 
             info!("Loaded model from {}", checkpoint_path.display());
 

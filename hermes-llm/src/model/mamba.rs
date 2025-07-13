@@ -12,7 +12,7 @@ use burn_nn::{Linear, LinearConfig};
 use crate::mal::{ModelDef, SsmDef};
 
 use super::conv::depthwise_conv1d;
-use super::matmul::linear;
+use super::matmul::{linear, prepare_linear_for_inference};
 use super::scan::selective_scan;
 
 /// Recurrent state for one Mamba layer.
@@ -88,6 +88,17 @@ impl MambaMixer {
         MambaState {
             conv: Tensor::zeros([batch, self.d_inner, self.conv_kernel - 1], device),
             h: Tensor::zeros([batch, self.d_inner, self.state_dim], device),
+        }
+    }
+
+    pub(crate) fn prepare_inference(&mut self) {
+        for layer in [
+            &mut self.in_proj,
+            &mut self.x_proj,
+            &mut self.dt_proj,
+            &mut self.out_proj,
+        ] {
+            prepare_linear_for_inference(layer);
         }
     }
 

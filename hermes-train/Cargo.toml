@@ -27,7 +27,7 @@ tempfile.workspace = true
 [features]
 default = []
 metal = ["hermes-llm/metal"]
-cuda = ["hermes-llm/cuda"]
+cuda = ["hermes-llm/training-fusion"]
 
 [[bin]]
 name = "hermes-train"
