@@ -170,6 +170,11 @@ pub struct SegmentFiles {
     pub vectors: PathBuf,
     /// Sparse vector posting lists (per field, per dimension)
     pub sparse: PathBuf,
+    /// Temporary sparse skip table used while streaming large merges.
+    ///
+    /// This is segment-scoped so abort and orphan cleanup must treat it as
+    /// part of the segment lifecycle, even though readers never open it.
+    pub sparse_skip_temp: PathBuf,
     /// Token positions for phrase queries (fields with record_positions=true)
     pub positions: PathBuf,
     /// Fast-field columnar storage for O(1) doc→value access
@@ -186,6 +191,7 @@ impl SegmentFiles {
             meta: PathBuf::from(format!("{}.meta", prefix)),
             vectors: PathBuf::from(format!("{}.vectors", prefix)),
             sparse: PathBuf::from(format!("{}.sparse", prefix)),
+            sparse_skip_temp: PathBuf::from(format!("{}.skip.tmp", prefix)),
             positions: PathBuf::from(format!("{}.pos", prefix)),
             fast: PathBuf::from(format!("{}.fast", prefix)),
         }

@@ -363,6 +363,7 @@ pub async fn delete_segment<D: Directory + DirectoryWriter>(
         dir.delete(&files.meta),
         dir.delete(&files.vectors),
         dir.delete(&files.sparse),
+        dir.delete(&files.sparse_skip_temp),
         dir.delete(&files.positions),
         dir.delete(&files.fast),
     );
@@ -372,6 +373,7 @@ pub async fn delete_segment<D: Directory + DirectoryWriter>(
     // reported as successful; a later orphan sweep can retry remaining files.
     for result in [
         results.0, results.1, results.2, results.3, results.4, results.5, results.6, results.7,
+        results.8,
     ] {
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::NotFound

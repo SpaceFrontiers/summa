@@ -2,6 +2,42 @@ use crate::directories::RamDirectory;
 use crate::dsl::{Document, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
 
+/// A failed sparse merge can leave its segment-scoped skip table behind.
+/// Cleanup must remove that temporary file along with the normal segment
+/// files; otherwise every optimizer scan rediscovers and reports the same ID.
+#[tokio::test]
+async fn test_orphan_sweep_removes_sparse_skip_temp_once() {
+    use crate::directories::{Directory, DirectoryWriter};
+    use crate::segment::{SegmentFiles, SegmentId};
+
+    let schema = SchemaBuilder::default().build();
+    let dir = RamDirectory::new();
+    let index = Index::create(
+        dir.clone(),
+        schema,
+        IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let manager = index.segment_manager();
+
+    let orphan_id = SegmentId::new();
+    let temp_path = SegmentFiles::new(orphan_id.0).sparse_skip_temp;
+    dir.write(&temp_path, b"partial skip table").await.unwrap();
+
+    assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 1);
+    assert_eq!(manager.cleanup_orphan_segments().await.unwrap(), 0);
+    assert!(
+        !dir.list_files(std::path::Path::new(""))
+            .await
+            .unwrap()
+            .contains(&temp_path)
+    );
+}
+
 /// Regression for the production lifecycle race: the optimizer's orphan
 /// sweep ran while indexing workers had finished files but had not yet
 /// published metadata. The sweep deleted those files and commit subsequently

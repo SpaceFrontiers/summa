@@ -71,8 +71,8 @@ impl SegmentMerger {
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
         // Skip entries written to a temp file to avoid unbounded memory usage.
         // For large indexes (200M+ docs) the skip section can exceed 3 GB.
-        let skip_tmp = files.sparse.with_extension("skip.tmp");
-        let mut skip_writer = dir.streaming_writer_cold(&skip_tmp).await?;
+        let skip_tmp = &files.sparse_skip_temp;
+        let mut skip_writer = dir.streaming_writer_cold(skip_tmp).await?;
         let mut skip_count: u32 = 0;
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
@@ -374,7 +374,7 @@ impl SegmentMerger {
         if field_tocs.is_empty() {
             drop(writer);
             let _ = dir.delete(&files.sparse).await;
-            let _ = dir.delete(&skip_tmp).await;
+            let _ = dir.delete(skip_tmp).await;
             return Ok((0, all_converged));
         }
 
@@ -386,14 +386,14 @@ impl SegmentMerger {
             let mut pos = 0u64;
             while pos < skip_size {
                 let end = (pos + SKIP_COPY_CHUNK).min(skip_size);
-                let chunk = dir.read_range(&skip_tmp, pos..end).await?;
+                let chunk = dir.read_range(skip_tmp, pos..end).await?;
                 writer
                     .write_all(chunk.as_slice())
                     .map_err(crate::Error::Io)?;
                 pos = end;
             }
         }
-        dir.delete(&skip_tmp).await.map_err(crate::Error::Io)?;
+        dir.delete(skip_tmp).await.map_err(crate::Error::Io)?;
 
         // Phase 3 + 4: Write TOC + footer
         let toc_offset = writer.offset();
