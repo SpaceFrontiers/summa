@@ -1,7 +1,9 @@
 //! Segment types and metadata
 
 use std::io::{self, Cursor};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
+use std::path::Path;
+use std::path::PathBuf;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rustc_hash::FxHashMap;
@@ -192,6 +194,7 @@ impl SegmentFiles {
     }
 
     /// Files every readable segment must contain.
+    #[cfg(feature = "native")]
     pub(crate) fn mandatory_paths(&self) -> [&Path; 4] {
         [
             self.meta.as_path(),
@@ -205,11 +208,13 @@ impl SegmentFiles {
     ///
     /// Readers never open it, but abort and orphan cleanup must treat it as a
     /// segment-owned artifact.
+    #[cfg(feature = "native")]
     pub(crate) fn sparse_skip_temp(&self) -> PathBuf {
         self.sparse.with_extension("skip.tmp")
     }
 
     /// Every permanent or temporary path owned by this segment ID.
+    #[cfg(feature = "native")]
     pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 9] {
         [
             self.term_dict.clone(),
