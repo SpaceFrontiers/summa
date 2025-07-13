@@ -35,6 +35,27 @@ impl Default for MultiValueCombiner {
 }
 
 impl MultiValueCombiner {
+    pub(crate) fn validate(self) -> Result<(), String> {
+        match self {
+            Self::LogSumExp { temperature } if !temperature.is_finite() || temperature <= 0.0 => {
+                Err(format!(
+                    "LogSumExp temperature must be finite and greater than zero, got {temperature}"
+                ))
+            }
+            Self::WeightedTopK { k: 0, .. } => {
+                Err("WeightedTopK k must be greater than zero".to_string())
+            }
+            Self::WeightedTopK { decay, .. }
+                if !decay.is_finite() || !(0.0..=1.0).contains(&decay) =>
+            {
+                Err(format!(
+                    "WeightedTopK decay must be finite and in [0, 1], got {decay}"
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Create LogSumExp combiner with default temperature (1.5)
     pub fn log_sum_exp() -> Self {
         Self::LogSumExp { temperature: 1.5 }

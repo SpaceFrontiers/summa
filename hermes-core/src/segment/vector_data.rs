@@ -21,38 +21,84 @@ pub fn dequantize_raw(
     quant: DenseVectorQuantization,
     num_floats: usize,
     out: &mut [f32],
-) {
-    debug_assert!(out.len() >= num_floats);
+) -> io::Result<()> {
+    if out.len() < num_floats {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "dequantization output is too short: need {num_floats} floats, got {}",
+                out.len()
+            ),
+        ));
+    }
+
+    let element_size = match quant {
+        DenseVectorQuantization::F32 => size_of::<f32>(),
+        DenseVectorQuantization::F16 => size_of::<u16>(),
+        DenseVectorQuantization::UInt8 => size_of::<u8>(),
+        DenseVectorQuantization::Binary => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary vectors cannot be dequantized to f32",
+            ));
+        }
+    };
+    let expected_bytes = num_floats.checked_mul(element_size).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dequantization byte length overflows usize",
+        )
+    })?;
+    if raw.len() != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "dequantization input length mismatch: need {expected_bytes} bytes, got {}",
+                raw.len()
+            ),
+        ));
+    }
+
     match quant {
         DenseVectorQuantization::F32 => {
-            debug_assert!(
-                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
-                "f32 vector data not 4-byte aligned"
-            );
+            if expected_bytes > 0
+                && !(raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "f32 vector data is not 4-byte aligned",
+                ));
+            }
             out[..num_floats].copy_from_slice(unsafe {
+                // Safety: the exact byte length and f32 alignment were checked above.
                 std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats)
             });
         }
         DenseVectorQuantization::F16 => {
-            debug_assert!(
-                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
-                "f16 vector data not 2-byte aligned"
-            );
-            let f16_slice =
-                unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, num_floats) };
+            if expected_bytes > 0
+                && !(raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "f16 vector data is not 2-byte aligned",
+                ));
+            }
+            let f16_slice = unsafe {
+                // Safety: the exact byte length and u16 alignment were checked above.
+                std::slice::from_raw_parts(raw.as_ptr() as *const u16, num_floats)
+            };
             for (i, &h) in f16_slice.iter().enumerate() {
                 out[i] = f16_to_f32(h);
             }
         }
         DenseVectorQuantization::UInt8 => {
-            for (i, &b) in raw.iter().enumerate().take(num_floats) {
+            for (i, &b) in raw.iter().enumerate() {
                 out[i] = u8_to_f32(b);
             }
         }
-        DenseVectorQuantization::Binary => {
-            unreachable!("Binary vectors use raw bytes, not f32 dequantization");
-        }
+        DenseVectorQuantization::Binary => unreachable!("validated above"),
     }
+    Ok(())
 }
 
 /// Flat vector binary format helpers for writing.
@@ -70,6 +116,124 @@ pub fn dequantize_raw(
 pub struct FlatVectorData;
 
 impl FlatVectorData {
+    fn validate_shape(
+        dim: usize,
+        num_vectors: usize,
+        quant: DenseVectorQuantization,
+    ) -> io::Result<usize> {
+        if dim == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector dimension must be greater than zero",
+            ));
+        }
+        if quant == DenseVectorQuantization::Binary && !dim.is_multiple_of(8) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("binary flat vector dimension must be a multiple of 8, got {dim}"),
+            ));
+        }
+        u32::try_from(dim).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("flat vector dimension {dim} exceeds u32::MAX"),
+            )
+        })?;
+        u32::try_from(num_vectors).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("flat vector count {num_vectors} exceeds u32::MAX"),
+            )
+        })?;
+
+        match quant {
+            DenseVectorQuantization::Binary => dim.checked_add(7).map(|bits| bits / 8),
+            _ => dim.checked_mul(quant.element_size()),
+        }
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector byte size overflows usize",
+            )
+        })
+    }
+
+    fn validate_doc_ids(doc_ids: &[(u32, u16)]) -> io::Result<()> {
+        if let Some(pair) = doc_ids.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flat vector doc map must be strictly sorted by (doc_id, ordinal), found {:?} before {:?}",
+                    pair[0], pair[1]
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate a dense writer input completely before any bytes are emitted.
+    /// Returns the exact serialized size on success.
+    pub(crate) fn validate_dense_input(
+        dim: usize,
+        flat_vectors: &[f32],
+        doc_ids: &[(u32, u16)],
+        quant: DenseVectorQuantization,
+    ) -> io::Result<usize> {
+        if quant == DenseVectorQuantization::Binary {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary quantization must use serialize_binary_from_bits_streaming",
+            ));
+        }
+        let num_vectors = doc_ids.len();
+        let expected_floats = num_vectors.checked_mul(dim).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat f32 vector count overflows usize",
+            )
+        })?;
+        if flat_vectors.len() != expected_floats {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flat vector input has {} floats, expected {num_vectors} x {dim} = {expected_floats}",
+                    flat_vectors.len()
+                ),
+            ));
+        }
+        Self::validate_doc_ids(doc_ids)?;
+        Self::serialized_binary_size(dim, num_vectors, quant)
+    }
+
+    /// Validate a packed-binary writer input completely before any bytes are
+    /// emitted. Returns the exact serialized size on success.
+    pub(crate) fn validate_binary_input(
+        dim_bits: usize,
+        packed_vectors: &[u8],
+        doc_ids: &[(u32, u16)],
+    ) -> io::Result<usize> {
+        let num_vectors = doc_ids.len();
+        let byte_len =
+            Self::validate_shape(dim_bits, num_vectors, DenseVectorQuantization::Binary)?;
+        let expected_bytes = num_vectors.checked_mul(byte_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packed binary vector size overflows usize",
+            )
+        })?;
+        if packed_vectors.len() != expected_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "packed binary input has {} bytes, expected {num_vectors} x {byte_len} = {expected_bytes}",
+                    packed_vectors.len()
+                ),
+            ));
+        }
+        Self::validate_doc_ids(doc_ids)?;
+        Self::serialized_binary_size(dim_bits, num_vectors, DenseVectorQuantization::Binary)
+    }
+
     /// Write the binary header to a writer.
     pub fn write_binary_header(
         dim: usize,
@@ -77,9 +241,19 @@ impl FlatVectorData {
         quant: DenseVectorQuantization,
         writer: &mut dyn std::io::Write,
     ) -> std::io::Result<()> {
+        Self::validate_shape(dim, num_vectors, quant)?;
+        let dim = u32::try_from(dim).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector dimension exceeds u32",
+            )
+        })?;
+        let num_vectors = u32::try_from(num_vectors).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "flat vector count exceeds u32")
+        })?;
         writer.write_all(&FLAT_BINARY_MAGIC.to_le_bytes())?;
-        writer.write_all(&(dim as u32).to_le_bytes())?;
-        writer.write_all(&(num_vectors as u32).to_le_bytes())?;
+        writer.write_all(&dim.to_le_bytes())?;
+        writer.write_all(&num_vectors.to_le_bytes())?;
         writer.write_all(&[quant.tag(), 0, 0, 0])?; // quant_type + 3 bytes padding
         Ok(())
     }
@@ -89,12 +263,29 @@ impl FlatVectorData {
         dim: usize,
         num_vectors: usize,
         quant: DenseVectorQuantization,
-    ) -> usize {
-        let bytes_per_vector = match quant {
-            DenseVectorQuantization::Binary => dim.div_ceil(8),
-            _ => dim * quant.element_size(),
-        };
-        FLAT_BINARY_HEADER_SIZE + num_vectors * bytes_per_vector + num_vectors * DOC_ID_ENTRY_SIZE
+    ) -> io::Result<usize> {
+        let bytes_per_vector = Self::validate_shape(dim, num_vectors, quant)?;
+        let vector_bytes = num_vectors.checked_mul(bytes_per_vector).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector payload size overflows usize",
+            )
+        })?;
+        let doc_id_bytes = num_vectors.checked_mul(DOC_ID_ENTRY_SIZE).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector doc-map size overflows usize",
+            )
+        })?;
+        FLAT_BINARY_HEADER_SIZE
+            .checked_add(vector_bytes)
+            .and_then(|size| size.checked_add(doc_id_bytes))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "flat vector serialized size overflows usize",
+                )
+            })
     }
 
     /// Stream from flat f32 storage to a writer, quantizing on write.
@@ -108,6 +299,7 @@ impl FlatVectorData {
         quant: DenseVectorQuantization,
         writer: &mut dyn std::io::Write,
     ) -> std::io::Result<()> {
+        Self::validate_dense_input(dim, flat_vectors, doc_ids, quant)?;
         let num_vectors = doc_ids.len();
         Self::write_binary_header(dim, num_vectors, quant, writer)?;
 
@@ -137,10 +329,7 @@ impl FlatVectorData {
                     writer.write_all(&buf)?;
                 }
             }
-            DenseVectorQuantization::Binary => {
-                // Binary vectors use serialize_binary_from_bits_streaming(), not this path
-                unreachable!("Binary quantization should use serialize_binary_from_bits_streaming");
-            }
+            DenseVectorQuantization::Binary => unreachable!("validated above"),
         }
 
         for &(doc_id, ordinal) in doc_ids {
@@ -161,9 +350,8 @@ impl FlatVectorData {
         doc_ids: &[(u32, u16)],
         writer: &mut dyn std::io::Write,
     ) -> std::io::Result<()> {
+        Self::validate_binary_input(dim_bits, packed_vectors, doc_ids)?;
         let num_vectors = doc_ids.len();
-        let byte_len = dim_bits.div_ceil(8);
-        debug_assert_eq!(packed_vectors.len(), num_vectors * byte_len);
 
         Self::write_binary_header(
             dim_bits,
@@ -209,6 +397,8 @@ pub struct LazyFlatVectorData {
     pub dim: usize,
     /// Total number of vectors
     pub num_vectors: usize,
+    /// Number of distinct document IDs represented in the flat vector map.
+    num_docs_with_vectors: usize,
     /// Storage quantization type
     pub quantization: DenseVectorQuantization,
     /// Zero-copy doc_id index: packed [u32_le doc_id + u16_le ordinal] × num_vectors
@@ -219,6 +409,8 @@ pub struct LazyFlatVectorData {
     vectors_offset: u64,
     /// Bytes per vector in storage (cached: Binary = ceil(dim/8), else dim * element_size)
     vbs: usize,
+    /// Exact byte length of the raw vector region, validated when opening.
+    vectors_byte_len: u64,
 }
 
 impl LazyFlatVectorData {
@@ -227,10 +419,45 @@ impl LazyFlatVectorData {
     /// Reads header (16 bytes) + doc_ids (~6 bytes/vector) into memory.
     /// Vector data stays lazy on disk.
     pub async fn open(handle: FileHandle) -> io::Result<Self> {
+        Self::open_with_doc_limit(handle, None).await
+    }
+
+    /// Open flat vectors while also validating every referenced document ID.
+    ///
+    /// Segment readers pass their durable `num_docs` here. Keeping the public
+    /// `open` entry point is useful for standalone flat payloads and tests that
+    /// do not have segment metadata available.
+    pub(crate) async fn open_with_doc_limit(
+        handle: FileHandle,
+        total_docs: Option<u32>,
+    ) -> io::Result<Self> {
+        let header_len = u64::try_from(FLAT_BINARY_HEADER_SIZE).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector header size does not fit in u64",
+            )
+        })?;
+        if handle.len() < header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "flat vector payload is {} bytes, shorter than its {FLAT_BINARY_HEADER_SIZE}-byte header",
+                    handle.len()
+                ),
+            ));
+        }
+
         // Read header: magic(4) + dim(4) + num_vectors(4) + quant_type(1) + pad(3) = 16 bytes
-        let header = handle
-            .read_bytes_range(0..FLAT_BINARY_HEADER_SIZE as u64)
-            .await?;
+        let header = handle.read_bytes_range(0..header_len).await?;
+        if header.len() != FLAT_BINARY_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "flat vector header read returned {} bytes, expected {FLAT_BINARY_HEADER_SIZE}",
+                    header.len()
+                ),
+            ));
+        }
         let hdr = header.as_slice();
 
         let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
@@ -249,29 +476,224 @@ impl LazyFlatVectorData {
                 format!("Unknown quantization tag: {}", hdr[12]),
             )
         })?;
-        // Read doc_ids section as zero-copy OwnedBytes (6 bytes per vector)
-        let vbs = if quantization == DenseVectorQuantization::Binary {
-            dim.div_ceil(8)
-        } else {
-            dim * quantization.element_size()
-        };
-        let vectors_byte_len = num_vectors * vbs;
-        let doc_ids_start = (FLAT_BINARY_HEADER_SIZE + vectors_byte_len) as u64;
-        let doc_ids_byte_len = (num_vectors * DOC_ID_ENTRY_SIZE) as u64;
+        if hdr[13..] != [0, 0, 0] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector header has non-zero reserved bytes",
+            ));
+        }
 
-        let doc_ids_bytes = handle
-            .read_bytes_range(doc_ids_start..doc_ids_start + doc_ids_byte_len)
-            .await?;
+        // Read doc_ids section as zero-copy OwnedBytes (6 bytes per vector)
+        let vbs =
+            FlatVectorData::validate_shape(dim, num_vectors, quantization).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid flat vector shape: {error}"),
+                )
+            })?;
+        let vectors_byte_len_usize = num_vectors.checked_mul(vbs).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector payload size overflows usize",
+            )
+        })?;
+        let doc_ids_byte_len_usize =
+            num_vectors.checked_mul(DOC_ID_ENTRY_SIZE).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "flat vector doc-map size overflows usize",
+                )
+            })?;
+        let expected_len_usize = FLAT_BINARY_HEADER_SIZE
+            .checked_add(vectors_byte_len_usize)
+            .and_then(|size| size.checked_add(doc_ids_byte_len_usize))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "flat vector serialized size overflows usize",
+                )
+            })?;
+        let expected_len = u64::try_from(expected_len_usize).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector serialized size does not fit in u64",
+            )
+        })?;
+        if handle.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "flat vector payload has {} bytes, expected exactly {expected_len}",
+                    handle.len()
+                ),
+            ));
+        }
+
+        let vectors_byte_len = u64::try_from(vectors_byte_len_usize).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector payload size does not fit in u64",
+            )
+        })?;
+        let doc_ids_byte_len = u64::try_from(doc_ids_byte_len_usize).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector doc-map size does not fit in u64",
+            )
+        })?;
+        let doc_ids_start = header_len.checked_add(vectors_byte_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector doc-map offset overflows u64",
+            )
+        })?;
+        let doc_ids_end = doc_ids_start.checked_add(doc_ids_byte_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector doc-map range overflows u64",
+            )
+        })?;
+
+        let doc_ids_bytes = handle.read_bytes_range(doc_ids_start..doc_ids_end).await?;
+        if doc_ids_bytes.len() != doc_ids_byte_len_usize {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "flat vector doc-map read returned {} bytes, expected {doc_ids_byte_len_usize}",
+                    doc_ids_bytes.len()
+                ),
+            ));
+        }
+
+        let mut previous = None;
+        let mut num_docs_with_vectors = 0usize;
+        for entry in doc_ids_bytes.as_slice().chunks_exact(DOC_ID_ENTRY_SIZE) {
+            let doc_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let ordinal = u16::from_le_bytes([entry[4], entry[5]]);
+            let current = (doc_id, ordinal);
+            if let Some(previous) = previous
+                && previous >= current
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "flat vector doc map must be strictly sorted by (doc_id, ordinal), found {previous:?} before {current:?}"
+                    ),
+                ));
+            }
+            if let Some(limit) = total_docs
+                && doc_id >= limit
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "flat vector doc map references document {doc_id}, but segment contains only {} documents",
+                        limit
+                    ),
+                ));
+            }
+            if previous.is_none_or(|(previous_doc_id, _)| previous_doc_id != doc_id) {
+                num_docs_with_vectors = num_docs_with_vectors.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "flat vector distinct-document count overflows usize",
+                    )
+                })?;
+            }
+            previous = Some(current);
+        }
 
         Ok(Self {
             dim,
             num_vectors,
+            num_docs_with_vectors,
             quantization,
             doc_ids_bytes,
             handle,
-            vectors_offset: FLAT_BINARY_HEADER_SIZE as u64,
+            vectors_offset: header_len,
             vbs,
+            vectors_byte_len,
         })
+    }
+
+    fn checked_vector_range(
+        &self,
+        start_idx: usize,
+        count: usize,
+    ) -> io::Result<(std::ops::Range<u64>, usize)> {
+        let end_idx = start_idx.checked_add(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector index range overflows usize",
+            )
+        })?;
+        if end_idx > self.num_vectors {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flat vector range {start_idx}..{end_idx} exceeds {} vectors",
+                    self.num_vectors
+                ),
+            ));
+        }
+
+        let relative_offset = start_idx.checked_mul(self.vbs).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector byte offset overflows usize",
+            )
+        })?;
+        let byte_len = count.checked_mul(self.vbs).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector byte length overflows usize",
+            )
+        })?;
+        let relative_offset = u64::try_from(relative_offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector byte offset does not fit in u64",
+            )
+        })?;
+        let byte_len_u64 = u64::try_from(byte_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flat vector byte length does not fit in u64",
+            )
+        })?;
+        let start = self
+            .vectors_offset
+            .checked_add(relative_offset)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "flat vector byte offset overflows u64",
+                )
+            })?;
+        let end = start.checked_add(byte_len_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat vector byte range overflows u64",
+            )
+        })?;
+        let vectors_end = self
+            .vectors_offset
+            .checked_add(self.vectors_byte_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "flat vector payload boundary overflows u64",
+                )
+            })?;
+        if end > vectors_end || end > self.handle.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "flat vector byte range {start}..{end} exceeds payload boundary {vectors_end}"
+                ),
+            ));
+        }
+        Ok((start..end, byte_len))
     }
 
     /// Pin the doc-id map (priority 3: every rerank / top-k resolution
@@ -300,11 +722,11 @@ impl LazyFlatVectorData {
     /// No-op for non-mmap (RAM, HTTP) backing.
     #[cfg(feature = "native")]
     pub fn advise_random_access(&self) {
-        let data_len = (self.num_vectors * self.vbs) as u64;
-        self.handle.madvise_range(
-            self.vectors_offset..self.vectors_offset + data_len,
-            libc::MADV_RANDOM,
-        );
+        let Some(vectors_end) = self.vectors_offset.checked_add(self.vectors_byte_len) else {
+            return;
+        };
+        self.handle
+            .madvise_range(self.vectors_offset..vectors_end, libc::MADV_RANDOM);
     }
 
     /// Prefetch the pages backing a sorted set of vector indexes (`MADV_WILLNEED`).
@@ -317,22 +739,24 @@ impl LazyFlatVectorData {
     pub fn prefetch_vectors(&self, sorted_flat_indexes: impl IntoIterator<Item = usize>) {
         /// Gap (in bytes) below which two candidate ranges are merged into one advice call.
         const COALESCE_GAP: u64 = 64 * 1024;
-        let vbs = self.vbs as u64;
-        let mut iter = sorted_flat_indexes.into_iter();
-        let Some(first) = iter.next() else {
+        let mut ranges = sorted_flat_indexes.into_iter().filter_map(|idx| {
+            self.checked_vector_range(idx, 1)
+                .ok()
+                .map(|(range, _)| range)
+        });
+        let Some(first) = ranges.next() else {
             return;
         };
-        let mut run_start = self.vectors_offset + first as u64 * vbs;
-        let mut run_end = run_start + vbs;
-        for idx in iter {
-            let start = self.vectors_offset + idx as u64 * vbs;
-            if start <= run_end + COALESCE_GAP {
-                run_end = start + vbs;
+        let mut run_start = first.start;
+        let mut run_end = first.end;
+        for range in ranges {
+            if range.start <= run_end.saturating_add(COALESCE_GAP) {
+                run_end = run_end.max(range.end);
             } else {
                 self.handle
                     .madvise_range(run_start..run_end, libc::MADV_WILLNEED);
-                run_start = start;
-                run_end = start + vbs;
+                run_start = range.start;
+                run_end = range.end;
             }
         }
         self.handle
@@ -344,17 +768,18 @@ impl LazyFlatVectorData {
     /// `out` must have length >= `self.dim`. Returns `Ok(())` on success.
     /// Used for ANN training and doc() hydration where f32 is needed.
     pub async fn read_vector_into(&self, idx: usize, out: &mut [f32]) -> io::Result<()> {
-        debug_assert!(out.len() >= self.dim);
-        let vbs = self.vector_byte_size();
-        let byte_offset = self.vectors_offset + (idx * vbs) as u64;
-        let bytes = self
-            .handle
-            .read_bytes_range(byte_offset..byte_offset + vbs as u64)
-            .await?;
-        let raw = bytes.as_slice();
-
-        dequantize_raw(raw, self.quantization, self.dim, out);
-        Ok(())
+        if out.len() < self.dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flat vector output is too short: need {} floats, got {}",
+                    self.dim,
+                    out.len()
+                ),
+            ));
+        }
+        let bytes = self.read_vectors_batch(idx, 1).await?;
+        dequantize_raw(bytes.as_slice(), self.quantization, self.dim, out)
     }
 
     /// Read a single vector by index, dequantized to f32 (allocates a new Vec<f32>).
@@ -369,14 +794,72 @@ impl LazyFlatVectorData {
     /// `out` must have length >= `self.vector_byte_size()`.
     /// Used for native-precision reranking where raw quantized bytes are scored directly.
     pub async fn read_vector_raw_into(&self, idx: usize, out: &mut [u8]) -> io::Result<()> {
+        self.read_vector_prefix_raw_into(idx, self.vector_byte_size(), out)
+            .await
+    }
+
+    /// Read a prefix of one vector's raw bytes into a caller-provided buffer.
+    ///
+    /// This is used by Matryoshka scoring to avoid reading the unused tail of
+    /// a vector. Unlike the old full-vector boundary, all caller-controlled
+    /// sizes and offset arithmetic are checked in release builds.
+    pub async fn read_vector_prefix_raw_into(
+        &self,
+        idx: usize,
+        prefix_byte_len: usize,
+        out: &mut [u8],
+    ) -> io::Result<()> {
         let vbs = self.vector_byte_size();
-        debug_assert!(out.len() >= vbs);
-        let byte_offset = self.vectors_offset + (idx * vbs) as u64;
+        if prefix_byte_len > vbs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "vector prefix is {prefix_byte_len} bytes, but a vector has only {vbs} bytes"
+                ),
+            ));
+        }
+        if out.len() < prefix_byte_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "vector prefix output is too short: need {prefix_byte_len} bytes, got {}",
+                    out.len()
+                ),
+            ));
+        }
+        let (full_range, _) = self.checked_vector_range(idx, 1)?;
+        if prefix_byte_len == 0 {
+            return Ok(());
+        }
+        let prefix_byte_len_u64 = u64::try_from(prefix_byte_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vector prefix length does not fit in u64",
+            )
+        })?;
+        let byte_end = full_range
+            .start
+            .checked_add(prefix_byte_len_u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector byte range overflows u64",
+                )
+            })?;
         let bytes = self
             .handle
-            .read_bytes_range(byte_offset..byte_offset + vbs as u64)
+            .read_bytes_range(full_range.start..byte_end)
             .await?;
-        out[..vbs].copy_from_slice(bytes.as_slice());
+        if bytes.len() != prefix_byte_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "vector prefix read returned {} bytes, expected {prefix_byte_len}",
+                    bytes.len()
+                ),
+            ));
+        }
+        out[..prefix_byte_len].copy_from_slice(bytes.as_slice());
         Ok(())
     }
 
@@ -390,24 +873,34 @@ impl LazyFlatVectorData {
         start_idx: usize,
         count: usize,
     ) -> io::Result<OwnedBytes> {
-        debug_assert!(start_idx + count <= self.num_vectors);
-        let vbs = self.vector_byte_size();
-        let byte_offset = self.vectors_offset + (start_idx * vbs) as u64;
-        let byte_len = (count * vbs) as u64;
-        self.handle
-            .read_bytes_range(byte_offset..byte_offset + byte_len)
-            .await
+        let (range, expected_len) = self.checked_vector_range(start_idx, count)?;
+        let bytes = self.handle.read_bytes_range(range).await?;
+        if bytes.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "flat vector batch read returned {} bytes, expected {expected_len}",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Synchronous read of a single vector's raw bytes.
     #[cfg(feature = "sync")]
     pub fn read_vector_raw_into_sync(&self, idx: usize, out: &mut [u8]) -> io::Result<()> {
         let vbs = self.vector_byte_size();
-        debug_assert!(out.len() >= vbs);
-        let byte_offset = self.vectors_offset + (idx * vbs) as u64;
-        let bytes = self
-            .handle
-            .read_bytes_range_sync(byte_offset..byte_offset + vbs as u64)?;
+        if out.len() < vbs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "flat vector output is too short: need {vbs} bytes, got {}",
+                    out.len()
+                ),
+            ));
+        }
+        let bytes = self.read_vectors_batch_sync(idx, 1)?;
         out[..vbs].copy_from_slice(bytes.as_slice());
         Ok(())
     }
@@ -419,12 +912,18 @@ impl LazyFlatVectorData {
         start_idx: usize,
         count: usize,
     ) -> io::Result<OwnedBytes> {
-        debug_assert!(start_idx + count <= self.num_vectors);
-        let vbs = self.vector_byte_size();
-        let byte_offset = self.vectors_offset + (start_idx * vbs) as u64;
-        let byte_len = (count * vbs) as u64;
-        self.handle
-            .read_bytes_range_sync(byte_offset..byte_offset + byte_len)
+        let (range, expected_len) = self.checked_vector_range(start_idx, count)?;
+        let bytes = self.handle.read_bytes_range_sync(range)?;
+        if bytes.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "flat vector batch read returned {} bytes, expected {expected_len}",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Find flat index range for a given doc_id (non-allocating).
@@ -516,9 +1015,15 @@ impl LazyFlatVectorData {
         self.vbs
     }
 
+    /// Number of distinct documents that have at least one vector in this field.
+    #[inline]
+    pub fn num_docs_with_vectors(&self) -> usize {
+        self.num_docs_with_vectors
+    }
+
     /// Total byte length of raw vector data (for chunked merger streaming).
     pub fn vector_bytes_len(&self) -> u64 {
-        (self.num_vectors as u64) * (self.vector_byte_size() as u64)
+        self.vectors_byte_len
     }
 
     /// Byte offset where vector data starts (for direct handle access in merger).
@@ -554,9 +1059,52 @@ impl IVFRaBitQIndexData {
     }
 
     pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        bincode::serde::decode_from_slice(data, bincode::config::standard())
-            .map(|(v, _)| v)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let value: Self = crate::structures::vector::decode_ann_bincode_exact(data, "IVF-RaBitQ")?;
+        value
+            .codebook
+            .validate()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if value.index.config.default_nprobe == 0
+            || value.index.config.dim != value.codebook.config.dim
+            || value.index.codebook_version != value.codebook.version
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IVF-RaBitQ index/codebook metadata mismatch",
+            ));
+        }
+        let mut total_vectors = 0usize;
+        for (_, cluster) in value.index.clusters.iter() {
+            if cluster.doc_ids.len() != cluster.ordinals.len()
+                || cluster.doc_ids.len() != cluster.codes.len()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "IVF-RaBitQ cluster column lengths differ",
+                ));
+            }
+            total_vectors = total_vectors
+                .checked_add(cluster.codes.len())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IVF-RaBitQ vector count overflow",
+                    )
+                })?;
+            for code in &cluster.codes {
+                value
+                    .codebook
+                    .validate_vector(code)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            }
+        }
+        if total_vectors != value.index.clusters.total_vectors {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IVF-RaBitQ total vector count is inconsistent",
+            ));
+        }
+        Ok(value)
     }
 }
 
@@ -577,8 +1125,491 @@ impl ScaNNIndexData {
     }
 
     pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        bincode::serde::decode_from_slice(data, bincode::config::standard())
-            .map(|(v, _)| v)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let value: Self = crate::structures::vector::decode_ann_bincode_exact(data, "ScaNN")?;
+        value
+            .codebook
+            .validate()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if value.index.config.default_nprobe == 0
+            || value.index.config.dim != value.codebook.config.dim
+            || value.index.codebook_version != value.codebook.version
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ScaNN index/codebook metadata mismatch",
+            ));
+        }
+        let expected_codes = value.codebook.config.num_subspaces;
+        let num_centroids = value.codebook.config.num_centroids;
+        let mut total_vectors = 0usize;
+        for (_, cluster) in value.index.clusters.iter() {
+            if cluster.doc_ids.len() != cluster.ordinals.len()
+                || cluster.doc_ids.len() != cluster.codes.len()
+                || cluster.codes.iter().any(|code| {
+                    code.codes.len() != expected_codes
+                        || !code.norm.is_finite()
+                        || code.norm < 0.0
+                        || code
+                            .codes
+                            .iter()
+                            .any(|&centroid| centroid as usize >= num_centroids)
+                })
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ScaNN cluster columns or PQ code lengths are invalid",
+                ));
+            }
+            total_vectors = total_vectors
+                .checked_add(cluster.codes.len())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ScaNN vector count overflow",
+                    )
+                })?;
+        }
+        if total_vectors != value.index.clusters.total_vectors {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ScaNN total vector count is inconsistent",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dequantize_raw_accepts_valid_storage_formats() {
+        let f32_values = [1.25f32, -2.5];
+        let f32_bytes = unsafe {
+            // Safety: viewing an initialized f32 array as bytes is always valid.
+            std::slice::from_raw_parts(
+                f32_values.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&f32_values),
+            )
+        };
+        let mut out = [0.0; 2];
+        dequantize_raw(f32_bytes, DenseVectorQuantization::F32, 2, &mut out).unwrap();
+        assert_eq!(out, f32_values);
+
+        let f16_values = [0x3c00u16, 0xc000u16]; // 1.0, -2.0
+        let f16_bytes = unsafe {
+            // Safety: viewing an initialized u16 array as bytes is always valid.
+            std::slice::from_raw_parts(
+                f16_values.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&f16_values),
+            )
+        };
+        dequantize_raw(f16_bytes, DenseVectorQuantization::F16, 2, &mut out).unwrap();
+        assert_eq!(out, [1.0, -2.0]);
+
+        dequantize_raw(&[0, u8::MAX], DenseVectorQuantization::UInt8, 2, &mut out).unwrap();
+        assert_eq!(out, [u8_to_f32(0), u8_to_f32(u8::MAX)]);
+    }
+
+    #[test]
+    fn dequantize_raw_rejects_invalid_lengths_and_binary_storage() {
+        let mut out = [0.0; 2];
+        assert_eq!(
+            dequantize_raw(&[0; 7], DenseVectorQuantization::F32, 2, &mut out)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            dequantize_raw(&[0; 8], DenseVectorQuantization::F32, 2, &mut out[..1])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            dequantize_raw(&[], DenseVectorQuantization::Binary, 0, &mut [])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn dequantize_raw_rejects_misaligned_typed_storage() {
+        let storage = [0u8; 9];
+        let offset = if (storage.as_ptr() as usize).is_multiple_of(4) {
+            1
+        } else {
+            0
+        };
+        let raw = &storage[offset..offset + 8];
+        assert!(!(raw.as_ptr() as usize).is_multiple_of(4));
+
+        let mut out = [0.0; 2];
+        assert_eq!(
+            dequantize_raw(raw, DenseVectorQuantization::F32, 2, &mut out)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn flat_vector_writers_reject_inconsistent_shapes_and_doc_maps() {
+        let mut encoded = Vec::new();
+        assert!(
+            FlatVectorData::serialize_binary_from_flat_streaming(
+                0,
+                &[],
+                &[],
+                DenseVectorQuantization::F32,
+                &mut encoded,
+            )
+            .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        assert!(
+            FlatVectorData::serialize_binary_from_flat_streaming(
+                2,
+                &[1.0],
+                &[(0, 0)],
+                DenseVectorQuantization::F32,
+                &mut encoded,
+            )
+            .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        assert!(
+            FlatVectorData::serialize_binary_from_flat_streaming(
+                1,
+                &[1.0],
+                &[(0, 0)],
+                DenseVectorQuantization::Binary,
+                &mut encoded,
+            )
+            .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        assert!(
+            FlatVectorData::serialize_binary_from_flat_streaming(
+                1,
+                &[1.0, 2.0],
+                &[(1, 0), (0, 0)],
+                DenseVectorQuantization::F32,
+                &mut encoded,
+            )
+            .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        assert!(
+            FlatVectorData::serialize_binary_from_flat_streaming(
+                1,
+                &[1.0, 2.0],
+                &[(0, 0), (0, 0)],
+                DenseVectorQuantization::F32,
+                &mut encoded,
+            )
+            .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        assert!(
+            FlatVectorData::serialize_binary_from_bits_streaming(7, &[0], &[(0, 0)], &mut encoded,)
+                .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        assert!(
+            FlatVectorData::serialize_binary_from_bits_streaming(8, &[], &[(0, 0)], &mut encoded,)
+                .is_err()
+        );
+        assert!(encoded.is_empty());
+
+        let vectors = [1.0f32, 2.0, 3.0, 4.0];
+        let doc_ids = [(0, 0), (1, 0)];
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &vectors,
+            &doc_ids,
+            DenseVectorQuantization::F32,
+            &mut encoded,
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.len(),
+            FlatVectorData::serialized_binary_size(2, 2, DenseVectorQuantization::F32).unwrap()
+        );
+    }
+
+    fn encoded_two_vector_payload() -> Vec<u8> {
+        let mut encoded = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0, 3.0, 4.0],
+            &[(0, 0), (1, 0)],
+            DenseVectorQuantization::F32,
+            &mut encoded,
+        )
+        .unwrap();
+        encoded
+    }
+
+    #[tokio::test]
+    async fn flat_vector_open_rejects_corrupt_layout_and_doc_map() {
+        let valid = encoded_two_vector_payload();
+
+        let mut multi_value = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            1,
+            &[1.0, 2.0, 3.0],
+            &[(0, 0), (0, 1), (2, 0)],
+            DenseVectorQuantization::F32,
+            &mut multi_value,
+        )
+        .unwrap();
+        let multi_value = LazyFlatVectorData::open_with_doc_limit(
+            FileHandle::from_bytes(OwnedBytes::new(multi_value)),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(multi_value.num_docs_with_vectors(), 2);
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(
+            LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(trailing)))
+                .await
+                .is_err()
+        );
+
+        let mut truncated = valid.clone();
+        truncated.pop();
+        assert!(
+            LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(truncated)))
+                .await
+                .is_err()
+        );
+
+        let mut reserved = valid.clone();
+        reserved[13] = 1;
+        assert!(
+            LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(reserved)))
+                .await
+                .is_err()
+        );
+
+        let doc_map_start = FLAT_BINARY_HEADER_SIZE + 2 * 2 * size_of::<f32>();
+        let mut unsorted = valid.clone();
+        let (first, second) = unsorted[doc_map_start..doc_map_start + 2 * DOC_ID_ENTRY_SIZE]
+            .split_at_mut(DOC_ID_ENTRY_SIZE);
+        first.swap_with_slice(second);
+        assert!(
+            LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(unsorted)))
+                .await
+                .is_err()
+        );
+
+        let mut duplicate = valid.clone();
+        duplicate.copy_within(
+            doc_map_start..doc_map_start + DOC_ID_ENTRY_SIZE,
+            doc_map_start + DOC_ID_ENTRY_SIZE,
+        );
+        assert!(
+            LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(duplicate)))
+                .await
+                .is_err()
+        );
+
+        assert!(
+            LazyFlatVectorData::open_with_doc_limit(
+                FileHandle::from_bytes(OwnedBytes::new(valid)),
+                Some(1),
+            )
+            .await
+            .is_err()
+        );
+
+        let mut invalid_binary = Vec::new();
+        FlatVectorData::serialize_binary_from_bits_streaming(
+            8,
+            &[0],
+            &[(0, 0)],
+            &mut invalid_binary,
+        )
+        .unwrap();
+        invalid_binary[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert!(
+            LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(invalid_binary)))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_vector_batch_and_dequantized_reads_are_checked() {
+        let flat = LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(
+            encoded_two_vector_payload(),
+        )))
+        .await
+        .unwrap();
+
+        assert_eq!(flat.read_vectors_batch(0, 2).await.unwrap().len(), 16);
+        assert_eq!(flat.read_vectors_batch(2, 0).await.unwrap().len(), 0);
+        assert!(flat.read_vectors_batch(1, 2).await.is_err());
+        assert!(flat.read_vectors_batch(usize::MAX, 1).await.is_err());
+        assert!(flat.read_vectors_batch(0, usize::MAX).await.is_err());
+
+        let mut values = [0.0; 2];
+        flat.read_vector_into(1, &mut values).await.unwrap();
+        assert_eq!(values, [3.0, 4.0]);
+        assert!(flat.read_vector_into(2, &mut values).await.is_err());
+        assert!(flat.read_vector_into(0, &mut values[..1]).await.is_err());
+
+        #[cfg(feature = "sync")]
+        {
+            assert_eq!(flat.read_vectors_batch_sync(0, 2).unwrap().len(), 16);
+            assert!(flat.read_vectors_batch_sync(1, 2).is_err());
+            assert!(flat.read_vectors_batch_sync(usize::MAX, 1).is_err());
+            let mut too_short = [0; 7];
+            assert!(flat.read_vector_raw_into_sync(0, &mut too_short).is_err());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn flat_vector_reads_reject_short_lazy_range_results() {
+        let payload = std::sync::Arc::new(encoded_two_vector_payload());
+        let payload_len = payload.len() as u64;
+        let read_payload = std::sync::Arc::clone(&payload);
+        let read_fn: crate::directories::RangeReadFn = std::sync::Arc::new(move |range| {
+            let payload = std::sync::Arc::clone(&read_payload);
+            Box::pin(async move {
+                let start = usize::try_from(range.start).unwrap();
+                let mut end = usize::try_from(range.end).unwrap();
+                // Header and doc-map reads are exact, allowing open to finish.
+                // Raw vector reads deliberately violate the range-read contract.
+                if range.start == FLAT_BINARY_HEADER_SIZE as u64 {
+                    end -= 1;
+                }
+                Ok(OwnedBytes::new(payload[start..end].to_vec()))
+            })
+        });
+        let flat = LazyFlatVectorData::open(FileHandle::lazy(payload_len, read_fn))
+            .await
+            .unwrap();
+
+        let error = flat.read_vectors_batch(0, 1).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let mut raw = [0; 8];
+        let error = flat.read_vector_raw_into(0, &mut raw).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn ann_bincode_decoders_reject_trailing_and_invalid_semantics() {
+        let rabitq_codebook =
+            crate::structures::RaBitQCodebook::new(crate::structures::RaBitQConfig::new(8));
+        let rabitq = IVFRaBitQIndexData {
+            index: crate::structures::IVFRaBitQIndex::new(
+                crate::structures::IVFRaBitQConfig::new(8),
+                1,
+                rabitq_codebook.version,
+            ),
+            codebook: rabitq_codebook,
+        };
+        let mut rabitq_bytes = rabitq.to_bytes().unwrap();
+        assert!(IVFRaBitQIndexData::from_bytes(&rabitq_bytes).is_ok());
+        let mut invalid_rabitq = rabitq.clone();
+        invalid_rabitq.index.config.default_nprobe = 0;
+        assert!(IVFRaBitQIndexData::from_bytes(&invalid_rabitq.to_bytes().unwrap()).is_err());
+        invalid_rabitq.index.config.default_nprobe = 1;
+        invalid_rabitq.codebook.config.query_bits = 0;
+        assert!(IVFRaBitQIndexData::from_bytes(&invalid_rabitq.to_bytes().unwrap()).is_err());
+        rabitq_bytes.push(0);
+        assert!(IVFRaBitQIndexData::from_bytes(&rabitq_bytes).is_err());
+
+        let pq_config = crate::structures::PQConfig::new(2);
+        let pq_codebook = crate::structures::PQCodebook {
+            centroids: vec![
+                0.0;
+                pq_config.num_subspaces
+                    * pq_config.num_centroids
+                    * pq_config.dims_per_block
+            ],
+            rotation_matrix: None,
+            centroid_norms: None,
+            version: 2,
+            config: pq_config,
+        };
+        let scann = ScaNNIndexData {
+            index: crate::structures::IVFPQIndex::new(
+                crate::structures::IVFPQConfig::new(2),
+                1,
+                pq_codebook.version,
+            ),
+            codebook: pq_codebook,
+        };
+        let mut scann_bytes = scann.to_bytes().unwrap();
+        assert!(ScaNNIndexData::from_bytes(&scann_bytes).is_ok());
+        let mut invalid_scann = scann.clone();
+        invalid_scann.index.config.default_nprobe = 0;
+        assert!(ScaNNIndexData::from_bytes(&invalid_scann.to_bytes().unwrap()).is_err());
+        invalid_scann.index.config.default_nprobe = 1;
+        invalid_scann.codebook.config.aniso_eta = f32::NAN;
+        assert!(ScaNNIndexData::from_bytes(&invalid_scann.to_bytes().unwrap()).is_err());
+        scann_bytes.push(0);
+        assert!(ScaNNIndexData::from_bytes(&scann_bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn vector_prefix_reads_are_checked_and_do_not_fetch_the_tail() {
+        let vectors = [1.0f32, 2.0, 3.0, 4.0];
+        let doc_ids = [(0, 0), (1, 0)];
+        let mut encoded = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &vectors,
+            &doc_ids,
+            DenseVectorQuantization::F32,
+            &mut encoded,
+        )
+        .unwrap();
+        let flat = LazyFlatVectorData::open(FileHandle::from_bytes(OwnedBytes::new(encoded)))
+            .await
+            .unwrap();
+
+        let mut prefix = [0xa5; 8];
+        flat.read_vector_prefix_raw_into(1, 4, &mut prefix)
+            .await
+            .unwrap();
+        assert_eq!(&prefix[..4], &3.0f32.to_ne_bytes());
+        assert_eq!(&prefix[4..], &[0xa5; 4]);
+
+        let mut full = [0; 8];
+        flat.read_vector_raw_into(1, &mut full).await.unwrap();
+        assert_eq!(&full[..4], &3.0f32.to_ne_bytes());
+        assert_eq!(&full[4..], &4.0f32.to_ne_bytes());
+
+        assert!(
+            flat.read_vector_prefix_raw_into(2, 4, &mut prefix)
+                .await
+                .is_err()
+        );
+        assert!(
+            flat.read_vector_prefix_raw_into(0, 9, &mut prefix)
+                .await
+                .is_err()
+        );
+        assert!(
+            flat.read_vector_prefix_raw_into(0, 4, &mut prefix[..3])
+                .await
+                .is_err()
+        );
     }
 }

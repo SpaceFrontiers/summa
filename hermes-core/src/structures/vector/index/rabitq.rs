@@ -31,6 +31,26 @@ pub struct RaBitQIndex {
 }
 
 impl RaBitQIndex {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.codebook.validate()?;
+        let dim = self.codebook.config.dim;
+        if self.centroid.len() != dim || self.centroid.iter().any(|value| !value.is_finite()) {
+            return Err(format!("RaBitQ centroid is invalid for dimension {dim}"));
+        }
+        if self.doc_ids.len() != self.vectors.len() || self.ordinals.len() != self.vectors.len() {
+            return Err(format!(
+                "RaBitQ column lengths differ: docs={}, ordinals={}, vectors={}",
+                self.doc_ids.len(),
+                self.ordinals.len(),
+                self.vectors.len()
+            ));
+        }
+        for vector in &self.vectors {
+            self.codebook.validate_vector(vector)?;
+        }
+        Ok(())
+    }
+
     /// Create a new empty RaBitQ index
     pub fn new(config: RaBitQConfig) -> Self {
         let dim = config.dim;
@@ -113,26 +133,15 @@ impl RaBitQIndex {
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u32, u16, f32)> {
         let prepared = self.prepare_query(query);
 
-        // Phase 1: Estimate distances for all vectors
-        let mut candidates: Vec<(usize, f32)> = self
-            .vectors
-            .iter()
-            .enumerate()
-            .map(|(i, _)| (i, self.estimate_distance(&prepared, i)))
-            .collect();
-
-        // Partial sort: O(n + k log k) instead of O(n log n)
-        if candidates.len() > k {
-            candidates.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
-            candidates.truncate(k);
+        let mut candidates = super::BoundedDistanceCollector::new(k);
+        for idx in 0..self.vectors.len() {
+            candidates.insert(
+                self.doc_ids[idx],
+                self.ordinals[idx],
+                self.estimate_distance(&prepared, idx),
+            );
         }
-        candidates.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-
-        // Map indices to (doc_id, ordinal, dist)
-        candidates
-            .into_iter()
-            .map(|(idx, dist)| (self.doc_ids[idx], self.ordinals[idx], dist))
-            .collect()
+        candidates.into_sorted_results()
     }
 
     /// Number of indexed vectors
@@ -181,7 +190,12 @@ impl RaBitQIndex {
 
     /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
-        serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let index: Self = serde_json::from_slice(data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        index
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(index)
     }
 }
 

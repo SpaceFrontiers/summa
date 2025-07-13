@@ -17,5 +17,5 @@ mod zstd;
 
 pub use self::zstd::{
     CompressionDict, CompressionLevel, compress, compress_with_dict, decompress,
-    decompress_with_dict,
+    decompress_limited, decompress_with_dict, decompress_with_dict_limited,
 };

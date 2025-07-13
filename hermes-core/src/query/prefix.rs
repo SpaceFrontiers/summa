@@ -1,6 +1,6 @@
 //! Prefix query — matches all documents containing any term that starts with a
 //! given prefix. Materializes the union of matching posting lists into a sorted
-//! doc ID set, giving O(log N) seek via `SortedVecDocSet`. Score is always 1.0
+//! doc ID set bounded by the segment's document count. Score is always 1.0
 //! (filter-style, like `RangeQuery`).
 
 use std::sync::Arc;
@@ -58,7 +58,7 @@ impl Query for PrefixQuery {
             if postings.is_empty() {
                 return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
             }
-            let docs = materialize_union(&postings);
+            let docs = materialize_union(&postings, reader.num_docs());
             if docs.is_empty() {
                 return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
             }
@@ -76,7 +76,7 @@ impl Query for PrefixQuery {
         if postings.is_empty() {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
         }
-        let docs = materialize_union(&postings);
+        let docs = materialize_union(&postings, reader.num_docs());
         if docs.is_empty() {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
         }
@@ -88,7 +88,10 @@ impl Query for PrefixQuery {
         let prefix = self.prefix.clone();
         Box::pin(async move {
             let postings = reader.get_prefix_postings(field, &prefix).await?;
-            Ok(postings.iter().map(|p| p.doc_count()).sum())
+            Ok(postings
+                .iter()
+                .fold(0u32, |sum, posting| sum.saturating_add(posting.doc_count()))
+                .min(reader.num_docs()))
         })
     }
 
@@ -166,11 +169,37 @@ impl Scorer for PrefixScorer {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Iterate all posting lists, collect doc IDs, sort, and deduplicate.
-fn materialize_union(postings: &[BlockPostingList]) -> Vec<u32> {
-    let total: usize = postings.iter().map(|p| p.doc_count() as usize).sum();
-    let mut docs = Vec::with_capacity(total);
+/// Materialize a posting union using the smaller of two bounded scratch forms.
+/// Narrow prefixes append/sort doc IDs; broad, overlapping prefixes use a
+/// segment-sized bitset so duplicate postings cannot multiply memory.
+fn materialize_union(postings: &[BlockPostingList], num_docs: u32) -> Vec<u32> {
+    let posting_count = postings.iter().fold(0usize, |sum, posting| {
+        sum.saturating_add(posting.doc_count() as usize)
+    });
+    let posting_bytes = posting_count.saturating_mul(std::mem::size_of::<u32>());
+    let bitset_bytes = (num_docs as usize)
+        .div_ceil(64)
+        .saturating_mul(std::mem::size_of::<u64>());
 
+    if posting_bytes <= bitset_bytes {
+        let mut docs = Vec::with_capacity(posting_count);
+        for posting in postings {
+            let mut iter = posting.iterator();
+            loop {
+                let d = iter.doc();
+                if d == TERMINATED {
+                    break;
+                }
+                docs.push(d);
+                iter.advance();
+            }
+        }
+        docs.sort_unstable();
+        docs.dedup();
+        return docs;
+    }
+
+    let mut bitset = super::DocBitset::new(num_docs);
     for posting in postings {
         let mut iter = posting.iterator();
         loop {
@@ -178,13 +207,20 @@ fn materialize_union(postings: &[BlockPostingList]) -> Vec<u32> {
             if d == TERMINATED {
                 break;
             }
-            docs.push(d);
+            bitset.set(d);
             iter.advance();
         }
     }
 
-    docs.sort_unstable();
-    docs.dedup();
+    let mut docs = Vec::with_capacity(bitset.count() as usize);
+    for (word_idx, &word) in bitset.bits.iter().enumerate() {
+        let mut remaining = word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as usize;
+            docs.push((word_idx * 64 + bit) as u32);
+            remaining &= remaining - 1;
+        }
+    }
     docs
 }
 
@@ -194,8 +230,32 @@ mod tests {
 
     #[test]
     fn test_materialize_union_empty() {
-        let docs = materialize_union(&[]);
+        let docs = materialize_union(&[], 0);
         assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_materialize_union_deduplicates() {
+        let mut left = crate::structures::PostingList::new();
+        left.push(1, 1);
+        left.push(5, 1);
+        left.push(9, 1);
+        let mut right = crate::structures::PostingList::new();
+        right.push(2, 1);
+        right.push(5, 1);
+        right.push(10, 1);
+        let postings = vec![
+            BlockPostingList::from_posting_list(&left).unwrap(),
+            BlockPostingList::from_posting_list(&right).unwrap(),
+        ];
+
+        assert_eq!(materialize_union(&postings, 11), vec![1, 2, 5, 9, 10]);
+        // A huge segment with a narrow prefix takes the posting-vector path;
+        // it must not allocate a num_docs-sized bitset.
+        assert_eq!(
+            materialize_union(&postings[..1], 1_000_000_000),
+            vec![1, 5, 9]
+        );
     }
 
     #[test]

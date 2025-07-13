@@ -151,7 +151,7 @@ impl IVFPQIndex {
         // Find nprobe nearest coarse centroids
         let nearest_clusters = coarse_centroids.find_k_nearest(query, nprobe);
 
-        let mut candidates: Vec<(u32, u16, f32)> = Vec::new();
+        let mut candidates = super::BoundedDistanceCollector::new(k);
 
         for &cluster_id in &nearest_clusters {
             if let Some(cluster) = self.clusters.get(cluster_id) {
@@ -162,15 +162,12 @@ impl IVFPQIndex {
                 // Score all vectors in cluster using ADC (Asymmetric Distance Computation)
                 for (doc_id, ordinal, code) in cluster.iter() {
                     let dist = distance_table.compute_distance(&code.codes);
-                    candidates.push((doc_id, ordinal, dist));
+                    candidates.insert(doc_id, ordinal, dist);
                 }
             }
         }
 
-        // With SOAR, a spilled vector appears once per probed cluster it
-        // lives in — finalize dedups to the best estimate before top-k.
-        super::finalize_candidates(&mut candidates, k, coarse_centroids.soar_config.is_some());
-        candidates
+        candidates.into_sorted_results()
     }
 
     /// Search using inner product (MIPS - Maximum Inner Product Search)
@@ -192,7 +189,11 @@ impl IVFPQIndex {
         }
 
         // Re-sort by inner product (descending)
-        results.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        results.sort_unstable_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
         results
     }
 
@@ -381,7 +382,7 @@ mod tests {
                     (i, d)
                 })
                 .collect();
-            exact.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
             let exact_top_k: std::collections::HashSet<usize> =
                 exact[..k].iter().map(|(i, _)| *i).collect();
 

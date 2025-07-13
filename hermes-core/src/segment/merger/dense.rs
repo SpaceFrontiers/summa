@@ -71,19 +71,22 @@ async fn feed_segment(
             .await
             .map_err(crate::Error::Io)?;
         let raw = batch_bytes.as_slice();
-        let batch_floats = batch_count * dim;
+        let batch_floats = batch_count.checked_mul(dim).ok_or_else(|| {
+            crate::Error::Corruption("dense merge batch size overflows usize".into())
+        })?;
 
         // For f32: reinterpret mmap bytes directly (zero-copy).
         // For f16/u8: dequantize into buffer.
         let vectors: &[f32] = if needs_dequant {
             f32_buf.resize(batch_floats, 0.0);
-            dequantize_raw(raw, quant, batch_floats, &mut f32_buf);
+            dequantize_raw(raw, quant, batch_floats, &mut f32_buf).map_err(crate::Error::Io)?;
             &f32_buf
         } else {
-            assert!(
-                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
-                "f32 vector data not 4-byte aligned"
-            );
+            if !(raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+                return Err(crate::Error::Corruption(
+                    "f32 flat vector data is not 4-byte aligned".into(),
+                ));
+            }
             // Safety: mmap-backed vector data is page-aligned. Assertion above
             // guards against unexpected misalignment.
             unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
@@ -124,11 +127,28 @@ async fn write_flat_entry(
             let base_offset = lazy_flat.vectors_byte_offset();
             let handle = lazy_flat.handle();
             for chunk_start in (0..total_bytes).step_by(FLAT_VECTOR_CHUNK as usize) {
-                let chunk_end = (chunk_start + FLAT_VECTOR_CHUNK).min(total_bytes);
+                let chunk_end = chunk_start
+                    .saturating_add(FLAT_VECTOR_CHUNK)
+                    .min(total_bytes);
+                let range_start = base_offset.checked_add(chunk_start).ok_or_else(|| {
+                    crate::Error::Corruption("flat vector source offset exceeds u64".into())
+                })?;
+                let range_end = base_offset.checked_add(chunk_end).ok_or_else(|| {
+                    crate::Error::Corruption("flat vector source range exceeds u64".into())
+                })?;
                 let bytes = handle
-                    .read_bytes_range(base_offset + chunk_start..base_offset + chunk_end)
+                    .read_bytes_range(range_start..range_end)
                     .await
                     .map_err(crate::Error::Io)?;
+                let expected_len = usize::try_from(chunk_end - chunk_start).map_err(|_| {
+                    crate::Error::Corruption("flat vector merge chunk exceeds usize".into())
+                })?;
+                if bytes.len() != expected_len {
+                    return Err(crate::Error::Corruption(format!(
+                        "flat vector merge read returned {} bytes, expected {expected_len}",
+                        bytes.len()
+                    )));
+                }
                 super::block_in_place_if_multithread(|| writer.write_all(bytes.as_slice()))?;
             }
         }
@@ -200,10 +220,16 @@ impl SegmentMerger {
                 continue;
             }
 
-            let total_vectors: usize = segments
+            let total_vectors = segments
                 .iter()
                 .filter_map(|s| s.flat_vectors().get(&field.0).map(|f| f.num_vectors))
-                .sum();
+                .try_fold(0usize, |total, count| total.checked_add(count))
+                .ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "flat vector count overflows usize for field {}",
+                        field.0
+                    ))
+                })?;
             if total_vectors == 0 {
                 continue;
             }
@@ -418,17 +444,16 @@ impl SegmentMerger {
                 pool.install(build)
             } else {
                 build()
-            };
+            }?;
             // The built clusters now own the only code copy needed by the
             // serializer. Release the raw merge inputs before returning.
             drop(codes);
             drop(labels);
-            index
+            Ok::<_, std::io::Error>(index)
         })
         .await
-        .map_err(|error| {
-            crate::Error::Internal(format!("binary IVF build task failed: {error}"))
-        })?;
+        .map_err(|error| crate::Error::Internal(format!("binary IVF build task failed: {error}")))?
+        .map_err(crate::Error::Io)?;
         log::debug!(
             "[merge_vectors] field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {} bytes)",
             field.0,

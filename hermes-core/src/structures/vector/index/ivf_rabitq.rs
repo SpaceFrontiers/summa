@@ -152,7 +152,7 @@ impl IVFRaBitQIndex {
         // Find nprobe nearest coarse centroids
         let nearest_clusters = coarse_centroids.find_k_nearest(query, nprobe);
 
-        let mut candidates: Vec<(u32, u16, f32)> = Vec::new();
+        let mut candidates = super::BoundedDistanceCollector::new(k);
 
         for &cluster_id in &nearest_clusters {
             if let Some(cluster) = self.clusters.get(cluster_id) {
@@ -163,15 +163,12 @@ impl IVFRaBitQIndex {
                 // Score all vectors in cluster
                 for (doc_id, ordinal, code) in cluster.iter() {
                     let dist = codebook.estimate_distance(&prepared_query, code);
-                    candidates.push((doc_id, ordinal, dist));
+                    candidates.insert(doc_id, ordinal, dist);
                 }
             }
         }
 
-        // With SOAR, a spilled vector appears once per probed cluster it
-        // lives in — finalize dedups to the best estimate before top-k.
-        super::finalize_candidates(&mut candidates, k, coarse_centroids.soar_config.is_some());
-        candidates
+        candidates.into_sorted_results()
     }
 
     /// Merge another index into this one (instance method)

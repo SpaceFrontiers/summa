@@ -45,6 +45,12 @@ pub const BLOOM_BITS_PER_KEY: usize = 10;
 /// Bloom filter hash count (optimal for 10 bits/key)
 pub const BLOOM_HASH_COUNT: usize = 7;
 
+const MAX_SSTABLE_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SSTABLE_DICTIONARY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Results and truncation flag returned by a budgeted prefix scan.
+pub type PrefixScanResult<V> = (Vec<(Vec<u8>, V)>, bool);
+
 // ============================================================================
 // Bloom Filter Implementation
 // ============================================================================
@@ -113,7 +119,7 @@ impl BloomBits {
 impl BloomFilter {
     /// Create a new bloom filter sized for expected number of keys
     pub fn new(expected_keys: usize, bits_per_key: usize) -> Self {
-        let num_bits = (expected_keys * bits_per_key).max(64);
+        let num_bits = expected_keys.saturating_mul(bits_per_key).max(64);
         let num_words = num_bits.div_ceil(64);
         Self {
             bits: BloomBits::Vec(vec![0u64; num_words]),
@@ -136,7 +142,9 @@ impl BloomFilter {
         let num_hashes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
         let num_words = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
-        if data.len() < 12 + num_words * 8 {
+        validate_bloom_header(data.len(), num_bits, num_hashes, num_words)?;
+        let expected_len = 12 + num_words * 8;
+        if data.len() != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Bloom filter data truncated",
@@ -169,7 +177,9 @@ impl BloomFilter {
         let num_hashes = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
         let num_words = u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
 
-        if d.len() < 12 + num_words * 8 {
+        validate_bloom_header(d.len(), num_bits, num_hashes, num_words)?;
+        let expected_len = 12 + num_words * 8;
+        if d.len() != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Bloom filter data truncated",
@@ -267,6 +277,39 @@ impl BloomFilter {
     }
 }
 
+fn validate_bloom_header(
+    data_len: usize,
+    num_bits: usize,
+    num_hashes: usize,
+    num_words: usize,
+) -> io::Result<()> {
+    if num_bits == 0 || num_hashes == 0 || num_hashes > 32 || num_words == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid bloom filter parameters",
+        ));
+    }
+    let word_bytes = num_words
+        .checked_mul(8)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow"))?;
+    let expected_len = 12usize
+        .checked_add(word_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow"))?;
+    let capacity_bits = num_words
+        .checked_mul(64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow"))?;
+    if expected_len > data_len
+        || num_bits > capacity_bits
+        || num_bits <= capacity_bits.saturating_sub(64)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent bloom filter dimensions",
+        ));
+    }
+    Ok(())
+}
+
 /// Compute bloom filter hash pair for a key (standalone, no BloomFilter needed).
 /// Uses the same FNV-1a double-hashing as BloomFilter::hash_pair (single pass).
 #[inline]
@@ -307,7 +350,15 @@ impl SSTableValue for Vec<u8> {
     }
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let len = read_vint(reader)? as usize;
+        let len = usize::try_from(read_vint(reader)?).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "SSTable value length too large")
+        })?;
+        if len > MAX_SSTABLE_BLOCK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable value exceeds block safety limit",
+            ));
+        }
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data)?;
         Ok(data)
@@ -338,7 +389,12 @@ impl SSTableValue for SparseDimInfo {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let offset = read_vint(reader)?;
-        let length = read_vint(reader)? as u32;
+        let length = u32::try_from(read_vint(reader)?).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sparse posting length exceeds u32",
+            )
+        })?;
         Ok(Self { offset, length })
     }
 }
@@ -410,7 +466,10 @@ impl TermInfo {
     /// Try to create an inline TermInfo from posting data
     /// Returns None if posting list is too large to inline
     pub fn try_inline(doc_ids: &[u32], term_freqs: &[u32]) -> Option<Self> {
-        if doc_ids.len() > MAX_INLINE_POSTINGS || doc_ids.is_empty() {
+        if doc_ids.len() > MAX_INLINE_POSTINGS
+            || doc_ids.is_empty()
+            || doc_ids.len() != term_freqs.len()
+        {
             return None;
         }
 
@@ -419,7 +478,7 @@ impl TermInfo {
         let mut prev_doc_id = 0u32;
 
         for (i, &doc_id) in doc_ids.iter().enumerate() {
-            let delta = doc_id - prev_doc_id;
+            let delta = doc_id.checked_sub(prev_doc_id)?;
             if write_vint(&mut cursor, delta as u64).is_err() {
                 return None;
             }
@@ -453,8 +512,12 @@ impl TermInfo {
         let mut cursor = std::io::Cursor::new(&mut data[..]);
         let mut prev_doc_id = 0u32;
 
+        let mut actual_count = 0usize;
         for (doc_id, tf) in iter {
-            let delta = doc_id - prev_doc_id;
+            if actual_count >= count {
+                return None;
+            }
+            let delta = doc_id.checked_sub(prev_doc_id)?;
             if write_vint(&mut cursor, delta as u64).is_err() {
                 return None;
             }
@@ -462,6 +525,11 @@ impl TermInfo {
                 return None;
             }
             prev_doc_id = doc_id;
+            actual_count += 1;
+        }
+
+        if actual_count != count {
+            return None;
         }
 
         let data_len = cursor.position() as u8;
@@ -519,6 +587,12 @@ impl TermInfo {
                 data,
                 data_len,
             } => {
+                if *doc_freq == 0
+                    || *doc_freq as usize > MAX_INLINE_POSTINGS
+                    || *data_len as usize > data.len()
+                {
+                    return None;
+                }
                 let mut doc_ids = Vec::with_capacity(*doc_freq as usize);
                 let mut term_freqs = Vec::with_capacity(*doc_freq as usize);
                 let mut reader = &data[..*data_len as usize];
@@ -527,7 +601,7 @@ impl TermInfo {
                 for _ in 0..*doc_freq {
                     let delta = read_vint(&mut reader).ok()? as u32;
                     let tf = read_vint(&mut reader).ok()? as u32;
-                    let doc_id = prev_doc_id + delta;
+                    let doc_id = prev_doc_id.checked_add(delta)?;
                     doc_ids.push(doc_id);
                     term_freqs.push(tf);
                     prev_doc_id = doc_id;
@@ -548,6 +622,15 @@ impl SSTableValue for TermInfo {
                 data,
                 data_len,
             } => {
+                if *doc_freq == 0
+                    || *doc_freq as usize > MAX_INLINE_POSTINGS
+                    || *data_len as usize > data.len()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid inline TermInfo",
+                    ));
+                }
                 // Tag byte 0xFF = inline marker
                 writer.write_u8(0xFF)?;
                 writer.write_u8(*doc_freq)?;
@@ -588,6 +671,12 @@ impl SSTableValue for TermInfo {
             // Inline
             let doc_freq = reader.read_u8()?;
             let data_len = reader.read_u8()?;
+            if doc_freq == 0 || doc_freq as usize > MAX_INLINE_POSTINGS || data_len as usize > 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid inline TermInfo lengths",
+                ));
+            }
             let mut data = [0u8; 16];
             reader.read_exact(&mut data[..data_len as usize])?;
             Ok(TermInfo::Inline {
@@ -986,12 +1075,11 @@ pub struct AsyncSSTableReader<V: SSTableValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
-/// LRU block cache — O(1) lookup/insert, amortized O(n) promotion.
+/// Bounded block cache with a contention-free read path.
 ///
-/// On `get()`, promotes the accessed entry to MRU position.
-/// On eviction, removes the LRU entry (front of VecDeque).
-/// For typical cache sizes (16-64 blocks), the linear scan in
-/// `promote()` is negligible compared to I/O savings.
+/// Normal reads use [`BlockCache::peek`] under a shared lock and deliberately
+/// do not promote hits, so normal eviction order is insertion order. `get()`
+/// still promotes entries for exclusive warm-up and race-resolution paths.
 struct BlockCache {
     blocks: FxHashMap<u64, Arc<[u8]>>,
     lru_order: std::collections::VecDeque<u64>,
@@ -1022,6 +1110,9 @@ impl BlockCache {
     }
 
     fn insert(&mut self, offset: u64, block: Arc<[u8]>) {
+        if self.max_blocks == 0 {
+            return;
+        }
         if self.blocks.contains_key(&offset) {
             self.promote(offset);
             return;
@@ -1081,16 +1172,46 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             ));
         }
 
+        let footer_start = file_len - 37;
+        if data_end_offset > footer_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable data section extends past its footer",
+            ));
+        }
+        if bloom_offset != 0 && (bloom_offset < data_end_offset || bloom_offset >= footer_start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable bloom filter offset is out of bounds",
+            ));
+        }
+        if dict_offset != 0
+            && (dict_offset < data_end_offset
+                || dict_offset >= footer_start
+                || (bloom_offset != 0 && dict_offset <= bloom_offset))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable dictionary offset is out of bounds",
+            ));
+        }
+
         // Read index section
         let index_start = data_end_offset;
-        let index_end = file_len - 37;
+        let index_end = if bloom_offset != 0 {
+            bloom_offset
+        } else if dict_offset != 0 {
+            dict_offset
+        } else {
+            footer_start
+        };
         let index_bytes = file_handle.read_bytes_range(index_start..index_end).await?;
 
         // Parse block index (length-prefixed FST or mmap index)
         let mut idx_reader = index_bytes.as_slice();
         let index_len = idx_reader.read_u32::<LittleEndian>()? as usize;
 
-        if index_len > idx_reader.len() {
+        if index_len != idx_reader.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Index data truncated",
@@ -1108,12 +1229,46 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         #[cfg(not(feature = "fst-index"))]
         let block_index = BlockIndex::Mmap(MmapBlockIndex::load(index_data)?);
 
+        let mut expected_offset = 0u64;
+        for addr in block_index.all_addrs() {
+            let end = addr.offset.checked_add(addr.length as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "SSTable block range overflow")
+            })?;
+            if addr.length == 0 || addr.offset != expected_offset || end > data_end_offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSTable block addresses are inconsistent",
+                ));
+            }
+            expected_offset = end;
+        }
+        if expected_offset != data_end_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable block addresses do not cover the data section",
+            ));
+        }
+
         // Load bloom filter if present
         let bloom_filter = if bloom_offset > 0 {
             let bloom_start = bloom_offset;
+            let bloom_end = if dict_offset != 0 {
+                dict_offset
+            } else {
+                footer_start
+            };
             // Read bloom filter size first (12 bytes header)
+            let bloom_header_end = bloom_start.checked_add(12).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "bloom filter range overflow")
+            })?;
+            if bloom_header_end > bloom_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bloom filter header is truncated",
+                ));
+            }
             let bloom_header = file_handle
-                .read_bytes_range(bloom_start..bloom_start + 12)
+                .read_bytes_range(bloom_start..bloom_header_end)
                 .await?;
             let num_words = u32::from_le_bytes([
                 bloom_header[8],
@@ -1121,10 +1276,20 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 bloom_header[10],
                 bloom_header[11],
             ]) as u64;
-            let bloom_size = 12 + num_words * 8;
-            let bloom_data = file_handle
-                .read_bytes_range(bloom_start..bloom_start + bloom_size)
-                .await?;
+            let bloom_size = num_words
+                .checked_mul(8)
+                .and_then(|bytes| bytes.checked_add(12))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow")
+                })?;
+            let actual_bloom_size = bloom_end - bloom_start;
+            if bloom_size != actual_bloom_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bloom filter length is inconsistent",
+                ));
+            }
+            let bloom_data = file_handle.read_bytes_range(bloom_start..bloom_end).await?;
             Some(BloomFilter::from_owned_bytes(bloom_data)?)
         } else {
             None
@@ -1134,8 +1299,17 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let dictionary = if dict_offset > 0 {
             let dict_start = dict_offset;
             // Read dictionary size first
+            let dict_header_end = dict_start.checked_add(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "dictionary range overflow")
+            })?;
+            if dict_header_end > footer_start {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "dictionary header is truncated",
+                ));
+            }
             let dict_len_bytes = file_handle
-                .read_bytes_range(dict_start..dict_start + 4)
+                .read_bytes_range(dict_start..dict_header_end)
                 .await?;
             let dict_len = u32::from_le_bytes([
                 dict_len_bytes[0],
@@ -1143,8 +1317,23 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 dict_len_bytes[2],
                 dict_len_bytes[3],
             ]) as u64;
+            if dict_len > MAX_SSTABLE_DICTIONARY_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSTable dictionary exceeds safety limit",
+                ));
+            }
+            let dict_end = dict_header_end.checked_add(dict_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "dictionary range overflow")
+            })?;
+            if dict_end != footer_start {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSTable dictionary length is inconsistent",
+                ));
+            }
             let dict_data = file_handle
-                .read_bytes_range(dict_start + 4..dict_start + 4 + dict_len)
+                .read_bytes_range(dict_header_end..dict_end)
                 .await?;
             Some(CompressionDict::from_owned_bytes(dict_data))
         } else {
@@ -1191,6 +1380,20 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
     /// Number of blocks currently in the cache
     pub fn cached_blocks(&self) -> usize {
         self.cache.read().blocks.len()
+    }
+
+    /// Heap bytes retained by decompressed cached blocks.
+    ///
+    /// This deliberately reports the actual block lengths instead of assuming
+    /// the configured writer block size: compression dictionaries and boundary
+    /// blocks make the retained size variable.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache
+            .read()
+            .blocks
+            .values()
+            .map(|block| block.len())
+            .sum()
     }
 
     /// Look up a key (async - may need to load block)
@@ -1308,7 +1511,10 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let mut max_end: u64 = 0;
         for i in 0..num_blocks {
             if let Some(addr) = self.block_index.get_addr(i) {
-                max_end = max_end.max(addr.offset + addr.length as u64);
+                let end = addr.offset.checked_add(addr.length as u64).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "SSTable block range overflow")
+                })?;
+                max_end = max_end.max(end);
             }
         }
 
@@ -1324,12 +1530,27 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             if cache.get(addr.offset).is_some() {
                 continue;
             }
-            let compressed =
-                &buf[addr.offset as usize..(addr.offset + addr.length as u64) as usize];
+            let start = usize::try_from(addr.offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "SSTable block offset too large")
+            })?;
+            let end = addr
+                .offset
+                .checked_add(addr.length as u64)
+                .and_then(|end| usize::try_from(end).ok())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "SSTable block range overflow")
+                })?;
+            let compressed = buf.get(start..end).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "SSTable block is truncated")
+            })?;
             let decompressed = if let Some(ref dict) = self.dictionary {
-                crate::compression::decompress_with_dict(compressed, dict)?
+                crate::compression::decompress_with_dict_limited(
+                    compressed,
+                    dict,
+                    MAX_SSTABLE_BLOCK_BYTES,
+                )?
             } else {
-                crate::compression::decompress(compressed)?
+                crate::compression::decompress_limited(compressed, MAX_SSTABLE_BLOCK_BYTES)?
             };
             cache.insert(addr.offset, Arc::from(decompressed));
         }
@@ -1364,14 +1585,18 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         // Decompress with dictionary if available
         let decompressed = if let Some(ref dict) = self.dictionary {
-            crate::compression::decompress_with_dict(compressed.as_slice(), dict)?
+            crate::compression::decompress_with_dict_limited(
+                compressed.as_slice(),
+                dict,
+                MAX_SSTABLE_BLOCK_BYTES,
+            )?
         } else {
-            crate::compression::decompress(compressed.as_slice())?
+            crate::compression::decompress_limited(compressed.as_slice(), MAX_SSTABLE_BLOCK_BYTES)?
         };
 
         let block: Arc<[u8]> = Arc::from(decompressed);
 
-        // Insert into cache (write lock, promotes LRU)
+        // Insert into cache under the write lock.
         {
             let mut cache = self.cache.write();
             cache.insert(addr.offset, Arc::clone(&block));
@@ -1400,14 +1625,18 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         // Decompress with dictionary if available
         let decompressed = if let Some(ref dict) = self.dictionary {
-            crate::compression::decompress_with_dict(compressed.as_slice(), dict)?
+            crate::compression::decompress_with_dict_limited(
+                compressed.as_slice(),
+                dict,
+                MAX_SSTABLE_BLOCK_BYTES,
+            )?
         } else {
-            crate::compression::decompress(compressed.as_slice())?
+            crate::compression::decompress_limited(compressed.as_slice(), MAX_SSTABLE_BLOCK_BYTES)?
         };
 
         let block: Arc<[u8]> = Arc::from(decompressed);
 
-        // Insert into cache (write lock, promotes LRU)
+        // Insert into cache under the write lock.
         {
             let mut cache = self.cache.write();
             cache.insert(addr.offset, Arc::clone(&block));
@@ -1525,13 +1754,24 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
     /// forward collecting matching entries. Early-terminates once keys
     /// exceed the prefix range (keys are sorted).
     pub async fn prefix_scan(&self, prefix: &[u8]) -> io::Result<Vec<(Vec<u8>, V)>> {
+        let (results, _) = self.prefix_scan_limited(prefix, usize::MAX).await?;
+        Ok(results)
+    }
+
+    /// Prefix scan with an explicit result budget. The boolean indicates that
+    /// at least one additional matching entry existed beyond the budget.
+    pub async fn prefix_scan_limited(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+    ) -> io::Result<PrefixScanResult<V>> {
         if self.block_index.is_empty() || prefix.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         let start_block = match self.block_index.locate(prefix) {
             Some(idx) => idx,
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), false)),
         };
 
         let mut results = Vec::new();
@@ -1558,27 +1798,41 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 let value = V::deserialize(&mut reader)?;
 
                 if current_key.starts_with(prefix) {
+                    if results.len() >= max_results {
+                        return Ok((results, true));
+                    }
                     results.push((current_key.clone(), value));
                 } else if current_key.as_slice() > prefix {
                     // Keys are sorted — past the prefix range, done
-                    return Ok(results);
+                    return Ok((results, false));
                 }
             }
         }
 
-        Ok(results)
+        Ok((results, false))
     }
 
     /// Synchronous prefix scan — requires Inline (mmap/RAM) file handles.
     #[cfg(feature = "sync")]
     pub fn prefix_scan_sync(&self, prefix: &[u8]) -> io::Result<Vec<(Vec<u8>, V)>> {
+        let (results, _) = self.prefix_scan_limited_sync(prefix, usize::MAX)?;
+        Ok(results)
+    }
+
+    /// Synchronous prefix scan with an explicit result budget.
+    #[cfg(feature = "sync")]
+    pub fn prefix_scan_limited_sync(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+    ) -> io::Result<PrefixScanResult<V>> {
         if self.block_index.is_empty() || prefix.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         let start_block = match self.block_index.locate(prefix) {
             Some(idx) => idx,
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), false)),
         };
 
         let mut results = Vec::new();
@@ -1605,14 +1859,17 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 let value = V::deserialize(&mut reader)?;
 
                 if current_key.starts_with(prefix) {
+                    if results.len() >= max_results {
+                        return Ok((results, true));
+                    }
                     results.push((current_key.clone(), value));
                 } else if current_key.as_slice() > prefix {
-                    return Ok(results);
+                    return Ok((results, false));
                 }
             }
         }
 
-        Ok(results)
+        Ok((results, false))
     }
 }
 

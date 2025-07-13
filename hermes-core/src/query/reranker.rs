@@ -3,15 +3,176 @@
 //! Optimized for throughput:
 //! - Candidates grouped by segment for batched I/O
 //! - Flat indexes sorted for sequential mmap access (OS readahead)
-//! - Single SIMD batch-score call per segment (not per candidate)
-//! - Reusable buffers across segments (no per-candidate heap allocation)
+//! - Bounded SIMD batches (not per-candidate scoring or unbounded raw buffers)
+//! - Reusable per-segment scratch buffers
 //! - unit_norm fast path: skip per-vector norm when vectors are pre-normalized
 
-use rustc_hash::FxHashMap;
+use futures::{StreamExt, TryStreamExt};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::dsl::Field;
 
-use super::{MultiValueCombiner, ScoredPosition, SearchResult};
+use super::{MultiValueCombiner, ScoredPosition, SearchResult, compare_search_results_desc};
+
+/// Maximum stored vectors expanded from the document candidate set by one L2
+/// rerank request. Candidate documents are bounded separately by the server;
+/// this closes the multi-value/ordinal multiplier.
+const MAX_L2_RERANK_VECTORS: usize = 500_000;
+const MAX_L2_RERANK_VECTOR_BYTES: usize = 512 * 1024 * 1024;
+const RERANK_SCORE_BATCH: usize = 4_096;
+const MAX_RERANK_RAW_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_RERANK_SEGMENTS: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RerankerKind {
+    Dense,
+    Binary,
+}
+
+fn validate_reranker_config<D: crate::directories::Directory + 'static>(
+    searcher: &crate::index::Searcher<D>,
+    config: &RerankerConfig,
+) -> crate::error::Result<RerankerKind> {
+    if !config.rrf_k.is_finite() || config.rrf_k < 0.0 {
+        return Err(crate::Error::Query(format!(
+            "reranker rrf_k must be finite and non-negative, got {}",
+            config.rrf_k
+        )));
+    }
+    config.combiner.validate().map_err(crate::Error::Query)?;
+    if config.vector.is_empty() == config.binary_vector.is_empty() {
+        return Err(crate::Error::Query(
+            "reranker must provide exactly one of vector or binary_vector".to_string(),
+        ));
+    }
+
+    let entry = searcher
+        .schema()
+        .get_field_entry(config.field)
+        .ok_or_else(|| crate::Error::FieldNotFound(config.field.0.to_string()))?;
+    if !config.binary_vector.is_empty() {
+        if entry.field_type != crate::dsl::FieldType::BinaryDenseVector {
+            return Err(crate::Error::InvalidFieldType {
+                expected: "binary_dense_vector".to_string(),
+                got: format!("{:?}", entry.field_type),
+            });
+        }
+        let field_config = entry.binary_dense_vector_config.as_ref().ok_or_else(|| {
+            crate::Error::Schema(format!(
+                "binary dense vector field '{}' has no configuration",
+                entry.name
+            ))
+        })?;
+        if field_config.dim == 0 || !field_config.dim.is_multiple_of(8) {
+            return Err(crate::Error::Schema(format!(
+                "binary dense vector field '{}' has invalid dimension {}",
+                entry.name, field_config.dim
+            )));
+        }
+        if config.binary_vector.len() != field_config.byte_len() {
+            return Err(crate::Error::Query(format!(
+                "reranker binary vector byte length {} does not match field '{}' byte length {}",
+                config.binary_vector.len(),
+                entry.name,
+                field_config.byte_len()
+            )));
+        }
+        if config.matryoshka_dims.is_some() {
+            return Err(crate::Error::Query(
+                "reranker matryoshka_dims is not supported for binary vectors".to_string(),
+            ));
+        }
+        return Ok(RerankerKind::Binary);
+    }
+
+    if entry.field_type != crate::dsl::FieldType::DenseVector {
+        return Err(crate::Error::InvalidFieldType {
+            expected: "dense_vector".to_string(),
+            got: format!("{:?}", entry.field_type),
+        });
+    }
+    let field_config = entry.dense_vector_config.as_ref().ok_or_else(|| {
+        crate::Error::Schema(format!(
+            "dense vector field '{}' has no configuration",
+            entry.name
+        ))
+    })?;
+    if config.vector.len() != field_config.dim {
+        return Err(crate::Error::Query(format!(
+            "reranker vector dimension {} does not match field '{}' dimension {}",
+            config.vector.len(),
+            entry.name,
+            field_config.dim
+        )));
+    }
+    if let Some((index, value)) = config
+        .vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(crate::Error::Query(format!(
+            "reranker vector contains non-finite value {value} at index {index}"
+        )));
+    }
+    if config.unit_norm != field_config.unit_norm {
+        return Err(crate::Error::Query(format!(
+            "reranker unit_norm={} does not match field '{}' unit_norm={}",
+            config.unit_norm, entry.name, field_config.unit_norm
+        )));
+    }
+    if let Some(dims) = config.matryoshka_dims
+        && (dims == 0 || dims > field_config.dim)
+    {
+        return Err(crate::Error::Query(format!(
+            "reranker matryoshka_dims must be in 1..={}, got {dims}",
+            field_config.dim
+        )));
+    }
+    Ok(RerankerKind::Dense)
+}
+
+fn reserve_rerank_vectors(
+    vector_budget: &AtomicUsize,
+    byte_budget: &AtomicUsize,
+    count: usize,
+    vector_byte_size: usize,
+) -> crate::error::Result<()> {
+    let bytes = count.checked_mul(vector_byte_size).ok_or_else(|| {
+        crate::Error::Query("reranker stored-vector byte budget overflow".to_string())
+    })?;
+    byte_budget
+        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |used| {
+            used.checked_add(bytes)
+                .filter(|&next| next <= MAX_L2_RERANK_VECTOR_BYTES)
+        })
+        .map_err(|used| {
+            crate::Error::Query(format!(
+                "reranker reads more than {MAX_L2_RERANK_VECTOR_BYTES} stored vector bytes \
+                 (already reserved {used}, next document needs {bytes})"
+            ))
+        })?;
+
+    vector_budget
+        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |used| {
+            used.checked_add(count)
+                .filter(|&next| next <= MAX_L2_RERANK_VECTORS)
+        })
+        .map(|_| ())
+        .map_err(|used| {
+            crate::Error::Query(format!(
+                "reranker expands to more than {MAX_L2_RERANK_VECTORS} stored vectors \
+                 (already reserved {used}, next document has {count})"
+            ))
+        })
+}
+
+#[inline]
+fn rerank_batch_len(vector_byte_size: usize) -> usize {
+    RERANK_SCORE_BATCH.min((MAX_RERANK_RAW_BATCH_BYTES / vector_byte_size.max(1)).max(1))
+}
 
 /// Precomputed query data for dense reranking (computed once, reused across segments).
 struct PrecompQuery<'a> {
@@ -30,32 +191,49 @@ fn score_batch_precomp(
     dim: usize,
     scores: &mut [f32],
     unit_norm: bool,
-) {
+) -> crate::error::Result<()> {
     let query = pq.query;
     let inv_norm_q = pq.inv_norm_q;
     let query_f16 = pq.query_f16;
     use crate::dsl::DenseVectorQuantization;
     use crate::structures::simd;
+    let element_size = quant.element_size();
+    let required_bytes = scores
+        .len()
+        .checked_mul(dim)
+        .and_then(|elements| elements.checked_mul(element_size))
+        .ok_or_else(|| {
+            crate::Error::Corruption("dense reranker batch size overflow".to_string())
+        })?;
+    if raw.len() < required_bytes {
+        return Err(crate::Error::Corruption(format!(
+            "dense reranker batch is truncated: need {required_bytes} bytes, got {}",
+            raw.len()
+        )));
+    }
+    if matches!(
+        quant,
+        DenseVectorQuantization::F32 | DenseVectorQuantization::F16
+    ) && required_bytes > 0
+        && !(raw.as_ptr() as usize).is_multiple_of(element_size)
+    {
+        return Err(crate::Error::Corruption(format!(
+            "dense reranker {:?} data is not {}-byte aligned",
+            quant, element_size
+        )));
+    }
     match (quant, unit_norm) {
         (DenseVectorQuantization::F32, false) => {
             let num_floats = scores.len() * dim;
             // Safety: Vec<u8> from the global allocator is guaranteed to be at least
             // 8-byte aligned on 64-bit platforms (aligned to max_align_t). Assert at
             // runtime to guard against custom allocators with weaker guarantees.
-            assert!(
-                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
-                "f32 vector data not 4-byte aligned"
-            );
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
             simd::batch_cosine_scores_precomp(query, vectors, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::F32, true) => {
             let num_floats = scores.len() * dim;
-            assert!(
-                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
-                "f32 vector data not 4-byte aligned"
-            );
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
             simd::batch_dot_scores_precomp(query, vectors, dim, scores, inv_norm_q);
@@ -73,9 +251,13 @@ fn score_batch_precomp(
             simd::batch_dot_scores_u8_precomp(query, raw, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::Binary, _) => {
-            unreachable!("Binary quantization should not reach score_batch_precomp");
+            return Err(crate::Error::InvalidFieldType {
+                expected: "non-binary dense vector".to_string(),
+                got: "binary dense vector".to_string(),
+            });
         }
     }
+    Ok(())
 }
 
 /// Configuration for L2 dense/binary vector reranking
@@ -174,16 +356,15 @@ fn apply_rrf(
             + super::fusion::rrf_contribution(k, l2_idx + 1);
     }
 
-    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    scored.sort_unstable_by(compare_search_results_desc);
     scored.truncate(final_limit);
 }
 
 /// Rerank L1 candidates by exact dense vector distance.
 ///
 /// Groups candidates by segment for batched I/O, sorts flat indexes for
-/// sequential mmap access, and scores all vectors in a single SIMD batch
-/// per segment. Reuses buffers across segments to avoid per-candidate
-/// heap allocation.
+/// sequential mmap access, and scores vectors in bounded SIMD batches.
+/// Scratch memory remains independent of the candidate count.
 ///
 /// When `unit_norm` is set in the config, scoring uses dot-product only
 /// (skips per-vector norm computation — ~40% less work).
@@ -193,13 +374,16 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     config: &RerankerConfig,
     final_limit: usize,
 ) -> crate::error::Result<Vec<SearchResult>> {
-    // Dispatch: binary vector → Hamming, f32 vector → cosine/dot
-    if !config.binary_vector.is_empty() {
-        return rerank_binary(searcher, candidates, config, final_limit).await;
+    // Validate before empty-result early returns so malformed requests do not
+    // succeed or fail depending on whether the first-stage query found hits.
+    let kind = validate_reranker_config(searcher, config)?;
+    if final_limit == 0 || candidates.is_empty() {
+        return Ok(Vec::new());
     }
 
-    if config.vector.is_empty() || candidates.is_empty() {
-        return Ok(Vec::new());
+    // Dispatch: binary vector → Hamming, f32 vector → cosine/dot.
+    if kind == RerankerKind::Binary {
+        return rerank_binary(searcher, candidates, config, final_limit).await;
     }
 
     let t0 = std::time::Instant::now();
@@ -237,15 +421,16 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     }
 
     // ── Phase 2: Per-segment batched resolve + read + score (concurrent) ──
-    // Each segment runs independently: resolve flat indexes, read vectors,
-    // and score — all overlapping I/O across segments via join_all.
+    // Bound the fan-out so many immutable segments cannot each retain a raw
+    // scoring buffer and candidate scratch at the same time.
     let query_ref = pq.query;
     let inv_norm_q_val = pq.inv_norm_q;
     let query_f16_ref = pq.query_f16;
+    let vector_budget = Arc::new(AtomicUsize::new(0));
+    let byte_budget = Arc::new(AtomicUsize::new(0));
 
-    let segment_futs: Vec<_> = segment_groups
-        .into_iter()
-        .map(|(si, candidate_indices)| {
+    let segment_futs = futures::stream::iter(segment_groups.into_iter().map(
+        |(si, candidate_indices)| {
             #[allow(clippy::redundant_locals)]
             let segments = &segments;
             #[allow(clippy::redundant_locals)]
@@ -256,6 +441,8 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
             let query_f16_ref = query_f16_ref;
             #[allow(clippy::redundant_locals)]
             let config = config;
+            let vector_budget = Arc::clone(&vector_budget);
+            let byte_budget = Arc::clone(&byte_budget);
             async move {
                 let mut scores: Vec<(usize, u32, f32)> = Vec::new();
                 let mut vectors = 0usize;
@@ -269,7 +456,15 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                     ));
                 };
                 if lazy_flat.dim != query_dim {
-                    return Ok((scores, vectors, candidate_indices.len() as u32));
+                    return Err(crate::Error::Corruption(format!(
+                        "dense reranker field {field_id} stores dimension {}, expected {query_dim}",
+                        lazy_flat.dim
+                    )));
+                }
+                if lazy_flat.quantization == crate::dsl::DenseVectorQuantization::Binary {
+                    return Err(crate::Error::Corruption(format!(
+                        "dense reranker field {field_id} unexpectedly uses binary storage"
+                    )));
                 }
 
                 let vbs = lazy_flat.vector_byte_size();
@@ -284,6 +479,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                         seg_skipped += 1;
                         continue;
                     }
+                    reserve_rerank_vectors(&vector_budget, &byte_budget, count, vbs)?;
                     for j in 0..count {
                         let (_, ordinal) = lazy_flat.get_doc_id(start + j);
                         resolved.push((ci, start + j, ordinal as u32));
@@ -297,43 +493,17 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                 let n = resolved.len();
                 vectors = n;
 
-                // Sort by flat_idx for sequential mmap access
+                // Sort by flat_idx for sequential mmap access. Prefetch only
+                // each bounded scoring chunk below; advising the entire
+                // candidate set at once can flood the page cache.
                 resolved.sort_unstable_by_key(|&(_, flat_idx, _)| flat_idx);
 
-                let first_idx = resolved[0].1;
-                let last_idx = resolved[n - 1].1;
-                let span = last_idx - first_idx + 1;
-
-                let mut raw_buf: Vec<u8> = vec![0u8; n * vbs];
-
-                if span <= n * 4 {
-                    let range_bytes = lazy_flat
-                        .read_vectors_batch(first_idx, span)
-                        .await
-                        .map_err(crate::error::Error::Io)?;
-                    let rb = range_bytes.as_slice();
-                    for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
-                        let rel = flat_idx - first_idx;
-                        let src = &rb[rel * vbs..(rel + 1) * vbs];
-                        raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs].copy_from_slice(src);
-                    }
-                } else {
-                    // Scattered reads: batch-prefetch candidate pages so
-                    // page-ins overlap instead of one major fault per vector
-                    // (same treatment as the ANN rerank path).
-                    #[cfg(feature = "native")]
-                    lazy_flat.prefetch_vectors(resolved.iter().map(|&(_, flat_idx, _)| flat_idx));
-
-                    for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
-                        lazy_flat
-                            .read_vector_raw_into(
-                                flat_idx,
-                                &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
-                            )
-                            .await
-                            .map_err(crate::error::Error::Io)?;
-                    }
-                }
+                let batch_len = rerank_batch_len(vbs);
+                let max_batch = batch_len.min(n);
+                let max_raw_len = max_batch.checked_mul(vbs).ok_or_else(|| {
+                    crate::Error::Query("dense reranker buffer size overflow".into())
+                })?;
+                let mut raw_buf = vec![0u8; max_raw_len];
 
                 // Reconstruct PrecompQuery from captured components
                 let pq = PrecompQuery {
@@ -342,12 +512,10 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                     query_f16: query_f16_ref,
                 };
 
-                let mut scores_buf: Vec<f32> = vec![0.0; n];
-
                 // Matryoshka pre-filter
                 if let Some(mdims) = config.matryoshka_dims
                     && mdims < query_dim
-                    && n > final_limit * 2
+                    && n > final_limit.saturating_mul(2)
                 {
                     let trunc_dim = mdims;
                     let trunc_pq = PrecompQuery {
@@ -367,108 +535,170 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                         query_f16: &query_f16_ref[..trunc_dim],
                     };
                     let trunc_vbs = trunc_dim * quant.element_size();
-                    for i in 0..n {
-                        let vec_start = i * vbs;
-                        score_batch_precomp(
-                            &trunc_pq,
-                            &raw_buf[vec_start..vec_start + trunc_vbs],
-                            quant,
-                            trunc_dim,
-                            &mut scores_buf[i..i + 1],
-                            config.unit_norm,
+                    let mut scores_buf = vec![0.0f32; n];
+                    for (chunk_idx, chunk) in resolved.chunks(batch_len).enumerate() {
+                        // Pack only the Matryoshka prefix for this batch. The
+                        // previous full-vector reads pulled every unused tail
+                        // into the page cache and then reread surviving vectors.
+                        let raw_len = chunk.len().checked_mul(trunc_vbs).ok_or_else(|| {
+                            crate::Error::Query("dense reranker buffer size overflow".into())
+                        })?;
+                        let raw = &mut raw_buf[..raw_len];
+                        for (buf_idx, &(_, flat_idx, _)) in chunk.iter().enumerate() {
+                            lazy_flat
+                                .read_vector_prefix_raw_into(
+                                    flat_idx,
+                                    trunc_vbs,
+                                    &mut raw[buf_idx * trunc_vbs..(buf_idx + 1) * trunc_vbs],
+                                )
+                                .await
+                                .map_err(crate::error::Error::Io)?;
+                        }
+                        let score_base = chunk_idx * batch_len;
+                        searcher.install_search_cpu(|| {
+                            score_batch_precomp(
+                                &trunc_pq,
+                                raw,
+                                quant,
+                                trunc_dim,
+                                &mut scores_buf[score_base..score_base + chunk.len()],
+                                config.unit_norm,
+                            )
+                        })?;
+                    }
+
+                    // Rank approximate *documents*, using every stored value
+                    // and the configured combiner. Selecting individual
+                    // vectors here can discard the other values needed by
+                    // Avg/Sum/LSE and can choose the wrong Max document.
+                    let mut approximate_ordinals: FxHashMap<usize, Vec<(u32, f32)>> =
+                        FxHashMap::default();
+                    for (resolved_index, &(ci, _, ordinal)) in resolved.iter().enumerate() {
+                        approximate_ordinals
+                            .entry(ci)
+                            .or_default()
+                            .push((ordinal, scores_buf[resolved_index]));
+                    }
+                    let mut ranked: Vec<(usize, f32)> = approximate_ordinals
+                        .into_iter()
+                        .map(|(ci, ordinals)| (ci, config.combiner.combine(&ordinals)))
+                        .collect();
+                    searcher.install_search_cpu(|| {
+                        ranked.sort_unstable_by(|a, b| {
+                            b.1.total_cmp(&a.1)
+                                .then_with(|| candidates[a.0].doc_id.cmp(&candidates[b.0].doc_id))
+                        });
+                    });
+                    let approximate_docs = ranked.len();
+                    let survivor_doc_limit = final_limit.saturating_mul(2).min(approximate_docs);
+                    let survivor_docs: FxHashSet<usize> = ranked
+                        .into_iter()
+                        .take(survivor_doc_limit)
+                        .map(|(ci, _)| ci)
+                        .collect();
+                    // Full-score every value belonging to each surviving doc;
+                    // the final combiner must never see a truncated value set.
+                    let mut survivor_entries: Vec<_> = resolved
+                        .iter()
+                        .copied()
+                        .filter(|(ci, _, _)| survivor_docs.contains(ci))
+                        .collect();
+                    survivor_entries.sort_unstable_by_key(|&(_, flat_idx, _)| flat_idx);
+                    let mut full_scores = vec![0.0f32; max_batch.min(survivor_entries.len())];
+                    scores.reserve(survivor_entries.len());
+                    for chunk in survivor_entries.chunks(batch_len) {
+                        #[cfg(feature = "native")]
+                        lazy_flat.prefetch_vectors(
+                            chunk.iter().map(|&(_, flat_idx, _)| flat_idx),
                         );
-                    }
-
-                    let per_doc_cap: usize = match &config.combiner {
-                        super::MultiValueCombiner::Max => 1,
-                        super::MultiValueCombiner::WeightedTopK { k, .. } => *k,
-                        _ => usize::MAX,
-                    };
-
-                    let mut ranked: Vec<(usize, f32)> =
-                        (0..n).map(|i| (i, scores_buf[i])).collect();
-                    ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-
-                    let mut survivors: Vec<(usize, f32)> =
-                        Vec::with_capacity(n.min(final_limit * 4));
-                    let mut doc_vector_counts: FxHashMap<usize, usize> = FxHashMap::default();
-                    let mut unique_docs = 0usize;
-
-                    for &(orig_idx, score) in &ranked {
-                        let ci = resolved[orig_idx].0;
-                        let count = doc_vector_counts.entry(ci).or_insert(0);
-
-                        if *count >= per_doc_cap {
-                            continue;
+                        let raw_len = chunk.len().checked_mul(vbs).ok_or_else(|| {
+                            crate::Error::Query("dense reranker buffer size overflow".into())
+                        })?;
+                        let raw = &mut raw_buf[..raw_len];
+                        for (buf_idx, &(_, flat_idx, _)) in chunk.iter().enumerate() {
+                            lazy_flat
+                                .read_vector_raw_into(
+                                    flat_idx,
+                                    &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
+                                )
+                                .await
+                                .map_err(crate::error::Error::Io)?;
                         }
-                        if *count == 0 {
-                            unique_docs += 1;
-                        }
-                        *count += 1;
-                        survivors.push((orig_idx, score));
-
-                        if unique_docs >= final_limit && survivors.len() >= final_limit * 2 {
-                            break;
+                        searcher.install_search_cpu(|| {
+                            score_batch_precomp(
+                                &pq,
+                                raw,
+                                quant,
+                                query_dim,
+                                &mut full_scores[..chunk.len()],
+                                config.unit_norm,
+                            )
+                        })?;
+                        for (buf_idx, &(ci, _, ordinal)) in chunk.iter().enumerate() {
+                            scores.push((ci, ordinal, full_scores[buf_idx]));
                         }
                     }
 
-                    scores.reserve(survivors.len());
-                    for &(orig_idx, _) in &survivors {
-                        let vec_start = orig_idx * vbs;
-                        let mut score = 0.0f32;
-                        score_batch_precomp(
-                            &pq,
-                            &raw_buf[vec_start..vec_start + vbs],
-                            quant,
-                            query_dim,
-                            std::slice::from_mut(&mut score),
-                            config.unit_norm,
-                        );
-                        let (ci, _, ordinal) = resolved[orig_idx];
-                        scores.push((ci, ordinal, score));
-                    }
-
-                    let filtered = n - survivors.len();
+                    let survivor_vectors = survivor_entries.len();
                     log::debug!(
-                        "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived from {} unique docs (filtered {}, per_doc_cap={})",
+                        "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} docs and {}/{} vectors survived",
                         trunc_dim,
                         query_dim,
-                        survivors.len(),
+                        survivor_docs.len(),
+                        approximate_docs,
+                        survivor_vectors,
                         n,
-                        unique_docs,
-                        filtered,
-                        per_doc_cap
                     );
                 } else {
-                    score_batch_precomp(
-                        &pq,
-                        &raw_buf[..n * vbs],
-                        quant,
-                        query_dim,
-                        &mut scores_buf[..n],
-                        config.unit_norm,
-                    );
-
+                    let mut scores_buf = vec![0.0f32; max_batch];
                     scores.reserve(n);
-                    for (buf_idx, &(ci, _, ordinal)) in resolved.iter().enumerate() {
-                        scores.push((ci, ordinal, scores_buf[buf_idx]));
+                    for chunk in resolved.chunks(batch_len) {
+                        #[cfg(feature = "native")]
+                        lazy_flat.prefetch_vectors(
+                            chunk.iter().map(|&(_, flat_idx, _)| flat_idx),
+                        );
+                        let raw_len = chunk.len().checked_mul(vbs).ok_or_else(|| {
+                            crate::Error::Query("dense reranker buffer size overflow".into())
+                        })?;
+                        let raw = &mut raw_buf[..raw_len];
+                        for (buf_idx, &(_, flat_idx, _)) in chunk.iter().enumerate() {
+                            lazy_flat
+                                .read_vector_raw_into(
+                                    flat_idx,
+                                    &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
+                                )
+                                .await
+                                .map_err(crate::error::Error::Io)?;
+                        }
+                        searcher.install_search_cpu(|| {
+                            score_batch_precomp(
+                                &pq,
+                                raw,
+                                quant,
+                                query_dim,
+                                &mut scores_buf[..chunk.len()],
+                                config.unit_norm,
+                            )
+                        })?;
+                        for (buf_idx, &(ci, _, ordinal)) in chunk.iter().enumerate() {
+                            scores.push((ci, ordinal, scores_buf[buf_idx]));
+                        }
                     }
                 }
 
                 Ok((scores, vectors, seg_skipped))
             }
-        })
-        .collect();
-
-    let results = futures::future::join_all(segment_futs).await;
+        },
+    ))
+    .buffer_unordered(MAX_CONCURRENT_RERANK_SEGMENTS);
+    futures::pin_mut!(segment_futs);
 
     let mut all_scores: Vec<(usize, u32, f32)> = Vec::new();
     let mut total_vectors = 0usize;
-    for result in results {
-        let (scores, vectors, seg_skipped) = result?;
+    while let Some((scores, vectors, seg_skipped)) = segment_futs.try_next().await? {
         all_scores.extend(scores);
-        total_vectors += vectors;
-        skipped += seg_skipped;
+        total_vectors = total_vectors.saturating_add(vectors);
+        skipped = skipped.saturating_add(seg_skipped);
     }
 
     let read_score_elapsed = t0.elapsed();
@@ -517,7 +747,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         });
     }
 
-    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    scored.sort_unstable_by(compare_search_results_desc);
 
     if config.rrf_k > 0.0 {
         apply_rrf(candidates, &mut scored, config.rrf_k, final_limit);
@@ -570,23 +800,35 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
         }
     }
 
-    // Concurrent per-segment scoring (same pattern as dense reranker)
-    let segment_futs: Vec<_> = segment_groups
-        .into_iter()
-        .map(|(seg_idx, cand_indices)| {
+    // Bounded concurrent per-segment scoring (same pattern as dense reranker).
+    let vector_budget = Arc::new(AtomicUsize::new(0));
+    let byte_budget = Arc::new(AtomicUsize::new(0));
+    let segment_futs = futures::stream::iter(segment_groups.into_iter().map(
+        |(seg_idx, cand_indices)| {
             #[allow(clippy::redundant_locals)]
             let segments = &segments;
             #[allow(clippy::redundant_locals)]
             let candidates = candidates;
+            let vector_budget = Arc::clone(&vector_budget);
+            let byte_budget = Arc::clone(&byte_budget);
             async move {
                 let mut scores: Vec<(usize, u32, f32)> = Vec::new();
 
                 let Some(lazy_flat) = segments[seg_idx].flat_vectors().get(&field_id) else {
                     return Ok::<_, crate::error::Error>(scores);
                 };
+                if lazy_flat.quantization != crate::dsl::DenseVectorQuantization::Binary
+                    || !lazy_flat.dim.is_multiple_of(8)
+                {
+                    return Err(crate::Error::Corruption(format!(
+                        "binary reranker field {field_id} has invalid flat-vector metadata"
+                    )));
+                }
                 let vbs = lazy_flat.vector_byte_size();
                 if vbs != byte_len {
-                    return Ok(scores);
+                    return Err(crate::Error::Corruption(format!(
+                        "binary reranker field {field_id} stores {vbs} bytes/vector, expected {byte_len}"
+                    )));
                 }
 
                 // Resolve flat indexes
@@ -594,6 +836,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                 for &ci in &cand_indices {
                     let doc_id = candidates[ci].doc_id;
                     let (start, count) = lazy_flat.flat_indexes_for_doc_range(doc_id);
+                    reserve_rerank_vectors(&vector_budget, &byte_budget, count, vbs)?;
                     for j in 0..count {
                         resolved.push((ci, start + j));
                     }
@@ -605,62 +848,56 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                 resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
 
                 let n = resolved.len();
-                let first_idx = resolved[0].1;
-                let last_idx = resolved[n - 1].1;
-                let span = last_idx - first_idx + 1;
+                let batch_len = rerank_batch_len(vbs);
+                let max_batch = batch_len.min(n);
+                let max_raw_len = max_batch.checked_mul(vbs).ok_or_else(|| {
+                    crate::Error::Query("binary reranker buffer size overflow".into())
+                })?;
+                let mut raw_buf = vec![0u8; max_raw_len];
+                let mut scores_buf = vec![0f32; max_batch];
+                scores.reserve(n);
 
-                let mut raw_buf = vec![0u8; n * vbs];
-
-                if span <= n * 4 {
-                    let range_bytes = lazy_flat
-                        .read_vectors_batch(first_idx, span)
-                        .await
-                        .map_err(crate::error::Error::Io)?;
-                    let rb = range_bytes.as_slice();
-                    for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
-                        let rel = flat_idx - first_idx;
-                        raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs]
-                            .copy_from_slice(&rb[rel * vbs..(rel + 1) * vbs]);
-                    }
-                } else {
-                    for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                for chunk in resolved.chunks(batch_len) {
+                    let raw_len = chunk.len().checked_mul(vbs).ok_or_else(|| {
+                        crate::Error::Query("binary reranker buffer size overflow".into())
+                    })?;
+                    let raw = &mut raw_buf[..raw_len];
+                    for (buf_idx, &(_, flat_idx)) in chunk.iter().enumerate() {
                         lazy_flat
                             .read_vector_raw_into(
                                 flat_idx,
-                                &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
+                                &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
                             )
                             .await
                             .map_err(crate::error::Error::Io)?;
                     }
-                }
+                    searcher.install_search_cpu(|| {
+                        crate::structures::simd::batch_hamming_scores(
+                            query,
+                            raw,
+                            byte_len,
+                            lazy_flat.dim,
+                            &mut scores_buf[..chunk.len()],
+                        );
+                    });
 
-                // Batch Hamming scoring
-                let dim_bits = lazy_flat.dim;
-                let mut scores_buf = vec![0f32; n];
-                crate::structures::simd::batch_hamming_scores(
-                    query,
-                    &raw_buf,
-                    byte_len,
-                    dim_bits,
-                    &mut scores_buf,
-                );
-
-                for (buf_idx, &(ci, flat_idx)) in resolved.iter().enumerate() {
-                    let (_, ordinal) = lazy_flat.get_doc_id(flat_idx);
-                    scores.push((ci, ordinal as u32, scores_buf[buf_idx]));
+                    for (buf_idx, &(ci, flat_idx)) in chunk.iter().enumerate() {
+                        let (_, ordinal) = lazy_flat.get_doc_id(flat_idx);
+                        scores.push((ci, ordinal as u32, scores_buf[buf_idx]));
+                    }
                 }
 
                 Ok(scores)
             }
-        })
-        .collect();
-
-    let results = futures::future::join_all(segment_futs).await;
+        },
+    ))
+    .buffer_unordered(MAX_CONCURRENT_RERANK_SEGMENTS);
+    futures::pin_mut!(segment_futs);
 
     // Combine ordinal scores per candidate and apply combiner
     let mut cand_ordinal_scores: FxHashMap<usize, Vec<(u32, f32)>> = FxHashMap::default();
-    for result in results {
-        for (ci, ordinal, score) in result? {
+    while let Some(scores) = segment_futs.try_next().await? {
+        for (ci, ordinal, score) in scores {
             cand_ordinal_scores
                 .entry(ci)
                 .or_default()
@@ -684,7 +921,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
         });
     }
 
-    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    scored.sort_unstable_by(compare_search_results_desc);
 
     if config.rrf_k > 0.0 {
         apply_rrf(candidates, &mut scored, config.rrf_k, final_limit);
@@ -721,6 +958,33 @@ mod tests {
             matryoshka_dims: None,
             rrf_k: 0.0,
         }
+    }
+
+    #[test]
+    fn rerank_batches_are_bounded_by_bytes() {
+        assert_eq!(rerank_batch_len(1), RERANK_SCORE_BATCH);
+        assert_eq!(
+            rerank_batch_len(MAX_RERANK_RAW_BATCH_BYTES),
+            1,
+            "one very wide vector must still make progress"
+        );
+        assert!(
+            rerank_batch_len(4_096) * 4_096 <= MAX_RERANK_RAW_BATCH_BYTES,
+            "normal batches must stay within the raw scratch budget"
+        );
+    }
+
+    #[test]
+    fn rerank_budget_bounds_count_and_bytes() {
+        let vectors = AtomicUsize::new(0);
+        let bytes = AtomicUsize::new(0);
+        reserve_rerank_vectors(&vectors, &bytes, 2, 32).unwrap();
+        assert_eq!(vectors.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(bytes.load(AtomicOrdering::Relaxed), 64);
+
+        let vectors = AtomicUsize::new(0);
+        let bytes = AtomicUsize::new(0);
+        assert!(reserve_rerank_vectors(&vectors, &bytes, 2, MAX_L2_RERANK_VECTOR_BYTES).is_err());
     }
 
     #[test]

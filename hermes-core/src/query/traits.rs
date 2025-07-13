@@ -29,6 +29,25 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 #[cfg(target_arch = "wasm32")]
 pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 'a>>> + 'a>>;
 
+/// Options that affect scorer construction rather than scoring semantics.
+///
+/// Position postings can be much larger than the top-k result itself. Keeping
+/// this explicit lets ID/score-only collectors avoid loading them while query
+/// types that need positions for matching (for example phrases) remain free to
+/// load their own internal data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScorerOptions {
+    pub collect_positions: bool,
+}
+
+impl ScorerOptions {
+    pub const fn with_positions() -> Self {
+        Self {
+            collect_positions: true,
+        }
+    }
+}
+
 /// Future type for count estimation
 #[cfg(not(target_arch = "wasm32"))]
 pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>>;
@@ -204,6 +223,19 @@ macro_rules! define_query_traits {
                 limit: usize,
             ) -> ScorerFuture<'a>;
 
+            /// Create a scorer with collector-specific construction options.
+            /// Query implementations that can avoid optional position data
+            /// should override this; the default preserves existing behavior.
+            fn scorer_with_options<'a>(
+                &self,
+                reader: &'a SegmentReader,
+                limit: usize,
+                options: ScorerOptions,
+            ) -> ScorerFuture<'a> {
+                let _ = options;
+                self.scorer(reader, limit)
+            }
+
             /// Estimated number of matching documents in a segment (async)
             fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
 
@@ -221,6 +253,18 @@ macro_rules! define_query_traits {
                 Err(crate::error::Error::Query(
                     "sync scorer not supported for this query type".into(),
                 ))
+            }
+
+            /// Synchronous counterpart to [`Query::scorer_with_options`].
+            #[cfg(feature = "sync")]
+            fn scorer_sync_with_options<'a>(
+                &self,
+                reader: &'a SegmentReader,
+                limit: usize,
+                options: ScorerOptions,
+            ) -> Result<Box<dyn Scorer + 'a>> {
+                let _ = options;
+                self.scorer_sync(reader, limit)
             }
 
             /// Decompose this query for MaxScore optimization.
@@ -299,6 +343,15 @@ impl Query for Box<dyn Query> {
         (**self).count_estimate(reader)
     }
 
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: ScorerOptions,
+    ) -> ScorerFuture<'a> {
+        (**self).scorer_with_options(reader, limit, options)
+    }
+
     fn decompose(&self) -> QueryDecomposition {
         (**self).decompose()
     }
@@ -326,6 +379,16 @@ impl Query for Box<dyn Query> {
         limit: usize,
     ) -> Result<Box<dyn Scorer + 'a>> {
         (**self).scorer_sync(reader, limit)
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: ScorerOptions,
+    ) -> Result<Box<dyn Scorer + 'a>> {
+        (**self).scorer_sync_with_options(reader, limit, options)
     }
 }
 

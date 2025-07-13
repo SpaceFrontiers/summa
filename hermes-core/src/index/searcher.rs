@@ -16,6 +16,43 @@ use crate::segment::{SegmentId, SegmentReader};
 use crate::segment::{SegmentSnapshot, SegmentTracker};
 use crate::structures::CoarseCentroids;
 
+/// Immutable resources that must stay identical across `IndexReader` reloads.
+/// The search pool exists only when synchronous scoring is compiled in; native
+/// async-only builds retain the cache policy without spawning unused threads.
+#[cfg(feature = "native")]
+#[derive(Clone)]
+pub(crate) struct SearcherResources {
+    pub(crate) term_cache_blocks: usize,
+    pub(crate) store_cache_blocks: usize,
+    #[cfg(feature = "sync")]
+    pub(crate) search_pool: Arc<rayon::ThreadPool>,
+}
+
+#[cfg(feature = "native")]
+impl SearcherResources {
+    pub(crate) fn new(
+        term_cache_blocks: usize,
+        store_cache_blocks: usize,
+        num_threads: usize,
+    ) -> Result<Self> {
+        if num_threads == 0 {
+            return Err(crate::Error::Internal(
+                "IndexConfig.num_threads must be greater than zero".into(),
+            ));
+        }
+
+        #[cfg(feature = "sync")]
+        let search_pool = super::shared_search_pool(num_threads)?;
+
+        Ok(Self {
+            term_cache_blocks,
+            store_cache_blocks,
+            #[cfg(feature = "sync")]
+            search_pool,
+        })
+    }
+}
+
 /// Searcher - provides search over loaded segments
 ///
 /// For wasm/read-only use, create via `Searcher::open()`.
@@ -42,6 +79,9 @@ pub struct Searcher<D: Directory + 'static> {
     segment_map: FxHashMap<u128, usize>,
     /// Total document count across all segments
     total_docs: u32,
+    /// Bounded process-wide-by-width pool for the complete nested search tree.
+    #[cfg(feature = "sync")]
+    search_pool: Arc<rayon::ThreadPool>,
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -55,12 +95,31 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         term_cache_blocks: usize,
     ) -> Result<Self> {
+        Self::open_with_cache_blocks(
+            directory,
+            schema,
+            segment_ids,
+            term_cache_blocks,
+            term_cache_blocks,
+        )
+        .await
+    }
+
+    /// Create a read-only searcher with independent cache capacities.
+    pub async fn open_with_cache_blocks(
+        directory: Arc<D>,
+        schema: Arc<Schema>,
+        segment_ids: &[String],
+        term_cache_blocks: usize,
+        store_cache_blocks: usize,
+    ) -> Result<Self> {
         Self::create(
             directory,
             schema,
             segment_ids,
             FxHashMap::default(),
             term_cache_blocks,
+            store_cache_blocks,
         )
         .await
     }
@@ -72,14 +131,15 @@ impl<D: Directory + 'static> Searcher<D> {
         schema: Arc<Schema>,
         snapshot: SegmentSnapshot,
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        term_cache_blocks: usize,
+        resources: SearcherResources,
     ) -> Result<Self> {
         let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
             &directory,
             &schema,
             snapshot.segment_ids(),
             &trained_centroids,
-            term_cache_blocks,
+            resources.term_cache_blocks,
+            resources.store_cache_blocks,
             &[],
         )
         .await?;
@@ -95,6 +155,8 @@ impl<D: Directory + 'static> Searcher<D> {
             global_stats,
             segment_map,
             total_docs,
+            #[cfg(feature = "sync")]
+            search_pool: resources.search_pool,
         })
     }
 
@@ -107,7 +169,7 @@ impl<D: Directory + 'static> Searcher<D> {
         schema: Arc<Schema>,
         snapshot: SegmentSnapshot,
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        term_cache_blocks: usize,
+        resources: SearcherResources,
         existing_segments: &[Arc<SegmentReader>],
     ) -> Result<Self> {
         let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
@@ -115,7 +177,8 @@ impl<D: Directory + 'static> Searcher<D> {
             &schema,
             snapshot.segment_ids(),
             &trained_centroids,
-            term_cache_blocks,
+            resources.term_cache_blocks,
+            resources.store_cache_blocks,
             existing_segments,
         )
         .await?;
@@ -131,6 +194,8 @@ impl<D: Directory + 'static> Searcher<D> {
             global_stats,
             segment_map,
             total_docs,
+            #[cfg(feature = "sync")]
+            search_pool: resources.search_pool,
         })
     }
 
@@ -141,6 +206,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
+        store_cache_blocks: usize,
     ) -> Result<Self> {
         let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
             &directory,
@@ -148,6 +214,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             &trained_centroids,
             term_cache_blocks,
+            store_cache_blocks,
             &[],
         )
         .await?;
@@ -157,6 +224,9 @@ impl<D: Directory + 'static> Searcher<D> {
             let tracker = Arc::new(SegmentTracker::new());
             SegmentSnapshot::new(tracker, segment_ids.to_vec())
         };
+
+        #[cfg(feature = "sync")]
+        let search_pool = super::shared_search_pool(crate::default_search_threads())?;
 
         let _ = directory; // suppress unused warning on wasm
         Ok(Self {
@@ -171,6 +241,8 @@ impl<D: Directory + 'static> Searcher<D> {
             global_stats,
             segment_map,
             total_docs,
+            #[cfg(feature = "sync")]
+            search_pool,
         })
     }
 
@@ -181,6 +253,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
+        store_cache_blocks: usize,
         existing_segments: &[Arc<SegmentReader>],
     ) -> Result<(
         Vec<Arc<SegmentReader>>,
@@ -195,6 +268,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             trained_centroids,
             term_cache_blocks,
+            store_cache_blocks,
             existing_segments,
         )
         .await?;
@@ -219,6 +293,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
+        store_cache_blocks: usize,
         existing_segments: &[Arc<SegmentReader>],
     ) -> Result<Vec<Arc<SegmentReader>>> {
         // Build lookup from existing segment readers for reuse
@@ -260,7 +335,16 @@ impl<D: Directory + 'static> Searcher<D> {
                 let dir = Arc::clone(directory);
                 let sch = Arc::clone(schema);
                 let sid = *segment_id;
-                async move { SegmentReader::open(dir.as_ref(), sid, sch, term_cache_blocks).await }
+                async move {
+                    SegmentReader::open_with_cache_blocks(
+                        dir.as_ref(),
+                        sid,
+                        sch,
+                        term_cache_blocks,
+                        store_cache_blocks,
+                    )
+                    .await
+                }
             })
             .collect();
 
@@ -395,6 +479,19 @@ impl<D: Directory + 'static> Searcher<D> {
         &self.segment_map
     }
 
+    /// Run a bounded piece of CPU work inside this index's shared search pool.
+    /// Async-only/WASM builds execute inline because Rayon is not available.
+    pub(crate) fn install_search_cpu<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        #[cfg(feature = "sync")]
+        {
+            self.search_pool.install(operation)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            operation()
+        }
+    }
+
     /// Get number of segments
     pub fn num_segments(&self) -> usize {
         self.segments.len()
@@ -470,7 +567,7 @@ impl<D: Directory + 'static> Searcher<D> {
         offset: usize,
         collect_positions: bool,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
-        let fetch_limit = offset + limit;
+        let fetch_limit = checked_search_window(limit, offset)?;
 
         // Use rayon + block_in_place for CPU-bound scoring (sync feature required).
         // Offloads the scoring loop from tokio workers so search doesn't starve
@@ -485,50 +582,44 @@ impl<D: Directory + 'static> Searcher<D> {
             return self.search_internal_parallel(query, fetch_limit, offset, collect_positions);
         }
 
-        // No segments, no sync feature, or current_thread runtime: use async path
-        let futures: Vec<_> = self
-            .segments
-            .iter()
-            .map(|segment| {
-                let sid = segment.meta().id;
-                async move {
-                    let (mut results, segment_seen) = if collect_positions {
-                        crate::query::search_segment_with_positions_and_count(
-                            segment.as_ref(),
-                            query,
-                            fetch_limit,
-                        )
+        // No segments, no sync feature, or current_thread runtime: use an
+        // explicitly bounded async stream. Starting every segment at once can
+        // retain `segments × top_k` results while the slowest I/O completes.
+        const MAX_ASYNC_SEGMENT_SEARCHES: usize = 8;
+        use futures::StreamExt;
+        use futures::TryStreamExt;
+        let searches = futures::stream::iter(self.segments.iter().cloned().map(|segment| {
+            let sid = segment.meta().id;
+            async move {
+                let (mut results, segment_seen) = if collect_positions {
+                    crate::query::search_segment_with_positions_and_count(
+                        segment.as_ref(),
+                        query,
+                        fetch_limit,
+                    )
+                    .await?
+                } else {
+                    crate::query::search_segment_with_count(segment.as_ref(), query, fetch_limit)
                         .await?
-                    } else {
-                        crate::query::search_segment_with_count(
-                            segment.as_ref(),
-                            query,
-                            fetch_limit,
-                        )
-                        .await?
-                    };
-                    // Stamp segment_id on each result
-                    for r in &mut results {
-                        r.segment_id = sid;
-                    }
-                    Ok::<_, crate::error::Error>((results, segment_seen))
+                };
+                // Stamp segment_id on each result
+                for r in &mut results {
+                    r.segment_id = sid;
                 }
-            })
-            .collect();
-
-        let batches = futures::future::try_join_all(futures).await?;
-        let mut total_seen: u32 = 0;
-
-        let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
-            Vec::with_capacity(batches.len());
-        for (batch, segment_seen) in batches {
-            total_seen = total_seen.saturating_add(segment_seen);
-            if !batch.is_empty() {
-                sorted_batches.push(batch);
+                Ok::<_, crate::error::Error>((results, segment_seen))
             }
+        }))
+        .buffer_unordered(MAX_ASYNC_SEGMENT_SEARCHES);
+        futures::pin_mut!(searches);
+
+        let mut total_seen: u32 = 0;
+        let mut merged = Vec::new();
+        while let Some((batch, segment_seen)) = searches.try_next().await? {
+            total_seen = total_seen.saturating_add(segment_seen);
+            merged = merge_two_ranked(merged, batch, fetch_limit);
         }
 
-        let results = merge_segment_results(sorted_batches, fetch_limit, offset);
+        let results = apply_result_offset(merged, fetch_limit, offset);
         Ok((results, total_seen))
     }
 
@@ -563,7 +654,7 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         use rayon::prelude::*;
 
-        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> = {
+        let (merged, total_seen) = self.search_pool.install(|| {
             self.segments
                 .par_iter()
                 .map(|segment| {
@@ -584,23 +675,20 @@ impl<D: Directory + 'static> Searcher<D> {
                     for r in &mut results {
                         r.segment_id = sid;
                     }
-                    Ok((results, segment_seen))
+                    Ok::<_, crate::Error>((results, segment_seen))
                 })
-                .collect()
-        };
+                .try_reduce(
+                    || (Vec::new(), 0u32),
+                    |(left, left_seen), (right, right_seen)| {
+                        Ok((
+                            merge_two_ranked(left, right, fetch_limit),
+                            left_seen.saturating_add(right_seen),
+                        ))
+                    },
+                )
+        })?;
 
-        let mut total_seen: u32 = 0;
-        let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
-            Vec::with_capacity(batches.len());
-        for result in batches {
-            let (batch, segment_seen) = result?;
-            total_seen = total_seen.saturating_add(segment_seen);
-            if !batch.is_empty() {
-                sorted_batches.push(batch);
-            }
-        }
-
-        let results = merge_segment_results(sorted_batches, fetch_limit, offset);
+        let results = apply_result_offset(merged, fetch_limit, offset);
         Ok((results, total_seen))
     }
 
@@ -616,37 +704,35 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         use rayon::prelude::*;
 
-        let fetch_limit = offset + limit;
+        let fetch_limit = checked_search_window(limit, offset)?;
 
-        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> = self
-            .segments
-            .par_iter()
-            .map(|segment| {
-                let sid = segment.meta().id;
-                let (mut results, segment_seen) = crate::query::search_segment_with_count_sync(
-                    segment.as_ref(),
-                    query,
-                    fetch_limit,
-                )?;
-                for r in &mut results {
-                    r.segment_id = sid;
-                }
-                Ok((results, segment_seen))
-            })
-            .collect();
+        let (merged, total_seen) = self.search_pool.install(|| {
+            self.segments
+                .par_iter()
+                .map(|segment| {
+                    let sid = segment.meta().id;
+                    let (mut results, segment_seen) = crate::query::search_segment_with_count_sync(
+                        segment.as_ref(),
+                        query,
+                        fetch_limit,
+                    )?;
+                    for r in &mut results {
+                        r.segment_id = sid;
+                    }
+                    Ok::<_, crate::Error>((results, segment_seen))
+                })
+                .try_reduce(
+                    || (Vec::new(), 0u32),
+                    |(left, left_seen), (right, right_seen)| {
+                        Ok((
+                            merge_two_ranked(left, right, fetch_limit),
+                            left_seen.saturating_add(right_seen),
+                        ))
+                    },
+                )
+        })?;
 
-        let mut total_seen: u32 = 0;
-        let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
-            Vec::with_capacity(batches.len());
-        for result in batches {
-            let (batch, segment_seen) = result?;
-            total_seen = total_seen.saturating_add(segment_seen);
-            if !batch.is_empty() {
-                sorted_batches.push(batch);
-            }
-        }
-
-        let results = merge_segment_results(sorted_batches, fetch_limit, offset);
+        let results = apply_result_offset(merged, fetch_limit, offset);
         Ok((results, total_seen))
     }
 
@@ -677,6 +763,66 @@ impl<D: Directory + 'static> Searcher<D> {
         method: crate::query::FusionMethod,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<crate::query::SearchResult>> {
+        let (results, _) = self
+            .search_fused_with_count(queries, fetch_limit, limit, method, combiner)
+            .await?;
+        Ok(results)
+    }
+
+    /// Fusion variant that also returns the aggregate number of documents
+    /// scored by all sub-queries. This lets request-facing callers use the
+    /// parallel fusion path without rerunning sub-queries for observability.
+    pub async fn search_fused_with_count(
+        &self,
+        queries: &[(&dyn crate::query::Query, f32)],
+        fetch_limit: usize,
+        limit: usize,
+        method: crate::query::FusionMethod,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        if queries.is_empty() {
+            return Err(crate::Error::Query(
+                "fusion requires at least one sub-query".to_string(),
+            ));
+        }
+        if queries.len() > crate::query::MAX_FUSION_SUB_QUERIES {
+            return Err(crate::Error::Query(format!(
+                "fusion supports at most {} sub-queries, got {}",
+                crate::query::MAX_FUSION_SUB_QUERIES,
+                queries.len()
+            )));
+        }
+        if fetch_limit == 0 {
+            return Err(crate::Error::Query(
+                "fusion fetch_limit must be greater than zero".to_string(),
+            ));
+        }
+        let candidate_slots = fetch_limit
+            .checked_mul(queries.len())
+            .ok_or_else(|| crate::Error::Query("fusion candidate budget overflow".to_string()))?;
+        if candidate_slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
+            return Err(crate::Error::Query(format!(
+                "fusion candidate budget must not exceed {}, got {candidate_slots}",
+                crate::query::MAX_FUSION_CANDIDATE_SLOTS
+            )));
+        }
+        for (index, &(_, weight)) in queries.iter().enumerate() {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(crate::Error::Query(format!(
+                    "fusion query weight at index {index} must be finite and non-negative, \
+                     got {weight}"
+                )));
+            }
+        }
+        if let crate::query::FusionMethod::Rrf { k } = method
+            && (!k.is_finite() || k < 0.0)
+        {
+            return Err(crate::Error::Query(format!(
+                "fusion RRF k must be finite and non-negative, got {k}"
+            )));
+        }
+        combiner.validate().map_err(crate::Error::Query)?;
+
         // Sub-queries are independent — fan them out on rayon under a single
         // block_in_place (each also par_iters its segments; rayon
         // work-stealing composes the two levels). Sequential fallback for
@@ -687,31 +833,59 @@ impl<D: Directory + 'static> Searcher<D> {
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
             use rayon::prelude::*;
-            let lists: Vec<Result<(Vec<crate::query::SearchResult>, f32)>> =
+            let lists: Vec<Result<(Vec<crate::query::SearchResult>, f32, u32)>> =
                 tokio::task::block_in_place(|| {
-                    queries
-                        .par_iter()
-                        .map(|&(query, weight)| {
-                            let (results, _) =
-                                self.search_internal_sync(query, fetch_limit, 0, true)?;
-                            Ok((results, weight))
-                        })
-                        .collect()
+                    self.search_pool.install(|| {
+                        queries
+                            .par_iter()
+                            .map(|&(query, weight)| {
+                                let (results, seen) =
+                                    self.search_internal_sync(query, fetch_limit, 0, true)?;
+                                Ok((results, weight, seen))
+                            })
+                            .collect()
+                    })
                 });
             let lists = lists.into_iter().collect::<Result<Vec<_>>>()?;
-            return Ok(crate::query::fuse_ranked_lists_chunked(
-                lists, method, combiner, limit,
-            ));
+            let mut total_seen = 0u32;
+            let ranked_lists = lists
+                .into_iter()
+                .map(|(results, weight, seen)| {
+                    total_seen = total_seen.saturating_add(seen);
+                    (results, weight)
+                })
+                .collect();
+            let fused =
+                crate::query::try_fuse_ranked_lists_chunked(ranked_lists, method, combiner, limit)
+                    .map_err(crate::Error::Query)?;
+            return Ok((fused, total_seen));
         }
 
-        let mut lists = Vec::with_capacity(queries.len());
+        // Async/current-thread fallback retains bounded I/O concurrency and
+        // preserves input list order for deterministic rank ties.
+        const MAX_ASYNC_FUSION_SEARCHES: usize = 4;
+        use futures::{StreamExt, TryStreamExt};
+        let mut pending = Vec::with_capacity(queries.len());
         for &(query, weight) in queries {
-            let (results, _) = self.search_with_positions(query, fetch_limit).await?;
-            lists.push((results, weight));
+            pending.push(async move {
+                let (results, seen) = self.search_with_positions(query, fetch_limit).await?;
+                Ok::<_, crate::Error>((results, weight, seen))
+            });
         }
-        Ok(crate::query::fuse_ranked_lists_chunked(
-            lists, method, combiner, limit,
-        ))
+        let searches = futures::stream::iter(pending).buffered(MAX_ASYNC_FUSION_SEARCHES);
+        let lists: Vec<_> = searches.try_collect().await?;
+        let mut total_seen = 0u32;
+        let ranked_lists = lists
+            .into_iter()
+            .map(|(results, weight, seen)| {
+                total_seen = total_seen.saturating_add(seen);
+                (results, weight)
+            })
+            .collect();
+        let fused =
+            crate::query::try_fuse_ranked_lists_chunked(ranked_lists, method, combiner, limit)
+                .map_err(crate::Error::Query)?;
+        Ok((fused, total_seen))
     }
 
     /// Two-stage search: L1 retrieval + L2 dense vector reranking
@@ -821,74 +995,52 @@ impl<D: Directory + 'static> Searcher<D> {
     }
 }
 
-/// K-way merge of pre-sorted segment result batches.
-///
-/// Each batch is sorted by score descending. Uses a max-heap of
-/// (score, batch_idx, position) to merge in O(N log K).
-fn merge_segment_results(
-    sorted_batches: Vec<Vec<crate::query::SearchResult>>,
+/// Merge two canonically sorted batches while moving (not cloning) hits.
+/// Reductions use this eagerly, so retained cross-segment results stay O(k)
+/// instead of O(number_of_segments × k).
+fn merge_two_ranked(
+    left: Vec<crate::query::SearchResult>,
+    right: Vec<crate::query::SearchResult>,
+    limit: usize,
+) -> Vec<crate::query::SearchResult> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::with_capacity(limit.min(left.len().saturating_add(right.len())));
+
+    while merged.len() < limit {
+        let take_left = match (left.peek(), right.peek()) {
+            (Some(left), Some(right)) => {
+                !crate::query::compare_search_results_desc(left, right).is_gt()
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_left {
+            merged.push(left.next().expect("peeked left result"));
+        } else {
+            merged.push(right.next().expect("peeked right result"));
+        }
+    }
+    merged
+}
+
+fn apply_result_offset(
+    results: Vec<crate::query::SearchResult>,
     fetch_limit: usize,
     offset: usize,
 ) -> Vec<crate::query::SearchResult> {
-    use std::cmp::Ordering;
-
-    struct MergeEntry {
-        score: f32,
-        batch_idx: usize,
-        pos: usize,
-    }
-    impl PartialEq for MergeEntry {
-        fn eq(&self, other: &Self) -> bool {
-            self.score == other.score
-        }
-    }
-    impl Eq for MergeEntry {}
-    impl PartialOrd for MergeEntry {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for MergeEntry {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.score
-                .partial_cmp(&other.score)
-                .unwrap_or(Ordering::Equal)
-        }
-    }
-
-    let mut heap = std::collections::BinaryHeap::with_capacity(sorted_batches.len());
-    for (i, batch) in sorted_batches.iter().enumerate() {
-        if !batch.is_empty() {
-            heap.push(MergeEntry {
-                score: batch[0].score,
-                batch_idx: i,
-                pos: 0,
-            });
-        }
-    }
-
-    let mut results = Vec::with_capacity(fetch_limit.min(64));
-    let mut emitted = 0usize;
-    while let Some(entry) = heap.pop() {
-        if emitted >= fetch_limit {
-            break;
-        }
-        let batch = &sorted_batches[entry.batch_idx];
-        if emitted >= offset {
-            results.push(batch[entry.pos].clone());
-        }
-        emitted += 1;
-        let next_pos = entry.pos + 1;
-        if next_pos < batch.len() {
-            heap.push(MergeEntry {
-                score: batch[next_pos].score,
-                batch_idx: entry.batch_idx,
-                pos: next_pos,
-            });
-        }
-    }
-
     results
+        .into_iter()
+        .skip(offset)
+        .take(fetch_limit.saturating_sub(offset))
+        .collect()
+}
+
+fn checked_search_window(limit: usize, offset: usize) -> Result<usize> {
+    offset
+        .checked_add(limit)
+        .ok_or_else(|| crate::Error::Query("search offset + limit overflow".into()))
 }
 
 /// Get current process RSS in MB (best-effort, returns 0.0 on failure)
@@ -949,5 +1101,52 @@ fn process_rss_mb() -> f64 {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod search_window_tests {
+    use super::{apply_result_offset, checked_search_window, merge_two_ranked};
+    use crate::query::SearchResult;
+
+    fn result(segment_id: u128, doc_id: u32, score: f32) -> SearchResult {
+        SearchResult {
+            doc_id,
+            score,
+            segment_id,
+            positions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn search_window_is_checked() {
+        assert_eq!(checked_search_window(7, 5).unwrap(), 12);
+        assert!(checked_search_window(1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn bounded_merge_preserves_canonical_order_and_ties() {
+        let left = vec![result(2, 9, 10.0), result(2, 3, 7.0)];
+        let right = vec![result(1, 8, 10.0), result(1, 2, 7.0)];
+
+        let merged = merge_two_ranked(left, right, 3);
+        let keys: Vec<_> = merged
+            .iter()
+            .map(|result| (result.score, result.segment_id, result.doc_id))
+            .collect();
+        assert_eq!(keys, vec![(10.0, 1, 8), (10.0, 2, 9), (7.0, 1, 2)]);
+    }
+
+    #[test]
+    fn result_offset_returns_only_the_requested_window() {
+        let results = (0..8)
+            .map(|doc_id| result(1, doc_id, 8.0 - doc_id as f32))
+            .collect();
+
+        let page = apply_result_offset(results, 5, 2);
+        assert_eq!(
+            page.iter().map(|result| result.doc_id).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
     }
 }

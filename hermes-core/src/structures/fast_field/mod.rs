@@ -310,6 +310,12 @@ impl FastFieldTocEntry {
         let column_type = FastFieldColumnType::from_u8(ct)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad column type"))?;
         let flags = r.read_u8()?;
+        if flags & !1 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown fast field flags",
+            ));
+        }
         let multi = (flags & 1) != 0;
         let data_offset = r.read_u64::<LittleEndian>()?;
         let data_len = r.read_u64::<LittleEndian>()?;
@@ -732,8 +738,21 @@ impl FastFieldReader {
     /// For text-ordinal columns, dictionary scanning and global dict merging are
     /// deferred to first access — no mmap pages are touched for dict data here.
     pub fn open(file_data: &OwnedBytes, toc: &FastFieldTocEntry) -> io::Result<Self> {
-        let region_start = toc.data_offset as usize;
-        let region_end = region_start + toc.data_len as usize;
+        let region_start = usize::try_from(toc.data_offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fast field data offset exceeds address space",
+            )
+        })?;
+        let region_len = usize::try_from(toc.data_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fast field data length exceeds address space",
+            )
+        })?;
+        let region_end = region_start.checked_add(region_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "fast field data range overflow")
+        })?;
 
         if region_end > file_data.len() {
             return Err(io::Error::new(
@@ -746,7 +765,7 @@ impl FastFieldReader {
 
         // Read num_blocks
         let mut pos = region_start;
-        if pos + 4 > region_end {
+        if pos.checked_add(4).is_none_or(|end| end > region_end) {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "fast field: missing num_blocks",
@@ -756,35 +775,67 @@ impl FastFieldReader {
         pos += 4;
 
         // Read block index
-        let idx_size = num_blocks as usize * BLOCK_INDEX_ENTRY_SIZE;
-        if pos + idx_size > region_end {
+        let idx_size = (num_blocks as usize)
+            .checked_mul(BLOCK_INDEX_ENTRY_SIZE)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fast field block index overflow",
+                )
+            })?;
+        let index_end = pos.checked_add(idx_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fast field block index overflow",
+            )
+        })?;
+        if index_end > region_end {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "fast field: block index truncated",
             ));
         }
-        let mut block_entries = Vec::with_capacity(num_blocks as usize);
+        let mut block_entries = Vec::new();
+        block_entries
+            .try_reserve_exact(num_blocks as usize)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "too many fast field blocks")
+            })?;
         {
-            let mut cursor = std::io::Cursor::new(&raw[pos..pos + idx_size]);
+            let mut cursor = std::io::Cursor::new(&raw[pos..index_end]);
             for _ in 0..num_blocks {
                 block_entries.push(BlockIndexEntry::read_from(&mut cursor)?);
             }
         }
-        pos += idx_size;
+        pos = index_end;
 
         let empty = OwnedBytes::new(Vec::new());
 
         // Parse each block's data + dict slices
-        let mut blocks = Vec::with_capacity(num_blocks as usize);
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(num_blocks as usize).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "too many fast field blocks")
+        })?;
         let mut cumulative = 0u32;
 
         for entry in &block_entries {
             let data_start = pos;
-            let data_end = data_start + entry.data_len as usize;
+            let data_end = data_start
+                .checked_add(entry.data_len as usize)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "fast field block range overflow",
+                    )
+                })?;
             let dict_start = data_end;
-            let dict_end = dict_start + entry.dict_len as usize;
+            let dict_end = dict_start
+                .checked_add(entry.dict_len as usize)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fast field dict range overflow")
+                })?;
 
-            if dict_end > file_data.len() {
+            if dict_end > region_end {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "fast field: block data/dict truncated",
@@ -795,27 +846,74 @@ impl FastFieldReader {
             let (block_data, offset_data, value_data) = if toc.multi {
                 let block_raw = &raw[data_start..data_end];
                 if block_raw.len() < 4 {
-                    (empty.clone(), empty.clone(), empty.clone())
-                } else {
-                    let offset_col_len =
-                        u32::from_le_bytes(block_raw[0..4].try_into().unwrap()) as usize;
-                    let o_start = data_start + 4;
-                    let o_end = o_start + offset_col_len;
-                    let v_start = o_end;
-                    let v_end = data_end;
-                    (
-                        file_data.slice(data_start..data_end),
-                        file_data.slice(o_start..o_end),
-                        file_data.slice(v_start..v_end),
-                    )
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "fast field multi-value header is truncated",
+                    ));
                 }
-            } else {
+                let offset_col_len =
+                    u32::from_le_bytes(block_raw[0..4].try_into().unwrap()) as usize;
+                let o_start = data_start + 4;
+                let o_end = o_start.checked_add(offset_col_len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "fast field offset column range overflow",
+                    )
+                })?;
+                if o_end > data_end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "fast field offset column is truncated",
+                    ));
+                }
+                let v_start = o_end;
+                let v_end = data_end;
+                let offset_data = file_data.slice(o_start..o_end);
+                let value_data = file_data.slice(v_start..v_end);
+                let offset_count = (entry.num_docs as usize).checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fast field doc count overflow")
+                })?;
+                codec::validate_auto(offset_data.as_slice(), offset_count)?;
+
+                let mut previous = 0u64;
+                for index in 0..offset_count {
+                    let offset = codec::auto_read(offset_data.as_slice(), index);
+                    if offset > u32::MAX as u64 || (index == 0 && offset != 0) || offset < previous
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "fast field value offsets are invalid",
+                        ));
+                    }
+                    previous = offset;
+                }
+                codec::validate_auto(value_data.as_slice(), previous as usize)?;
+
                 (
                     file_data.slice(data_start..data_end),
-                    empty.clone(),
-                    empty.clone(),
+                    offset_data,
+                    value_data,
                 )
+            } else {
+                let block_data = file_data.slice(data_start..data_end);
+                codec::validate_auto(block_data.as_slice(), entry.num_docs as usize)?;
+                (block_data, empty.clone(), empty.clone())
             };
+
+            if toc.column_type == FastFieldColumnType::TextOrdinal {
+                if entry.dict_count == 0 && entry.dict_len != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty fast field dictionary has data",
+                    ));
+                }
+                validate_text_dict_bytes(&raw[dict_start..dict_end], entry.dict_count)?;
+            } else if entry.dict_count != 0 || entry.dict_len != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "numeric fast field contains a text dictionary",
+                ));
+            }
 
             // Create lazy block dict — no scanning, just stores the data slice + count
             let dict = if entry.dict_count > 0 {
@@ -843,8 +941,23 @@ impl FastFieldReader {
                 raw_dict,
             });
 
-            cumulative += entry.num_docs;
+            cumulative = cumulative.checked_add(entry.num_docs).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "fast field doc count overflow")
+            })?;
             pos = dict_end;
+        }
+
+        if pos != region_end || cumulative != toc.num_docs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fast field block totals are inconsistent with the TOC",
+            ));
+        }
+        if toc.num_docs > 0 && blocks.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-empty fast field has no blocks",
+            ));
         }
 
         Ok(Self {
@@ -1250,7 +1363,7 @@ pub struct TextDictReader {
 impl TextDictReader {
     /// Create a lazy text dictionary from pre-sliced data.
     /// No scanning is performed — offsets are built on first `get()`/`ordinal()` call.
-    pub fn new_lazy(data: OwnedBytes, count: u32) -> Self {
+    fn new_lazy(data: OwnedBytes, count: u32) -> Self {
         Self {
             data,
             count,
@@ -1266,9 +1379,15 @@ impl TextDictReader {
         }
         // Scan to find end position (need to know the slice range)
         let dict_slice = file_data.as_slice();
+        if dict_start > dict_slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "text dict offset out of bounds",
+            ));
+        }
         let mut pos = dict_start;
         for _ in 0..count {
-            if pos + 4 > dict_slice.len() {
+            if pos.checked_add(4).is_none_or(|end| end > dict_slice.len()) {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "text dict truncated",
@@ -1276,12 +1395,17 @@ impl TextDictReader {
             }
             let len = u32::from_le_bytes(dict_slice[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            if pos + len > dict_slice.len() {
+            if pos
+                .checked_add(len)
+                .is_none_or(|end| end > dict_slice.len())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "text dict entry truncated",
                 ));
             }
+            std::str::from_utf8(&dict_slice[pos..pos + len])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             pos += len;
         }
         let data = file_data.slice(dict_start..pos);
@@ -1290,6 +1414,7 @@ impl TextDictReader {
 
     /// Open from raw dict bytes (already length-prefixed entries).
     pub fn open_from_raw(raw_dict: &OwnedBytes, count: u32) -> io::Result<Self> {
+        validate_text_dict_bytes(raw_dict.as_slice(), count)?;
         Ok(Self::new_lazy(raw_dict.clone(), count))
     }
 
@@ -1323,7 +1448,7 @@ impl TextDictReader {
         let offsets = self.ensure_offsets();
         let &(off, len) = offsets.get(ordinal as usize)?;
         let slice = &self.data.as_slice()[off as usize..off as usize + len as usize];
-        Some(unsafe { std::str::from_utf8_unchecked(slice) })
+        std::str::from_utf8(slice).ok()
     }
 
     /// Binary search for a string → ordinal.
@@ -1332,8 +1457,7 @@ impl TextDictReader {
         offsets
             .binary_search_by(|&(off, len)| {
                 let slice = &self.data.as_slice()[off as usize..off as usize + len as usize];
-                let entry = unsafe { std::str::from_utf8_unchecked(slice) };
-                entry.cmp(text)
+                std::str::from_utf8(slice).unwrap_or("").cmp(text)
             })
             .ok()
             .map(|i| i as u64)
@@ -1354,9 +1478,63 @@ impl TextDictReader {
         let offsets = self.ensure_offsets();
         offsets.iter().map(|&(off, len)| {
             let slice = &self.data.as_slice()[off as usize..off as usize + len as usize];
-            unsafe { std::str::from_utf8_unchecked(slice) }
+            std::str::from_utf8(slice).unwrap_or("")
         })
     }
+}
+
+fn validate_text_dict_bytes(data: &[u8], count: u32) -> io::Result<()> {
+    let minimum = (count as usize).checked_mul(4).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "text dictionary size overflow")
+    })?;
+    if minimum > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "text dictionary entry table is truncated",
+        ));
+    }
+
+    let mut pos = 0usize;
+    let mut previous: Option<&str> = None;
+    for _ in 0..count {
+        let len_end = pos.checked_add(4).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "text dictionary offset overflow",
+            )
+        })?;
+        let len = u32::from_le_bytes(data[pos..len_end].try_into().unwrap()) as usize;
+        pos = len_end;
+        let end = pos.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "text dictionary offset overflow",
+            )
+        })?;
+        if end > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "text dictionary entry is truncated",
+            ));
+        }
+        let value = std::str::from_utf8(&data[pos..end])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if previous.is_some_and(|previous| previous >= value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "text dictionary entries are not strictly increasing",
+            ));
+        }
+        previous = Some(value);
+        pos = end;
+    }
+    if pos != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "text dictionary contains trailing data",
+        ));
+    }
+    Ok(())
 }
 
 // ── File-level write/read ─────────────────────────────────────────────────
@@ -1406,16 +1584,31 @@ pub fn read_fast_field_toc(
     toc_offset: u64,
     num_columns: u32,
 ) -> io::Result<Vec<FastFieldTocEntry>> {
-    let start = toc_offset as usize;
-    let expected = num_columns as usize * FAST_FIELD_TOC_ENTRY_SIZE;
-    if start + expected > file_data.len() {
+    let start = usize::try_from(toc_offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fast field TOC offset exceeds address space",
+        )
+    })?;
+    let expected = (num_columns as usize)
+        .checked_mul(FAST_FIELD_TOC_ENTRY_SIZE)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "fast field TOC size overflow")
+        })?;
+    let end = start.checked_add(expected).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "fast field TOC range overflow")
+    })?;
+    if end > file_data.len() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "fast field TOC out of bounds",
         ));
     }
-    let mut cursor = std::io::Cursor::new(&file_data[start..start + expected]);
-    let mut entries = Vec::with_capacity(num_columns as usize);
+    let mut cursor = std::io::Cursor::new(&file_data[start..end]);
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(num_columns as usize)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many fast field columns"))?;
     for _ in 0..num_columns {
         entries.push(FastFieldTocEntry::read_from(&mut cursor)?);
     }

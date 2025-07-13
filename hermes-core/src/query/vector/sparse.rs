@@ -86,6 +86,43 @@ impl SparseVectorQuery {
         self.pruned.as_deref().unwrap_or(&self.vector)
     }
 
+    fn validate(&self, reader: &SegmentReader) -> crate::Result<()> {
+        let entry = reader
+            .schema()
+            .get_field_entry(self.field)
+            .ok_or_else(|| crate::Error::FieldNotFound(self.field.0.to_string()))?;
+        if entry.field_type != crate::dsl::FieldType::SparseVector {
+            return Err(crate::Error::InvalidFieldType {
+                expected: "sparse_vector".to_string(),
+                got: format!("{:?}", entry.field_type),
+            });
+        }
+        if self.vector.iter().any(|(_, weight)| !weight.is_finite()) {
+            return Err(crate::Error::Query(
+                "sparse query contains a non-finite weight".to_string(),
+            ));
+        }
+        if self.pruned_dims().len() > crate::query::MAX_QUERY_TERMS {
+            return Err(crate::Error::Query(format!(
+                "sparse query contains more than {} effective dimensions",
+                crate::query::MAX_QUERY_TERMS
+            )));
+        }
+        if !self.heap_factor.is_finite() || !(0.0..=1.0).contains(&self.heap_factor) {
+            return Err(crate::Error::Query(format!(
+                "sparse heap_factor must be finite and in [0, 1], got {}",
+                self.heap_factor
+            )));
+        }
+        if !self.over_fetch_factor.is_finite() || self.over_fetch_factor < 1.0 {
+            return Err(crate::Error::Query(format!(
+                "sparse over_fetch_factor must be finite and at least 1, got {}",
+                self.over_fetch_factor
+            )));
+        }
+        self.combiner.validate().map_err(crate::Error::Query)
+    }
+
     /// Set the multi-value score combiner
     pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
         self.combiner = combiner;
@@ -122,7 +159,9 @@ impl SparseVectorQuery {
 
     /// Set maximum number of query dimensions (top-k by weight)
     pub fn with_max_query_dims(mut self, max_dims: usize) -> Self {
-        self.max_query_dims = Some(max_dims);
+        // MaxScore and BMP use a u64 query-term mask in their hot paths.  Keep
+        // this invariant here even when an SDL or RPC override asks for more.
+        self.max_query_dims = Some(max_dims.min(crate::query::MAX_QUERY_TERMS));
         self.pruned = Some(self.compute_pruned_vector());
         self
     }
@@ -179,10 +218,14 @@ impl SparseVectorQuery {
         }
         let after_pruning = v.len();
 
-        // Step 3: max_query_dims — absolute cap on dimensions
-        if let Some(max_dims) = self.max_query_dims
-            && v.len() > max_dims
-        {
+        // Step 3: max_query_dims — absolute cap on dimensions.  The hard
+        // MAX_QUERY_TERMS bound is a correctness requirement, not merely a
+        // tuning default: both sparse executors represent query terms in u64.
+        let max_dims = self
+            .max_query_dims
+            .unwrap_or(crate::query::MAX_QUERY_TERMS)
+            .min(crate::query::MAX_QUERY_TERMS);
+        if v.len() > max_dims {
             if !sorted_by_weight {
                 v.sort_unstable_by(|a, b| {
                     b.1.abs()
@@ -394,9 +437,11 @@ impl SparseVectorQuery {
 
 impl Query for SparseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        let validation = self.validate(reader);
         let infos = self.sparse_infos();
 
         Box::pin(async move {
+            validation?;
             if infos.is_empty() {
                 return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>);
             }
@@ -436,6 +481,7 @@ impl Query for SparseVectorQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        self.validate(reader)?;
         let infos = self.sparse_infos();
         if infos.is_empty() {
             return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>);
@@ -540,6 +586,37 @@ impl SparseTermQuery {
         self
     }
 
+    fn validate(&self, reader: &SegmentReader) -> crate::Result<()> {
+        let entry = reader
+            .schema()
+            .get_field_entry(self.field)
+            .ok_or_else(|| crate::Error::FieldNotFound(self.field.0.to_string()))?;
+        if entry.field_type != crate::dsl::FieldType::SparseVector {
+            return Err(crate::Error::InvalidFieldType {
+                expected: "sparse_vector".to_string(),
+                got: format!("{:?}", entry.field_type),
+            });
+        }
+        if !self.weight.is_finite() {
+            return Err(crate::Error::Query(
+                "sparse term query weight must be finite".to_string(),
+            ));
+        }
+        if !self.heap_factor.is_finite() || !(0.0..=1.0).contains(&self.heap_factor) {
+            return Err(crate::Error::Query(format!(
+                "sparse heap_factor must be finite and in [0, 1], got {}",
+                self.heap_factor
+            )));
+        }
+        if !self.over_fetch_factor.is_finite() || self.over_fetch_factor < 1.0 {
+            return Err(crate::Error::Query(format!(
+                "sparse over_fetch_factor must be finite and at least 1, got {}",
+                self.over_fetch_factor
+            )));
+        }
+        self.combiner.validate().map_err(crate::Error::Query)
+    }
+
     /// BMP fallback: execute BMP for this single dimension and wrap in a TopK scorer.
     fn bmp_fallback_scorer<'a>(
         &self,
@@ -547,12 +624,15 @@ impl SparseTermQuery {
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         if let Some(bmp) = reader.bmp_index(self.field) {
+            let executor_limit =
+                crate::query::planner::bounded_sparse_executor_limit(limit, self.over_fetch_factor)
+                    .min(bmp.num_virtual_docs as usize);
             let results = crate::query::bmp::execute_bmp(
                 bmp,
                 reader.schema().index_label(),
                 reader.schema().get_field_name(self.field).unwrap_or("?"),
                 &[(self.dim_id, self.weight)],
-                limit,
+                executor_limit,
                 self.heap_factor,
                 0,
             )?;
@@ -602,6 +682,7 @@ impl Query for SparseTermQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let query = self.clone();
         Box::pin(async move {
+            query.validate(reader)?;
             let mut scorer = match query.make_scorer(reader)? {
                 Some(s) => s,
                 None => return query.bmp_fallback_scorer(reader, limit),
@@ -617,6 +698,7 @@ impl Query for SparseTermQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        self.validate(reader)?;
         let mut scorer = match self.make_scorer(reader)? {
             Some(s) => s,
             None => return self.bmp_fallback_scorer(reader, limit),
@@ -727,5 +809,15 @@ mod tests {
             SparseVectorQuery::from_indices_weights(Field(0), vec![1, 5, 10], vec![0.5, 0.3, 0.2]);
 
         assert_eq!(query.vector, vec![(1, 0.5), (5, 0.3), (10, 0.2)]);
+    }
+
+    #[test]
+    fn max_query_dims_cannot_exceed_executor_mask_width() {
+        let vector: Vec<(u32, f32)> = (0..100).map(|dim| (dim, dim as f32 + 1.0)).collect();
+        let query = SparseVectorQuery::new(Field(0), vector).with_max_query_dims(usize::MAX);
+
+        assert_eq!(query.pruned_dims().len(), crate::query::MAX_QUERY_TERMS);
+        // Pruning retains the dimensions with the largest absolute weights.
+        assert!(query.pruned_dims().iter().all(|(dim, _)| *dim >= 36));
     }
 }

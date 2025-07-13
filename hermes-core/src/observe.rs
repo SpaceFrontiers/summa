@@ -168,6 +168,7 @@ mod imp {
     }
 
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub fn bmp_query(_: &str, _: &str, _: f64, _: usize, _: usize, _: usize, _: usize, _: usize) {}
     #[inline(always)]
     pub fn maxscore_query(_: &str, _: &str, _: f64, _: usize) {}

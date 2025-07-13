@@ -33,6 +33,12 @@ pub const STORE_BLOCK_SIZE: usize = 16 * 1024;
 /// Default dictionary size (4KB is a good balance)
 pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
 
+/// Hard safety bounds for individual on-disk store objects. Writers normally
+/// emit ~16 KiB blocks and 4 KiB dictionaries; these generous limits preserve
+/// large legacy documents while bounding corrupt compressed frames.
+const MAX_STORE_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STORE_DICTIONARY_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Default compression level for document store
 #[cfg(feature = "native")]
 const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(3);
@@ -48,7 +54,12 @@ fn write_store_index_and_footer(
     num_docs: u32,
     has_dict: bool,
 ) -> io::Result<()> {
-    writer.write_u32::<LittleEndian>(index.len() as u32)?;
+    writer.write_u32::<LittleEndian>(u32::try_from(index.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many document store blocks",
+        )
+    })?)?;
     for entry in index {
         writer.write_u32::<LittleEndian>(entry.first_doc_id)?;
         writer.write_u64::<LittleEndian>(entry.offset)?;
@@ -110,15 +121,22 @@ pub fn serialize_document_into(
         .filter(|(field, value)| is_stored(field, value))
         .count();
 
-    buf.write_u16::<LittleEndian>(stored_count as u16)?;
+    buf.write_u16::<LittleEndian>(
+        u16::try_from(stored_count)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many stored fields"))?,
+    )?;
 
     for (field, value) in doc.field_values().iter().filter(|(f, v)| is_stored(f, v)) {
-        buf.write_u16::<LittleEndian>(field.0 as u16)?;
+        buf.write_u16::<LittleEndian>(u16::try_from(field.0).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "stored field id exceeds u16")
+        })?)?;
         match value {
             FieldValue::Text(s) => {
                 buf.push(0);
                 let bytes = s.as_bytes();
-                buf.write_u32::<LittleEndian>(bytes.len() as u32)?;
+                buf.write_u32::<LittleEndian>(u32::try_from(bytes.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "stored text is too large")
+                })?)?;
                 buf.extend_from_slice(bytes);
             }
             FieldValue::U64(v) => {
@@ -135,12 +153,22 @@ pub fn serialize_document_into(
             }
             FieldValue::Bytes(b) => {
                 buf.push(4);
-                buf.write_u32::<LittleEndian>(b.len() as u32)?;
+                buf.write_u32::<LittleEndian>(u32::try_from(b.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "stored byte field is too large",
+                    )
+                })?)?;
                 buf.extend_from_slice(b);
             }
             FieldValue::SparseVector(entries) => {
                 buf.push(5);
-                buf.write_u32::<LittleEndian>(entries.len() as u32)?;
+                buf.write_u32::<LittleEndian>(u32::try_from(entries.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "stored sparse vector is too large",
+                    )
+                })?)?;
                 for (idx, val) in entries {
                     buf.write_u32::<LittleEndian>(*idx)?;
                     buf.write_f32::<LittleEndian>(*val)?;
@@ -148,7 +176,12 @@ pub fn serialize_document_into(
             }
             FieldValue::DenseVector(values) => {
                 buf.push(6);
-                buf.write_u32::<LittleEndian>(values.len() as u32)?;
+                buf.write_u32::<LittleEndian>(u32::try_from(values.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "stored dense vector is too large",
+                    )
+                })?)?;
                 // Write raw f32 bytes directly
                 let byte_slice = unsafe {
                     std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
@@ -159,12 +192,19 @@ pub fn serialize_document_into(
                 buf.push(7);
                 let json_bytes = serde_json::to_vec(v)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                buf.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
+                buf.write_u32::<LittleEndian>(u32::try_from(json_bytes.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "stored JSON is too large")
+                })?)?;
                 buf.extend_from_slice(&json_bytes);
             }
             FieldValue::BinaryDenseVector(b) => {
                 buf.push(8);
-                buf.write_u32::<LittleEndian>(b.len() as u32)?;
+                buf.write_u32::<LittleEndian>(u32::try_from(b.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "stored binary dense vector is too large",
+                    )
+                })?)?;
                 buf.extend_from_slice(b);
             }
         }
@@ -265,8 +305,17 @@ impl<'a> EagerParallelStoreWriter<'a> {
 
     pub fn store(&mut self, doc: &Document, schema: &Schema) -> io::Result<DocId> {
         serialize_document_into(doc, schema, &mut self.serialize_buf)?;
+        if self.serialize_buf.len() > MAX_STORE_BLOCK_BYTES.saturating_sub(4) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "serialized document exceeds store block limit",
+            ));
+        }
         let doc_id = self.next_doc_id;
-        self.next_doc_id += 1;
+        self.next_doc_id = self
+            .next_doc_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "document id overflow"))?;
         self.block_buffer
             .write_u32::<LittleEndian>(self.serialize_buf.len() as u32)?;
         self.block_buffer.extend_from_slice(&self.serialize_buf);
@@ -278,8 +327,17 @@ impl<'a> EagerParallelStoreWriter<'a> {
 
     /// Store pre-serialized document bytes directly (avoids deserialize+reserialize roundtrip).
     pub fn store_raw(&mut self, doc_bytes: &[u8]) -> io::Result<DocId> {
+        if doc_bytes.len() > MAX_STORE_BLOCK_BYTES.saturating_sub(4) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "serialized document exceeds store block limit",
+            ));
+        }
         let doc_id = self.next_doc_id;
-        self.next_doc_id += 1;
+        self.next_doc_id = self
+            .next_doc_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "document id overflow"))?;
 
         self.block_buffer
             .write_u32::<LittleEndian>(doc_bytes.len() as u32)?;
@@ -374,12 +432,19 @@ impl<'a> EagerParallelStoreWriter<'a> {
             index.push(StoreBlockIndex {
                 first_doc_id: block.first_doc_id,
                 offset: current_offset,
-                length: block.compressed.len() as u32,
+                length: u32::try_from(block.compressed.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compressed store block too large",
+                    )
+                })?,
                 num_docs: block.num_docs,
             });
 
             self.writer.write_all(&block.compressed)?;
-            current_offset += block.compressed.len() as u64;
+            current_offset = current_offset
+                .checked_add(block.compressed.len() as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "store size overflow"))?;
         }
 
         let data_end_offset = current_offset;
@@ -446,20 +511,51 @@ struct CachedBlock {
 
 impl CachedBlock {
     fn build(data: Vec<u8>, num_docs: u32) -> io::Result<Self> {
-        let mut offsets = Vec::with_capacity(num_docs as usize);
+        if num_docs as usize > data.len() / 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store block document count exceeds block length",
+            ));
+        }
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(num_docs as usize).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store block has too many documents",
+            )
+        })?;
         let mut pos = 0usize;
         for _ in 0..num_docs {
-            if pos + 4 > data.len() {
+            let length_end = pos.checked_add(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store block offset overflow")
+            })?;
+            if length_end > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated block while building offset table",
                 ));
             }
-            offsets.push(pos as u32);
+            offsets.push(u32::try_from(pos).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "store block offset exceeds u32")
+            })?);
             let doc_len =
                 u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
                     as usize;
-            pos += 4 + doc_len;
+            pos = length_end.checked_add(doc_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store document length overflow")
+            })?;
+            if pos > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "store document is truncated",
+                ));
+            }
+        }
+        if pos != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store block contains trailing data",
+            ));
         }
         Ok(Self { data, offsets })
     }
@@ -474,7 +570,10 @@ impl CachedBlock {
             ));
         }
         let start = self.offsets[idx] as usize;
-        if start + 4 > self.data.len() {
+        let data_start = start.checked_add(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "store document offset overflow")
+        })?;
+        if data_start > self.data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated doc length",
@@ -486,21 +585,29 @@ impl CachedBlock {
             self.data[start + 2],
             self.data[start + 3],
         ]) as usize;
-        let data_start = start + 4;
-        if data_start + doc_len > self.data.len() {
+        let data_end = data_start.checked_add(doc_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "store document length overflow")
+        })?;
+        if data_end > self.data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "doc data overflow",
             ));
         }
-        Ok(&self.data[data_start..data_start + doc_len])
+        Ok(&self.data[data_start..data_end])
+    }
+
+    #[inline]
+    fn retained_bytes(&self) -> usize {
+        self.data.capacity() + self.offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
-/// LRU block cache — O(1) lookup/insert, amortized O(n) promotion.
+/// Bounded block cache with a contention-free read path.
 ///
-/// On `get()`, promotes accessed entry to MRU position.
-/// For typical cache sizes (16-64 blocks), the linear promote scan is negligible.
+/// Normal reads use [`StoreBlockCache::peek`] under a shared lock and do not
+/// promote hits, so normal eviction order is insertion order. `get()` promotes
+/// only on the exclusive race-resolution path.
 struct StoreBlockCache {
     blocks: FxHashMap<DocId, Arc<CachedBlock>>,
     lru_order: std::collections::VecDeque<DocId>,
@@ -528,6 +635,9 @@ impl StoreBlockCache {
     }
 
     fn insert(&mut self, first_doc_id: DocId, block: Arc<CachedBlock>) {
+        if self.max_blocks == 0 {
+            return;
+        }
         if self.blocks.contains_key(&first_doc_id) {
             self.promote(first_doc_id);
             return;
@@ -589,31 +699,101 @@ impl AsyncStoreReader {
             ));
         }
 
+        let index_end = file_len - 32;
+        if data_end_offset > index_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store data section extends past its footer",
+            ));
+        }
+
         // Load dictionary if present, and compute index_start in one pass
-        let (dict, index_start) = if has_dict && dict_offset > 0 {
+        let (dict, index_start) = if has_dict {
+            if dict_offset < data_end_offset || dict_offset >= index_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store dictionary offset is out of bounds",
+                ));
+            }
             let dict_start = dict_offset;
+            let dict_header_end = dict_start.checked_add(4).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store dictionary range overflow",
+                )
+            })?;
+            if dict_header_end > index_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "store dictionary length is truncated",
+                ));
+            }
             let dict_len_bytes = file_handle
-                .read_bytes_range(dict_start..dict_start + 4)
+                .read_bytes_range(dict_start..dict_header_end)
                 .await?;
             let dict_len = (&dict_len_bytes[..]).read_u32::<LittleEndian>()? as u64;
+            if dict_len > MAX_STORE_DICTIONARY_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store dictionary exceeds safety limit",
+                ));
+            }
+            let dict_end = dict_header_end.checked_add(dict_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store dictionary range overflow",
+                )
+            })?;
+            if dict_end > index_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "store dictionary is truncated",
+                ));
+            }
             let dict_bytes = file_handle
-                .read_bytes_range(dict_start + 4..dict_start + 4 + dict_len)
+                .read_bytes_range(dict_header_end..dict_end)
                 .await?;
-            let idx_start = dict_start + 4 + dict_len;
             (
                 Some(CompressionDict::from_owned_bytes(dict_bytes)),
-                idx_start,
+                dict_end,
             )
         } else {
+            if dict_offset != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store without a dictionary has a dictionary offset",
+                ));
+            }
             (None, data_end_offset)
         };
-        let index_end = file_len - 32;
+
+        if index_start > index_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store index offset is out of bounds",
+            ));
+        }
 
         let index_bytes = file_handle.read_bytes_range(index_start..index_end).await?;
         let mut reader = index_bytes.as_slice();
 
         let num_blocks = reader.read_u32::<LittleEndian>()? as usize;
-        let mut index = Vec::with_capacity(num_blocks);
+        let required_index_bytes = num_blocks.checked_mul(20).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "store index size overflow")
+        })?;
+        if reader.len() != required_index_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store index length is inconsistent",
+            ));
+        }
+        let mut index = Vec::new();
+        index
+            .try_reserve_exact(num_blocks)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many store blocks"))?;
+
+        let mut expected_doc = 0u32;
+        let mut expected_offset = 0u64;
 
         for _ in 0..num_blocks {
             let first_doc_id = reader.read_u32::<LittleEndian>()?;
@@ -621,12 +801,37 @@ impl AsyncStoreReader {
             let length = reader.read_u32::<LittleEndian>()?;
             let num_docs_in_block = reader.read_u32::<LittleEndian>()?;
 
+            let end = offset.checked_add(length as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store block range overflow")
+            })?;
+            if first_doc_id != expected_doc
+                || num_docs_in_block == 0
+                || offset != expected_offset
+                || end > data_end_offset
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store block index is inconsistent",
+                ));
+            }
+            expected_doc = expected_doc.checked_add(num_docs_in_block).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store document count overflow")
+            })?;
+            expected_offset = end;
+
             index.push(StoreBlockIndex {
                 first_doc_id,
                 offset,
                 length,
                 num_docs: num_docs_in_block,
             });
+        }
+
+        if expected_doc != num_docs || expected_offset != data_end_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store footer totals do not match its block index",
+            ));
         }
 
         // Create lazy slice for data portion only
@@ -649,6 +854,16 @@ impl AsyncStoreReader {
     /// Number of blocks currently in the cache
     pub fn cached_blocks(&self) -> usize {
         self.cache.read().blocks.len()
+    }
+
+    /// Heap bytes retained by decompressed blocks and their document offsets.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache
+            .read()
+            .blocks
+            .values()
+            .map(|block| block.retained_bytes())
+            .sum()
     }
 
     /// Get a document by doc_id (async - may load block)
@@ -719,7 +934,7 @@ impl AsyncStoreReader {
                 return Ok(block);
             }
         }
-        // Slow path: write lock for LRU promotion or insert
+        // Resolve a race where another reader inserted after our shared probe.
         {
             if let Some(block) = self.cache.write().get(entry.first_doc_id) {
                 return Ok(block);
@@ -728,14 +943,20 @@ impl AsyncStoreReader {
 
         // Load from FileSlice
         let start = entry.offset;
-        let end = start + entry.length as u64;
+        let end = start.checked_add(entry.length as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "store block range overflow")
+        })?;
         let compressed = self.data_slice.read_bytes_range(start..end).await?;
 
         // Use dictionary decompression if available
         let decompressed = if let Some(ref dict) = self.dict {
-            crate::compression::decompress_with_dict(compressed.as_slice(), dict)?
+            crate::compression::decompress_with_dict_limited(
+                compressed.as_slice(),
+                dict,
+                MAX_STORE_BLOCK_BYTES,
+            )?
         } else {
-            crate::compression::decompress(compressed.as_slice())?
+            crate::compression::decompress_limited(compressed.as_slice(), MAX_STORE_BLOCK_BYTES)?
         };
 
         // Build offset table for O(1) doc lookup within the block
@@ -795,12 +1016,12 @@ fn deserialize_document_inner(
             0 => {
                 // Text
                 let len = reader.read_u32::<LittleEndian>()? as usize;
+                let bytes = take_document_bytes(&mut reader, len, "text field")?;
                 if wanted {
-                    let s = std::str::from_utf8(&reader[..len])
+                    let s = std::str::from_utf8(bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     doc.add_text(Field(field_id as u32), s);
                 }
-                reader = &reader[len..];
             }
             1 => {
                 // U64
@@ -826,85 +1047,68 @@ fn deserialize_document_inner(
             4 => {
                 // Bytes
                 let len = reader.read_u32::<LittleEndian>()? as usize;
+                let bytes = take_document_bytes(&mut reader, len, "byte field")?;
                 if wanted {
-                    doc.add_bytes(Field(field_id as u32), reader[..len].to_vec());
+                    doc.add_bytes(Field(field_id as u32), bytes.to_vec());
                 }
-                reader = &reader[len..];
             }
             5 => {
                 // SparseVector
                 let count = reader.read_u32::<LittleEndian>()? as usize;
+                let byte_len = count.checked_mul(8).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "sparse vector size overflow")
+                })?;
+                let bytes = take_document_bytes(&mut reader, byte_len, "sparse vector")?;
                 if wanted {
-                    let mut entries = Vec::with_capacity(count);
+                    let mut entries = Vec::new();
+                    entries.try_reserve_exact(count).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "sparse vector is too large")
+                    })?;
+                    let mut vector_reader = bytes;
                     for _ in 0..count {
-                        let idx = reader.read_u32::<LittleEndian>()?;
-                        let val = reader.read_f32::<LittleEndian>()?;
+                        let idx = vector_reader.read_u32::<LittleEndian>()?;
+                        let val = vector_reader.read_f32::<LittleEndian>()?;
                         entries.push((idx, val));
                     }
                     doc.add_sparse_vector(Field(field_id as u32), entries);
-                } else {
-                    let skip = count * 8;
-                    if skip > reader.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "sparse vector skip overflow",
-                        ));
-                    }
-                    reader = &reader[skip..];
                 }
             }
             6 => {
                 // DenseVector
                 let count = reader.read_u32::<LittleEndian>()? as usize;
-                let byte_len = count * 4;
-                if byte_len > reader.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "dense vector truncated",
-                    ));
-                }
+                let byte_len = count.checked_mul(4).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "dense vector size overflow")
+                })?;
+                let bytes = take_document_bytes(&mut reader, byte_len, "dense vector")?;
                 if wanted {
                     let mut values = vec![0.0f32; count];
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            reader.as_ptr(),
+                            bytes.as_ptr(),
                             values.as_mut_ptr() as *mut u8,
                             byte_len,
                         );
                     }
                     doc.add_dense_vector(Field(field_id as u32), values);
                 }
-                reader = &reader[byte_len..];
             }
             7 => {
                 // Json
                 let len = reader.read_u32::<LittleEndian>()? as usize;
-                if len > reader.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "json field truncated",
-                    ));
-                }
+                let bytes = take_document_bytes(&mut reader, len, "JSON field")?;
                 if wanted {
-                    let v: serde_json::Value = serde_json::from_slice(&reader[..len])
+                    let v: serde_json::Value = serde_json::from_slice(bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     doc.add_json(Field(field_id as u32), v);
                 }
-                reader = &reader[len..];
             }
             8 => {
                 // BinaryDenseVector
                 let len = reader.read_u32::<LittleEndian>()? as usize;
-                if len > reader.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "binary dense vector truncated",
-                    ));
-                }
+                let bytes = take_document_bytes(&mut reader, len, "binary dense vector")?;
                 if wanted {
-                    doc.add_binary_dense_vector(Field(field_id as u32), reader[..len].to_vec());
+                    doc.add_binary_dense_vector(Field(field_id as u32), bytes.to_vec());
                 }
-                reader = &reader[len..];
             }
             _ => {
                 return Err(io::Error::new(
@@ -916,6 +1120,18 @@ fn deserialize_document_inner(
     }
 
     Ok(doc)
+}
+
+fn take_document_bytes<'a>(reader: &mut &'a [u8], len: usize, field: &str) -> io::Result<&'a [u8]> {
+    if len > reader.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{field} is truncated"),
+        ));
+    }
+    let (value, remaining) = reader.split_at(len);
+    *reader = remaining;
+    Ok(value)
 }
 
 /// Raw block info for store merging (without decompression)
@@ -966,7 +1182,15 @@ impl<'a, W: Write> StoreMerger<'a, W> {
         for block in blocks {
             // Read raw compressed block data
             let start = block.offset;
-            let end = start + block.length as u64;
+            let end = start.checked_add(block.length as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store block range overflow")
+            })?;
+            if end > data_slice.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "store block range is out of bounds",
+                ));
+            }
             let compressed_data = data_slice.read_bytes_range(start..end).await?;
 
             // Write to output
@@ -980,8 +1204,16 @@ impl<'a, W: Write> StoreMerger<'a, W> {
                 num_docs: block.num_docs,
             });
 
-            self.current_offset += block.length as u64;
-            self.next_doc_id += block.num_docs;
+            self.current_offset = self
+                .current_offset
+                .checked_add(block.length as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "store size overflow"))?;
+            self.next_doc_id = self
+                .next_doc_id
+                .checked_add(block.num_docs)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "store document count overflow")
+                })?;
         }
 
         Ok(())
@@ -1000,14 +1232,29 @@ impl<'a, W: Write> StoreMerger<'a, W> {
 
         for block in blocks {
             let start = block.offset;
-            let end = start + block.length as u64;
+            let end = start.checked_add(block.length as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "store block range overflow")
+            })?;
+            if end > data_slice.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "store block range is out of bounds",
+                ));
+            }
             let compressed = data_slice.read_bytes_range(start..end).await?;
 
             // Decompress with source dict (or without if no dict)
             let decompressed = if let Some(d) = dict {
-                crate::compression::decompress_with_dict(compressed.as_slice(), d)?
+                crate::compression::decompress_with_dict_limited(
+                    compressed.as_slice(),
+                    d,
+                    MAX_STORE_BLOCK_BYTES,
+                )?
             } else {
-                crate::compression::decompress(compressed.as_slice())?
+                crate::compression::decompress_limited(
+                    compressed.as_slice(),
+                    MAX_STORE_BLOCK_BYTES,
+                )?
             };
 
             // Recompress without dictionary
@@ -1021,12 +1268,25 @@ impl<'a, W: Write> StoreMerger<'a, W> {
             self.index.push(StoreBlockIndex {
                 first_doc_id: self.next_doc_id,
                 offset: self.current_offset,
-                length: recompressed.len() as u32,
+                length: u32::try_from(recompressed.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compressed store block too large",
+                    )
+                })?,
                 num_docs: block.num_docs,
             });
 
-            self.current_offset += recompressed.len() as u64;
-            self.next_doc_id += block.num_docs;
+            self.current_offset = self
+                .current_offset
+                .checked_add(recompressed.len() as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "store size overflow"))?;
+            self.next_doc_id = self
+                .next_doc_id
+                .checked_add(block.num_docs)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "store document count overflow")
+                })?;
         }
 
         Ok(())
@@ -1085,5 +1345,26 @@ impl AsyncStoreReader {
     /// Get block index for iteration
     pub(crate) fn block_index(&self) -> &[StoreBlockIndex] {
         &self.index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_block_rejects_truncated_and_trailing_documents() {
+        assert!(CachedBlock::build(vec![8, 0, 0, 0, 1], 1).is_err());
+        assert!(CachedBlock::build(vec![0, 0, 0, 0, 1], 1).is_err());
+    }
+
+    #[test]
+    fn document_deserializer_rejects_length_prefixed_slice_overrun() {
+        let schema = Schema::builder().build();
+        let truncated_text = [1, 0, 0, 0, 0, 5, 0, 0, 0, b'x'];
+        assert!(deserialize_document(&truncated_text, &schema).is_err());
+
+        let truncated_sparse = [1, 0, 0, 0, 5, 2, 0, 0, 0, 1, 0, 0, 0];
+        assert!(deserialize_document(&truncated_sparse, &schema).is_err());
     }
 }

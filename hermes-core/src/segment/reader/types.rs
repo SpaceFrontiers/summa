@@ -88,15 +88,13 @@ impl LazyRaBitQ {
 
     pub fn get(&self) -> Option<&Arc<RaBitQIndex>> {
         self.resolved
-            .get_or_init(
-                || match serde_json::from_slice::<RaBitQIndex>(self.raw.as_slice()) {
-                    Ok(idx) => Some(Arc::new(idx)),
-                    Err(e) => {
-                        log::warn!("[lazy_rabitq] deserialization failed: {}", e);
-                        None
-                    }
-                },
-            )
+            .get_or_init(|| match RaBitQIndex::from_bytes(self.raw.as_slice()) {
+                Ok(idx) => Some(Arc::new(idx)),
+                Err(e) => {
+                    log::warn!("[lazy_rabitq] deserialization failed: {}", e);
+                    None
+                }
+            })
             .as_ref()
     }
 
@@ -342,6 +340,25 @@ pub struct SparseIndex {
     pub total_vectors: u32,
 }
 
+fn checked_sparse_block_range(
+    base: u64,
+    entry: SparseSkipEntry,
+    file_len: u64,
+) -> crate::Result<std::ops::Range<u64>> {
+    let start = base.checked_add(entry.offset).ok_or_else(|| {
+        crate::Error::Corruption("sparse block start offset overflows u64".into())
+    })?;
+    let end = start
+        .checked_add(u64::from(entry.length))
+        .ok_or_else(|| crate::Error::Corruption("sparse block end offset overflows u64".into()))?;
+    if end > file_len {
+        return Err(crate::Error::Corruption(format!(
+            "sparse block range {start}..{end} exceeds file length {file_len}"
+        )));
+    }
+    Ok(start..end)
+}
+
 impl SparseIndex {
     /// Pin the skip section (priority 2: every posting traversal reads it).
     #[cfg(feature = "native")]
@@ -410,10 +427,10 @@ impl SparseIndex {
     async fn load_block_at(&self, dim_idx: usize, block_idx: usize) -> crate::Result<SparseBlock> {
         let entry = self.read_skip_entry(self.dims.skip_starts[dim_idx] as usize + block_idx);
         let base = self.dims.block_offsets[dim_idx];
-        let abs_offset = base + entry.offset;
+        let range = checked_sparse_block_range(base, entry, self.handle.len())?;
         let data = self
             .handle
-            .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
+            .read_bytes_range(range)
             .await
             .map_err(crate::Error::Io)?;
 
@@ -502,19 +519,24 @@ impl SparseIndex {
         if block_start >= total_blocks || block_count == 0 {
             return Ok(Vec::new());
         }
-        let end = (block_start + block_count).min(total_blocks);
+        let end = block_start.saturating_add(block_count).min(total_blocks);
         let base = self.dims.block_offsets[idx];
 
         // Compute the byte range covering all blocks [block_start..end)
         let first_entry = self.read_skip_entry(skip_start + block_start);
         let last_entry = self.read_skip_entry(skip_start + end - 1);
-        let range_start = base + first_entry.offset;
-        let range_end = base + last_entry.offset + last_entry.length as u64;
+        let first_range = checked_sparse_block_range(base, first_entry, self.handle.len())?;
+        let last_range = checked_sparse_block_range(base, last_entry, self.handle.len())?;
+        if last_range.end < first_range.start {
+            return Err(crate::Error::Corruption(
+                "sparse block offsets are not monotonic".into(),
+            ));
+        }
 
         // Single coalesced mmap read
         let range_data = self
             .handle
-            .read_bytes_range(range_start..range_end)
+            .read_bytes_range(first_range.start..last_range.end)
             .await
             .map_err(crate::Error::Io)?;
 
@@ -522,9 +544,22 @@ impl SparseIndex {
         let mut blocks = Vec::with_capacity(end - block_start);
         for bi in block_start..end {
             let entry = self.read_skip_entry(skip_start + bi);
-            let rel_offset = entry.offset - first_entry.offset;
-            let block_bytes = range_data
-                .slice(rel_offset as usize..(rel_offset as usize + entry.length as usize));
+            let rel_offset = entry
+                .offset
+                .checked_sub(first_entry.offset)
+                .ok_or_else(|| {
+                    crate::Error::Corruption("sparse block offsets are not monotonic".into())
+                })?;
+            let rel_start = usize::try_from(rel_offset).map_err(|_| {
+                crate::Error::Corruption("sparse relative block offset exceeds usize".into())
+            })?;
+            let rel_end = rel_start
+                .checked_add(entry.length as usize)
+                .filter(|&end| end <= range_data.len())
+                .ok_or_else(|| {
+                    crate::Error::Corruption("sparse block exceeds coalesced range".into())
+                })?;
+            let block_bytes = range_data.slice(rel_start..rel_end);
             blocks.push(SparseBlock::from_owned_bytes(block_bytes).map_err(|e| {
                 crate::Error::Corruption(format!(
                     "dim_id={} block={}/{} skip_entry(offset={},length={}) base={}: {e}",
@@ -562,15 +597,18 @@ impl SparseIndex {
         block_data_offset: u64,
         block_idx: usize,
     ) -> crate::Result<Option<SparseBlock>> {
-        if skip_start + block_idx >= self.skip_entry_count() {
+        let Some(entry_idx) = skip_start.checked_add(block_idx) else {
+            return Ok(None);
+        };
+        if entry_idx >= self.skip_entry_count() {
             return Ok(None);
         }
-        let entry = self.read_skip_entry(skip_start + block_idx);
+        let entry = self.read_skip_entry(entry_idx);
         let base = block_data_offset;
-        let abs_offset = base + entry.offset;
+        let range = checked_sparse_block_range(base, entry, self.handle.len())?;
         let data = self
             .handle
-            .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
+            .read_bytes_range(range)
             .await
             .map_err(crate::Error::Io)?;
         Ok(Some(SparseBlock::from_owned_bytes(data).map_err(|e| {
@@ -652,15 +690,18 @@ impl SparseIndex {
         block_data_offset: u64,
         block_idx: usize,
     ) -> crate::Result<Option<SparseBlock>> {
-        if skip_start + block_idx >= self.skip_entry_count() {
+        let Some(entry_idx) = skip_start.checked_add(block_idx) else {
+            return Ok(None);
+        };
+        if entry_idx >= self.skip_entry_count() {
             return Ok(None);
         }
-        let entry = self.read_skip_entry(skip_start + block_idx);
+        let entry = self.read_skip_entry(entry_idx);
         let base = block_data_offset;
-        let abs_offset = base + entry.offset;
+        let range = checked_sparse_block_range(base, entry, self.handle.len())?;
         let data = self
             .handle
-            .read_bytes_range_sync(abs_offset..abs_offset + entry.length as u64)
+            .read_bytes_range_sync(range)
             .map_err(crate::Error::Io)?;
         Ok(Some(SparseBlock::from_owned_bytes(data).map_err(|e| {
             crate::Error::Corruption(format!(
@@ -689,25 +730,43 @@ impl SparseIndex {
         if block_start >= total_blocks || block_count == 0 {
             return Ok(Vec::new());
         }
-        let end = (block_start + block_count).min(total_blocks);
+        let end = block_start.saturating_add(block_count).min(total_blocks);
         let base = self.dims.block_offsets[idx];
 
         let first_entry = self.read_skip_entry(skip_start + block_start);
         let last_entry = self.read_skip_entry(skip_start + end - 1);
-        let range_start = base + first_entry.offset;
-        let range_end = base + last_entry.offset + last_entry.length as u64;
+        let first_range = checked_sparse_block_range(base, first_entry, self.handle.len())?;
+        let last_range = checked_sparse_block_range(base, last_entry, self.handle.len())?;
+        if last_range.end < first_range.start {
+            return Err(crate::Error::Corruption(
+                "sparse block offsets are not monotonic".into(),
+            ));
+        }
 
         let range_data = self
             .handle
-            .read_bytes_range_sync(range_start..range_end)
+            .read_bytes_range_sync(first_range.start..last_range.end)
             .map_err(crate::Error::Io)?;
 
         let mut blocks = Vec::with_capacity(end - block_start);
         for bi in block_start..end {
             let entry = self.read_skip_entry(skip_start + bi);
-            let rel_offset = entry.offset - first_entry.offset;
-            let block_bytes = range_data
-                .slice(rel_offset as usize..(rel_offset as usize + entry.length as usize));
+            let rel_offset = entry
+                .offset
+                .checked_sub(first_entry.offset)
+                .ok_or_else(|| {
+                    crate::Error::Corruption("sparse block offsets are not monotonic".into())
+                })?;
+            let rel_start = usize::try_from(rel_offset).map_err(|_| {
+                crate::Error::Corruption("sparse relative block offset exceeds usize".into())
+            })?;
+            let rel_end = rel_start
+                .checked_add(entry.length as usize)
+                .filter(|&end| end <= range_data.len())
+                .ok_or_else(|| {
+                    crate::Error::Corruption("sparse block exceeds coalesced range".into())
+                })?;
+            let block_bytes = range_data.slice(rel_start..rel_end);
             blocks.push(SparseBlock::from_owned_bytes(block_bytes).map_err(|e| {
                 crate::Error::Corruption(format!(
                     "sync dim_id={} block={}/{} skip_entry(offset={},length={}) base={}: {e}",

@@ -121,35 +121,52 @@ fn build_phrase_scorer<'a>(
 // ── Shared early-return checks for phrase scorer ─────────────────────────
 //
 // Handles: empty terms, single-term delegation, no-positions fallback.
-// Parameterised on $scorer_fn + $($aw)* for async/sync.
+// Parameterised on the option-aware scorer function plus async/sync awaiting.
 macro_rules! phrase_early_returns {
     ($field:expr, $terms:expr, $reader:expr, $limit:expr,
-     $scorer_fn:ident $(, $aw:tt)*) => {
+     $scorer_fn:ident, $options:expr $(, $aw:tt)*) => {
         if $terms.is_empty() {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
         }
         if $terms.len() == 1 {
             let tq = super::TermQuery::new($field, $terms[0].clone());
-            return tq.$scorer_fn($reader, $limit) $(. $aw)* ;
+            return tq.$scorer_fn($reader, $limit, $options) $(. $aw)* ;
         }
         if !$reader.has_positions($field) {
             let mut bq = super::BooleanQuery::new();
             for t in $terms.iter() {
                 bq = bq.must(super::TermQuery::new($field, t.clone()));
             }
-            return bq.$scorer_fn($reader, $limit) $(. $aw)* ;
+            return bq.$scorer_fn($reader, $limit, $options) $(. $aw)* ;
         }
     };
 }
 
 impl Query for PhraseQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> ScorerFuture<'a> {
         let field = self.field;
         let terms = self.terms.clone();
         let slop = self.slop;
 
         Box::pin(async move {
-            phrase_early_returns!(field, terms, reader, limit, scorer, await);
+            phrase_early_returns!(
+                field,
+                terms,
+                reader,
+                limit,
+                scorer_with_options,
+                options,
+                await
+            );
 
             // Fetch postings + positions in parallel per term via futures::join!
             let mut term_data = Vec::with_capacity(terms.len());
@@ -174,7 +191,24 @@ impl Query for PhraseQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        phrase_early_returns!(self.field, self.terms, reader, limit, scorer_sync);
+        self.scorer_sync_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        phrase_early_returns!(
+            self.field,
+            self.terms,
+            reader,
+            limit,
+            scorer_sync_with_options,
+            options
+        );
 
         // Parallel fetch across all terms via rayon
         use rayon::prelude::*;

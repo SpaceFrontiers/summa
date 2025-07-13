@@ -42,6 +42,149 @@ impl CodecType {
 /// Block size for BlockwiseLinear codec (matching Tantivy).
 pub const BLOCKWISE_LINEAR_BLOCK_SIZE: usize = 512;
 
+/// Validate an auto-codec payload before exposing it through the infallible
+/// hot-path readers below. This keeps every bounds check out of per-document
+/// access while ensuring corrupt segment metadata cannot trigger slice panics.
+pub fn validate_auto(data: &[u8], expected_values: usize) -> io::Result<()> {
+    let (&codec_id, rest) = data.split_first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "fast field codec is missing")
+    })?;
+
+    let packed_len = |count: usize, bpv: u8| -> io::Result<usize> {
+        if bpv > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fast field bit width exceeds 64",
+            ));
+        }
+        count
+            .checked_mul(bpv as usize)
+            .and_then(|bits| bits.checked_add(7))
+            .map(|bits| bits / 8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "fast field size overflow"))
+    };
+
+    match CodecType::from_u8(codec_id) {
+        Some(CodecType::Constant) => {
+            if rest.len() != 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid constant fast field length",
+                ));
+            }
+        }
+        Some(CodecType::Bitpacked) => {
+            if rest.len() < 9 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bitpacked fast field header is truncated",
+                ));
+            }
+            let expected_len = 9usize
+                .checked_add(packed_len(expected_values, rest[8])?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fast field size overflow")
+                })?;
+            if rest.len() != expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bitpacked fast field length is inconsistent",
+                ));
+            }
+        }
+        Some(CodecType::Linear) => {
+            if rest.len() < 29 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "linear fast field header is truncated",
+                ));
+            }
+            let count = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
+            if count != expected_values || count < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linear fast field value count is inconsistent",
+                ));
+            }
+            let expected_len = 29usize
+                .checked_add(packed_len(count, rest[28])?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fast field size overflow")
+                })?;
+            if rest.len() != expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linear fast field length is inconsistent",
+                ));
+            }
+        }
+        Some(CodecType::BlockwiseLinear) => {
+            if rest.len() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "blockwise fast field header is truncated",
+                ));
+            }
+            let count = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+            let num_blocks = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
+            if count != expected_values || num_blocks != count.div_ceil(BLOCKWISE_LINEAR_BLOCK_SIZE)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "blockwise fast field counts are inconsistent",
+                ));
+            }
+
+            let mut pos = 8usize;
+            for block_idx in 0..num_blocks {
+                let header_end = pos.checked_add(29).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fast field offset overflow")
+                })?;
+                if header_end > rest.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "blockwise fast field block header is truncated",
+                    ));
+                }
+                let bpv = rest[pos + 24];
+                let declared =
+                    u32::from_le_bytes(rest[pos + 25..header_end].try_into().unwrap()) as usize;
+                let block_start = block_idx * BLOCKWISE_LINEAR_BLOCK_SIZE;
+                let block_count = (count - block_start).min(BLOCKWISE_LINEAR_BLOCK_SIZE);
+                let expected = packed_len(block_count, bpv)?;
+                if declared != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "blockwise fast field packed length is inconsistent",
+                    ));
+                }
+                pos = header_end.checked_add(declared).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fast field offset overflow")
+                })?;
+                if pos > rest.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "blockwise fast field data is truncated",
+                    ));
+                }
+            }
+            if pos != rest.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "blockwise fast field contains trailing data",
+                ));
+            }
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown fast field codec",
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── Estimator trait ──────────────────────────────────────────────────────
 
 /// Estimates serialized size for a given codec.
@@ -168,7 +311,7 @@ pub fn bitpacked_read(data: &[u8], index: usize) -> u64 {
         return min_value;
     }
     let packed = &data[9..];
-    bitpack_read(packed, bpv, index) + min_value
+    bitpack_read(packed, bpv, index).wrapping_add(min_value)
 }
 
 // ── Linear codec ─────────────────────────────────────────────────────────
@@ -588,7 +731,7 @@ pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
         8 => {
             for (i, v) in out.iter_mut().enumerate() {
                 let idx = start_index + i;
-                *v = packed[idx] as u64 + min_value;
+                *v = (packed[idx] as u64).wrapping_add(min_value);
             }
         }
         16 => {
@@ -596,7 +739,7 @@ pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
                 let idx = start_index + i;
                 let byte_off = idx * 2;
                 let raw = u16::from_le_bytes([packed[byte_off], packed[byte_off + 1]]);
-                *v = raw as u64 + min_value;
+                *v = (raw as u64).wrapping_add(min_value);
             }
         }
         32 => {
@@ -604,7 +747,7 @@ pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
                 let idx = start_index + i;
                 let byte_off = idx * 4;
                 let raw = u32::from_le_bytes(packed[byte_off..byte_off + 4].try_into().unwrap());
-                *v = raw as u64 + min_value;
+                *v = (raw as u64).wrapping_add(min_value);
             }
         }
         64 => {
@@ -618,7 +761,7 @@ pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
         // Arbitrary bpv — tight scalar loop using u64 fast-path read
         _ => {
             for (i, v) in out.iter_mut().enumerate() {
-                *v = super::bitpack_read(packed, bpv, start_index + i) + min_value;
+                *v = super::bitpack_read(packed, bpv, start_index + i).wrapping_add(min_value);
             }
         }
     }
@@ -737,6 +880,23 @@ mod tests {
         let mut buf = Vec::new();
         serialize_auto(&values, &mut buf).unwrap();
         assert!(buf.len() <= 10);
+    }
+
+    #[test]
+    fn test_validate_rejects_truncated_and_inconsistent_payloads() {
+        assert!(validate_auto(&[], 1).is_err());
+        assert!(validate_auto(&[CodecType::Constant as u8], 1).is_err());
+
+        let mut bitpacked = vec![CodecType::Bitpacked as u8];
+        bitpacked.extend_from_slice(&0u64.to_le_bytes());
+        bitpacked.push(65);
+        assert!(validate_auto(&bitpacked, 1).is_err());
+
+        let mut valid = Vec::new();
+        serialize_auto(&[1, 2, 3, 4], &mut valid).unwrap();
+        assert!(validate_auto(&valid, 4).is_ok());
+        valid.pop();
+        assert!(validate_auto(&valid, 4).is_err());
     }
 
     #[test]

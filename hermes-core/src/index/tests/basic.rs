@@ -1,6 +1,7 @@
 use crate::directories::RamDirectory;
-use crate::dsl::{Document, SchemaBuilder};
+use crate::dsl::{Document, PositionMode, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
+use crate::query::{BooleanQuery, BoostQuery, PhraseQuery, Query, ScorerOptions, TermQuery};
 
 #[tokio::test]
 async fn test_index_create_and_search() {
@@ -198,6 +199,95 @@ async fn test_match_query() {
         !doc.field_values().is_empty(),
         "Doc should have field values"
     );
+}
+
+#[tokio::test]
+async fn boolean_and_boost_search_preserve_requested_positions_and_scores() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    schema_builder.set_positions(title, PositionMode::Full);
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut rust_doc = Document::new();
+    rust_doc.add_text(title, "rust");
+    writer.add_document(rust_doc).unwrap();
+    let mut search_doc = Document::new();
+    search_doc.add_text(title, "search");
+    writer.add_document(search_doc).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let boosted = BoostQuery::new(TermQuery::text(title, "rust"), 10.0);
+    let query = BooleanQuery::new()
+        .should(boosted.clone())
+        .should(TermQuery::text(title, "search"));
+
+    let (without_positions, _) = searcher.search_with_count(&query, 2).await.unwrap();
+    assert!(
+        without_positions
+            .iter()
+            .all(|result| result.positions.is_empty())
+    );
+    assert_eq!(without_positions[0].doc_id, 0);
+    assert!(without_positions[0].score > without_positions[1].score);
+
+    let (with_positions, _) = searcher.search_with_positions(&query, 2).await.unwrap();
+    assert!(
+        with_positions
+            .iter()
+            .all(|result| !result.positions.is_empty())
+    );
+    assert_eq!(with_positions[0].doc_id, 0);
+    let position_score: f32 = with_positions[0]
+        .positions
+        .iter()
+        .flat_map(|(_, positions)| positions)
+        .map(|position| position.score)
+        .sum();
+    assert!((position_score - with_positions[0].score).abs() < 1e-5);
+}
+
+#[tokio::test]
+async fn single_term_phrase_propagates_position_collection_options() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    schema_builder.set_positions(title, PositionMode::Full);
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut doc = Document::new();
+    doc.add_text(title, "rust");
+    writer.add_document(doc).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let segment = &searcher.segment_readers()[0];
+    let query = PhraseQuery::new(title, vec![b"rust".to_vec()]);
+
+    let scorer = query
+        .scorer_with_options(segment, 1, ScorerOptions::default())
+        .await
+        .unwrap();
+    assert!(scorer.matched_positions().is_none());
+
+    let scorer = query
+        .scorer_with_options(segment, 1, ScorerOptions::with_positions())
+        .await
+        .unwrap();
+    assert!(scorer.matched_positions().is_some());
 }
 
 #[tokio::test]

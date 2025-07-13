@@ -1672,6 +1672,12 @@ unsafe fn dequantize_uint8_sse(
 /// Compute dot product of two f32 arrays with SIMD acceleration
 #[inline]
 pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
+    assert!(
+        count <= a.len() && count <= b.len(),
+        "dot_product_f32 count {count} exceeds input lengths ({}, {})",
+        a.len(),
+        b.len()
+    );
     #[cfg(target_arch = "aarch64")]
     {
         if neon::is_available() {
@@ -2164,8 +2170,15 @@ pub fn fast_inv_sqrt(x: f32) -> f32 {
 #[inline]
 pub fn batch_cosine_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
-    debug_assert!(vectors.len() >= n * dim);
-    debug_assert_eq!(query.len(), dim);
+    let required = n
+        .checked_mul(dim)
+        .expect("batch cosine vector length overflow");
+    assert_eq!(query.len(), dim, "batch cosine query dimension mismatch");
+    assert!(
+        vectors.len() >= required,
+        "batch cosine vectors are truncated: need {required}, got {}",
+        vectors.len()
+    );
 
     if dim == 0 || n == 0 {
         return;
@@ -2934,6 +2947,26 @@ fn dot_product_u8_quant(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
 #[inline]
 pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
+    let vec_bytes = dim.checked_mul(2).expect("f16 vector size overflow");
+    let required = n
+        .checked_mul(vec_bytes)
+        .expect("f16 batch byte length overflow");
+    assert_eq!(
+        query.len(),
+        dim,
+        "f16 batch cosine query dimension mismatch"
+    );
+    assert!(
+        vectors_raw.len() >= required,
+        "f16 batch cosine vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
+    if required > 0 {
+        assert!(
+            (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+            "f16 batch cosine vectors are not 2-byte aligned"
+        );
+    }
     if dim == 0 || n == 0 {
         return;
     }
@@ -2950,16 +2983,6 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
 
     // Quantize query to f16 once (O(dim)), reused for all N vector scorings
     let query_f16: Vec<u16> = query.iter().map(|&v| f32_to_f16(v)).collect();
-
-    let vec_bytes = dim * 2;
-    debug_assert!(vectors_raw.len() >= n * vec_bytes);
-
-    // Vectors file uses data-first layout with 8-byte padding between fields,
-    // so mmap slices are always 2-byte aligned for u16 access.
-    debug_assert!(
-        (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
-        "f16 vector data not 2-byte aligned"
-    );
 
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
@@ -2982,6 +3005,13 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
 #[inline]
 pub fn batch_cosine_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
+    let required = n.checked_mul(dim).expect("u8 batch byte length overflow");
+    assert_eq!(query.len(), dim, "u8 batch cosine query dimension mismatch");
+    assert!(
+        vectors_raw.len() >= required,
+        "u8 batch cosine vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
     if dim == 0 || n == 0 {
         return;
     }
@@ -2994,8 +3024,6 @@ pub fn batch_cosine_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, sco
         return;
     }
     let inv_norm_q = fast_inv_sqrt(norm_q_sq);
-
-    debug_assert!(vectors_raw.len() >= n * dim);
 
     for i in 0..n {
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
@@ -3020,8 +3048,15 @@ pub fn batch_cosine_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, sco
 #[inline]
 pub fn batch_dot_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
-    debug_assert!(vectors.len() >= n * dim);
-    debug_assert_eq!(query.len(), dim);
+    let required = n
+        .checked_mul(dim)
+        .expect("batch dot vector length overflow");
+    assert_eq!(query.len(), dim, "batch dot query dimension mismatch");
+    assert!(
+        vectors.len() >= required,
+        "batch dot vectors are truncated: need {required}, got {}",
+        vectors.len()
+    );
 
     if dim == 0 || n == 0 {
         return;
@@ -3050,6 +3085,22 @@ pub fn batch_dot_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &mut
 #[inline]
 pub fn batch_dot_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
+    let vec_bytes = dim.checked_mul(2).expect("f16 vector size overflow");
+    let required = n
+        .checked_mul(vec_bytes)
+        .expect("f16 batch byte length overflow");
+    assert_eq!(query.len(), dim, "f16 batch dot query dimension mismatch");
+    assert!(
+        vectors_raw.len() >= required,
+        "f16 batch dot vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
+    if required > 0 {
+        assert!(
+            (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+            "f16 batch dot vectors are not 2-byte aligned"
+        );
+    }
     if dim == 0 || n == 0 {
         return;
     }
@@ -3064,13 +3115,6 @@ pub fn batch_dot_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, score
     let inv_norm_q = fast_inv_sqrt(norm_q_sq);
 
     let query_f16: Vec<u16> = query.iter().map(|&v| f32_to_f16(v)).collect();
-    let vec_bytes = dim * 2;
-    debug_assert!(vectors_raw.len() >= n * vec_bytes);
-    debug_assert!(
-        (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
-        "f16 vector data not 2-byte aligned"
-    );
-
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
@@ -3086,6 +3130,13 @@ pub fn batch_dot_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, score
 #[inline]
 pub fn batch_dot_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
+    let required = n.checked_mul(dim).expect("u8 batch byte length overflow");
+    assert_eq!(query.len(), dim, "u8 batch dot query dimension mismatch");
+    assert!(
+        vectors_raw.len() >= required,
+        "u8 batch dot vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
     if dim == 0 || n == 0 {
         return;
     }
@@ -3098,8 +3149,6 @@ pub fn batch_dot_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores
         return;
     }
     let inv_norm_q = fast_inv_sqrt(norm_q_sq);
-
-    debug_assert!(vectors_raw.len() >= n * dim);
 
     for i in 0..n {
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
@@ -3122,7 +3171,19 @@ pub fn batch_cosine_scores_precomp(
     inv_norm_q: f32,
 ) {
     let n = scores.len();
-    debug_assert!(vectors.len() >= n * dim);
+    let required = n
+        .checked_mul(dim)
+        .expect("precomputed cosine vector length overflow");
+    assert_eq!(
+        query.len(),
+        dim,
+        "precomputed cosine query dimension mismatch"
+    );
+    assert!(
+        vectors.len() >= required,
+        "precomputed cosine vectors are truncated: need {required}, got {}",
+        vectors.len()
+    );
     for i in 0..n {
         let vec = &vectors[i * dim..(i + 1) * dim];
         let (dot, norm_v_sq) = fused_dot_norm(query, vec, dim);
@@ -3144,8 +3205,26 @@ pub fn batch_cosine_scores_f16_precomp(
     inv_norm_q: f32,
 ) {
     let n = scores.len();
-    let vec_bytes = dim * 2;
-    debug_assert!(vectors_raw.len() >= n * vec_bytes);
+    let vec_bytes = dim.checked_mul(2).expect("f16 vector size overflow");
+    let required = n
+        .checked_mul(vec_bytes)
+        .expect("precomputed f16 cosine batch byte length overflow");
+    assert_eq!(
+        query_f16.len(),
+        dim,
+        "precomputed f16 cosine query dimension mismatch"
+    );
+    assert!(
+        vectors_raw.len() >= required,
+        "precomputed f16 cosine vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
+    if required > 0 {
+        assert!(
+            (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+            "precomputed f16 cosine vectors are not 2-byte aligned"
+        );
+    }
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
@@ -3168,7 +3247,19 @@ pub fn batch_cosine_scores_u8_precomp(
     inv_norm_q: f32,
 ) {
     let n = scores.len();
-    debug_assert!(vectors_raw.len() >= n * dim);
+    let required = n
+        .checked_mul(dim)
+        .expect("precomputed u8 cosine batch byte length overflow");
+    assert_eq!(
+        query.len(),
+        dim,
+        "precomputed u8 cosine query dimension mismatch"
+    );
+    assert!(
+        vectors_raw.len() >= required,
+        "precomputed u8 cosine vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
     for i in 0..n {
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
         let (dot, norm_v_sq) = fused_dot_norm_u8(query, u8_slice, dim);
@@ -3190,7 +3281,15 @@ pub fn batch_dot_scores_precomp(
     inv_norm_q: f32,
 ) {
     let n = scores.len();
-    debug_assert!(vectors.len() >= n * dim);
+    let required = n
+        .checked_mul(dim)
+        .expect("precomputed dot vector length overflow");
+    assert_eq!(query.len(), dim, "precomputed dot query dimension mismatch");
+    assert!(
+        vectors.len() >= required,
+        "precomputed dot vectors are truncated: need {required}, got {}",
+        vectors.len()
+    );
     for i in 0..n {
         let vec = &vectors[i * dim..(i + 1) * dim];
         scores[i] = dot_product_f32(query, vec, dim) * inv_norm_q;
@@ -3207,8 +3306,26 @@ pub fn batch_dot_scores_f16_precomp(
     inv_norm_q: f32,
 ) {
     let n = scores.len();
-    let vec_bytes = dim * 2;
-    debug_assert!(vectors_raw.len() >= n * vec_bytes);
+    let vec_bytes = dim.checked_mul(2).expect("f16 vector size overflow");
+    let required = n
+        .checked_mul(vec_bytes)
+        .expect("precomputed f16 dot batch byte length overflow");
+    assert_eq!(
+        query_f16.len(),
+        dim,
+        "precomputed f16 dot query dimension mismatch"
+    );
+    assert!(
+        vectors_raw.len() >= required,
+        "precomputed f16 dot vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
+    if required > 0 {
+        assert!(
+            (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+            "precomputed f16 dot vectors are not 2-byte aligned"
+        );
+    }
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
@@ -3226,7 +3343,19 @@ pub fn batch_dot_scores_u8_precomp(
     inv_norm_q: f32,
 ) {
     let n = scores.len();
-    debug_assert!(vectors_raw.len() >= n * dim);
+    let required = n
+        .checked_mul(dim)
+        .expect("precomputed u8 dot batch byte length overflow");
+    assert_eq!(
+        query.len(),
+        dim,
+        "precomputed u8 dot query dimension mismatch"
+    );
+    assert!(
+        vectors_raw.len() >= required,
+        "precomputed u8 dot vectors are truncated: need {required} bytes, got {}",
+        vectors_raw.len()
+    );
     for i in 0..n {
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
         scores[i] = dot_product_u8_quant(query, u8_slice, dim) * inv_norm_q;
@@ -3239,7 +3368,7 @@ pub fn batch_dot_scores_u8_precomp(
 /// Returns 0.0 if either vector has zero norm.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "cosine vector dimension mismatch");
     let count = a.len();
 
     if count == 0 {
@@ -3268,7 +3397,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Uses NEON intrinsics on aarch64, POPCNT on x86_64, scalar fallback otherwise.
 #[inline]
 pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "Hamming vector byte length mismatch");
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -3325,8 +3454,15 @@ pub fn batch_hamming_scores(
     scores: &mut [f32],
 ) {
     let n = scores.len();
-    debug_assert_eq!(query.len(), byte_len);
-    debug_assert!(db.len() >= n * byte_len);
+    let required = n
+        .checked_mul(byte_len)
+        .expect("Hamming batch byte length overflow");
+    assert_eq!(query.len(), byte_len, "Hamming query byte length mismatch");
+    assert!(
+        db.len() >= required,
+        "Hamming batch is truncated: need {required} bytes, got {}",
+        db.len()
+    );
 
     if byte_len == 0 || n == 0 || dim_bits == 0 {
         return;
@@ -3344,6 +3480,60 @@ pub fn batch_hamming_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_simd_boundaries_reject_dimension_mismatches() {
+        let vectors = vec![1.0f32; 6];
+        let raw_f16 = vec![0u8; 12];
+        let raw_u8 = vec![0u8; 6];
+        let mut scores = vec![0.0f32; 2];
+
+        for invalid_query in [vec![1.0, 2.0], vec![1.0, 2.0, 3.0, 4.0]] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    batch_cosine_scores(&invalid_query, &vectors, 3, &mut scores)
+                }))
+                .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    batch_dot_scores_f16(&invalid_query, &raw_f16, 3, &mut scores)
+                }))
+                .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    batch_cosine_scores_u8(&invalid_query, &raw_u8, 3, &mut scores)
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn vector_simd_boundaries_reject_truncated_storage() {
+        let query = [1.0f32, 2.0, 3.0];
+        let mut scores = [0.0f32; 2];
+
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                batch_dot_scores(&query, &[0.0; 5], 3, &mut scores)
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                batch_cosine_scores_f16(&query, &[0u8; 11], 3, &mut scores)
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dot_product_f32(&query, &query, 4)
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_unpack_8bit() {

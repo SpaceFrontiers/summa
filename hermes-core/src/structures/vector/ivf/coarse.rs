@@ -232,10 +232,10 @@ impl CoarseCentroids {
 
         // Partial sort: O(n + k log k) instead of O(n log n)
         if distances.len() > k {
-            distances.select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            distances.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
             distances.truncate(k);
         }
-        distances.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         distances.into_iter().map(|(c, _)| c).collect()
     }
 
@@ -255,10 +255,10 @@ impl CoarseCentroids {
 
         // Partial sort: O(n + k log k) instead of O(n log n)
         if distances.len() > k {
-            distances.select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            distances.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
             distances.truncate(k);
         }
-        distances.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         distances
     }
 
@@ -317,7 +317,7 @@ impl CoarseCentroids {
         // Partial sort by orthogonality (smallest dot product first)
         let take = config.num_secondary.min(candidates.len());
         if candidates.len() > take {
-            candidates.select_nth_unstable_by(take, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            candidates.select_nth_unstable_by(take, |a, b| a.1.total_cmp(&b.1));
             candidates.truncate(take);
         }
 

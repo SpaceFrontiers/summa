@@ -60,6 +60,16 @@ struct Args {
     #[arg(long)]
     worker_threads: Option<usize>,
 
+    /// Maximum number of search RPCs executing concurrently across all
+    /// connections (default: one per 8 CPUs, clamped to 1..=8)
+    #[arg(long)]
+    max_concurrent_searches: Option<usize>,
+
+    /// Rayon threads shared by CPU-bound search work across every index
+    /// (default: one per 4 CPUs, minimum 1)
+    #[arg(long)]
+    search_threads: Option<usize>,
+
     /// Validate all indexes on startup, remove corrupt segments
     #[arg(long)]
     doctor: bool,
@@ -192,6 +202,22 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let num_indexing_threads = args
         .indexing_threads
         .unwrap_or_else(|| (num_cpus::get() / 4).max(1));
+    let max_concurrent_searches = args
+        .max_concurrent_searches
+        .unwrap_or_else(|| (num_cpus::get() / 8).clamp(1, 8));
+    if max_concurrent_searches == 0 {
+        return Err(anyhow::anyhow!(
+            "--max-concurrent-searches must be greater than zero"
+        ));
+    }
+    let search_threads = args
+        .search_threads
+        .unwrap_or_else(hermes_core::default_search_threads);
+    if search_threads == 0 {
+        return Err(anyhow::anyhow!(
+            "--search-threads must be greater than zero"
+        ));
+    }
 
     let max_indexing_memory_bytes = args
         .max_indexing_memory_mb
@@ -222,6 +248,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     };
 
     let config = IndexConfig {
+        num_threads: search_threads,
         max_indexing_memory_bytes,
         num_indexing_threads,
         reload_interval_ms: args.reload_interval_ms,
@@ -245,9 +272,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         registry.doctor_all_indexes().await;
     }
 
-    let search_service = search_service::SearchServiceImpl {
-        registry: Arc::clone(&registry),
-    };
+    let search_service =
+        search_service::SearchServiceImpl::new(Arc::clone(&registry), max_concurrent_searches);
 
     let index_service = index_service::IndexServiceImpl {
         registry: Arc::clone(&registry),
@@ -274,6 +300,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
     info!("Indexing threads: {}", num_indexing_threads);
     info!("Worker threads: {}", worker_threads);
+    info!("Search CPU threads: {}", search_threads);
+    info!("Maximum concurrent searches: {}", max_concurrent_searches);
     info!("Reload interval: {} ms", args.reload_interval_ms);
     if args.optimizer_threads > 0 {
         info!(

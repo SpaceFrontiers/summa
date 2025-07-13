@@ -294,7 +294,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 swept
             );
         }
-        segment_manager.load_and_publish_trained().await;
+        segment_manager.try_load_and_publish_trained().await?;
 
         Ok(Self::new_with_parts(
             directory,
@@ -806,7 +806,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 return;
             }
         };
-        let trained = state.segment_manager.trained();
+        let trained = state.segment_manager.trained_for_segment_build();
         let doc_count = builder.num_docs();
         let build_start = std::time::Instant::now();
 

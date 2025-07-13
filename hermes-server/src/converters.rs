@@ -3,8 +3,8 @@
 use std::sync::LazyLock;
 
 use hermes_core::query::{
-    BinaryDenseVectorQuery, DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, RerankerConfig,
-    SparseVectorQuery,
+    BinaryDenseVectorQuery, DenseVectorQuery, LazyGlobalStats, MAX_DENSE_NPROBE,
+    MAX_DENSE_RERANK_FACTOR, MultiValueCombiner, RerankerConfig, SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
@@ -19,6 +19,18 @@ static TOKENIZER_REGISTRY: LazyLock<TokenizerRegistry> = LazyLock::new(Tokenizer
 use crate::proto;
 use crate::proto::field_value::Value;
 use crate::proto::query::Query as ProtoQueryType;
+
+const MAX_TEXT_QUERY_TOKENS: usize = 256;
+const MAX_SPARSE_TOKEN_DIMENSIONS: usize = 4_096;
+
+fn validate_token_expansion(kind: &str, count: usize, maximum: usize) -> Result<(), String> {
+    if count > maximum {
+        return Err(format!(
+            "{kind} expands to {count} tokens; maximum is {maximum}"
+        ));
+    }
+    Ok(())
+}
 
 /// Convert proto combiner enum to core MultiValueCombiner
 /// Parameters (temperature, k, decay) are passed separately from the query message
@@ -77,6 +89,7 @@ pub fn convert_query(
                 .into_iter()
                 .map(|t| t.text)
                 .collect();
+            validate_token_expansion("TermQuery", tokens.len(), MAX_TEXT_QUERY_TOKENS)?;
             if tokens.is_empty() {
                 return Err(format!("No tokens in term '{}'", term_query.term));
             }
@@ -97,6 +110,9 @@ pub fn convert_query(
 
             // Trailing `*` → PrefixQuery (no tokenization, raw lowercased prefix)
             if let Some(prefix) = match_query.text.strip_suffix('*') {
+                if prefix.is_empty() {
+                    return Err("Prefix query must not be empty".to_string());
+                }
                 return Ok(Box::new(PrefixQuery::text(field, prefix)));
             }
 
@@ -115,6 +131,7 @@ pub fn convert_query(
                 .into_iter()
                 .map(|t| t.text)
                 .collect();
+            validate_token_expansion("MatchQuery", tokens.len(), MAX_TEXT_QUERY_TOKENS)?;
 
             if tokens.is_empty() {
                 return Err(format!(
@@ -139,6 +156,9 @@ pub fn convert_query(
             convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir)
         }
         Some(ProtoQueryType::Boost(boost_query)) => {
+            if !boost_query.boost.is_finite() {
+                return Err("Boost must be a finite number".to_string());
+            }
             let inner = boost_query
                 .query
                 .as_ref()
@@ -158,12 +178,56 @@ pub fn convert_query(
             let field = schema
                 .get_field(&sv_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", sv_query.field))?;
+            let field_entry = schema
+                .get_field_entry(field)
+                .ok_or_else(|| format!("Field entry for '{}' not found", sv_query.field))?;
+            if field_entry.field_type != hermes_core::FieldType::SparseVector {
+                return Err(format!(
+                    "SparseVectorQuery requires a sparse_vector field, but '{}' is {:?}",
+                    sv_query.field, field_entry.field_type
+                ));
+            }
+            if sv_query.text.is_empty() && sv_query.indices.len() != sv_query.values.len() {
+                return Err(format!(
+                    "Sparse query has {} indices but {} values",
+                    sv_query.indices.len(),
+                    sv_query.values.len()
+                ));
+            }
+            if let Some((index, value)) = sv_query
+                .values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(format!(
+                    "Sparse query contains non-finite value {value} at index {index}"
+                ));
+            }
+            if !sv_query.heap_factor.is_finite()
+                || sv_query.heap_factor < 0.0
+                || sv_query.heap_factor > 1.0
+            {
+                return Err(format!(
+                    "Sparse query heap_factor must be finite and in [0, 1], got {}",
+                    sv_query.heap_factor
+                ));
+            }
+            if !sv_query.weight_threshold.is_finite() || sv_query.weight_threshold < 0.0 {
+                return Err(format!(
+                    "Sparse query weight_threshold must be finite and non-negative, got {}",
+                    sv_query.weight_threshold
+                ));
+            }
+            if !sv_query.pruning.is_finite() || sv_query.pruning < 0.0 || sv_query.pruning > 1.0 {
+                return Err(format!(
+                    "Sparse query pruning must be finite and in [0, 1], got {}",
+                    sv_query.pruning
+                ));
+            }
 
             let vector: Vec<(u32, f32)> = if !sv_query.text.is_empty() {
                 // Text provided - tokenize server-side
-                let field_entry = schema
-                    .get_field_entry(field)
-                    .ok_or_else(|| format!("Field entry for '{}' not found", sv_query.field))?;
                 let sparse_config = field_entry.sparse_vector_config.as_ref().ok_or_else(|| {
                     format!("Field '{}' is not a sparse vector field", sv_query.field)
                 })?;
@@ -182,6 +246,11 @@ pub fn convert_query(
                 let token_counts = tokenizer
                     .tokenize(&sv_query.text)
                     .map_err(|e| format!("Tokenization failed: {}", e))?;
+                validate_token_expansion(
+                    "SparseVectorQuery.text",
+                    token_counts.len(),
+                    MAX_SPARSE_TOKEN_DIMENSIONS,
+                )?;
 
                 // Convert (token_id, count) to (token_id, weight)
                 // Apply IDF weighting if configured
@@ -348,13 +417,70 @@ pub fn convert_query(
             let field = schema
                 .get_field(&dv_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", dv_query.field))?;
-            let mut query = DenseVectorQuery::new(field, dv_query.vector.clone());
-            if dv_query.nprobe > 0 {
-                query = query.with_nprobe(dv_query.nprobe as usize);
+            let entry = schema
+                .get_field_entry(field)
+                .ok_or_else(|| format!("Field entry for '{}' not found", dv_query.field))?;
+            if entry.field_type != hermes_core::FieldType::DenseVector {
+                return Err(format!(
+                    "DenseVectorQuery requires a dense_vector field, but '{}' is {:?}",
+                    dv_query.field, entry.field_type
+                ));
             }
-            if dv_query.rerank_factor > 0.0 {
-                query = query.with_rerank_factor(dv_query.rerank_factor);
+            let config = entry.dense_vector_config.as_ref().ok_or_else(|| {
+                format!(
+                    "Dense vector field '{}' has no dense vector configuration",
+                    dv_query.field
+                )
+            })?;
+            if dv_query.vector.is_empty() {
+                return Err("Dense query vector must not be empty".to_string());
             }
+            if dv_query.vector.len() != config.dim {
+                return Err(format!(
+                    "Dense query vector dimension {} does not match field '{}' dimension {}",
+                    dv_query.vector.len(),
+                    dv_query.field,
+                    config.dim
+                ));
+            }
+            if let Some((index, value)) = dv_query
+                .vector
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(format!(
+                    "Dense query vector contains non-finite value {value} at index {index}"
+                ));
+            }
+
+            let nprobe = if dv_query.nprobe == 0 {
+                config.nprobe
+            } else {
+                dv_query.nprobe as usize
+            };
+            if nprobe > MAX_DENSE_NPROBE {
+                return Err(format!(
+                    "Dense query nprobe must be at most {MAX_DENSE_NPROBE}, got {nprobe}"
+                ));
+            }
+
+            let rerank_factor = if dv_query.rerank_factor == 0.0 {
+                3.0
+            } else {
+                dv_query.rerank_factor
+            };
+            if !rerank_factor.is_finite()
+                || !(1.0..=MAX_DENSE_RERANK_FACTOR).contains(&rerank_factor)
+            {
+                return Err(format!(
+                    "Dense query rerank_factor must be finite and in [1, {MAX_DENSE_RERANK_FACTOR}], got {rerank_factor}"
+                ));
+            }
+
+            let mut query = DenseVectorQuery::new(field, dv_query.vector.clone())
+                .with_nprobe(nprobe)
+                .with_rerank_factor(rerank_factor);
             let combiner = convert_combiner(
                 dv_query.combiner,
                 dv_query.combiner_temperature,
@@ -368,6 +494,29 @@ pub fn convert_query(
             let field = schema
                 .get_field(&bv_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", bv_query.field))?;
+            let entry = schema
+                .get_field_entry(field)
+                .ok_or_else(|| format!("Field entry for '{}' not found", bv_query.field))?;
+            if entry.field_type != hermes_core::FieldType::BinaryDenseVector {
+                return Err(format!(
+                    "BinaryDenseVectorQuery requires a binary_dense_vector field, but '{}' is {:?}",
+                    bv_query.field, entry.field_type
+                ));
+            }
+            let config = entry.binary_dense_vector_config.as_ref().ok_or_else(|| {
+                format!(
+                    "Binary dense vector field '{}' has no configuration",
+                    bv_query.field
+                )
+            })?;
+            if bv_query.vector.len() != config.byte_len() {
+                return Err(format!(
+                    "Binary query byte length {} does not match field '{}' byte length {}",
+                    bv_query.vector.len(),
+                    bv_query.field,
+                    config.byte_len()
+                ));
+            }
             let mut query = BinaryDenseVectorQuery::new(field, bv_query.vector.clone());
             let combiner = convert_combiner(
                 bv_query.combiner,
@@ -383,6 +532,9 @@ pub fn convert_query(
             let field = schema
                 .get_field(&prefix_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", prefix_query.field))?;
+            if prefix_query.prefix.is_empty() {
+                return Err("Prefix query must not be empty".to_string());
+            }
             Ok(Box::new(PrefixQuery::text(field, &prefix_query.prefix)))
         }
         Some(ProtoQueryType::Fusion(_)) => {
@@ -690,6 +842,13 @@ pub fn convert_reranker(
 
     let is_binary = entry.field_type == hermes_core::FieldType::BinaryDenseVector;
 
+    if !reranker.rrf_k.is_finite() || reranker.rrf_k < 0.0 {
+        return Err(format!(
+            "Reranker rrf_k must be finite and non-negative, got {}",
+            reranker.rrf_k
+        ));
+    }
+
     if entry.field_type != hermes_core::FieldType::DenseVector && !is_binary {
         return Err(format!(
             "Reranker field '{}' must be dense_vector or binary_dense_vector, got {:?}",
@@ -731,6 +890,16 @@ pub fn convert_reranker(
                 dv_config.dim
             ));
         }
+        if let Some((index, value)) = reranker
+            .vector
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "Reranker query vector contains non-finite value {value} at index {index}"
+            ));
+        }
     }
 
     // Default reranker combiner to WeightedTopK(k=3, decay=0.7) — decaying
@@ -759,6 +928,17 @@ pub fn convert_reranker(
     } else {
         None
     };
+    if is_binary && matryoshka_dims.is_some() {
+        return Err("Reranker matryoshka_dims is not supported for binary vectors".to_string());
+    }
+    if let (Some(dims), Some(config)) = (matryoshka_dims, entry.dense_vector_config.as_ref())
+        && dims > config.dim
+    {
+        return Err(format!(
+            "Reranker matryoshka_dims {dims} exceeds field '{}' dimension {}",
+            reranker.field, config.dim
+        ));
+    }
 
     Ok(RerankerConfig {
         field,
@@ -769,6 +949,27 @@ pub fn convert_reranker(
         matryoshka_dims,
         rrf_k: reranker.rrf_k,
     })
+}
+
+fn validate_binary_document_value(
+    name: &str,
+    field: hermes_core::Field,
+    bytes: &[u8],
+    schema: &Schema,
+) -> Result<(), String> {
+    let config = schema
+        .get_field_entry(field)
+        .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+        .ok_or_else(|| format!("Field '{}' has no binary dense vector config", name))?;
+    if bytes.len() != config.byte_len() {
+        return Err(format!(
+            "Field '{}': binary vector byte length {} does not match schema byte length {}",
+            name,
+            bytes.len(),
+            config.byte_len()
+        ));
+    }
+    Ok(())
 }
 
 pub fn convert_proto_to_document(
@@ -819,13 +1020,31 @@ pub fn convert_proto_to_document(
             // ── Non-numeric types: no coercion needed ──
             // bytes_value coerced to binary_dense_vector when schema says so
             (Some(Value::BytesValue(b)), FieldType::BinaryDenseVector) => {
+                validate_binary_document_value(name, field, b, schema)?;
                 doc.add_binary_dense_vector(field, b.clone());
             }
             (Some(Value::BytesValue(b)), _) => doc.add_bytes(field, b.clone()),
-            (Some(Value::BinaryDenseVector(b)), _) => {
+            (Some(Value::BinaryDenseVector(b)), FieldType::BinaryDenseVector) => {
+                validate_binary_document_value(name, field, b, schema)?;
                 doc.add_binary_dense_vector(field, b.clone());
             }
-            (Some(Value::SparseVector(sv)), _) => {
+            (Some(Value::SparseVector(sv)), FieldType::SparseVector) => {
+                if sv.indices.len() != sv.values.len() {
+                    return Err(format!(
+                        "Field '{}': sparse vector has {} indices but {} values",
+                        name,
+                        sv.indices.len(),
+                        sv.values.len()
+                    ));
+                }
+                if let Some((index, value)) =
+                    sv.values.iter().enumerate().find(|(_, v)| !v.is_finite())
+                {
+                    return Err(format!(
+                        "Field '{}': sparse vector contains non-finite value {value} at index {index}",
+                        name
+                    ));
+                }
                 let entries: Vec<(u32, f32)> = sv
                     .indices
                     .iter()
@@ -834,8 +1053,40 @@ pub fn convert_proto_to_document(
                     .collect();
                 doc.add_sparse_vector(field, entries);
             }
-            (Some(Value::DenseVector(dv)), _) => {
+            (Some(Value::DenseVector(dv)), FieldType::DenseVector) => {
+                let expected_dim = schema
+                    .get_field_entry(field)
+                    .and_then(|field| field.dense_vector_config.as_ref())
+                    .map(|config| config.dim)
+                    .ok_or_else(|| format!("Field '{}' has no dense vector config", name))?;
+                if dv.values.len() != expected_dim {
+                    return Err(format!(
+                        "Field '{}': dense vector dimension {} does not match schema dimension {}",
+                        name,
+                        dv.values.len(),
+                        expected_dim
+                    ));
+                }
+                if let Some((index, value)) = dv
+                    .values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !value.is_finite())
+                {
+                    return Err(format!(
+                        "Field '{}': dense vector contains non-finite value {value} at index {index}",
+                        name
+                    ));
+                }
                 doc.add_dense_vector(field, dv.values.clone());
+            }
+            (Some(Value::DenseVector(_)), got)
+            | (Some(Value::SparseVector(_)), got)
+            | (Some(Value::BinaryDenseVector(_)), got) => {
+                return Err(format!(
+                    "Field '{}': vector value does not match schema type {:?}",
+                    name, got
+                ));
             }
             // ── JSON: expand string arrays into multi-valued text fields ──
             // Python client serializes list[str] as json_value '["en","fr"]'
@@ -886,6 +1137,203 @@ pub fn convert_proto_to_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_expansion_is_bounded_before_query_construction() {
+        assert!(validate_token_expansion("test", 256, 256).is_ok());
+        assert!(validate_token_expansion("test", 257, 256).is_err());
+    }
+
+    fn dense_test_schema(nprobe: usize) -> Schema {
+        let mut builder = hermes_core::SchemaBuilder::default();
+        let mut config = hermes_core::dsl::DenseVectorConfig::new(3);
+        config.nprobe = nprobe;
+        builder.add_dense_vector_field_with_config("embedding", true, false, config);
+        builder.add_text_field("title", true, false);
+        builder.build()
+    }
+
+    fn dense_proto_query(vector: Vec<f32>) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::DenseVector(proto::DenseVectorQuery {
+                field: "embedding".to_string(),
+                vector,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn vector_test_schema() -> Schema {
+        let mut builder = hermes_core::SchemaBuilder::default();
+        builder.add_sparse_vector_field("sparse", true, false);
+        builder.add_binary_dense_vector_field("binary", 16, true, false);
+        builder.add_text_field("title", true, false);
+        builder.build()
+    }
+
+    #[test]
+    fn dense_query_uses_schema_nprobe_when_request_omits_it() {
+        let schema = dense_test_schema(17);
+        let query =
+            convert_query(&dense_proto_query(vec![1.0, 2.0, 3.0]), &schema, None, None).unwrap();
+
+        assert!(query.to_string().contains("nprobe=17"));
+    }
+
+    #[test]
+    fn dense_query_rejects_invalid_dimensions_and_values() {
+        let schema = dense_test_schema(17);
+        for vector in [
+            vec![],
+            vec![1.0, 2.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![1.0, f32::NAN, 3.0],
+            vec![1.0, f32::INFINITY, 3.0],
+            vec![1.0, f32::NEG_INFINITY, 3.0],
+        ] {
+            assert!(
+                convert_query(&dense_proto_query(vector), &schema, None, None).is_err(),
+                "invalid vector should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_query_rejects_wrong_field_and_unbounded_search_parameters() {
+        let schema = dense_test_schema(17);
+        let mut wrong_field = dense_proto_query(vec![1.0, 2.0, 3.0]);
+        let Some(ProtoQueryType::DenseVector(query)) = wrong_field.query.as_mut() else {
+            unreachable!()
+        };
+        query.field = "title".to_string();
+        assert!(convert_query(&wrong_field, &schema, None, None).is_err());
+
+        for rerank_factor in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1.0,
+            MAX_DENSE_RERANK_FACTOR + 1.0,
+        ] {
+            let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);
+            let Some(ProtoQueryType::DenseVector(query)) = proto.query.as_mut() else {
+                unreachable!()
+            };
+            query.rerank_factor = rerank_factor;
+            assert!(
+                convert_query(&proto, &schema, None, None).is_err(),
+                "rerank_factor {rerank_factor} should be rejected"
+            );
+        }
+
+        let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);
+        let Some(ProtoQueryType::DenseVector(query)) = proto.query.as_mut() else {
+            unreachable!()
+        };
+        query.nprobe = MAX_DENSE_NPROBE as u32 + 1;
+        assert!(convert_query(&proto, &schema, None, None).is_err());
+    }
+
+    #[test]
+    fn prefix_query_rejects_empty_prefixes() {
+        let schema = dense_test_schema(17);
+        let match_all_prefix = proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: "title".to_string(),
+                text: "*".to_string(),
+            })),
+        };
+        let explicit_empty_prefix = proto::Query {
+            query: Some(ProtoQueryType::Prefix(proto::PrefixQuery {
+                field: "title".to_string(),
+                prefix: String::new(),
+            })),
+        };
+
+        assert!(convert_query(&match_all_prefix, &schema, None, None).is_err());
+        assert!(convert_query(&explicit_empty_prefix, &schema, None, None).is_err());
+    }
+
+    #[test]
+    fn binary_query_and_document_require_exact_schema_width() {
+        let schema = vector_test_schema();
+        let query = |field: &str, vector: Vec<u8>| proto::Query {
+            query: Some(ProtoQueryType::BinaryDenseVector(
+                proto::BinaryDenseVectorQuery {
+                    field: field.to_string(),
+                    vector,
+                    ..Default::default()
+                },
+            )),
+        };
+
+        assert!(convert_query(&query("binary", vec![0, 1]), &schema, None, None).is_ok());
+        assert!(convert_query(&query("binary", vec![0]), &schema, None, None).is_err());
+        assert!(convert_query(&query("title", vec![0, 1]), &schema, None, None).is_err());
+
+        let bad_document = [proto::FieldEntry {
+            name: "binary".to_string(),
+            value: Some(proto::FieldValue {
+                value: Some(Value::BinaryDenseVector(vec![0])),
+            }),
+        }];
+        assert!(convert_proto_to_document(&bad_document, &schema).is_err());
+    }
+
+    #[test]
+    fn sparse_query_rejects_malformed_arrays_and_parameters() {
+        let schema = vector_test_schema();
+        let query = |field: &str, indices: Vec<u32>, values: Vec<f32>| proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: field.to_string(),
+                indices,
+                values,
+                ..Default::default()
+            })),
+        };
+
+        assert!(convert_query(&query("sparse", vec![1], vec![1.0]), &schema, None, None).is_ok());
+        assert!(
+            convert_query(&query("sparse", vec![1, 2], vec![1.0]), &schema, None, None).is_err()
+        );
+        assert!(
+            convert_query(
+                &query("sparse", vec![1], vec![f32::NAN]),
+                &schema,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(convert_query(&query("title", vec![1], vec![1.0]), &schema, None, None).is_err());
+
+        let mut invalid_factor = query("sparse", vec![1], vec![1.0]);
+        let Some(ProtoQueryType::SparseVector(query)) = invalid_factor.query.as_mut() else {
+            unreachable!()
+        };
+        query.heap_factor = f32::INFINITY;
+        assert!(convert_query(&invalid_factor, &schema, None, None).is_err());
+    }
+
+    #[test]
+    fn reranker_rejects_invalid_rrf_and_matryoshka_dimensions() {
+        let schema = dense_test_schema(17);
+        let base = proto::Reranker {
+            field: "embedding".to_string(),
+            vector: vec![1.0, 2.0, 3.0],
+            ..Default::default()
+        };
+
+        for rrf_k in [f32::NAN, f32::INFINITY, -1.0] {
+            let mut reranker = base.clone();
+            reranker.rrf_k = rrf_k;
+            assert!(convert_reranker(&reranker, &schema).is_err());
+        }
+
+        let mut too_wide = base;
+        too_wide.matryoshka_dims = 4;
+        assert!(convert_reranker(&too_wide, &schema).is_err());
+    }
 
     #[test]
     fn test_schema_to_sdl_roundtrip() {

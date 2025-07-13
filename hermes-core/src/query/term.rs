@@ -103,7 +103,7 @@ fn compute_term_idf(
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
     ($field:expr, $term:expr, $global_stats:expr, $reader:expr,
-     $get_postings_fn:ident, $get_positions_fn:ident
+     $load_positions:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
@@ -127,8 +127,11 @@ macro_rules! term_plan {
                 let (idf, avg_field_len) =
                     compute_term_idf(&posting_list, field, reader, global_stats, term);
 
-                let positions = reader.$get_positions_fn(field, term)
-                    $(. $aw)* .ok().flatten();
+                let positions = if $load_positions {
+                    reader.$get_positions_fn(field, term) $(. $aw)* ?
+                } else {
+                    None
+                };
 
                 let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0);
                 if let Some(pos) = positions {
@@ -149,16 +152,27 @@ macro_rules! term_plan {
 }
 
 impl Query for TermQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        _limit: usize,
+        options: super::ScorerOptions,
+    ) -> ScorerFuture<'a> {
         let field = self.field;
         let term = self.term.clone();
         let global_stats = self.global_stats.clone();
+        let load_positions = options.collect_positions;
         Box::pin(async move {
             term_plan!(
                 field,
                 &term,
                 global_stats.as_ref(),
                 reader,
+                load_positions,
                 get_postings,
                 get_positions,
                 await
@@ -181,13 +195,24 @@ impl Query for TermQuery {
     fn scorer_sync<'a>(
         &self,
         reader: &'a SegmentReader,
+        limit: usize,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        self.scorer_sync_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
         _limit: usize,
+        options: super::ScorerOptions,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         term_plan!(
             self.field,
             &self.term,
             self.global_stats.as_ref(),
             reader,
+            options.collect_positions,
             get_postings_sync,
             get_positions_sync
         )

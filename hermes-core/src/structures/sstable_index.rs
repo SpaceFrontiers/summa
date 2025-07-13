@@ -71,7 +71,9 @@ impl BlockAddrStore {
             deltas.push(delta);
             max_delta = max_delta.max(delta);
             max_length = max_length.max(addr.length);
-            prev_end = addr.offset + addr.length as u64;
+            prev_end = addr.offset.checked_add(addr.length as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "block address overflow")
+            })?;
         }
 
         // Compute bit widths
@@ -88,7 +90,9 @@ impl BlockAddrStore {
 
         // Calculate packed size
         let bits_per_entry = offset_bits as usize + length_bits as usize;
-        let total_bits = bits_per_entry * addrs.len();
+        let total_bits = bits_per_entry.checked_mul(addrs.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "block address table too large")
+        })?;
         let packed_bytes = total_bits.div_ceil(8);
 
         let mut buf = Vec::with_capacity(6 + packed_bytes);
@@ -121,23 +125,57 @@ impl BlockAddrStore {
         let offset_bits = reader.read_u8()?;
         let length_bits = reader.read_u8()?;
 
+        if offset_bits > 64 || length_bits > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid block address bit width",
+            ));
+        }
+        if num_blocks > 0 && (offset_bits == 0 || length_bits == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-empty block address table has a zero bit width",
+            ));
+        }
+
+        let bits_per_entry = offset_bits as usize + length_bits as usize;
+        let total_bits = bits_per_entry
+            .checked_mul(num_blocks as usize)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block address table overflow")
+            })?;
+        let packed_len = total_bits.checked_add(7).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "block address table overflow")
+        })? / 8;
+        if packed_len > data.len() - 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "block address table truncated",
+            ));
+        }
+
         // Eagerly decode all block addresses once at load time
-        let packed_data = &data.as_slice()[6..];
+        let packed_data = &data.as_slice()[6..6 + packed_len];
         let mut bit_reader = BitReader::new(packed_data);
-        let mut addrs = Vec::with_capacity(num_blocks as usize);
+        let mut addrs = Vec::new();
+        addrs.try_reserve_exact(num_blocks as usize).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "block address table too large")
+        })?;
         let mut current_offset: u64 = 0;
 
         for _ in 0..num_blocks {
-            if let (Ok(delta), Ok(length)) =
-                (bit_reader.read(offset_bits), bit_reader.read(length_bits))
-            {
-                current_offset += delta;
-                addrs.push(BlockAddr {
-                    offset: current_offset,
-                    length: length as u32,
-                });
-                current_offset += length;
-            }
+            let delta = bit_reader.read(offset_bits)?;
+            let length = bit_reader.read(length_bits)?;
+            let offset = current_offset.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block address offset overflow")
+            })?;
+            let length = u32::try_from(length).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "block length exceeds u32")
+            })?;
+            current_offset = offset.checked_add(length as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block address end overflow")
+            })?;
+            addrs.push(BlockAddr { offset, length });
         }
 
         Ok(Self {
@@ -221,19 +259,41 @@ impl FstBlockIndex {
 
         let fst_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
-        if data.len() < 4 + fst_len {
+        let fst_end = 4usize.checked_add(fst_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "FstBlockIndex length overflow")
+        })?;
+        if data.len() < fst_end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "FstBlockIndex FST data truncated",
             ));
         }
 
-        let fst_data = data.slice(4..4 + fst_len);
-        let addr_data = data.slice(4 + fst_len..data.len());
+        let fst_data = data.slice(4..fst_end);
+        let addr_data = data.slice(fst_end..data.len());
 
         let fst =
             fst::Map::new(fst_data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let block_addrs = BlockAddrStore::load(addr_data)?;
+
+        if fst.len() != block_addrs.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FST key count does not match block address count",
+            ));
+        }
+        use fst::Streamer;
+        let mut entries = fst.stream();
+        let mut expected_ordinal = 0u64;
+        while let Some((_key, ordinal)) = entries.next() {
+            if ordinal != expected_ordinal {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FST block ordinals are not contiguous",
+                ));
+            }
+            expected_ordinal += 1;
+        }
 
         Ok(Self { fst, block_addrs })
     }
@@ -374,7 +434,7 @@ impl MmapBlockIndex {
 
     /// Load from raw bytes
     pub fn load(data: OwnedBytes) -> io::Result<Self> {
-        if data.len() < 4 {
+        if data.len() < 16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "MmapBlockIndex data too short",
@@ -388,11 +448,29 @@ impl MmapBlockIndex {
         let remaining = data.slice(addr_data_start..data.len());
         let block_addrs = BlockAddrStore::load(remaining.clone())?;
 
+        if block_addrs.len() != num_blocks as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "block address count does not match key count",
+            ));
+        }
+
         // Calculate where keys start
         let bits_per_entry = block_addrs.offset_bits as usize + block_addrs.length_bits as usize;
-        let total_bits = bits_per_entry * num_blocks as usize;
-        let addr_packed_size = total_bits.div_ceil(8);
-        let keys_offset = addr_data_start + 6 + addr_packed_size; // 6 = header of BlockAddrStore
+        let total_bits = bits_per_entry
+            .checked_mul(num_blocks as usize)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block index size overflow")
+            })?;
+        let addr_packed_size = total_bits.checked_add(7).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "block index size overflow")
+        })? / 8;
+        let keys_offset = addr_data_start
+            .checked_add(6)
+            .and_then(|v| v.checked_add(addr_packed_size))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block index offset overflow")
+            })?; // 6 = header of BlockAddrStore
 
         // Read footer (last 6 bytes: restart_count u32 + restart_interval u16)
         if data.len() < keys_offset + 6 {
@@ -411,11 +489,100 @@ impl MmapBlockIndex {
         let restart_interval =
             u16::from_le_bytes([data[footer_start + 4], data[footer_start + 5]]) as usize;
 
+        if restart_interval == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "block index restart interval is zero",
+            ));
+        }
+
+        let expected_restart_count = (num_blocks as usize).div_ceil(restart_interval);
+        if restart_count != expected_restart_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "block index restart count is inconsistent",
+            ));
+        }
+
         // Restart offsets array: restart_count × 4 bytes, just before footer
-        let restart_array_offset = footer_start - restart_count * 4;
+        let restart_bytes = restart_count.checked_mul(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "restart table size overflow")
+        })?;
+        let restart_array_offset = footer_start.checked_sub(restart_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "restart table out of bounds")
+        })?;
+        if restart_array_offset < keys_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "restart table overlaps block keys",
+            ));
+        }
 
         // Keys section spans from keys_offset to restart_array_offset
         let keys_end = restart_array_offset;
+
+        // Validate the complete prefix-compressed key stream and all restart
+        // offsets once so the hot lookup path can remain allocation-light and
+        // infallible without trusting corrupt on-disk lengths.
+        let keys_data = &data.as_slice()[keys_offset..keys_end];
+        let mut reader = keys_data;
+        let mut current_key = Vec::new();
+        let mut previous_key: Option<Vec<u8>> = None;
+        for ordinal in 0..num_blocks as usize {
+            let entry_offset = keys_data.len() - reader.len();
+            if ordinal % restart_interval == 0 {
+                let restart_idx = ordinal / restart_interval;
+                let pos = restart_array_offset + restart_idx * 4;
+                let recorded =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                if recorded != entry_offset {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "block index restart offset is inconsistent",
+                    ));
+                }
+            }
+
+            let prefix_len = usize::try_from(read_vint(&mut reader)?).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "block key prefix is too large")
+            })?;
+            let suffix_len = usize::try_from(read_vint(&mut reader)?).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "block key suffix is too large")
+            })?;
+            if ordinal % restart_interval == 0 && prefix_len != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block index restart key uses a prefix",
+                ));
+            }
+            if prefix_len > current_key.len() || suffix_len > reader.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "block index key is truncated",
+                ));
+            }
+            current_key.truncate(prefix_len);
+            current_key.extend_from_slice(&reader[..suffix_len]);
+            reader = &reader[suffix_len..];
+
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| previous.as_slice() >= current_key.as_slice())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block index keys are not strictly increasing",
+                ));
+            }
+            previous_key = Some(current_key.clone());
+        }
+        if !reader.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "block index contains trailing key data",
+            ));
+        }
 
         Ok(Self {
             data,
@@ -815,6 +982,27 @@ mod tests {
         let store = BlockAddrStore::load(OwnedBytes::new(bytes)).unwrap();
         assert_eq!(store.len(), 0);
         assert!(store.get(0).is_none());
+    }
+
+    #[test]
+    fn test_block_addr_store_rejects_truncated_packed_data() {
+        let bytes = vec![1, 0, 0, 0, 1, 1];
+        assert!(BlockAddrStore::load(OwnedBytes::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn test_mmap_index_rejects_restart_table_underflow() {
+        let entries = vec![(
+            b"key".to_vec(),
+            BlockAddr {
+                offset: 0,
+                length: 1,
+            },
+        )];
+        let mut bytes = MmapBlockIndex::build(&entries).unwrap();
+        let footer = bytes.len() - 6;
+        bytes[footer..footer + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(MmapBlockIndex::load(OwnedBytes::new(bytes)).is_err());
     }
 
     #[test]

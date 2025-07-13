@@ -14,6 +14,7 @@ use crate::dsl::Schema;
 use crate::error::Result;
 
 use super::Searcher;
+use super::searcher::SearcherResources;
 
 /// IndexReader - manages Searcher with reload policy
 ///
@@ -43,8 +44,8 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Current searcher + segment IDs (ArcSwap for wait-free reads)
     state: ArcSwap<SearcherState<D>>,
-    /// Term cache blocks
-    term_cache_blocks: usize,
+    /// Cache and CPU policy preserved across every searcher reload.
+    resources: SearcherResources,
     /// Last reload check time
     last_reload_check: RwLock<std::time::Instant>,
     /// Reload check interval (default 1 second)
@@ -64,10 +65,50 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         term_cache_blocks: usize,
         reload_interval_ms: u64,
     ) -> Result<Self> {
+        Self::from_segment_manager_with_cache_blocks(
+            schema,
+            segment_manager,
+            term_cache_blocks,
+            term_cache_blocks,
+            reload_interval_ms,
+        )
+        .await
+    }
+
+    /// Create an IndexReader with independent term and document-store caches.
+    pub async fn from_segment_manager_with_cache_blocks(
+        schema: Arc<Schema>,
+        segment_manager: Arc<crate::merge::SegmentManager<D>>,
+        term_cache_blocks: usize,
+        store_cache_blocks: usize,
+        reload_interval_ms: u64,
+    ) -> Result<Self> {
+        let resources = SearcherResources::new(
+            term_cache_blocks,
+            store_cache_blocks,
+            crate::default_search_threads(),
+        )?;
+        Self::from_segment_manager_with_resources(
+            schema,
+            segment_manager,
+            reload_interval_ms,
+            resources,
+        )
+        .await
+    }
+
+    /// Internal constructor used by `Index` to preserve its configured cache
+    /// and search CPU policy across reader reloads.
+    pub(crate) async fn from_segment_manager_with_resources(
+        schema: Arc<Schema>,
+        segment_manager: Arc<crate::merge::SegmentManager<D>>,
+        reload_interval_ms: u64,
+        resources: SearcherResources,
+    ) -> Result<Self> {
         // Get initial segment IDs
         let initial_segment_ids = segment_manager.get_segment_ids().await;
 
-        let reader = Self::create_reader(&schema, &segment_manager, term_cache_blocks).await?;
+        let reader = Self::create_reader(&schema, &segment_manager, resources.clone()).await?;
 
         Ok(Self {
             schema,
@@ -76,7 +117,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
                 searcher: Arc::new(reader),
                 segment_ids: initial_segment_ids,
             }),
-            term_cache_blocks,
+            resources,
             last_reload_check: RwLock::new(std::time::Instant::now()),
             reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
             reloading: AtomicBool::new(false),
@@ -89,7 +130,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     async fn create_reader(
         schema: &Arc<Schema>,
         segment_manager: &Arc<crate::merge::SegmentManager<D>>,
-        term_cache_blocks: usize,
+        resources: SearcherResources,
     ) -> Result<Searcher<D>> {
         // Read trained centroids from ArcSwap (lock-free)
         let trained = segment_manager.trained();
@@ -106,7 +147,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             Arc::clone(schema),
             snapshot,
             trained_centroids,
-            term_cache_blocks,
+            resources,
         )
         .await
     }
@@ -231,7 +272,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             Arc::clone(&self.schema),
             snapshot,
             trained_centroids,
-            self.term_cache_blocks,
+            self.resources.clone(),
             &existing_segments,
         )
         .await?;

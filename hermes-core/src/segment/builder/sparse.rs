@@ -17,7 +17,7 @@ use crate::Result;
 use crate::dsl::{Field, Schema};
 use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
 use crate::structures::{
-    BlockSparsePostingList, SparseFormat, SparseSkipEntry, WeightQuantization, optimal_partition,
+    BlockSparsePostingList, SparseFormat, SparseSkipEntry, WeightQuantization,
 };
 
 use crate::DocId;
@@ -155,10 +155,12 @@ pub(super) fn build_sparse_streaming(
                 }
             }
             SparseFormat::MaxScore => {
+                let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
                 build_maxscore_field(
                     builder,
                     field_id,
                     quantization,
+                    block_size,
                     pruning_fraction,
                     weight_threshold,
                     min_terms,
@@ -197,6 +199,7 @@ fn build_maxscore_field(
     builder: &mut SparseVectorBuilder,
     field_id: u32,
     quantization: WeightQuantization,
+    block_size: usize,
     pruning_fraction: Option<f32>,
     weight_threshold: f32,
     min_terms: usize,
@@ -243,12 +246,14 @@ fn build_maxscore_field(
             postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
         }
 
-        let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
-        let partition = optimal_partition(&weights);
-        let block_list = BlockSparsePostingList::from_postings_with_partition(
+        // Honor the field's configured block size. The old unconstrained
+        // block-error DP always preferred the smallest (16-entry) blocks,
+        // multiplying skip metadata and decode overhead while effectively
+        // ignoring this setting.
+        let block_list = BlockSparsePostingList::from_postings_with_block_size(
             &postings,
             quantization,
-            &partition,
+            block_size,
         )
         .map_err(crate::Error::Io)?;
 
