@@ -8,7 +8,7 @@ use burn_nn::{Dropout, DropoutConfig, Linear, LinearConfig};
 
 use crate::mal::{Activation, BlockDef, ModelDef};
 
-use super::matmul::linear;
+use super::matmul::{linear, prepare_linear_for_inference};
 
 #[derive(Module, Debug)]
 pub struct FeedForward {
@@ -67,5 +67,10 @@ impl FeedForward {
             act(projected)
         };
         linear(&self.down_proj, self.dropout.forward(hidden))
+    }
+
+    pub(crate) fn prepare_inference(&mut self) {
+        prepare_linear_for_inference(&mut self.in_proj);
+        prepare_linear_for_inference(&mut self.down_proj);
     }
 }

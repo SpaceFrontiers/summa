@@ -21,7 +21,7 @@ use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy
 use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "training-fusion")]
 use super::matmul::{matmul_4, matmul_input};
 
 /// Backend capability used by full-sequence Transformer attention.
@@ -216,7 +216,7 @@ where
 /// Recompute attention a block of query rows at a time. Each block uses the
 /// backend's accelerated matmuls while memory remains linear in sequence
 /// length for a fixed block size.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "training-fusion")]
 pub(super) fn chunked_attention_backward<B: AttentionBackend>(
     query: FloatTensor<B>,
     key: FloatTensor<B>,
@@ -528,7 +528,53 @@ mod tests {
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     #[test]
-    fn cuda_attention_matches_cpu_reference_for_causal_gqa() {
+    fn cuda_attention_forward_matches_cpu_reference_for_causal_gqa() {
+        let cpu_device = Device::ndarray();
+        let cuda_device = Device::cuda(0);
+        let (batch, query_heads, kv_heads, sequence, head_dim) = (1, 4, 2, 64, 64);
+        let query_data = values(batch * query_heads * sequence * head_dim, 0.071);
+        let key_data = values(batch * kv_heads * sequence * head_dim, 0.097);
+        let value_data = values(batch * kv_heads * sequence * head_dim, 0.113);
+        let expected = attention_probabilities(
+            Tensor::<4>::from_data(
+                TensorData::new(query_data.clone(), [batch, query_heads, sequence, head_dim]),
+                &cpu_device,
+            ),
+            Tensor::<4>::from_data(
+                TensorData::new(key_data.clone(), [batch, kv_heads, sequence, head_dim]),
+                &cpu_device,
+            ),
+            true,
+        )
+        .matmul(repeat_kv(
+            Tensor::<4>::from_data(
+                TensorData::new(value_data.clone(), [batch, kv_heads, sequence, head_dim]),
+                &cpu_device,
+            ),
+            query_heads,
+        ));
+        let actual = fused_attention(
+            Tensor::<4>::from_data(
+                TensorData::new(query_data, [batch, query_heads, sequence, head_dim]),
+                &cuda_device,
+            ),
+            Tensor::<4>::from_data(
+                TensorData::new(key_data, [batch, kv_heads, sequence, head_dim]),
+                &cuda_device,
+            ),
+            Tensor::<4>::from_data(
+                TensorData::new(value_data, [batch, kv_heads, sequence, head_dim]),
+                &cuda_device,
+            ),
+            true,
+        );
+        let difference = max_diff(snapshot(expected), snapshot(actual));
+        assert!(difference < 0.01, "output max diff: {difference}");
+    }
+
+    #[cfg(all(feature = "training-fusion", target_os = "linux"))]
+    #[test]
+    fn cuda_attention_backward_matches_cpu_reference_for_causal_gqa() {
         let cpu_device = Device::ndarray().autodiff();
         let cuda_device = Device::cuda(0).autodiff();
         let (batch, query_heads, kv_heads, sequence, head_dim) = (1, 4, 2, 64, 64);

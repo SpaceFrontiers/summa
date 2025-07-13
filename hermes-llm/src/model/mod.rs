@@ -10,7 +10,7 @@ mod cube_attention;
 mod cube_tensor;
 mod ffn;
 mod fused_attention;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "training-fusion")]
 mod fusion;
 mod linear_cross_entropy;
 mod mamba;
@@ -69,7 +69,24 @@ mod tests {
     use burn_nn::RotaryEncodingConfig;
 
     use super::*;
-    use crate::mal::{NormType, PositionEncoding, get_builtin_model};
+    use crate::mal::{ModelDef, NormType, PositionEncoding, get_builtin_model};
+
+    fn hybrid_test_config() -> ModelDef {
+        let mut config = get_builtin_model("hybrid-tiny").unwrap();
+        config.vocab_size = 32;
+        config.hidden_size = 8;
+        config.num_layers = 3;
+        config.max_seq_len = 16;
+        if let Some(pattern) = config.pattern.as_mut() {
+            for block in pattern {
+                block.ffn.hidden_dim = Some(16);
+                block.attention.num_heads = Some(2);
+                block.attention.num_kv_heads = Some(1);
+                block.attention.head_dim = Some(4);
+            }
+        }
+        config
+    }
 
     fn max_abs_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
         let a = a.into_data().convert::<f32>().to_vec::<f32>().unwrap();
@@ -186,19 +203,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_transformer_stateful_matches_stateless() {
-        let mut config = get_builtin_model("hybrid-tiny").unwrap();
-        config.vocab_size = 32;
-        config.hidden_size = 8;
-        config.num_layers = 3;
-        config.max_seq_len = 16;
-        if let Some(pattern) = config.pattern.as_mut() {
-            for block in pattern {
-                block.ffn.hidden_dim = Some(16);
-                block.attention.num_heads = Some(2);
-                block.attention.num_kv_heads = Some(1);
-                block.attention.head_dim = Some(4);
-            }
-        }
+        let config = hybrid_test_config();
         let device = Device::ndarray();
         device.seed(19);
         let model = Transformer::new(&config, &device).unwrap();
@@ -221,6 +226,31 @@ mod tests {
         assert!(max_abs_diff(prefill, full.clone().slice([0..1, 0..4, 0..32])) < 1e-4);
         assert!(max_abs_diff(decode, full.slice([0..1, 4..6, 0..32])) < 1e-4);
         assert_eq!(state.pos(), 6);
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn test_cuda_prepared_inference_matches_ephemeral_weight_casts() {
+        let config = hybrid_test_config();
+        let device = default_device();
+        device.seed(29);
+        let mut model = Transformer::new(&config, &device).unwrap();
+        let input = Tensor::<2, Int>::from_data(
+            TensorData::new(vec![1_i64, 7, 3, 9, 2, 5], [1, 6]),
+            &device,
+        );
+        let before = model.forward(input.clone(), 0).into_data();
+        model.prepare_inference();
+        let after = model.forward(input, 0).into_data();
+        let difference = before
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .zip(after.convert::<f32>().to_vec::<f32>().unwrap())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0, f32::max);
+        assert!(difference < 1e-3, "maximum logit difference: {difference}");
     }
 
     #[test]

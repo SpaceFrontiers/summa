@@ -10,7 +10,7 @@ use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
 use crate::mal::{BlockDef, ModelDef, PositionEncoding};
 
 use super::linear_cross_entropy::linear_cross_entropy;
-use super::matmul::matmul_2;
+use super::matmul::{matmul_2, matmul_input, prepare_linear_for_inference};
 use super::{InferenceState, Norm, TransformerBlock};
 
 const EMBEDDING_STD: f64 = 0.02;
@@ -26,6 +26,9 @@ pub struct Transformer {
     lm_head: Option<Linear>,
     /// Output bias when the embedding matrix is reused as the output matrix.
     tied_output_bias: Option<Param<Tensor<1>>>,
+    /// Mixed-precision view of tied output weights, prepared once for decoding.
+    #[module(skip)]
+    inference_output_weight: Option<Tensor<2>>,
     rope: RotaryEncoding,
     #[module(skip)]
     embedding_scale: Option<f64>,
@@ -169,6 +172,7 @@ impl Transformer {
             final_norm,
             lm_head,
             tied_output_bias,
+            inference_output_weight: None,
             rope,
             embedding_scale: config.embeddings.scale,
             config: config.clone(),
@@ -255,9 +259,30 @@ impl Transformer {
                 head.bias.as_ref().map(Param::val),
             ),
             None => (
-                self.embedding.weight.val(),
+                self.inference_output_weight
+                    .clone()
+                    .unwrap_or_else(|| self.embedding.weight.val()),
                 self.tied_output_bias.as_ref().map(Param::val),
             ),
+        }
+    }
+
+    /// Prepare immutable mixed-precision weights once for low-latency decode.
+    ///
+    /// Call this after loading a checkpoint and before creating inference
+    /// state. Training never calls it, so optimizer parameters remain F32.
+    pub fn prepare_inference(&mut self) {
+        assert!(
+            !self.embedding.weight.val().device().is_autodiff(),
+            "inference preparation requires a non-autodiff model"
+        );
+        for layer in &mut self.layers {
+            layer.prepare_inference();
+        }
+        if let Some(head) = &mut self.lm_head {
+            prepare_linear_for_inference(head);
+        } else {
+            self.inference_output_weight = Some(matmul_input(self.embedding.weight.val()));
         }
     }
 
