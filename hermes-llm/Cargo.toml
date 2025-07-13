@@ -24,7 +24,9 @@ burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23
     "std",
 ] }
 burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std"] }
-cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "0a62060a2c7a66c94f717d7cac0be0dc259bb607", optional = true, default-features = false, features = ["std"] }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std"] }
+burn-ir = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std"] }
+cubecl = { git = "https://github.com/ppodolsky/cubecl.git", rev = "73bd0ea3054c5c9fc33b3fb3fd60320a90af6021", optional = true, default-features = false, features = ["std"] }
 cubek = { git = "https://github.com/ppodolsky/cubek", rev = "058827ffef7231d48901983cbc1121f897ced752", optional = true, default-features = false, features = ["attention", "stdlib"] }
 
 # Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
@@ -60,7 +62,7 @@ default = ["remote"]
 # Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
 remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
 metal = ["burn/metal", "burn/autotune", "dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl"]
-cuda = ["burn/cuda", "burn/autotune", "dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cubek"]
+cuda = ["burn/cuda", "burn/autotune", "burn/fusion", "dep:burn-cuda", "dep:burn-cubecl", "dep:burn-fusion", "dep:burn-ir", "dep:cubecl", "dep:cubek"]
 
 [[bin]]
 name = "hermes-llm"

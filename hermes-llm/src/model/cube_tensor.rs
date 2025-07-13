@@ -1,7 +1,5 @@
 //! Allocation helpers for custom CubeCL operators.
 
-#[cfg(feature = "cuda")]
-use burn::tensor::DType;
 use burn::tensor::Shape;
 use burn_cubecl::CubeRuntime;
 use burn_cubecl::tensor::CubeTensor;
@@ -16,20 +14,6 @@ pub(super) fn empty_like<R: CubeRuntime>(tensor: &CubeTensor<R>, shape: Shape) -
         tensor.device.clone(),
         shape,
         tensor.dtype,
-    )
-}
-
-#[cfg(feature = "cuda")]
-pub(super) fn empty_dtype_like<R: CubeRuntime>(
-    tensor: &CubeTensor<R>,
-    shape: Shape,
-    dtype: DType,
-) -> CubeTensor<R> {
-    burn_cubecl::ops::numeric::empty_device_contiguous_dtype(
-        tensor.client.clone(),
-        tensor.device.clone(),
-        shape,
-        dtype,
     )
 }
 

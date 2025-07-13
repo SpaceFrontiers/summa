@@ -14,7 +14,7 @@ use super::matmul::matmul_2;
 use super::{InferenceState, Norm, TransformerBlock};
 
 const EMBEDDING_STD: f64 = 0.02;
-const LOSS_CHUNK_TOKENS: usize = 512;
+const LOSS_CHUNKS: usize = 4;
 
 #[derive(Module, Debug)]
 pub struct Transformer {
@@ -207,16 +207,17 @@ impl Transformer {
     /// so full-vocabulary logits are never retained for every input token.
     pub fn forward_loss(&self, input_ids: Tensor<2, Int>, targets: Tensor<2, Int>) -> Tensor<1> {
         let [batch, seq_len] = targets.dims();
+        let tokens = batch * seq_len;
         let hidden = self
             .forward_hidden(input_ids, 0)
-            .reshape([batch * seq_len, self.config.hidden_size]);
+            .reshape([tokens, self.config.hidden_size]);
         let (weight, bias) = self.output_parameters();
         linear_cross_entropy(
             hidden,
             weight,
             bias,
-            targets.reshape([batch * seq_len]),
-            LOSS_CHUNK_TOKENS,
+            targets.reshape([tokens]),
+            tokens.div_ceil(LOSS_CHUNKS),
         )
     }
 

@@ -10,6 +10,8 @@ mod cube_attention;
 mod cube_tensor;
 mod ffn;
 mod fused_attention;
+#[cfg(feature = "cuda")]
+mod fusion;
 mod linear_cross_entropy;
 mod mamba;
 mod matmul;

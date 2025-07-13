@@ -24,20 +24,6 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 #[cfg(feature = "cuda")]
 use super::matmul::{matmul_4, matmul_input};
 
-#[cfg(feature = "cuda")]
-struct CachedCausalMask {
-    device: Device,
-    sequence: usize,
-    mask: Tensor<4, Bool>,
-}
-
-#[cfg(feature = "cuda")]
-std::thread_local! {
-    static CAUSAL_MASK_CACHE: std::cell::RefCell<Option<CachedCausalMask>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
 /// Backend capability used by full-sequence Transformer attention.
 #[cfg_attr(feature = "cuda", backend_extension(Cuda, Autodiff))]
 #[cfg_attr(
@@ -61,7 +47,6 @@ pub trait AttentionBackend: Backend {
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
-        FloatTensor<Self>,
     );
 
     #[allow(clippy::too_many_arguments, unused_variables)]
@@ -70,11 +55,15 @@ pub trait AttentionBackend: Backend {
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
         output: FloatTensor<Self>,
-        _stats: FloatTensor<Self>,
         grad_output: FloatTensor<Self>,
         causal: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         panic!("custom attention only supports first-order autodiff")
+    }
+
+    #[allow(unused_variables)]
+    fn attention_causal_mask(scores: FloatTensor<Self>, row_offset: usize) -> FloatTensor<Self> {
+        panic!("custom causal masking is only available on CUDA")
     }
 }
 
@@ -135,26 +124,6 @@ fn causal_mask(sequence: usize, device: &Device) -> Tensor<4, Bool> {
         .reshape([1, 1, sequence, sequence])
 }
 
-#[cfg(feature = "cuda")]
-fn cached_causal_mask(sequence: usize, device: &Device) -> Tensor<4, Bool> {
-    CAUSAL_MASK_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(cached) = cache.as_ref()
-            && cached.sequence == sequence
-            && cached.device == *device
-        {
-            return cached.mask.clone();
-        }
-        let mask = causal_mask(sequence, device);
-        *cache = Some(CachedCausalMask {
-            device: device.clone(),
-            sequence,
-            mask: mask.clone(),
-        });
-        mask
-    })
-}
-
 fn attention_probabilities(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Tensor<4> {
     let [_, query_heads, sequence, head_dim] = query.dims();
     let key = repeat_kv(key, query_heads);
@@ -180,7 +149,6 @@ fn reference_attention<B: Backend>(
     FloatTensor<B>,
     FloatTensor<B>,
     FloatTensor<B>,
-    FloatTensor<B>,
 )
 where
     DispatchTensor: DispatchKindConversion<B>,
@@ -191,25 +159,13 @@ where
     let query = Tensor::<4>::from_primitive::<B>(query);
     let key = Tensor::<4>::from_primitive::<B>(key);
     let value = Tensor::<4>::from_primitive::<B>(value);
-    let [batch, query_heads, sequence, _] = query.dims();
+    let [_, query_heads, _, _] = query.dims();
     let probabilities = attention_probabilities(query, key, causal);
     let output = probabilities.matmul(repeat_kv(value, query_heads));
-    let stats = Tensor::<4>::zeros([batch, query_heads, sequence, 1], &output.device());
     let output = output
         .try_into_primitive::<B>()
         .expect("attention output stayed on its input backend");
-    (
-        output.clone(),
-        // The reference backward recomputes softmax. CUDA replaces this with
-        // per-row log-sum-exp statistics.
-        stats
-            .try_into_primitive::<B>()
-            .expect("attention stats stayed on its input backend"),
-        saved_query,
-        saved_key,
-        saved_value,
-        output,
-    )
+    (output.clone(), saved_query, saved_key, saved_value, output)
 }
 
 fn reference_attention_backward<B: Backend>(
@@ -261,7 +217,7 @@ where
 /// backend's accelerated matmuls while memory remains linear in sequence
 /// length for a fixed block size.
 #[cfg(feature = "cuda")]
-pub(super) fn chunked_attention_backward<B: Backend>(
+pub(super) fn chunked_attention_backward<B: AttentionBackend>(
     query: FloatTensor<B>,
     key: FloatTensor<B>,
     value: FloatTensor<B>,
@@ -283,15 +239,13 @@ where
     assert_eq!(value.dims(), [batch, heads, sequence, head_dim]);
     assert!(chunk_size > 0);
 
-    let device = query.device();
     let key_transposed = matmul_input(key.clone().transpose());
     let value_transposed = matmul_input(value.clone().transpose());
     let grad_output_compute = matmul_input(grad_output.clone());
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let causal_mask = causal.then(|| cached_causal_mask(sequence, &device));
     let mut query_gradients = Vec::with_capacity(sequence.div_ceil(chunk_size));
-    let mut key_gradient = Tensor::zeros([batch, heads, sequence, head_dim], &device);
-    let mut value_gradient = Tensor::zeros([batch, heads, sequence, head_dim], &device);
+    let mut key_gradient = None;
+    let mut value_gradient = None;
 
     for start in (0..sequence).step_by(chunk_size) {
         let end = (start + chunk_size).min(sequence);
@@ -310,23 +264,34 @@ where
                 .clone()
                 .slice([0..batch, 0..heads, start..end, 0..head_dim]);
         let mut scores = matmul_4(query_chunk.clone(), key_transposed.clone()) * scale;
-        if let Some(mask) = causal_mask.as_ref() {
-            scores = scores.mask_fill(
-                mask.clone().slice([0..1, 0..1, start..end, 0..sequence]),
-                f32::NEG_INFINITY,
-            );
+        if causal {
+            let scores_primitive = scores
+                .try_into_primitive::<B>()
+                .expect("attention scores stayed on their input backend");
+            scores = Tensor::from_primitive::<B>(B::attention_causal_mask(scores_primitive, start));
         }
         let probabilities = softmax(scores, 3);
+        let output_chunk = output_chunk.cast(grad_output_chunk.dtype());
         let correction = (grad_output_chunk.clone() * output_chunk).sum_dim(3);
         let probability_gradient =
             matmul_4(grad_output_compute_chunk.clone(), value_transposed.clone());
+        let compute_dtype = probability_gradient.dtype();
+        let probabilities = probabilities.cast(compute_dtype);
+        let correction = correction.cast(compute_dtype);
         let score_gradient = probabilities.clone() * (probability_gradient - correction) * scale;
         let score_gradient_compute = matmul_input(score_gradient);
 
         query_gradients.push(matmul_4(score_gradient_compute.clone(), key.clone()));
-        key_gradient = key_gradient + matmul_4(score_gradient_compute.transpose(), query_chunk);
-        value_gradient =
-            value_gradient + matmul_4(probabilities.transpose(), grad_output_compute_chunk);
+        let key_chunk = matmul_4(score_gradient_compute.transpose(), query_chunk);
+        key_gradient = Some(match key_gradient {
+            Some(gradient) => gradient + key_chunk,
+            None => key_chunk,
+        });
+        let value_chunk = matmul_4(probabilities.transpose(), grad_output_compute_chunk);
+        value_gradient = Some(match value_gradient {
+            Some(gradient) => gradient + value_chunk,
+            None => value_chunk,
+        });
     }
 
     (
@@ -334,9 +299,11 @@ where
             .try_into_primitive::<B>()
             .expect("query gradient stayed on its input backend"),
         key_gradient
+            .expect("attention backward requires at least one query chunk")
             .try_into_primitive::<B>()
             .expect("key gradient stayed on its input backend"),
         value_gradient
+            .expect("attention backward requires at least one query chunk")
             .try_into_primitive::<B>()
             .expect("value gradient stayed on its input backend"),
     )
@@ -356,7 +323,6 @@ macro_rules! impl_reference_attention {
                 FloatTensor<Self>,
                 FloatTensor<Self>,
                 FloatTensor<Self>,
-                FloatTensor<Self>,
             ) {
                 reference_attention::<Self>(query, key, value, causal)
             }
@@ -366,7 +332,6 @@ macro_rules! impl_reference_attention {
                 key: FloatTensor<Self>,
                 value: FloatTensor<Self>,
                 output: FloatTensor<Self>,
-                _stats: FloatTensor<Self>,
                 grad_output: FloatTensor<Self>,
                 causal: bool,
             ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
@@ -387,7 +352,6 @@ struct AttentionState<B: AttentionBackend> {
     key: FloatTensor<B>,
     value: FloatTensor<B>,
     output: FloatTensor<B>,
-    stats: FloatTensor<B>,
     causal: bool,
 }
 
@@ -411,7 +375,6 @@ impl<B: AttentionBackend> Backward<B, 3> for AttentionBackward {
             state.key,
             state.value,
             state.output,
-            state.stats,
             grad_output,
             state.causal,
         );
@@ -439,7 +402,6 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
-        FloatTensor<Self>,
     ) {
         match AttentionBackward
             .prepare::<C>([query.node.clone(), key.node.clone(), value.node.clone()])
@@ -447,7 +409,7 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let (output, stats, saved_query, saved_key, saved_value, saved_output) =
+                let (output, saved_query, saved_key, saved_value, saved_output) =
                     B::attention_inner(
                         query.primitive.clone(),
                         key.primitive.clone(),
@@ -459,12 +421,10 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
                     key: saved_key.clone(),
                     value: saved_value.clone(),
                     output: saved_output.clone(),
-                    stats: stats.clone(),
                     causal,
                 };
                 (
                     prep.finish(state, output),
-                    <Self as burn::backend::AutodiffBackend>::from_inner(stats),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_query),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_key),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_value),
@@ -472,11 +432,10 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
                 )
             }
             OpsKind::UnTracked(prep) => {
-                let (output, stats, saved_query, saved_key, saved_value, saved_output) =
+                let (output, saved_query, saved_key, saved_value, saved_output) =
                     B::attention_inner(query.primitive, key.primitive, value.primitive, causal);
                 (
                     prep.finish(output),
-                    <Self as burn::backend::AutodiffBackend>::from_inner(stats),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_query),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_key),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_value),
@@ -660,9 +619,13 @@ mod tests {
                 .into_data(),
         );
 
-        assert!(max_diff(expected.0, actual.0) < 0.01);
-        assert!(max_diff(expected.1, actual.1) < 0.02);
-        assert!(max_diff(expected.2, actual.2) < 0.02);
-        assert!(max_diff(expected.3, actual.3) < 0.02);
+        let output_diff = max_diff(expected.0, actual.0);
+        let query_diff = max_diff(expected.1, actual.1);
+        let key_diff = max_diff(expected.2, actual.2);
+        let value_diff = max_diff(expected.3, actual.3);
+        assert!(output_diff < 0.01, "output max diff: {output_diff}");
+        assert!(query_diff < 0.02, "query gradient max diff: {query_diff}");
+        assert!(key_diff < 0.02, "key gradient max diff: {key_diff}");
+        assert!(value_diff < 0.02, "value gradient max diff: {value_diff}");
     }
 }

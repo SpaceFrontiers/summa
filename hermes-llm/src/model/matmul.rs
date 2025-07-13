@@ -25,7 +25,7 @@ pub(super) fn linear<const D: usize>(layer: &Linear, input: Tensor<D>) -> Tensor
                 matmul_input(layer.weight.val()),
                 layer.bias.as_ref().map(|bias| matmul_input(bias.val())),
             )
-            .cast(FloatDType::Flex32);
+            .cast(FloatDType::F32);
         }
     }
 
@@ -38,7 +38,7 @@ pub(super) fn matmul_2(lhs: Tensor<2>, rhs: Tensor<2>) -> Tensor<2> {
         if lhs.device().supports_dtype(DType::F16) {
             return matmul_input(lhs)
                 .matmul(matmul_input(rhs))
-                .cast(FloatDType::Flex32);
+                .cast(FloatDType::F32);
         }
     }
 
@@ -50,7 +50,7 @@ pub(super) fn matmul_4(lhs: Tensor<4>, rhs: Tensor<4>) -> Tensor<4> {
     if lhs.device().supports_dtype(DType::F16) {
         return matmul_input(lhs)
             .matmul(matmul_input(rhs))
-            .cast(FloatDType::Flex32);
+            .cast(FloatDType::F32);
     }
 
     lhs.matmul(rhs)
