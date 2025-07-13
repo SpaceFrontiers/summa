@@ -358,17 +358,17 @@ mod gpu {
     }
 }
 
-#[cfg(all(test, feature = "metal"))]
+#[cfg(all(test, any(feature = "metal", feature = "cuda")))]
 mod tests {
-    use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
+    use burn::tensor::{Device, Tensor, TensorData};
 
     use super::depthwise_conv1d;
     use crate::model::test_support::{max_diff, snapshot, values};
 
     #[test]
-    fn fused_depthwise_conv1d_matches_ndarray_forward_and_backward() {
+    fn gpu_depthwise_conv1d_matches_ndarray_forward_and_backward() {
         let cpu = Device::ndarray().autodiff();
-        let gpu = Device::metal(DeviceKind::DefaultDevice).autodiff();
+        let gpu = crate::model::default_device().autodiff();
         let (batch, channels, input_len, kernel_size) = (2, 3, 7, 3);
         let output_len = input_len - kernel_size + 1;
         let input_data = values(batch * channels * input_len, 0.13, 0.0);
