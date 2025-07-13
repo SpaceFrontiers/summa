@@ -13,8 +13,27 @@
 
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::io;
 
 use crate::structures::simd::batch_hamming_scores;
+
+fn argmax_score_lowest_index(scores: &[f32]) -> usize {
+    scores
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.total_cmp(right)
+                // `max_by` keeps the greater element; reverse the index
+                // comparison so equal scores consistently prefer the lowest
+                // cluster ID, matching query-time centroid ordering.
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+const MAX_BINARY_IVF_CLUSTERS: usize = 4_096;
+const BINARY_IVF_SCORE_BATCH: usize = 8_192;
 
 fn default_max_train_samples() -> usize {
     100_000
@@ -55,6 +74,28 @@ impl BinaryIvfConfig {
     pub fn byte_len(&self) -> usize {
         self.dim_bits.div_ceil(8)
     }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.dim_bits == 0 || !self.dim_bits.is_multiple_of(8) {
+            return Err(format!(
+                "binary IVF dimension must be a positive multiple of 8, got {}",
+                self.dim_bits
+            ));
+        }
+        if !(1..=MAX_BINARY_IVF_CLUSTERS).contains(&self.num_clusters) {
+            return Err(format!(
+                "binary IVF cluster count must be in 1..={MAX_BINARY_IVF_CLUSTERS}, got {}",
+                self.num_clusters
+            ));
+        }
+        self.num_clusters
+            .checked_mul(self.byte_len())
+            .ok_or_else(|| "binary IVF centroid size overflow".to_string())?;
+        self.num_clusters
+            .checked_mul(self.dim_bits)
+            .ok_or_else(|| "binary IVF training scratch size overflow".to_string())?;
+        Ok(())
+    }
 }
 
 /// One cluster: SoA layout with contiguous packed codes for SIMD scanning.
@@ -77,6 +118,41 @@ pub struct BinaryIvfIndex {
 }
 
 impl BinaryIvfIndex {
+    fn validate(&self) -> Result<(), String> {
+        let config = &self.config;
+        config.validate()?;
+        let byte_len = config.byte_len();
+        let expected_centroids = config
+            .num_clusters
+            .checked_mul(byte_len)
+            .ok_or_else(|| "binary IVF centroid size overflow".to_string())?;
+        if self.centroids.len() != expected_centroids || self.clusters.len() != config.num_clusters
+        {
+            return Err("binary IVF centroid/cluster columns are inconsistent".to_string());
+        }
+
+        let mut total = 0usize;
+        for cluster in &self.clusters {
+            let count = cluster.doc_ids.len();
+            let expected_codes = count
+                .checked_mul(byte_len)
+                .ok_or_else(|| "binary IVF code size overflow".to_string())?;
+            if cluster.ordinals.len() != count || cluster.codes.len() != expected_codes {
+                return Err("binary IVF cluster columns are inconsistent".to_string());
+            }
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| "binary IVF vector count overflow".to_string())?;
+        }
+        if total != self.len {
+            return Err(format!(
+                "binary IVF vector count is {}, metadata says {}",
+                total, self.len
+            ));
+        }
+        Ok(())
+    }
+
     /// Train centroids via k-majority and build the index from packed vectors.
     ///
     /// `codes` is `n × byte_len` contiguous packed vectors;
@@ -85,10 +161,24 @@ impl BinaryIvfIndex {
         mut config: BinaryIvfConfig,
         codes: &[u8],
         doc_id_ordinals: &[(u32, u16)],
-    ) -> Self {
+    ) -> io::Result<Self> {
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let byte_len = config.byte_len();
         let n = doc_id_ordinals.len();
-        debug_assert_eq!(codes.len(), n * byte_len);
+        let expected_codes = n.checked_mul(byte_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "binary IVF code size overflow")
+        })?;
+        if codes.len() != expected_codes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "binary IVF needs {expected_codes} code bytes for {n} labels, got {}",
+                    codes.len()
+                ),
+            ));
+        }
 
         // Can't have more clusters than vectors
         config.num_clusters = config
@@ -157,7 +247,7 @@ impl BinaryIvfIndex {
         }
         index.len = n;
 
-        index
+        Ok(index)
     }
 
     /// Assign a packed code to its nearest centroid and append it.
@@ -182,12 +272,7 @@ impl BinaryIvfIndex {
             scores,
         );
         // batch_hamming_scores returns similarity (higher = closer)
-        scores
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        argmax_score_lowest_index(scores)
     }
 
     /// Search: probe `nprobe` nearest clusters, exact Hamming within each.
@@ -215,32 +300,40 @@ impl BinaryIvfIndex {
         let mut order: Vec<usize> = (0..self.config.num_clusters).collect();
         if nprobe < order.len() {
             order.select_nth_unstable_by(nprobe, |&a, &b| {
-                centroid_scores[b].total_cmp(&centroid_scores[a])
+                centroid_scores[b]
+                    .total_cmp(&centroid_scores[a])
+                    .then_with(|| a.cmp(&b))
             });
             order.truncate(nprobe);
         }
 
         // Scan probed clusters with exact SIMD Hamming
         let mut collector = crate::query::ScoreCollector::new(k);
-        let mut scores: Vec<f32> = Vec::new();
+        let mut scores = vec![0.0f32; BINARY_IVF_SCORE_BATCH.min(self.len)];
         for &cluster_id in &order {
             let cluster = &self.clusters[cluster_id];
             let count = cluster.doc_ids.len();
             if count == 0 {
                 continue;
             }
-            scores.resize(count, 0.0);
-            batch_hamming_scores(
-                query,
-                &cluster.codes,
-                byte_len,
-                self.config.dim_bits,
-                &mut scores[..count],
-            );
-            let threshold = collector.threshold();
-            for (i, &score) in scores.iter().enumerate().take(count) {
-                if score > threshold {
-                    collector.insert_with_ordinal(cluster.doc_ids[i], score, cluster.ordinals[i]);
+            for batch_start in (0..count).step_by(BINARY_IVF_SCORE_BATCH) {
+                let batch_count = BINARY_IVF_SCORE_BATCH.min(count - batch_start);
+                let code_start = batch_start * byte_len;
+                let code_end = (batch_start + batch_count) * byte_len;
+                batch_hamming_scores(
+                    query,
+                    &cluster.codes[code_start..code_end],
+                    byte_len,
+                    self.config.dim_bits,
+                    &mut scores[..batch_count],
+                );
+                for (batch_idx, &score) in scores.iter().enumerate().take(batch_count) {
+                    let i = batch_start + batch_idx;
+                    let doc_id = cluster.doc_ids[i];
+                    let ordinal = cluster.ordinals[i];
+                    if collector.would_enter_candidate(doc_id, score, ordinal) {
+                        collector.insert_with_ordinal(doc_id, score, ordinal);
+                    }
                 }
             }
         }
@@ -297,9 +390,11 @@ impl BinaryIvfIndex {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        bincode::serde::decode_from_slice(data, bincode::config::standard())
-            .map(|(v, _)| v)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let index: Self = crate::structures::vector::decode_ann_bincode_exact(data, "binary IVF")?;
+        index
+            .validate()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(index)
     }
 
     /// Estimated memory usage in bytes.
@@ -352,12 +447,7 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
         for (i, slot) in assignment.iter_mut().enumerate().take(n) {
             let code = vec_at(i);
             batch_hamming_scores(code, &centroids, byte_len, dim_bits, &mut scores);
-            let best = scores
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(c, _)| c as u32)
-                .unwrap_or(0);
+            let best = argmax_score_lowest_index(&scores) as u32;
             if *slot != best {
                 *slot = best;
                 changed += 1;
@@ -408,6 +498,25 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
 mod tests {
     use super::*;
 
+    #[test]
+    fn centroid_ties_prefer_the_lowest_cluster_id() {
+        assert_eq!(argmax_score_lowest_index(&[0.5, 1.0, 1.0, 0.25]), 1);
+    }
+
+    #[test]
+    fn duplicate_centroids_remain_searchable_with_one_probe() {
+        let codes = vec![0u8; 32];
+        let labels: Vec<_> = (0..32).map(|doc_id| (doc_id, 0)).collect();
+        let index = BinaryIvfIndex::build(BinaryIvfConfig::new(8, 4), &codes, &labels).unwrap();
+
+        let results = index.search(&[0], 5, Some(1));
+        assert_eq!(results.len(), 5);
+        assert_eq!(
+            results.iter().map(|result| result.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
     fn pack(bits: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
@@ -445,7 +554,7 @@ mod tests {
         }
 
         let config = BinaryIvfConfig::new(dim, 2);
-        let index = BinaryIvfIndex::build(config, &codes, &labels);
+        let index = BinaryIvfIndex::build(config, &codes, &labels).unwrap();
         assert_eq!(index.len(), n);
 
         // Query: all ones — must retrieve cluster-A (even doc_ids) members
@@ -456,6 +565,71 @@ mod tests {
             assert_eq!(doc_id % 2, 0, "expected mostly-ones cluster members");
             assert!(score > 0.7);
         }
+    }
+
+    #[test]
+    fn search_retains_zero_score_ties_in_doc_id_order() {
+        let codes = vec![0xff; 5];
+        let labels: Vec<_> = (0..5).map(|doc_id| (doc_id, 0)).collect();
+        let index = BinaryIvfIndex::build(BinaryIvfConfig::new(8, 1), &codes, &labels).unwrap();
+
+        let results = index.search(&[0], 3, Some(1));
+        assert_eq!(results, vec![(0, 0, 0.0), (1, 0, 0.0), (2, 0, 0.0)]);
+    }
+
+    #[test]
+    fn deserialize_rejects_inconsistent_cluster_columns() {
+        let mut index = BinaryIvfIndex::build(BinaryIvfConfig::new(8, 1), &[0], &[(0, 0)]).unwrap();
+        index.clusters[0].ordinals.clear();
+        let bytes = index.to_bytes().unwrap();
+
+        assert!(BinaryIvfIndex::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn build_rejects_invalid_config_and_code_lengths() {
+        let labels = [(0, 0)];
+
+        assert!(BinaryIvfIndex::build(BinaryIvfConfig::new(0, 1), &[], &labels).is_err());
+        assert!(BinaryIvfIndex::build(BinaryIvfConfig::new(7, 1), &[0], &labels).is_err());
+        assert!(BinaryIvfIndex::build(BinaryIvfConfig::new(8, 0), &[0], &labels).is_err());
+        assert!(
+            BinaryIvfIndex::build(
+                BinaryIvfConfig::new(8, MAX_BINARY_IVF_CLUSTERS + 1),
+                &[0],
+                &labels,
+            )
+            .is_err()
+        );
+        assert!(BinaryIvfIndex::build(BinaryIvfConfig::new(16, 1), &[0], &labels).is_err());
+    }
+
+    #[test]
+    fn search_scores_large_clusters_in_equivalent_chunks() {
+        let n = BINARY_IVF_SCORE_BATCH + 37;
+        let codes: Vec<u8> = (0..n).map(|i| i as u8).collect();
+        let labels: Vec<(u32, u16)> = (0..n as u32).map(|doc_id| (doc_id, 0)).collect();
+        let query = [0x5a];
+        let k = 64;
+
+        let index = BinaryIvfIndex::build(BinaryIvfConfig::new(8, 1), &codes, &labels).unwrap();
+        let actual = index.search(&query, k, Some(1));
+
+        let mut scores = vec![0.0; n];
+        batch_hamming_scores(&query, &codes, 1, 8, &mut scores);
+        let mut expected: Vec<_> = scores
+            .into_iter()
+            .enumerate()
+            .map(|(doc_id, score)| (doc_id as u32, 0, score))
+            .collect();
+        expected.sort_unstable_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        expected.truncate(k);
+
+        assert_eq!(actual, expected);
     }
 
     /// Full probing must match brute force exactly (scanned distances are exact).
@@ -482,7 +656,7 @@ mod tests {
         truth.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
         let config = BinaryIvfConfig::new(dim, 8);
-        let index = BinaryIvfIndex::build(config, &codes, &labels);
+        let index = BinaryIvfIndex::build(config, &codes, &labels).unwrap();
         let results = index.search(&query, k, Some(8)); // probe all clusters
 
         assert_eq!(results.len(), k);
@@ -509,8 +683,10 @@ mod tests {
         let (codes1, labels1) = make(100, &mut rng);
         let (codes2, labels2) = make(80, &mut rng);
 
-        let mut index1 = BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes1, &labels1);
-        let index2 = BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes2, &labels2);
+        let mut index1 =
+            BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes1, &labels1).unwrap();
+        let index2 =
+            BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes2, &labels2).unwrap();
 
         index1.merge_into(&index2, 100);
         assert_eq!(index1.len(), 180);
@@ -530,7 +706,7 @@ mod tests {
         let codes: Vec<u8> = (0..50 * byte_len).map(|_| rng.random::<u8>()).collect();
         let labels: Vec<(u32, u16)> = (0..50u32).map(|i| (i, 0)).collect();
 
-        let index = BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes, &labels);
+        let index = BinaryIvfIndex::build(BinaryIvfConfig::new(dim, 4), &codes, &labels).unwrap();
         let bytes = index.to_bytes().unwrap();
         let mut streamed = Vec::new();
         let written = index.write_to(&mut streamed).unwrap();
@@ -538,6 +714,9 @@ mod tests {
         assert_eq!(streamed, bytes);
         let back = BinaryIvfIndex::from_bytes(&bytes).unwrap();
         assert_eq!(back.len(), index.len());
+        let mut with_trailing_data = bytes.clone();
+        with_trailing_data.push(0);
+        assert!(BinaryIvfIndex::from_bytes(&with_trailing_data).is_err());
 
         let query = &codes[..byte_len];
         assert_eq!(index.search(query, 5, None), back.search(query, 5, None));

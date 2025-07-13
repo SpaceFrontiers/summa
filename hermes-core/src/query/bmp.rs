@@ -167,8 +167,8 @@ thread_local! {
 ///
 /// `heap_factor` controls approximate retrieval (BMP alpha parameter):
 /// - **1.0**: exact/safe retrieval (default)
-/// - **0.8**: prune when `UB * 0.8 <= threshold` → ~20% more aggressive
-/// - **0.6**: prune when `UB * 0.6 <= threshold` → ~40% more aggressive
+/// - **0.8**: prune when `UB * 0.8 < threshold` → ~20% more aggressive
+/// - **0.6**: prune when `UB * 0.6 < threshold` → ~40% more aggressive
 ///
 /// `max_superblocks` (LSP/0 gamma cap): hard limit on superblock visits.
 /// - **0**: unlimited (default, existing behavior)
@@ -240,7 +240,7 @@ fn execute_bmp_inner(
     }
 
     // Alpha parameter for approximate retrieval:
-    // UB * alpha <= threshold → prune when UB < threshold / alpha
+    // UB * alpha < threshold → prune when UB < threshold / alpha
     // alpha < 1.0 means more aggressive pruning (approximate but faster)
     let alpha = heap_factor.clamp(0.01, 1.0);
     let scale = index.max_weight_scale / 255.0;
@@ -270,6 +270,17 @@ fn execute_bmp_inner(
 
     if query_info.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Block masks and the two-phase scorer use one u64 bit per query term.
+    // SparseVectorQuery enforces this already; reject oversized direct calls
+    // rather than silently producing an incomplete mask.
+    if query_info.len() > crate::query::MAX_QUERY_TERMS {
+        return Err(crate::Error::Query(format!(
+            "BMP query has {} resolved dimensions; maximum is {}",
+            query_info.len(),
+            crate::query::MAX_QUERY_TERMS
+        )));
     }
 
     // Sort by dim_id for binary search within blocks (blocks store dim_id directly).
@@ -324,7 +335,7 @@ fn execute_bmp_inner(
 
     // ── Two-phase lazy block scoring setup ────────────────────────────
     // For queries with >5 dims, score only the top-3 heaviest dims first (phase1).
-    // If max_partial_score + remaining_block_ub <= threshold, skip phase2.
+    // If max_partial_score + remaining_block_ub < threshold, skip phase2.
     // For ≤5 dims: full scoring directly (zero overhead).
     const PHASE1_DIMS: usize = 3;
     const MIN_DIMS_FOR_TWO_PHASE: usize = 6;
@@ -352,16 +363,11 @@ fn execute_bmp_inner(
         Vec::new()
     };
 
-    // Over-fetch for multi-ordinal: each real doc may occupy multiple collector
-    // slots (one per ordinal). Inflate collector so combine_ordinal_results has
-    // enough unique docs after grouping. Cap at 10× to avoid degenerate cases
-    // (e.g., 200 ordinals/doc). For single-ordinal, collector_k == k (no overhead).
-    let ordinals_per_doc = if index.num_real_docs() > 0 {
-        (index.num_virtual_docs as f32 / index.num_real_docs() as f32).ceil() as usize
-    } else {
-        1
-    };
-    let collector_k = k.saturating_mul(ordinals_per_doc).min(k.saturating_mul(10));
+    // The planner has already applied the configured ordinal over-fetch factor
+    // to `k`.  Do not derive another factor from num_virtual_docs: that ratio
+    // includes block-alignment padding and used to multiply the heap depth a
+    // second time (usually turning the default 2x into 4x).
+    let collector_k = k;
 
     let t_start = std::time::Instant::now();
 
@@ -475,7 +481,7 @@ fn execute_bmp_inner(
         // Pre-compute suffix-max of ACTUAL UBs for safe early termination.
         // Because coverage-biased ordering is non-monotonic in UB, we can't `break`
         // on a single low-UB SB. Instead we `break` when the max UB of ALL remaining
-        // SBs <= threshold — guaranteed correct.
+        // SBs < threshold — guaranteed correct while retaining canonical ties.
         compute_suffix_max_ubs(
             &scratch.sb_ubs,
             &scratch.sb_order,
@@ -494,16 +500,16 @@ fn execute_bmp_inner(
                 break;
             }
 
-            // Safe early termination: max UB of ALL remaining SBs <= threshold
+            // Safe early termination: max UB of ALL remaining SBs < threshold
             if collector.len() >= collector_k
-                && scratch.sb_suffix_max[idx] * alpha <= collector.threshold()
+                && scratch.sb_suffix_max[idx] * alpha < collector.threshold()
             {
                 break;
             }
 
             // Individual SB skip (continue, not break — ordering is non-monotonic in UB)
             let sb_ub = scratch.sb_ubs[sb_id as usize];
-            if collector.len() >= collector_k && sb_ub * alpha <= collector.threshold() {
+            if collector.len() >= collector_k && sb_ub * alpha < collector.threshold() {
                 continue;
             }
 
@@ -566,7 +572,7 @@ fn execute_bmp_inner(
 
             // Level 3: page-level prefetch of the surviving blocks' data.
             // Mirrors the scoring loop's skip conditions (UB-descending order,
-            // break on ub*alpha <= threshold, skip zero-mask blocks) to find
+            // break on ub*alpha < threshold, skip zero-mask blocks) to find
             // the byte span that will actually be read, then issues a single
             // MADV_WILLNEED so cold pages are clustered into sequential reads
             // instead of one major fault per block (memory-bound hosts).
@@ -581,7 +587,7 @@ fn execute_bmp_inner(
                     if li >= count {
                         break;
                     }
-                    if heap_full && scratch.local_block_ubs[li] * alpha <= thr {
+                    if heap_full && scratch.local_block_ubs[li] * alpha < thr {
                         break;
                     }
                     if scratch.local_block_masks[li] == 0 {
@@ -774,7 +780,7 @@ fn score_block_bsearch_int(
 ///
 /// **Two-phase lazy scoring**: When `phase1_mask != u64::MAX` and `phase1_local_ubs`
 /// is `Some`, scores only phase1 dims first. If the best possible score from phase1 +
-/// remaining block UB <= threshold, skips phase2 dims entirely (~40-60% of scoring work).
+/// remaining block UB < threshold, skips phase2 dims entirely (~40-60% of scoring work).
 ///
 /// Integer scoring: accumulates u16×u8 products into u32, then dequantizes to f32
 /// for collector comparison.
@@ -799,7 +805,6 @@ fn score_superblock_blocks(
     phase1_local_ubs: Option<&[f32]>,
 ) {
     let block_size = index.bmp_block_size as usize;
-    let num_vdocs_total = index.num_virtual_docs as usize;
     let two_phase = phase1_mask != u64::MAX && phase1_local_ubs.is_some();
 
     // Level 2: Pre-warm first few blocks' data (eliminates cold-start for first block).
@@ -818,34 +823,12 @@ fn score_superblock_blocks(
         }
 
         let ub = local_ubs[local_idx as usize];
-        // Block early termination: UB * alpha <= threshold (BMP alpha parameter)
-        if collector.len() >= k && ub * alpha <= collector.threshold() {
+        // Block early termination: UB * alpha < threshold (BMP alpha parameter)
+        if collector.len() >= k && ub * alpha < collector.threshold() {
             break;
         }
 
         let block_id = (block_start + local_idx as usize) as u32;
-
-        // Lazy per-block predicate bitmask: only evaluated for blocks that survive
-        // UB pruning. For each slot, check the predicate.
-        // If all words are 0, skip the entire block (no scoring needed).
-        // Cost: block_size predicate evaluations per block.
-        let pred_mask: [u64; 4] = if let Some(pred) = predicate {
-            let base = block_id as usize * block_size;
-            let end = (base + block_size).min(num_vdocs_total);
-            let mut mask = [0u64; 4];
-            for slot in 0..(end - base) {
-                let doc_id = index.doc_id_for_virtual((base + slot) as u32);
-                if doc_id != u32::MAX && pred(doc_id) {
-                    mask[slot / 64] |= 1u64 << (slot % 64);
-                }
-            }
-            if mask == [0u64; 4] {
-                continue; // skip scoring entirely — no matching docs
-            }
-            mask
-        } else {
-            [u64::MAX; 4]
-        };
 
         // Level 3: Two-deep data prefetch (N+1 and N+2 block data).
         // block_data_starts offsets are warm from superblock-level prefetch,
@@ -884,12 +867,12 @@ fn score_superblock_blocks(
                 );
 
                 // Check if phase2 can be skipped:
-                // max_partial_score + remaining_ub <= threshold?
+                // max_partial_score + remaining_ub < threshold?
                 // remaining_ub = full_block_ub - phase1_block_ub
                 let max_partial = max_touched_acc(acc, &touched) as f32 * dequant;
                 let phase1_ub = phase1_local_ubs.unwrap()[local_idx as usize];
                 let remaining_ub = (ub - phase1_ub).max(0.0);
-                if (max_partial + remaining_ub) * alpha <= collector.threshold() {
+                if (max_partial + remaining_ub) * alpha < collector.threshold() {
                     // Skip phase2 — zero touched slots and continue
                     zero_touched_acc(acc, &touched);
                     *blocks_scored += 1;
@@ -926,26 +909,18 @@ fn score_superblock_blocks(
             }
         }
 
-        // Collect results + lazy zeroing.
-        // Split into collect (touched & pred_mask) and reject (touched & !pred_mask).
-        // When no predicate, pred_mask = [u64::MAX; 4] so reject is all zeros.
+        // Collect results + lazy zeroing. Apply an ordinary predicate only to
+        // slots that scoring actually touched. Sparse queries commonly touch a
+        // small fraction of a block, so evaluating every slot before scoring
+        // was needlessly expensive for broad/non-bitset predicates.
         //
         // Resolve virtual → real (doc_id, ordinal) inline and insert with real
         // doc_id. The combine_ordinal_results layer handles multi-ordinal grouping.
         let base = block_id as usize * block_size;
         let num_vdocs = index.num_virtual_docs as usize;
 
-        for word in 0..4 {
-            // Zero rejected slots (touched but filtered out by predicate)
-            let mut reject = touched[word] & !pred_mask[word];
-            while reject != 0 {
-                let bit = reject.trailing_zeros() as usize;
-                reject &= reject - 1;
-                acc[word * 64 + bit] = 0;
-            }
-
-            // Collect matching slots
-            let mut scan = touched[word] & pred_mask[word];
+        for (word, &touched_word) in touched.iter().enumerate() {
+            let mut scan = touched_word;
             while scan != 0 {
                 let bit = scan.trailing_zeros() as usize;
                 scan &= scan - 1;
@@ -969,9 +944,14 @@ fn score_superblock_blocks(
                 if doc_id == u32::MAX {
                     continue;
                 }
+                if let Some(pred) = predicate
+                    && !pred(doc_id)
+                {
+                    continue;
+                }
 
                 let score = score_u32 as f32 * dequant;
-                if collector.would_enter(score) {
+                if collector.would_enter_candidate(doc_id, score, ordinal) {
                     collector.insert_with_ordinal(doc_id, score, ordinal);
                 }
             }
@@ -1025,7 +1005,7 @@ fn sort_sb_desc_into(values: &[f32], out: &mut Vec<u32>) {
 ///
 /// `suffix_max[i]` = max UB among all SBs at positions `i..order.len()`.
 /// This enables safe early termination with non-monotonic ordering:
-/// if `suffix_max[i] * alpha <= threshold`, ALL remaining SBs can be skipped.
+/// if `suffix_max[i] * alpha < threshold`, ALL remaining SBs can be skipped.
 ///
 /// O(num_superblocks) pre-computation, then O(1) check per SB in the loop.
 fn compute_suffix_max_ubs(sb_ubs: &[f32], order: &[u32], out: &mut [f32]) {

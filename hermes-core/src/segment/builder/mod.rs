@@ -344,6 +344,16 @@ impl SegmentBuilder {
         ordinal
     }
 
+    fn next_vector_ordinal(&mut self, field_id: u32) -> Result<u16> {
+        let ordinal = self.next_element_ordinal(field_id);
+        u16::try_from(ordinal).map_err(|_| {
+            crate::Error::Document(format!(
+                "field {field_id} has more than {} vector values in one document",
+                u16::MAX as usize + 1
+            ))
+        })
+    }
+
     pub fn num_docs(&self) -> u32 {
         self.next_doc_id
     }
@@ -566,18 +576,18 @@ impl SegmentBuilder {
                 (FieldType::DenseVector, FieldValue::DenseVector(vec))
                     if entry.indexed || entry.stored =>
                 {
-                    let ordinal = self.next_element_ordinal(field.0);
-                    self.index_dense_vector_field(*field, doc_id, ordinal as u16, vec)?;
+                    let ordinal = self.next_vector_ordinal(field.0)?;
+                    self.index_dense_vector_field(*field, doc_id, ordinal, vec)?;
                 }
                 (FieldType::BinaryDenseVector, FieldValue::BinaryDenseVector(bytes))
                     if entry.indexed || entry.stored =>
                 {
-                    let ordinal = self.next_element_ordinal(field.0);
-                    self.index_binary_dense_vector_field(*field, doc_id, ordinal as u16, bytes)?;
+                    let ordinal = self.next_vector_ordinal(field.0)?;
+                    self.index_binary_dense_vector_field(*field, doc_id, ordinal, bytes)?;
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
-                    let ordinal = self.next_element_ordinal(field.0);
-                    self.index_sparse_vector_field(*field, doc_id, ordinal as u16, entries)?;
+                    let ordinal = self.next_vector_ordinal(field.0)?;
+                    self.index_sparse_vector_field(*field, doc_id, ordinal, entries)?;
                 }
                 _ => {}
             }
@@ -835,6 +845,15 @@ impl SegmentBuilder {
                 expected_dim, dim
             )));
         }
+        if let Some((index, value)) = vector
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(crate::Error::Document(format!(
+                "dense vector contains non-finite value {value} at index {index}"
+            )));
+        }
 
         let builder = self
             .dense_vectors
@@ -874,6 +893,11 @@ impl SegmentBuilder {
             })?;
 
         let expected_byte_len = dim_bits.div_ceil(8);
+        if dim_bits == 0 || !dim_bits.is_multiple_of(8) {
+            return Err(crate::Error::Schema(format!(
+                "Binary vector dimension must be a positive multiple of 8, got {dim_bits}"
+            )));
+        }
         if bytes.len() != expected_byte_len {
             return Err(crate::Error::Schema(format!(
                 "Binary vector byte length mismatch: expected {} (dim={}), got {}",
@@ -910,6 +934,15 @@ impl SegmentBuilder {
         ordinal: u16,
         entries: &[(u32, f32)],
     ) -> Result<()> {
+        if let Some((index, (_, weight))) = entries
+            .iter()
+            .enumerate()
+            .find(|(_, (_, weight))| !weight.is_finite())
+        {
+            return Err(crate::Error::Document(format!(
+                "sparse vector contains non-finite weight {weight} at index {index}"
+            )));
+        }
         let (weight_threshold, doc_mass, min_terms) = self
             .schema
             .get_field_entry(field)

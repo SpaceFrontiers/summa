@@ -7,6 +7,19 @@ use super::VectorResultScorer;
 use super::combiner::MultiValueCombiner;
 use crate::query::traits::{CountFuture, Query, Scorer, ScorerFuture};
 
+/// Maximum number of IVF clusters a single dense query may probe.
+///
+/// Automatic IVF construction caps the cluster count at 4096. Keeping the
+/// query override within the same bound prevents malformed requests from
+/// turning into unbounded work while still permitting a full-cluster scan.
+pub const MAX_DENSE_NPROBE: usize = 4096;
+
+/// Maximum exact-rerank candidate multiplier accepted by dense search.
+///
+/// Normal deployments use 2-5x. 32x leaves ample room for recall tuning while
+/// bounding the heap and raw-vector buffers derived from the requested top-k.
+pub const MAX_DENSE_RERANK_FACTOR: f32 = 32.0;
+
 /// Dense vector query for similarity search
 #[derive(Debug, Clone)]
 pub struct DenseVectorQuery {
@@ -48,12 +61,18 @@ impl DenseVectorQuery {
     }
 
     /// Set the number of clusters to probe (for IVF indexes)
+    ///
+    /// Values are validated when the query is executed. See
+    /// [`MAX_DENSE_NPROBE`].
     pub fn with_nprobe(mut self, nprobe: usize) -> Self {
         self.nprobe = nprobe;
         self
     }
 
     /// Set the re-ranking factor (e.g. 3.0 = fetch 3x candidates for reranking)
+    ///
+    /// Values are validated when the query is executed. See
+    /// [`MAX_DENSE_RERANK_FACTOR`].
     pub fn with_rerank_factor(mut self, factor: f32) -> Self {
         self.rerank_factor = factor;
         self

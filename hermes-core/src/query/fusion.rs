@@ -21,10 +21,16 @@
 use rustc_hash::FxHashMap;
 
 use super::vector::MultiValueCombiner;
-use super::{ScoredPosition, SearchResult};
+use super::{ScoredPosition, SearchResult, compare_search_results_desc};
 
 /// Default RRF rank constant (from Cormack et al., the standard choice).
 pub const DEFAULT_RRF_K: f32 = 60.0;
+/// Maximum independently executed lists accepted by the Searcher fusion API.
+pub const MAX_FUSION_SUB_QUERIES: usize = 16;
+/// Maximum aggregate list slots retained before fusion.
+pub const MAX_FUSION_CANDIDATE_SLOTS: usize = 200_000;
+/// Maximum per-ordinal chunk contributions materialized during fusion.
+pub const MAX_FUSION_CHUNK_SLOTS: usize = 500_000;
 
 /// Method for fusing multiple ranked result lists.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -74,7 +80,14 @@ pub fn fuse_ranked_lists(
     method: FusionMethod,
     limit: usize,
 ) -> Vec<SearchResult> {
-    let capacity = lists.iter().map(|(l, _)| l.len()).sum();
+    // Avoid reserving an attacker-controlled sum up front. The map can grow
+    // naturally if a trusted embedded caller intentionally fuses more.
+    const MAX_INITIAL_FUSION_CAPACITY: usize = 200_000;
+    let capacity = lists
+        .iter()
+        .map(|(list, _)| list.len())
+        .fold(0usize, usize::saturating_add)
+        .min(MAX_INITIAL_FUSION_CAPACITY);
     let mut fused: FxHashMap<(u128, u32), SearchResult> =
         FxHashMap::with_capacity_and_hasher(capacity, Default::default());
 
@@ -118,14 +131,10 @@ pub fn fuse_ranked_lists(
 
     let mut results: Vec<SearchResult> = fused.into_values().collect();
     if results.len() > limit {
-        results.select_nth_unstable_by(limit, |a, b| b.score.total_cmp(&a.score));
+        results.select_nth_unstable_by(limit, compare_search_results_desc);
         results.truncate(limit);
     }
-    results.sort_unstable_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
+    results.sort_unstable_by(compare_search_results_desc);
     results
 }
 
@@ -238,15 +247,78 @@ pub fn fuse_ranked_lists_chunked(
         .collect();
 
     if results.len() > limit {
-        results.select_nth_unstable_by(limit, |a, b| b.score.total_cmp(&a.score));
+        results.select_nth_unstable_by(limit, compare_search_results_desc);
         results.truncate(limit);
     }
-    results.sort_unstable_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
+    results.sort_unstable_by(compare_search_results_desc);
     results
+}
+
+/// Validated, bounded entry point for chunk-level fusion used by Searcher and
+/// the server. The legacy pure helper remains available for trusted embedded
+/// callers, while request-facing paths must account for ordinal expansion
+/// before allocating fusion maps.
+pub fn try_fuse_ranked_lists_chunked(
+    lists: Vec<(Vec<SearchResult>, f32)>,
+    method: FusionMethod,
+    combiner: MultiValueCombiner,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    if lists.is_empty() {
+        return Err("fusion requires at least one ranked list".to_string());
+    }
+    if lists.len() > MAX_FUSION_SUB_QUERIES {
+        return Err(format!(
+            "fusion supports at most {MAX_FUSION_SUB_QUERIES} ranked lists"
+        ));
+    }
+    if let FusionMethod::Rrf { k } = method
+        && (!k.is_finite() || k < 0.0)
+    {
+        return Err(format!(
+            "fusion RRF k must be finite and non-negative, got {k}"
+        ));
+    }
+    combiner.validate()?;
+
+    let mut candidates = 0usize;
+    let mut chunks = 0usize;
+    for (list_index, (list, weight)) in lists.iter().enumerate() {
+        if !weight.is_finite() || *weight < 0.0 {
+            return Err(format!(
+                "fusion list weight at index {list_index} must be finite and non-negative, \
+                 got {weight}"
+            ));
+        }
+        candidates = candidates
+            .checked_add(list.len())
+            .ok_or_else(|| "fusion candidate count overflow".to_string())?;
+        if candidates > MAX_FUSION_CANDIDATE_SLOTS {
+            return Err(format!(
+                "fusion contains more than {MAX_FUSION_CANDIDATE_SLOTS} candidate slots"
+            ));
+        }
+        for result in list {
+            let position_count = result
+                .positions
+                .iter()
+                .try_fold(0usize, |count, (_, positions)| {
+                    count.checked_add(positions.len())
+                })
+                .ok_or_else(|| "fusion chunk count overflow".to_string())?;
+            // Results without positions contribute one pseudo-chunk.
+            chunks = chunks
+                .checked_add(position_count.max(1))
+                .ok_or_else(|| "fusion chunk count overflow".to_string())?;
+            if chunks > MAX_FUSION_CHUNK_SLOTS {
+                return Err(format!(
+                    "fusion expands to more than {MAX_FUSION_CHUNK_SLOTS} ordinal chunks"
+                ));
+            }
+        }
+    }
+
+    Ok(fuse_ranked_lists_chunked(lists, method, combiner, limit))
 }
 
 #[cfg(test)]
@@ -424,6 +496,28 @@ mod tests {
         assert_eq!(fused[0].doc_id, 1);
         assert!((fused[0].score - 2.0 / 61.0).abs() < 1e-6);
         assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn test_validated_chunked_fusion_rejects_invalid_parameters() {
+        assert!(
+            try_fuse_ranked_lists_chunked(
+                vec![(vec![result(1, 1.0)], -1.0)],
+                FusionMethod::default(),
+                MultiValueCombiner::Max,
+                10,
+            )
+            .is_err()
+        );
+        assert!(
+            try_fuse_ranked_lists_chunked(
+                vec![(vec![result(1, 1.0)], 1.0)],
+                FusionMethod::Rrf { k: f32::NAN },
+                MultiValueCombiner::Max,
+                10,
+            )
+            .is_err()
+        );
     }
 
     #[test]

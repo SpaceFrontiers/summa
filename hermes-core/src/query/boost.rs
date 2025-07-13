@@ -39,10 +39,24 @@ impl BoostQuery {
 
 impl Query for BoostQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> ScorerFuture<'a> {
         let inner = self.inner.clone();
         let boost = self.boost;
         Box::pin(async move {
-            let inner_scorer = inner.scorer(reader, limit).await?;
+            if !boost.is_finite() {
+                return Err(crate::Error::Query(
+                    "boost must be a finite number".to_string(),
+                ));
+            }
+            let inner_scorer = inner.scorer_with_options(reader, limit, options).await?;
             Ok(Box::new(BoostScorer {
                 inner: inner_scorer,
                 boost,
@@ -56,7 +70,24 @@ impl Query for BoostQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        let inner_scorer = self.inner.scorer_sync(reader, limit)?;
+        self.scorer_sync_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        if !self.boost.is_finite() {
+            return Err(crate::Error::Query(
+                "boost must be a finite number".to_string(),
+            ));
+        }
+        let inner_scorer = self
+            .inner
+            .scorer_sync_with_options(reader, limit, options)?;
         Ok(Box::new(BoostScorer {
             inner: inner_scorer,
             boost: self.boost,
@@ -69,15 +100,21 @@ impl Query for BoostQuery {
     }
 
     fn is_filter(&self) -> bool {
-        self.inner.is_filter()
+        self.boost == 1.0 && self.inner.is_filter()
     }
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
-        self.inner.as_doc_predicate(reader)
+        (self.boost == 1.0)
+            .then(|| self.inner.as_doc_predicate(reader))
+            .flatten()
     }
 
     fn decompose(&self) -> super::QueryDecomposition {
-        self.inner.decompose()
+        if self.boost == 1.0 {
+            self.inner.decompose()
+        } else {
+            super::QueryDecomposition::Opaque
+        }
     }
 }
 
@@ -107,5 +144,15 @@ impl super::docset::DocSet for BoostScorer<'_> {
 impl Scorer for BoostScorer<'_> {
     fn score(&self) -> Score {
         self.inner.score() * self.boost
+    }
+
+    fn matched_positions(&self) -> Option<super::MatchedPositions> {
+        let mut positions = self.inner.matched_positions()?;
+        for (_, scored_positions) in &mut positions {
+            for position in scored_positions {
+                position.score *= self.boost;
+            }
+        }
+        Some(positions)
     }
 }

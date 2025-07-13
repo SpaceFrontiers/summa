@@ -35,6 +35,55 @@ Options:
 - `-a, --addr`: Address to bind to (default: `0.0.0.0:50051`)
 - `-d, --data-dir`: Directory for storing indexes (default: `./data`)
 
+### Search resource controls
+
+`--search-threads` sets the width of a bounded Rayon pool shared by CPU-bound
+search work across every open index. When omitted, it defaults to one thread per
+four detected CPUs (minimum one). Nested parallel work, including fused queries,
+segment fan-out, phrase loading, and vector search, stays inside this same pool;
+Hermes does not create a pool per index or request.
+
+`--max-concurrent-searches` bounds expensive search pipelines across all HTTP/2
+connections; document lookup and metadata RPCs do not consume these permits.
+When omitted, Hermes allows one concurrent search per eight detected CPUs,
+clamped to `1..=8` (six searches on a 48-core host). Requests above that
+capacity fail promptly with gRPC `RESOURCE_EXHAUSTED`; clients should retry with
+bounded exponential backoff. This keeps overload from accumulating an
+unbounded in-process request queue. Completed or cancelled searches release
+their permit automatically.
+
+The server also rejects request sizes that could otherwise multiply into large
+per-segment heaps:
+
+| Request component                           |            Limit |
+| ------------------------------------------- | ---------------: |
+| Final search results                        |          `10000` |
+| Pagination window (`offset + limit`)        |          `50000` |
+| L1 reranker candidates                      |          `50000` |
+| Fusion candidates fetched per sub-query     |          `50000` |
+| Fusion sub-queries                          |             `16` |
+| Fusion fetch depth x number of sub-queries  |         `200000` |
+| Query nesting depth                         |             `32` |
+| Query nodes / aggregate clauses             |    `256` / `512` |
+| Clauses in one Boolean query                |            `128` |
+| Aggregate query text                        |         `64 KiB` |
+| Aggregate query vector payload              |          `1 MiB` |
+| Dense dimensions / sparse input dimensions  | `65536` / `4096` |
+| Binary query bytes                          |        `256 KiB` |
+| Stored fields requested                     |             `64` |
+| Aggregate requested-field name bytes        |         `16 KiB` |
+| Retained response / encoded response (each) |         `48 MiB` |
+
+Zero-valued defaults remain supported. Derived reranker and fusion defaults are
+checked and capped at the corresponding limit; explicit values over a limit
+return gRPC `INVALID_ARGUMENT`.
+
+The structural limits are checked iteratively before query conversion and
+before a search permit is acquired. Requested stored fields are resolved and
+deduplicated once, and response hydration is charged before field values are
+cloned into protobuf objects. A response that would exceed its memory/encoding
+budget fails with `RESOURCE_EXHAUSTED`; request fewer hits or fields.
+
 ### Background merge and reorder
 
 The server uses one BP CPU pool and one whole-pass gate across all indexes.
@@ -175,6 +224,15 @@ Merge all segments into one for optimal search performance.
 ```protobuf
 rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
 ```
+
+#### RetrainVectorIndex
+
+Retraining global IVF/ScaNN centroids is accepted only while all committed
+segments for the affected fields are flat. ANN segments embed the artifact
+versions used to build them, so replacing the single global generation under
+existing ANN segments would make those segments unreadable. Hermes rejects
+that unsafe lifecycle transition instead of publishing mixed generations.
+Trained artifacts and metadata are validated and published all-or-nothing.
 
 #### DeleteIndex
 

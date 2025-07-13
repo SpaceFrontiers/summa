@@ -138,6 +138,97 @@ pub struct RaBitQCodebook {
 }
 
 impl RaBitQCodebook {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let dim = self.config.dim;
+        if dim == 0 {
+            return Err("RaBitQ dimension must be greater than zero".to_string());
+        }
+        if !(1..=8).contains(&self.config.query_bits) {
+            return Err(format!(
+                "RaBitQ query_bits must be in 1..=8, got {}",
+                self.config.query_bits
+            ));
+        }
+        if self.config.ex_bits > 7 {
+            return Err(format!("RaBitQ ex_bits {} exceeds 7", self.config.ex_bits));
+        }
+        if self.random_signs.len() != dim || self.random_perm.len() != dim {
+            return Err(format!(
+                "RaBitQ transform lengths ({}, {}) do not match dimension {dim}",
+                self.random_signs.len(),
+                self.random_perm.len()
+            ));
+        }
+        if self
+            .random_signs
+            .iter()
+            .any(|&sign| sign != -1 && sign != 1)
+        {
+            return Err("RaBitQ random signs contain a value other than -1 or 1".to_string());
+        }
+        let mut seen = vec![false; dim];
+        for &source in &self.random_perm {
+            let source = source as usize;
+            if source >= dim || seen[source] {
+                return Err("RaBitQ random permutation is invalid".to_string());
+            }
+            seen[source] = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_vector(&self, vector: &QuantizedVector) -> Result<(), String> {
+        let expected_bits = self.config.dim.div_ceil(8);
+        if vector.bits.len() != expected_bits {
+            return Err(format!(
+                "RaBitQ code has {} sign bytes, expected {expected_bits}",
+                vector.bits.len()
+            ));
+        }
+        let expected_extended = self
+            .config
+            .dim
+            .checked_mul(self.config.ex_bits as usize)
+            .ok_or_else(|| "RaBitQ extended code size overflow".to_string())?
+            .div_ceil(8);
+        if vector.ex_code.len() != expected_extended {
+            return Err(format!(
+                "RaBitQ code has {} extended bytes, expected {expected_extended}",
+                vector.ex_code.len()
+            ));
+        }
+        if !vector.dist_to_centroid.is_finite()
+            || !vector.self_dot.is_finite()
+            || !vector.ex_scale.is_finite()
+            || !vector.ex_norm.is_finite()
+        {
+            return Err("RaBitQ code contains non-finite metadata".to_string());
+        }
+        if vector.dist_to_centroid < 0.0 || vector.ex_scale < 0.0 || vector.ex_norm < 0.0 {
+            return Err("RaBitQ code contains negative norm/scale metadata".to_string());
+        }
+        let actual_popcount: u32 = vector.bits.iter().map(|byte| byte.count_ones()).sum();
+        if vector.popcount != actual_popcount || vector.popcount as usize > self.config.dim {
+            return Err(format!(
+                "RaBitQ code popcount {} does not match packed bits {actual_popcount}",
+                vector.popcount
+            ));
+        }
+        let padding_bits = expected_bits
+            .checked_mul(8)
+            .and_then(|bits| bits.checked_sub(self.config.dim))
+            .ok_or_else(|| "RaBitQ padding size overflow".to_string())?;
+        if padding_bits > 0
+            && vector
+                .bits
+                .last()
+                .is_some_and(|last| last >> (8 - padding_bits) != 0)
+        {
+            return Err("RaBitQ code has non-zero padding bits".to_string());
+        }
+        Ok(())
+    }
+
     /// Create a new RaBitQ codebook with random transform
     pub fn new(config: RaBitQConfig) -> Self {
         let dim = config.dim;

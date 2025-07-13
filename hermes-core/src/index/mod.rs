@@ -11,8 +11,12 @@
 use crate::dsl::Schema;
 #[cfg(feature = "native")]
 use crate::error::Result;
+#[cfg(feature = "sync")]
+use std::collections::HashMap;
 #[cfg(feature = "native")]
 use std::sync::Arc;
+#[cfg(feature = "sync")]
+use std::sync::{OnceLock, Weak};
 
 mod searcher;
 pub use searcher::Searcher;
@@ -55,7 +59,11 @@ pub const SLICE_CACHE_FILENAME: &str = "index.slicecache";
 /// Index configuration
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
-    /// Number of threads for CPU-intensive tasks (search parallelism)
+    /// Number of threads shared by CPU-intensive search work.
+    ///
+    /// Indexes in the same process that request the same width reuse one Rayon
+    /// pool. A value of zero is invalid and is rejected by `Index::create` and
+    /// `Index::open`.
     pub num_threads: usize,
     /// Number of parallel segment builders (documents distributed round-robin)
     pub num_indexing_threads: usize,
@@ -108,20 +116,62 @@ pub struct IndexConfig {
     pub background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
+/// Search pools are shared process-wide by width. This avoids multiplying OS
+/// threads by the number of open indexes while still allowing applications to
+/// deliberately isolate indexes that need different CPU budgets.
+#[cfg(feature = "sync")]
+static SEARCH_CPU_POOLS: OnceLock<parking_lot::Mutex<HashMap<usize, Weak<rayon::ThreadPool>>>> =
+    OnceLock::new();
+
+#[cfg(feature = "sync")]
+fn shared_search_pool(num_threads: usize) -> Result<Arc<rayon::ThreadPool>> {
+    if num_threads == 0 {
+        return Err(crate::Error::Internal(
+            "IndexConfig.num_threads must be greater than zero".into(),
+        ));
+    }
+
+    let mut pools = SEARCH_CPU_POOLS
+        .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+        .lock();
+    if let Some(pool) = pools.get(&num_threads).and_then(Weak::upgrade) {
+        return Ok(pool);
+    }
+
+    // Build while holding the registry lock. Index construction is cold-path
+    // work, and serialization here prevents two concurrent opens from creating
+    // duplicate pools for the same width.
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(move |idx| format!("hermes-search-{}-{}", num_threads, idx))
+            .build()
+            .map_err(|error| {
+                crate::Error::Internal(format!(
+                    "failed to create {num_threads}-thread search pool: {error}"
+                ))
+            })?,
+    );
+    pools.retain(|_, pool| pool.strong_count() > 0);
+    pools.insert(num_threads, Arc::downgrade(&pool));
+    log::info!("[search] process-wide CPU pool: {} thread(s)", num_threads);
+    Ok(pool)
+}
+
 impl Default for IndexConfig {
     fn default() -> Self {
-        #[cfg(feature = "native")]
-        let indexing_threads = crate::default_indexing_threads();
-        #[cfg(not(feature = "native"))]
-        let indexing_threads = 1;
-
         #[cfg(feature = "native")]
         let compression_threads = crate::default_compression_threads();
         #[cfg(not(feature = "native"))]
         let compression_threads = 1;
 
+        #[cfg(feature = "native")]
+        let search_threads = crate::default_search_threads();
+        #[cfg(not(feature = "native"))]
+        let search_threads = 1;
+
         Self {
-            num_threads: indexing_threads,
+            num_threads: search_threads,
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: 256,
@@ -171,6 +221,8 @@ pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
     directory: Arc<D>,
     schema: Arc<Schema>,
     config: IndexConfig,
+    /// Cache and CPU policy used by every searcher reload.
+    search_resources: searcher::SearcherResources,
     /// Segment manager - owns segments, tracker, metadata, and trained structures
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Cached reader (created lazily, reused across calls)
@@ -181,6 +233,11 @@ pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
 impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
+        let search_resources = searcher::SearcherResources::new(
+            config.term_cache_blocks,
+            config.store_cache_blocks,
+            config.num_threads,
+        )?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
@@ -208,6 +265,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             directory,
             schema,
             config,
+            search_resources,
             segment_manager,
             cached_reader: tokio::sync::OnceCell::new(),
         })
@@ -215,6 +273,11 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
     /// Open an existing index from a directory
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
+        let search_resources = searcher::SearcherResources::new(
+            config.term_cache_blocks,
+            config.store_cache_blocks,
+            config.num_threads,
+        )?;
         let directory = Arc::new(directory);
 
         // Load metadata (includes schema)
@@ -238,12 +301,13 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         ));
 
         // Load trained structures into SegmentManager's ArcSwap
-        segment_manager.load_and_publish_trained().await;
+        segment_manager.try_load_and_publish_trained().await?;
 
         Ok(Self {
             directory,
             schema,
             config,
+            search_resources,
             segment_manager,
             cached_reader: tokio::sync::OnceCell::new(),
         })
@@ -276,11 +340,11 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub async fn reader(&self) -> Result<&IndexReader<D>> {
         self.cached_reader
             .get_or_try_init(|| async {
-                IndexReader::from_segment_manager(
+                IndexReader::from_segment_manager_with_resources(
                     Arc::clone(&self.schema),
                     Arc::clone(&self.segment_manager),
-                    self.config.term_cache_blocks,
                     self.config.reload_interval_ms,
+                    self.search_resources.clone(),
                 )
                 .await
             })

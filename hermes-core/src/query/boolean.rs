@@ -115,7 +115,7 @@ fn build_should_scorer<'a>(scorers: Vec<Box<dyn Scorer + 'a>>) -> Box<dyn Scorer
 // ── Planner macro ────────────────────────────────────────────────────────
 //
 // Unified planner for both async and sync paths.  Parameterised on:
-//   $scorer_fn      – scorer | scorer_sync
+//   $scorer_fn      – scorer_with_options | scorer_sync_with_options
 //   $get_postings_fn – get_postings | get_postings_sync
 //   $execute_fn     – execute | execute_sync
 //   $($aw)*         – .await  (present for async, absent for sync)
@@ -127,7 +127,7 @@ fn build_should_scorer<'a>(scorers: Vec<Box<dyn Scorer + 'a>>) -> Box<dyn Scorer
 //   4. Standard BooleanScorer fallback
 macro_rules! boolean_plan {
     ($must:expr, $should:expr, $must_not:expr, $global_stats:expr,
-     $reader:expr, $limit:expr,
+     $reader:expr, $limit:expr, $scorer_options:expr,
      $scorer_fn:ident, $get_postings_fn:ident, $execute_fn:ident
      $(, $aw:tt)*) => {{
         let must: &[Arc<dyn Query>] = &$must;
@@ -136,6 +136,7 @@ macro_rules! boolean_plan {
         let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
+        let scorer_options: super::ScorerOptions = $scorer_options;
 
         // Cap SHOULD clauses to MAX_QUERY_TERMS, but only count queries that need
         // posting-list cursors. Fast-field predicates (O(1) per doc) are exempt.
@@ -182,17 +183,18 @@ macro_rules! boolean_plan {
         // ── 1. Single-clause optimisation ────────────────────────────────
         if must_not.is_empty() {
             if must.len() == 1 && should.is_empty() {
-                return must[0].$scorer_fn(reader, limit) $(.  $aw)* ;
+                return must[0].$scorer_fn(reader, limit, scorer_options) $(.  $aw)* ;
             }
             if should.len() == 1 && must.is_empty() {
-                return should[0].$scorer_fn(reader, limit) $(. $aw)* ;
+                return should[0].$scorer_fn(reader, limit, scorer_options) $(. $aw)* ;
             }
         }
 
         // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
         if must.is_empty() && must_not.is_empty() && should.len() >= 2 {
             // 2a. Text MaxScore (single-field, all term queries)
-            if let Some((mut infos, text_field, avg_field_len, num_docs)) =
+            if !scorer_options.collect_positions
+                && let Some((mut infos, text_field, avg_field_len, num_docs)) =
                 prepare_text_maxscore(should, reader, global_stats)
             {
                 let mut posting_lists = Vec::with_capacity(infos.len());
@@ -232,7 +234,9 @@ macro_rules! boolean_plan {
             }
 
             // 2c. Per-field text MaxScore (multi-field term grouping)
-            if let Some(grouping) = prepare_per_field_grouping(should, reader, limit, global_stats)
+            if !scorer_options.collect_positions
+                && let Some(grouping) =
+                    prepare_per_field_grouping(should, reader, limit, global_stats)
             {
                 let mut scorers: Vec<Box<dyn Scorer + '_>> = Vec::new();
                 // Query-local cross-group threshold seeding (see finish_text_maxscore)
@@ -261,14 +265,18 @@ macro_rules! boolean_plan {
                     }
                 }
                 for &idx in &grouping.fallback_indices {
-                    scorers.push(should[idx].$scorer_fn(reader, limit) $(. $aw)* ?);
+                    scorers.push(should[idx].$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
                 }
                 return Ok(build_should_scorer(scorers));
             }
         }
 
         // ── 3. Filter push-down (MUST + SHOULD) ─────────────────────────
-        if !should.is_empty() && !must.is_empty() && limit < usize::MAX / 4 {
+        if !scorer_options.collect_positions
+            && !should.is_empty()
+            && !must.is_empty()
+            && limit < usize::MAX / 4
+        {
             // Pre-check: is SHOULD all-sparse? This determines whether we can
             // use bitset fallback for MUST clauses that lack fast-field predicates.
             // For sparse SHOULD, the predicate is pushed into BMP/MaxScore traversal
@@ -294,11 +302,11 @@ macro_rules! boolean_plan {
                         predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
                     } else {
                         log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
-                        must_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+                        must_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
                     }
                 } else {
                     log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
-                    must_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+                    must_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
                 }
             }
             // Compile MUST_NOT → negated predicates vs verifier scorers
@@ -313,10 +321,10 @@ macro_rules! boolean_plan {
                         log::debug!("BooleanQuery planner 3a: MUST_NOT clause → bitset predicate ({})", q);
                         predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
                     } else {
-                        must_not_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+                        must_not_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
                     }
                 } else {
-                    must_not_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+                    must_not_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
                 }
             }
 
@@ -394,7 +402,7 @@ macro_rules! boolean_plan {
                 || !must_not_verifiers.is_empty();
             let should_limit = if has_filters { limit * 4 } else { limit };
             let should_scorer = if should.len() == 1 {
-                should[0].$scorer_fn(reader, should_limit) $(. $aw)* ?
+                should[0].$scorer_fn(reader, should_limit, scorer_options) $(. $aw)* ?
             } else {
                 let sub = BooleanQuery {
                     must: Vec::new(),
@@ -402,7 +410,7 @@ macro_rules! boolean_plan {
                     must_not: Vec::new(),
                     global_stats: global_stats.cloned(),
                 };
-                sub.$scorer_fn(reader, should_limit) $(. $aw)* ?
+                sub.$scorer_fn(reader, should_limit, scorer_options) $(. $aw)* ?
             };
 
             let use_predicated =
@@ -440,15 +448,15 @@ macro_rules! boolean_plan {
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
         let mut must_scorers = Vec::with_capacity(must.len());
         for q in must {
-            must_scorers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+            must_scorers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
         }
         let mut should_scorers = Vec::with_capacity(should.len());
         for q in should {
-            should_scorers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+            should_scorers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
         }
         let mut must_not_scorers = Vec::with_capacity(must_not.len());
         for q in must_not {
-            must_not_scorers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
+            must_not_scorers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
         }
         let mut scorer = BooleanScorer {
             must: must_scorers,
@@ -463,6 +471,15 @@ macro_rules! boolean_plan {
 
 impl Query for BooleanQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> ScorerFuture<'a> {
         let must = self.must.clone();
         let should = self.should.clone();
         let must_not = self.must_not.clone();
@@ -475,7 +492,8 @@ impl Query for BooleanQuery {
                 global_stats.as_ref(),
                 reader,
                 limit,
-                scorer,
+                options,
+                scorer_with_options,
                 get_postings,
                 execute,
                 await
@@ -489,6 +507,16 @@ impl Query for BooleanQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        self.scorer_sync_with_options(reader, limit, super::ScorerOptions::with_positions())
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
         boolean_plan!(
             self.must,
             self.should,
@@ -496,7 +524,8 @@ impl Query for BooleanQuery {
             self.global_stats.as_ref(),
             reader,
             limit,
-            scorer_sync,
+            options,
+            scorer_sync_with_options,
             get_postings_sync,
             execute_sync
         )

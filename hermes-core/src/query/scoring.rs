@@ -23,7 +23,9 @@ pub struct HeapEntry {
 
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.doc_id == other.doc_id
+        self.score.to_bits() == other.score.to_bits()
+            && self.doc_id == other.doc_id
+            && self.ordinal == other.ordinal
     }
 }
 
@@ -36,7 +38,8 @@ impl Ord for HeapEntry {
         other
             .score
             .total_cmp(&self.score)
-            .then(self.doc_id.cmp(&other.doc_id))
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+            .then_with(|| self.ordinal.cmp(&other.ordinal))
     }
 }
 
@@ -106,23 +109,23 @@ impl ScoreCollector {
     /// Caller must ensure each doc_id is inserted only once.
     #[inline]
     pub fn insert_with_ordinal(&mut self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        let entry = HeapEntry {
+            doc_id,
+            score,
+            ordinal,
+        };
         if self.heap.len() < self.k {
-            self.heap.push(HeapEntry {
-                doc_id,
-                score,
-                ordinal,
-            });
+            self.heap.push(entry);
             // Only recompute threshold when heap just became full
             if self.heap.len() == self.k {
                 self.update_threshold();
             }
             true
-        } else if score > self.cached_threshold {
-            self.heap.push(HeapEntry {
-                doc_id,
-                score,
-                ordinal,
-            });
+        } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
+            self.heap.push(entry);
             self.heap.pop(); // Remove lowest
             self.update_threshold();
             true
@@ -135,6 +138,21 @@ impl ScoreCollector {
     #[inline]
     pub fn would_enter(&self, score: f32) -> bool {
         self.heap.len() < self.k || score > self.cached_threshold
+    }
+
+    /// Check whether this fully identified candidate ranks ahead of the current
+    /// worst retained entry, including deterministic tie breaks.
+    #[inline]
+    pub fn would_enter_candidate(&self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        let entry = HeapEntry {
+            doc_id,
+            score,
+            ordinal,
+        };
+        self.heap.len() < self.k || self.heap.peek().is_some_and(|worst| entry < *worst)
     }
 
     /// Get number of documents collected so far
@@ -179,7 +197,11 @@ impl ScoreCollector {
             .collect();
 
         // Sort by score descending, then doc_id ascending
-        results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        results.sort_unstable_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.2.cmp(&b.2))
+        });
 
         results
     }
@@ -783,7 +805,7 @@ macro_rules! bms_execute_loop {
                     mask &= mask - 1;
                 }
 
-                if present_upper + non_essential_upper <= adjusted_threshold {
+                if present_upper + non_essential_upper < adjusted_threshold {
                     let mut mask = at_min_mask;
                     while mask != 0 {
                         let i = mask.trailing_zeros() as usize;
@@ -806,7 +828,7 @@ macro_rules! bms_execute_loop {
                     mask &= mask - 1;
                 }
 
-                if block_max_sum + non_essential_upper <= adjusted_threshold {
+                if block_max_sum + non_essential_upper < adjusted_threshold {
                     let mut mask = at_min_mask;
                     while mask != 0 {
                         let i = mask.trailing_zeros() as usize;
@@ -853,7 +875,7 @@ macro_rules! bms_execute_loop {
 
             let essential_total: f32 = ordinal_scores.iter().map(|(_, s)| *s).sum();
             if $self.collector.len() >= $self.collector.k
-                && essential_total + non_essential_upper <= adjusted_threshold
+                && essential_total + non_essential_upper < adjusted_threshold
             {
                 docs_skipped += 1;
                 continue;
@@ -863,7 +885,7 @@ macro_rules! bms_execute_loop {
             let mut running_total = essential_total;
             for i in (0..partition).rev() {
                 if $self.collector.len() >= $self.collector.k
-                    && running_total + $self.prefix_sums[i] <= adjusted_threshold
+                    && running_total + $self.prefix_sums[i] < adjusted_threshold
                 {
                     break;
                 }
@@ -965,6 +987,18 @@ impl<'a> MaxScoreExecutor<'a> {
     /// Cursors are sorted by max_score ascending (non-essential first) and
     /// prefix sums are computed for the MaxScore partitioning.
     pub(crate) fn new(mut cursors: Vec<TermCursor<'a>>, k: usize, heap_factor: f32) -> Self {
+        // The execution loop tracks cursors at the current document in a u64.
+        // Query construction normally enforces this bound, but keep this
+        // boundary defensive for direct/internal executor users as well.
+        if cursors.len() > super::MAX_QUERY_TERMS {
+            cursors.sort_unstable_by(|a, b| b.max_score.total_cmp(&a.max_score));
+            cursors.truncate(super::MAX_QUERY_TERMS);
+            log::warn!(
+                "MaxScore cursor count exceeded {}; retaining the strongest cursors",
+                super::MAX_QUERY_TERMS
+            );
+        }
+
         // Enable lazy ordinal decode — ordinals are only decoded when a doc
         // actually reaches the scoring phase (saves ~100ns per skipped block).
         for c in &mut cursors {
@@ -1061,7 +1095,9 @@ impl<'a> MaxScoreExecutor<'a> {
         // non-essential → more aggressive pruning (approximate retrieval).
         // Use multiplication by reciprocal (cheaper than division).
         let threshold = self.collector.threshold() * self.inv_heap_factor;
-        self.prefix_sums.partition_point(|&sum| sum <= threshold)
+        // Keep an equal-score candidate essential: it can still displace the
+        // current worst hit through the deterministic doc/ordinal tie-break.
+        self.prefix_sums.partition_point(|&sum| sum < threshold)
     }
 
     /// Attach a per-doc predicate filter to this executor.

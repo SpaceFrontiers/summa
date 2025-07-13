@@ -124,6 +124,117 @@ async fn test_vector_index_threshold_switch() {
     assert!(writer.segment_manager.trained().is_some());
 }
 
+#[tokio::test]
+async fn rebuild_rejects_segments_bound_to_the_current_artifact_generation() {
+    use crate::dsl::DenseVectorConfig;
+
+    let mut schema_builder = SchemaBuilder::default();
+    let embedding = schema_builder.add_dense_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        DenseVectorConfig::with_ivf(4, Some(1), 1),
+    );
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // Segments committed before training remain flat and provide the sample.
+    for i in 0..4 {
+        let mut doc = Document::new();
+        doc.add_dense_vector(embedding, vec![i as f32; 4]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let old_version = writer.segment_manager.trained().unwrap().centroids[&embedding.0].version;
+
+    // Once trained, a newly committed segment embeds that exact centroid
+    // generation in its IVF data.
+    let mut doc = Document::new();
+    doc.add_dense_vector(embedding, vec![10.0; 4]);
+    writer.add_document(doc).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert!(
+        index
+            .segment_readers()
+            .await
+            .unwrap()
+            .iter()
+            .any(|segment| matches!(
+                segment.vector_indexes().get(&embedding.0),
+                Some(crate::segment::VectorIndex::IVF(_))
+            ))
+    );
+    drop(index);
+
+    let error = writer
+        .rebuild_vector_index()
+        .await
+        .expect_err("retraining must reject an existing IVF generation")
+        .to_string();
+    assert!(
+        error.contains("already contains an IVF/ScaNN index"),
+        "{error}"
+    );
+    assert!(
+        writer
+            .segment_manager
+            .read_metadata(|metadata| metadata.is_field_built(embedding.0))
+            .await
+    );
+    assert_eq!(
+        writer.segment_manager.trained().unwrap().centroids[&embedding.0].version,
+        old_version,
+        "a rejected rebuild must leave the published generation untouched"
+    );
+
+    // Simulate metadata left Flat by a crash-interrupted rebuild from an older
+    // Hermes release. The ordinary build entry point must inspect the segment
+    // generation too; trusting metadata alone would silently replace artifacts
+    // still required by the committed IVF segment.
+    writer
+        .segment_manager
+        .update_metadata(|metadata| {
+            let field = metadata.vector_fields.get_mut(&embedding.0).unwrap();
+            field.state = crate::index::VectorIndexState::Flat;
+            field.centroids_file = None;
+            field.codebook_file = None;
+            metadata.refresh_total_vectors();
+        })
+        .await
+        .unwrap();
+    let error = writer
+        .build_vector_index()
+        .await
+        .expect_err("ordinary training must reject a stale Flat metadata state")
+        .to_string();
+    assert!(
+        error.contains("already contains an IVF/ScaNN index"),
+        "{error}"
+    );
+    assert!(
+        !writer
+            .segment_manager
+            .read_metadata(|metadata| metadata.is_field_built(embedding.0))
+            .await,
+        "a rejected recovery build must not mutate metadata"
+    );
+    assert_eq!(
+        writer.segment_manager.trained().unwrap().centroids[&embedding.0].version,
+        old_version,
+        "a rejected recovery build must not replace the published generation"
+    );
+}
+
 /// Sparse vector needle-in-haystack: one document with unique dimensions.
 #[tokio::test]
 async fn test_needle_sparse_vector() {
@@ -893,6 +1004,24 @@ async fn search_fused_hybrid_union_impl() {
         )
         .await
         .unwrap();
+    let (counted_fused, total_seen) = searcher
+        .search_fused_with_count(
+            &[(&text_query, 1.0), (&dense_query, 1.0)],
+            10,
+            10,
+            FusionMethod::default(),
+            crate::query::MultiValueCombiner::Max,
+        )
+        .await
+        .unwrap();
+    assert!(total_seen > 0);
+    assert_eq!(
+        fused.iter().map(|result| result.doc_id).collect::<Vec<_>>(),
+        counted_fused
+            .iter()
+            .map(|result| result.doc_id)
+            .collect::<Vec<_>>()
+    );
 
     // Union semantics: text-only, dense-only, and both-match docs all present
     assert!(fused.len() >= 3, "expected at least 3 fused results");

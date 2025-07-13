@@ -212,6 +212,77 @@ pub struct PQCodebook {
 }
 
 impl PQCodebook {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let config = &self.config;
+        if config.dim == 0
+            || config.num_subspaces == 0
+            || config.dims_per_block == 0
+            || config.num_centroids == 0
+            || config.num_centroids > 256
+        {
+            return Err("PQ codebook has invalid zero/unbounded dimensions".to_string());
+        }
+        let covered_dim = config
+            .num_subspaces
+            .checked_mul(config.dims_per_block)
+            .ok_or_else(|| "PQ subspace dimension overflow".to_string())?;
+        if covered_dim != config.dim {
+            return Err(format!(
+                "PQ subspaces cover {covered_dim} dimensions, expected {}",
+                config.dim
+            ));
+        }
+        if !config.aniso_eta.is_finite()
+            || config.aniso_eta < 0.0
+            || !config.aniso_threshold.is_finite()
+        {
+            return Err(
+                "PQ anisotropic eta must be non-negative and all parameters must be finite"
+                    .to_string(),
+            );
+        }
+        let expected_centroids = config
+            .num_subspaces
+            .checked_mul(config.num_centroids)
+            .and_then(|count| count.checked_mul(config.dims_per_block))
+            .ok_or_else(|| "PQ centroid size overflow".to_string())?;
+        if self.centroids.len() != expected_centroids
+            || self.centroids.iter().any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "PQ centroid table is invalid: got {}, expected {expected_centroids}",
+                self.centroids.len()
+            ));
+        }
+        if let Some(rotation) = &self.rotation_matrix {
+            let expected = config
+                .dim
+                .checked_mul(config.dim)
+                .ok_or_else(|| "PQ rotation size overflow".to_string())?;
+            if rotation.len() != expected || rotation.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "PQ rotation matrix is invalid: got {}, expected {expected}",
+                    rotation.len()
+                ));
+            }
+        }
+        if let Some(norms) = &self.centroid_norms {
+            let expected = config
+                .num_subspaces
+                .checked_mul(config.num_centroids)
+                .ok_or_else(|| "PQ norm table size overflow".to_string())?;
+            if norms.len() != expected
+                || norms.iter().any(|value| !value.is_finite() || *value < 0.0)
+            {
+                return Err(format!(
+                    "PQ centroid norm table is invalid: got {}, expected {expected}",
+                    norms.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Train codebook with OPQ rotation and anisotropic loss
     #[cfg(feature = "native")]
     pub fn train(config: PQConfig, vectors: &[Vec<f32>], max_iters: usize) -> Self {
@@ -604,7 +675,7 @@ impl PQCodebook {
                     .sum();
                 (c, dist)
             })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(c, _)| c)
             .unwrap_or(0)
     }

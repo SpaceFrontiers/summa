@@ -33,6 +33,7 @@
 //!
 //! Independent bookkeeping (never held with `state`):
 //!   trained                — arc_swap::ArcSwapOption, lock-free
+//!   vector_artifact_update — atomic producer gate, held across manual training
 //!   merge_handles          — parking_lot::Mutex, synchronous short hold
 //!   lifecycle_handles      — parking_lot::Mutex, synchronous short hold
 //!   merge/reorder permits  — tokio semaphores shared by configuration
@@ -71,6 +72,8 @@ use super::{MergePolicy, SegmentInfo};
 /// new output only and live from before the first write through commit/abort.
 struct ActiveOperationState {
     segment_ids: HashSet<String>,
+    operation_tokens: HashSet<u64>,
+    next_operation_token: u64,
     accepting: bool,
 }
 
@@ -85,6 +88,8 @@ impl ActiveSegmentOperations {
         Self {
             inner: parking_lot::Mutex::new(ActiveOperationState {
                 segment_ids: HashSet::new(),
+                operation_tokens: HashSet::new(),
+                next_operation_token: 0,
                 accepting: true,
             }),
             idle: Notify::new(),
@@ -116,18 +121,31 @@ impl ActiveSegmentOperations {
             segment_ids.len(),
             inner.segment_ids.len() + segment_ids.len()
         );
+        let operation_token = inner.next_operation_token;
+        let next_operation_token = operation_token.checked_add(1)?;
         for id in &segment_ids {
             inner.segment_ids.insert(id.clone());
         }
+        inner.next_operation_token = next_operation_token;
+        inner.operation_tokens.insert(operation_token);
         Some(SegmentOperationGuard {
             active_operations: Arc::clone(self),
             segment_ids,
+            operation_token,
         })
     }
 
     /// Snapshot of all IDs owned by active operations.
     fn snapshot(&self) -> HashSet<String> {
         self.inner.lock().segment_ids.clone()
+    }
+
+    /// Exact operation identities active at one instant. Unlike segment IDs,
+    /// tokens cannot be reused by a later retry, so an artifact-update barrier
+    /// can drain only pre-gate producers without being starved by new flat
+    /// producers.
+    fn operation_tokens_snapshot(&self) -> HashSet<u64> {
+        self.inner.lock().operation_tokens.clone()
     }
 
     /// Atomically prevent new lifecycle work from starting. Existing guards
@@ -158,6 +176,16 @@ impl ActiveSegmentOperations {
         }
     }
 
+    async fn wait_until_operations_finish(&self, operations: &HashSet<u64>) {
+        while !operations.is_empty() {
+            let notified = self.idle.notified();
+            if self.inner.lock().operation_tokens.is_disjoint(operations) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Resolve when shutdown starts, without missing a notification between
     /// checking the state and registering the waiter.
     async fn wait_for_shutdown(&self) {
@@ -177,6 +205,7 @@ impl ActiveSegmentOperations {
 pub(crate) struct SegmentOperationGuard {
     active_operations: Arc<ActiveSegmentOperations>,
     segment_ids: Vec<String>,
+    operation_token: u64,
 }
 
 impl Drop for SegmentOperationGuard {
@@ -185,10 +214,36 @@ impl Drop for SegmentOperationGuard {
         for id in &self.segment_ids {
             inner.segment_ids.remove(id);
         }
+        inner.operation_tokens.remove(&self.operation_token);
+        // Token barriers need notification on every completion, not only the
+        // transition to complete global idleness.
+        self.active_operations.idle.notify_waiters();
         if inner.segment_ids.is_empty() {
-            self.active_operations.idle.notify_waiters();
+            debug_assert!(inner.operation_tokens.is_empty());
         }
     }
+}
+
+/// Exclusive gate for an index-level trained-vector artifact update.
+///
+/// Segment producers consult this gate before capturing the current trained
+/// structures. Once the gate is raised, new producers deliberately emit flat
+/// vector data; waiting for already-active producers to drain then guarantees
+/// that no segment using the previous generation can appear after a rebuild
+/// safety check.
+struct VectorArtifactUpdateLease {
+    updating: Arc<AtomicBool>,
+}
+
+impl Drop for VectorArtifactUpdateLease {
+    fn drop(&mut self) {
+        self.updating.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VectorArtifactUpdateGuard {
+    _lease: Arc<VectorArtifactUpdateLease>,
 }
 
 /// Merge-time/manual BP pools are shared by every index in this process.
@@ -367,7 +422,14 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     lifecycle_handles: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
 
     /// Trained vector structures — lock-free reads via ArcSwap.
-    trained: ArcSwapOption<TrainedVectorStructures>,
+    /// Wrapped in `Arc` so cancellation-safe metadata transactions can publish
+    /// the matching in-memory generation after their durable commit point.
+    trained: Arc<ArcSwapOption<TrainedVectorStructures>>,
+
+    /// Raised while index-level trained artifacts and their metadata are being
+    /// replaced. Search readers keep using the last valid generation, while
+    /// segment producers fall back to flat output until publication completes.
+    vector_artifact_update: Arc<AtomicBool>,
 
     /// Reference counting for safe segment deletion (sync Mutex for Drop).
     tracker: Arc<SegmentTracker>,
@@ -496,7 +558,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             merge_handles: parking_lot::Mutex::new(Vec::new()),
             global_merge_wakeup_pending: AtomicBool::new(false),
             lifecycle_handles,
-            trained: ArcSwapOption::new(None),
+            trained: Arc::new(ArcSwapOption::new(None)),
+            vector_artifact_update: Arc::new(AtomicBool::new(false)),
             tracker,
             delete_fn,
             directory,
@@ -863,25 +926,121 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.trained.load_full()
     }
 
+    /// Capture trained structures for a segment producer.
+    ///
+    /// The second gate check closes the race where an update begins after the
+    /// first check but before the ArcSwap load. Producers have lifecycle guards
+    /// before calling this method, so an updater that raised the gate waits for
+    /// any producer that successfully captured the previous generation.
+    pub(crate) fn trained_for_segment_build(&self) -> Option<Arc<TrainedVectorStructures>> {
+        if self.vector_artifact_update.load(Ordering::Acquire) {
+            return None;
+        }
+        let trained = self.trained.load_full();
+        if self.vector_artifact_update.load(Ordering::Acquire) {
+            None
+        } else {
+            trained
+        }
+    }
+
+    /// Start an exclusive trained-artifact update and drain producers that may
+    /// already hold the previous generation.
+    ///
+    /// New segment operations may continue while this waits, but they observe
+    /// the gate through `trained_for_segment_build` and therefore emit flat
+    /// vector data. The guard is cancellation-safe: dropping the requesting
+    /// future reopens ANN production without leaving the manager wedged.
+    pub(crate) async fn begin_vector_artifact_update(&self) -> Result<VectorArtifactUpdateGuard> {
+        self.vector_artifact_update
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                Error::Internal("a trained-vector artifact update is already in progress".into())
+            })?;
+        let guard = VectorArtifactUpdateGuard {
+            _lease: Arc::new(VectorArtifactUpdateLease {
+                updating: Arc::clone(&self.vector_artifact_update),
+            }),
+        };
+        let preexisting = self.active_operations.operation_tokens_snapshot();
+        self.active_operations
+            .wait_until_operations_finish(&preexisting)
+            .await;
+        Ok(guard)
+    }
+
+    /// Compatibility entry point: load the complete trained set or clear the
+    /// published generation and log the validation failure.
+    pub async fn load_and_publish_trained(&self) {
+        if let Err(error) = self.try_load_and_publish_trained().await {
+            self.trained.store(None);
+            log::error!("[trained] refusing to publish trained artifacts: {error}");
+        }
+    }
+
     /// Load trained structures from disk and publish to ArcSwap.
     /// Copies metadata under lock, releases lock, then does disk I/O.
-    pub async fn load_and_publish_trained(&self) {
+    pub(crate) async fn try_load_and_publish_trained(&self) -> Result<()> {
         // Copy vector_fields under lock (cheap clone of HashMap<u32, FieldMeta>)
         let vector_fields = {
             let st = self.state.lock().await;
             st.metadata.vector_fields.clone()
         };
         // Disk I/O happens WITHOUT holding the state lock
-        let trained =
-            IndexMetadata::load_trained_from_fields(&vector_fields, self.directory.as_ref()).await;
-        if let Some(t) = trained {
-            self.trained.store(Some(Arc::new(t)));
-        }
+        let trained = IndexMetadata::try_load_trained_from_fields(
+            &vector_fields,
+            self.schema.as_ref(),
+            self.directory.as_ref(),
+        )
+        .await?
+        .map(Arc::new);
+        // Publish exactly the validated snapshot, including None. Retaining a
+        // previous map when metadata has no Built fields would let new segments
+        // depend on artifacts no longer referenced durably.
+        self.trained.store(trained);
+        Ok(())
     }
 
-    /// Clear trained structures (sets ArcSwap to None)
-    pub(crate) fn clear_trained(&self) {
-        self.trained.store(None);
+    /// Persist vector metadata and publish its fully validated artifact set as
+    /// one cancellation-safe lifecycle transaction.
+    ///
+    /// Validation happens before the durable metadata commit. Once the rename
+    /// commits, both in-memory metadata and ArcSwap publication are completed by
+    /// the tracked transaction even if the requesting RPC is cancelled.
+    pub(crate) async fn update_vector_metadata_and_publish<F>(
+        self: &Arc<Self>,
+        artifact_update: &VectorArtifactUpdateGuard,
+        update: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut IndexMetadata),
+    {
+        let mut st = Arc::clone(&self.state).lock_owned().await;
+        let mut next = st.metadata.clone();
+        update(&mut next);
+
+        let next_trained = IndexMetadata::try_load_trained_from_fields(
+            &next.vector_fields,
+            self.schema.as_ref(),
+            self.directory.as_ref(),
+        )
+        .await?
+        .map(Arc::new);
+
+        let directory = Arc::clone(&self.directory);
+        let trained = Arc::clone(&self.trained);
+        // Keep the producer gate raised if the requesting future is cancelled
+        // after the metadata transaction has been detached. The last guard
+        // clone drops only after durable metadata and ArcSwap state agree.
+        let artifact_update = artifact_update.clone();
+        self.run_lifecycle_transaction(async move {
+            let _artifact_update = artifact_update;
+            next.save(directory.as_ref()).await?;
+            st.metadata = next;
+            trained.store(next_trained);
+            Ok(())
+        })
+        .await
     }
 
     /// Read metadata with a closure (no persist)
@@ -1127,7 +1286,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let mut reevaluate = false;
             let mut retry_delay = None;
 
-            let trained_snap = sm.trained();
+            let trained_snap = sm.trained_for_segment_build();
             let granularity = sm.merge_granularity(&ids).await;
             let result = Self::do_merge(
                 sm.directory.as_ref(),
@@ -1696,7 +1855,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
             let mut output_cleanup = self.output_cleanup_guard(output_id);
 
-            let trained_snap = self.trained();
+            let trained_snap = self.trained_for_segment_build();
             let granularity = self.merge_granularity(&batch).await;
             let merge_result = Self::do_merge(
                 self.directory.as_ref(),
@@ -2210,6 +2369,59 @@ mod tests {
         assert!(snap.contains("x"));
         assert!(snap.contains("y"));
         assert!(!snap.contains("z"));
+    }
+
+    #[tokio::test]
+    async fn operation_barrier_ignores_producers_started_after_snapshot() {
+        let active = Arc::new(ActiveSegmentOperations::new());
+        let before_gate = active.try_register(vec!["old".into()]).unwrap();
+        let barrier = active.operation_tokens_snapshot();
+        let after_gate = active.try_register(vec!["new-flat".into()]).unwrap();
+
+        let waiter = {
+            let active = Arc::clone(&active);
+            tokio::spawn(async move { active.wait_until_operations_finish(&barrier).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        drop(before_gate);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("pre-gate operation barrier was starved by a post-gate producer")
+            .unwrap();
+        assert!(active.snapshot().contains("new-flat"));
+        drop(after_gate);
+    }
+
+    #[tokio::test]
+    async fn artifact_update_gate_preserves_search_generation_but_forces_flat_producers() {
+        let manager = lifecycle_test_manager();
+        manager
+            .trained
+            .store(Some(Arc::new(TrainedVectorStructures {
+                centroids: rustc_hash::FxHashMap::default(),
+                codebooks: rustc_hash::FxHashMap::default(),
+            })));
+
+        let guard = manager.begin_vector_artifact_update().await.unwrap();
+        assert!(
+            manager.trained().is_some(),
+            "search readers keep the last fully validated generation"
+        );
+        assert!(
+            manager.trained_for_segment_build().is_none(),
+            "new segment producers must stay flat during an artifact update"
+        );
+
+        let detached_transaction_guard = guard.clone();
+        drop(guard);
+        assert!(
+            manager.trained_for_segment_build().is_none(),
+            "a detached lifecycle transaction must retain the producer gate after request cancellation"
+        );
+        drop(detached_transaction_guard);
+        assert!(manager.trained_for_segment_build().is_some());
     }
 
     #[tokio::test]

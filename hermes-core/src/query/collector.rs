@@ -105,6 +105,14 @@ fn is_zero_u128(v: &u128) -> bool {
     *v == 0
 }
 
+/// Canonical result order used by search, reranking, fusion, and pagination.
+pub(crate) fn compare_search_results_desc(a: &SearchResult, b: &SearchResult) -> Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.segment_id.cmp(&b.segment_id))
+        .then_with(|| a.doc_id.cmp(&b.doc_id))
+}
+
 /// Matched field info with ordinals (for multi-valued fields)
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MatchedField {
@@ -176,7 +184,9 @@ pub struct SearchResponse {
 
 impl PartialEq for SearchResult {
     fn eq(&self, other: &Self) -> bool {
-        self.segment_id == other.segment_id && self.doc_id == other.doc_id
+        self.score.to_bits() == other.score.to_bits()
+            && self.segment_id == other.segment_id
+            && self.doc_id == other.doc_id
     }
 }
 
@@ -192,8 +202,7 @@ impl Ord for SearchResult {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .score
-            .partial_cmp(&self.score)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&self.score)
             .then_with(|| self.segment_id.cmp(&other.segment_id))
             .then_with(|| self.doc_id.cmp(&other.doc_id))
     }
@@ -207,6 +216,20 @@ pub trait Collector {
     /// Called for each matching document
     /// positions: Vec of (field_id, scored_positions)
     fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]);
+
+    /// Whether this score can enter the collector's retained result set.
+    ///
+    /// The scorer still calls `collect` when this returns false so counters and
+    /// other side effects remain exact; it only skips materializing positions.
+    fn would_collect(&self, _doc_id: DocId, _score: Score) -> bool {
+        true
+    }
+
+    /// Collect already-owned positions. Position-aware collectors can override
+    /// this to move the nested vectors instead of cloning them.
+    fn collect_owned(&mut self, doc_id: DocId, score: Score, positions: super::MatchedPositions) {
+        self.collect(doc_id, score, &positions);
+    }
 
     /// Whether this collector needs position information
     fn needs_positions(&self) -> bool {
@@ -223,10 +246,16 @@ pub struct TopKCollector {
     total_seen: u32,
 }
 
+// Avoid trusting a caller-controlled `k` as an up-front allocation size. The
+// heap still grows to the number of results actually retained, but malformed
+// or overly broad requests cannot reserve gigabytes once per segment before
+// any document has been scored.
+const MAX_INITIAL_TOP_K_CAPACITY: usize = 8 * 1024;
+
 impl TopKCollector {
     pub fn new(k: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(k + 1),
+            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_TOP_K_CAPACITY)),
             k,
             collect_positions: false,
             total_seen: 0,
@@ -236,7 +265,7 @@ impl TopKCollector {
     /// Create a collector that also collects positions
     pub fn with_positions(k: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(k + 1),
+            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_TOP_K_CAPACITY)),
             k,
             collect_positions: true,
             total_seen: 0,
@@ -250,12 +279,7 @@ impl TopKCollector {
 
     pub fn into_sorted_results(self) -> Vec<SearchResult> {
         let mut results: Vec<_> = self.heap.into_vec();
-        results.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.doc_id.cmp(&b.doc_id))
-        });
+        results.sort_unstable_by(compare_search_results_desc);
         results
     }
 
@@ -273,9 +297,7 @@ impl Collector for TopKCollector {
         // Only clone positions when the document will actually be kept in the heap.
         // This avoids deep-cloning Vec<ScoredPosition> for documents that are
         // immediately discarded (the common case for large result sets).
-        let dominated =
-            self.heap.len() >= self.k && self.heap.peek().is_some_and(|min| score <= min.score);
-        if dominated {
+        if !self.would_collect(doc_id, score) {
             return;
         }
 
@@ -293,6 +315,37 @@ impl Collector for TopKCollector {
             score,
             segment_id: 0,
             positions,
+        });
+    }
+
+    fn would_collect(&self, doc_id: DocId, score: Score) -> bool {
+        self.k > 0
+            && (self.heap.len() < self.k
+                || self.heap.peek().is_some_and(|min| {
+                    score.total_cmp(&min.score).is_gt()
+                        || (score.total_cmp(&min.score).is_eq() && doc_id < min.doc_id)
+                }))
+    }
+
+    fn collect_owned(&mut self, doc_id: DocId, score: Score, positions: super::MatchedPositions) {
+        self.total_seen = self.total_seen.saturating_add(1);
+
+        if !self.would_collect(doc_id, score) {
+            return;
+        }
+
+        if self.heap.len() >= self.k {
+            self.heap.pop();
+        }
+        self.heap.push(SearchResult {
+            doc_id,
+            score,
+            segment_id: 0,
+            positions: if self.collect_positions {
+                positions
+            } else {
+                Vec::new()
+            },
         });
     }
 
@@ -336,8 +389,9 @@ pub async fn search_segment_with_count(
     query: &dyn Query,
     limit: usize,
 ) -> Result<(Vec<SearchResult>, u32)> {
-    let mut collector = TopKCollector::new(limit);
-    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = TopKCollector::new(segment_limit);
+    collect_segment_with_limit(reader, query, &mut collector, segment_limit).await?;
     Ok(collector.into_results_with_count())
 }
 
@@ -347,9 +401,35 @@ pub async fn search_segment_with_positions_and_count(
     query: &dyn Query,
     limit: usize,
 ) -> Result<(Vec<SearchResult>, u32)> {
-    let mut collector = TopKCollector::with_positions(limit);
-    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = TopKCollector::with_positions(segment_limit);
+    collect_segment_with_limit(reader, query, &mut collector, segment_limit).await?;
     Ok(collector.into_results_with_count())
+}
+
+/// Return positions for the next collector that can retain them. All but the
+/// final consumer receive a clone; the final consumer takes the original
+/// allocation. Tuple collectors use this to avoid a deep clone when only one
+/// child actually needs positions (the common top-k + count case).
+fn positions_for_next_collector(
+    positions: &mut Option<super::MatchedPositions>,
+    remaining_consumers: &mut usize,
+) -> super::MatchedPositions {
+    assert!(
+        *remaining_consumers > 0,
+        "position consumer count underflow"
+    );
+    *remaining_consumers -= 1;
+    if *remaining_consumers == 0 {
+        positions
+            .take()
+            .expect("owned positions must remain for the final collector")
+    } else {
+        positions
+            .as_ref()
+            .cloned()
+            .expect("owned positions must remain while collectors are pending")
+    }
 }
 
 // Implement Collector for tuple of 2 collectors
@@ -360,6 +440,37 @@ impl<A: Collector, B: Collector> Collector for (&mut A, &mut B) {
     }
     fn needs_positions(&self) -> bool {
         self.0.needs_positions() || self.1.needs_positions()
+    }
+    fn would_collect(&self, doc_id: DocId, score: Score) -> bool {
+        (self.0.needs_positions() && self.0.would_collect(doc_id, score))
+            || (self.1.needs_positions() && self.1.would_collect(doc_id, score))
+    }
+    fn collect_owned(&mut self, doc_id: DocId, score: Score, positions: super::MatchedPositions) {
+        let wants = [
+            self.0.needs_positions() && self.0.would_collect(doc_id, score),
+            self.1.needs_positions() && self.1.would_collect(doc_id, score),
+        ];
+        let mut remaining = wants.iter().filter(|&&want| want).count();
+        let mut positions = Some(positions);
+
+        if wants[0] {
+            self.0.collect_owned(
+                doc_id,
+                score,
+                positions_for_next_collector(&mut positions, &mut remaining),
+            );
+        } else {
+            self.0.collect(doc_id, score, &[]);
+        }
+        if wants[1] {
+            self.1.collect_owned(
+                doc_id,
+                score,
+                positions_for_next_collector(&mut positions, &mut remaining),
+            );
+        } else {
+            self.1.collect(doc_id, score, &[]);
+        }
     }
 }
 
@@ -372,6 +483,48 @@ impl<A: Collector, B: Collector, C: Collector> Collector for (&mut A, &mut B, &m
     }
     fn needs_positions(&self) -> bool {
         self.0.needs_positions() || self.1.needs_positions() || self.2.needs_positions()
+    }
+    fn would_collect(&self, doc_id: DocId, score: Score) -> bool {
+        (self.0.needs_positions() && self.0.would_collect(doc_id, score))
+            || (self.1.needs_positions() && self.1.would_collect(doc_id, score))
+            || (self.2.needs_positions() && self.2.would_collect(doc_id, score))
+    }
+    fn collect_owned(&mut self, doc_id: DocId, score: Score, positions: super::MatchedPositions) {
+        let wants = [
+            self.0.needs_positions() && self.0.would_collect(doc_id, score),
+            self.1.needs_positions() && self.1.would_collect(doc_id, score),
+            self.2.needs_positions() && self.2.would_collect(doc_id, score),
+        ];
+        let mut remaining = wants.iter().filter(|&&want| want).count();
+        let mut positions = Some(positions);
+
+        if wants[0] {
+            self.0.collect_owned(
+                doc_id,
+                score,
+                positions_for_next_collector(&mut positions, &mut remaining),
+            );
+        } else {
+            self.0.collect(doc_id, score, &[]);
+        }
+        if wants[1] {
+            self.1.collect_owned(
+                doc_id,
+                score,
+                positions_for_next_collector(&mut positions, &mut remaining),
+            );
+        } else {
+            self.1.collect(doc_id, score, &[]);
+        }
+        if wants[2] {
+            self.2.collect_owned(
+                doc_id,
+                score,
+                positions_for_next_collector(&mut positions, &mut remaining),
+            );
+        } else {
+            self.2.collect(doc_id, score, &[]);
+        }
     }
 }
 
@@ -415,7 +568,10 @@ pub async fn collect_segment_with_limit<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
-    let mut scorer = query.scorer(reader, limit).await?;
+    let options = super::ScorerOptions {
+        collect_positions: collector.needs_positions(),
+    };
+    let mut scorer = query.scorer_with_options(reader, limit, options).await?;
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }
@@ -425,11 +581,12 @@ fn drive_scorer<C: Collector>(scorer: &mut dyn super::Scorer, collector: &mut C)
     let needs_positions = collector.needs_positions();
     let mut doc = scorer.doc();
     while doc != TERMINATED {
-        if needs_positions {
+        let score = scorer.score();
+        if needs_positions && collector.would_collect(doc, score) {
             let positions = scorer.matched_positions().unwrap_or_default();
-            collector.collect(doc, scorer.score(), &positions);
+            collector.collect_owned(doc, score, positions);
         } else {
-            collector.collect(doc, scorer.score(), &[]);
+            collector.collect(doc, score, &[]);
         }
         doc = scorer.advance();
     }
@@ -444,8 +601,9 @@ pub fn search_segment_with_count_sync(
     query: &dyn Query,
     limit: usize,
 ) -> Result<(Vec<SearchResult>, u32)> {
-    let mut collector = TopKCollector::new(limit);
-    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = TopKCollector::new(segment_limit);
+    collect_segment_with_limit_sync(reader, query, &mut collector, segment_limit)?;
     Ok(collector.into_results_with_count())
 }
 
@@ -456,8 +614,9 @@ pub fn search_segment_with_positions_and_count_sync(
     query: &dyn Query,
     limit: usize,
 ) -> Result<(Vec<SearchResult>, u32)> {
-    let mut collector = TopKCollector::with_positions(limit);
-    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = TopKCollector::with_positions(segment_limit);
+    collect_segment_with_limit_sync(reader, query, &mut collector, segment_limit)?;
     Ok(collector.into_results_with_count())
 }
 
@@ -469,7 +628,10 @@ pub fn collect_segment_with_limit_sync<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
-    let mut scorer = query.scorer_sync(reader, limit)?;
+    let options = super::ScorerOptions {
+        collect_positions: collector.needs_positions(),
+    };
+    let mut scorer = query.scorer_sync_with_options(reader, limit, options)?;
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }
@@ -477,6 +639,81 @@ pub fn collect_segment_with_limit_sync<C: Collector>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[derive(Default)]
+    struct OwnedPositionCollector {
+        owned_calls: usize,
+        borrowed_calls: usize,
+        positions: super::super::MatchedPositions,
+    }
+
+    impl Collector for OwnedPositionCollector {
+        fn collect(
+            &mut self,
+            _doc_id: DocId,
+            _score: Score,
+            positions: &[(u32, Vec<ScoredPosition>)],
+        ) {
+            self.borrowed_calls += 1;
+            self.positions = positions.to_vec();
+        }
+
+        fn collect_owned(
+            &mut self,
+            _doc_id: DocId,
+            _score: Score,
+            positions: super::super::MatchedPositions,
+        ) {
+            self.owned_calls += 1;
+            self.positions = positions;
+        }
+
+        fn needs_positions(&self) -> bool {
+            true
+        }
+    }
+
+    struct PositionCountingScorer {
+        index: usize,
+        position_calls: Arc<AtomicUsize>,
+    }
+
+    impl super::super::DocSet for PositionCountingScorer {
+        fn doc(&self) -> DocId {
+            if self.index < 3 {
+                self.index as DocId
+            } else {
+                TERMINATED
+            }
+        }
+
+        fn advance(&mut self) -> DocId {
+            self.index += 1;
+            self.doc()
+        }
+
+        fn seek(&mut self, target: DocId) -> DocId {
+            self.index = target.min(3) as usize;
+            self.doc()
+        }
+
+        fn size_hint(&self) -> u32 {
+            3u32.saturating_sub(self.index as u32)
+        }
+    }
+
+    impl super::super::Scorer for PositionCountingScorer {
+        fn score(&self) -> Score {
+            [10.0, 1.0, 2.0][self.index]
+        }
+
+        fn matched_positions(&self) -> Option<super::super::MatchedPositions> {
+            self.position_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Some(vec![(7, vec![ScoredPosition::new(self.index as u32, 1.0)])])
+        }
+    }
 
     #[test]
     fn test_top_k_collector() {
@@ -494,6 +731,72 @@ mod tests {
         assert_eq!(results[0].doc_id, 3); // score 4.0
         assert_eq!(results[1].doc_id, 1); // score 3.0
         assert_eq!(results[2].doc_id, 2); // score 2.0
+    }
+
+    #[test]
+    fn top_k_zero_retains_no_results() {
+        let mut collector = TopKCollector::new(0);
+        collector.collect(1, 1.0, &[]);
+
+        assert!(collector.into_sorted_results().is_empty());
+    }
+
+    #[test]
+    fn huge_top_k_does_not_trigger_a_huge_initial_allocation() {
+        let collector = TopKCollector::new(usize::MAX);
+
+        assert!(collector.heap.capacity() <= MAX_INITIAL_TOP_K_CAPACITY);
+    }
+
+    #[test]
+    fn positions_are_only_materialized_for_competitive_hits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut scorer = PositionCountingScorer {
+            index: 0,
+            position_calls: Arc::clone(&calls),
+        };
+        let mut collector = TopKCollector::with_positions(1);
+
+        drive_scorer(&mut scorer, &mut collector);
+
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(collector.total_seen(), 3);
+        let results = collector.into_sorted_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 0);
+        assert_eq!(results[0].positions[0].0, 7);
+    }
+
+    #[test]
+    fn tuple_moves_owned_positions_to_single_position_collector() {
+        let mut positions = OwnedPositionCollector::default();
+        let mut count = CountCollector::new();
+        let input = vec![(7, vec![ScoredPosition::new(3, 1.0)])];
+        let input_ptr = input[0].1.as_ptr();
+
+        (&mut positions, &mut count).collect_owned(11, 2.0, input);
+
+        assert_eq!(positions.owned_calls, 1);
+        assert_eq!(positions.borrowed_calls, 0);
+        assert_eq!(positions.positions[0].1.as_ptr(), input_ptr);
+        assert_eq!(count.count(), 1);
+    }
+
+    #[test]
+    fn tuple_clones_for_all_but_final_position_collector() {
+        let mut first = OwnedPositionCollector::default();
+        let mut second = OwnedPositionCollector::default();
+        let mut count = CountCollector::new();
+        let input = vec![(7, vec![ScoredPosition::new(3, 1.0)])];
+        let input_ptr = input[0].1.as_ptr();
+
+        (&mut first, &mut count, &mut second).collect_owned(11, 2.0, input);
+
+        assert_eq!((first.owned_calls, first.borrowed_calls), (1, 0));
+        assert_eq!((second.owned_calls, second.borrowed_calls), (1, 0));
+        assert_ne!(first.positions[0].1.as_ptr(), input_ptr);
+        assert_eq!(second.positions[0].1.as_ptr(), input_ptr);
+        assert_eq!(count.count(), 1);
     }
 
     #[test]

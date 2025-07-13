@@ -103,12 +103,21 @@ For production indexes, BP reorder resources are controlled independently:
 
 ```bash
 hermes-server --data-dir /data \
+  --search-threads 12 \
+  --max-concurrent-searches 6 \
   --optimizer-threads 16 \
   --optimizer-concurrent-passes 1 \
   --optimizer-max-unconverged-passes 3 \
   --bp-memory-budget-mb 24576
 ```
 
+- `--search-threads` bounds the process-wide CPU pool shared by nested search
+  work across every index; it defaults to one quarter of detected CPUs.
+- `--max-concurrent-searches` bounds simultaneous search pipelines and rejects
+  overload promptly instead of queueing an unbounded number of decoded RPCs.
+  Result windows, fusion/reranker work, query-tree expansion, vector payloads,
+  stored-field hydration, and response bytes also have explicit server-side
+  budgets; see [Search resource controls](hermes-server/README.md#search-resource-controls).
 - `--optimizer-threads` is the width of one process-wide Rayon pool shared by
   every index and BP path. An active pass intentionally keeps that pool busy;
   lower this value when search or indexing needs more CPU. `0` disables the

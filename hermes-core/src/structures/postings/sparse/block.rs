@@ -209,7 +209,7 @@ impl SparseBlock {
             out.resize(count, 0u16);
         } else {
             // SIMD-accelerated unpack (bits is always 8, 16, or 32)
-            let mut temp = [0u32; BLOCK_SIZE];
+            let mut temp = [0u32; MAX_BLOCK_SIZE];
             simd::unpack_rounded(
                 &self.ordinals_data,
                 simd::RoundedBitWidth::from_u8(self.header.ordinal_bits),
@@ -527,8 +527,8 @@ impl BlockSparsePostingList {
             });
         }
 
-        let block_size = block_size.max(16); // minimum 16 for sanity
-        let mut blocks = Vec::new();
+        let block_size = block_size.clamp(16, MAX_BLOCK_SIZE);
+        let mut blocks = Vec::with_capacity(postings.len().div_ceil(block_size));
         for chunk in postings.chunks(block_size) {
             blocks.push(SparseBlock::from_postings(chunk, weight_quant)?);
         }
@@ -1107,6 +1107,46 @@ mod tests {
         assert_eq!(block.decode_ordinals(), vec![0, 0, 1, 0]);
         let weights = block.decode_weights();
         assert!((weights[0] - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_max_size_block_ordinal_decode() {
+        let postings: Vec<(DocId, u16, f32)> = (0..MAX_BLOCK_SIZE)
+            .map(|i| (i as DocId, i as u16, i as f32 + 1.0))
+            .collect();
+        let list = BlockSparsePostingList::from_postings_with_block_size(
+            &postings,
+            WeightQuantization::Float32,
+            MAX_BLOCK_SIZE,
+        )
+        .unwrap();
+
+        assert_eq!(list.num_blocks(), 1);
+        assert_eq!(list.blocks[0].decode_ordinals().len(), MAX_BLOCK_SIZE);
+        assert_eq!(list.blocks[0].decode_ordinals()[255], 255);
+    }
+
+    #[test]
+    fn test_configurable_block_size_is_honored() {
+        let postings: Vec<(DocId, u16, f32)> = (0..300).map(|i| (i, 0, i as f32 + 1.0)).collect();
+
+        let small = BlockSparsePostingList::from_postings_with_block_size(
+            &postings,
+            WeightQuantization::Float32,
+            64,
+        )
+        .unwrap();
+        let large = BlockSparsePostingList::from_postings_with_block_size(
+            &postings,
+            WeightQuantization::Float32,
+            256,
+        )
+        .unwrap();
+
+        assert_eq!(small.num_blocks(), 5);
+        assert_eq!(small.blocks[0].header.count, 64);
+        assert_eq!(large.num_blocks(), 2);
+        assert_eq!(large.blocks[0].header.count, 256);
     }
 
     #[test]

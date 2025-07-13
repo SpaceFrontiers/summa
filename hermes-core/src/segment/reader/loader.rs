@@ -12,7 +12,9 @@ use super::bmp::BmpIndex;
 use super::{SparseIndex, VectorIndex};
 use crate::Result;
 use crate::directories::{Directory, FileHandle};
-use crate::dsl::Schema;
+use crate::dsl::{
+    BinaryIndexType, DenseVectorQuantization, Field, FieldType, Schema, VectorIndexType,
+};
 
 /// Result of loading the `.sparse` file — may contain MaxScore and/or BMP indexes.
 pub struct SparseFileData {
@@ -26,6 +28,151 @@ pub struct VectorsFileData {
     pub indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — doc_ids in memory, vectors via mmap for reranking/merge
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_sparse_dimension_skip_entries(
+    skip_section: &[u8],
+    skip_start: usize,
+    num_blocks: usize,
+    block_data_offset: u64,
+    data_end: u64,
+    total_docs: u32,
+    global_max_weight: f32,
+    field_id: u32,
+    dim_id: u32,
+) -> Result<std::ops::Range<u64>> {
+    if num_blocks == 0 {
+        return Err(crate::Error::Corruption(format!(
+            "sparse field {field_id} dimension {dim_id} has no blocks"
+        )));
+    }
+    if !global_max_weight.is_finite() || global_max_weight < 0.0 {
+        return Err(crate::Error::Corruption(format!(
+            "sparse field {field_id} dimension {dim_id} has invalid global max weight {global_max_weight}"
+        )));
+    }
+
+    let mut previous_end = 0u64;
+    let mut previous_first_doc = 0u32;
+    let mut previous_last_doc = 0u32;
+    let mut range_start = None;
+    let mut range_end = 0u64;
+    for block_index in 0..num_blocks {
+        let entry =
+            crate::structures::SparseSkipEntry::read_at(skip_section, skip_start + block_index);
+        if entry.length == 0 {
+            return Err(crate::Error::Corruption(format!(
+                "sparse field {field_id} dimension {dim_id} block {block_index} is empty"
+            )));
+        }
+        if entry.first_doc > entry.last_doc || entry.last_doc >= total_docs {
+            return Err(crate::Error::Corruption(format!(
+                "sparse field {field_id} dimension {dim_id} block {block_index} has invalid document range {}..={} for {total_docs} documents",
+                entry.first_doc, entry.last_doc
+            )));
+        }
+        if !entry.max_weight.is_finite()
+            || entry.max_weight < 0.0
+            || entry.max_weight > global_max_weight
+        {
+            return Err(crate::Error::Corruption(format!(
+                "sparse field {field_id} dimension {dim_id} block {block_index} has invalid max weight {} (global {global_max_weight})",
+                entry.max_weight
+            )));
+        }
+
+        let relative_end = entry
+            .offset
+            .checked_add(u64::from(entry.length))
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "sparse field {field_id} dimension {dim_id} block {block_index} range overflows u64"
+                ))
+            })?;
+        let absolute_start = block_data_offset
+            .checked_add(entry.offset)
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "sparse field {field_id} dimension {dim_id} block {block_index} file start overflows u64"
+                ))
+            })?;
+        let absolute_end = block_data_offset
+            .checked_add(relative_end)
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "sparse field {field_id} dimension {dim_id} block {block_index} file range overflows u64"
+                ))
+            })?;
+        if absolute_end > data_end || entry.offset < previous_end {
+            return Err(crate::Error::Corruption(format!(
+                "sparse field {field_id} dimension {dim_id} block {block_index} has overlapping or out-of-bounds byte range"
+            )));
+        }
+        if block_index > 0
+            && (entry.first_doc < previous_first_doc || entry.last_doc < previous_last_doc)
+        {
+            return Err(crate::Error::Corruption(format!(
+                "sparse field {field_id} dimension {dim_id} block {block_index} document ranges are not monotonic"
+            )));
+        }
+        previous_end = relative_end;
+        previous_first_doc = entry.first_doc;
+        previous_last_doc = entry.last_doc;
+        range_start.get_or_insert(absolute_start);
+        range_end = absolute_end;
+    }
+    Ok(range_start.expect("num_blocks was validated above")..range_end)
+}
+
+fn validate_ann_schema(schema: &Schema, field_id: u32, index_type: u8) -> Result<()> {
+    use crate::segment::ann_build;
+
+    let field = schema.get_field_entry(Field(field_id)).ok_or_else(|| {
+        crate::Error::Corruption(format!(
+            "ANN vectors reference unknown schema field {field_id}"
+        ))
+    })?;
+
+    let matches_schema = match index_type {
+        ann_build::RABITQ_TYPE => {
+            field.field_type == FieldType::DenseVector
+                && field
+                    .dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == VectorIndexType::RaBitQ)
+        }
+        ann_build::IVF_RABITQ_TYPE => {
+            field.field_type == FieldType::DenseVector
+                && field
+                    .dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == VectorIndexType::IvfRaBitQ)
+        }
+        ann_build::SCANN_TYPE => {
+            field.field_type == FieldType::DenseVector
+                && field
+                    .dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == VectorIndexType::ScaNN)
+        }
+        ann_build::BINARY_IVF_TYPE => {
+            field.field_type == FieldType::BinaryDenseVector
+                && field
+                    .binary_dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == BinaryIndexType::Ivf)
+        }
+        _ => false,
+    };
+
+    if !matches_schema {
+        return Err(crate::Error::Corruption(format!(
+            "ANN vector type {index_type} for field {field_id} does not match schema field '{}' ({:?})",
+            field.name, field.field_type
+        )));
+    }
+    Ok(())
 }
 
 fn take_toc_bytes<'a>(
@@ -53,6 +200,73 @@ use crate::segment::format::{
     DENSE_TOC_ENTRY_SIZE, DenseVectorTocEntry, FOOTER_SIZE, VECTORS_FOOTER_MAGIC, read_dense_toc,
 };
 
+fn is_ann_vector_type(index_type: u8) -> bool {
+    use crate::segment::ann_build;
+
+    matches!(
+        index_type,
+        ann_build::SCANN_TYPE
+            | ann_build::IVF_RABITQ_TYPE
+            | ann_build::BINARY_IVF_TYPE
+            | ann_build::RABITQ_TYPE
+    )
+}
+
+fn checked_vector_payload_end(
+    entry: &DenseVectorTocEntry,
+    data_start: u64,
+    data_end: u64,
+) -> Result<u64> {
+    entry
+        .offset
+        .checked_add(entry.size)
+        .filter(|&end| entry.offset >= data_start && end <= data_end)
+        .ok_or_else(|| {
+            crate::Error::Corruption(format!(
+                "vector field {} has invalid data range {}..{}+{}; valid payload is {data_start}..{data_end}",
+                entry.field_id, entry.offset, entry.offset, entry.size
+            ))
+        })
+}
+
+fn validate_vector_toc_ranges(
+    entries: &[DenseVectorTocEntry],
+    data_start: u64,
+    data_end: u64,
+) -> Result<()> {
+    let mut ranges = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if is_ann_vector_type(entry.index_type) && entry.size == 0 {
+            return Err(crate::Error::Corruption(format!(
+                "ANN vectors for field {} have an empty payload",
+                entry.field_id
+            )));
+        }
+        let end = checked_vector_payload_end(entry, data_start, data_end)?;
+        ranges.push((entry.offset, end, entry.field_id, entry.index_type));
+    }
+
+    ranges.sort_unstable();
+    for pair in ranges.windows(2) {
+        let previous = pair[0];
+        let current = pair[1];
+        if current.0 < previous.1 {
+            return Err(crate::Error::Corruption(format!(
+                "vector TOC payloads overlap: field {} type {} uses {}..{}, field {} type {} uses {}..{}",
+                previous.2,
+                previous.3,
+                previous.0,
+                previous.1,
+                current.2,
+                current.3,
+                current.0,
+                current.1
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Load dense vector indexes from unified .vectors file
 ///
 /// File format (data-first, TOC at end):
@@ -65,6 +279,7 @@ pub async fn load_vectors_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
     schema: &Schema,
+    total_docs: u32,
 ) -> Result<VectorsFileData> {
     let mut indexes = FxHashMap::default();
     let mut flat_vectors = FxHashMap::default();
@@ -174,6 +389,7 @@ pub async fn load_vectors_file<D: Directory>(
     if entries.is_empty() {
         return Ok(empty());
     }
+    validate_vector_toc_ranges(&entries, data_start, data_end)?;
 
     // Load each entry — a field can have both Flat (lazy) and ANN (in-memory)
     use crate::segment::ann_build;
@@ -184,23 +400,61 @@ pub async fn load_vectors_file<D: Directory>(
         size: length,
     } in entries
     {
-        let end = offset
-            .checked_add(length)
-            .filter(|&end| offset >= data_start && end <= data_end)
-            .ok_or_else(|| {
-                crate::Error::Corruption(format!(
-                    "vector field {field_id} has invalid data range {offset}..{offset}+{length}; valid payload is {data_start}..{data_end}"
-                ))
-            })?;
+        // The complete TOC was bounds/overlap checked before any payload read.
+        let end = offset + length;
         match index_type {
             ann_build::FLAT_TYPE => {
                 // Flat binary — load lazily (only doc_ids in memory, vectors via mmap)
-                let slice = handle.slice(offset..end);
-                let lazy_flat = LazyFlatVectorData::open(slice).await.map_err(|error| {
+                let field = schema.get_field_entry(Field(field_id)).ok_or_else(|| {
                     crate::Error::Corruption(format!(
-                        "invalid flat vectors for field {field_id}: {error}"
+                        "flat vectors reference unknown schema field {field_id}"
                     ))
                 })?;
+                let slice = handle.slice(offset..end);
+                let lazy_flat = LazyFlatVectorData::open_with_doc_limit(slice, Some(total_docs))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Corruption(format!(
+                            "invalid flat vectors for field {field_id}: {error}"
+                        ))
+                    })?;
+                match lazy_flat.quantization {
+                    DenseVectorQuantization::Binary => {
+                        let config = field
+                            .binary_dense_vector_config
+                            .as_ref()
+                            .filter(|_| field.field_type == FieldType::BinaryDenseVector)
+                            .ok_or_else(|| {
+                                crate::Error::Corruption(format!(
+                                    "binary flat vectors for field {field_id} do not match its schema type"
+                                ))
+                            })?;
+                        if lazy_flat.dim != config.dim {
+                            return Err(crate::Error::Corruption(format!(
+                                "binary flat vectors for field {field_id} have dimension {}, schema expects {}",
+                                lazy_flat.dim, config.dim
+                            )));
+                        }
+                    }
+                    stored_quantization => {
+                        let config = field
+                            .dense_vector_config
+                            .as_ref()
+                            .filter(|_| field.field_type == FieldType::DenseVector)
+                            .ok_or_else(|| {
+                                crate::Error::Corruption(format!(
+                                    "flat vectors for field {field_id} do not match its schema type"
+                                ))
+                            })?;
+                        if lazy_flat.dim != config.dim || stored_quantization != config.quantization
+                        {
+                            return Err(crate::Error::Corruption(format!(
+                                "flat vectors for field {field_id} have dimension {} and {:?} storage, schema expects {} and {:?}",
+                                lazy_flat.dim, stored_quantization, config.dim, config.quantization
+                            )));
+                        }
+                    }
+                }
                 if flat_vectors.insert(field_id, lazy_flat).is_some() {
                     return Err(crate::Error::Corruption(format!(
                         "duplicate flat-vector entry for field {field_id}"
@@ -211,6 +465,7 @@ pub async fn load_vectors_file<D: Directory>(
             | ann_build::IVF_RABITQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::RABITQ_TYPE => {
+                validate_ann_schema(schema, field_id, index_type)?;
                 // ANN payloads stay lazy and zero-copy; only their validated
                 // byte range is retained until first search.
                 let data = handle.read_bytes_range(offset..end).await?;
@@ -244,6 +499,20 @@ pub async fn load_vectors_file<D: Directory>(
                     "unknown vector index type {index_type} for field {field_id}"
                 )));
             }
+        }
+    }
+
+    // Every ANN implementation relies on the exact flat payload for reranking,
+    // multi-value expansion, merge streaming, and corruption checks. Flat-only
+    // fields remain valid while a segment is below its ANN build threshold, but
+    // an ANN-only field would silently change query semantics.
+    let mut ann_fields: Vec<u32> = indexes.keys().copied().collect();
+    ann_fields.sort_unstable();
+    for field_id in ann_fields {
+        if !flat_vectors.contains_key(&field_id) {
+            return Err(crate::Error::Corruption(format!(
+                "ANN vectors for field {field_id} are missing matching flat vector storage"
+            )));
         }
     }
 
@@ -375,6 +644,8 @@ pub async fn load_sparse_file<D: Directory>(
 
     // Parse TOC: per-field header(13B) + per-dim entries(28B each)
     let mut pos = 0usize;
+    let mut payload_ranges: Vec<(u64, u64, u32, u32)> = Vec::new();
+    let mut skip_ranges: Vec<(usize, usize, u32, u32)> = Vec::new();
 
     for _ in 0..num_fields {
         // Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13 bytes
@@ -433,6 +704,7 @@ pub async fn load_sparse_file<D: Directory>(
                     "BMP field {field_id} blob {blob_offset}..{blob_end} overlaps sparse metadata at {skip_offset}"
                 )));
             }
+            payload_ranges.push((blob_offset, blob_end, field_id, dim_id));
 
             match BmpIndex::parse(
                 handle.clone(),
@@ -465,7 +737,7 @@ pub async fn load_sparse_file<D: Directory>(
                 let num_blocks = u32::from_le_bytes(d[16..20].try_into().unwrap());
                 let doc_count = u32::from_le_bytes(d[20..24].try_into().unwrap());
                 let max_weight = f32::from_le_bytes(d[24..28].try_into().unwrap());
-                let _skip_end = (skip_start as usize)
+                let skip_end = (skip_start as usize)
                     .checked_add(num_blocks as usize)
                     .filter(|&end| end <= skip_entry_count)
                     .ok_or_else(|| {
@@ -473,6 +745,7 @@ pub async fn load_sparse_file<D: Directory>(
                             "sparse field {field_id} dimension {dim_id} references skip entries {skip_start}+{num_blocks}, but only {skip_entry_count} exist"
                         ))
                     })?;
+                skip_ranges.push((skip_start as usize, skip_end, field_id, dim_id));
                 if block_data_offset > skip_offset {
                     return Err(crate::Error::Corruption(format!(
                         "sparse field {field_id} dimension {dim_id} block offset {block_data_offset} exceeds data section {skip_offset}"
@@ -483,6 +756,23 @@ pub async fn load_sparse_file<D: Directory>(
                         "sparse field {field_id} dimension {dim_id} has {doc_count} docs, segment has {total_docs}"
                     )));
                 }
+                if doc_count == 0 {
+                    return Err(crate::Error::Corruption(format!(
+                        "sparse field {field_id} dimension {dim_id} has blocks but no documents"
+                    )));
+                }
+                let payload_range = validate_sparse_dimension_skip_entries(
+                    skip_section.as_slice(),
+                    skip_start as usize,
+                    num_blocks as usize,
+                    block_data_offset,
+                    skip_offset,
+                    total_docs,
+                    max_weight,
+                    field_id,
+                    dim_id,
+                )?;
+                payload_ranges.push((payload_range.start, payload_range.end, field_id, dim_id));
                 dims.push(
                     dim_id,
                     block_data_offset,
@@ -518,6 +808,36 @@ pub async fn load_sparse_file<D: Directory>(
                 ),
             );
         }
+    }
+
+    payload_ranges.sort_unstable_by_key(|range| (range.0, range.1, range.2, range.3));
+    for pair in payload_ranges.windows(2) {
+        let (left_start, left_end, left_field, left_dim) = pair[0];
+        let (right_start, right_end, right_field, right_dim) = pair[1];
+        if right_start < left_end {
+            return Err(crate::Error::Corruption(format!(
+                "sparse payloads overlap: field {left_field} dimension {left_dim} uses \
+                 {left_start}..{left_end}, field {right_field} dimension {right_dim} uses \
+                 {right_start}..{right_end}"
+            )));
+        }
+    }
+    skip_ranges.sort_unstable_by_key(|range| (range.0, range.1, range.2, range.3));
+    let mut owned_skip_entries = 0usize;
+    for &(start, end, field_id, dim_id) in &skip_ranges {
+        if start != owned_skip_entries {
+            return Err(crate::Error::Corruption(format!(
+                "sparse skip-entry ownership has a gap or overlap before field {field_id} \
+                 dimension {dim_id}: expected start {owned_skip_entries}, got {start}"
+            )));
+        }
+        owned_skip_entries = end;
+    }
+    if owned_skip_entries != skip_entry_count {
+        return Err(crate::Error::Corruption(format!(
+            "sparse skip section contains {} unowned entries",
+            skip_entry_count - owned_skip_entries
+        )));
     }
 
     if pos != toc_data.len() {
@@ -613,11 +933,62 @@ pub async fn load_fast_fields_file<D: Directory>(
 #[cfg(test)]
 mod tests {
     use crate::directories::{DirectoryWriter, RamDirectory};
-    use crate::dsl::SchemaBuilder;
+    use crate::dsl::{DenseVectorQuantization, SchemaBuilder};
     use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
-    use crate::structures::SparseVectorConfig;
+    use crate::segment::{FlatVectorData, ann_build};
+    use crate::structures::{SparseSkipEntry, SparseVectorConfig};
 
-    use super::{SegmentFiles, load_sparse_file, load_vectors_file};
+    use super::{
+        SegmentFiles, load_sparse_file, load_vectors_file, validate_sparse_dimension_skip_entries,
+    };
+
+    fn encoded_skip_entries(entries: &[SparseSkipEntry]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(entries.len() * SparseSkipEntry::SIZE);
+        for entry in entries {
+            entry.write_to_vec(&mut bytes);
+        }
+        bytes
+    }
+
+    fn vectors_file_with_toc(mut payload: Vec<u8>, entries: &[DenseVectorTocEntry]) -> Vec<u8> {
+        let toc_offset = payload.len() as u64;
+        write_dense_toc_and_footer(&mut payload, toc_offset, entries).unwrap();
+        payload
+    }
+
+    fn vectors_file_with_payloads(payloads: Vec<(u32, u8, Vec<u8>)>) -> Vec<u8> {
+        let mut file = Vec::new();
+        let mut entries = Vec::with_capacity(payloads.len());
+        for (field_id, index_type, payload) in payloads {
+            let offset = file.len() as u64;
+            let size = payload.len() as u64;
+            file.extend_from_slice(&payload);
+            entries.push(DenseVectorTocEntry {
+                field_id,
+                index_type,
+                offset,
+                size,
+            });
+        }
+        vectors_file_with_toc(file, &entries)
+    }
+
+    fn vectors_file_with_flat_payload(payload: Vec<u8>) -> Vec<u8> {
+        vectors_file_with_payloads(vec![(0, ann_build::FLAT_TYPE, payload)])
+    }
+
+    fn one_dense_flat_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0],
+            &[(0, 0)],
+            DenseVectorQuantization::F32,
+            &mut payload,
+        )
+        .unwrap();
+        payload
+    }
 
     #[tokio::test]
     async fn existing_truncated_sparse_file_is_corruption() {
@@ -659,7 +1030,7 @@ mod tests {
         .unwrap();
         dir.write(&files.vectors, &bytes).await.unwrap();
 
-        let result = load_vectors_file(&dir, &files, &schema).await;
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
         assert!(matches!(result, Err(crate::Error::Corruption(_))));
     }
 
@@ -672,7 +1043,276 @@ mod tests {
         let dir = RamDirectory::new();
         dir.write(&files.vectors, &[1, 2, 3]).await.unwrap();
 
-        let result = load_vectors_file(&dir, &files, &schema).await;
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
         assert!(matches!(result, Err(crate::Error::Corruption(_))));
+    }
+
+    #[tokio::test]
+    async fn flat_vectors_must_match_schema_storage() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(10);
+        let dir = RamDirectory::new();
+
+        let mut payload = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0],
+            &[(0, 0)],
+            DenseVectorQuantization::F16,
+            &mut payload,
+        )
+        .unwrap();
+        dir.write(&files.vectors, &vectors_file_with_flat_payload(payload))
+            .await
+            .unwrap();
+
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
+        assert!(matches!(result, Err(crate::Error::Corruption(_))));
+    }
+
+    #[tokio::test]
+    async fn flat_vector_doc_ids_must_fit_segment_metadata() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(11);
+        let dir = RamDirectory::new();
+
+        let mut payload = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0],
+            &[(1, 0)],
+            DenseVectorQuantization::F32,
+            &mut payload,
+        )
+        .unwrap();
+        dir.write(&files.vectors, &vectors_file_with_flat_payload(payload))
+            .await
+            .unwrap();
+
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
+        assert!(matches!(result, Err(crate::Error::Corruption(_))));
+    }
+
+    #[tokio::test]
+    async fn ann_vectors_require_same_field_flat_storage() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense_0", 2, true, true);
+        schema.add_dense_vector_field("dense_1", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(12);
+        let dir = RamDirectory::new();
+
+        let mut flat = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0],
+            &[(0, 0)],
+            DenseVectorQuantization::F32,
+            &mut flat,
+        )
+        .unwrap();
+        let bytes = vectors_file_with_payloads(vec![
+            (0, ann_build::FLAT_TYPE, flat),
+            (1, ann_build::RABITQ_TYPE, vec![0]),
+        ]);
+        dir.write(&files.vectors, &bytes).await.unwrap();
+
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
+        let Err(crate::Error::Corruption(message)) = result else {
+            panic!("ANN storage without a same-field flat payload must be rejected");
+        };
+        assert!(message.contains("field 1"));
+        assert!(message.contains("missing matching flat"));
+    }
+
+    #[tokio::test]
+    async fn ann_vector_type_must_match_schema_index_type() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(13);
+        let dir = RamDirectory::new();
+
+        let mut flat = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0],
+            &[(0, 0)],
+            DenseVectorQuantization::F32,
+            &mut flat,
+        )
+        .unwrap();
+        let bytes = vectors_file_with_payloads(vec![
+            (0, ann_build::FLAT_TYPE, flat),
+            // `add_dense_vector_field` configures RaBitQ, not ScaNN.
+            (0, ann_build::SCANN_TYPE, vec![0]),
+        ]);
+        dir.write(&files.vectors, &bytes).await.unwrap();
+
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
+        let Err(crate::Error::Corruption(message)) = result else {
+            panic!("ANN storage that disagrees with the schema must be rejected");
+        };
+        assert!(message.contains("does not match schema"));
+    }
+
+    #[tokio::test]
+    async fn flat_only_vectors_are_valid_below_ann_build_threshold() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(14);
+        let dir = RamDirectory::new();
+
+        let mut flat = Vec::new();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            2,
+            &[1.0, 2.0],
+            &[(0, 0)],
+            DenseVectorQuantization::F32,
+            &mut flat,
+        )
+        .unwrap();
+        dir.write(&files.vectors, &vectors_file_with_flat_payload(flat))
+            .await
+            .unwrap();
+
+        let loaded = load_vectors_file(&dir, &files, &schema, 1)
+            .await
+            .expect("flat-only pre-threshold segment must remain readable");
+        assert!(loaded.indexes.is_empty());
+        assert!(loaded.flat_vectors.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn ann_vector_payload_must_not_be_empty() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(15);
+        let dir = RamDirectory::new();
+
+        let bytes = vectors_file_with_payloads(vec![
+            (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
+            (0, ann_build::RABITQ_TYPE, Vec::new()),
+        ]);
+        dir.write(&files.vectors, &bytes).await.unwrap();
+
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
+        let Err(crate::Error::Corruption(message)) = result else {
+            panic!("an empty ANN payload must be rejected");
+        };
+        assert!(message.contains("empty payload"));
+    }
+
+    #[tokio::test]
+    async fn vector_toc_rejects_overlapping_and_aliased_payloads() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let flat = one_dense_flat_payload();
+        let flat_len = flat.len() as u64;
+
+        // Exercise both exact aliasing and a one-byte partial overlap.
+        for (segment_id, ann_offset, ann_size) in [(16, 0, flat_len), (17, flat_len - 1, 2)] {
+            let files = SegmentFiles::new(segment_id);
+            let dir = RamDirectory::new();
+            let mut payload = flat.clone();
+            let required_len = (ann_offset + ann_size) as usize;
+            payload.resize(payload.len().max(required_len), 0);
+            let entries = [
+                DenseVectorTocEntry {
+                    field_id: 0,
+                    index_type: ann_build::FLAT_TYPE,
+                    offset: 0,
+                    size: flat_len,
+                },
+                DenseVectorTocEntry {
+                    field_id: 0,
+                    index_type: ann_build::RABITQ_TYPE,
+                    offset: ann_offset,
+                    size: ann_size,
+                },
+            ];
+            let bytes = vectors_file_with_toc(payload, &entries);
+            dir.write(&files.vectors, &bytes).await.unwrap();
+
+            let result = load_vectors_file(&dir, &files, &schema, 1).await;
+            let Err(crate::Error::Corruption(message)) = result else {
+                panic!("overlapping vector payloads must be rejected");
+            };
+            assert!(message.contains("overlap"));
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_toc_allows_unreferenced_padding_gaps() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense_0", 2, true, true);
+        schema.add_dense_vector_field("dense_1", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(18);
+        let dir = RamDirectory::new();
+
+        let first = one_dense_flat_payload();
+        let second = one_dense_flat_payload();
+        let first_size = first.len() as u64;
+        let padding = 8 - first.len() % 8;
+        let second_offset = first_size + padding as u64;
+        let second_size = second.len() as u64;
+        let mut payload = first;
+        payload.resize(payload.len() + padding, 0);
+        payload.extend_from_slice(&second);
+        let entries = [
+            DenseVectorTocEntry {
+                field_id: 0,
+                index_type: ann_build::FLAT_TYPE,
+                offset: 0,
+                size: first_size,
+            },
+            DenseVectorTocEntry {
+                field_id: 1,
+                index_type: ann_build::FLAT_TYPE,
+                offset: second_offset,
+                size: second_size,
+            },
+        ];
+        let bytes = vectors_file_with_toc(payload, &entries);
+        dir.write(&files.vectors, &bytes).await.unwrap();
+
+        let loaded = load_vectors_file(&dir, &files, &schema, 1)
+            .await
+            .expect("padding between disjoint vector payloads must be allowed");
+        assert_eq!(loaded.flat_vectors.len(), 2);
+    }
+
+    #[test]
+    fn sparse_skip_metadata_rejects_unsafe_ranges_and_pruning_bounds() {
+        let valid = [
+            SparseSkipEntry::new(0, 4, 0, 8, 2.0),
+            SparseSkipEntry::new(4, 9, 8, 12, 3.0),
+        ];
+        let valid_bytes = encoded_skip_entries(&valid);
+        validate_sparse_dimension_skip_entries(&valid_bytes, 0, valid.len(), 10, 30, 10, 3.0, 0, 7)
+            .unwrap();
+
+        let overlapping = encoded_skip_entries(&[
+            SparseSkipEntry::new(0, 4, 0, 8, 2.0),
+            SparseSkipEntry::new(5, 9, 7, 4, 2.0),
+        ]);
+        assert!(
+            validate_sparse_dimension_skip_entries(&overlapping, 0, 2, 10, 30, 10, 2.0, 0, 7,)
+                .is_err()
+        );
+
+        let unsafe_bound = encoded_skip_entries(&[SparseSkipEntry::new(0, 9, 0, 8, 4.0)]);
+        assert!(
+            validate_sparse_dimension_skip_entries(&unsafe_bound, 0, 1, 10, 30, 10, 3.0, 0, 7,)
+                .is_err()
+        );
     }
 }

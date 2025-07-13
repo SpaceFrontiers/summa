@@ -137,7 +137,9 @@ pub(super) fn prepare_per_field_grouping(
     }
 
     let num_groups = field_groups.len() + non_term_indices.len();
-    let per_field_limit = limit * num_groups;
+    let per_field_limit = limit
+        .saturating_mul(num_groups)
+        .min(reader.num_docs() as usize);
     let num_docs = reader.num_docs() as f32;
 
     let mut multi_term_groups = Vec::new();
@@ -166,6 +168,21 @@ pub(super) fn prepare_per_field_grouping(
 
 // ── Sparse MaxScore helpers ──────────────────────────────────────────────
 
+const MAX_SPARSE_EXECUTOR_RESULTS: usize = 200_000;
+
+pub(super) fn bounded_sparse_executor_limit(limit: usize, over_fetch_factor: f32) -> usize {
+    let factor = if over_fetch_factor.is_finite() && over_fetch_factor >= 1.0 {
+        over_fetch_factor as f64
+    } else {
+        1.0
+    };
+    let derived = (limit as f64 * factor).ceil();
+    if !derived.is_finite() || derived >= usize::MAX as f64 {
+        return MAX_SPARSE_EXECUTOR_RESULTS;
+    }
+    (derived as usize).min(MAX_SPARSE_EXECUTOR_RESULTS)
+}
+
 /// Build a sparse MaxScoreExecutor from decomposed sparse infos.
 ///
 /// Returns the executor + representative info (for combiner/field), or None
@@ -186,7 +203,11 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
     if query_terms.is_empty() {
         return None;
     }
-    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
+    // Sparse postings contain one entry per stored ordinal, so the raw heap
+    // may legitimately need to exceed the real document count before ordinal
+    // scores can be combined back into documents.
+    let executor_limit = bounded_sparse_executor_limit(limit, infos[0].over_fetch_factor)
+        .min(si.total_vectors as usize);
     let mut executor =
         MaxScoreExecutor::sparse(si, query_terms, executor_limit, infos[0].heap_factor)
             .with_metric_labels(
@@ -218,7 +239,8 @@ pub(crate) fn build_sparse_bmp_results(
     if query_terms.is_empty() {
         return None;
     }
-    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
+    let executor_limit = bounded_sparse_executor_limit(limit, infos[0].over_fetch_factor)
+        .min(bmp.num_virtual_docs as usize);
     let max_sb = infos[0].max_superblocks;
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     match super::bmp::execute_bmp(
@@ -257,7 +279,8 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     if query_terms.is_empty() {
         return None;
     }
-    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
+    let executor_limit = bounded_sparse_executor_limit(limit, infos[0].over_fetch_factor)
+        .min(bmp.num_virtual_docs as usize);
     let max_sb = infos[0].max_superblocks;
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     match super::bmp::execute_bmp_filtered(
