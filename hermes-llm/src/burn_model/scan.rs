@@ -10,6 +10,8 @@ use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy
 use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
+use super::conv::DepthwiseConv1dBackend;
+
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct ScanOutput<B: Backend> {
@@ -31,7 +33,7 @@ pub struct ScanGradients<B: Backend> {
 }
 
 /// Backend capability required by the Burn Mamba mixer.
-pub trait MambaBackend: Backend {
+pub trait MambaBackend: Backend + DepthwiseConv1dBackend {
     #[allow(clippy::too_many_arguments)]
     fn selective_scan_inner(
         delta: FloatTensor<Self>,

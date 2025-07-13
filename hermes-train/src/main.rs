@@ -7,12 +7,16 @@ use burn::module::{AutodiffModule, Module, ModuleVisitor, Param};
 use burn::tensor::backend::Backend as _;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
-use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams, MuonConfig, Optimizer};
+use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_llm::{Backend, ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+
+mod muon;
+
+use muon::BatchedMuon;
 
 type TrainBackend = Autodiff<Backend>;
 
@@ -402,7 +406,7 @@ fn train(args: TrainArgs) -> Result<()> {
         !muon_parameter_ids.is_empty(),
         "model has no hidden matrix parameters for Muon"
     );
-    let mut muon_optimizer = MuonConfig::new().init();
+    let mut muon_optimizer = BatchedMuon::new(muon_parameter_ids.clone());
     let mut adamw_optimizer = AdamWConfig::new()
         .with_beta_1(0.9)
         .with_beta_2(0.95)
@@ -473,7 +477,7 @@ fn train(args: TrainArgs) -> Result<()> {
                         args.grad_clip,
                     )?;
                     let current = model.take().unwrap();
-                    let current = muon_optimizer.step(muon_lr, current, muon_grads);
+                    let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
                     model = Some(adamw_optimizer.step(lr, current, adamw_grads));
                     step += 1;
                     let loss = loss_sum / args.grad_accum as f32;
@@ -569,7 +573,7 @@ mod tests {
         let muon_parameter_ids = model.muon_parameter_ids();
         assert!(!muon_parameter_ids.is_empty());
         assert!(muon_parameter_ids.len() < burn::module::list_param_ids(&model).len());
-        let mut muon_optimizer = MuonConfig::new().init();
+        let mut muon_optimizer = BatchedMuon::new(muon_parameter_ids.clone());
         let mut adamw_optimizer = AdamWConfig::new()
             .with_beta_2(0.95)
             .with_epsilon(1e-8)
@@ -602,7 +606,7 @@ mod tests {
             let norm =
                 gradient_norm_and_clip(&model, &mut muon_grads, &mut adamw_grads, 1.0).unwrap();
             assert!(norm.is_finite());
-            model = muon_optimizer.step(2e-2, model, muon_grads);
+            model = muon_optimizer.step(2e-2, model, muon_grads).unwrap();
             model = adamw_optimizer.step(1e-3, model, adamw_grads);
         }
         assert!(

@@ -4,6 +4,7 @@
 mod attention;
 pub mod backend;
 mod block;
+mod conv;
 mod ffn;
 mod mamba;
 mod norm;

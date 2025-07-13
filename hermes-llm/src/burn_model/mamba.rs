@@ -11,6 +11,7 @@ use burn_nn::{Linear, LinearConfig};
 
 use crate::mal::{ModelDef, SsmDef};
 
+use super::conv::depthwise_conv1d;
 use super::scan::{MambaBackend, selective_scan};
 
 /// Recurrent state for one Mamba layer.
@@ -138,7 +139,18 @@ impl<B: MambaBackend> MambaMixer<B> {
                 total - (self.conv_kernel - 1)..total,
             ]);
         }
-        let xs = silu(self.conv1d.forward(padded).swap_dims(1, 2));
+        let xs = silu(
+            depthwise_conv1d(
+                padded,
+                self.conv1d.weight.val(),
+                self.conv1d
+                    .bias
+                    .as_ref()
+                    .expect("Mamba depthwise convolution always has a bias")
+                    .val(),
+            )
+            .swap_dims(1, 2),
+        );
 
         // Input-dependent delta, B, C.
         let x_dbl = self.x_proj.forward(xs.clone());

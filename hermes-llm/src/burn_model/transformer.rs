@@ -241,9 +241,8 @@ impl<B: MambaBackend> Transformer<B> {
 
     /// Parameter IDs optimized by Muon during training.
     ///
-    /// This matches the original trainer's split: every 2D parameter inside a
-    /// transformer block uses Muon, while embeddings, the output head, norms,
-    /// biases, and convolution kernels remain on AdamW.
+    /// Every 2D parameter inside a transformer block uses Muon. Embeddings, the
+    /// output head, norms, biases, and convolution kernels remain on AdamW.
     pub fn muon_parameter_ids(&self) -> Vec<ParamId> {
         let mut visitor = MatrixParameterVisitor::default();
         for layer in &self.layers {
