@@ -3006,7 +3006,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "anyhow",
  "burn-autodiff",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "anyhow",
  "pest",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-py"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3102,7 +3102,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "anyhow",
  "clap",
@@ -3126,7 +3126,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.63"
+version = "1.8.64"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
