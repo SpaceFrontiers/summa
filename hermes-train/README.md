@@ -46,8 +46,10 @@ both parameter sets. It supports cosine or warmup-stable-decay scheduling and
 fine-tuning from safetensors. On CUDA, linear algebra uses relaxed FP32 storage
 with FP16 Tensor Core staging and FP32 accumulation. Model parameters and
 optimizer state remain FP32; Muon's Newton-Schulz iterations use BF16.
-It atomically replaces the latest native checkpoint every 100 optimizer steps
-by default; pass `--checkpoint-every 0` to save only at completion.
+It writes the latest checkpoint every 100 optimizer steps by default; pass
+`--checkpoint-every 0` to save only at completion. Files are staged behind an
+in-progress marker and the training-state file is published last, so resume and
+remote sync never consume a partially replaced checkpoint.
 Each training checkpoint includes weights, AdamW and Muon state, and the exact
 curriculum position. Relaunch the same command with `--resume` to replay the
 deterministic bounded shuffle up to that position and continue the schedule.
@@ -59,7 +61,7 @@ Outputs are deliberately minimal:
 - `config.json`, with tokenizer vocabulary size applied
 - `metrics.jsonl`, flushed after every optimizer step for live reporters
 - `weights.safetensors`, using the shared model's parameter names
-- `adamw-state.bin`, `muon-state.bin`, and `training-state.json` for resume
+- `adamw-state.bpk`, `muon-state.bpk`, and `training-state.json` for resume
 
 The checkpoint loads directly in `hermes-llm` with strict tensor and shape
 validation. Experiment services such as W&B can tail `metrics.jsonl` without

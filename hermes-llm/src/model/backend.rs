@@ -1,25 +1,15 @@
-//! Compile-time tensor backend selection.
-//!
-//! One compute stack, three targets, chosen at compile time by cargo feature:
-//! - `metal`   → wgpu (Metal on macOS, Vulkan/DX elsewhere)
-//! - `cuda`    → CUDA
-//! - neither   → ndarray (CPU; also the test/parity backend)
+//! Runtime tensor-device selection.
 
-/// Active compute backend. `hermes-train` wraps it in Burn Autodiff; inference
-/// uses it directly without a training graph.
-#[cfg(feature = "metal")]
-pub type Backend = burn_wgpu::Wgpu;
-
-#[cfg(all(feature = "cuda", not(feature = "metal")))]
-pub type Backend = burn_cuda::Cuda<cubecl::flex32>;
-
-#[cfg(not(any(feature = "metal", feature = "cuda")))]
-pub type Backend = burn_ndarray::NdArray;
-
-/// Device handle for the active backend.
-pub type Device = burn::tensor::Device<Backend>;
+pub use burn::tensor::Device;
 
 /// The default device for the active backend (best-available GPU, or CPU).
 pub fn default_device() -> Device {
-    Device::default()
+    #[cfg(feature = "metal")]
+    return Device::metal(burn::tensor::DeviceKind::DefaultDevice);
+
+    #[cfg(all(feature = "cuda", not(feature = "metal")))]
+    return Device::cuda(burn::tensor::DeviceIndex::Default);
+
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    return Device::ndarray();
 }

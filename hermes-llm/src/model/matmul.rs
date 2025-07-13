@@ -5,10 +5,10 @@ use burn::prelude::*;
 use burn::tensor::{DType, FloatDType};
 use burn_nn::Linear;
 
-pub(super) fn matmul_input<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub(super) fn matmul_input<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     #[cfg(feature = "cuda")]
     {
-        if B::supports_dtype(&tensor.device(), DType::F16) {
+        if tensor.device().supports_dtype(DType::F16) {
             return tensor.cast(FloatDType::F16);
         }
     }
@@ -16,13 +16,10 @@ pub(super) fn matmul_input<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> 
     tensor
 }
 
-pub(super) fn linear<B: Backend, const D: usize>(
-    layer: &Linear<B>,
-    input: Tensor<B, D>,
-) -> Tensor<B, D> {
+pub(super) fn linear<const D: usize>(layer: &Linear, input: Tensor<D>) -> Tensor<D> {
     #[cfg(feature = "cuda")]
     {
-        if B::supports_dtype(&input.device(), DType::F16) {
+        if input.device().supports_dtype(DType::F16) {
             return burn::tensor::module::linear(
                 matmul_input(input),
                 matmul_input(layer.weight.val()),
@@ -35,10 +32,10 @@ pub(super) fn linear<B: Backend, const D: usize>(
     layer.forward(input)
 }
 
-pub(super) fn matmul_2<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>) -> Tensor<B, 2> {
+pub(super) fn matmul_2(lhs: Tensor<2>, rhs: Tensor<2>) -> Tensor<2> {
     #[cfg(feature = "cuda")]
     {
-        if B::supports_dtype(&lhs.device(), DType::F16) {
+        if lhs.device().supports_dtype(DType::F16) {
             return matmul_input(lhs)
                 .matmul(matmul_input(rhs))
                 .cast(FloatDType::Flex32);
@@ -49,8 +46,8 @@ pub(super) fn matmul_2<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>) -> Tens
 }
 
 #[cfg(feature = "cuda")]
-pub(super) fn matmul_4<B: Backend>(lhs: Tensor<B, 4>, rhs: Tensor<B, 4>) -> Tensor<B, 4> {
-    if B::supports_dtype(&lhs.device(), DType::F16) {
+pub(super) fn matmul_4(lhs: Tensor<4>, rhs: Tensor<4>) -> Tensor<4> {
+    if lhs.device().supports_dtype(DType::F16) {
         return matmul_input(lhs)
             .matmul(matmul_input(rhs))
             .cast(FloatDType::Flex32);

@@ -53,12 +53,12 @@ hybrid Transformer/Mamba presets.
 ## Library usage
 
 ```rust,no_run
-use hermes_llm::{Backend, TextGenerator, Transformer, default_device, load_safetensors};
+use hermes_llm::{TextGenerator, Transformer, default_device, load_safetensors};
 
 # fn main() -> anyhow::Result<()> {
 let config = hermes_llm::ModelDef::from_json("config.json")?;
 let device = default_device();
-let mut model = Transformer::<Backend>::new(&config, &device)?;
+let mut model = Transformer::new(&config, &device)?;
 load_safetensors(&mut model, "weights.safetensors")?;
 let generator = TextGenerator::new(&model, &device);
 # Ok(())

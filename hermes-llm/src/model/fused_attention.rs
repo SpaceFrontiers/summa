@@ -3,9 +3,19 @@
 //! CUDA uses CubeCL kernels. Other backends keep a tensor-op reference so the
 //! model has one portable attention API.
 
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
+#[cfg(feature = "metal")]
+use burn::backend::Metal;
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+use burn::backend::NdArray;
+use burn::backend::{
+    Backend, Dispatch, DispatchKindConversion, DispatchTensor, backend_extension,
+    tensor::FloatTensor,
+};
 use burn::prelude::*;
+use burn::tensor::TensorData;
 use burn::tensor::activation::softmax;
-use burn::tensor::{TensorData, TensorPrimitive, ops::FloatTensor};
 use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy};
 use burn_autodiff::grads::Gradients;
@@ -14,37 +24,33 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 #[cfg(feature = "cuda")]
 use super::matmul::{matmul_4, matmul_input};
 
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct AttentionOutput<B: Backend> {
-    pub(super) output: FloatTensor<B>,
-    pub(super) stats: FloatTensor<B>,
-    pub(super) saved_query: FloatTensor<B>,
-    pub(super) saved_key: FloatTensor<B>,
-    pub(super) saved_value: FloatTensor<B>,
-    pub(super) saved_output: FloatTensor<B>,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct AttentionGradients<B: Backend> {
-    pub(super) query: FloatTensor<B>,
-    pub(super) key: FloatTensor<B>,
-    pub(super) value: FloatTensor<B>,
-}
-
 /// Backend capability used by full-sequence Transformer attention.
+#[cfg_attr(feature = "cuda", backend_extension(Cuda, Autodiff))]
+#[cfg_attr(
+    all(not(feature = "cuda"), feature = "metal"),
+    backend_extension(Metal, Autodiff)
+)]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "metal")),
+    backend_extension(NdArray, Autodiff)
+)]
 pub trait AttentionBackend: Backend {
+    #[allow(clippy::type_complexity)]
     fn attention_inner(
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
         causal: bool,
-    ) -> AttentionOutput<Self> {
-        reference_attention(query, key, value, causal)
-    }
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    );
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_variables)]
     fn attention_backward(
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
@@ -53,30 +59,33 @@ pub trait AttentionBackend: Backend {
         _stats: FloatTensor<Self>,
         grad_output: FloatTensor<Self>,
         causal: bool,
-    ) -> AttentionGradients<Self> {
-        reference_attention_backward(query, key, value, output, grad_output, causal)
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        panic!("custom attention only supports first-order autodiff")
     }
 }
 
-pub(super) fn fused_attention<B: AttentionBackend>(
-    query: Tensor<B, 4>,
-    key: Tensor<B, 4>,
-    value: Tensor<B, 4>,
+pub(super) fn fused_attention(
+    query: Tensor<4>,
+    key: Tensor<4>,
+    value: Tensor<4>,
     causal: bool,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     let query_heads = query.dims()[1];
+    if query.device() == Device::ndarray() {
+        return attention_probabilities(query, key, causal).matmul(repeat_kv(value, query_heads));
+    }
     let key = repeat_kv(key, query_heads);
     let value = repeat_kv(value, query_heads);
-    let output = B::attention_inner(
-        query.into_primitive().tensor(),
-        key.into_primitive().tensor(),
-        value.into_primitive().tensor(),
+    let output = Dispatch::attention_inner(
+        query.into_dispatch(),
+        key.into_dispatch(),
+        value.into_dispatch(),
         causal,
     );
-    Tensor::from_primitive(TensorPrimitive::Float(output.output))
+    Tensor::from_dispatch(output.0)
 }
 
-pub(super) fn repeat_kv<B: Backend>(tensor: Tensor<B, 4>, query_heads: usize) -> Tensor<B, 4> {
+pub(super) fn repeat_kv(tensor: Tensor<4>, query_heads: usize) -> Tensor<4> {
     let [batch, kv_heads, sequence, head_dim] = tensor.dims();
     if kv_heads == query_heads {
         return tensor;
@@ -89,7 +98,7 @@ pub(super) fn repeat_kv<B: Backend>(tensor: Tensor<B, 4>, query_heads: usize) ->
         .reshape([batch, query_heads, sequence, head_dim])
 }
 
-fn reduce_kv_grad<B: Backend>(tensor: Tensor<B, 4>, kv_heads: usize) -> Tensor<B, 4> {
+fn reduce_kv_grad(tensor: Tensor<4>, kv_heads: usize) -> Tensor<4> {
     let [batch, query_heads, sequence, head_dim] = tensor.dims();
     if kv_heads == query_heads {
         return tensor;
@@ -101,24 +110,24 @@ fn reduce_kv_grad<B: Backend>(tensor: Tensor<B, 4>, kv_heads: usize) -> Tensor<B
         .reshape([batch, kv_heads, sequence, head_dim])
 }
 
-fn causal_mask<B: Backend>(sequence: usize, device: &Device<B>) -> Tensor<B, 4, Bool> {
+fn causal_mask(sequence: usize, device: &Device) -> Tensor<4, Bool> {
     let mut values = vec![false; sequence * sequence];
     for row in 0..sequence {
         for column in row + 1..sequence {
             values[row * sequence + column] = true;
         }
     }
-    Tensor::<B, 2, Bool>::from_data(TensorData::new(values, [sequence, sequence]), device)
+    Tensor::<2, Bool>::from_data(TensorData::new(values, [sequence, sequence]), device)
         .reshape([1, 1, sequence, sequence])
 }
 
 #[cfg(feature = "cuda")]
-fn causal_chunk_mask<B: Backend>(
+fn causal_chunk_mask(
     sequence: usize,
     row_start: usize,
     rows: usize,
-    device: &Device<B>,
-) -> Tensor<B, 4, Bool> {
+    device: &Device,
+) -> Tensor<4, Bool> {
     let mut values = vec![false; rows * sequence];
     for row in 0..rows {
         let global_row = row_start + row;
@@ -126,15 +135,11 @@ fn causal_chunk_mask<B: Backend>(
             values[row * sequence + column] = true;
         }
     }
-    Tensor::<B, 2, Bool>::from_data(TensorData::new(values, [rows, sequence]), device)
+    Tensor::<2, Bool>::from_data(TensorData::new(values, [rows, sequence]), device)
         .reshape([1, 1, rows, sequence])
 }
 
-fn attention_probabilities<B: Backend>(
-    query: Tensor<B, 4>,
-    key: Tensor<B, 4>,
-    causal: bool,
-) -> Tensor<B, 4> {
+fn attention_probabilities(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Tensor<4> {
     let [_, query_heads, sequence, head_dim] = query.dims();
     let key = repeat_kv(key, query_heads);
     let mut scores = query
@@ -147,33 +152,48 @@ fn attention_probabilities<B: Backend>(
     softmax(scores, 3)
 }
 
+#[allow(clippy::type_complexity)]
 fn reference_attention<B: Backend>(
     query: FloatTensor<B>,
     key: FloatTensor<B>,
     value: FloatTensor<B>,
     causal: bool,
-) -> AttentionOutput<B> {
+) -> (
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
     let saved_query = query.clone();
     let saved_key = key.clone();
     let saved_value = value.clone();
-    let query = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(query));
-    let key = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(key));
-    let value = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(value));
+    let query = Tensor::<4>::from_primitive::<B>(query);
+    let key = Tensor::<4>::from_primitive::<B>(key);
+    let value = Tensor::<4>::from_primitive::<B>(value);
     let [batch, query_heads, sequence, _] = query.dims();
     let probabilities = attention_probabilities(query, key, causal);
     let output = probabilities.matmul(repeat_kv(value, query_heads));
-    let stats = Tensor::<B, 4>::zeros([batch, query_heads, sequence, 1], &output.device());
-    let output = output.into_primitive().tensor();
-    AttentionOutput {
-        output: output.clone(),
+    let stats = Tensor::<4>::zeros([batch, query_heads, sequence, 1], &output.device());
+    let output = output
+        .try_into_primitive::<B>()
+        .expect("attention output stayed on its input backend");
+    (
+        output.clone(),
         // The reference backward recomputes softmax. CUDA replaces this with
         // per-row log-sum-exp statistics.
-        stats: stats.into_primitive().tensor(),
+        stats
+            .try_into_primitive::<B>()
+            .expect("attention stats stayed on its input backend"),
         saved_query,
         saved_key,
         saved_value,
-        saved_output: output,
-    }
+        output,
+    )
 }
 
 fn reference_attention_backward<B: Backend>(
@@ -183,12 +203,15 @@ fn reference_attention_backward<B: Backend>(
     output: FloatTensor<B>,
     grad_output: FloatTensor<B>,
     causal: bool,
-) -> AttentionGradients<B> {
-    let query = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(query));
-    let key = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(key));
-    let value = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(value));
-    let output = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(output));
-    let grad_output = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(grad_output));
+) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let query = Tensor::<4>::from_primitive::<B>(query);
+    let key = Tensor::<4>::from_primitive::<B>(key);
+    let value = Tensor::<4>::from_primitive::<B>(value);
+    let output = Tensor::<4>::from_primitive::<B>(output);
+    let grad_output = Tensor::<4>::from_primitive::<B>(grad_output);
     let [_, query_heads, _, head_dim] = query.dims();
     let kv_heads = key.dims()[1];
     let key_repeated = repeat_kv(key, query_heads);
@@ -205,11 +228,17 @@ fn reference_attention_backward<B: Backend>(
         kv_heads,
     );
     let grad_value = reduce_kv_grad(probabilities.transpose().matmul(grad_output), kv_heads);
-    AttentionGradients {
-        query: grad_query.into_primitive().tensor(),
-        key: grad_key.into_primitive().tensor(),
-        value: grad_value.into_primitive().tensor(),
-    }
+    (
+        grad_query
+            .try_into_primitive::<B>()
+            .expect("query gradient stayed on its input backend"),
+        grad_key
+            .try_into_primitive::<B>()
+            .expect("key gradient stayed on its input backend"),
+        grad_value
+            .try_into_primitive::<B>()
+            .expect("value gradient stayed on its input backend"),
+    )
 }
 
 /// Recompute attention a block of query rows at a time. Each block uses the
@@ -224,12 +253,15 @@ pub(super) fn chunked_attention_backward<B: Backend>(
     grad_output: FloatTensor<B>,
     causal: bool,
     chunk_size: usize,
-) -> AttentionGradients<B> {
-    let query = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(query));
-    let key = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(key));
-    let value = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(value));
-    let output = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(output));
-    let grad_output = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(grad_output));
+) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let query = Tensor::<4>::from_primitive::<B>(query);
+    let key = Tensor::<4>::from_primitive::<B>(key);
+    let value = Tensor::<4>::from_primitive::<B>(value);
+    let output = Tensor::<4>::from_primitive::<B>(output);
+    let grad_output = Tensor::<4>::from_primitive::<B>(grad_output);
     let [batch, heads, sequence, head_dim] = query.dims();
     assert_eq!(key.dims(), [batch, heads, sequence, head_dim]);
     assert_eq!(value.dims(), [batch, heads, sequence, head_dim]);
@@ -281,14 +313,57 @@ pub(super) fn chunked_attention_backward<B: Backend>(
             value_gradient + matmul_4(probabilities.transpose(), grad_output_compute_chunk);
     }
 
-    AttentionGradients {
-        query: Tensor::cat(query_gradients, 2).into_primitive().tensor(),
-        key: key_gradient.into_primitive().tensor(),
-        value: value_gradient.into_primitive().tensor(),
-    }
+    (
+        Tensor::cat(query_gradients, 2)
+            .try_into_primitive::<B>()
+            .expect("query gradient stayed on its input backend"),
+        key_gradient
+            .try_into_primitive::<B>()
+            .expect("key gradient stayed on its input backend"),
+        value_gradient
+            .try_into_primitive::<B>()
+            .expect("value gradient stayed on its input backend"),
+    )
 }
 
-impl AttentionBackend for burn_ndarray::NdArray {}
+macro_rules! impl_reference_attention {
+    ($backend:ty) => {
+        impl AttentionBackend for $backend {
+            fn attention_inner(
+                query: FloatTensor<Self>,
+                key: FloatTensor<Self>,
+                value: FloatTensor<Self>,
+                causal: bool,
+            ) -> (
+                FloatTensor<Self>,
+                FloatTensor<Self>,
+                FloatTensor<Self>,
+                FloatTensor<Self>,
+                FloatTensor<Self>,
+                FloatTensor<Self>,
+            ) {
+                reference_attention::<Self>(query, key, value, causal)
+            }
+
+            fn attention_backward(
+                query: FloatTensor<Self>,
+                key: FloatTensor<Self>,
+                value: FloatTensor<Self>,
+                output: FloatTensor<Self>,
+                _stats: FloatTensor<Self>,
+                grad_output: FloatTensor<Self>,
+                causal: bool,
+            ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+                reference_attention_backward::<Self>(query, key, value, output, grad_output, causal)
+            }
+        }
+    };
+}
+
+impl_reference_attention!(burn_ndarray::NdArray);
+
+#[cfg(feature = "metal")]
+impl_reference_attention!(burn_wgpu::Metal);
 
 #[derive(Clone, Debug)]
 struct AttentionState<B: AttentionBackend> {
@@ -325,9 +400,9 @@ impl<B: AttentionBackend> Backward<B, 3> for AttentionBackward {
             state.causal,
         );
         for (node, grad) in [
-            (node_query, output.query),
-            (node_key, output.key),
-            (node_value, output.value),
+            (node_query, output.0),
+            (node_key, output.1),
+            (node_value, output.2),
         ] {
             if let Some(node) = node {
                 grads.register::<B>(node.id, grad);
@@ -342,89 +417,67 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
         causal: bool,
-    ) -> AttentionOutput<Self> {
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         match AttentionBackward
             .prepare::<C>([query.node.clone(), key.node.clone(), value.node.clone()])
             .compute_bound()
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let output = B::attention_inner(
-                    query.primitive.clone(),
-                    key.primitive.clone(),
-                    value.primitive.clone(),
-                    causal,
-                );
+                let (output, stats, saved_query, saved_key, saved_value, saved_output) =
+                    B::attention_inner(
+                        query.primitive.clone(),
+                        key.primitive.clone(),
+                        value.primitive.clone(),
+                        causal,
+                    );
                 let state = AttentionState {
-                    query: output.saved_query.clone(),
-                    key: output.saved_key.clone(),
-                    value: output.saved_value.clone(),
-                    output: output.saved_output.clone(),
-                    stats: output.stats.clone(),
+                    query: saved_query.clone(),
+                    key: saved_key.clone(),
+                    value: saved_value.clone(),
+                    output: saved_output.clone(),
+                    stats: stats.clone(),
                     causal,
                 };
-                AttentionOutput {
-                    output: prep.finish(state, output.output),
-                    stats: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.stats,
-                    ),
-                    saved_query: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_query,
-                    ),
-                    saved_key: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_key,
-                    ),
-                    saved_value: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_value,
-                    ),
-                    saved_output: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_output,
-                    ),
-                }
+                (
+                    prep.finish(state, output),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(stats),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_query),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_key),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_value),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_output),
+                )
             }
             OpsKind::UnTracked(prep) => {
-                let output =
+                let (output, stats, saved_query, saved_key, saved_value, saved_output) =
                     B::attention_inner(query.primitive, key.primitive, value.primitive, causal);
-                AttentionOutput {
-                    output: prep.finish(output.output),
-                    stats: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.stats,
-                    ),
-                    saved_query: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_query,
-                    ),
-                    saved_key: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_key,
-                    ),
-                    saved_value: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_value,
-                    ),
-                    saved_output: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(
-                        output.saved_output,
-                    ),
-                }
+                (
+                    prep.finish(output),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(stats),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_query),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_key),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_value),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(saved_output),
+                )
             }
         }
     }
 }
 
-#[cfg(feature = "metal")]
-impl<I, BT> AttentionBackend for burn_cubecl::CubeBackend<burn_wgpu::WgpuRuntime, f32, I, BT>
-where
-    I: burn_cubecl::element::IntElement,
-    BT: burn_cubecl::element::BoolElement,
-{
-}
-
 #[cfg(test)]
 mod tests {
-    use burn::tensor::{Tensor, TensorData};
-    use burn_autodiff::Autodiff;
-    use burn_ndarray::NdArray;
+    use burn::tensor::{Device, Tensor, TensorData};
 
     use super::{attention_probabilities, fused_attention, repeat_kv};
-
-    type TestBackend = Autodiff<NdArray>;
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    use crate::model::test_support::snapshot;
 
     fn values(length: usize, scale: f32) -> Vec<f32> {
         (0..length)
@@ -444,7 +497,7 @@ mod tests {
 
     #[test]
     fn custom_attention_backward_matches_burn_autodiff_for_causal_gqa() {
-        let device = Default::default();
+        let device = Device::ndarray().autodiff();
         let (batch, query_heads, kv_heads, sequence, head_dim) = (2, 4, 2, 5, 4);
         let query_data = values(batch * query_heads * sequence * head_dim, 0.071);
         let key_data = values(batch * kv_heads * sequence * head_dim, 0.097);
@@ -452,17 +505,17 @@ mod tests {
         let factor_data = values(batch * query_heads * sequence * head_dim, 0.137);
 
         let run = |custom: bool| {
-            let query = Tensor::<TestBackend, 4>::from_data(
+            let query = Tensor::<4>::from_data(
                 TensorData::new(query_data.clone(), [batch, query_heads, sequence, head_dim]),
                 &device,
             )
             .require_grad();
-            let key = Tensor::<TestBackend, 4>::from_data(
+            let key = Tensor::<4>::from_data(
                 TensorData::new(key_data.clone(), [batch, kv_heads, sequence, head_dim]),
                 &device,
             )
             .require_grad();
-            let value = Tensor::<TestBackend, 4>::from_data(
+            let value = Tensor::<4>::from_data(
                 TensorData::new(value_data.clone(), [batch, kv_heads, sequence, head_dim]),
                 &device,
             )
@@ -473,8 +526,8 @@ mod tests {
                 attention_probabilities(query.clone(), key.clone(), true)
                     .matmul(repeat_kv(value.clone(), query_heads))
             };
-            let output_data = output.clone().inner().into_data();
-            let factors = Tensor::<TestBackend, 4>::from_data(
+            let output_data = output.clone().into_data();
+            let factors = Tensor::<4>::from_data(
                 TensorData::new(
                     factor_data.clone(),
                     [batch, query_heads, sequence, head_dim],
@@ -501,35 +554,33 @@ mod tests {
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     #[test]
     fn cuda_attention_matches_cpu_reference_for_causal_gqa() {
-        type CudaBackend = Autodiff<burn_cuda::Cuda>;
-
-        let cpu_device = Default::default();
-        let cuda_device = Default::default();
+        let cpu_device = Device::ndarray().autodiff();
+        let cuda_device = Device::cuda(0).autodiff();
         let (batch, query_heads, kv_heads, sequence, head_dim) = (1, 4, 2, 64, 64);
         let query_data = values(batch * query_heads * sequence * head_dim, 0.071);
         let key_data = values(batch * kv_heads * sequence * head_dim, 0.097);
         let value_data = values(batch * kv_heads * sequence * head_dim, 0.113);
         let factor_data = values(batch * query_heads * sequence * head_dim, 0.137);
 
-        let cpu_query = Tensor::<TestBackend, 4>::from_data(
+        let cpu_query = Tensor::<4>::from_data(
             TensorData::new(query_data.clone(), [batch, query_heads, sequence, head_dim]),
             &cpu_device,
         )
         .require_grad();
-        let cpu_key = Tensor::<TestBackend, 4>::from_data(
+        let cpu_key = Tensor::<4>::from_data(
             TensorData::new(key_data.clone(), [batch, kv_heads, sequence, head_dim]),
             &cpu_device,
         )
         .require_grad();
-        let cpu_value = Tensor::<TestBackend, 4>::from_data(
+        let cpu_value = Tensor::<4>::from_data(
             TensorData::new(value_data.clone(), [batch, kv_heads, sequence, head_dim]),
             &cpu_device,
         )
         .require_grad();
         let cpu_output = attention_probabilities(cpu_query.clone(), cpu_key.clone(), true)
             .matmul(repeat_kv(cpu_value.clone(), query_heads));
-        let cpu_output_data = cpu_output.clone().inner().into_data();
-        let cpu_factors = Tensor::<TestBackend, 4>::from_data(
+        let cpu_output_data = snapshot(cpu_output.clone());
+        let cpu_factors = Tensor::<4>::from_data(
             TensorData::new(
                 factor_data.clone(),
                 [batch, query_heads, sequence, head_dim],
@@ -550,17 +601,17 @@ mod tests {
                 .into_data(),
         );
 
-        let cuda_query = Tensor::<CudaBackend, 4>::from_data(
+        let cuda_query = Tensor::<4>::from_data(
             TensorData::new(query_data, [batch, query_heads, sequence, head_dim]),
             &cuda_device,
         )
         .require_grad();
-        let cuda_key = Tensor::<CudaBackend, 4>::from_data(
+        let cuda_key = Tensor::<4>::from_data(
             TensorData::new(key_data, [batch, kv_heads, sequence, head_dim]),
             &cuda_device,
         )
         .require_grad();
-        let cuda_value = Tensor::<CudaBackend, 4>::from_data(
+        let cuda_value = Tensor::<4>::from_data(
             TensorData::new(value_data, [batch, kv_heads, sequence, head_dim]),
             &cuda_device,
         )
@@ -571,8 +622,8 @@ mod tests {
             cuda_value.clone(),
             true,
         );
-        let cuda_output_data = cuda_output.clone().inner().into_data();
-        let cuda_factors = Tensor::<CudaBackend, 4>::from_data(
+        let cuda_output_data = snapshot(cuda_output.clone());
+        let cuda_factors = Tensor::<4>::from_data(
             TensorData::new(factor_data, [batch, query_heads, sequence, head_dim]),
             &cuda_device,
         );

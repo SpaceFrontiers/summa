@@ -7,24 +7,19 @@ use burn_nn::{LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig};
 
 use crate::mal::NormType;
 
-#[derive(Module, Clone, Debug)]
+#[derive(Module, Debug)]
 pub struct Identity {}
 
 /// Unified normalization layer.
 #[derive(Module, Debug)]
-pub enum Norm<B: Backend> {
-    Rms(RmsNorm<B>),
-    Layer(LayerNorm<B>),
+pub enum Norm {
+    Rms(RmsNorm),
+    Layer(LayerNorm),
     Identity(Identity),
 }
 
-impl<B: Backend> Norm<B> {
-    pub fn new(
-        norm_type: NormType,
-        size: usize,
-        eps: f64,
-        device: &burn::tensor::Device<B>,
-    ) -> Self {
+impl Norm {
+    pub fn new(norm_type: NormType, size: usize, eps: f64, device: &Device) -> Self {
         match norm_type {
             NormType::RmsNorm => Self::Rms(RmsNormConfig::new(size).with_epsilon(eps).init(device)),
             NormType::LayerNorm => {
@@ -34,7 +29,7 @@ impl<B: Backend> Norm<B> {
         }
     }
 
-    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
         match self {
             Self::Rms(n) => n.forward(x),
             Self::Layer(n) => n.forward(x),

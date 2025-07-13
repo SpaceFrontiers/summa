@@ -12,23 +12,34 @@ use burn_nn::{
 
 use crate::mal::{BlockDef, ModelDef};
 
-use super::fused_attention::{AttentionBackend, fused_attention, repeat_kv};
+use super::fused_attention::{fused_attention, repeat_kv};
 use super::matmul::linear;
 
-/// KV cache for one attention layer: [B, n_kv, T, head_dim], pre-GQA-repeat.
-#[derive(Debug, Clone, Default)]
-pub struct AttnCache<B: Backend> {
-    pub k: Option<Tensor<B, 4>>,
-    pub v: Option<Tensor<B, 4>>,
+/// Preallocated KV cache for one attention layer, before GQA head expansion.
+#[derive(Debug, Clone)]
+pub struct AttnCache {
+    k: Option<Tensor<4>>,
+    v: Option<Tensor<4>>,
+    len: usize,
+}
+
+impl AttnCache {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[derive(Module, Debug)]
-pub struct MultiHeadAttention<B: Backend> {
-    qkv_proj: Linear<B>,
-    o_proj: Linear<B>,
+pub struct MultiHeadAttention {
+    qkv_proj: Linear,
+    o_proj: Linear,
     /// Per-head RMSNorm over head_dim, applied to Q/K before RoPE (qk_norm).
-    q_norm: Option<RmsNorm<B>>,
-    k_norm: Option<RmsNorm<B>>,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     #[module(skip)]
     num_heads: usize,
     #[module(skip)]
@@ -41,11 +52,13 @@ pub struct MultiHeadAttention<B: Backend> {
     causal: bool,
     #[module(skip)]
     use_rope: bool,
+    #[module(skip)]
+    max_seq_len: usize,
     attention_dropout: Dropout,
 }
 
-impl<B: AttentionBackend> MultiHeadAttention<B> {
-    pub fn new(config: &ModelDef, block: &BlockDef, device: &Device<B>) -> Self {
+impl MultiHeadAttention {
+    pub fn new(config: &ModelDef, block: &BlockDef, device: &Device) -> Self {
         let num_heads = block.num_heads();
         let num_kv_heads = block.num_kv_heads();
         let head_dim = block.head_dim(config.hidden_size);
@@ -83,20 +96,30 @@ impl<B: AttentionBackend> MultiHeadAttention<B> {
                 &block.attention.position_encoding,
                 crate::mal::PositionEncoding::Rope { .. }
             ),
+            max_seq_len: config.max_seq_len,
             attention_dropout: DropoutConfig::new(block.attention.dropout).init(),
+        }
+    }
+
+    pub fn make_cache(&self, batch: usize, device: &Device) -> AttnCache {
+        let shape = [batch, self.num_kv_heads, self.max_seq_len, self.head_dim];
+        AttnCache {
+            k: Some(Tensor::zeros(shape, device)),
+            v: Some(Tensor::zeros(shape, device)),
+            len: 0,
         }
     }
 
     /// Project and position per-head Q, K, and V tensors.
     fn project_qkv(
         &self,
-        x: Tensor<B, 3>,
-        rope: &RotaryEncoding<B>,
+        x: Tensor<3>,
+        rope: &RotaryEncoding,
         start_pos: usize,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+    ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let [b, s, _] = x.dims();
         let split =
-            |t: Tensor<B, 3>, heads: usize| t.reshape([b, s, heads, self.head_dim]).swap_dims(1, 2);
+            |t: Tensor<3>, heads: usize| t.reshape([b, s, heads, self.head_dim]).swap_dims(1, 2);
         let qkv = linear(&self.qkv_proj, x);
         let query_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
@@ -127,17 +150,11 @@ impl<B: AttentionBackend> MultiHeadAttention<B> {
 
     /// Scaled-dot-product attention over K/V ([B, H, T, hd]) for queries at
     /// global positions `q_start..q_start+S`. Applies causal + window masking.
-    fn sdpa(
-        &self,
-        q: Tensor<B, 4>,
-        k: Tensor<B, 4>,
-        v: Tensor<B, 4>,
-        q_start: usize,
-    ) -> Tensor<B, 4> {
+    fn sdpa(&self, q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, q_start: usize) -> Tensor<4> {
         let device = q.device();
         let [_, _, seq_q, _] = q.dims();
         let total = k.dims()[2];
-        if B::ad_enabled(&device) && self.attention_dropout.prob > 0.0 {
+        if device.is_autodiff() && self.attention_dropout.prob > 0.0 {
             let k = repeat_kv(k, self.num_heads);
             let v = repeat_kv(v, self.num_heads);
             let mut scores = q
@@ -159,7 +176,7 @@ impl<B: AttentionBackend> MultiHeadAttention<B> {
         } else {
             self.build_mask(seq_q, total, q_start, &device)
         };
-        if mask.is_none() {
+        if mask.is_none() && q_start == 0 && seq_q == total {
             fused_attention(q, k, v, fused_causal)
         } else {
             attention(
@@ -184,10 +201,10 @@ impl<B: AttentionBackend> MultiHeadAttention<B> {
         seq_q: usize,
         total: usize,
         q_start: usize,
-        device: &Device<B>,
-    ) -> Option<Tensor<B, 4, Bool>> {
-        let needs = (self.causal && (seq_q > 1 || q_start > 0 || total > seq_q))
-            || (self.window_size.is_some() && total > 1);
+        device: &Device,
+    ) -> Option<Tensor<4, Bool>> {
+        let needs =
+            (self.causal && total > q_start + 1) || (self.window_size.is_some() && total > 1);
         if !needs {
             return None;
         }
@@ -203,23 +220,18 @@ impl<B: AttentionBackend> MultiHeadAttention<B> {
                 mask[i * total + j] = causal_block || window_block;
             }
         }
-        let m = Tensor::<B, 2, Bool>::from_data(TensorData::new(mask, [seq_q, total]), device);
+        let m = Tensor::<2, Bool>::from_data(TensorData::new(mask, [seq_q, total]), device);
         Some(m.reshape([1, 1, seq_q, total]))
     }
 
-    fn merge_heads(&self, out: Tensor<B, 4>) -> Tensor<B, 3> {
+    fn merge_heads(&self, out: Tensor<4>) -> Tensor<3> {
         let [b, _, s, _] = out.dims();
         out.swap_dims(1, 2)
             .reshape([b, s, self.num_heads * self.head_dim])
     }
 
     /// Full (stateless) attention over the given sequence.
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        rope: &RotaryEncoding<B>,
-        start_pos: usize,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>, rope: &RotaryEncoding, start_pos: usize) -> Tensor<3> {
         let (q, k, v) = self.project_qkv(x, rope, start_pos);
         let out = self.sdpa(q, k, v, start_pos);
         linear(&self.o_proj, self.merge_heads(out))
@@ -229,24 +241,50 @@ impl<B: AttentionBackend> MultiHeadAttention<B> {
     /// positions `start_pos..start_pos+S`.
     pub fn forward_cached(
         &self,
-        x: Tensor<B, 3>,
-        rope: &RotaryEncoding<B>,
+        x: Tensor<3>,
+        rope: &RotaryEncoding,
         start_pos: usize,
-        cache: &mut AttnCache<B>,
-    ) -> Tensor<B, 3> {
+        cache: &mut AttnCache,
+    ) -> Tensor<3> {
         let (q, k, v) = self.project_qkv(x, rope, start_pos);
 
-        // Append to cache (pre-GQA-repeat).
-        let k = match cache.k.take() {
-            Some(ck) => Tensor::cat(vec![ck, k], 2),
-            None => k,
-        };
-        let v = match cache.v.take() {
-            Some(cv) => Tensor::cat(vec![cv, v], 2),
-            None => v,
-        };
-        cache.k = Some(k.clone());
-        cache.v = Some(v.clone());
+        assert_eq!(
+            start_pos, cache.len,
+            "attention cache position does not match inference state"
+        );
+        let end = start_pos + k.dims()[2];
+        assert!(end <= self.max_seq_len, "attention cache capacity exceeded");
+        let ranges = [
+            0..k.dims()[0],
+            0..self.num_kv_heads,
+            start_pos..end,
+            0..self.head_dim,
+        ];
+        let k_cache = cache
+            .k
+            .take()
+            .expect("attention cache is initialized")
+            .slice_assign(ranges.clone(), k);
+        let v_cache = cache
+            .v
+            .take()
+            .expect("attention cache is initialized")
+            .slice_assign(ranges, v);
+        let k = k_cache.clone().slice([
+            0..k_cache.dims()[0],
+            0..self.num_kv_heads,
+            0..end,
+            0..self.head_dim,
+        ]);
+        let v = v_cache.clone().slice([
+            0..v_cache.dims()[0],
+            0..self.num_kv_heads,
+            0..end,
+            0..self.head_dim,
+        ]);
+        cache.k = Some(k_cache);
+        cache.v = Some(v_cache);
+        cache.len = end;
 
         let out = self.sdpa(q, k, v, start_pos);
         linear(&self.o_proj, self.merge_heads(out))

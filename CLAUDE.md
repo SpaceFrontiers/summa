@@ -48,7 +48,7 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-client-python**: Python gRPC client
 - **hermes-web**: Vue.js web UI
 
-LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same generic `hermes_llm::Transformer` used by inference, saves a safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
+LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same `hermes_llm::Transformer` used by inference, saves a safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
 
 **MAL parser is a single source of truth:** the pest grammar + AST live in the standalone `hermes-mal` crate (`hermes-mal/src/{lib.rs,mal.pest}`, embeds `hermes-mal/well-known/*.mal`). `hermes-llm` re-exports it as `crate::mal`; `hermes-train` consumes that re-export. Change the grammar/AST in one place.
 

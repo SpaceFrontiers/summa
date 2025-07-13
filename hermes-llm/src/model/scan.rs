@@ -3,9 +3,18 @@
 //! CPU uses a tensor-op reference. GPU inference and training use CubeCL
 //! forward and backward kernels directly on Burn's resident tensors.
 
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
+#[cfg(feature = "metal")]
+use burn::backend::Metal;
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+use burn::backend::NdArray;
+use burn::backend::{
+    Backend, Dispatch, DispatchKindConversion, DispatchTensor, backend_extension,
+    tensor::FloatTensor,
+};
 use burn::prelude::*;
 use burn::tensor::activation::{relu, sigmoid};
-use burn::tensor::{TensorPrimitive, ops::FloatTensor};
 use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy};
 use burn_autodiff::grads::Gradients;
@@ -13,31 +22,20 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
 use super::conv::DepthwiseConv1dBackend;
 
-fn stable_softplus<B: Backend, const D: usize>(value: Tensor<B, D>) -> Tensor<B, D> {
+fn stable_softplus<const D: usize>(value: Tensor<D>) -> Tensor<D> {
     relu(value.clone()) + (-value.abs()).exp().add_scalar(1.0).log()
 }
 
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct ScanOutput<B: Backend> {
-    pub(super) y: FloatTensor<B>,
-    pub(super) h: FloatTensor<B>,
-    pub(super) states: Option<FloatTensor<B>>,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct ScanGradients<B: Backend> {
-    pub(super) delta: FloatTensor<B>,
-    pub(super) xs: FloatTensor<B>,
-    pub(super) b_mat: FloatTensor<B>,
-    pub(super) c_mat: FloatTensor<B>,
-    pub(super) a: FloatTensor<B>,
-    pub(super) d: FloatTensor<B>,
-    pub(super) h: FloatTensor<B>,
-}
-
 /// Backend capability required by the Mamba mixer.
+#[cfg_attr(feature = "cuda", backend_extension(Cuda, Autodiff))]
+#[cfg_attr(
+    all(not(feature = "cuda"), feature = "metal"),
+    backend_extension(Metal, Autodiff)
+)]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "metal")),
+    backend_extension(NdArray, Autodiff)
+)]
 pub trait MambaBackend: Backend + DepthwiseConv1dBackend {
     #[allow(clippy::too_many_arguments)]
     fn selective_scan_inner(
@@ -50,11 +48,9 @@ pub trait MambaBackend: Backend + DepthwiseConv1dBackend {
         h: FloatTensor<Self>,
         state_dim: usize,
         save_states: bool,
-    ) -> ScanOutput<Self> {
-        reference_selective_scan(delta, xs, b_mat, c_mat, a, d, h, state_dim, save_states)
-    }
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity, unused_variables)]
     fn selective_scan_backward(
         delta: FloatTensor<Self>,
         xs: FloatTensor<Self>,
@@ -66,38 +62,49 @@ pub trait MambaBackend: Backend + DepthwiseConv1dBackend {
         states: FloatTensor<Self>,
         grad_y: FloatTensor<Self>,
         state_dim: usize,
-    ) -> ScanGradients<Self> {
-        reference_selective_scan_backward(
-            delta, xs, b_mat, c_mat, a, d, h, states, grad_y, state_dim,
-        )
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
+        panic!("selective scan only supports first-order autodiff")
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn selective_scan<B: MambaBackend>(
-    delta: Tensor<B, 3>,
-    xs: Tensor<B, 3>,
-    b_mat: Tensor<B, 3>,
-    c_mat: Tensor<B, 3>,
-    a: Tensor<B, 2>,
-    d: Tensor<B, 1>,
-    h: Tensor<B, 3>,
+pub(super) fn selective_scan(
+    delta: Tensor<3>,
+    xs: Tensor<3>,
+    b_mat: Tensor<3>,
+    c_mat: Tensor<3>,
+    a: Tensor<2>,
+    d: Tensor<1>,
+    h: Tensor<3>,
     state_dim: usize,
-) -> (Tensor<B, 3>, Tensor<B, 3>) {
-    let output = B::selective_scan_inner(
-        delta.into_primitive().tensor(),
-        xs.into_primitive().tensor(),
-        b_mat.into_primitive().tensor(),
-        c_mat.into_primitive().tensor(),
-        a.into_primitive().tensor(),
-        d.into_primitive().tensor(),
-        h.into_primitive().tensor(),
+) -> (Tensor<3>, Tensor<3>) {
+    if delta.device() == Device::ndarray() {
+        let (y, h, _) =
+            reference_selective_scan_tensor(delta, xs, b_mat, c_mat, a, d, h, state_dim, false);
+        return (y, h);
+    }
+    let output = Dispatch::selective_scan_inner(
+        delta.into_dispatch(),
+        xs.into_dispatch(),
+        b_mat.into_dispatch(),
+        c_mat.into_dispatch(),
+        a.into_dispatch(),
+        d.into_dispatch(),
+        h.into_dispatch(),
         state_dim,
         false,
     );
     (
-        Tensor::from_primitive(TensorPrimitive::Float(output.y)),
-        Tensor::from_primitive(TensorPrimitive::Float(output.h)),
+        Tensor::from_dispatch(output.0),
+        Tensor::from_dispatch(output.1),
     )
 }
 
@@ -112,16 +119,45 @@ fn reference_selective_scan<B: Backend>(
     h: FloatTensor<B>,
     state_dim: usize,
     save_states: bool,
-) -> ScanOutput<B> {
-    let delta = stable_softplus(Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(
-        delta,
-    )));
-    let xs = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(xs));
-    let b_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(b_mat));
-    let c_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(c_mat));
-    let a = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(a));
-    let d = Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(d));
-    let mut h = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(h));
+) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let (y, h, states) = reference_selective_scan_tensor(
+        Tensor::<3>::from_primitive::<B>(delta),
+        Tensor::<3>::from_primitive::<B>(xs),
+        Tensor::<3>::from_primitive::<B>(b_mat),
+        Tensor::<3>::from_primitive::<B>(c_mat),
+        Tensor::<2>::from_primitive::<B>(a),
+        Tensor::<1>::from_primitive::<B>(d),
+        Tensor::<3>::from_primitive::<B>(h),
+        state_dim,
+        save_states,
+    );
+    (
+        y.try_into_primitive::<B>()
+            .expect("scan output stayed on its input backend"),
+        h.try_into_primitive::<B>()
+            .expect("scan state stayed on its input backend"),
+        states
+            .try_into_primitive::<B>()
+            .expect("saved scan states stayed on their input backend"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reference_selective_scan_tensor(
+    delta: Tensor<3>,
+    xs: Tensor<3>,
+    b_mat: Tensor<3>,
+    c_mat: Tensor<3>,
+    a: Tensor<2>,
+    d: Tensor<1>,
+    mut h: Tensor<3>,
+    state_dim: usize,
+    save_states: bool,
+) -> (Tensor<3>, Tensor<3>, Tensor<4>) {
+    let delta = stable_softplus(delta);
     let [batch, seq_len, channels] = xs.dims();
     assert_eq!(state_dim, h.dims()[2]);
 
@@ -159,14 +195,13 @@ fn reference_selective_scan<B: Backend>(
         }
     }
 
-    ScanOutput {
-        y: Tensor::cat(ys, 1).into_primitive().tensor(),
-        h: h.into_primitive().tensor(),
-        states: states.map(|states| Tensor::cat(states, 1).into_primitive().tensor()),
-    }
+    let states = states
+        .map(|states| Tensor::cat(states, 1))
+        .unwrap_or_else(|| h.clone().unsqueeze_dim::<4>(1));
+    (Tensor::cat(ys, 1), h, states)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn reference_selective_scan_backward<B: Backend>(
     delta: FloatTensor<B>,
     xs: FloatTensor<B>,
@@ -178,18 +213,29 @@ fn reference_selective_scan_backward<B: Backend>(
     states: FloatTensor<B>,
     grad_y: FloatTensor<B>,
     state_dim: usize,
-) -> ScanGradients<B> {
-    let delta_raw = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(delta));
+) -> (
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let delta_raw = Tensor::<3>::from_primitive::<B>(delta);
     let delta_derivative = sigmoid(delta_raw.clone());
     let delta = stable_softplus(delta_raw);
-    let xs = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(xs));
-    let b_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(b_mat));
-    let c_mat = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(c_mat));
-    let a = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(a));
-    let d = Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(d));
-    let h0 = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(h));
-    let states = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(states));
-    let grad_y = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(grad_y));
+    let xs = Tensor::<3>::from_primitive::<B>(xs);
+    let b_mat = Tensor::<3>::from_primitive::<B>(b_mat);
+    let c_mat = Tensor::<3>::from_primitive::<B>(c_mat);
+    let a = Tensor::<2>::from_primitive::<B>(a);
+    let d = Tensor::<1>::from_primitive::<B>(d);
+    let h0 = Tensor::<3>::from_primitive::<B>(h);
+    let states = Tensor::<4>::from_primitive::<B>(states);
+    let grad_y = Tensor::<3>::from_primitive::<B>(grad_y);
     let [batch, seq_len, channels] = xs.dims();
     let device = xs.device();
 
@@ -278,20 +324,71 @@ fn reference_selective_scan_backward<B: Backend>(
     grad_xs.reverse();
     grad_b.reverse();
     grad_c.reverse();
-    ScanGradients {
-        delta: (Tensor::cat(grad_delta, 1) * delta_derivative)
-            .into_primitive()
-            .tensor(),
-        xs: Tensor::cat(grad_xs, 1).into_primitive().tensor(),
-        b_mat: Tensor::cat(grad_b, 1).into_primitive().tensor(),
-        c_mat: Tensor::cat(grad_c, 1).into_primitive().tensor(),
-        a: grad_a.into_primitive().tensor(),
-        d: grad_d.into_primitive().tensor(),
-        h: grad_h.into_primitive().tensor(),
-    }
+    (
+        (Tensor::cat(grad_delta, 1) * delta_derivative)
+            .try_into_primitive::<B>()
+            .expect("delta gradient stayed on its input backend"),
+        Tensor::cat(grad_xs, 1)
+            .try_into_primitive::<B>()
+            .expect("input gradient stayed on its input backend"),
+        Tensor::cat(grad_b, 1)
+            .try_into_primitive::<B>()
+            .expect("B gradient stayed on its input backend"),
+        Tensor::cat(grad_c, 1)
+            .try_into_primitive::<B>()
+            .expect("C gradient stayed on its input backend"),
+        grad_a
+            .try_into_primitive::<B>()
+            .expect("A gradient stayed on its input backend"),
+        grad_d
+            .try_into_primitive::<B>()
+            .expect("D gradient stayed on its input backend"),
+        grad_h
+            .try_into_primitive::<B>()
+            .expect("state gradient stayed on its input backend"),
+    )
 }
 
-impl MambaBackend for burn_ndarray::NdArray {}
+impl MambaBackend for burn_ndarray::NdArray {
+    fn selective_scan_inner(
+        delta: FloatTensor<Self>,
+        xs: FloatTensor<Self>,
+        b_mat: FloatTensor<Self>,
+        c_mat: FloatTensor<Self>,
+        a: FloatTensor<Self>,
+        d: FloatTensor<Self>,
+        h: FloatTensor<Self>,
+        state_dim: usize,
+        save_states: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        reference_selective_scan::<Self>(delta, xs, b_mat, c_mat, a, d, h, state_dim, save_states)
+    }
+
+    fn selective_scan_backward(
+        delta: FloatTensor<Self>,
+        xs: FloatTensor<Self>,
+        b_mat: FloatTensor<Self>,
+        c_mat: FloatTensor<Self>,
+        a: FloatTensor<Self>,
+        d: FloatTensor<Self>,
+        h: FloatTensor<Self>,
+        states: FloatTensor<Self>,
+        grad_y: FloatTensor<Self>,
+        state_dim: usize,
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
+        reference_selective_scan_backward::<Self>(
+            delta, xs, b_mat, c_mat, a, d, h, states, grad_y, state_dim,
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 struct SelectiveScanState<B: MambaBackend> {
@@ -335,13 +432,13 @@ impl<B: MambaBackend> Backward<B, 7> for SelectiveScanBackward {
         );
 
         for (node, grad) in [
-            (node_delta, output.delta),
-            (node_xs, output.xs),
-            (node_b, output.b_mat),
-            (node_c, output.c_mat),
-            (node_a, output.a),
-            (node_d, output.d),
-            (node_h, output.h),
+            (node_delta, output.0),
+            (node_xs, output.1),
+            (node_b, output.2),
+            (node_c, output.3),
+            (node_a, output.4),
+            (node_d, output.5),
+            (node_h, output.6),
         ] {
             if let Some(node) = node {
                 grads.register::<B>(node.id, grad);
@@ -361,7 +458,7 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
         h: FloatTensor<Self>,
         state_dim: usize,
         _save_states: bool,
-    ) -> ScanOutput<Self> {
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         match SelectiveScanBackward
             .prepare::<C>([
                 delta.node.clone(),
@@ -376,7 +473,7 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let output = B::selective_scan_inner(
+                let (y, h_out, states) = B::selective_scan_inner(
                     delta.primitive.clone(),
                     xs.primitive.clone(),
                     b_mat.primitive.clone(),
@@ -395,19 +492,17 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
                     a: a.primitive,
                     d: d.primitive,
                     h: h.primitive,
-                    states: output
-                        .states
-                        .expect("training selective scan must retain recurrent states"),
+                    states,
                     state_dim,
                 };
-                ScanOutput {
-                    y: prep.finish(state, output.y),
-                    h: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(output.h),
-                    states: None,
-                }
+                (
+                    prep.finish(state, y),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(h_out.clone()),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(h_out),
+                )
             }
             OpsKind::UnTracked(prep) => {
-                let output = B::selective_scan_inner(
+                let (y, h_out, _states) = B::selective_scan_inner(
                     delta.primitive,
                     xs.primitive,
                     b_mat.primitive,
@@ -418,11 +513,11 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
                     state_dim,
                     false,
                 );
-                ScanOutput {
-                    y: prep.finish(output.y),
-                    h: <Self as burn::tensor::backend::AutodiffBackend>::from_inner(output.h),
-                    states: None,
-                }
+                (
+                    prep.finish(y),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(h_out.clone()),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(h_out),
+                )
             }
         }
     }
@@ -430,13 +525,13 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
 
 #[cfg(any(feature = "metal", feature = "cuda"))]
 mod gpu {
-    use burn::tensor::{Shape, TensorMetadata};
+    use burn::backend::TensorMetadata;
+    use burn::tensor::Shape;
     use burn_cubecl::cubecl::prelude::*;
-    use burn_cubecl::element::{BoolElement, FloatElement, IntElement};
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
-    use super::{MambaBackend, ScanGradients, ScanOutput};
+    use super::MambaBackend;
     use crate::model::cube_tensor::{empty_like, into_contiguous, zeros_like};
 
     const THREADS_PER_CUBE: u32 = 128;
@@ -468,7 +563,7 @@ mod gpu {
     }
 
     #[cube(launch)]
-    fn softplus_forward(input: &Array<f32>, output: &mut Array<f32>) {
+    fn softplus_forward(input: &Tensor<f32>, output: &mut Tensor<f32>) {
         let idx = ABSOLUTE_POS;
         if idx < input.len() {
             output[idx] = stable_softplus(input[idx]);
@@ -477,15 +572,15 @@ mod gpu {
 
     #[cube(launch)]
     fn selective_scan_step(
-        delta: &Array<f32>,
-        xs: &Array<f32>,
-        b_mat: &Array<f32>,
-        c_mat: &Array<f32>,
-        a: &Array<f32>,
-        d: &Array<f32>,
-        h_in: &Array<f32>,
-        y: &mut Array<f32>,
-        h_out: &mut Array<f32>,
+        delta: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        d: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        y: &mut Tensor<f32>,
+        h_out: &mut Tensor<f32>,
         channels: u32,
         #[comptime] state_dim: usize,
     ) {
@@ -521,13 +616,13 @@ mod gpu {
     /// reduces the small state dimension into the output.
     #[cube(launch)]
     fn selective_scan_states(
-        delta: &Array<f32>,
-        xs: &Array<f32>,
-        b_mat: &Array<f32>,
-        a: &Array<f32>,
-        h_in: &Array<f32>,
-        states: &mut Array<f32>,
-        h_out: &mut Array<f32>,
+        delta: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        states: &mut Tensor<f32>,
+        h_out: &mut Tensor<f32>,
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
@@ -557,11 +652,11 @@ mod gpu {
 
     #[cube(launch)]
     fn selective_scan_output(
-        xs: &Array<f32>,
-        c_mat: &Array<f32>,
-        d: &Array<f32>,
-        states: &Array<f32>,
-        y: &mut Array<f32>,
+        xs: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        d: &Tensor<f32>,
+        states: &Tensor<f32>,
+        y: &mut Tensor<f32>,
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
@@ -586,15 +681,15 @@ mod gpu {
     #[allow(clippy::useless_conversion)]
     #[cube(launch)]
     fn selective_scan_bc_backward(
-        delta: &Array<f32>,
-        xs: &Array<f32>,
-        c_mat: &Array<f32>,
-        a: &Array<f32>,
-        h_in: &Array<f32>,
-        states: &Array<f32>,
-        grad_y: &Array<f32>,
-        grad_b: &mut Array<Atomic<f32>>,
-        grad_c: &mut Array<Atomic<f32>>,
+        delta: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        states: &Tensor<f32>,
+        grad_y: &Tensor<f32>,
+        grad_b: &mut Tensor<Atomic<f32>>,
+        grad_c: &mut Tensor<Atomic<f32>>,
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
@@ -614,20 +709,16 @@ mod gpu {
             let t = seq_len - step - 1;
             let btc = (batch * seq_len + t) * channels + channel;
             let btn = (batch * seq_len + t) * state_dim;
-            let dt = if active { delta[btc] } else { 0.0f32.into() };
-            let x = if active { xs[btc] } else { 0.0f32.into() };
-            let dy = if active { grad_y[btc] } else { 0.0f32.into() };
-            let av = if active { a[a_index] } else { 0.0f32.into() };
-            let cv = if active {
-                c_mat[btn + n]
-            } else {
-                0.0f32.into()
-            };
+            let dt = if active { delta[btc] } else { 0.0f32 };
+            let x = if active { xs[btc] } else { 0.0f32 };
+            let dy = if active { grad_y[btc] } else { 0.0f32 };
+            let av = if active { a[a_index] } else { 0.0f32 };
+            let cv = if active { c_mat[btn + n] } else { 0.0f32 };
             let alpha = (dt * av).exp();
             let h_t = if active {
                 states[btc * state_dim + n]
             } else {
-                0.0f32.into()
+                0.0f32
             };
             let g = adjoint + dy * cv;
             let grad_b_sum = plane_sum(g * dt * x);
@@ -645,21 +736,21 @@ mod gpu {
     #[allow(clippy::useless_conversion)]
     #[cube(launch)]
     fn selective_scan_input_backward(
-        delta: &Array<f32>,
-        delta_raw: &Array<f32>,
-        xs: &Array<f32>,
-        b_mat: &Array<f32>,
-        c_mat: &Array<f32>,
-        a: &Array<f32>,
-        d: &Array<f32>,
-        h_in: &Array<f32>,
-        states: &Array<f32>,
-        grad_y: &Array<f32>,
-        grad_delta: &mut Array<f32>,
-        grad_xs: &mut Array<f32>,
-        grad_a: &mut Array<Atomic<f32>>,
-        grad_d: &mut Array<Atomic<f32>>,
-        grad_h: &mut Array<f32>,
+        delta: &Tensor<f32>,
+        delta_raw: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        d: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        states: &Tensor<f32>,
+        grad_y: &Tensor<f32>,
+        grad_delta: &mut Tensor<f32>,
+        grad_xs: &mut Tensor<f32>,
+        grad_a: &mut Tensor<Atomic<f32>>,
+        grad_d: &mut Tensor<Atomic<f32>>,
+        grad_h: &mut Tensor<f32>,
         channels: u32,
         seq_len: u32,
         #[comptime] state_dim: usize,
@@ -683,25 +774,13 @@ mod gpu {
             let t = seq_len - step - 1;
             let btc = (batch * seq_len + t) * channels + channel;
             let btn = (batch * seq_len + t) * state_dim;
-            let dt = if active { delta[btc] } else { 0.0f32.into() };
-            let raw_dt = if active {
-                delta_raw[btc]
-            } else {
-                0.0f32.into()
-            };
-            let x = if active { xs[btc] } else { 0.0f32.into() };
-            let dy = if active { grad_y[btc] } else { 0.0f32.into() };
-            let av = if active { a[a_index] } else { 0.0f32.into() };
-            let bv = if active {
-                b_mat[btn + n]
-            } else {
-                0.0f32.into()
-            };
-            let cv = if active {
-                c_mat[btn + n]
-            } else {
-                0.0f32.into()
-            };
+            let dt = if active { delta[btc] } else { 0.0f32 };
+            let raw_dt = if active { delta_raw[btc] } else { 0.0f32 };
+            let x = if active { xs[btc] } else { 0.0f32 };
+            let dy = if active { grad_y[btc] } else { 0.0f32 };
+            let av = if active { a[a_index] } else { 0.0f32 };
+            let bv = if active { b_mat[btn + n] } else { 0.0f32 };
+            let cv = if active { c_mat[btn + n] } else { 0.0f32 };
             let alpha = (dt * av).exp();
             let h_prev = if active {
                 if t == 0 {
@@ -710,7 +789,7 @@ mod gpu {
                     states[((batch * seq_len + t - 1) * channels + channel) * state_dim + n]
                 }
             } else {
-                0.0f32.into()
+                0.0f32
             };
             let g = adjoint + dy * cv;
             let grad_dt = plane_sum(g * (h_prev * alpha * av + bv * x));
@@ -733,13 +812,7 @@ mod gpu {
         }
     }
 
-    impl<R, F, I, BT> MambaBackend for CubeBackend<R, F, I, BT>
-    where
-        R: CubeRuntime,
-        F: FloatElement,
-        I: IntElement,
-        BT: BoolElement,
-    {
+    impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
         fn selective_scan_inner(
             delta: CubeTensor<R>,
             xs: CubeTensor<R>,
@@ -750,7 +823,7 @@ mod gpu {
             h: CubeTensor<R>,
             state_dim: usize,
             save_states: bool,
-        ) -> ScanOutput<Self> {
+        ) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
             let [batch, seq_len, channels] = xs.shape().dims();
             let delta_raw = into_contiguous(delta);
             let xs = into_contiguous(xs);
@@ -775,8 +848,8 @@ mod gpu {
                 &client,
                 CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
                 CubeDim::new_1d(THREADS_PER_CUBE),
-                delta_raw.into_array_arg(),
-                delta.clone().into_array_arg(),
+                delta_raw.into_tensor_arg(),
+                delta.clone().into_tensor_arg(),
             );
             if parallel_scan {
                 let state_total = (batch * channels * state_dim) as u32;
@@ -784,13 +857,13 @@ mod gpu {
                     &client,
                     CubeCount::Static(state_total.div_ceil(THREADS_PER_CUBE), 1, 1),
                     CubeDim::new_1d(THREADS_PER_CUBE),
-                    delta.clone().into_array_arg(),
-                    xs.clone().into_array_arg(),
-                    b_mat.clone().into_array_arg(),
-                    a.clone().into_array_arg(),
-                    h.clone().into_array_arg(),
-                    states.clone().into_array_arg(),
-                    h_out.clone().into_array_arg(),
+                    delta.clone().into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.clone().into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    h.clone().into_tensor_arg(),
+                    states.clone().into_tensor_arg(),
+                    h_out.clone().into_tensor_arg(),
                     channels as u32,
                     seq_len as u32,
                     state_dim,
@@ -800,11 +873,11 @@ mod gpu {
                     &client,
                     CubeCount::Static(output_total.div_ceil(THREADS_PER_CUBE), 1, 1),
                     CubeDim::new_1d(THREADS_PER_CUBE),
-                    xs.clone().into_array_arg(),
-                    c_mat.into_array_arg(),
-                    d.into_array_arg(),
-                    states.clone().into_array_arg(),
-                    y.clone().into_array_arg(),
+                    xs.clone().into_tensor_arg(),
+                    c_mat.into_tensor_arg(),
+                    d.into_tensor_arg(),
+                    states.clone().into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
                     channels as u32,
                     seq_len as u32,
                     state_dim,
@@ -815,25 +888,21 @@ mod gpu {
                     &client,
                     CubeCount::Static(total.div_ceil(THREADS_PER_CUBE), 1, 1),
                     CubeDim::new_1d(THREADS_PER_CUBE),
-                    delta.into_array_arg(),
-                    xs.clone().into_array_arg(),
-                    b_mat.into_array_arg(),
-                    c_mat.into_array_arg(),
-                    a.into_array_arg(),
-                    d.into_array_arg(),
-                    h.into_array_arg(),
-                    y.clone().into_array_arg(),
-                    h_out.clone().into_array_arg(),
+                    delta.into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.into_tensor_arg(),
+                    c_mat.into_tensor_arg(),
+                    a.into_tensor_arg(),
+                    d.into_tensor_arg(),
+                    h.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    h_out.clone().into_tensor_arg(),
                     channels as u32,
                     state_dim,
                 );
             }
 
-            ScanOutput {
-                y,
-                h: h_out,
-                states: save_states.then_some(states),
-            }
+            (y, h_out, states)
         }
 
         fn selective_scan_backward(
@@ -847,7 +916,15 @@ mod gpu {
             states: CubeTensor<R>,
             grad_y: CubeTensor<R>,
             state_dim: usize,
-        ) -> ScanGradients<Self> {
+        ) -> (
+            CubeTensor<R>,
+            CubeTensor<R>,
+            CubeTensor<R>,
+            CubeTensor<R>,
+            CubeTensor<R>,
+            CubeTensor<R>,
+            CubeTensor<R>,
+        ) {
             let [batch, seq_len, channels] = xs.shape().dims();
             assert!(
                 state_dim <= PLANE_WIDTH as usize,
@@ -877,8 +954,8 @@ mod gpu {
                 &client,
                 CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
                 CubeDim::new_1d(THREADS_PER_CUBE),
-                delta_raw.clone().into_array_arg(),
-                delta.clone().into_array_arg(),
+                delta_raw.clone().into_tensor_arg(),
+                delta.clone().into_tensor_arg(),
             );
 
             selective_scan_bc_backward::launch::<R>(
@@ -889,15 +966,15 @@ mod gpu {
                     1,
                 ),
                 CubeDim::new_2d(PLANE_WIDTH, PLANES_PER_CUBE),
-                delta.clone().into_array_arg(),
-                xs.clone().into_array_arg(),
-                c_mat.clone().into_array_arg(),
-                a.clone().into_array_arg(),
-                h.clone().into_array_arg(),
-                states.clone().into_array_arg(),
-                grad_y.clone().into_array_arg(),
-                grad_b.clone().into_array_arg(),
-                grad_c.clone().into_array_arg(),
+                delta.clone().into_tensor_arg(),
+                xs.clone().into_tensor_arg(),
+                c_mat.clone().into_tensor_arg(),
+                a.clone().into_tensor_arg(),
+                h.clone().into_tensor_arg(),
+                states.clone().into_tensor_arg(),
+                grad_y.clone().into_tensor_arg(),
+                grad_b.clone().into_tensor_arg(),
+                grad_c.clone().into_tensor_arg(),
                 channels as u32,
                 seq_len as u32,
                 state_dim,
@@ -910,61 +987,50 @@ mod gpu {
                     1,
                 ),
                 CubeDim::new_2d(PLANE_WIDTH, PLANES_PER_CUBE),
-                delta.into_array_arg(),
-                delta_raw.into_array_arg(),
-                xs.into_array_arg(),
-                b_mat.into_array_arg(),
-                c_mat.into_array_arg(),
-                a.into_array_arg(),
-                d.into_array_arg(),
-                h.into_array_arg(),
-                states.into_array_arg(),
-                grad_y.into_array_arg(),
-                grad_delta.clone().into_array_arg(),
-                grad_xs.clone().into_array_arg(),
-                grad_a.clone().into_array_arg(),
-                grad_d.clone().into_array_arg(),
-                grad_h.clone().into_array_arg(),
+                delta.into_tensor_arg(),
+                delta_raw.into_tensor_arg(),
+                xs.into_tensor_arg(),
+                b_mat.into_tensor_arg(),
+                c_mat.into_tensor_arg(),
+                a.into_tensor_arg(),
+                d.into_tensor_arg(),
+                h.into_tensor_arg(),
+                states.into_tensor_arg(),
+                grad_y.into_tensor_arg(),
+                grad_delta.clone().into_tensor_arg(),
+                grad_xs.clone().into_tensor_arg(),
+                grad_a.clone().into_tensor_arg(),
+                grad_d.clone().into_tensor_arg(),
+                grad_h.clone().into_tensor_arg(),
                 channels as u32,
                 seq_len as u32,
                 state_dim,
             );
 
-            ScanGradients {
-                delta: grad_delta,
-                xs: grad_xs,
-                b_mat: grad_b,
-                c_mat: grad_c,
-                a: grad_a,
-                d: grad_d,
-                h: grad_h,
-            }
+            (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h)
         }
     }
 }
 
 #[cfg(all(test, any(feature = "metal", feature = "cuda")))]
 mod tests {
-    use burn::tensor::{Tensor, TensorData};
-    use burn_autodiff::Autodiff;
-    #[cfg(all(feature = "cuda", not(feature = "metal")))]
-    use burn_cuda::Cuda as Gpu;
-    use burn_ndarray::NdArray;
-    #[cfg(feature = "metal")]
-    use burn_wgpu::Wgpu;
+    use burn::tensor::{Device, Tensor, TensorData};
 
     use super::selective_scan;
     use crate::model::test_support::{max_diff, values};
 
+    fn gpu_device() -> Device {
+        #[cfg(feature = "metal")]
+        return Device::metal(burn::tensor::DeviceKind::DefaultDevice);
+
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        return Device::cuda(0);
+    }
+
     #[test]
     fn test_cubecl_selective_scan_matches_ndarray_reference() {
-        type Cpu = NdArray;
-        #[cfg(feature = "metal")]
-        type GpuBackend = Wgpu;
-        #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        type GpuBackend = Gpu<cubecl::flex32>;
-        let cpu = Default::default();
-        let gpu = Default::default();
+        let cpu = Device::ndarray();
+        let gpu = gpu_device();
         let (batch, seq_len, channels, state_dim) = (2, 5, 3, 4);
 
         let delta = values(batch * seq_len * channels, 0.13, 0.08);
@@ -976,29 +1042,29 @@ mod tests {
         let h = values(batch * channels * state_dim, 0.05, 0.01);
 
         macro_rules! tensor {
-            ($backend:ty, $device:expr, $data:expr, $shape:expr) => {
-                Tensor::<$backend, _>::from_data(TensorData::new($data.clone(), $shape), $device)
+            ($device:expr, $data:expr, $shape:expr) => {
+                Tensor::from_data(TensorData::new($data.clone(), $shape), $device)
             };
         }
 
         let (cpu_y, cpu_h) = selective_scan(
-            tensor!(Cpu, &cpu, delta, [batch, seq_len, channels]),
-            tensor!(Cpu, &cpu, xs, [batch, seq_len, channels]),
-            tensor!(Cpu, &cpu, b_mat, [batch, seq_len, state_dim]),
-            tensor!(Cpu, &cpu, c_mat, [batch, seq_len, state_dim]),
-            tensor!(Cpu, &cpu, a, [channels, state_dim]),
-            tensor!(Cpu, &cpu, d, [channels]),
-            tensor!(Cpu, &cpu, h, [batch, channels, state_dim]),
+            tensor!(&cpu, delta, [batch, seq_len, channels]),
+            tensor!(&cpu, xs, [batch, seq_len, channels]),
+            tensor!(&cpu, b_mat, [batch, seq_len, state_dim]),
+            tensor!(&cpu, c_mat, [batch, seq_len, state_dim]),
+            tensor!(&cpu, a, [channels, state_dim]),
+            tensor!(&cpu, d, [channels]),
+            tensor!(&cpu, h, [batch, channels, state_dim]),
             state_dim,
         );
         let (gpu_y, gpu_h) = selective_scan(
-            tensor!(GpuBackend, &gpu, delta, [batch, seq_len, channels]),
-            tensor!(GpuBackend, &gpu, xs, [batch, seq_len, channels]),
-            tensor!(GpuBackend, &gpu, b_mat, [batch, seq_len, state_dim]),
-            tensor!(GpuBackend, &gpu, c_mat, [batch, seq_len, state_dim]),
-            tensor!(GpuBackend, &gpu, a, [channels, state_dim]),
-            tensor!(GpuBackend, &gpu, d, [channels]),
-            tensor!(GpuBackend, &gpu, h, [batch, channels, state_dim]),
+            tensor!(&gpu, delta, [batch, seq_len, channels]),
+            tensor!(&gpu, xs, [batch, seq_len, channels]),
+            tensor!(&gpu, b_mat, [batch, seq_len, state_dim]),
+            tensor!(&gpu, c_mat, [batch, seq_len, state_dim]),
+            tensor!(&gpu, a, [channels, state_dim]),
+            tensor!(&gpu, d, [channels]),
+            tensor!(&gpu, h, [batch, channels, state_dim]),
             state_dim,
         );
 
@@ -1008,13 +1074,8 @@ mod tests {
 
     #[test]
     fn test_cubecl_selective_scan_backward_matches_ndarray() {
-        type Cpu = Autodiff<NdArray>;
-        #[cfg(feature = "metal")]
-        type GpuBackend = Autodiff<Wgpu>;
-        #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        type GpuBackend = Autodiff<Gpu<cubecl::flex32>>;
-        let cpu = Default::default();
-        let gpu = Default::default();
+        let cpu = Device::ndarray().autodiff();
+        let gpu = gpu_device().autodiff();
         let (batch, seq_len, channels, state_dim) = (2, 4, 3, 4);
         let shapes = (
             [batch, seq_len, channels],
@@ -1034,42 +1095,22 @@ mod tests {
         );
 
         macro_rules! run {
-            ($backend:ty, $device:expr) => {{
-                let delta = Tensor::<$backend, 3>::from_data(
-                    TensorData::new(data.0.clone(), shapes.0),
-                    $device,
-                )
-                .require_grad();
-                let xs = Tensor::<$backend, 3>::from_data(
-                    TensorData::new(data.1.clone(), shapes.0),
-                    $device,
-                )
-                .require_grad();
-                let b = Tensor::<$backend, 3>::from_data(
-                    TensorData::new(data.2.clone(), shapes.1),
-                    $device,
-                )
-                .require_grad();
-                let c = Tensor::<$backend, 3>::from_data(
-                    TensorData::new(data.3.clone(), shapes.1),
-                    $device,
-                )
-                .require_grad();
-                let a = Tensor::<$backend, 2>::from_data(
-                    TensorData::new(data.4.clone(), shapes.2),
-                    $device,
-                )
-                .require_grad();
-                let d = Tensor::<$backend, 1>::from_data(
-                    TensorData::new(data.5.clone(), shapes.3),
-                    $device,
-                )
-                .require_grad();
-                let h = Tensor::<$backend, 3>::from_data(
-                    TensorData::new(data.6.clone(), shapes.4),
-                    $device,
-                )
-                .require_grad();
+            ($device:expr) => {{
+                let delta =
+                    Tensor::<3>::from_data(TensorData::new(data.0.clone(), shapes.0), $device)
+                        .require_grad();
+                let xs = Tensor::<3>::from_data(TensorData::new(data.1.clone(), shapes.0), $device)
+                    .require_grad();
+                let b = Tensor::<3>::from_data(TensorData::new(data.2.clone(), shapes.1), $device)
+                    .require_grad();
+                let c = Tensor::<3>::from_data(TensorData::new(data.3.clone(), shapes.1), $device)
+                    .require_grad();
+                let a = Tensor::<2>::from_data(TensorData::new(data.4.clone(), shapes.2), $device)
+                    .require_grad();
+                let d = Tensor::<1>::from_data(TensorData::new(data.5.clone(), shapes.3), $device)
+                    .require_grad();
+                let h = Tensor::<3>::from_data(TensorData::new(data.6.clone(), shapes.4), $device)
+                    .require_grad();
                 let (y, _) = selective_scan(
                     delta.clone(),
                     xs.clone(),
@@ -1080,7 +1121,7 @@ mod tests {
                     h.clone(),
                     state_dim,
                 );
-                let weights = Tensor::<$backend, 3>::from_data(
+                let weights = Tensor::<3>::from_data(
                     TensorData::new(values(batch * seq_len * channels, 0.29, 0.5), shapes.0),
                     $device,
                 );
@@ -1097,8 +1138,8 @@ mod tests {
             }};
         }
 
-        let cpu_grads = run!(Cpu, &cpu);
-        let gpu_grads = run!(GpuBackend, &gpu);
+        let cpu_grads = run!(&cpu);
+        let gpu_grads = run!(&gpu);
         for ((name, cpu), gpu) in ["delta", "xs", "b", "c", "a", "d", "h"]
             .into_iter()
             .zip(cpu_grads)

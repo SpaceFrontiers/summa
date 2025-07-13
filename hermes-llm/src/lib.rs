@@ -65,8 +65,8 @@ pub mod tokenizer;
 
 // Core types
 pub use model::{
-    Backend, Device, InferenceState, MambaBackend, ModelBackend, Transformer, default_device,
-    load_safetensors, save_safetensors,
+    Device, InferenceState, MambaBackend, Transformer, default_device, load_safetensors,
+    save_safetensors,
 };
 
 // Generation

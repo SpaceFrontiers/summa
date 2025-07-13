@@ -10,12 +10,11 @@ description = "Training for MAL-defined Hermes language models"
 
 [dependencies]
 anyhow.workspace = true
-burn = { package = "burn-core", version = "0.21", default-features = false, features = ["std"] }
-burn-autodiff = { version = "0.21", default-features = false, features = ["std"] }
-burn-optim = { version = "0.21", default-features = false, features = ["std"] }
+burn = { package = "burn-core", git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", default-features = false, features = ["std", "extension", "ndarray", "autodiff"] }
+burn-optim = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", default-features = false, features = ["std"] }
+burn-pack = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", default-features = false, features = ["std"] }
 clap.workspace = true
 hermes-llm.workspace = true
-hashbrown = "0.16"
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

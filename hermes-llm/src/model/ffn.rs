@@ -11,9 +11,9 @@ use crate::mal::{Activation, BlockDef, ModelDef};
 use super::matmul::linear;
 
 #[derive(Module, Debug)]
-pub struct FeedForward<B: Backend> {
-    in_proj: Linear<B>,
-    down_proj: Linear<B>,
+pub struct FeedForward {
+    in_proj: Linear,
+    down_proj: Linear,
     dropout: Dropout,
     #[module(skip)]
     activation: Activation,
@@ -23,8 +23,8 @@ pub struct FeedForward<B: Backend> {
     gated: bool,
 }
 
-impl<B: Backend> FeedForward<B> {
-    pub fn new(config: &ModelDef, block: &BlockDef, device: &burn::tensor::Device<B>) -> Self {
+impl FeedForward {
+    pub fn new(config: &ModelDef, block: &BlockDef, device: &Device) -> Self {
         let use_gate = block.ffn.gate;
         let use_bias = block.ffn.bias;
         let hidden = config.hidden_size;
@@ -49,8 +49,8 @@ impl<B: Backend> FeedForward<B> {
         }
     }
 
-    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let act = |t: Tensor<B, D>| match self.activation {
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
+        let act = |t: Tensor<D>| match self.activation {
             Activation::SwiGLU | Activation::SiLU => silu(t),
             Activation::GELU => gelu(t),
             Activation::ReLU => relu(t),

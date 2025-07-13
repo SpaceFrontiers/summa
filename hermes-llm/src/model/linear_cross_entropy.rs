@@ -1,11 +1,16 @@
 //! Memory-bounded output projection and cross-entropy for training.
 
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
+#[cfg(feature = "metal")]
+use burn::backend::Metal;
+use burn::backend::{
+    Backend, Dispatch, DispatchKindConversion, DispatchTensor, NdArray, backend_extension,
+    tensor::{FloatTensor, IntTensor},
+};
 use burn::prelude::*;
 use burn::tensor::activation::softmax;
-use burn::tensor::{
-    IndexingUpdateOp, Int, TensorPrimitive,
-    ops::{FloatTensor, IntTensor},
-};
+use burn::tensor::{IndexingUpdateOp, Int};
 use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy};
 use burn_autodiff::grads::Gradients;
@@ -14,15 +19,13 @@ use burn_nn::loss::CrossEntropyLossConfig;
 
 use super::matmul::{matmul_2, matmul_input};
 
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct LinearCrossEntropyGradients<B: Backend> {
-    pub(super) hidden: FloatTensor<B>,
-    pub(super) weight: FloatTensor<B>,
-    pub(super) bias: FloatTensor<B>,
-}
-
 /// Backend capability for training without retaining full-vocabulary logits.
+#[backend_extension(
+    Cuda: cfg(feature = "cuda"),
+    Metal: cfg(feature = "metal"),
+    NdArray,
+    Autodiff,
+)]
 pub trait LinearCrossEntropyBackend: Backend {
     fn linear_cross_entropy_inner(
         hidden: FloatTensor<Self>,
@@ -31,10 +34,9 @@ pub trait LinearCrossEntropyBackend: Backend {
         targets: IntTensor<Self>,
         chunk_size: usize,
         use_bias: bool,
-    ) -> FloatTensor<Self> {
-        chunked_loss::<Self>(hidden, weight, bias, targets, chunk_size, use_bias)
-    }
+    ) -> FloatTensor<Self>;
 
+    #[allow(unused_variables)]
     fn linear_cross_entropy_backward(
         hidden: FloatTensor<Self>,
         weight: FloatTensor<Self>,
@@ -43,41 +45,33 @@ pub trait LinearCrossEntropyBackend: Backend {
         grad_output: FloatTensor<Self>,
         chunk_size: usize,
         use_bias: bool,
-    ) -> LinearCrossEntropyGradients<Self> {
-        chunked_backward::<Self>(
-            hidden,
-            weight,
-            bias,
-            targets,
-            grad_output,
-            chunk_size,
-            use_bias,
-        )
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        panic!("linear cross-entropy only supports first-order autodiff")
     }
 }
 
-pub(super) fn linear_cross_entropy<B: LinearCrossEntropyBackend>(
-    hidden: Tensor<B, 2>,
-    weight: Tensor<B, 2>,
-    bias: Option<Tensor<B, 1>>,
-    targets: Tensor<B, 1, Int>,
+pub(super) fn linear_cross_entropy(
+    hidden: Tensor<2>,
+    weight: Tensor<2>,
+    bias: Option<Tensor<1>>,
+    targets: Tensor<1, Int>,
     chunk_size: usize,
-) -> Tensor<B, 1> {
+) -> Tensor<1> {
     assert!(
         chunk_size > 0,
         "linear cross-entropy chunk size must be positive"
     );
     let use_bias = bias.is_some();
     let bias = bias.unwrap_or_else(|| Tensor::zeros([weight.dims()[0]], &hidden.device()));
-    let output = B::linear_cross_entropy_inner(
-        hidden.into_primitive().tensor(),
-        weight.into_primitive().tensor(),
-        bias.into_primitive().tensor(),
-        targets.into_primitive(),
+    let output = Dispatch::linear_cross_entropy_inner(
+        hidden.into_dispatch(),
+        weight.into_dispatch(),
+        bias.into_dispatch(),
+        targets.into_dispatch(),
         chunk_size,
         use_bias,
     );
-    Tensor::from_primitive(TensorPrimitive::Float(output))
+    Tensor::from_dispatch(output)
 }
 
 fn chunked_loss<B: Backend>(
@@ -87,11 +81,14 @@ fn chunked_loss<B: Backend>(
     targets: IntTensor<B>,
     chunk_size: usize,
     use_bias: bool,
-) -> FloatTensor<B> {
-    let hidden = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(hidden));
-    let weight = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(weight));
-    let bias = Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(bias));
-    let targets = Tensor::<B, 1, Int>::from_primitive(targets);
+) -> FloatTensor<B>
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let hidden = Tensor::<2>::from_primitive::<B>(hidden);
+    let weight = Tensor::<2>::from_primitive::<B>(weight);
+    let bias = Tensor::<1>::from_primitive::<B>(bias);
+    let targets = Tensor::<1, Int>::from_primitive::<B>(targets);
     let [tokens, hidden_size] = hidden.dims();
     let [vocab_size, weight_hidden] = weight.dims();
     assert_eq!(hidden_size, weight_hidden);
@@ -122,8 +119,8 @@ fn chunked_loss<B: Backend>(
     total
         .expect("linear cross-entropy requires at least one token")
         .div_scalar(tokens as f32)
-        .into_primitive()
-        .tensor()
+        .try_into_primitive::<B>()
+        .expect("linear cross-entropy output stayed on its input backend")
 }
 
 fn chunked_backward<B: Backend>(
@@ -134,13 +131,15 @@ fn chunked_backward<B: Backend>(
     grad_output: FloatTensor<B>,
     chunk_size: usize,
     use_bias: bool,
-) -> LinearCrossEntropyGradients<B> {
-    let hidden = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(hidden));
-    let weight = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(weight));
-    let bias = Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(bias));
-    let targets = Tensor::<B, 1, Int>::from_primitive(targets);
-    let grad_output =
-        Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(grad_output)).reshape([1, 1]);
+) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let hidden = Tensor::<2>::from_primitive::<B>(hidden);
+    let weight = Tensor::<2>::from_primitive::<B>(weight);
+    let bias = Tensor::<1>::from_primitive::<B>(bias);
+    let targets = Tensor::<1, Int>::from_primitive::<B>(targets);
+    let grad_output = Tensor::<1>::from_primitive::<B>(grad_output).reshape([1, 1]);
     let [tokens, hidden_size] = hidden.dims();
     let [vocab_size, weight_hidden] = weight.dims();
     assert_eq!(hidden_size, weight_hidden);
@@ -149,8 +148,8 @@ fn chunked_backward<B: Backend>(
     let weight = matmul_input(weight);
     let weight_transposed = weight.clone().transpose();
     let mut hidden_gradients = Vec::with_capacity(tokens.div_ceil(chunk_size));
-    let mut weight_gradient = Tensor::<B, 2>::zeros([vocab_size, hidden_size], &device);
-    let mut bias_gradient = Tensor::<B, 1>::zeros([vocab_size], &device);
+    let mut weight_gradient = Tensor::<2>::zeros([vocab_size, hidden_size], &device);
+    let mut bias_gradient = Tensor::<1>::zeros([vocab_size], &device);
 
     for start in (0..tokens).step_by(chunk_size) {
         let end = (start + chunk_size).min(tokens);
@@ -163,7 +162,7 @@ fn chunked_backward<B: Backend>(
             logits
         };
         let target_indices = targets.clone().slice(start..end).reshape([chunk_tokens, 1]);
-        let corrections = Tensor::<B, 2>::ones([chunk_tokens, 1], &device).neg();
+        let corrections = Tensor::<2>::ones([chunk_tokens, 1], &device).neg();
         let logits_gradient =
             softmax(logits, 1).scatter(1, target_indices, corrections, IndexingUpdateOp::Add)
                 * scale.clone();
@@ -176,34 +175,63 @@ fn chunked_backward<B: Backend>(
         }
     }
 
-    LinearCrossEntropyGradients {
-        hidden: Tensor::cat(hidden_gradients, 0).into_primitive().tensor(),
-        weight: weight_gradient.into_primitive().tensor(),
-        bias: bias_gradient.into_primitive().tensor(),
-    }
+    (
+        Tensor::cat(hidden_gradients, 0)
+            .try_into_primitive::<B>()
+            .expect("hidden gradient stayed on its input backend"),
+        weight_gradient
+            .try_into_primitive::<B>()
+            .expect("weight gradient stayed on its input backend"),
+        bias_gradient
+            .try_into_primitive::<B>()
+            .expect("bias gradient stayed on its input backend"),
+    )
 }
 
-impl LinearCrossEntropyBackend for burn_ndarray::NdArray {}
+macro_rules! impl_reference_linear_cross_entropy {
+    ($backend:ty) => {
+        impl LinearCrossEntropyBackend for $backend {
+            fn linear_cross_entropy_inner(
+                hidden: FloatTensor<Self>,
+                weight: FloatTensor<Self>,
+                bias: FloatTensor<Self>,
+                targets: IntTensor<Self>,
+                chunk_size: usize,
+                use_bias: bool,
+            ) -> FloatTensor<Self> {
+                chunked_loss::<Self>(hidden, weight, bias, targets, chunk_size, use_bias)
+            }
+
+            fn linear_cross_entropy_backward(
+                hidden: FloatTensor<Self>,
+                weight: FloatTensor<Self>,
+                bias: FloatTensor<Self>,
+                targets: IntTensor<Self>,
+                grad_output: FloatTensor<Self>,
+                chunk_size: usize,
+                use_bias: bool,
+            ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+                chunked_backward::<Self>(
+                    hidden,
+                    weight,
+                    bias,
+                    targets,
+                    grad_output,
+                    chunk_size,
+                    use_bias,
+                )
+            }
+        }
+    };
+}
+
+impl_reference_linear_cross_entropy!(burn_ndarray::NdArray);
 
 #[cfg(feature = "metal")]
-impl<F, I, BT> LinearCrossEntropyBackend
-    for burn_cubecl::CubeBackend<burn_wgpu::WgpuRuntime, F, I, BT>
-where
-    F: burn_cubecl::element::FloatElement,
-    I: burn_cubecl::element::IntElement,
-    BT: burn_cubecl::element::BoolElement,
-{
-}
+impl_reference_linear_cross_entropy!(burn_wgpu::Metal);
 
 #[cfg(feature = "cuda")]
-impl<F, I, BT> LinearCrossEntropyBackend
-    for burn_cubecl::CubeBackend<burn_cubecl::cubecl::cuda::CudaRuntime, F, I, BT>
-where
-    F: burn_cubecl::element::FloatElement,
-    I: burn_cubecl::element::IntElement,
-    BT: burn_cubecl::element::BoolElement,
-{
-}
+impl_reference_linear_cross_entropy!(burn_cuda::Cuda);
 
 #[derive(Clone, Debug)]
 struct LinearCrossEntropyState<B: LinearCrossEntropyBackend> {
@@ -240,9 +268,9 @@ impl<B: LinearCrossEntropyBackend> Backward<B, 3> for LinearCrossEntropyBackward
             state.use_bias,
         );
         for (node, gradient) in [
-            (node_hidden, gradients.hidden),
-            (node_weight, gradients.weight),
-            (node_bias, gradients.bias),
+            (node_hidden, gradients.0),
+            (node_weight, gradients.1),
+            (node_bias, gradients.2),
         ] {
             if let Some(node) = node {
                 grads.register::<B>(node.id, gradient);
@@ -268,7 +296,7 @@ impl<B: LinearCrossEntropyBackend, C: CheckpointStrategy> LinearCrossEntropyBack
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let targets = <Self as burn::tensor::backend::AutodiffBackend>::int_inner(targets);
+                let targets = <Self as burn::backend::AutodiffBackend>::int_inner(targets);
                 let output = B::linear_cross_entropy_inner(
                     hidden.primitive.clone(),
                     weight.primitive.clone(),
@@ -288,7 +316,7 @@ impl<B: LinearCrossEntropyBackend, C: CheckpointStrategy> LinearCrossEntropyBack
                 prep.finish(state, output)
             }
             OpsKind::UnTracked(prep) => {
-                let targets = <Self as burn::tensor::backend::AutodiffBackend>::int_inner(targets);
+                let targets = <Self as burn::backend::AutodiffBackend>::int_inner(targets);
                 let output = B::linear_cross_entropy_inner(
                     hidden.primitive,
                     weight.primitive,
@@ -305,13 +333,9 @@ impl<B: LinearCrossEntropyBackend, C: CheckpointStrategy> LinearCrossEntropyBack
 
 #[cfg(test)]
 mod tests {
-    use burn::tensor::TensorData;
-    use burn_autodiff::Autodiff;
-    use burn_ndarray::NdArray;
+    use burn::tensor::{Device, TensorData};
 
     use super::*;
-
-    type TestBackend = Autodiff<NdArray>;
 
     fn max_diff(lhs: TensorData, rhs: TensorData) -> f32 {
         lhs.convert::<f32>()
@@ -325,7 +349,7 @@ mod tests {
 
     #[test]
     fn chunked_loss_and_gradients_match_materialized_cross_entropy() {
-        let device = Default::default();
+        let device = Device::ndarray().autodiff();
         let (tokens, hidden_size, vocab_size) = (7, 5, 11);
         let hidden_data = (0..tokens * hidden_size)
             .map(|index| (index as f32 * 0.071).sin() * 0.2)
@@ -339,22 +363,20 @@ mod tests {
         let target_data = vec![0_i64, 3, 7, 2, 10, 4, 1];
 
         let run = |chunked: bool, use_bias: bool| {
-            let hidden = Tensor::<TestBackend, 2>::from_data(
+            let hidden = Tensor::<2>::from_data(
                 TensorData::new(hidden_data.clone(), [tokens, hidden_size]),
                 &device,
             )
             .require_grad();
-            let weight = Tensor::<TestBackend, 2>::from_data(
+            let weight = Tensor::<2>::from_data(
                 TensorData::new(weight_data.clone(), [vocab_size, hidden_size]),
                 &device,
             )
             .require_grad();
-            let bias = Tensor::<TestBackend, 1>::from_data(
-                TensorData::new(bias_data.clone(), [vocab_size]),
-                &device,
-            )
-            .require_grad();
-            let targets = Tensor::<TestBackend, 1, Int>::from_data(
+            let bias =
+                Tensor::<1>::from_data(TensorData::new(bias_data.clone(), [vocab_size]), &device)
+                    .require_grad();
+            let targets = Tensor::<1, Int>::from_data(
                 TensorData::new(target_data.clone(), [tokens]),
                 &device,
             );
@@ -377,7 +399,7 @@ mod tests {
                     .init(&device)
                     .forward(logits, targets)
             };
-            let loss_data = loss.clone().inner().into_data();
+            let loss_data = loss.clone().into_data();
             let mut gradients = loss.backward();
             (
                 loss_data,

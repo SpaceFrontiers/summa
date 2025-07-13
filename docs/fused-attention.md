@@ -1,37 +1,35 @@
-# Fused attention training
+# Attention kernels
 
-Hermes uses one attention abstraction for inference and training. CPU and Metal
-retain a tensor-op reference. CUDA uses CubeCL only; there is no native cuDNN,
-C++, or Python dependency.
+Hermes uses Burn tensor and module operations by default. CUDA attention calls
+Burn's CubeCL integration, which launches CubeK Flash Attention with FP16 inputs
+and FP32 accumulation. CPU and Metal use Burn's portable attention operations.
+There are no cuDNN, C++, or Python runtime dependencies.
 
-CubeCL 0.10 provides the accelerated Flash Attention forward used here, but not
-a fused training backward. A materialized autodiff graph retains multiple
-`[batch, heads, sequence, sequence]` tensors per layer at a 4096-token context.
-Hermes therefore supplies a bounded-memory backward behind the same
-`AttentionBackend` trait.
+The only custom attention component is the CUDA training autodiff boundary.
+Burn's current attention API returns the output but not the per-row log-sum-exp
+needed by CubeK's experimental fused backward. Materializing the full
+`[batch, heads, sequence, sequence]` autodiff graph is not viable at a
+4096-token context, so Hermes saves Q/K/V and the output, then recomputes exact
+probabilities in fixed query-row chunks during backward. The chunks use Burn's
+CubeCL matmuls and reductions; no scalar attention kernel is maintained here.
 
-The CUDA path:
+Grouped-query K/V heads are expanded immediately before the attention operation.
+Autodiff reduces their gradients back to the compact head count. This is linear
+in sequence length for the current 2:1 head ratio.
 
-- makes BHSD inputs contiguous once and stages Q/K/V as FP16;
-- uses CubeCL's accelerated causal Flash Attention with FP32 accumulation;
-- saves low-precision Q/K/V/output, but no attention matrix;
-- recomputes probabilities in fixed query-row chunks using CubeCL's accelerated
-  matmuls, so the A100 uses Tensor Cores in backward as well as forward; and
-- returns gradients in the backend's default relaxed-FP32 dtype.
+The kernel policy is deliberately narrow:
 
-The backward is exact but is not presented as FlashAttention-2 backward: it
-trades additional probability recomputation and launches for a small,
-sequence-bounded live score buffer. This is substantially more efficient than
-the former scalar per-row kernel while remaining portable Rust/CubeCL code.
-
-Grouped-query K/V heads are expanded immediately before the custom operation;
-autodiff reduces their gradients back to the compact head count. This is a
-small linear copy for the current 2:1 head ratio, not a quadratic allocation.
+- use Burn/CubeK implementations whenever they support the required operation;
+- keep a local kernel boundary only for a measured throughput or peak-memory win;
+- compare forward output and Q/K/V gradients with the Burn reference; and
+- gate changes with steady-state A100 tokens/s, utilization, power, and peak
+  memory at the production shape (batch 2, sequence 4096).
 
 FlashAttention-2 is the relevant algorithm family for the SM80 A100.
-FlashAttention-3 targets Hopper, while FlashAttention-4 targets Hopper and
-Blackwell; their hardware-specific mechanisms are not emulated on Ampere.
+FlashAttention-3 targets Hopper; FlashAttention-4 targets Hopper and Blackwell.
+Their hardware-specific mechanisms are not emulated on Ampere.
 
-Correctness tests compare the custom forward and Q/K/V gradients with the CPU
-reference for causal grouped-query attention. The CUDA smoke gate runs the same
-parity check on the A100 before a corpus launch.
+Burn's optional whole-graph fusion is separate from these explicit kernels. It
+is disabled because the tested global fusion bridge produced invalid CubeCL MSL
+for this model. Explicit Burn/CubeK kernels remain enabled and are the optimized
+path.

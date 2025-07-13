@@ -1,11 +1,10 @@
 //! Autoregressive text generation.
 
 use anyhow::{Result, bail};
-use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use burn::tensor::activation::softmax;
+use burn::tensor::{Int, Tensor, TensorData};
 
-use crate::{Backend, Device, InferenceState, Transformer};
+use crate::{Device, InferenceState, Transformer};
 
 /// Sampling configuration for [`TextGenerator::generate`].
 #[derive(Debug, Clone)]
@@ -31,30 +30,28 @@ impl Default for SamplingConfig {
 }
 
 pub struct TextGenerator<'a> {
-    model: &'a Transformer<Backend>,
+    model: &'a Transformer,
     device: &'a Device,
 }
 
 impl<'a> TextGenerator<'a> {
-    pub fn new(model: &'a Transformer<Backend>, device: &'a Device) -> Self {
+    pub fn new(model: &'a Transformer, device: &'a Device) -> Self {
         Self { model, device }
     }
 
-    fn input(&self, tokens: &[u32]) -> Tensor<Backend, 2, Int> {
+    fn input(&self, tokens: &[u32]) -> Tensor<2, Int> {
         let values = tokens.iter().map(|&token| i64::from(token)).collect();
         Tensor::from_data(TensorData::new(values, [1, tokens.len()]), self.device)
     }
 
-    fn prefill(&self, context: &[u32]) -> (InferenceState<Backend>, Tensor<Backend, 1>) {
+    fn prefill(&self, context: &[u32]) -> (InferenceState, Tensor<1>) {
         debug_assert!(!context.is_empty());
         let mut state = self.model.make_state(1, self.device);
         let logits = self
             .model
-            .forward_with_state(self.input(context), &mut state);
+            .forward_next_logits_with_state(self.input(context), &mut state);
         let vocab = self.model.config().vocab_size;
-        let last = logits
-            .slice([0..1, context.len() - 1..context.len(), 0..vocab])
-            .reshape([vocab]);
+        let last = logits.reshape([vocab]);
         (state, last)
     }
 
@@ -73,22 +70,15 @@ impl<'a> TextGenerator<'a> {
         let max_seq_len = self.model.config().max_seq_len;
         let vocab = self.model.config().vocab_size;
         let mut tokens = prompt_tokens.to_vec();
-        let mut rng = StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random));
+        self.device.seed(config.seed.unwrap_or_else(rand::random));
         let context_len = tokens.len().min(max_seq_len);
         let (mut state, mut last_logits) = self.prefill(&tokens[tokens.len() - context_len..]);
 
         for _ in 0..config.max_new_tokens {
-            let values = last_logits
-                .clone()
-                .into_data()
-                .to_vec::<<Backend as burn::tensor::backend::BackendTypes>::FloatElem>()?
-                .into_iter()
-                .map(|value| value.elem::<f32>())
-                .collect::<Vec<f32>>();
             let next_token = if config.temperature <= 0.0 {
-                argmax(&values)
+                last_logits.clone().argmax(0).try_into_scalar::<i64>()? as u32
             } else {
-                sample_from_logits(&values, config.temperature as f32, config.top_k, &mut rng)?
+                sample_from_logits(last_logits.clone(), config.temperature as f32, config.top_k)?
             };
             tokens.push(next_token);
 
@@ -102,8 +92,8 @@ impl<'a> TextGenerator<'a> {
             } else {
                 let logits = self
                     .model
-                    .forward_with_state(self.input(&[next_token]), &mut state);
-                last_logits = logits.slice([0..1, 0..1, 0..vocab]).reshape([vocab]);
+                    .forward_next_logits_with_state(self.input(&[next_token]), &mut state);
+                last_logits = logits.reshape([vocab]);
             }
         }
 
@@ -111,55 +101,16 @@ impl<'a> TextGenerator<'a> {
     }
 }
 
-fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map_or(0, |(index, _)| index as u32)
-}
-
-fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
-    let mut indices: Vec<_> = (0..logits.len()).collect();
-    indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-    indices.truncate(k.min(indices.len()));
-    indices
-}
-
-fn sample_from_logits(
-    logits: &[f32],
-    temperature: f32,
-    top_k: Option<usize>,
-    rng: &mut impl rand::Rng,
-) -> Result<u32> {
-    if logits.is_empty() {
-        bail!("cannot sample empty logits");
+fn sample_from_logits(logits: Tensor<1>, temperature: f32, top_k: Option<usize>) -> Result<u32> {
+    let vocab = logits.dims()[0];
+    if let Some(k) = top_k.filter(|&k| k < vocab) {
+        let (values, indices) = logits.topk_with_indices(k, 0);
+        let sampled = softmax(values.div_scalar(temperature), 0).categorical(1);
+        return Ok(indices.select(0, sampled).try_into_scalar::<i64>()? as u32);
     }
-    let candidates = match top_k {
-        Some(k) => top_k_indices(logits, k),
-        None => (0..logits.len()).collect(),
-    };
-    let max = candidates
-        .iter()
-        .map(|&index| logits[index] / temperature)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let weights: Vec<_> = candidates
-        .iter()
-        .map(|&index| (logits[index] / temperature - max).exp())
-        .collect();
-    let total: f32 = weights.iter().sum();
-    if !total.is_finite() || total <= 0.0 {
-        bail!("sampling produced an invalid probability distribution");
-    }
-
-    let mut draw = rng.random::<f32>() * total;
-    for (&index, weight) in candidates.iter().zip(weights) {
-        draw -= weight;
-        if draw <= 0.0 {
-            return Ok(index as u32);
-        }
-    }
-    Ok(*candidates.last().unwrap() as u32)
+    Ok(softmax(logits.div_scalar(temperature), 0)
+        .categorical(1)
+        .try_into_scalar::<i64>()? as u32)
 }
 
 #[cfg(test)]
@@ -168,24 +119,19 @@ mod tests {
 
     #[test]
     fn argmax_picks_highest() {
-        assert_eq!(argmax(&[0.1, 5.0, 0.2, -1.0]), 1);
-    }
-
-    #[test]
-    fn top_k_keeps_highest_indices() {
-        assert_eq!(top_k_indices(&[1.0, 3.0, 2.0, 0.5], 2), vec![1, 2]);
+        let device = Device::ndarray();
+        let logits = Tensor::<1>::from_floats([0.1, 5.0, 0.2, -1.0], &device);
+        assert_eq!(logits.argmax(0).into_scalar::<i64>(), 1);
     }
 
     #[test]
     fn sampling_is_deterministic_under_seed() {
-        let logits = [1.0, 2.0, 3.0, 0.5, 1.5];
-        let mut a = StdRng::seed_from_u64(42);
-        let mut b = StdRng::seed_from_u64(42);
-        for _ in 0..20 {
-            assert_eq!(
-                sample_from_logits(&logits, 0.8, Some(3), &mut a).unwrap(),
-                sample_from_logits(&logits, 0.8, Some(3), &mut b).unwrap()
-            );
-        }
+        let sample = || {
+            let device = Device::ndarray();
+            device.seed(42);
+            let logits = Tensor::<1>::from_floats([1.0, 2.0, 3.0, 0.5, 1.5], &device);
+            sample_from_logits(logits, 0.8, Some(3)).unwrap()
+        };
+        assert_eq!(sample(), sample());
     }
 }
