@@ -296,15 +296,27 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
 
     // Copy unchanged segment files
     let copy_start = std::time::Instant::now();
-    for (src, dst) in [
-        (&src_files.term_dict, &dst_files.term_dict),
-        (&src_files.postings, &dst_files.postings),
-        (&src_files.positions, &dst_files.positions),
-        (&src_files.store, &dst_files.store),
-        (&src_files.fast, &dst_files.fast),
-        (&src_files.vectors, &dst_files.vectors),
+    for (src, dst, required) in [
+        (&src_files.term_dict, &dst_files.term_dict, true),
+        (&src_files.postings, &dst_files.postings, true),
+        (
+            &src_files.positions,
+            &dst_files.positions,
+            reader.has_positions_file(),
+        ),
+        (&src_files.store, &dst_files.store, true),
+        (
+            &src_files.fast,
+            &dst_files.fast,
+            !reader.fast_fields().is_empty(),
+        ),
+        (
+            &src_files.vectors,
+            &dst_files.vectors,
+            !reader.vector_indexes().is_empty() || !reader.flat_vectors().is_empty(),
+        ),
     ] {
-        copy_segment_file(dir, src, dst).await?;
+        copy_segment_file(dir, src, dst, required).await?;
     }
     log::info!(
         "[reorder] copied files in {:.1}s",
@@ -338,34 +350,71 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
 
 /// Copy a segment file via streaming I/O (4 MB chunks).
 ///
-/// No-op if the source file does not exist.
+/// No-op if an optional source file does not exist. A file observed by the
+/// source reader is required: losing it during the copy is corruption, not an
+/// empty optional field.
 /// Empty files are still created (SegmentReader requires their existence).
 async fn copy_segment_file<D: Directory + DirectoryWriter>(
     dir: &D,
     src: &Path,
     dst: &Path,
+    required: bool,
 ) -> Result<()> {
     let handle = match dir.open_read(src).await {
         Ok(h) => h,
-        Err(_) => return Ok(()), // file doesn't exist
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::Error::Corruption(format!(
+                "required reorder source file {src:?} disappeared before copy"
+            )));
+        }
+        Err(error) => return Err(crate::Error::Io(error)),
     };
-    let data = handle.read_bytes().await.map_err(crate::Error::Io)?;
-    let slice = data.as_slice();
-
     let mut writer = dir
         .streaming_writer_cold(dst)
         .await
         .map_err(crate::Error::Io)?;
     const CHUNK: usize = 4 * 1024 * 1024;
-    for (i, chunk) in slice.chunks(CHUNK).enumerate() {
-        writer.write_all(chunk).map_err(crate::Error::Io)?;
-        // Drop source pages behind the copy cursor — a whole-file copy must
-        // not fault the entire source into the page cache and leave it
-        // resident (see docs/cold-io.md).
-        #[cfg(feature = "native")]
-        data.madvise_range(i * CHUNK..i * CHUNK + chunk.len(), libc::MADV_DONTNEED);
+    let source_len = handle.len();
+    let mut offset = 0u64;
+    while offset < source_len {
+        let end = (offset + CHUNK as u64).min(source_len);
+        let data = handle
+            .read_bytes_range(offset..end)
+            .await
+            .map_err(crate::Error::Io)?;
+        writer = tokio::task::spawn_blocking(move || {
+            writer.write_all(data.as_slice())?;
+            // Drop source pages behind the copy cursor — a whole-file copy
+            // must not leave the complete source resident in page cache.
+            #[cfg(feature = "native")]
+            data.madvise_range(0..data.len(), libc::MADV_DONTNEED);
+            Ok::<_, std::io::Error>(writer)
+        })
+        .await
+        .map_err(|error| {
+            crate::Error::Internal(format!("reorder copy worker failed for {src:?}: {error}"))
+        })?
+        .map_err(crate::Error::Io)?;
+        offset = end;
     }
-    writer.finish().map_err(crate::Error::Io)?;
+    if writer.bytes_written() != source_len {
+        return Err(crate::Error::Corruption(format!(
+            "short reorder copy from {:?} to {:?}: wrote {} of {} bytes",
+            src,
+            dst,
+            writer.bytes_written(),
+            source_len,
+        )));
+    }
+    tokio::task::spawn_blocking(move || writer.finish())
+        .await
+        .map_err(|error| {
+            crate::Error::Internal(format!(
+                "reorder copy finalizer failed for {dst:?}: {error}"
+            ))
+        })?
+        .map_err(crate::Error::Io)?;
 
     Ok(())
 }
@@ -411,6 +460,13 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
             && reader.bmp_indexes().get(&field.0).is_some()
     });
 
+    // Sparse files are legitimately absent when the schema has sparse fields
+    // but this segment contains no sparse values. Do not turn that valid
+    // optional-file case into a required-copy corruption error.
+    if reader.sparse_indexes().is_empty() && reader.bmp_indexes().is_empty() {
+        return Ok(true);
+    }
+
     if !has_bmp_data {
         // No BMP field wants reordering — just copy the sparse file as-is
         log::info!(
@@ -418,7 +474,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
             reader.meta().id,
         );
         let src_files = SegmentFiles::new(reader.meta().id);
-        copy_segment_file(dir, &src_files.sparse, &dst_files.sparse).await?;
+        copy_segment_file(dir, &src_files.sparse, &dst_files.sparse, true).await?;
         return Ok(true);
     }
 
@@ -653,7 +709,10 @@ fn reorder_bmp_field_blockwise(
             };
             graph_bisection(&fwd, sb, 20, block_budget)
         } else {
-            ((0..num_blocks_total as u32).collect(), true)
+            (
+                (0..num_blocks_total as u32).collect(),
+                num_blocks_total <= sb || !fwd.budget_limited(),
+            )
         }
     };
     let (perm, converged) = if let Some(ref pool) = rayon_pool {
@@ -1114,6 +1173,51 @@ pub(crate) fn reorder_bmp_field(
         );
     }
 
+    // Record-level BP needs both directions of every document map before it
+    // can even start building the forward graph. Reserve that non-negotiable
+    // peak up front; previously these vectors were allocated outside the
+    // advertised budget. Fall back to a valid blockwise rewrite when the
+    // record representation itself cannot fit, but keep the result marked
+    // unconverged so a larger-budget/manual pass may still deepen it later.
+    let record_map_bytes = sources.iter().fold(0usize, |total, (bmp, _)| {
+        total
+            .saturating_add((bmp.num_virtual_docs as usize).saturating_mul(4))
+            .saturating_add((bmp.num_real_docs() as usize).saturating_mul(4))
+    });
+    let record_rewrite_fixed_bytes = sources.iter().fold(0usize, |total, (bmp, _)| {
+        total
+            // retained real→virtual map + output permutation
+            .saturating_add((bmp.num_real_docs() as usize).saturating_mul(8))
+            // output block-offset table
+            .saturating_add((bmp.num_blocks as usize).saturating_mul(8))
+    });
+    let record_fixed_peak = record_map_bytes.max(record_rewrite_fixed_bytes);
+    const MIN_RECORD_WORKSPACE: usize = 16 * 1024 * 1024;
+    if record_fixed_peak > memory_budget.saturating_sub(MIN_RECORD_WORKSPACE) {
+        log::warn!(
+            "[reorder_bmp] field {}: record maps need {:.0} MB of the {:.0} MB total budget; falling back to blockwise order",
+            field_id,
+            record_fixed_peak as f64 / (1024.0 * 1024.0),
+            memory_budget as f64 / (1024.0 * 1024.0),
+        );
+        let (writer, field_tocs, _) = reorder_bmp_field_blockwise(
+            sources,
+            field_id,
+            quantization,
+            dims,
+            effective_block_size,
+            grid_bits,
+            max_weight_scale,
+            total_vectors,
+            memory_budget,
+            bp_budget,
+            writer,
+            field_tocs,
+            rayon_pool,
+        )?;
+        return Ok((writer, field_tocs, false));
+    }
+
     let source_pages =
         crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| bmp));
 
@@ -1124,8 +1228,10 @@ pub(crate) fn reorder_bmp_field(
     // Build padding-aware maps once. Forward-index construction needs both
     // directions; output encoding reuses real→virtual instead of rescanning
     // every source document map.
-    let mut vid_maps: Vec<(Vec<u32>, Vec<u32>)> =
-        bmp_refs.iter().map(|bmp| build_vid_maps(bmp)).collect();
+    let mut vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmp_refs
+        .iter()
+        .map(|bmp| build_vid_maps(bmp))
+        .collect::<Result<_>>()?;
     // Prefix sums of real doc counts: source s owns global real ids
     // real_base[s]..real_base[s+1].
     let mut real_base = Vec::with_capacity(vid_maps.len() + 1);
@@ -1165,6 +1271,13 @@ pub(crate) fn reorder_bmp_field(
     let zero_budget = bp_budget.time_budget.is_some_and(|d| d.is_zero());
 
     let (perm, converged) = if zero_budget {
+        // No forward graph will consume virtual→real. Release it before
+        // allocating the identity permutation; otherwise the zero-budget path
+        // briefly holds both full map directions plus the permutation and can
+        // exceed the same budget check that protects normal passes.
+        for (virtual_to_real, _) in &mut vid_maps {
+            *virtual_to_real = Vec::new();
+        }
         log::info!(
             "[reorder_bmp] field {}: zero time budget — identity re-block, forward index skipped",
             field_id,
@@ -1180,13 +1293,14 @@ pub(crate) fn reorder_bmp_field(
         let min_doc_freq = (num_real_docs / 5000).clamp(2, 128);
 
         // Forward-index build is parallel too — keep it on the bounded pool.
+        let forward_budget = memory_budget.saturating_sub(record_map_bytes);
         let build_forward = || {
             build_forward_index_from_bmps_with_maps(
                 &bmp_refs,
                 &vid_maps,
                 min_doc_freq,
                 max_doc_freq.max(1),
-                memory_budget,
+                forward_budget,
             )
         };
         let (fwd, _source_doc_counts) = if let Some(ref pool) = rayon_pool {
@@ -1232,7 +1346,10 @@ pub(crate) fn reorder_bmp_field(
             );
             (perm, converged)
         } else {
-            ((0..num_real_docs as u32).collect(), true)
+            (
+                (0..num_real_docs as u32).collect(),
+                num_real_docs <= effective_block_size || !fwd.budget_limited(),
+            )
         }
     };
 
@@ -1267,11 +1384,32 @@ pub(crate) fn reorder_bmp_field(
     let mut total_postings: u64 = 0;
     let mut cumulative_bytes: u64 = 0;
 
+    // Grid entries and parallel encoded blocks coexist with the retained
+    // real→virtual map and permutation. Divide the actual remaining pass
+    // budget between them instead of adding fixed 512+256 MB allocations on
+    // top of `--bp-memory-budget-mb`.
+    let persistent_rewrite_bytes = perm
+        .capacity()
+        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_add(real_to_virtual.iter().fold(0usize, |total, map| {
+            total.saturating_add(map.capacity().saturating_mul(std::mem::size_of::<u32>()))
+        }))
+        .saturating_add(
+            block_data_starts
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>()),
+        );
+    let rewrite_workspace = memory_budget.saturating_sub(persistent_rewrite_bytes);
+    let grid_entries_budget =
+        (rewrite_workspace.saturating_mul(2) / 3).clamp(1024 * 1024, 512 * 1024 * 1024);
+    let encode_window_budget = rewrite_workspace
+        .saturating_sub(grid_entries_budget)
+        .clamp(1024 * 1024, 256 * 1024 * 1024);
+
     // Grid entries with external merge sort: accumulate in memory up to budget,
     // spill sorted runs to temp files when exceeded. 12 bytes per entry in memory.
-    const GRID_ENTRIES_BUDGET: usize = 512 * 1024 * 1024; // 512 MB
     const GRID_ENTRY_MEM_SIZE: usize = std::mem::size_of::<(u32, u32, u8)>(); // 12 bytes
-    let max_entries_in_memory = GRID_ENTRIES_BUDGET / GRID_ENTRY_MEM_SIZE;
+    let max_entries_in_memory = grid_entries_budget / GRID_ENTRY_MEM_SIZE;
 
     let total_source_terms = bmp_refs.iter().fold(0usize, |total, bmp| {
         total.saturating_add(bmp.total_terms() as usize)
@@ -1297,7 +1435,10 @@ pub(crate) fn reorder_bmp_field(
         let slots_count = new_vid_end - new_vid_start;
 
         // Group records by (source, source block), scatter matching slots
-        let mut slot_map = [u8::MAX; 256];
+        // All 256 u8 values are valid slots when bmp_block_size=256. The old
+        // u8::MAX "unmapped" sentinel therefore dropped a posting whenever
+        // source slot 255 mapped to output slot 255.
+        let mut slot_map = [u16::MAX; 256];
         let mut block_mappings: rustc_hash::FxHashMap<(usize, usize), Vec<(u8, u8)>> =
             rustc_hash::FxHashMap::default();
         for new_local_slot in 0..slots_count {
@@ -1317,23 +1458,23 @@ pub(crate) fn reorder_bmp_field(
             rustc_hash::FxHashMap::default();
         for (&(src, old_block), mappings) in &block_mappings {
             for &(old_s, new_s) in mappings {
-                slot_map[old_s as usize] = new_s;
+                slot_map[old_s as usize] = u16::from(new_s);
             }
 
             for (dim_id, postings) in sources[src].0.iter_block_terms(old_block as u32) {
                 for p in postings {
                     let new_slot = slot_map[p.local_slot as usize];
-                    if new_slot != u8::MAX {
+                    if new_slot != u16::MAX {
                         dim_postings
                             .entry(dim_id)
                             .or_default()
-                            .push((new_slot, p.impact));
+                            .push((new_slot as u8, p.impact));
                     }
                 }
             }
 
             for &(old_s, _) in mappings {
-                slot_map[old_s as usize] = u8::MAX;
+                slot_map[old_s as usize] = u16::MAX;
             }
         }
 
@@ -1383,7 +1524,6 @@ pub(crate) fn reorder_bmp_field(
 
     // Encode blocks in parallel per bounded window (blob order is fixed, so
     // the write itself stays serial; the window caps buffered bytes).
-    const ENCODE_WINDOW_BUDGET: usize = 256 * 1024 * 1024;
     let source_block_bytes = bmp_refs
         .iter()
         .map(|bmp| bmp.block_data_slice().len())
@@ -1412,7 +1552,7 @@ pub(crate) fn reorder_bmp_field(
         .max(1);
     let max_parallel_window = parallel_width.saturating_mul(2);
     let encode_window =
-        (ENCODE_WINDOW_BUDGET / estimated_bytes_per_block).clamp(1, max_parallel_window);
+        (encode_window_budget / estimated_bytes_per_block).clamp(1, max_parallel_window);
     let mut encoded: Vec<Result<EncodedBlock>> = Vec::new();
     for window_start in (0..new_num_blocks).step_by(encode_window) {
         let window_end = (window_start + encode_window).min(new_num_blocks);
@@ -1639,6 +1779,47 @@ pub(crate) fn reorder_bmp_field(
 
 #[cfg(test)]
 mod grid_run_prefix_tests {
+    use crate::directories::{Directory, DirectoryWriter};
+
+    #[tokio::test]
+    async fn segment_copy_distinguishes_optional_and_required_missing_files() {
+        let dir = crate::directories::RamDirectory::new();
+        let missing = std::path::Path::new("missing");
+        let output = std::path::Path::new("output");
+
+        super::copy_segment_file(&dir, missing, output, false)
+            .await
+            .unwrap();
+        assert!(!dir.exists(output).await.unwrap());
+
+        let error = super::copy_segment_file(&dir, missing, output, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::Corruption(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn segment_copy_preserves_all_bytes() {
+        let dir = crate::directories::RamDirectory::new();
+        let source = std::path::Path::new("source");
+        let output = std::path::Path::new("output");
+        let data = vec![0x5a; 4 * 1024 * 1024 + 17];
+        dir.write(source, &data).await.unwrap();
+
+        super::copy_segment_file(&dir, source, output, true)
+            .await
+            .unwrap();
+
+        let copied = dir
+            .open_read(output)
+            .await
+            .unwrap()
+            .read_bytes()
+            .await
+            .unwrap();
+        assert_eq!(copied.as_slice(), data);
+    }
+
     /// Regression: run prefixes were `pid_field` — identical for every pass
     /// in a container (PID 1) reordering the same field id, so concurrent
     /// passes clobbered and deleted each other's spill files (prod ENOENT).

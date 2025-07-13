@@ -37,7 +37,9 @@ pub use wasm_writer::IndexWriter as WasmIndexWriter;
 pub use writer::{IndexWriter, PreparedCommit};
 
 mod metadata;
-pub use metadata::{FieldVectorMeta, INDEX_META_FILENAME, IndexMetadata, VectorIndexState};
+pub use metadata::{
+    FieldVectorMeta, INDEX_META_FILENAME, IndexMetadata, SegmentMetaInfo, VectorIndexState,
+};
 
 #[cfg(feature = "native")]
 mod helpers;

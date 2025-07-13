@@ -34,6 +34,9 @@ pub enum Error {
     #[error("Indexing queue full — apply backpressure")]
     QueueFull,
 
+    #[error("Commit is still finalizing or awaiting retry")]
+    CommitInProgress,
+
     #[error("Internal error: {0}")]
     Internal(String),
 

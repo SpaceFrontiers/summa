@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 
 use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
-use crate::index::IndexMetadata;
+use crate::index::{IndexMetadata, SegmentMetaInfo};
 use crate::segment::{
     SegmentFiles, SegmentId, SegmentMeta, SegmentSnapshot, SegmentTracker, TrainedVectorStructures,
 };
@@ -1233,6 +1233,32 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // The operation guard owns the output during validation. Publication
         // below replaces that ownership with metadata + tracker atomically.
         self.validate_completed_segment(&new_id, doc_count).await?;
+        let output_id = SegmentId::from_hex(&new_id).ok_or_else(|| {
+            Error::Corruption(format!("invalid replacement segment ID: {new_id}"))
+        })?;
+        let output_reader = SegmentReader::open(
+            self.directory.as_ref(),
+            output_id,
+            Arc::clone(&self.schema),
+            self.term_cache_blocks,
+        )
+        .await
+        .map_err(|error| match error {
+            // Preserve retryable storage failures as I/O. Structural failures
+            // are deterministic for this completed output and get explicit
+            // corruption context.
+            Error::Io(_) | Error::IndexClosed => error,
+            error => Error::Corruption(format!(
+                "replacement segment {new_id} failed full reader validation: {error}"
+            )),
+        })?;
+        if output_reader.num_docs() != doc_count {
+            return Err(Error::Corruption(format!(
+                "replacement segment {new_id} opened with {} docs, expected {doc_count}",
+                output_reader.num_docs(),
+            )));
+        }
+        drop(output_reader);
 
         let mut st = Arc::clone(&self.state).lock_owned().await;
         // Every source must still be live: callers hold operation ownership,
@@ -1258,18 +1284,32 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| Error::Corruption("merge generation exceeds u32::MAX".into()))?;
+        let parent_unconverged_passes = old_ids
+            .iter()
+            .filter_map(|id| st.metadata.segment_metas.get(id))
+            .map(|info| info.bp_unconverged_passes)
+            .max()
+            .unwrap_or(0);
+        let bp_unconverged_passes = if reordered && !bp_converged {
+            parent_unconverged_passes.saturating_add(1)
+        } else {
+            0
+        };
         let retired_ids = old_ids.to_vec();
         let mut next = st.metadata.clone();
         for id in old_ids {
             next.remove_segment(id);
         }
-        next.add_merged_segment(
+        next.add_segment_meta(
             new_id.clone(),
-            doc_count,
-            retired_ids.clone(),
-            parent_generation,
-            reordered,
-            bp_converged,
+            SegmentMetaInfo {
+                num_docs: doc_count,
+                ancestors: retired_ids.clone(),
+                generation: parent_generation,
+                reordered,
+                bp_converged,
+                bp_unconverged_passes,
+            },
         );
 
         let directory = Arc::clone(&self.directory);
@@ -1778,6 +1818,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// (`bp_converged == false`). A warm-started follow-up pass deepens the
     /// ordering; the optimizer revisits these at low priority.
     pub async fn unconverged_segments(&self) -> Vec<(String, u32)> {
+        self.unconverged_segments_below(u32::MAX)
+            .await
+            .into_iter()
+            .map(|(id, docs, _)| (id, docs))
+            .collect()
+    }
+
+    /// Unconverged segments still below a hard replacement-lineage work
+    /// bound. Includes the persisted attempt count for scheduler diagnostics.
+    pub async fn unconverged_segments_below(
+        &self,
+        max_unconverged_passes: u32,
+    ) -> Vec<(String, u32, u32)> {
         let quarantined = self.quarantined_segments.lock().clone();
         let paused = self.paused_reorder_segments();
         let st = self.state.lock().await;
@@ -1788,11 +1841,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .filter(|(id, info)| {
                 info.reordered
                     && !info.bp_converged
+                    && info.bp_unconverged_passes < max_unconverged_passes
                     && !active_ids.contains(*id)
                     && !quarantined.contains(*id)
                     && !paused.contains(*id)
             })
-            .map(|(id, info)| (id.clone(), info.num_docs))
+            .map(|(id, info)| (id.clone(), info.num_docs, info.bp_unconverged_passes))
             .collect()
     }
 
@@ -2215,6 +2269,54 @@ mod tests {
         .await
         .expect("shutdown did not drain detached lifecycle transaction");
         assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn unconverged_scheduler_stops_at_the_lineage_limit() {
+        let manager = lifecycle_test_manager();
+        {
+            let mut state = manager.state.lock().await;
+            state.metadata.add_segment_meta(
+                "eligible".into(),
+                SegmentMetaInfo {
+                    num_docs: 10,
+                    ancestors: Vec::new(),
+                    generation: 1,
+                    reordered: true,
+                    bp_converged: false,
+                    bp_unconverged_passes: 2,
+                },
+            );
+            state.metadata.add_segment_meta(
+                "at-limit".into(),
+                SegmentMetaInfo {
+                    num_docs: 20,
+                    ancestors: Vec::new(),
+                    generation: 1,
+                    reordered: true,
+                    bp_converged: false,
+                    bp_unconverged_passes: 3,
+                },
+            );
+            state.metadata.add_segment_meta(
+                "converged".into(),
+                SegmentMetaInfo {
+                    num_docs: 30,
+                    ancestors: Vec::new(),
+                    generation: 1,
+                    reordered: true,
+                    bp_converged: true,
+                    bp_unconverged_passes: 0,
+                },
+            );
+            state.metadata.add_segment("fresh".into(), 40);
+        }
+
+        assert_eq!(
+            manager.unconverged_segments_below(3).await,
+            vec![("eligible".into(), 10, 2)]
+        );
+        assert!(manager.unconverged_segments_below(0).await.is_empty());
     }
 
     #[test]

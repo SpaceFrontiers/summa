@@ -49,8 +49,9 @@ These are deliberately separate controls:
 | `--optimizer-time-budget-secs`           |     `600` | Wall-clock budget for an optimizer pass on a large segment.                                                                              |
 | `--optimizer-partial-min-partition-docs` |    `4096` | Initial depth floor for large segments.                                                                                                  |
 | `--optimizer-unconverged-cooldown-secs`  |     `600` | Delay after a rewrite finishes before another deepening pass.                                                                            |
+| `--optimizer-max-unconverged-passes`     |       `3` | Optimizer follow-up eligibility limit per truncated lineage, including the initial partial pass. `0` disables follow-up deepening.       |
 | `--merge-bp-budget-secs`                 |     `600` | Wall-clock budget for BP performed inside a merge; `0` means unbudgeted.                                                                 |
-| `--bp-memory-budget-mb`                  |   `24576` | Per-pass forward-index cap, not a reservation and not a total RSS limit.                                                                 |
+| `--bp-memory-budget-mb`                  |   `24576` | Per-pass algorithmic working-set bound; not a reservation or a total-process RSS limit.                                                  |
 
 An active BP pass is CPU-bound and is expected to occupy up to
 `--optimizer-threads` cores. Concurrent passes share that same pool, so raising
@@ -59,12 +60,15 @@ it does not create another pool per pass or per index. For predictable service
 latency, start with one pass and a CPU width that leaves capacity for query and
 indexing work.
 
-The forward index is roughly `4 bytes/posting + 32 bytes/document` before
-format-specific rewrite buffers. At the process level, budget for up to
-`concurrent-passes * bp-memory-budget`, plus indexing builders, merge state,
-mmap/page-cache residency, and open readers. The memory limit drops
-highest-frequency dimensions from BP when necessary; it does not truncate or
-drop stored postings.
+The dominant graph representation is roughly `4 bytes/posting + 32
+bytes/document`. The limit also accounts for record maps, vocabulary-sized
+degree arrays, and record-rewrite grid/encode windows. If the record
+representation cannot fit, Hermes performs a valid blockwise rewrite and marks
+it unconverged; if only the graph is too large, it retains a bounded set of
+low-frequency dimensions. Stored postings are never truncated. At the process
+level, still budget for up to `concurrent-passes * bp-memory-budget`, plus
+indexing builders, merge state, mmap/page-cache residency, output buffering,
+and open readers.
 
 Merge failures use exponential retry backoff (30 seconds through 30 minutes).
 A deterministic missing/corrupt source is quarantined for the process lifetime
@@ -81,8 +85,12 @@ and removes entries that cannot be opened. Normal startup/writer-open cleanup
 only deletes true unowned files and cannot delete metadata-live, actively
 written, or reader-retained segments. Standalone reorder failures are also
 backed off per source from pass completion, so a pass that outlasts the scan
-interval cannot restart continuously. Details and invariants are in
-[Segment lifecycle and recovery](../docs/segment-lifecycle.md).
+interval cannot restart continuously. Successful but budget-truncated outputs
+carry a retry count across replacement IDs and stop being optimizer candidates
+at `--optimizer-max-unconverged-passes`, so a lineage that never converges
+cannot consume the optimizer pool forever. Explicitly configured merge-time BP
+still runs when that lineage later participates in a real merge. Details and
+invariants are in [Segment lifecycle and recovery](../docs/segment-lifecycle.md).
 
 ## gRPC API
 

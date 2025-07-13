@@ -32,6 +32,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use futures::FutureExt;
 use rustc_hash::FxHashMap;
 
 use crate::directories::DirectoryWriter;
@@ -47,8 +48,10 @@ const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
 /// Async IndexWriter for adding documents and committing segments.
 ///
-/// **Backpressure:** `add_document()` is sync, O(1). Returns `Error::QueueFull`
-/// when the shared queue is at capacity — caller must back off.
+/// **Backpressure:** `add_document()` is sync and O(1). It returns
+/// `Error::QueueFull` when the shared queue is full and
+/// `Error::CommitInProgress` while a generation is publishing or awaiting
+/// retry; callers must back off.
 ///
 /// **Two-phase commit:**
 /// - `prepare_commit()` → `PreparedCommit::commit()` or `PreparedCommit::abort()`
@@ -60,9 +63,9 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) directory: Arc<D>,
     pub(super) schema: Arc<Schema>,
     pub(super) config: IndexConfig,
-    /// MPMC sender — `try_send(&self)` is thread-safe, no lock needed.
-    /// Replaced on each commit cycle (workers get new receiver via resume).
-    doc_sender: async_channel::Sender<Document>,
+    /// MPMC sender, replaced under a brief lock on each commit cycle (workers
+    /// get the corresponding new receiver via resume).
+    doc_sender: Arc<parking_lot::RwLock<async_channel::Sender<Document>>>,
     /// Worker OS thread handles — long-lived, survive across commits.
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Shared worker state (immutable config + mutable segment output + sync)
@@ -71,9 +74,42 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Segments flushed to disk but not yet registered in metadata. Each item
     /// owns an active-operation guard, so orphan sweeping cannot delete it.
-    flushed_segments: Vec<PreparedSegment<D>>,
+    flushed_segments: Arc<parking_lot::Mutex<Vec<PreparedSegment<D>>>>,
     /// Primary key dedup index (None if schema has no primary field)
-    primary_key_index: Option<super::primary_key::PrimaryKeyIndex>,
+    primary_key_index: Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+    /// Tracks the owned finalizer spawned by `PreparedCommit::commit`. The
+    /// requesting future may disappear, but a second commit generation must
+    /// not start until this one has made publication and worker state agree.
+    commit_finalization: Arc<CommitFinalizationState>,
+}
+
+#[derive(Default)]
+struct CommitFinalizationState {
+    in_progress: AtomicBool,
+    idle: tokio::sync::Notify,
+}
+
+impl CommitFinalizationState {
+    fn begin(&self) -> bool {
+        self.in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish(&self) {
+        self.in_progress.store(false, Ordering::Release);
+        self.idle.notify_waiters();
+    }
+
+    async fn wait_until_idle(&self) {
+        while self.in_progress.load(Ordering::Acquire) {
+            let notified = self.idle.notified();
+            if !self.in_progress.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Shared state for worker threads.
@@ -331,12 +367,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             directory,
             schema,
             config,
-            doc_sender,
+            doc_sender: Arc::new(parking_lot::RwLock::new(doc_sender)),
             workers,
             worker_state,
             segment_manager,
-            flushed_segments: Vec::new(),
-            primary_key_index: None,
+            flushed_segments: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            primary_key_index: Arc::new(parking_lot::RwLock::new(None)),
+            commit_finalization: Arc::new(CommitFinalizationState::default()),
         }
     }
 
@@ -395,6 +432,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// No-op if schema has no primary field.
     pub async fn init_primary_key_dedup(&mut self) -> Result<()> {
         use super::primary_key::{PK_BLOOM_FILE, deserialize_pk_bloom};
+
+        self.commit_finalization.wait_until_idle().await;
 
         let field = match self.schema.primary_field() {
             Some(f) => f,
@@ -497,7 +536,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 self.persist_pk_bloom(&pk_index, &current_seg_ids).await;
             }
 
-            self.primary_key_index = Some(pk_index);
+            *self.primary_key_index.write() = Some(pk_index);
         } else {
             // No cache — full rebuild, offloaded to blocking thread.
             let pk_index = tokio::task::spawn_blocking(move || {
@@ -507,7 +546,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .map_err(|e| Error::Internal(format!("spawn_blocking failed: {}", e)))?;
 
             self.persist_pk_bloom(&pk_index, &current_seg_ids).await;
-            self.primary_key_index = Some(pk_index);
+            *self.primary_key_index.write() = Some(pk_index);
         }
 
         Ok(())
@@ -533,32 +572,44 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
     }
 
-    /// Add a document to the indexing queue (sync, O(1), lock-free).
+    /// Add a document to the indexing queue (sync, O(1)).
     ///
     /// `Document` is moved into the channel (zero-copy). Workers compete to pull it.
-    /// Returns `Error::QueueFull` when the queue is at capacity — caller must back off.
+    /// Returns an explicit backpressure error when the queue is at capacity or
+    /// a prepared commit generation is not yet resolved.
     pub fn add_document(&self, doc: Document) -> Result<()> {
         if self.worker_state.shutdown.load(Ordering::Acquire) {
             return Err(Error::IndexClosed);
         }
-        if let Some(ref pk_index) = self.primary_key_index {
+        if self.commit_finalization.in_progress.load(Ordering::Acquire) {
+            return Err(Error::CommitInProgress);
+        }
+        let sender = self.doc_sender.read().clone();
+        // A publication error deliberately leaves the prepared generation and
+        // its workers paused for a lossless retry. Report this as backpressure
+        // instead of inserting/rolling back a PK key against a closed channel.
+        if sender.is_closed() {
+            return Err(Error::CommitInProgress);
+        }
+        let primary_key_index = self.primary_key_index.read();
+        if let Some(ref pk_index) = *primary_key_index {
             pk_index.check_and_insert(&doc)?;
         }
-        match self.doc_sender.try_send(doc) {
+        match sender.try_send(doc) {
             Ok(()) => Ok(()),
             Err(async_channel::TrySendError::Full(doc)) => {
                 // Roll back PK registration so the caller can retry later
-                if let Some(ref pk_index) = self.primary_key_index {
+                if let Some(ref pk_index) = *primary_key_index {
                     pk_index.rollback_uncommitted_key(&doc);
                 }
                 Err(Error::QueueFull)
             }
             Err(async_channel::TrySendError::Closed(doc)) => {
                 // Roll back PK registration for defense-in-depth
-                if let Some(ref pk_index) = self.primary_key_index {
+                if let Some(ref pk_index) = *primary_key_index {
                     pk_index.rollback_uncommitted_key(&doc);
                 }
-                Err(Error::Internal("Document channel closed".into()))
+                Err(Error::CommitInProgress)
             }
         }
     }
@@ -566,13 +617,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Add multiple documents to the indexing queue.
     ///
     /// Returns the number of documents successfully queued. Stops at the first
-    /// `QueueFull` and returns the count queued so far.
+    /// backpressure error and returns the count queued so far.
     pub fn add_documents(&self, documents: Vec<Document>) -> Result<usize> {
         let total = documents.len();
         for (i, doc) in documents.into_iter().enumerate() {
             match self.add_document(doc) {
                 Ok(()) => {}
-                Err(Error::QueueFull) => return Ok(i),
+                Err(Error::QueueFull | Error::CommitInProgress) => return Ok(i),
                 Err(e) => return Err(e),
             }
         }
@@ -839,6 +890,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.begin_shutdown();
         self.signal_worker_shutdown();
 
+        // A cancelled commit request leaves its owned finalizer running. Do not
+        // clear shared PK/prepared state while that task may still publish or
+        // refresh it. Worker shutdown is signalled first, so a successful
+        // finalizer cannot restart ingestion while deletion is waiting.
+        self.commit_finalization.wait_until_idle().await;
+
         let workers = std::mem::take(&mut self.workers);
         let panicked = tokio::task::spawn_blocking(move || {
             workers
@@ -855,9 +912,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         // No commit is possible after shutdown. Dropping these RAII values
         // releases their lifecycle ownership before directory deletion.
-        self.flushed_segments.clear();
+        self.flushed_segments.lock().clear();
         self.worker_state.built_segments.lock().clear();
-        if let Some(pk_index) = &mut self.primary_key_index {
+        if let Some(pk_index) = self.primary_key_index.write().as_mut() {
             pk_index.clear_uncommitted();
         }
         Ok(())
@@ -871,6 +928,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Wait for all eligible merges to complete, including cascading merges.
     pub async fn wait_for_all_merges(&self) {
         self.segment_manager.wait_for_all_merges().await;
+    }
+
+    /// Wait until an owned commit finalizer has reconciled durable metadata,
+    /// primary-key state, and worker availability. Normally callers need not
+    /// use this: it exists for orderly shutdown and request supervisors that
+    /// want to observe completion after cancelling their original waiter.
+    pub async fn wait_for_commit_finalization(&self) {
+        self.commit_finalization.wait_until_idle().await;
     }
 
     /// Get the segment tracker for sharing with readers.
@@ -897,13 +962,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Workers are NOT destroyed — they flush their builders and wait for
     /// `resume_workers()` to give them a new channel.
     ///
-    /// `add_document` will return `Closed` error until commit/abort resumes workers.
+    /// `add_document` returns `CommitInProgress` until commit/abort resumes workers.
     pub async fn prepare_commit(&mut self) -> Result<PreparedCommit<'_, D>> {
         if self.worker_state.shutdown.load(Ordering::Acquire) {
             return Err(Error::IndexClosed);
         }
+        if self.commit_finalization.in_progress.load(Ordering::Acquire) {
+            return Err(Error::CommitInProgress);
+        }
         // 1. Close channel → workers drain remaining docs and flush builders
-        self.doc_sender.close();
+        self.doc_sender.read().close();
 
         // Wake any workers still waiting on resume_cvar from previous cycle.
         // They'll clone the stale receiver, enter recv_blocking, get Err
@@ -954,9 +1022,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // longer exist in a worker builder, so successful sibling outputs
             // cannot be committed without violating commit's all-prior-docs
             // guarantee. Their RAII drops retain ownership through deletion.
-            self.flushed_segments.clear();
+            self.flushed_segments.lock().clear();
             self.worker_state.built_segments.lock().clear();
-            if let Some(pk_index) = &mut self.primary_key_index {
+            if let Some(pk_index) = self.primary_key_index.write().as_mut() {
                 pk_index.clear_uncommitted();
             }
             self.resume_workers();
@@ -967,12 +1035,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         // 3. Collect built segments
         let built = std::mem::take(&mut *self.worker_state.built_segments.lock());
-        self.flushed_segments.extend(built);
+        self.flushed_segments.lock().extend(built);
 
         Ok(PreparedCommit {
             writer: self,
             is_resolved: false,
-            is_published: false,
         })
     }
 
@@ -1009,42 +1076,45 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Workers are already alive — just give them a new channel and wake them.
     /// If the tokio runtime has shut down (e.g., program exit), this is a no-op.
     fn resume_workers(&mut self) {
-        if self.worker_state.shutdown.load(Ordering::Acquire) {
+        Self::resume_workers_shared(&self.worker_state, &self.doc_sender);
+    }
+
+    fn resume_workers_shared(
+        worker_state: &Arc<WorkerState<D>>,
+        doc_sender: &Arc<parking_lot::RwLock<async_channel::Sender<Document>>>,
+    ) {
+        if worker_state.shutdown.load(Ordering::Acquire) {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
             // Runtime is gone — signal permanent shutdown so workers don't
             // hang forever on resume_cvar.
-            self.worker_state.shutdown.store(true, Ordering::Release);
-            self.worker_state.resume_cvar.notify_all();
+            worker_state.shutdown.store(true, Ordering::Release);
+            worker_state.resume_cvar.notify_all();
             return;
         }
 
         // Reset flush count for next cycle
-        self.worker_state.flush_count.store(0, Ordering::Release);
-        *self.worker_state.cycle_error.lock() = None;
-        self.worker_state
-            .cycle_failed
-            .store(false, Ordering::Release);
+        worker_state.flush_count.store(0, Ordering::Release);
+        *worker_state.cycle_error.lock() = None;
+        worker_state.cycle_failed.store(false, Ordering::Release);
 
         // Create new channel
         let (sender, receiver) = async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
-        self.doc_sender = sender;
+        *doc_sender.write() = sender;
 
         // Set new receiver, bump epoch, and wake all workers
         {
-            let mut lock = self.worker_state.resume_receiver.lock();
+            let mut lock = worker_state.resume_receiver.lock();
             *lock = Some(receiver);
         }
-        self.worker_state
-            .resume_epoch
-            .fetch_add(1, Ordering::Release);
-        self.worker_state.resume_cvar.notify_all();
+        worker_state.resume_epoch.fetch_add(1, Ordering::Release);
+        worker_state.resume_cvar.notify_all();
     }
 
     fn signal_worker_shutdown(&self) {
         self.worker_state.shutdown.store(true, Ordering::Release);
-        self.doc_sender.close();
+        self.doc_sender.read().close();
         self.worker_state.resume_cvar.notify_all();
     }
 
@@ -1069,9 +1139,184 @@ impl<D: DirectoryWriter + 'static> Drop for IndexWriter<D> {
 pub struct PreparedCommit<'a, D: DirectoryWriter + 'static> {
     writer: &'a mut IndexWriter<D>,
     is_resolved: bool,
-    /// Metadata publication is the commit point. Post-publication cache work
-    /// may still fail or be cancelled, but must never be described as an abort.
-    is_published: bool,
+}
+
+/// Returns prepared segments to the writer if an owned commit finalizer fails
+/// or unwinds before it can establish that metadata owns them. Retrying commit
+/// is safe even when publication actually won the race: `SegmentManager::commit`
+/// is idempotent and the operation guards keep the files protected meanwhile.
+struct PreparedSegmentsGuard<D: DirectoryWriter + 'static> {
+    segments: Option<Vec<PreparedSegment<D>>>,
+    retry_slot: Arc<parking_lot::Mutex<Vec<PreparedSegment<D>>>>,
+}
+
+impl<D: DirectoryWriter + 'static> PreparedSegmentsGuard<D> {
+    fn metadata_entries(&self) -> Vec<(String, u32)> {
+        self.segments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(PreparedSegment::metadata_entry)
+            .collect()
+    }
+
+    fn take_published(&mut self) -> Vec<PreparedSegment<D>> {
+        self.segments.take().unwrap_or_default()
+    }
+}
+
+impl<D: DirectoryWriter + 'static> Drop for PreparedSegmentsGuard<D> {
+    fn drop(&mut self) {
+        if let Some(segments) = self.segments.take() {
+            self.retry_slot.lock().extend(segments);
+        }
+    }
+}
+
+/// Couples completion of the owned commit task to writer availability. The
+/// default is deliberately fail-closed: a pre-publication error or panic keeps
+/// workers paused so the retained prepared generation can be retried. Only the
+/// normal published path arms resumption.
+struct CommitFinalizationGuard<D: DirectoryWriter + 'static> {
+    state: Arc<CommitFinalizationState>,
+    worker_state: Arc<WorkerState<D>>,
+    doc_sender: Arc<parking_lot::RwLock<async_channel::Sender<Document>>>,
+    resume_workers: bool,
+}
+
+impl<D: DirectoryWriter + 'static> CommitFinalizationGuard<D> {
+    fn resume_on_drop(&mut self) {
+        self.resume_workers = true;
+    }
+}
+
+impl<D: DirectoryWriter + 'static> Drop for CommitFinalizationGuard<D> {
+    fn drop(&mut self) {
+        if self.resume_workers {
+            IndexWriter::<D>::resume_workers_shared(&self.worker_state, &self.doc_sender);
+        }
+        self.state.finish();
+    }
+}
+
+/// Everything needed to finish one prepared generation is moved into this
+/// value before spawning. Its two guards therefore reconcile segment
+/// ownership and writer availability even if Tokio drops the task before its
+/// first poll.
+struct OwnedCommitFinalization<D: DirectoryWriter + 'static> {
+    directory: Arc<D>,
+    schema: Arc<Schema>,
+    segment_manager: Arc<crate::merge::SegmentManager<D>>,
+    primary_key_index: Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+    prepared: PreparedSegmentsGuard<D>,
+    finalization: Option<CommitFinalizationGuard<D>>,
+    publication_observed: Arc<AtomicBool>,
+}
+
+async fn refresh_primary_key_after_commit<D: DirectoryWriter + 'static>(
+    directory: &Arc<D>,
+    schema: &Arc<Schema>,
+    segment_manager: &Arc<crate::merge::SegmentManager<D>>,
+    primary_key_index: &Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+) -> Result<()> {
+    let existing_ids: std::collections::HashSet<String> = {
+        let guard = primary_key_index.read();
+        let Some(pk_index) = guard.as_ref() else {
+            return Ok(());
+        };
+        pk_index
+            .committed_segment_ids()
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+
+    let snapshot = segment_manager.acquire_snapshot().await;
+    let load_futures: Vec<_> = snapshot
+        .segment_ids()
+        .iter()
+        .filter(|id| !existing_ids.contains(id.as_str()))
+        .map(|seg_id_str| {
+            let seg_id_str = seg_id_str.clone();
+            let dir = directory.as_ref();
+            let schema = Arc::clone(schema);
+            async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
+        })
+        .collect();
+    let new_data = futures::future::try_join_all(load_futures).await?;
+    let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
+
+    let bloom_file = {
+        let mut guard = primary_key_index.write();
+        let Some(pk_index) = guard.as_mut() else {
+            return Ok(());
+        };
+        pk_index.refresh_incremental(new_data, snapshot);
+        let bloom_bytes = pk_index.bloom_to_bytes();
+        super::primary_key::serialize_pk_bloom(&seg_ids, &bloom_bytes)
+    };
+
+    if let Err(error) = directory
+        .write(
+            std::path::Path::new(super::primary_key::PK_BLOOM_FILE),
+            &bloom_file,
+        )
+        .await
+    {
+        log::warn!("[primary_key] failed to persist bloom cache: {}", error);
+    }
+    Ok(())
+}
+
+async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
+    mut commit: OwnedCommitFinalization<D>,
+) -> Result<bool> {
+    let metadata_entries = commit.prepared.metadata_entries();
+
+    // This entire future is owned by a Tokio task. Cancelling the RPC only
+    // drops its JoinHandle; it cannot split durable metadata publication from
+    // PK reservations or worker resumption.
+    commit.segment_manager.commit(&metadata_entries).await?;
+    commit.publication_observed.store(true, Ordering::Release);
+
+    let mut published = commit.prepared.take_published();
+    for segment in &mut published {
+        segment.mark_published();
+    }
+    drop(published);
+    // Publication is irreversible. From here onward every exit path, including
+    // panic unwind, must make the writer available again while PK reservations
+    // remain fail-closed until refresh succeeds.
+    if let Some(finalization) = commit.finalization.as_mut() {
+        finalization.resume_on_drop();
+    } else {
+        log::error!("owned commit finalization guard was already released after publication");
+    }
+
+    // Metadata publication is the commit point. Cache refresh is fail-closed:
+    // retaining the generation's uncommitted keys may cause conservative
+    // duplicate rejections, but can never admit a duplicate or turn a durable
+    // commit into an API error.
+    if let Err(error) = refresh_primary_key_after_commit(
+        &commit.directory,
+        &commit.schema,
+        &commit.segment_manager,
+        &commit.primary_key_index,
+    )
+    .await
+    {
+        log::error!(
+            "[primary_key] committed metadata but failed to refresh dedup state; \
+             retaining reservations until a later successful commit: {}",
+            error,
+        );
+    }
+
+    // Merge scheduling is optional post-commit work and may briefly wait on
+    // manager state. Reconcile worker availability first so it cannot extend
+    // ingestion backpressure after metadata and PK state already agree.
+    drop(commit.finalization.take());
+    commit.segment_manager.maybe_merge().await;
+    Ok(true)
 }
 
 impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
@@ -1079,7 +1324,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     ///
     /// Returns `true` if new segments were committed, `false` if nothing changed.
     pub async fn commit(mut self) -> Result<bool> {
-        let mut segments = std::mem::take(&mut self.writer.flushed_segments);
+        let segments = std::mem::take(&mut *self.writer.flushed_segments.lock());
 
         // Fast path: nothing to commit
         if segments.is_empty() {
@@ -1089,87 +1334,84 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
             return Ok(false);
         }
 
-        let metadata_entries: Vec<(String, u32)> = segments
-            .iter()
-            .map(PreparedSegment::metadata_entry)
-            .collect();
-        if let Err(error) = self.writer.segment_manager.commit(&metadata_entries).await {
-            // Publication is transactional, so these guarded files remain a
-            // valid prepared commit. Preserve them and keep this generation
-            // paused for the caller's next commit/abort. Resuming here allowed
-            // a later worker generation to mix with the retained outputs; a
-            // failure in that generation then discarded documents from both.
-            self.writer.flushed_segments = segments;
+        if !self.writer.commit_finalization.begin() {
+            self.writer.flushed_segments.lock().extend(segments);
+            // Keep the prepared generation paused. Letting `Drop` auto-abort
+            // here would delete the retryable segments owned by another
+            // finalization state transition.
             self.is_resolved = true;
-            return Err(error);
+            return Err(Error::CommitInProgress);
         }
-        self.is_published = true;
 
-        // Metadata + tracker now own the IDs; releasing indexing ownership is
-        // the final transition from prepared to live.
-        for segment in &mut segments {
-            segment.mark_published();
-        }
-        drop(segments);
+        let publication_observed = Arc::new(AtomicBool::new(false));
+        let owned = OwnedCommitFinalization {
+            directory: Arc::clone(&self.writer.directory),
+            schema: Arc::clone(&self.writer.schema),
+            segment_manager: Arc::clone(&self.writer.segment_manager),
+            primary_key_index: Arc::clone(&self.writer.primary_key_index),
+            prepared: PreparedSegmentsGuard {
+                segments: Some(segments),
+                retry_slot: Arc::clone(&self.writer.flushed_segments),
+            },
+            finalization: Some(CommitFinalizationGuard {
+                state: Arc::clone(&self.writer.commit_finalization),
+                worker_state: Arc::clone(&self.writer.worker_state),
+                doc_sender: Arc::clone(&self.writer.doc_sender),
+                resume_workers: false,
+            }),
+            publication_observed: Arc::clone(&publication_observed),
+        };
 
-        // Refresh primary key index: only load fast fields for NEW segments.
-        let post_publish_result = async {
-            if let Some(ref mut pk_index) = self.writer.primary_key_index {
-                let snapshot = self.writer.segment_manager.acquire_snapshot().await;
-                let existing_ids: std::collections::HashSet<&str> =
-                    pk_index.committed_segment_ids().collect();
-
-                // Only load fast fields for segments not already held.
-                let load_futures: Vec<_> = snapshot
-                    .segment_ids()
-                    .iter()
-                    .filter(|id| !existing_ids.contains(id.as_str()))
-                    .map(|seg_id_str| {
-                        let seg_id_str = seg_id_str.clone();
-                        let dir = self.writer.directory.as_ref();
-                        let schema = Arc::clone(&self.writer.schema);
-                        async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
-                    })
-                    .collect();
-                let new_data = futures::future::try_join_all(load_futures).await?;
-
-                let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
-                pk_index.refresh_incremental(new_data, snapshot);
-
-                // Persist bloom cache (extract bytes to avoid borrow conflict).
-                let bloom_bytes = pk_index.bloom_to_bytes();
-                let data = super::primary_key::serialize_pk_bloom(&seg_ids, &bloom_bytes);
-                if let Err(e) = self
-                    .writer
-                    .directory
-                    .write(
-                        std::path::Path::new(super::primary_key::PK_BLOOM_FILE),
-                        &data,
-                    )
+        // From this point the owned value, not this cancel-sensitive guard,
+        // controls every segment and the paused worker generation. Resolve the
+        // local guard before spawning so even a runtime-spawn panic cannot
+        // auto-abort the retryable generation during unwind.
+        self.is_resolved = true;
+        let task_publication = Arc::clone(&publication_observed);
+        let task = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::spawn(async move {
+                match std::panic::AssertUnwindSafe(finalize_prepared_commit(owned))
+                    .catch_unwind()
                     .await
                 {
-                    log::warn!("[primary_key] failed to persist bloom cache: {}", e);
+                    Ok(result) => result,
+                    Err(_) if task_publication.load(Ordering::Acquire) => {
+                        log::error!(
+                            "owned commit finalizer panicked after metadata publication; \
+                             treating the durable generation as committed"
+                        );
+                        Ok(true)
+                    }
+                    Err(_) => Err(Error::Internal(
+                        "owned commit finalizer panicked before metadata publication".into(),
+                    )),
                 }
+            })
+        }))
+        .map_err(|_| Error::Internal("runtime rejected owned commit finalizer".into()))?;
+
+        match task.await {
+            Ok(result) => result,
+            Err(error) if publication_observed.load(Ordering::Acquire) => {
+                log::error!(
+                    "owned commit finalizer terminated after metadata publication: {}; \
+                     treating the durable generation as committed",
+                    error,
+                );
+                Ok(true)
             }
-
-            self.writer.segment_manager.maybe_merge().await;
-            Ok(())
+            Err(error) => Err(Error::Internal(format!(
+                "owned commit finalizer terminated unexpectedly: {error}"
+            ))),
         }
-        .await;
-
-        // Worker availability must not depend on optional post-publication
-        // cache refresh or merge scheduling.
-        self.is_resolved = true;
-        self.writer.resume_workers();
-        post_publish_result.map(|()| true)
     }
 
     /// Abort: discard prepared segments, delete their files asynchronously,
     /// and resume workers. Lifecycle ownership is held until deletion ends.
     pub fn abort(mut self) {
         self.is_resolved = true;
-        self.writer.flushed_segments.clear();
-        if let Some(ref mut pk_index) = self.writer.primary_key_index {
+        self.writer.flushed_segments.lock().clear();
+        if let Some(pk_index) = self.writer.primary_key_index.write().as_mut() {
             pk_index.clear_uncommitted();
         }
         self.writer.resume_workers();
@@ -1179,14 +1421,10 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
 impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
     fn drop(&mut self) {
         if !self.is_resolved {
-            if self.is_published {
-                log::warn!("PreparedCommit dropped after metadata publication — resuming workers");
-            } else {
-                log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
-                self.writer.flushed_segments.clear();
-                if let Some(ref mut pk_index) = self.writer.primary_key_index {
-                    pk_index.clear_uncommitted();
-                }
+            log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
+            self.writer.flushed_segments.lock().clear();
+            if let Some(pk_index) = self.writer.primary_key_index.write().as_mut() {
+                pk_index.clear_uncommitted();
             }
             self.writer.resume_workers();
         }

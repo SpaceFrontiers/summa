@@ -57,9 +57,9 @@ impl IndexServiceImpl {
                         error: format!("Duplicate primary key: {}", key),
                     });
                 }
-                Err(hermes_core::Error::QueueFull) => {
+                Err(hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress) => {
                     warn!(
-                        "QueueFull during stream batch: indexed {}/{} docs before backpressure",
+                        "Indexing backpressure during stream batch: indexed {}/{} docs",
                         count, total_docs
                     );
                     break;
@@ -142,15 +142,18 @@ impl IndexService for IndexServiceImpl {
                             error: format!("Duplicate primary key: {}", key),
                         });
                     }
-                    Err(hermes_core::Error::QueueFull) => {
+                    Err(hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress) => {
                         let skipped = total_docs - i;
                         warn!(
-                            "QueueFull during batch_index: index={}, indexed {}/{} docs, {} skipped",
+                            "Indexing backpressure during batch_index: index={}, indexed {}/{} docs, {} skipped",
                             req.index_name, indexed_count, total_docs, skipped
                         );
                         doc_errors.push(DocumentError {
                             index: i as u32,
-                            error: format!("Queue full — {} remaining documents skipped", skipped),
+                            error: format!(
+                                "Indexing backpressure — {} remaining documents skipped",
+                                skipped
+                            ),
                         });
                         break;
                     }

@@ -63,6 +63,11 @@ pub struct SegmentMetaInfo {
     /// Old metadata (field absent) deserializes as converged.
     #[serde(default = "default_true")]
     pub bp_converged: bool,
+    /// Number of consecutive budget-exhausted BP rewrites in this segment's
+    /// current reordered lineage. Carried across replacement IDs so the
+    /// optimizer can impose a hard follow-up bound instead of rewriting forever.
+    #[serde(default)]
+    pub bp_unconverged_passes: u32,
 }
 
 /// Per-field vector index metadata
@@ -130,6 +135,7 @@ impl IndexMetadata {
                 generation: 0,
                 reordered: false,
                 bp_converged: true,
+                bp_unconverged_passes: 0,
             },
         );
     }
@@ -144,7 +150,7 @@ impl IndexMetadata {
         reordered: bool,
         bp_converged: bool,
     ) {
-        self.segment_metas.insert(
+        self.add_segment_meta(
             segment_id,
             SegmentMetaInfo {
                 num_docs,
@@ -152,8 +158,16 @@ impl IndexMetadata {
                 generation,
                 reordered,
                 bp_converged,
+                bp_unconverged_passes: 0,
             },
         );
+    }
+
+    /// Insert fully constructed lifecycle metadata. Merge/reorder code uses
+    /// this to carry bounded BP lineage; ordinary callers use the safer
+    /// constructors above, which start a fresh lineage.
+    pub(crate) fn add_segment_meta(&mut self, segment_id: String, info: SegmentMetaInfo) {
+        self.segment_metas.insert(segment_id, info);
     }
 
     /// Remove a segment
@@ -609,6 +623,20 @@ mod tests {
         assert_eq!(loaded.segment_doc_count("seg1"), Some(100));
         assert_eq!(loaded.total_vectors, meta.total_vectors);
         assert!(loaded.vector_fields.contains_key(&0));
+    }
+
+    #[test]
+    fn old_metadata_defaults_the_bp_retry_counter() {
+        let mut meta = IndexMetadata::new(test_schema());
+        meta.add_segment("legacy".to_string(), 10);
+        let mut json = serde_json::to_value(&meta).unwrap();
+        json["segment_metas"]["legacy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bp_unconverged_passes");
+
+        let loaded: IndexMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.segment_metas["legacy"].bp_unconverged_passes, 0);
     }
 
     #[test]

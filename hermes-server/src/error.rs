@@ -23,7 +23,9 @@ pub fn hermes_error_to_status(e: hermes_core::Error) -> Status {
         hermes_core::Error::DuplicatePrimaryKey(_) => Status::already_exists(e.to_string()),
 
         // Backpressure
-        hermes_core::Error::QueueFull => Status::resource_exhausted(e.to_string()),
+        hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress => {
+            Status::resource_exhausted(e.to_string())
+        }
 
         // Precondition failures
         hermes_core::Error::IndexClosed => Status::failed_precondition(e.to_string()),
