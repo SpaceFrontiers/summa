@@ -17,15 +17,15 @@ struct Cli {
 enum Commands {
     /// Generate text from a trained model
     Generate {
-        /// Path to model checkpoint
+        /// Model weights path or remote URI
         #[arg(short, long)]
         checkpoint: String,
 
-        /// Path to model config
+        /// Model config path or remote URI
         #[arg(long)]
         config: String,
 
-        /// Path to tokenizer
+        /// Tokenizer path or remote URI
         #[arg(short, long)]
         tokenizer: String,
 

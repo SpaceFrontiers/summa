@@ -4,6 +4,9 @@
 mod attention;
 pub mod backend;
 mod block;
+mod conv;
+#[cfg(any(feature = "metal", feature = "cuda"))]
+mod cube_tensor;
 mod ffn;
 mod mamba;
 mod norm;
@@ -20,6 +23,26 @@ pub use norm::Norm;
 pub use scan::MambaBackend;
 pub use transformer::Transformer;
 pub use weights::{load_safetensors, save_safetensors};
+
+#[cfg(all(test, feature = "metal"))]
+mod test_support {
+    use burn::tensor::TensorData;
+
+    pub(super) fn values(len: usize, scale: f32, offset: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| (i as f32 * scale).sin() * 0.25 + offset)
+            .collect()
+    }
+
+    pub(super) fn max_diff(lhs: TensorData, rhs: TensorData) -> f32 {
+        lhs.to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .zip(rhs.to_vec::<f32>().unwrap())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+}
 
 #[cfg(test)]
 mod tests {

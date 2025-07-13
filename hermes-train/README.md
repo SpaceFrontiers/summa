@@ -39,12 +39,13 @@ retaining the corpus in memory. Repeat `--data` to combine files. Samples never
 cross document boundaries. Set `--shuffle-buffer 0` only for ordered diagnostic
 runs.
 
-The trainer uses Burn Autodiff with Burn's Muon optimizer for hidden 2D matrices
+The trainer uses Burn Autodiff with batched Muon updates for hidden 2D matrices
 and AdamW for embeddings, output weights, norms, biases, and convolution
-kernels. This matches the original trainer's optimizer split, including Muon's
-20x learning rate, AdamW beta2 of 0.95, and global norm clipping. It supports
-cosine or warmup-stable-decay scheduling and fine-tuning from a Burn-native
-checkpoint.
+kernels. Muon uses a 20x learning rate; AdamW uses beta2 0.95; global gradient
+norm clipping covers both parameter sets. It supports cosine or
+warmup-stable-decay scheduling and fine-tuning from Burn-native safetensors.
+On CUDA, Muon's Newton-Schulz iterations use BF16 while model parameters and
+optimizer state remain FP32.
 It atomically replaces the latest native checkpoint every 100 optimizer steps
 by default; pass `--checkpoint-every 0` to save only at completion.
 On Mamba models, training and inference use fused CubeCL selective-scan kernels

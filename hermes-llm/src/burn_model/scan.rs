@@ -10,6 +10,8 @@ use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy
 use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
+use super::conv::DepthwiseConv1dBackend;
+
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct ScanOutput<B: Backend> {
@@ -31,7 +33,7 @@ pub struct ScanGradients<B: Backend> {
 }
 
 /// Backend capability required by the Burn Mamba mixer.
-pub trait MambaBackend: Backend {
+pub trait MambaBackend: Backend + DepthwiseConv1dBackend {
     #[allow(clippy::too_many_arguments)]
     fn selective_scan_inner(
         delta: FloatTensor<Self>,
@@ -424,6 +426,7 @@ mod gpu {
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
     use super::{MambaBackend, ScanGradients, ScanOutput};
+    use crate::burn_model::cube_tensor::{empty_like, into_contiguous, zeros_like};
 
     const THREADS_PER_CUBE: u32 = 64;
 
@@ -587,28 +590,6 @@ mod gpu {
         }
     }
 
-    fn contiguous<R: CubeRuntime>(tensor: CubeTensor<R>) -> CubeTensor<R> {
-        burn_cubecl::kernel::into_contiguous(tensor)
-    }
-
-    fn empty<R: CubeRuntime>(like: &CubeTensor<R>, shape: Shape) -> CubeTensor<R> {
-        burn_cubecl::ops::numeric::empty_device_contiguous_dtype(
-            like.client.clone(),
-            like.device.clone(),
-            shape,
-            like.dtype,
-        )
-    }
-
-    fn zeros<R: CubeRuntime>(like: &CubeTensor<R>, shape: Shape) -> CubeTensor<R> {
-        burn_cubecl::ops::numeric::zeros_client(
-            like.client.clone(),
-            like.device.clone(),
-            shape,
-            like.dtype,
-        )
-    }
-
     impl<R, I, BT> MambaBackend for CubeBackend<R, f32, I, BT>
     where
         R: CubeRuntime,
@@ -627,17 +608,17 @@ mod gpu {
             save_states: bool,
         ) -> ScanOutput<Self> {
             let [batch, seq_len, channels] = xs.shape().dims();
-            let delta = contiguous(delta);
-            let xs = contiguous(xs);
-            let b_mat = contiguous(b_mat);
-            let c_mat = contiguous(c_mat);
-            let a = contiguous(a);
-            let d = contiguous(d);
-            let h = contiguous(h);
-            let y = empty(&xs, Shape::new([batch, seq_len, channels]));
-            let h_out = empty(&xs, Shape::new([batch, channels, state_dim]));
+            let delta = into_contiguous(delta);
+            let xs = into_contiguous(xs);
+            let b_mat = into_contiguous(b_mat);
+            let c_mat = into_contiguous(c_mat);
+            let a = into_contiguous(a);
+            let d = into_contiguous(d);
+            let h = into_contiguous(h);
+            let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let h_out = empty_like(&xs, Shape::new([batch, channels, state_dim]));
             let states = if save_states {
-                empty(&xs, Shape::new([batch, seq_len, channels, state_dim]))
+                empty_like(&xs, Shape::new([batch, seq_len, channels, state_dim]))
             } else {
                 h_out.clone()
             };
@@ -683,22 +664,22 @@ mod gpu {
             state_dim: usize,
         ) -> ScanGradients<Self> {
             let [batch, seq_len, channels] = xs.shape().dims();
-            let delta = contiguous(delta);
-            let xs = contiguous(xs);
-            let b_mat = contiguous(b_mat);
-            let c_mat = contiguous(c_mat);
-            let a = contiguous(a);
-            let d = contiguous(d);
-            let h = contiguous(h);
-            let states = contiguous(states);
-            let grad_y = contiguous(grad_y);
-            let grad_delta = empty(&xs, Shape::new([batch, seq_len, channels]));
-            let grad_xs = empty(&xs, Shape::new([batch, seq_len, channels]));
-            let grad_b = zeros(&xs, Shape::new([batch, seq_len, state_dim]));
-            let grad_c = zeros(&xs, Shape::new([batch, seq_len, state_dim]));
-            let grad_a = zeros(&xs, Shape::new([channels, state_dim]));
-            let grad_d = zeros(&xs, Shape::new([channels]));
-            let grad_h = empty(&xs, Shape::new([batch, channels, state_dim]));
+            let delta = into_contiguous(delta);
+            let xs = into_contiguous(xs);
+            let b_mat = into_contiguous(b_mat);
+            let c_mat = into_contiguous(c_mat);
+            let a = into_contiguous(a);
+            let d = into_contiguous(d);
+            let h = into_contiguous(h);
+            let states = into_contiguous(states);
+            let grad_y = into_contiguous(grad_y);
+            let grad_delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let grad_xs = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let grad_b = zeros_like(&xs, Shape::new([batch, seq_len, state_dim]));
+            let grad_c = zeros_like(&xs, Shape::new([batch, seq_len, state_dim]));
+            let grad_a = zeros_like(&xs, Shape::new([channels, state_dim]));
+            let grad_d = zeros_like(&xs, Shape::new([channels]));
+            let grad_h = empty_like(&xs, Shape::new([batch, channels, state_dim]));
             let client = xs.client.clone();
 
             selective_scan_backward::launch::<R>(
@@ -751,21 +732,7 @@ mod tests {
     use burn_wgpu::Wgpu;
 
     use super::selective_scan;
-
-    fn values(len: usize, scale: f32, offset: f32) -> Vec<f32> {
-        (0..len)
-            .map(|i| (i as f32 * scale).sin() * 0.25 + offset)
-            .collect()
-    }
-
-    fn max_diff(lhs: TensorData, rhs: TensorData) -> f32 {
-        lhs.to_vec::<f32>()
-            .unwrap()
-            .into_iter()
-            .zip(rhs.to_vec::<f32>().unwrap())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
-    }
+    use crate::burn_model::test_support::{max_diff, values};
 
     #[test]
     fn test_cubecl_selective_scan_matches_ndarray_reference() {

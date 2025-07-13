@@ -17,17 +17,18 @@ cargo build --release -p hermes-llm --features metal
 cargo build --release -p hermes-llm --features cuda
 ```
 
-Burn supplies embeddings, linear layers, normalization, grouped convolution,
-attention, and its optimized CubeCL kernels. Hermes adds one custom CubeCL
-operation for Mamba selective scan because Burn does not provide that operation.
-GPU tensors stay in the Burn/CubeCL runtime throughout inference.
+Burn supplies embeddings, linear layers, normalization, attention, and its
+optimized CubeCL kernels. Hermes adds fused CubeCL operators for Mamba's
+selective scan and depthwise convolution; Burn has no selective scan, while its
+generic grouped-convolution gradient launches once per channel. GPU tensors stay
+in the Burn/CubeCL runtime throughout inference and training.
 
 ## Generate text
 
 ```bash
 hermes-llm generate \
-  --checkpoint checkpoints/weights.safetensors \
-  --config checkpoints/config.json \
+  --checkpoint checkpoint/weights.safetensors \
+  --config checkpoint/config.json \
   --tokenizer tokenizer.json \
   --prompt "Once upon a time" \
   --max-tokens 100 \

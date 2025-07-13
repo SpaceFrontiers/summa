@@ -88,21 +88,28 @@ impl<B: Backend> MultiHeadAttention<B> {
         }
     }
 
-    fn apply_qk_norm(&self, q: Tensor<B, 4>, k: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        match (&self.q_norm, &self.k_norm) {
-            (Some(qn), Some(kn)) => (qn.forward(q), kn.forward(k)),
-            _ => (q, k),
-        }
-    }
-
-    /// Project x -> per-head Q,K,V, each [B, H|n_kv, S, head_dim].
-    fn qkv(&self, x: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+    /// Project and position per-head Q, K, and V tensors.
+    fn project_qkv(
+        &self,
+        x: Tensor<B, 3>,
+        rope: &RotaryEncoding<B>,
+        start_pos: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
         let [b, s, _] = x.dims();
         let split =
             |t: Tensor<B, 3>, heads: usize| t.reshape([b, s, heads, self.head_dim]).swap_dims(1, 2);
         let q = split(self.q_proj.forward(x.clone()), self.num_heads);
         let k = split(self.k_proj.forward(x.clone()), self.num_kv_heads);
         let v = split(self.v_proj.forward(x), self.num_kv_heads);
+        let (q, k) = match (&self.q_norm, &self.k_norm) {
+            (Some(q_norm), Some(k_norm)) => (q_norm.forward(q), k_norm.forward(k)),
+            _ => (q, k),
+        };
+        let (q, k) = if self.use_rope {
+            (rope.apply(q, start_pos), rope.apply(k, start_pos))
+        } else {
+            (q, k)
+        };
         (q, k, v)
     }
 
@@ -208,13 +215,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         rope: &RotaryEncoding<B>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
-        let (q, k, v) = self.qkv(x);
-        let (q, k) = self.apply_qk_norm(q, k);
-        let (q, k) = if self.use_rope {
-            (rope.apply(q, start_pos), rope.apply(k, start_pos))
-        } else {
-            (q, k)
-        };
+        let (q, k, v) = self.project_qkv(x, rope, start_pos);
         let out = self.sdpa(q, self.repeat_kv(k), self.repeat_kv(v), start_pos);
         self.o_proj.forward(self.merge_heads(out))
     }
@@ -228,13 +229,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         start_pos: usize,
         cache: &mut AttnCache<B>,
     ) -> Tensor<B, 3> {
-        let (q, k, v) = self.qkv(x);
-        let (q, k) = self.apply_qk_norm(q, k);
-        let (q, k) = if self.use_rope {
-            (rope.apply(q, start_pos), rope.apply(k, start_pos))
-        } else {
-            (q, k)
-        };
+        let (q, k, v) = self.project_qkv(x, rope, start_pos);
 
         // Append to cache (pre-GQA-repeat).
         let k = match cache.k.take() {

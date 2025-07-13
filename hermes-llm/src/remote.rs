@@ -30,8 +30,13 @@ mod imp {
 mod imp {
     use anyhow::{Context, Result};
     use std::collections::hash_map::DefaultHasher;
+    use std::fs::File;
     use std::hash::{Hash, Hasher};
+    use std::io::Write;
+    use std::ops::Range;
     use std::path::PathBuf;
+
+    pub(super) const DOWNLOAD_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
     pub fn resolve(uri: &str) -> Result<PathBuf> {
         match super::remote_scheme(uri) {
@@ -77,24 +82,28 @@ mod imp {
             return Ok(dest);
         }
         tracing::info!("downloading {} …", uri);
-        let bytes = fetch(uri)?;
-        // Atomic publish: write to a temp sibling then rename, so a concurrent
-        // or interrupted run never observes a partial cache file.
+        // Publish only after the complete object has been written and synced, so
+        // an interrupted run never exposes a partial cache file.
         let tmp = dest.with_extension("part");
-        std::fs::write(&tmp, &bytes)
-            .with_context(|| format!("writing cache temp {}", tmp.display()))?;
+        let size = download(uri, &tmp)?;
         std::fs::rename(&tmp, &dest)
             .with_context(|| format!("publishing cache file {}", dest.display()))?;
         tracing::info!(
             "downloaded {} ({:.1} MiB) → {}",
             uri,
-            bytes.len() as f64 / (1024.0 * 1024.0),
+            size as f64 / (1024.0 * 1024.0),
             dest.display()
         );
         Ok(dest)
     }
 
-    fn fetch(uri: &str) -> Result<Vec<u8>> {
+    pub(super) fn ranges(size: u64) -> impl Iterator<Item = Range<u64>> {
+        (0..size)
+            .step_by(DOWNLOAD_CHUNK_BYTES as usize)
+            .map(move |start| start..(start + DOWNLOAD_CHUNK_BYTES).min(size))
+    }
+
+    fn download(uri: &str, dest: &std::path::Path) -> Result<u64> {
         use object_store::{ObjectStore, ObjectStoreExt};
 
         let url = url::Url::parse(uri).with_context(|| format!("parsing URI {uri}"))?;
@@ -108,14 +117,27 @@ mod imp {
             .enable_all()
             .build()
             .context("building download runtime")?;
-        let bytes = rt.block_on(async move {
-            let get = store
-                .get(&path)
+        let mut file = File::create(dest)
+            .with_context(|| format!("creating cache temp {}", dest.display()))?;
+        let size = rt.block_on(async move {
+            let size = store
+                .head(&path)
                 .await
-                .with_context(|| format!("GET {path}"))?;
-            get.bytes().await.context("reading object body")
+                .with_context(|| format!("HEAD {path}"))?
+                .size;
+            for range in ranges(size) {
+                let bytes = store
+                    .get_range(&path, range.clone())
+                    .await
+                    .with_context(|| format!("GET {path} bytes {}-{}", range.start, range.end))?;
+                file.write_all(&bytes)
+                    .with_context(|| format!("writing cache temp {}", dest.display()))?;
+            }
+            file.sync_all()
+                .with_context(|| format!("syncing cache temp {}", dest.display()))?;
+            anyhow::Ok(size)
         })?;
-        anyhow::Ok(bytes.to_vec())
+        Ok(size)
     }
 }
 
@@ -124,22 +146,23 @@ pub use imp::resolve;
 /// The remote scheme of `uri` (`s3`, `gs`, `http`, `https`), or `None` for a
 /// local path or `file://`. Bare Windows drive letters (`C:\…`) are local.
 fn remote_scheme(uri: &str) -> Option<&'static str> {
-    let lower = uri.to_ascii_lowercase();
-    for scheme in ["s3://", "gs://", "gcs://", "http://", "https://"] {
-        if lower.starts_with(scheme) {
-            return Some(match scheme {
-                "s3://" => "s3",
-                "gs://" | "gcs://" => "gs",
-                "http://" => "http",
-                _ => "https",
-            });
-        }
-    }
-    None
+    [
+        ("s3://", "s3"),
+        ("gs://", "gs"),
+        ("gcs://", "gs"),
+        ("http://", "http"),
+        ("https://", "https"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, scheme)| {
+        uri.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            .then_some(scheme)
+    })
 }
 
-fn strip_file_scheme(uri: &str) -> String {
-    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+fn strip_file_scheme(uri: &str) -> &str {
+    uri.strip_prefix("file://").unwrap_or(uri)
 }
 
 #[cfg(test)]
@@ -170,6 +193,23 @@ mod tests {
         assert_eq!(remote_scheme("https://h/k"), Some("https"));
         assert_eq!(remote_scheme("/local/path"), None);
         assert_eq!(remote_scheme("C:\\weights"), None);
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn download_ranges_cover_object_once() {
+        use super::imp::{DOWNLOAD_CHUNK_BYTES, ranges};
+
+        let size = DOWNLOAD_CHUNK_BYTES * 2 + 7;
+        let ranges = ranges(size).collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            [
+                0..DOWNLOAD_CHUNK_BYTES,
+                DOWNLOAD_CHUNK_BYTES..DOWNLOAD_CHUNK_BYTES * 2,
+                DOWNLOAD_CHUNK_BYTES * 2..size,
+            ]
+        );
     }
 
     #[cfg(not(feature = "remote"))]
