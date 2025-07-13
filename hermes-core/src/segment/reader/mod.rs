@@ -5,6 +5,7 @@ pub(crate) mod loader;
 mod types;
 
 pub use bmp::BmpIndex;
+#[cfg(feature = "native")]
 pub(crate) use types::DimRawData;
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
 
