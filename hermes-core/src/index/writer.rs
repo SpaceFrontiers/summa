@@ -69,8 +69,9 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     worker_state: Arc<WorkerState<D>>,
     /// Segment manager — owns metadata.json, handles segments and background merging
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Segments flushed to disk but not yet registered in metadata
-    flushed_segments: Vec<(String, u32)>,
+    /// Segments flushed to disk but not yet registered in metadata. Each item
+    /// owns an active-operation guard, so orphan sweeping cannot delete it.
+    flushed_segments: Vec<PreparedSegment>,
     /// Primary key dedup index (None if schema has no primary field)
     primary_key_index: Option<super::primary_key::PrimaryKeyIndex>,
 }
@@ -85,8 +86,9 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     memory_budget_per_worker: usize,
     /// Segment manager — workers read trained structures from its ArcSwap (lock-free).
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Segments built by workers, collected by `prepare_commit()`. Sync mutex for sub-μs push.
-    built_segments: parking_lot::Mutex<Vec<(String, u32)>>,
+    /// Segments built by workers, collected by `prepare_commit()`. Their RAII
+    /// guards protect both in-progress and completed-uncommitted files.
+    built_segments: parking_lot::Mutex<Vec<PreparedSegment>>,
 
     // === Worker lifecycle synchronization ===
     // Workers survive across commits. On prepare_commit the channel is closed;
@@ -109,6 +111,23 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     shutdown: AtomicBool,
     /// Total number of worker threads.
     num_workers: usize,
+}
+
+/// A completed indexing segment that has not been published in metadata yet.
+///
+/// `_operation` is intentionally data, not a side-channel set update: moving
+/// this value through worker → prepared commit → commit/abort moves lifecycle
+/// ownership with it, and every unwind/drop path releases ownership safely.
+struct PreparedSegment {
+    id: String,
+    num_docs: u32,
+    _operation: crate::merge::SegmentOperationGuard,
+}
+
+impl PreparedSegment {
+    fn metadata_entry(&self) -> (String, u32) {
+        (self.id.clone(), self.num_docs)
+    }
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -635,6 +654,22 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ) {
         let segment_id = SegmentId::new();
         let segment_hex = segment_id.to_hex();
+        // Claim the ID before the first file write. The guard is moved into
+        // `PreparedSegment` on success and otherwise releases automatically.
+        let operation = match state
+            .segment_manager
+            .protect_new_segment(segment_hex.clone())
+        {
+            Ok(operation) => operation,
+            Err(e) => {
+                log::error!(
+                    "[segment_build_failed] segment_id={} lifecycle_error={}",
+                    segment_hex,
+                    e,
+                );
+                return;
+            }
+        };
         let trained = state.segment_manager.trained();
         let doc_count = builder.num_docs();
         let build_start = std::time::Instant::now();
@@ -659,10 +694,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     meta.num_docs,
                     duration_ms,
                 );
-                state
-                    .built_segments
-                    .lock()
-                    .push((segment_hex, meta.num_docs));
+                state.built_segments.lock().push(PreparedSegment {
+                    id: segment_hex,
+                    num_docs: meta.num_docs,
+                    _operation: operation,
+                });
             }
             Ok(_) => {}
             Err(e) => {
@@ -671,6 +707,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     segment_hex,
                     e
                 );
+                if let Err(delete_error) = handle.block_on(crate::segment::delete_segment(
+                    state.directory.as_ref(),
+                    segment_id,
+                )) {
+                    log::warn!(
+                        "[segment_cleanup] failed deleting partial indexing segment {}: {}",
+                        segment_hex,
+                        delete_error,
+                    );
+                }
             }
         }
     }
@@ -773,6 +819,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(PreparedCommit {
             writer: self,
             is_resolved: false,
+            is_published: false,
         })
     }
 
@@ -862,6 +909,9 @@ impl<D: DirectoryWriter + 'static> Drop for IndexWriter<D> {
 pub struct PreparedCommit<'a, D: DirectoryWriter + 'static> {
     writer: &'a mut IndexWriter<D>,
     is_resolved: bool,
+    /// Metadata publication is the commit point. Post-publication cache work
+    /// may still fail or be cancelled, but must never be described as an abort.
+    is_published: bool,
 }
 
 impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
@@ -869,60 +919,85 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     ///
     /// Returns `true` if new segments were committed, `false` if nothing changed.
     pub async fn commit(mut self) -> Result<bool> {
-        self.is_resolved = true;
         let segments = std::mem::take(&mut self.writer.flushed_segments);
 
         // Fast path: nothing to commit
         if segments.is_empty() {
             log::debug!("[commit] no segments to commit, skipping");
+            self.is_resolved = true;
             self.writer.resume_workers();
             return Ok(false);
         }
 
-        self.writer.segment_manager.commit(segments).await?;
+        let metadata_entries: Vec<(String, u32)> = segments
+            .iter()
+            .map(PreparedSegment::metadata_entry)
+            .collect();
+        if let Err(error) = self.writer.segment_manager.commit(&metadata_entries).await {
+            // Publication is transactional, so these guarded files remain a
+            // valid prepared commit. Preserve them for the caller's next
+            // commit instead of leaking ownership or wedging the workers.
+            self.writer.flushed_segments = segments;
+            self.is_resolved = true;
+            self.writer.resume_workers();
+            return Err(error);
+        }
+        self.is_published = true;
+
+        // Metadata + tracker now own the IDs; releasing indexing ownership is
+        // the final transition from prepared to live.
+        drop(segments);
 
         // Refresh primary key index: only load fast fields for NEW segments.
-        if let Some(ref mut pk_index) = self.writer.primary_key_index {
-            let snapshot = self.writer.segment_manager.acquire_snapshot().await;
-            let existing_ids: std::collections::HashSet<&str> =
-                pk_index.committed_segment_ids().collect();
+        let post_publish_result = async {
+            if let Some(ref mut pk_index) = self.writer.primary_key_index {
+                let snapshot = self.writer.segment_manager.acquire_snapshot().await;
+                let existing_ids: std::collections::HashSet<&str> =
+                    pk_index.committed_segment_ids().collect();
 
-            // Only load fast fields for segments not already held.
-            let load_futures: Vec<_> = snapshot
-                .segment_ids()
-                .iter()
-                .filter(|id| !existing_ids.contains(id.as_str()))
-                .map(|seg_id_str| {
-                    let seg_id_str = seg_id_str.clone();
-                    let dir = self.writer.directory.as_ref();
-                    let schema = Arc::clone(&self.writer.schema);
-                    async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
-                })
-                .collect();
-            let new_data = futures::future::try_join_all(load_futures).await?;
+                // Only load fast fields for segments not already held.
+                let load_futures: Vec<_> = snapshot
+                    .segment_ids()
+                    .iter()
+                    .filter(|id| !existing_ids.contains(id.as_str()))
+                    .map(|seg_id_str| {
+                        let seg_id_str = seg_id_str.clone();
+                        let dir = self.writer.directory.as_ref();
+                        let schema = Arc::clone(&self.writer.schema);
+                        async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
+                    })
+                    .collect();
+                let new_data = futures::future::try_join_all(load_futures).await?;
 
-            let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
-            pk_index.refresh_incremental(new_data, snapshot);
+                let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
+                pk_index.refresh_incremental(new_data, snapshot);
 
-            // Persist bloom cache (extract bytes to avoid borrow conflict).
-            let bloom_bytes = pk_index.bloom_to_bytes();
-            let data = super::primary_key::serialize_pk_bloom(&seg_ids, &bloom_bytes);
-            if let Err(e) = self
-                .writer
-                .directory
-                .write(
-                    std::path::Path::new(super::primary_key::PK_BLOOM_FILE),
-                    &data,
-                )
-                .await
-            {
-                log::warn!("[primary_key] failed to persist bloom cache: {}", e);
+                // Persist bloom cache (extract bytes to avoid borrow conflict).
+                let bloom_bytes = pk_index.bloom_to_bytes();
+                let data = super::primary_key::serialize_pk_bloom(&seg_ids, &bloom_bytes);
+                if let Err(e) = self
+                    .writer
+                    .directory
+                    .write(
+                        std::path::Path::new(super::primary_key::PK_BLOOM_FILE),
+                        &data,
+                    )
+                    .await
+                {
+                    log::warn!("[primary_key] failed to persist bloom cache: {}", e);
+                }
             }
-        }
 
-        self.writer.segment_manager.maybe_merge().await;
+            self.writer.segment_manager.maybe_merge().await;
+            Ok(())
+        }
+        .await;
+
+        // Worker availability must not depend on optional post-publication
+        // cache refresh or merge scheduling.
+        self.is_resolved = true;
         self.writer.resume_workers();
-        Ok(true)
+        post_publish_result.map(|()| true)
     }
 
     /// Abort: discard prepared segments, resume workers.
@@ -940,10 +1015,14 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
 impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
     fn drop(&mut self) {
         if !self.is_resolved {
-            log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
-            self.writer.flushed_segments.clear();
-            if let Some(ref mut pk_index) = self.writer.primary_key_index {
-                pk_index.clear_uncommitted();
+            if self.is_published {
+                log::warn!("PreparedCommit dropped after metadata publication — resuming workers");
+            } else {
+                log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
+                self.writer.flushed_segments.clear();
+                if let Some(ref mut pk_index) = self.writer.primary_key_index {
+                    pk_index.clear_uncommitted();
+                }
             }
             self.writer.resume_workers();
         }

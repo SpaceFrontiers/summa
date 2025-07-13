@@ -199,14 +199,13 @@ async fn scan_and_optimize(
             Arc::clone(w.segment_manager())
         };
 
-        // Sweep orphan segment files (outputs of failed/panicked merges and
-        // reorders — observed leaking 1.7 TB overnight). In-flight outputs
-        // are protected by the merge inventory. Runs for every index, not
-        // just reorder-enabled ones: merges can fail anywhere.
+        // Sweep segment files with no lifecycle owner (metadata, active
+        // indexing/merge/reorder operation, or deferred reader deletion).
+        // Runs for every index: every producer can be cancelled or fail.
         match segment_manager.cleanup_orphan_segments().await {
             Ok(0) => {}
             Ok(n) => warn!(
-                "[optimizer] swept {} orphan segment(s) in '{}' (failed merge/reorder outputs)",
+                "[optimizer] swept {} unowned orphan segment(s) in '{}'",
                 n, name
             ),
             Err(e) => debug!("[optimizer] orphan sweep failed for '{}': {}", name, e),
