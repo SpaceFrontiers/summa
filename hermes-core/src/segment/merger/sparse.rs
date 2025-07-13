@@ -71,7 +71,7 @@ impl SegmentMerger {
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
         // Skip entries written to a temp file to avoid unbounded memory usage.
         // For large indexes (200M+ docs) the skip section can exceed 3 GB.
-        let skip_tmp = files.sparse.with_extension("skip.tmp");
+        let skip_tmp = files.sparse_skip_temp();
         let mut skip_writer = dir.streaming_writer_cold(&skip_tmp).await?;
         let mut skip_count: u32 = 0;
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);

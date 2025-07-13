@@ -730,7 +730,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.maybe_merge().await;
     }
 
-    /// Abort all in-flight merge tasks without waiting for completion.
+    /// Cancel all in-flight merge tasks and wait for lifecycle cleanup.
     pub async fn abort_merges(&self) {
         self.segment_manager.abort_merges().await;
     }

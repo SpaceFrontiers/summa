@@ -356,23 +356,13 @@ pub async fn delete_segment<D: Directory + DirectoryWriter>(
     segment_id: SegmentId,
 ) -> Result<()> {
     let files = SegmentFiles::new(segment_id.0);
-    let results = tokio::join!(
-        dir.delete(&files.term_dict),
-        dir.delete(&files.postings),
-        dir.delete(&files.store),
-        dir.delete(&files.meta),
-        dir.delete(&files.vectors),
-        dir.delete(&files.sparse),
-        dir.delete(&files.positions),
-        dir.delete(&files.fast),
-    );
+    let paths = files.lifecycle_paths();
+    let results = futures::future::join_all(paths.iter().map(|path| dir.delete(path))).await;
 
     // Missing files are expected for optional components and idempotent
     // retries. Any other failure must be surfaced so cleanup is not falsely
     // reported as successful; a later orphan sweep can retry remaining files.
-    for result in [
-        results.0, results.1, results.2, results.3, results.4, results.5, results.6, results.7,
-    ] {
+    for result in results {
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::NotFound
         {
