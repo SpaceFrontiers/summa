@@ -715,6 +715,14 @@ fn train(args: TrainArgs) -> Result<()> {
                     if micro_step == args.grad_accum {
                         let lr = learning_rate(&args, step + 1, total_steps);
                         let muon_lr = lr * MUON_LR_SCALE;
+                        let loss = loss_sum
+                            .take()
+                            .expect("an optimizer step must contain a loss")
+                            .div_scalar(args.grad_accum as f32);
+                        let loss = scalar_value(loss)?;
+                        if !loss.is_finite() {
+                            bail!("non-finite loss at optimizer step {}: {loss}", step + 1);
+                        }
                         let mut muon_grads = muon_accumulator.grads();
                         let mut adamw_grads = adamw_accumulator.grads();
                         let grad_norm = gradient_norm_and_clip(
@@ -723,19 +731,17 @@ fn train(args: TrainArgs) -> Result<()> {
                             &mut adamw_grads,
                             args.grad_clip,
                         )?;
+                        if !grad_norm.is_finite() {
+                            bail!(
+                                "non-finite gradient norm at optimizer step {}: {grad_norm}",
+                                step + 1
+                            );
+                        }
                         let current = model.take().unwrap();
                         let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
                         model = Some(adamw_optimizer.step(lr.into(), current, adamw_grads));
                         step += 1;
                         training_state.step = step;
-                        let loss = loss_sum
-                            .take()
-                            .expect("an optimizer step must contain a loss")
-                            .div_scalar(args.grad_accum as f32);
-                        let loss = scalar_value(loss)?;
-                        if !loss.is_finite() {
-                            bail!("non-finite loss at optimizer step {step}: {loss}");
-                        }
                         let step_seconds = optimizer_step_started.elapsed().as_secs_f64();
                         let step_tokens = args.batch_size * args.grad_accum * args.seq_len;
                         let tokens_per_second = step_tokens as f64 / step_seconds;
