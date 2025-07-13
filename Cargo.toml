@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.8.60"
+version = "1.8.61"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -44,7 +44,7 @@ cubecl-zspace = { git = "https://github.com/ppodolsky/cubecl.git", rev = "42d193
 
 [workspace.dependencies]
 # Internal crates
-hermes-core = { version = "1.8.60", path = "hermes-core", default-features = false }
+hermes-core = { version = "1.8.61", path = "hermes-core", default-features = false }
 hermes-mal = { version = "1.8.57", path = "hermes-mal" }
 hermes-llm = { version = "1.8.57", path = "hermes-llm", default-features = false }
 
