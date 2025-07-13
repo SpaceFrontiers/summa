@@ -825,9 +825,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.1"
+version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
+checksum = "dd059f9da4f5c36b3787f65d38ccaab1cc315f07b01f89abc8359ee6a8205011"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -835,9 +835,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.0"
+version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
+checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2402,9 +2402,9 @@ checksum = "7f22fb22f065b308be0d8724e3706c7fa3fc2a6c7d6899df4cad7860e7a75436"
 
 [[package]]
 name = "globset"
-version = "0.4.18"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
 dependencies = [
  "aho-corasick",
  "bstr",
@@ -2567,7 +2567,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "anyhow",
  "burn-autodiff",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "anyhow",
  "pest",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-py"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -2662,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "anyhow",
  "clap",
@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "anyhow",
  "burn-autodiff",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.61"
+version = "1.8.62"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
