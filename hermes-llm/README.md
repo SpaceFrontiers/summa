@@ -1,8 +1,7 @@
 # hermes-llm
 
-Burn-based inference for Hermes Transformer, Mamba, and hybrid models. Model
-architectures are defined with the shared MAL parser; Burn Autodiff training
-lives in the `hermes-train` crate.
+Inference for Hermes Transformer, Mamba, and hybrid models. Model architectures
+are defined with the shared MAL parser; training lives in `hermes-train`.
 
 ## Backends
 
@@ -10,18 +9,17 @@ lives in the `hermes-train` crate.
 # CPU (default when no GPU feature is selected)
 cargo build --release -p hermes-llm
 
-# Apple Metal through Burn/WGPU
+# Apple Metal
 cargo build --release -p hermes-llm --features metal
 
 # NVIDIA CUDA
 cargo build --release -p hermes-llm --features cuda
 ```
 
-Burn supplies embeddings, linear layers, normalization, attention, and its
-optimized CubeCL kernels. Hermes adds fused CubeCL operators for Mamba's
-selective scan and depthwise convolution; Burn has no selective scan, while its
-generic grouped-convolution gradient launches once per channel. GPU tensors stay
-in the Burn/CubeCL runtime throughout inference and training.
+The runtime supplies embeddings, linear layers, normalization, RoPE, and
+optimized CubeCL kernels. Hermes adds CubeCL training kernels for Mamba's
+selective scan, depthwise convolution, and attention backward. GPU tensors stay
+resident throughout inference and training.
 
 ## Generate text
 
@@ -55,20 +53,20 @@ hybrid Transformer/Mamba presets.
 ## Library usage
 
 ```rust,no_run
-use hermes_llm::{Backend, TextGenerator, Transformer, default_device, load_safetensors};
+use hermes_llm::{TextGenerator, Transformer, default_device, load_safetensors};
 
 # fn main() -> anyhow::Result<()> {
 let config = hermes_llm::ModelDef::from_json("config.json")?;
 let device = default_device();
-let mut model = Transformer::<Backend>::new(&config, &device)?;
+let mut model = Transformer::new(&config, &device)?;
 load_safetensors(&mut model, "weights.safetensors")?;
 let generator = TextGenerator::new(&model, &device);
 # Ok(())
 # }
 ```
 
-The safetensors loader is strict and consumes the Burn-native checkpoint written
-by `hermes-train`.
+The safetensors loader is strict and consumes the checkpoint written by
+`hermes-train` without conversion.
 
 ## Architecture support
 

@@ -1,15 +1,13 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use burn::module::{Module, ModuleMapper, Param, ParamId};
-use burn::record::Record;
 #[cfg(feature = "cuda")]
 use burn::tensor::FloatDType;
-use burn::tensor::Tensor;
+use burn::tensor::{Device, Tensor, TensorData};
 use burn_optim::GradientsParams;
-use hermes_llm::Backend;
-
-use crate::TrainBackend;
+use burn_pack::{Reader, Tensor as PackedTensor, Writer};
 
 const MOMENTUM: f64 = 0.95;
 const NS_COEFFICIENTS: (f64, f64, f64) = (3.4445, -4.775, 2.0315);
@@ -25,12 +23,7 @@ const EPSILON: f64 = 1e-7;
 /// compute dtype, while parameters and momentum remain FP32.
 pub struct BatchedMuon {
     parameter_ids: Vec<ParamId>,
-    velocities: BTreeMap<[usize; 2], Tensor<Backend, 3>>,
-}
-
-#[derive(Record)]
-pub struct BatchedMuonRecord<B: burn::tensor::backend::Backend> {
-    velocities: Vec<Tensor<B, 3>>,
+    velocities: BTreeMap<[usize; 2], Tensor<3>>,
 }
 
 impl BatchedMuon {
@@ -41,15 +34,48 @@ impl BatchedMuon {
         }
     }
 
-    pub fn to_record(&self) -> BatchedMuonRecord<Backend> {
-        BatchedMuonRecord {
-            velocities: self.velocities.values().cloned().collect(),
-        }
+    pub fn set_parameter_ids(&mut self, parameter_ids: Vec<ParamId>) {
+        self.parameter_ids = parameter_ids;
     }
 
-    pub fn load_record(&mut self, record: BatchedMuonRecord<Backend>) -> Result<()> {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let tensors = self
+            .velocities
+            .iter()
+            .map(|([rows, columns], velocity)| {
+                let data = velocity.clone().into_data();
+                PackedTensor::new(
+                    format!("{rows}x{columns}"),
+                    data.dtype,
+                    data.shape,
+                    None,
+                    data.bytes,
+                )
+            })
+            .collect();
+        Writer::new(tensors)
+            .write_to_file(path)
+            .context("failed to write Muon state")?;
+        Ok(())
+    }
+
+    pub fn load(&mut self, path: impl AsRef<Path>, device: &Device) -> Result<()> {
         self.velocities.clear();
-        for velocity in record.velocities {
+        for tensor in Reader::from_file(path)
+            .context("failed to open Muon state")?
+            .into_tensors()
+            .context("failed to read Muon state")?
+        {
+            ensure!(
+                tensor.shape.rank() == 3,
+                "Muon velocity {} has rank {}, expected 3",
+                tensor.name,
+                tensor.shape.rank()
+            );
+            let velocity = Tensor::<3>::from_data(
+                TensorData::from_bytes(tensor.bytes, tensor.shape, tensor.dtype),
+                device,
+            );
             let [_, rows, columns] = velocity.dims();
             ensure!(
                 self.velocities.insert([rows, columns], velocity).is_none(),
@@ -59,16 +85,11 @@ impl BatchedMuon {
         Ok(())
     }
 
-    pub fn step<M: Module<TrainBackend>>(
-        &mut self,
-        lr: f64,
-        model: M,
-        mut grads: GradientsParams,
-    ) -> Result<M> {
-        let mut batches = BTreeMap::<[usize; 2], Vec<(ParamId, Tensor<Backend, 2>)>>::new();
+    pub fn step<M: Module>(&mut self, lr: f64, model: M, mut grads: GradientsParams) -> Result<M> {
+        let mut batches = BTreeMap::<[usize; 2], Vec<(ParamId, Tensor<2>)>>::new();
         for id in &self.parameter_ids {
             let grad = grads
-                .remove::<Backend, 2>(*id)
+                .remove::<2>(*id)
                 .with_context(|| format!("Muon gradient is missing for parameter {id}"))?;
             batches.entry(grad.dims()).or_default().push((*id, grad));
         }
@@ -97,7 +118,7 @@ impl BatchedMuon {
                     .clone()
                     .slice([index..index + 1, 0..shape[0], 0..shape[1]])
                     .reshape(shape);
-                updates.register::<Backend, 2>(id, delta);
+                updates.register::<2>(id, delta);
             }
             self.velocities.insert(shape, velocity);
         }
@@ -119,7 +140,7 @@ impl BatchedMuon {
     }
 }
 
-fn zeropower_via_newton_schulz(gradient: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
+fn zeropower_via_newton_schulz(gradient: Tensor<3>) -> Tensor<3> {
     let [_, rows, columns] = gradient.dims();
     let (mut x, transpose) = if rows > columns {
         (gradient.swap_dims(1, 2), true)
@@ -148,22 +169,22 @@ fn zeropower_via_newton_schulz(gradient: Tensor<Backend, 3>) -> Tensor<Backend, 
 }
 
 #[cfg(feature = "cuda")]
-fn to_compute_dtype(tensor: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
+fn to_compute_dtype(tensor: Tensor<3>) -> Tensor<3> {
     tensor.cast(FloatDType::BF16)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn to_compute_dtype(tensor: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
+fn to_compute_dtype(tensor: Tensor<3>) -> Tensor<3> {
     tensor
 }
 
 #[cfg(feature = "cuda")]
-fn from_compute_dtype(tensor: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
-    tensor.cast(FloatDType::F32)
+fn from_compute_dtype(tensor: Tensor<3>) -> Tensor<3> {
+    tensor.cast(FloatDType::Flex32)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn from_compute_dtype(tensor: Tensor<Backend, 3>) -> Tensor<Backend, 3> {
+fn from_compute_dtype(tensor: Tensor<3>) -> Tensor<3> {
     tensor
 }
 
@@ -171,13 +192,10 @@ struct MuonUpdateMapper<'a> {
     updates: &'a mut GradientsParams,
 }
 
-impl ModuleMapper<TrainBackend> for MuonUpdateMapper<'_> {
-    fn map_float<const D: usize>(
-        &mut self,
-        param: Param<Tensor<TrainBackend, D>>,
-    ) -> Param<Tensor<TrainBackend, D>> {
+impl ModuleMapper for MuonUpdateMapper<'_> {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
         let (id, tensor, mapper) = param.consume();
-        let tensor = match self.updates.remove::<Backend, D>(id) {
+        let tensor = match self.updates.remove::<D>(id) {
             Some(delta) => {
                 let requires_grad = tensor.is_require_grad();
                 let mut updated = Tensor::from_inner(tensor.inner() - delta);
@@ -194,39 +212,40 @@ impl ModuleMapper<TrainBackend> for MuonUpdateMapper<'_> {
 
 #[cfg(all(test, not(feature = "cuda")))]
 mod tests {
-    use burn::tensor::{TensorData, backend::Backend as _};
-    use burn_optim::{MuonConfig, Optimizer};
+    use burn::tensor::TensorData;
+    use burn_optim::MuonConfig;
 
     use super::*;
 
     #[derive(Module, Debug)]
-    struct MatrixPair<B: burn::tensor::backend::Backend> {
-        first: Param<Tensor<B, 2>>,
-        second: Param<Tensor<B, 2>>,
+    struct MatrixPair {
+        first: Param<Tensor<2>>,
+        second: Param<Tensor<2>>,
     }
 
-    impl<B: burn::tensor::backend::Backend> MatrixPair<B> {
-        fn loss(&self, input: Tensor<B, 2>) -> Tensor<B, 1> {
+    impl MatrixPair {
+        fn loss(&self, input: Tensor<2>) -> Tensor<1> {
             (input.clone().matmul(self.first.val()).square()
                 + input.matmul(self.second.val()).square())
             .sum()
         }
     }
 
-    fn values(model: &MatrixPair<TrainBackend>) -> Vec<f32> {
+    fn values(model: &MatrixPair) -> Vec<f32> {
         [model.first.val(), model.second.val()]
             .into_iter()
-            .flat_map(|tensor| tensor.inner().into_data().to_vec::<f32>().unwrap())
+            .flat_map(|tensor| tensor.into_data().to_vec::<f32>().unwrap())
             .collect()
     }
 
     #[test]
     fn batched_muon_matches_burn_for_repeated_shapes() {
         let device = hermes_llm::default_device();
-        Backend::seed(&device, 17);
+        device.seed(17);
+        let device = device.autodiff();
         let matrix = |scale: f32| {
             Param::from_tensor(
-                Tensor::<TrainBackend, 2>::from_data(
+                Tensor::<2>::from_data(
                     TensorData::new(
                         (0..24)
                             .map(|i| (i as f32 * scale).sin())
@@ -245,7 +264,7 @@ mod tests {
         let mut expected = actual.clone();
         let ids = vec![actual.first.id, actual.second.id];
         let input = || {
-            Tensor::<TrainBackend, 2>::from_data(
+            Tensor::<2>::from_data(
                 TensorData::new((0..12).map(|i| i as f32 * 0.03).collect(), [3, 4]),
                 &device,
             )
@@ -258,7 +277,7 @@ mod tests {
             let reference_grads =
                 GradientsParams::from_grads(expected.loss(input()).backward(), &expected);
             actual = batched.step(2e-2, actual, grads).unwrap();
-            expected = burn.step(2e-2, expected, reference_grads);
+            expected = burn.step(2e-2.into(), expected, reference_grads);
         }
 
         let max_diff = values(&actual)

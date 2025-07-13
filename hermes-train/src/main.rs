@@ -1,19 +1,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
-use burn::module::{AutodiffModule, Module, ModuleVisitor, Param, ParamId};
-use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::Backend as _;
+use burn::module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::tensor::{Device, Int, Tensor, TensorData};
-use burn_autodiff::Autodiff;
-use burn_optim::adaptor::OptimizerAdaptor;
-use burn_optim::record::AdaptorRecord;
-use burn_optim::{AdamW, AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
+use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer};
 use clap::{Parser, Subcommand, ValueEnum};
-use hashbrown::HashMap;
-use hermes_llm::{Backend, ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors};
+use hermes_llm::{ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -23,15 +18,13 @@ mod muon;
 
 use muon::BatchedMuon;
 
-type TrainBackend = Autodiff<Backend>;
-type AdamWOptimizer = OptimizerAdaptor<AdamW, Transformer<TrainBackend>, TrainBackend>;
-type AdamWRecord = HashMap<ParamId, AdaptorRecord<AdamW, TrainBackend>>;
+type AdamWOptimizer = ModuleOptimizer;
 
 const MUON_LR_SCALE: f64 = 20.0;
 const TOKENIZE_BATCH: usize = 1_000;
 
 #[derive(Parser)]
-#[command(name = "hermes-train", about = "Burn-native Hermes model training")]
+#[command(name = "hermes-train", about = "Hermes model training")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -85,10 +78,10 @@ struct TrainArgs {
     schedule: Schedule,
     #[arg(long)]
     max_steps: Option<usize>,
-    /// Atomically replace weights.safetensors every N optimizer steps; 0 disables it.
+    /// Save a resumable checkpoint every N optimizer steps; 0 disables it.
     #[arg(long, default_value_t = 100)]
     checkpoint_every: usize,
-    /// Burn-native checkpoint to fine-tune from.
+    /// Safetensors checkpoint to fine-tune from.
     #[arg(long, conflicts_with = "resume")]
     checkpoint: Option<PathBuf>,
     /// Resume weights, optimizer state, schedule, and corpus position from --output.
@@ -104,7 +97,7 @@ struct TrainingState {
     stage: usize,
     epoch: usize,
     samples_in_stage: usize,
-    parameter_ids: Vec<String>,
+    parameter_ids: Vec<u64>,
 }
 
 fn load_config(path: &Path) -> Result<ModelDef> {
@@ -334,8 +327,8 @@ fn count_samples(path: &Path, tokenizer: &Tokenizer, seq_len: usize) -> Result<u
 fn make_batch(
     samples: &[Vec<i64>],
     seq_len: usize,
-    device: &Device<TrainBackend>,
-) -> (Tensor<TrainBackend, 2, Int>, Tensor<TrainBackend, 2, Int>) {
+    device: &Device,
+) -> (Tensor<2, Int>, Tensor<2, Int>) {
     let mut inputs = Vec::with_capacity(samples.len() * seq_len);
     let mut targets = Vec::with_capacity(samples.len() * seq_len);
     for sample in samples {
@@ -350,12 +343,12 @@ fn make_batch(
 
 struct SquaredGradientNorm<'a> {
     grads: &'a GradientsParams,
-    sum: Option<Tensor<Backend, 1>>,
+    sum: Option<Tensor<1>>,
 }
 
-impl ModuleVisitor<TrainBackend> for SquaredGradientNorm<'_> {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TrainBackend, D>>) {
-        let Some(grad) = self.grads.get::<Backend, D>(param.id) else {
+impl ModuleVisitor for SquaredGradientNorm<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        let Some(grad) = self.grads.get::<D>(param.id) else {
             return;
         };
         let squared = grad.square().sum();
@@ -366,10 +359,7 @@ impl ModuleVisitor<TrainBackend> for SquaredGradientNorm<'_> {
     }
 }
 
-fn squared_gradient_norm(
-    model: &Transformer<TrainBackend>,
-    grads: &GradientsParams,
-) -> Option<Tensor<Backend, 1>> {
+fn squared_gradient_norm(model: &Transformer, grads: &GradientsParams) -> Option<Tensor<1>> {
     let mut visitor = SquaredGradientNorm { grads, sum: None };
     model.visit(&mut visitor);
     visitor.sum
@@ -380,22 +370,22 @@ struct GradientScaler<'a> {
     scale: f32,
 }
 
-impl ModuleVisitor<TrainBackend> for GradientScaler<'_> {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TrainBackend, D>>) {
-        let Some(grad) = self.grads.remove::<Backend, D>(param.id) else {
+impl ModuleVisitor for GradientScaler<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        let Some(grad) = self.grads.remove::<D>(param.id) else {
             return;
         };
         self.grads
-            .register::<Backend, D>(param.id, grad.mul_scalar(self.scale));
+            .register::<D>(param.id, grad.mul_scalar(self.scale));
     }
 }
 
-fn scale_gradients(model: &Transformer<TrainBackend>, grads: &mut GradientsParams, scale: f32) {
+fn scale_gradients(model: &Transformer, grads: &mut GradientsParams, scale: f32) {
     model.visit(&mut GradientScaler { grads, scale });
 }
 
 fn gradient_norm_and_clip(
-    model: &Transformer<TrainBackend>,
+    model: &Transformer,
     muon_grads: &mut GradientsParams,
     adamw_grads: &mut GradientsParams,
     max_norm: f32,
@@ -408,13 +398,17 @@ fn gradient_norm_and_clip(
         (Some(sum), None) | (None, Some(sum)) => sum,
         (None, None) => return Ok(0.0),
     };
-    let norm = sum.sqrt().into_data().to_vec::<f32>()?[0];
+    let norm = scalar_value(sum.sqrt())?;
     if max_norm > 0.0 && norm > max_norm {
         let scale = max_norm / norm;
         scale_gradients(model, muon_grads, scale);
         scale_gradients(model, adamw_grads, scale);
     }
     Ok(norm)
+}
+
+fn scalar_value(tensor: Tensor<1>) -> Result<f32> {
+    Ok(tensor.into_data().convert::<f32>().to_vec::<f32>()?[0])
 }
 
 fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
@@ -434,92 +428,94 @@ fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
     min_lr + cosine * (args.lr - min_lr)
 }
 
-fn save_weights<B: hermes_llm::MambaBackend>(model: &Transformer<B>, output: &Path) -> Result<()> {
-    let temporary = output.join("weights.safetensors.tmp");
-    save_safetensors(model, &temporary)?;
-    fs::rename(temporary, output.join("weights.safetensors"))?;
-    Ok(())
-}
-
-fn parameter_ids(model: &Transformer<TrainBackend>) -> Vec<String> {
+fn parameter_ids(model: &Transformer) -> Vec<u64> {
     burn::module::list_param_ids(model)
         .into_iter()
-        .map(ParamId::serialize)
+        .map(|id| id.val())
         .collect()
 }
 
+struct ParameterIdMapper<'a> {
+    ids: std::slice::Iter<'a, u64>,
+}
+
+impl ModuleMapper for ParameterIdMapper<'_> {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
+        let (_, tensor, mapper) = param.consume();
+        let id = self
+            .ids
+            .next()
+            .copied()
+            .expect("checkpoint contains too few parameter IDs");
+        Param::from_mapped_value(ParamId::from(id), tensor, mapper)
+    }
+}
+
+fn restore_parameter_ids(model: &mut Transformer, ids: &[u64]) -> Result<()> {
+    ensure!(
+        ids.len() == burn::module::list_param_ids(model).len(),
+        "checkpoint has {} parameter IDs, model has {}",
+        ids.len(),
+        burn::module::list_param_ids(model).len()
+    );
+    let mut mapper = ParameterIdMapper { ids: ids.iter() };
+    *model = model.clone().map(&mut mapper);
+    ensure!(
+        mapper.ids.next().is_none(),
+        "checkpoint contains too many parameter IDs"
+    );
+    Ok(())
+}
+
 fn save_training_checkpoint(
-    model: &Transformer<TrainBackend>,
+    model: &Transformer,
     adamw: &AdamWOptimizer,
     muon: &BatchedMuon,
     state: &TrainingState,
     output: &Path,
 ) -> Result<()> {
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let adamw_temporary = output.join("adamw-state-tmp");
-    let muon_temporary = output.join("muon-state-tmp");
+    let marker = output.join(".checkpoint-in-progress");
+    let weights_temporary = output.join("weights.safetensors.tmp");
+    let adamw_temporary = output.join("adamw-state.bpk.tmp");
+    let muon_temporary = output.join("muon-state.bpk.tmp");
     let state_temporary = output.join("training-state.json.tmp");
 
-    save_weights(&model.clone().valid(), output)?;
-    Recorder::<TrainBackend>::record(&recorder, adamw.to_record(), adamw_temporary.clone())
+    fs::write(&marker, state.step.to_string())?;
+    save_safetensors(&model.clone().valid(), &weights_temporary)?;
+    adamw
+        .save(&adamw_temporary)
         .context("failed to save AdamW state")?;
-    Recorder::<Backend>::record(&recorder, muon.to_record(), muon_temporary.clone())
-        .context("failed to save Muon state")?;
+    muon.save(&muon_temporary)?;
     fs::write(&state_temporary, serde_json::to_vec_pretty(&state)?)?;
-    fs::rename(
-        adamw_temporary.with_extension("bin"),
-        output.join("adamw-state.bin"),
-    )?;
-    fs::rename(
-        muon_temporary.with_extension("bin"),
-        output.join("muon-state.bin"),
-    )?;
+    fs::rename(weights_temporary, output.join("weights.safetensors"))?;
+    fs::rename(adamw_temporary, output.join("adamw-state.bpk"))?;
+    fs::rename(muon_temporary, output.join("muon-state.bpk"))?;
     fs::rename(state_temporary, output.join("training-state.json"))?;
+    fs::remove_file(marker)?;
     Ok(())
 }
 
 fn load_training_state(
-    model: &mut Transformer<TrainBackend>,
+    model: &mut Transformer,
     adamw: AdamWOptimizer,
     muon: &mut BatchedMuon,
     output: &Path,
-    device: &Device<TrainBackend>,
+    device: &Device,
 ) -> Result<(AdamWOptimizer, TrainingState)> {
-    load_safetensors(model, output.join("weights.safetensors"))?;
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let mut state: TrainingState =
+    ensure!(
+        !output.join(".checkpoint-in-progress").exists(),
+        "checkpoint was interrupted while being saved"
+    );
+    let state: TrainingState =
         serde_json::from_slice(&fs::read(output.join("training-state.json"))?)?;
-    let current_parameter_ids = burn::module::list_param_ids(model);
-    ensure!(
-        state.parameter_ids.len() == current_parameter_ids.len(),
-        "checkpoint has {} parameter IDs, model has {}",
-        state.parameter_ids.len(),
-        current_parameter_ids.len()
-    );
-    let mut adamw_record: AdamWRecord =
-        Recorder::<TrainBackend>::load(&recorder, output.join("adamw-state"), device)
-            .context("failed to load AdamW state")?;
-    let mut remapped_record = AdamWRecord::with_capacity(adamw_record.len());
-    for (old, new) in state.parameter_ids.iter().zip(&current_parameter_ids) {
-        let old = ParamId::try_deserialize(old)
-            .with_context(|| format!("invalid parameter ID in checkpoint: {old}"))?;
-        if let Some(record) = adamw_record.remove(&old) {
-            remapped_record.insert(*new, record);
-        }
-    }
-    ensure!(
-        adamw_record.is_empty(),
-        "{} AdamW states do not match model parameters",
-        adamw_record.len()
-    );
-    let muon_record = Recorder::<Backend>::load(&recorder, output.join("muon-state"), device)
-        .context("failed to load Muon state")?;
-    muon.load_record(muon_record)?;
-    state.parameter_ids = current_parameter_ids
-        .into_iter()
-        .map(ParamId::serialize)
-        .collect();
-    Ok((adamw.load_record(remapped_record), state))
+    restore_parameter_ids(model, &state.parameter_ids)?;
+    load_safetensors(model, output.join("weights.safetensors"))?;
+    muon.set_parameter_ids(model.muon_parameter_ids());
+    muon.load(output.join("muon-state.bpk"), &device.clone().inner())?;
+    let adamw = adamw
+        .load(output.join("adamw-state.bpk"))
+        .context("failed to load AdamW state")?;
+    Ok((adamw, state))
 }
 
 fn train(args: TrainArgs) -> Result<()> {
@@ -574,9 +570,9 @@ fn train(args: TrainArgs) -> Result<()> {
         .open(args.output.join("metrics.jsonl"))?;
     let mut metrics = BufWriter::new(metrics_file);
 
-    let device = hermes_llm::default_device();
-    Backend::seed(&device, args.seed);
-    let mut initial_model = Transformer::<TrainBackend>::new(&config, &device)?;
+    let device = hermes_llm::default_device().autodiff();
+    device.seed(args.seed);
+    let mut initial_model = Transformer::new(&config, &device)?;
     if let Some(path) = &args.checkpoint {
         load_safetensors(&mut initial_model, path)?;
     }
@@ -622,7 +618,8 @@ fn train(args: TrainArgs) -> Result<()> {
     let mut model = Some(initial_model);
     let mut step = resume_state.as_ref().map_or(0, |state| state.step);
     let mut micro_step = 0;
-    let mut loss_sum = 0.0f32;
+    let mut loss_sum: Option<Tensor<1>> = None;
+    let mut optimizer_step_started = Instant::now();
     let mut training_state = resume_state.clone().unwrap_or(TrainingState {
         step: 0,
         stage: 0,
@@ -697,14 +694,15 @@ fn train(args: TrainArgs) -> Result<()> {
                     let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
                     batch.clear();
                     let current = model.as_ref().unwrap();
-                    let loss = current.forward_loss(inputs, targets);
-                    let loss_value = loss.clone().into_data().to_vec::<f32>()?[0];
-                    if !loss_value.is_finite() {
-                        bail!(
-                            "non-finite loss before optimizer step {}: {loss_value}",
-                            step + 1
-                        );
+                    if micro_step == 0 {
+                        optimizer_step_started = Instant::now();
                     }
+                    let loss = current.forward_loss(inputs, targets);
+                    let detached_loss = loss.clone().detach();
+                    loss_sum = Some(match loss_sum.take() {
+                        Some(sum) => sum + detached_loss,
+                        None => detached_loss,
+                    });
                     let mut grads = loss.div_scalar(args.grad_accum as f64).backward();
                     let muon_grads =
                         GradientsParams::from_params(&mut grads, current, &muon_parameter_ids);
@@ -712,7 +710,6 @@ fn train(args: TrainArgs) -> Result<()> {
                     muon_accumulator.accumulate(current, muon_grads);
                     adamw_accumulator.accumulate(current, adamw_grads);
                     micro_step += 1;
-                    loss_sum += loss_value;
 
                     if micro_step == args.grad_accum {
                         let lr = learning_rate(&args, step + 1, total_steps);
@@ -727,12 +724,22 @@ fn train(args: TrainArgs) -> Result<()> {
                         )?;
                         let current = model.take().unwrap();
                         let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
-                        model = Some(adamw_optimizer.step(lr, current, adamw_grads));
+                        model = Some(adamw_optimizer.step(lr.into(), current, adamw_grads));
                         step += 1;
                         training_state.step = step;
-                        let loss = loss_sum / args.grad_accum as f32;
+                        let loss = loss_sum
+                            .take()
+                            .expect("an optimizer step must contain a loss")
+                            .div_scalar(args.grad_accum as f32);
+                        let loss = scalar_value(loss)?;
+                        if !loss.is_finite() {
+                            bail!("non-finite loss at optimizer step {step}: {loss}");
+                        }
+                        let step_seconds = optimizer_step_started.elapsed().as_secs_f64();
+                        let step_tokens = args.batch_size * args.grad_accum * args.seq_len;
+                        let tokens_per_second = step_tokens as f64 / step_seconds;
                         println!(
-                            "stage={}/{} epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3}",
+                            "stage={}/{} epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3} tokens_per_second={tokens_per_second:.0}",
                             stage + 1,
                             args.data.len(),
                             epoch + 1,
@@ -748,6 +755,8 @@ fn train(args: TrainArgs) -> Result<()> {
                                 "lr": lr,
                                 "muon_lr": muon_lr,
                                 "grad_norm": grad_norm,
+                                "step_seconds": step_seconds,
+                                "tokens_per_second": tokens_per_second,
                                 "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
                             }),
                         )?;
@@ -764,7 +773,6 @@ fn train(args: TrainArgs) -> Result<()> {
                             println!("checkpointed {}", args.output.display());
                         }
                         micro_step = 0;
-                        loss_sum = 0.0;
                     }
                     Ok(step < total_steps)
                 },
@@ -777,7 +785,7 @@ fn train(args: TrainArgs) -> Result<()> {
                 muon_accumulator = GradientsAccumulator::new();
                 adamw_accumulator = GradientsAccumulator::new();
                 micro_step = 0;
-                loss_sum = 0.0;
+                loss_sum = None;
             }
         }
     }
@@ -830,11 +838,11 @@ mod tests {
     }
 
     #[test]
-    fn burn_training_decreases_loss_and_checkpoint_roundtrips() {
+    fn training_decreases_loss_and_checkpoint_roundtrips() {
         let config = small_hybrid();
-        let device = hermes_llm::default_device();
-        Backend::seed(&device, 41);
-        let mut model = Transformer::<TrainBackend>::new(&config, &device).unwrap();
+        let device = hermes_llm::default_device().autodiff();
+        device.seed(41);
+        let mut model = Transformer::new(&config, &device).unwrap();
         let muon_parameter_ids = model.muon_parameter_ids();
         assert!(!muon_parameter_ids.is_empty());
         assert!(muon_parameter_ids.len() < burn::module::list_param_ids(&model).len());
@@ -848,14 +856,8 @@ mod tests {
         let targets = vec![7_i64, 3, 9, 2, 5, 4, 6, 8, 3, 1];
         let batch = || {
             (
-                Tensor::<TrainBackend, 2, Int>::from_data(
-                    TensorData::new(inputs.clone(), [2, 5]),
-                    &device,
-                ),
-                Tensor::<TrainBackend, 2, Int>::from_data(
-                    TensorData::new(targets.clone(), [2, 5]),
-                    &device,
-                ),
+                Tensor::<2, Int>::from_data(TensorData::new(inputs.clone(), [2, 5]), &device),
+                Tensor::<2, Int>::from_data(TensorData::new(targets.clone(), [2, 5]), &device),
             )
         };
 
@@ -863,7 +865,7 @@ mod tests {
         for _ in 0..20 {
             let (input, target) = batch();
             let loss = model.forward_loss(input, target);
-            losses.push(loss.clone().into_data().to_vec::<f32>().unwrap()[0]);
+            losses.push(scalar_value(loss.clone()).unwrap());
             let mut grads = loss.backward();
             let mut muon_grads =
                 GradientsParams::from_params(&mut grads, &model, &muon_parameter_ids);
@@ -872,7 +874,7 @@ mod tests {
                 gradient_norm_and_clip(&model, &mut muon_grads, &mut adamw_grads, 1.0).unwrap();
             assert!(norm.is_finite());
             model = muon_optimizer.step(2e-2, model, muon_grads).unwrap();
-            model = adamw_optimizer.step(1e-3, model, adamw_grads);
+            model = adamw_optimizer.step(1e-3.into(), model, adamw_grads);
         }
         assert!(
             losses.last().unwrap() < &losses[0],
@@ -896,7 +898,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut resumed = Transformer::<TrainBackend>::new(&config, &device).unwrap();
+        let mut resumed = Transformer::new(&config, &device).unwrap();
         let resumed_ids = resumed.muon_parameter_ids();
         let mut resumed_muon = BatchedMuon::new(resumed_ids);
         let resumed_adamw = AdamWConfig::new()
@@ -917,30 +919,29 @@ mod tests {
         assert_eq!(resumed_state.epoch, state.epoch);
         assert_eq!(resumed_state.samples_in_stage, state.samples_in_stage);
 
-        let advance = |mut model: Transformer<TrainBackend>,
-                       muon: &mut BatchedMuon,
-                       adamw: &mut AdamWOptimizer| {
-            let (input, target) = batch();
-            let mut grads = model.forward_loss(input, target).backward();
-            let muon_ids = model.muon_parameter_ids();
-            let muon_grads = GradientsParams::from_params(&mut grads, &model, &muon_ids);
-            let adamw_grads = GradientsParams::from_module(&mut grads, &model);
-            model = muon.step(2e-2, model, muon_grads).unwrap();
-            adamw.step(1e-3, model, adamw_grads)
-        };
+        let advance =
+            |mut model: Transformer, muon: &mut BatchedMuon, adamw: &mut AdamWOptimizer| {
+                let (input, target) = batch();
+                let mut grads = model.forward_loss(input, target).backward();
+                let muon_ids = model.muon_parameter_ids();
+                let muon_grads = GradientsParams::from_params(&mut grads, &model, &muon_ids);
+                let adamw_grads = GradientsParams::from_module(&mut grads, &model);
+                model = muon.step(2e-2, model, muon_grads).unwrap();
+                adamw.step(1e-3.into(), model, adamw_grads)
+            };
         model = advance(model, &mut muon_optimizer, &mut adamw_optimizer);
         resumed = advance(resumed, &mut resumed_muon, &mut resumed_adamw);
 
         let valid = model.valid();
         let loaded = resumed.valid();
-        let input = Tensor::<Backend, 2, Int>::from_data(
+        let input = Tensor::<2, Int>::from_data(
             TensorData::new(inputs[..5].to_vec(), [1, 5]),
-            &device,
+            &device.clone().inner(),
         );
         let expected = valid.forward(input.clone(), 0).into_data();
         let actual = loaded.forward(input, 0).into_data();
-        let expected = expected.to_vec::<f32>().unwrap();
-        let actual = actual.to_vec::<f32>().unwrap();
+        let expected = expected.convert::<f32>().to_vec::<f32>().unwrap();
+        let actual = actual.convert::<f32>().to_vec::<f32>().unwrap();
         let max_diff = expected
             .into_iter()
             .zip(actual)

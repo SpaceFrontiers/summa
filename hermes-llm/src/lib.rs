@@ -2,7 +2,7 @@
 //!
 //! Inference and model-definition library for Hermes LLMs.
 //!
-//! Burn Autodiff training lives in the `hermes-train` crate; this crate owns the
+//! Autodiff training lives in the `hermes-train` crate; this crate owns the
 //! shared model and everything needed for inference:
 //!
 //! - **Model Architecture Language (MAL)**: Define any transformer architecture using a composable DSL
@@ -10,7 +10,7 @@
 //! - **Tokenization**: HuggingFace `tokenizer.json` loading
 //! - **Export**: MAL → JSON model config
 //!
-//! Checkpoints are Burn-native safetensors written directly from the same
+//! Checkpoints are safetensors written directly from the same
 //! [`Transformer`] module tree used by `hermes-train`, with no conversion layer.
 //!
 //! ## Quick Start
@@ -55,8 +55,8 @@
 //! }
 //! ```
 
-pub mod burn_model;
 pub mod generate;
+pub mod model;
 /// Model Architecture Language (MAL) — re-exported from the standalone
 /// `hermes-mal` crate, which is the single source of truth.
 pub use hermes_mal as mal;
@@ -64,8 +64,8 @@ pub mod remote;
 pub mod tokenizer;
 
 // Core types
-pub use burn_model::{
-    Backend, Device, InferenceState, MambaBackend, Transformer, default_device, load_safetensors,
+pub use model::{
+    Device, InferenceState, MambaBackend, Transformer, default_device, load_safetensors,
     save_safetensors,
 };
 

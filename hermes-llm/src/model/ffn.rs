@@ -1,4 +1,4 @@
-//! Position-wise feed-forward network.
+//! Position-wise feed-forward layer.
 //!
 //! Gated or plain MLP using the activation selected by MAL.
 
@@ -8,18 +8,23 @@ use burn_nn::{Dropout, DropoutConfig, Linear, LinearConfig};
 
 use crate::mal::{Activation, BlockDef, ModelDef};
 
+use super::matmul::linear;
+
 #[derive(Module, Debug)]
-pub struct FeedForward<B: Backend> {
-    gate_proj: Option<Linear<B>>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
+pub struct FeedForward {
+    in_proj: Linear,
+    down_proj: Linear,
     dropout: Dropout,
     #[module(skip)]
     activation: Activation,
+    #[module(skip)]
+    intermediate: usize,
+    #[module(skip)]
+    gated: bool,
 }
 
-impl<B: Backend> FeedForward<B> {
-    pub fn new(config: &ModelDef, block: &BlockDef, device: &burn::tensor::Device<B>) -> Self {
+impl FeedForward {
+    pub fn new(config: &ModelDef, block: &BlockDef, device: &Device) -> Self {
         let use_gate = block.ffn.gate;
         let use_bias = block.ffn.bias;
         let hidden = config.hidden_size;
@@ -31,34 +36,36 @@ impl<B: Backend> FeedForward<B> {
                 .init(device)
         };
 
-        let gate_proj = use_gate.then(|| lin(hidden, intermediate));
-        let up_proj = lin(hidden, intermediate);
+        let in_proj = lin(hidden, intermediate * if use_gate { 2 } else { 1 });
         let down_proj = lin(intermediate, hidden);
 
         Self {
-            gate_proj,
-            up_proj,
+            in_proj,
             down_proj,
             dropout: DropoutConfig::new(block.ffn.dropout).init(),
             activation: block.ffn.activation,
+            intermediate,
+            gated: use_gate,
         }
     }
 
-    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let act = |t: Tensor<B, D>| match self.activation {
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
+        let act = |t: Tensor<D>| match self.activation {
             Activation::SwiGLU | Activation::SiLU => silu(t),
             Activation::GELU => gelu(t),
             Activation::ReLU => relu(t),
             Activation::GELUNew | Activation::GELUTanh => gelu_approximate(t),
         };
-        let hidden = match &self.gate_proj {
-            Some(gate_proj) => {
-                let gate = act(gate_proj.forward(x.clone()));
-                let up = self.up_proj.forward(x);
-                gate * up
-            }
-            None => act(self.up_proj.forward(x)),
+        let projected = linear(&self.in_proj, x);
+        let hidden = if self.gated {
+            let mut ranges = projected.dims().map(|size| 0..size);
+            ranges[D - 1] = 0..self.intermediate;
+            let gate = act(projected.clone().slice(ranges.clone()));
+            ranges[D - 1] = self.intermediate..2 * self.intermediate;
+            gate * projected.slice(ranges)
+        } else {
+            act(projected)
         };
-        self.down_proj.forward(self.dropout.forward(hidden))
+        linear(&self.down_proj, self.dropout.forward(hidden))
     }
 }

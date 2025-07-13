@@ -4,22 +4,30 @@
 //! per group. Mamba has one group per channel, so GPU training uses dedicated
 //! CubeCL kernels while CPU keeps Burn's reference implementation.
 
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
+#[cfg(feature = "metal")]
+use burn::backend::Metal;
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+use burn::backend::NdArray;
+use burn::backend::{
+    Backend, Dispatch, TensorMetadata, backend_extension, ops::ConvOptions, tensor::FloatTensor,
+};
 use burn::prelude::*;
-use burn::tensor::ops::ConvOptions;
-use burn::tensor::{TensorMetadata, TensorPrimitive, ops::FloatTensor};
 use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::{base::Checkpointer, strategy::CheckpointStrategy};
 use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct DepthwiseConv1dGradients<B: Backend> {
-    input: FloatTensor<B>,
-    weight: FloatTensor<B>,
-    bias: FloatTensor<B>,
-}
-
+#[cfg_attr(feature = "cuda", backend_extension(Cuda, Autodiff))]
+#[cfg_attr(
+    all(not(feature = "cuda"), feature = "metal"),
+    backend_extension(Metal, Autodiff)
+)]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "metal")),
+    backend_extension(NdArray, Autodiff)
+)]
 pub trait DepthwiseConv1dBackend: Backend {
     fn depthwise_conv1d_inner(
         input: FloatTensor<Self>,
@@ -39,7 +47,7 @@ pub trait DepthwiseConv1dBackend: Backend {
         input: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         grad: FloatTensor<Self>,
-    ) -> DepthwiseConv1dGradients<Self> {
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         let channels = input.shape()[1];
         let input_grad = Self::conv1d_x_backward(
             input.clone(),
@@ -53,31 +61,29 @@ pub trait DepthwiseConv1dBackend: Backend {
             grad.clone(),
             ConvOptions::new([1], [0], [1], channels),
         );
-        let bias_grad = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(grad))
-            .sum_dim(0)
-            .sum_dim(2)
-            .reshape([channels])
-            .into_primitive()
-            .tensor();
-        DepthwiseConv1dGradients {
-            input: input_grad,
-            weight: weight_grad,
-            bias: bias_grad,
-        }
+        let bias_grad = Self::float_sum_dim(grad, 0);
+        let bias_grad = Self::float_sum_dim(bias_grad, 2);
+        let bias_grad = Self::float_reshape(bias_grad, [channels].into());
+        (input_grad, weight_grad, bias_grad)
     }
 }
 
-pub(super) fn depthwise_conv1d<B: DepthwiseConv1dBackend>(
-    input: Tensor<B, 3>,
-    weight: Tensor<B, 3>,
-    bias: Tensor<B, 1>,
-) -> Tensor<B, 3> {
-    let output = B::depthwise_conv1d_inner(
-        input.into_primitive().tensor(),
-        weight.into_primitive().tensor(),
-        bias.into_primitive().tensor(),
+pub(super) fn depthwise_conv1d(input: Tensor<3>, weight: Tensor<3>, bias: Tensor<1>) -> Tensor<3> {
+    if input.device() == Device::ndarray() {
+        let channels = input.dims()[1];
+        return burn::tensor::module::conv1d(
+            input,
+            weight,
+            Some(bias),
+            ConvOptions::new([1], [0], [1], channels),
+        );
+    }
+    let output = Dispatch::depthwise_conv1d_inner(
+        input.into_dispatch(),
+        weight.into_dispatch(),
+        bias.into_dispatch(),
     );
-    Tensor::from_primitive(TensorPrimitive::Float(output))
+    Tensor::from_dispatch(output)
 }
 
 impl DepthwiseConv1dBackend for burn_ndarray::NdArray {}
@@ -104,9 +110,9 @@ impl<B: DepthwiseConv1dBackend> Backward<B, 3> for DepthwiseConv1dBackward {
         let grad = grads.consume::<B>(&ops.node);
         let output = B::depthwise_conv1d_backward(ops.state.input, ops.state.weight, grad);
         for (node, grad) in [
-            (node_input, output.input),
-            (node_weight, output.weight),
-            (node_bias, output.bias),
+            (node_input, output.0),
+            (node_weight, output.1),
+            (node_bias, output.2),
         ] {
             if let Some(node) = node {
                 grads.register::<B>(node.id, grad);
@@ -151,22 +157,21 @@ impl<B: DepthwiseConv1dBackend, C: CheckpointStrategy> DepthwiseConv1dBackend fo
 mod gpu {
     use burn::tensor::Shape;
     use burn_cubecl::cubecl::prelude::*;
-    use burn_cubecl::element::{BoolElement, IntElement};
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
-    use super::{DepthwiseConv1dBackend, DepthwiseConv1dGradients};
-    use crate::burn_model::cube_tensor::{empty_like, into_contiguous};
+    use super::DepthwiseConv1dBackend;
+    use crate::model::cube_tensor::{empty_like, into_contiguous};
 
     const ELEMENTWISE_THREADS: u32 = 256;
     const REDUCTION_THREADS: u32 = 32;
 
     #[cube(launch)]
     fn depthwise_conv1d_forward(
-        input: &Array<f32>,
-        weight: &Array<f32>,
-        bias: &Array<f32>,
-        output: &mut Array<f32>,
+        input: &Tensor<f32>,
+        weight: &Tensor<f32>,
+        bias: &Tensor<f32>,
+        output: &mut Tensor<f32>,
         channels: u32,
         input_len: u32,
         output_len: u32,
@@ -192,9 +197,9 @@ mod gpu {
 
     #[cube(launch)]
     fn depthwise_conv1d_backward_input(
-        weight: &Array<f32>,
-        grad: &Array<f32>,
-        grad_input: &mut Array<f32>,
+        weight: &Tensor<f32>,
+        grad: &Tensor<f32>,
+        grad_input: &mut Tensor<f32>,
         channels: u32,
         input_len: u32,
         output_len: u32,
@@ -225,10 +230,10 @@ mod gpu {
 
     #[cube(launch)]
     fn depthwise_conv1d_backward_params(
-        input: &Array<f32>,
-        grad: &Array<f32>,
-        grad_weight: &mut Array<f32>,
-        grad_bias: &mut Array<f32>,
+        input: &Tensor<f32>,
+        grad: &Tensor<f32>,
+        grad_weight: &mut Tensor<f32>,
+        grad_bias: &mut Tensor<f32>,
         batch: u32,
         channels: u32,
         input_len: u32,
@@ -269,12 +274,7 @@ mod gpu {
         }
     }
 
-    impl<R, I, BT> DepthwiseConv1dBackend for CubeBackend<R, f32, I, BT>
-    where
-        R: CubeRuntime,
-        I: IntElement,
-        BT: BoolElement,
-    {
+    impl<R: CubeRuntime> DepthwiseConv1dBackend for CubeBackend<R> {
         fn depthwise_conv1d_inner(
             input: CubeTensor<R>,
             weight: CubeTensor<R>,
@@ -296,10 +296,10 @@ mod gpu {
                 &client,
                 CubeCount::Static(total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
                 CubeDim::new_1d(ELEMENTWISE_THREADS),
-                input.into_array_arg(),
-                weight.into_array_arg(),
-                bias.into_array_arg(),
-                output.clone().into_array_arg(),
+                input.into_tensor_arg(),
+                weight.into_tensor_arg(),
+                bias.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
                 channels as u32,
                 input_len as u32,
                 output_len as u32,
@@ -312,7 +312,7 @@ mod gpu {
             input: CubeTensor<R>,
             weight: CubeTensor<R>,
             grad: CubeTensor<R>,
-        ) -> DepthwiseConv1dGradients<Self> {
+        ) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
             let [batch, channels, input_len] = input.meta.shape.dims();
             let [_, _, kernel_size] = weight.meta.shape.dims();
             let [_, _, output_len] = grad.meta.shape.dims();
@@ -330,9 +330,9 @@ mod gpu {
                 &client,
                 CubeCount::Static(input_total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
                 CubeDim::new_1d(ELEMENTWISE_THREADS),
-                weight.into_array_arg(),
-                grad.clone().into_array_arg(),
-                grad_input.clone().into_array_arg(),
+                weight.into_tensor_arg(),
+                grad.clone().into_tensor_arg(),
+                grad_input.clone().into_tensor_arg(),
                 channels as u32,
                 input_len as u32,
                 output_len as u32,
@@ -342,10 +342,10 @@ mod gpu {
                 &client,
                 CubeCount::Static((channels * kernel_size) as u32, 1, 1),
                 CubeDim::new_1d(REDUCTION_THREADS),
-                input.into_array_arg(),
-                grad.into_array_arg(),
-                grad_weight.clone().into_array_arg(),
-                grad_bias.clone().into_array_arg(),
+                input.into_tensor_arg(),
+                grad.into_tensor_arg(),
+                grad_weight.clone().into_tensor_arg(),
+                grad_bias.clone().into_tensor_arg(),
                 batch as u32,
                 channels as u32,
                 input_len as u32,
@@ -353,31 +353,22 @@ mod gpu {
                 kernel_size,
             );
 
-            DepthwiseConv1dGradients {
-                input: grad_input,
-                weight: grad_weight,
-                bias: grad_bias,
-            }
+            (grad_input, grad_weight, grad_bias)
         }
     }
 }
 
-#[cfg(all(test, feature = "metal"))]
+#[cfg(all(test, any(feature = "metal", feature = "cuda")))]
 mod tests {
-    use burn::tensor::{Tensor, TensorData};
-    use burn_autodiff::Autodiff;
-    use burn_ndarray::NdArray;
-    use burn_wgpu::Wgpu;
+    use burn::tensor::{Device, Tensor, TensorData};
 
     use super::depthwise_conv1d;
-    use crate::burn_model::test_support::{max_diff, values};
+    use crate::model::test_support::{max_diff, snapshot, values};
 
     #[test]
-    fn fused_depthwise_conv1d_matches_ndarray_forward_and_backward() {
-        type Cpu = Autodiff<NdArray>;
-        type Gpu = Autodiff<Wgpu>;
-        let cpu = Default::default();
-        let gpu = Default::default();
+    fn gpu_depthwise_conv1d_matches_ndarray_forward_and_backward() {
+        let cpu = Device::ndarray().autodiff();
+        let gpu = crate::model::default_device().autodiff();
         let (batch, channels, input_len, kernel_size) = (2, 3, 7, 3);
         let output_len = input_len - kernel_size + 1;
         let input_data = values(batch * channels * input_len, 0.13, 0.0);
@@ -386,25 +377,23 @@ mod tests {
         let output_weights = values(batch * channels * output_len, 0.29, 0.0);
 
         macro_rules! run {
-            ($backend:ty, $device:expr) => {{
-                let input = Tensor::<$backend, 3>::from_data(
+            ($device:expr) => {{
+                let input = Tensor::<3>::from_data(
                     TensorData::new(input_data.clone(), [batch, channels, input_len]),
                     $device,
                 )
                 .require_grad();
-                let weight = Tensor::<$backend, 3>::from_data(
+                let weight = Tensor::<3>::from_data(
                     TensorData::new(weight_data.clone(), [channels, 1, kernel_size]),
                     $device,
                 )
                 .require_grad();
-                let bias = Tensor::<$backend, 1>::from_data(
-                    TensorData::new(bias_data.clone(), [channels]),
-                    $device,
-                )
-                .require_grad();
+                let bias =
+                    Tensor::<1>::from_data(TensorData::new(bias_data.clone(), [channels]), $device)
+                        .require_grad();
                 let output = depthwise_conv1d(input.clone(), weight.clone(), bias.clone());
-                let output_data = output.clone().inner().into_data();
-                let factors = Tensor::<$backend, 3>::from_data(
+                let output_data = snapshot(output.clone());
+                let factors = Tensor::<3>::from_data(
                     TensorData::new(output_weights.clone(), [batch, channels, output_len]),
                     $device,
                 );
@@ -418,11 +407,19 @@ mod tests {
             }};
         }
 
-        let cpu = run!(Cpu, &cpu);
-        let gpu = run!(Gpu, &gpu);
-        assert!(max_diff(cpu.0, gpu.0) < 1e-5);
-        assert!(max_diff(cpu.1, gpu.1) < 1e-5);
-        assert!(max_diff(cpu.2, gpu.2) < 1e-4);
-        assert!(max_diff(cpu.3, gpu.3) < 1e-5);
+        let cpu = run!(&cpu);
+        let gpu = run!(&gpu);
+        for (name, cpu, gpu, tolerance) in [
+            ("output", cpu.0, gpu.0, 1e-5),
+            ("input", cpu.1, gpu.1, 1e-5),
+            ("weight", cpu.2, gpu.2, 1e-4),
+            ("bias", cpu.3, gpu.3, 1e-5),
+        ] {
+            let difference = max_diff(cpu, gpu);
+            assert!(
+                difference < tolerance,
+                "{name} max diff {difference} exceeds {tolerance}"
+            );
+        }
     }
 }

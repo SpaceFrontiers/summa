@@ -131,7 +131,7 @@ fn main() -> Result<()> {
                 tokenizer.vocab_size()
             );
 
-            let mut model = hermes_llm::Transformer::<hermes_llm::Backend>::new(&config, &device)?;
+            let mut model = hermes_llm::Transformer::new(&config, &device)?;
             hermes_llm::load_safetensors(&mut model, &checkpoint_path)?;
 
             info!("Loaded model from {}", checkpoint_path.display());
