@@ -14,7 +14,7 @@ use cubek::attention::forward::routines::blackbox_accelerated::BlackboxAccelerat
 use super::cube_tensor::{empty_dtype_like, into_contiguous};
 use super::fused_attention::{AttentionBackend, chunked_attention_backward};
 
-const BACKWARD_CHUNK_ROWS: usize = 512;
+const BACKWARD_CHUNK_ROWS: usize = 2048;
 const MAX_HEAD_DIM: usize = 128;
 
 fn dimensions(query: &CubeTensor<CudaRuntime>, key: &CubeTensor<CudaRuntime>) -> [usize; 4] {
