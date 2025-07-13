@@ -536,7 +536,7 @@ mod gpu {
 
     const THREADS_PER_CUBE: u32 = 128;
     const PLANE_WIDTH: u32 = 32;
-    const PLANES_PER_CUBE: u32 = THREADS_PER_CUBE / PLANE_WIDTH;
+    const BACKWARD_CHANNELS: usize = 16;
 
     #[cube]
     fn atomic_add_f32(target: &mut Atomic<f32>, value: f32) {
@@ -678,64 +678,13 @@ mod gpu {
         }
     }
 
+    /// One block owns a `(batch, channel tile)` and computes every scan
+    /// gradient while following the reverse recurrence exactly once. The
+    /// channel and state reductions share the per-token contributions in
+    /// workgroup memory instead of launching a second recurrent kernel.
     #[allow(clippy::useless_conversion)]
     #[cube(launch)]
-    fn selective_scan_bc_backward(
-        delta: &Tensor<f32>,
-        xs: &Tensor<f32>,
-        c_mat: &Tensor<f32>,
-        a: &Tensor<f32>,
-        h_in: &Tensor<f32>,
-        states: &Tensor<f32>,
-        grad_y: &Tensor<f32>,
-        grad_b: &mut Tensor<Atomic<f32>>,
-        grad_c: &mut Tensor<Atomic<f32>>,
-        channels: u32,
-        seq_len: u32,
-        #[comptime] state_dim: usize,
-    ) {
-        let channels = channels as usize;
-        let seq_len = seq_len as usize;
-        let state_group = ABSOLUTE_POS_Y as usize;
-        let channel = ABSOLUTE_POS_X as usize;
-        let total_state_groups = h_in.len() / channels;
-        let active = channel < channels && state_group < total_state_groups;
-        let n = state_group % state_dim;
-        let batch = state_group / state_dim;
-        let a_index = channel * state_dim + n;
-        let mut adjoint = 0.0f32;
-
-        for step in 0..seq_len {
-            let t = seq_len - step - 1;
-            let btc = (batch * seq_len + t) * channels + channel;
-            let btn = (batch * seq_len + t) * state_dim;
-            let dt = if active { delta[btc] } else { 0.0f32 };
-            let x = if active { xs[btc] } else { 0.0f32 };
-            let dy = if active { grad_y[btc] } else { 0.0f32 };
-            let av = if active { a[a_index] } else { 0.0f32 };
-            let cv = if active { c_mat[btn + n] } else { 0.0f32 };
-            let alpha = (dt * av).exp();
-            let h_t = if active {
-                states[btc * state_dim + n]
-            } else {
-                0.0f32
-            };
-            let g = adjoint + dy * cv;
-            let grad_b_sum = plane_sum(g * dt * x);
-            let grad_c_sum = plane_sum(dy * h_t);
-            if UNIT_POS_PLANE == 0 && state_group < total_state_groups {
-                atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
-                atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
-            }
-            adjoint = g * alpha;
-        }
-    }
-
-    /// A plane owns one (batch, channel) recurrence and reduces its state
-    /// lanes without global atomics for the per-token input gradients.
-    #[allow(clippy::useless_conversion)]
-    #[cube(launch)]
-    fn selective_scan_input_backward(
+    fn selective_scan_backward_fused(
         delta: &Tensor<f32>,
         delta_raw: &Tensor<f32>,
         xs: &Tensor<f32>,
@@ -748,6 +697,8 @@ mod gpu {
         grad_y: &Tensor<f32>,
         grad_delta: &mut Tensor<f32>,
         grad_xs: &mut Tensor<f32>,
+        grad_b: &mut Tensor<Atomic<f32>>,
+        grad_c: &mut Tensor<Atomic<f32>>,
         grad_a: &mut Tensor<Atomic<f32>>,
         grad_d: &mut Tensor<Atomic<f32>>,
         grad_h: &mut Tensor<f32>,
@@ -757,15 +708,20 @@ mod gpu {
     ) {
         let channels = channels as usize;
         let seq_len = seq_len as usize;
-        let batch_channel = ABSOLUTE_POS_Y as usize;
-        let n = UNIT_POS_PLANE as usize;
-        let total_batch_channels = h_in.len() / state_dim;
-        let active_channel = batch_channel < total_batch_channels;
+        let local_channel = UNIT_POS_X as usize;
+        let n = UNIT_POS_Y as usize;
+        let batch = CUBE_POS_Y as usize;
+        let channel = CUBE_POS_X as usize * BACKWARD_CHANNELS + local_channel;
+        let active_channel = channel < channels;
         let active = active_channel && n < state_dim;
-        let batch = batch_channel / channels;
-        let channel = batch_channel % channels;
-        let state_index = batch_channel * state_dim + n;
+        let state_index = (batch * channels + channel) * state_dim + n;
         let a_index = channel * state_dim + n;
+        let shared_index = n * BACKWARD_CHANNELS + local_channel;
+        let shared_len = BACKWARD_CHANNELS * state_dim;
+        let mut grad_dt_shared = Shared::new_slice(shared_len);
+        let mut grad_x_shared = Shared::new_slice(shared_len);
+        let mut grad_b_shared = Shared::new_slice(shared_len);
+        let mut grad_c_shared = Shared::new_slice(shared_len);
         let mut adjoint = 0.0f32;
         let mut grad_a_local = 0.0f32;
         let mut grad_d_local = 0.0f32;
@@ -791,23 +747,51 @@ mod gpu {
             } else {
                 0.0f32
             };
+            let h_t = if active {
+                states[btc * state_dim + n]
+            } else {
+                0.0f32
+            };
             let g = adjoint + dy * cv;
-            let grad_dt = plane_sum(g * (h_prev * alpha * av + bv * x));
-            let grad_x = plane_sum(g * dt * bv);
-            if UNIT_POS_PLANE == 0 && active_channel {
+            grad_dt_shared[shared_index] = g * (h_prev * alpha * av + bv * x);
+            grad_x_shared[shared_index] = g * dt * bv;
+            grad_b_shared[shared_index] = g * dt * x;
+            grad_c_shared[shared_index] = dy * h_t;
+            sync_cube();
+
+            if n == 0 && active_channel {
+                let mut grad_dt = 0.0f32;
+                let mut grad_x = 0.0f32;
+                for state in 0..state_dim {
+                    let index = state * BACKWARD_CHANNELS + local_channel;
+                    grad_dt += grad_dt_shared[index];
+                    grad_x += grad_x_shared[index];
+                }
                 grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
                 grad_xs[btc] = dy * d[channel] + grad_x;
                 grad_d_local += dy * x;
             }
+            if local_channel == 0 {
+                let mut grad_b_sum = 0.0f32;
+                let mut grad_c_sum = 0.0f32;
+                for offset in 0..BACKWARD_CHANNELS {
+                    let index = n * BACKWARD_CHANNELS + offset;
+                    grad_b_sum += grad_b_shared[index];
+                    grad_c_sum += grad_c_shared[index];
+                }
+                atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
+                atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
+            }
             grad_a_local += g * h_prev * alpha * dt;
             adjoint = g * alpha;
+            sync_cube();
         }
 
         if active {
             atomic_add_f32(&mut grad_a[a_index], grad_a_local);
             grad_h[state_index] = adjoint;
         }
-        if UNIT_POS_PLANE == 0 && active_channel {
+        if n == 0 && active_channel {
             atomic_add_f32(&mut grad_d[channel], grad_d_local);
         }
     }
@@ -958,47 +942,28 @@ mod gpu {
                 delta.clone().into_tensor_arg(),
             );
 
-            selective_scan_bc_backward::launch::<R>(
+            selective_scan_backward_fused::launch::<R>(
                 &client,
                 CubeCount::Static(
-                    (channels as u32).div_ceil(PLANE_WIDTH),
-                    (batch as u32 * state_dim as u32).div_ceil(PLANES_PER_CUBE),
+                    (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                    batch as u32,
                     1,
                 ),
-                CubeDim::new_2d(PLANE_WIDTH, PLANES_PER_CUBE),
+                CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
                 delta.clone().into_tensor_arg(),
+                delta_raw.into_tensor_arg(),
                 xs.clone().into_tensor_arg(),
+                b_mat.into_tensor_arg(),
                 c_mat.clone().into_tensor_arg(),
                 a.clone().into_tensor_arg(),
+                d.into_tensor_arg(),
                 h.clone().into_tensor_arg(),
                 states.clone().into_tensor_arg(),
                 grad_y.clone().into_tensor_arg(),
-                grad_b.clone().into_tensor_arg(),
-                grad_c.clone().into_tensor_arg(),
-                channels as u32,
-                seq_len as u32,
-                state_dim,
-            );
-            selective_scan_input_backward::launch::<R>(
-                &client,
-                CubeCount::Static(
-                    1,
-                    (batch as u32 * channels as u32).div_ceil(PLANES_PER_CUBE),
-                    1,
-                ),
-                CubeDim::new_2d(PLANE_WIDTH, PLANES_PER_CUBE),
-                delta.into_tensor_arg(),
-                delta_raw.into_tensor_arg(),
-                xs.into_tensor_arg(),
-                b_mat.into_tensor_arg(),
-                c_mat.into_tensor_arg(),
-                a.into_tensor_arg(),
-                d.into_tensor_arg(),
-                h.into_tensor_arg(),
-                states.into_tensor_arg(),
-                grad_y.into_tensor_arg(),
                 grad_delta.clone().into_tensor_arg(),
                 grad_xs.clone().into_tensor_arg(),
+                grad_b.clone().into_tensor_arg(),
+                grad_c.clone().into_tensor_arg(),
                 grad_a.clone().into_tensor_arg(),
                 grad_d.clone().into_tensor_arg(),
                 grad_h.clone().into_tensor_arg(),
