@@ -48,6 +48,9 @@ On CUDA, Muon's Newton-Schulz iterations use BF16 while model parameters and
 optimizer state remain FP32.
 It atomically replaces the latest native checkpoint every 100 optimizer steps
 by default; pass `--checkpoint-every 0` to save only at completion.
+Each training checkpoint includes weights, AdamW and Muon state, and the exact
+curriculum position. Relaunch the same command with `--resume` to replay the
+deterministic bounded shuffle up to that position and continue the schedule.
 On Mamba models, training and inference use fused CubeCL selective-scan kernels
 on Metal and CUDA; CPU uses the tensor-operation reference implementation.
 
@@ -56,6 +59,7 @@ Outputs are deliberately minimal:
 - `config.json`, with tokenizer vocabulary size applied
 - `metrics.jsonl`, flushed after every optimizer step for live reporters
 - `weights.safetensors`, using Burn-native parameter names
+- `adamw-state.bin`, `muon-state.bin`, and `training-state.json` for resume
 
 The checkpoint loads directly in `hermes-llm` with strict tensor and shape
 validation. Experiment services such as W&B can tail `metrics.jsonl` without

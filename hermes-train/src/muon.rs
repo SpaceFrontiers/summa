@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 use burn::module::{Module, ModuleMapper, Param, ParamId};
+use burn::record::Record;
 #[cfg(feature = "cuda")]
 use burn::tensor::FloatDType;
 use burn::tensor::Tensor;
@@ -27,12 +28,35 @@ pub struct BatchedMuon {
     velocities: BTreeMap<[usize; 2], Tensor<Backend, 3>>,
 }
 
+#[derive(Record)]
+pub struct BatchedMuonRecord<B: burn::tensor::backend::Backend> {
+    velocities: Vec<Tensor<B, 3>>,
+}
+
 impl BatchedMuon {
     pub fn new(parameter_ids: Vec<ParamId>) -> Self {
         Self {
             parameter_ids,
             velocities: BTreeMap::new(),
         }
+    }
+
+    pub fn to_record(&self) -> BatchedMuonRecord<Backend> {
+        BatchedMuonRecord {
+            velocities: self.velocities.values().cloned().collect(),
+        }
+    }
+
+    pub fn load_record(&mut self, record: BatchedMuonRecord<Backend>) -> Result<()> {
+        self.velocities.clear();
+        for velocity in record.velocities {
+            let [_, rows, columns] = velocity.dims();
+            ensure!(
+                self.velocities.insert([rows, columns], velocity).is_none(),
+                "Muon checkpoint contains duplicate {rows}x{columns} velocity groups"
+            );
+        }
+        Ok(())
     }
 
     pub fn step<M: Module<TrainBackend>>(

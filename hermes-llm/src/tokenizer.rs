@@ -43,6 +43,21 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    pub fn encode_batch(
+        &self,
+        texts: Vec<String>,
+        add_special_tokens: bool,
+    ) -> Result<Vec<Vec<u32>>> {
+        let encodings = self
+            .inner
+            .encode_batch(texts, add_special_tokens)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(encodings
+            .into_iter()
+            .map(|encoding| encoding.get_ids().to_vec())
+            .collect())
+    }
+
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.inner
             .decode(ids, skip_special_tokens)
