@@ -45,23 +45,35 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         let [batch, heads, sequence, head_dim] = dimensions(&query, &key);
         assert_eq!(value.shape().dims(), [batch, heads, sequence, head_dim]);
 
+        let options = AttentionModuleOptions {
+            is_causal: causal,
+            ..Default::default()
+        };
         let output = attention(
             query.clone(),
             key.clone(),
             value.clone(),
             None,
             None,
-            AttentionModuleOptions {
-                is_causal: causal,
-                ..Default::default()
-            },
+            options,
             AttentionStrategy::FlashBlackboxAccelerated(BlackboxAcceleratedStrategy {
                 num_planes: 4,
                 seq_q: 1,
                 seq_kv: 1,
             }),
         )
-        .expect("CubeCL Flash Attention must support the validated Hermes shape");
+        .or_else(|_| {
+            attention(
+                query.clone(),
+                key.clone(),
+                value.clone(),
+                None,
+                None,
+                options,
+                AttentionStrategy::Fallback,
+            )
+        })
+        .expect("Burn attention fallback must support the validated Hermes shape");
         let output_default = Self::float_cast(output.clone(), output_dtype.into());
         let stats = empty_dtype_like(&query, Shape::new([1, 1, 1, 1]), output_dtype);
         (output_default, stats, query, key, value, output)

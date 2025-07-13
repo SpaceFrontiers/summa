@@ -52,7 +52,10 @@ mod test_support {
 
     pub(super) fn snapshot<const D: usize>(tensor: Tensor<D>) -> TensorData {
         let shape = tensor.shape();
-        TensorData::new(tensor.into_data().to_vec::<f32>().unwrap(), shape)
+        TensorData::new(
+            tensor.into_data().convert::<f32>().to_vec::<f32>().unwrap(),
+            shape,
+        )
     }
 }
 
@@ -67,8 +70,8 @@ mod tests {
     use crate::mal::{NormType, PositionEncoding, get_builtin_model};
 
     fn max_abs_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
-        let a = a.into_data().to_vec::<f32>().unwrap();
-        let b = b.into_data().to_vec::<f32>().unwrap();
+        let a = a.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let b = b.into_data().convert::<f32>().to_vec::<f32>().unwrap();
         a.into_iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())

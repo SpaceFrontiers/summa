@@ -408,7 +408,7 @@ fn gradient_norm_and_clip(
 }
 
 fn scalar_value(tensor: Tensor<1>) -> Result<f32> {
-    Ok(tensor.into_data().to_vec::<f32>()?[0])
+    Ok(tensor.into_data().convert::<f32>().to_vec::<f32>()?[0])
 }
 
 fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
@@ -865,7 +865,7 @@ mod tests {
         for _ in 0..20 {
             let (input, target) = batch();
             let loss = model.forward_loss(input, target);
-            losses.push(loss.clone().into_data().to_vec::<f32>().unwrap()[0]);
+            losses.push(scalar_value(loss.clone()).unwrap());
             let mut grads = loss.backward();
             let mut muon_grads =
                 GradientsParams::from_params(&mut grads, &model, &muon_parameter_ids);
@@ -940,8 +940,8 @@ mod tests {
         );
         let expected = valid.forward(input.clone(), 0).into_data();
         let actual = loaded.forward(input, 0).into_data();
-        let expected = expected.to_vec::<f32>().unwrap();
-        let actual = actual.to_vec::<f32>().unwrap();
+        let expected = expected.convert::<f32>().to_vec::<f32>().unwrap();
+        let actual = actual.convert::<f32>().to_vec::<f32>().unwrap();
         let max_diff = expected
             .into_iter()
             .zip(actual)

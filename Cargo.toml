@@ -103,3 +103,8 @@ lasso = { version = "0.7", features = ["multi-threaded"] }
 hashbrown = "0.17"
 memmap2 = "0.9"
 uuid = { version = "1.19", features = ["v4"] }
+
+# Keep Burn's CubeK dependency on the same A100-safe revision used directly by
+# hermes-llm.
+[patch."https://github.com/tracel-ai/cubek"]
+cubek = { git = "https://github.com/ppodolsky/cubek", rev = "058827ffef7231d48901983cbc1121f897ced752" }
