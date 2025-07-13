@@ -576,7 +576,7 @@ fn train(args: TrainArgs) -> Result<()> {
     if let Some(path) = &args.checkpoint {
         load_safetensors(&mut initial_model, path)?;
     }
-    let muon_parameter_ids = initial_model.muon_parameter_ids();
+    let mut muon_parameter_ids = initial_model.muon_parameter_ids();
     ensure!(
         !muon_parameter_ids.is_empty(),
         "model has no hidden matrix parameters for Muon"
@@ -597,6 +597,7 @@ fn train(args: TrainArgs) -> Result<()> {
             &device,
         )?;
         adamw_optimizer = optimizer;
+        muon_parameter_ids = initial_model.muon_parameter_ids();
         ensure!(
             state.step < total_steps,
             "checkpoint step {} has already reached requested total {total_steps}",
@@ -899,8 +900,8 @@ mod tests {
         .unwrap();
 
         let mut resumed = Transformer::new(&config, &device).unwrap();
-        let resumed_ids = resumed.muon_parameter_ids();
-        let mut resumed_muon = BatchedMuon::new(resumed_ids);
+        let mut resumed_ids = resumed.muon_parameter_ids();
+        let mut resumed_muon = BatchedMuon::new(resumed_ids.clone());
         let resumed_adamw = AdamWConfig::new()
             .with_beta_2(0.95)
             .with_epsilon(1e-8)
@@ -918,19 +919,29 @@ mod tests {
         assert_eq!(resumed_state.stage, state.stage);
         assert_eq!(resumed_state.epoch, state.epoch);
         assert_eq!(resumed_state.samples_in_stage, state.samples_in_stage);
+        let restored_ids = resumed.muon_parameter_ids();
+        assert_ne!(resumed_ids, restored_ids);
+        assert_eq!(muon_parameter_ids, restored_ids);
+        resumed_ids = restored_ids;
 
-        let advance =
-            |mut model: Transformer, muon: &mut BatchedMuon, adamw: &mut AdamWOptimizer| {
-                let (input, target) = batch();
-                let mut grads = model.forward_loss(input, target).backward();
-                let muon_ids = model.muon_parameter_ids();
-                let muon_grads = GradientsParams::from_params(&mut grads, &model, &muon_ids);
-                let adamw_grads = GradientsParams::from_module(&mut grads, &model);
-                model = muon.step(2e-2, model, muon_grads).unwrap();
-                adamw.step(1e-3.into(), model, adamw_grads)
-            };
-        model = advance(model, &mut muon_optimizer, &mut adamw_optimizer);
-        resumed = advance(resumed, &mut resumed_muon, &mut resumed_adamw);
+        let advance = |mut model: Transformer,
+                       muon: &mut BatchedMuon,
+                       adamw: &mut AdamWOptimizer,
+                       muon_ids: &[ParamId]| {
+            let (input, target) = batch();
+            let mut grads = model.forward_loss(input, target).backward();
+            let muon_grads = GradientsParams::from_params(&mut grads, &model, muon_ids);
+            let adamw_grads = GradientsParams::from_module(&mut grads, &model);
+            model = muon.step(2e-2, model, muon_grads).unwrap();
+            adamw.step(1e-3.into(), model, adamw_grads)
+        };
+        model = advance(
+            model,
+            &mut muon_optimizer,
+            &mut adamw_optimizer,
+            &muon_parameter_ids,
+        );
+        resumed = advance(resumed, &mut resumed_muon, &mut resumed_adamw, &resumed_ids);
 
         let valid = model.valid();
         let loaded = resumed.valid();
