@@ -33,11 +33,11 @@ hermes-train train \
 ```
 
 Training data is either a text file or JSONL with a string `text` field; both
-formats may be Zstandard-compressed (`.zst`). The reader streams documents and
-fixed-length samples through a deterministic bounded shuffle buffer instead of
-retaining the corpus in memory. Repeat `--data` to combine files. Samples never
-cross document boundaries. Set `--shuffle-buffer 0` only for ordered diagnostic
-runs.
+formats may be Zstandard-compressed (`.zst`). The reader EOS-joins documents,
+packs every complete fixed-length sample, and streams samples through a
+deterministic bounded shuffle buffer instead of retaining the corpus in memory.
+Repeat `--data` for curriculum stages; each file is trained completely before
+the next. Set `--shuffle-buffer 0` only for ordered diagnostic runs.
 
 The trainer uses Burn Autodiff with batched Muon updates for hidden 2D matrices
 and AdamW for embeddings, output weights, norms, biases, and convolution

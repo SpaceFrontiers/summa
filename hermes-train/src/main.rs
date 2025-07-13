@@ -137,80 +137,107 @@ impl ShuffleBuffer {
     }
 }
 
-fn visit_document(
-    document: &str,
-    tokenizer: &Tokenizer,
+struct SamplePacker {
+    pending: Vec<i64>,
+    consumed: usize,
     seq_len: usize,
-    count: &mut usize,
-    visit: &mut impl FnMut(Vec<i64>) -> Result<bool>,
-) -> Result<bool> {
-    let mut tokens = tokenizer.encode(document, false)?;
-    tokens.push(tokenizer.eos_token_id());
-    for chunk in tokens.windows(seq_len + 1).step_by(seq_len) {
-        *count += 1;
-        if !visit(chunk.iter().map(|&token| i64::from(token)).collect())? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
-/// Visit fixed-length next-token samples without retaining the corpus in RAM.
+impl SamplePacker {
+    fn new(seq_len: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            consumed: 0,
+            seq_len,
+        }
+    }
+
+    fn push(
+        &mut self,
+        tokens: impl IntoIterator<Item = i64>,
+        count: &mut usize,
+        visit: &mut impl FnMut(Vec<i64>) -> Result<bool>,
+    ) -> Result<bool> {
+        if self.consumed > 0 {
+            self.pending.drain(..self.consumed);
+            self.consumed = 0;
+        }
+        self.pending.extend(tokens);
+        while self.pending.len() - self.consumed > self.seq_len {
+            let end = self.consumed + self.seq_len + 1;
+            let sample = self.pending[self.consumed..end].to_vec();
+            self.consumed += self.seq_len;
+            *count += 1;
+            if !visit(sample)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Pack the EOS-joined token stream into fixed-length next-token samples.
 fn visit_samples_in_order(
-    paths: &[PathBuf],
+    path: &Path,
     tokenizer: &Tokenizer,
     seq_len: usize,
     mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
 ) -> Result<usize> {
     ensure!(seq_len > 0, "seq_len must be positive");
     let mut count = 0;
-    for path in paths {
-        let is_jsonl = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"));
-        let mut reader = open_data(path)?;
-        if is_jsonl {
-            let mut line = String::new();
-            let mut line_number = 0;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line)? == 0 {
-                    break;
-                }
-                line_number += 1;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let value: serde_json::Value = serde_json::from_str(&line).with_context(|| {
-                    format!("invalid JSONL at {}:{line_number}", path.display())
-                })?;
-                let document = value
-                    .get("text")
-                    .and_then(|value| value.as_str())
-                    .with_context(|| {
-                        format!(
-                            "JSONL row at {}:{line_number} must contain a string `text` field",
-                            path.display()
-                        )
-                    })?;
-                if !visit_document(document, tokenizer, seq_len, &mut count, &mut visit)? {
-                    return Ok(count);
-                }
+    let mut packer = SamplePacker::new(seq_len);
+    let mut push_document = |document: &str| -> Result<bool> {
+        let tokens = tokenizer
+            .encode(document, false)?
+            .into_iter()
+            .map(i64::from)
+            .chain(std::iter::once(i64::from(tokenizer.eos_token_id())));
+        packer.push(tokens, &mut count, &mut visit)
+    };
+    let is_jsonl = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"));
+    let mut reader = open_data(path)?;
+    if is_jsonl {
+        let mut line = String::new();
+        let mut line_number = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
             }
-        } else {
-            let mut document = String::new();
-            reader.read_to_string(&mut document)?;
-            if !visit_document(&document, tokenizer, seq_len, &mut count, &mut visit)? {
+            line_number += 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("invalid JSONL at {}:{line_number}", path.display()))?;
+            let document = value
+                .get("text")
+                .and_then(|value| value.as_str())
+                .with_context(|| {
+                    format!(
+                        "JSONL row at {}:{line_number} must contain a string `text` field",
+                        path.display()
+                    )
+                })?;
+            if !push_document(document)? {
                 return Ok(count);
             }
+        }
+    } else {
+        let mut document = String::new();
+        reader.read_to_string(&mut document)?;
+        if !push_document(&document)? {
+            return Ok(count);
         }
     }
     Ok(count)
 }
 
 fn visit_samples(
-    paths: &[PathBuf],
+    path: &Path,
     tokenizer: &Tokenizer,
     seq_len: usize,
     shuffle_buffer: usize,
@@ -218,12 +245,12 @@ fn visit_samples(
     mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
 ) -> Result<usize> {
     if shuffle_buffer == 0 {
-        return visit_samples_in_order(paths, tokenizer, seq_len, visit);
+        return visit_samples_in_order(path, tokenizer, seq_len, visit);
     }
 
     let mut shuffler = ShuffleBuffer::new(shuffle_buffer, seed);
     let mut keep_going = true;
-    let count = visit_samples_in_order(paths, tokenizer, seq_len, |sample| {
+    let count = visit_samples_in_order(path, tokenizer, seq_len, |sample| {
         if let Some(sample) = shuffler.push(sample) {
             keep_going = visit(sample)?;
         }
@@ -240,8 +267,8 @@ fn visit_samples(
     Ok(count)
 }
 
-fn count_samples(paths: &[PathBuf], tokenizer: &Tokenizer, seq_len: usize) -> Result<usize> {
-    visit_samples_in_order(paths, tokenizer, seq_len, |_| Ok(true))
+fn count_samples(path: &Path, tokenizer: &Tokenizer, seq_len: usize) -> Result<usize> {
+    visit_samples_in_order(path, tokenizer, seq_len, |_| Ok(true))
 }
 
 fn make_batch(
@@ -371,16 +398,24 @@ fn train(args: TrainArgs) -> Result<()> {
         args.seq_len,
         config.max_seq_len
     );
-    let sample_count = match args.max_steps {
+    let sample_counts = match args.max_steps {
         Some(_) => None,
-        None => Some(count_samples(&args.data, &tokenizer, args.seq_len)?),
+        None => Some(
+            args.data
+                .iter()
+                .map(|path| count_samples(path, &tokenizer, args.seq_len))
+                .collect::<Result<Vec<_>>>()?,
+        ),
     };
-    let total_steps = match (args.max_steps, sample_count) {
+    let total_steps = match (args.max_steps, &sample_counts) {
         (Some(steps), _) => steps,
-        (None, Some(samples)) => {
-            let microbatches = samples / args.batch_size;
-            (microbatches / args.grad_accum).saturating_mul(args.epochs)
-        }
+        (None, Some(counts)) => counts
+            .iter()
+            .map(|samples| {
+                let microbatches = samples / args.batch_size;
+                (microbatches / args.grad_accum).saturating_mul(args.epochs)
+            })
+            .sum(),
         (None, None) => unreachable!(),
     };
     ensure!(
@@ -422,103 +457,121 @@ fn train(args: TrainArgs) -> Result<()> {
     let mut micro_step = 0;
     let mut loss_sum = 0.0f32;
 
+    let sample_summary = sample_counts.as_ref().map_or_else(
+        || "streaming".to_owned(),
+        |counts| {
+            counts
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
     println!(
-        "model={} params={} muon_matrices={} device={device:?} samples={} steps={total_steps} shuffle_buffer={}",
+        "model={} params={} muon_matrices={} device={device:?} stage_samples={sample_summary} steps={total_steps} shuffle_buffer={}",
         config.name,
         model.as_ref().unwrap().num_parameters(),
         muon_parameter_ids.len(),
-        sample_count.map_or_else(|| "streaming".to_owned(), |count| count.to_string()),
         args.shuffle_buffer,
     );
 
-    'epochs: for epoch in 0..args.epochs {
-        let mut batch = Vec::with_capacity(args.batch_size);
-        visit_samples(
-            &args.data,
-            &tokenizer,
-            args.seq_len,
-            args.shuffle_buffer,
-            args.seed.wrapping_add(epoch as u64),
-            |sample| {
-                batch.push(sample);
-                if batch.len() < args.batch_size {
-                    return Ok(true);
-                }
-
-                let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
-                batch.clear();
-                let current = model.as_ref().unwrap();
-                let loss = current.forward_loss(inputs, targets);
-                let loss_value = loss.clone().into_data().to_vec::<f32>()?[0];
-                if !loss_value.is_finite() {
-                    bail!(
-                        "non-finite loss before optimizer step {}: {loss_value}",
-                        step + 1
-                    );
-                }
-                let mut grads = loss.div_scalar(args.grad_accum as f64).backward();
-                let muon_grads =
-                    GradientsParams::from_params(&mut grads, current, &muon_parameter_ids);
-                let adamw_grads = GradientsParams::from_module(&mut grads, current);
-                muon_accumulator.accumulate(current, muon_grads);
-                adamw_accumulator.accumulate(current, adamw_grads);
-                micro_step += 1;
-                loss_sum += loss_value;
-
-                if micro_step == args.grad_accum {
-                    let lr = learning_rate(&args, step + 1, total_steps);
-                    let muon_lr = lr * MUON_LR_SCALE;
-                    let mut muon_grads = muon_accumulator.grads();
-                    let mut adamw_grads = adamw_accumulator.grads();
-                    let grad_norm = gradient_norm_and_clip(
-                        current,
-                        &mut muon_grads,
-                        &mut adamw_grads,
-                        args.grad_clip,
-                    )?;
-                    let current = model.take().unwrap();
-                    let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
-                    model = Some(adamw_optimizer.step(lr, current, adamw_grads));
-                    step += 1;
-                    let loss = loss_sum / args.grad_accum as f32;
-                    println!(
-                        "epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3}",
-                        epoch + 1,
-                        loss
-                    );
-                    serde_json::to_writer(
-                        &mut metrics,
-                        &serde_json::json!({
-                            "step": step,
-                            "epoch": epoch + 1,
-                            "loss": loss,
-                            "lr": lr,
-                            "muon_lr": muon_lr,
-                            "grad_norm": grad_norm,
-                            "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
-                        }),
-                    )?;
-                    metrics.write_all(b"\n")?;
-                    metrics.flush()?;
-                    if args.checkpoint_every > 0 && step % args.checkpoint_every == 0 {
-                        save_checkpoint(&model.as_ref().unwrap().clone().valid(), &args.output)?;
-                        println!("checkpointed {}", args.output.display());
+    'stages: for (stage, path) in args.data.iter().enumerate() {
+        for epoch in 0..args.epochs {
+            let mut batch = Vec::with_capacity(args.batch_size);
+            let shuffle_seed = args.seed.wrapping_add((stage * args.epochs + epoch) as u64);
+            visit_samples(
+                path,
+                &tokenizer,
+                args.seq_len,
+                args.shuffle_buffer,
+                shuffle_seed,
+                |sample| {
+                    batch.push(sample);
+                    if batch.len() < args.batch_size {
+                        return Ok(true);
                     }
-                    micro_step = 0;
-                    loss_sum = 0.0;
-                }
-                Ok(step < total_steps)
-            },
-        )?;
-        if step >= total_steps {
-            break 'epochs;
-        }
-        // An optimizer step always consists of exactly grad_accum microbatches.
-        if micro_step != 0 {
-            muon_accumulator = GradientsAccumulator::new();
-            adamw_accumulator = GradientsAccumulator::new();
-            micro_step = 0;
-            loss_sum = 0.0;
+
+                    let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
+                    batch.clear();
+                    let current = model.as_ref().unwrap();
+                    let loss = current.forward_loss(inputs, targets);
+                    let loss_value = loss.clone().into_data().to_vec::<f32>()?[0];
+                    if !loss_value.is_finite() {
+                        bail!(
+                            "non-finite loss before optimizer step {}: {loss_value}",
+                            step + 1
+                        );
+                    }
+                    let mut grads = loss.div_scalar(args.grad_accum as f64).backward();
+                    let muon_grads =
+                        GradientsParams::from_params(&mut grads, current, &muon_parameter_ids);
+                    let adamw_grads = GradientsParams::from_module(&mut grads, current);
+                    muon_accumulator.accumulate(current, muon_grads);
+                    adamw_accumulator.accumulate(current, adamw_grads);
+                    micro_step += 1;
+                    loss_sum += loss_value;
+
+                    if micro_step == args.grad_accum {
+                        let lr = learning_rate(&args, step + 1, total_steps);
+                        let muon_lr = lr * MUON_LR_SCALE;
+                        let mut muon_grads = muon_accumulator.grads();
+                        let mut adamw_grads = adamw_accumulator.grads();
+                        let grad_norm = gradient_norm_and_clip(
+                            current,
+                            &mut muon_grads,
+                            &mut adamw_grads,
+                            args.grad_clip,
+                        )?;
+                        let current = model.take().unwrap();
+                        let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
+                        model = Some(adamw_optimizer.step(lr, current, adamw_grads));
+                        step += 1;
+                        let loss = loss_sum / args.grad_accum as f32;
+                        println!(
+                            "stage={}/{} epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3}",
+                            stage + 1,
+                            args.data.len(),
+                            epoch + 1,
+                            loss
+                        );
+                        serde_json::to_writer(
+                            &mut metrics,
+                            &serde_json::json!({
+                                "step": step,
+                                "stage": stage + 1,
+                                "epoch": epoch + 1,
+                                "loss": loss,
+                                "lr": lr,
+                                "muon_lr": muon_lr,
+                                "grad_norm": grad_norm,
+                                "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
+                            }),
+                        )?;
+                        metrics.write_all(b"\n")?;
+                        metrics.flush()?;
+                        if args.checkpoint_every > 0 && step % args.checkpoint_every == 0 {
+                            save_checkpoint(
+                                &model.as_ref().unwrap().clone().valid(),
+                                &args.output,
+                            )?;
+                            println!("checkpointed {}", args.output.display());
+                        }
+                        micro_step = 0;
+                        loss_sum = 0.0;
+                    }
+                    Ok(step < total_steps)
+                },
+            )?;
+            if step >= total_steps {
+                break 'stages;
+            }
+            // Optimizer steps never span epoch or curriculum-stage boundaries.
+            if micro_step != 0 {
+                muon_accumulator = GradientsAccumulator::new();
+                adamw_accumulator = GradientsAccumulator::new();
+                micro_step = 0;
+                loss_sum = 0.0;
+            }
         }
     }
     ensure!(
@@ -672,5 +725,23 @@ mod tests {
         let mut sorted = first;
         sorted.sort_unstable();
         assert_eq!(sorted, (0..32_i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sample_packer_joins_documents_without_dropping_tokens() {
+        let mut packer = SamplePacker::new(3);
+        let mut samples = Vec::new();
+        let mut count = 0;
+        let mut collect = |sample| {
+            samples.push(sample);
+            Ok(true)
+        };
+
+        for document in [vec![1, 2, 0], vec![3, 4, 0], vec![5, 6, 0]] {
+            assert!(packer.push(document, &mut count, &mut collect).unwrap());
+        }
+
+        assert_eq!(count, 2);
+        assert_eq!(samples, [vec![1, 2, 0, 3], vec![3, 4, 0, 5]]);
     }
 }
