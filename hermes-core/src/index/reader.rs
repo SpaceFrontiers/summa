@@ -132,15 +132,23 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         segment_manager: &Arc<crate::merge::SegmentManager<D>>,
         resources: SearcherResources,
     ) -> Result<Searcher<D>> {
+        // Use SegmentManager's acquire_snapshot - non-blocking RwLock read.
+        //
+        // The snapshot MUST be acquired before reading trained centroids:
+        // segment producers capture trained structures only after the ArcSwap
+        // publication, so any ANN segment visible in the snapshot is always
+        // satisfiable by a trained value loaded after the snapshot. The
+        // reverse order can leave an ANN segment without centroids — and the
+        // miss is sticky, because reused readers are never re-injected on
+        // later reloads.
+        let snapshot = segment_manager.acquire_snapshot().await;
+
         // Read trained centroids from ArcSwap (lock-free)
         let trained = segment_manager.trained();
         let trained_centroids = trained
             .as_ref()
             .map(|t| t.centroids.clone())
             .unwrap_or_default();
-
-        // Use SegmentManager's acquire_snapshot - non-blocking RwLock read
-        let snapshot = segment_manager.acquire_snapshot().await;
 
         Searcher::from_snapshot(
             segment_manager.directory(),
@@ -258,14 +266,18 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         let existing_segments: Vec<Arc<crate::segment::SegmentReader>> =
             self.state.load().searcher.segment_readers().to_vec();
 
+        // Acquire the snapshot BEFORE reading trained centroids: producers
+        // capture trained structures only after the ArcSwap publication, so
+        // any ANN segment visible in the snapshot is always satisfiable by a
+        // trained value loaded after the snapshot (see create_reader).
+        let snapshot = self.segment_manager.acquire_snapshot().await;
+
         // Read trained centroids from ArcSwap (lock-free)
         let trained = self.segment_manager.trained();
         let trained_centroids = trained
             .as_ref()
             .map(|t| t.centroids.clone())
             .unwrap_or_default();
-
-        let snapshot = self.segment_manager.acquire_snapshot().await;
 
         let new_reader = Searcher::from_snapshot_reuse(
             self.segment_manager.directory(),

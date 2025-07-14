@@ -439,6 +439,12 @@ impl LocalIndex {
     }
 
     /// Sync new/changed files to storage (if any).
+    ///
+    /// Ordering is crash-safety-critical (see [`plan_storage_sync`]): data
+    /// files are persisted first, `metadata.json` — the commit point on
+    /// reload — second, and stale-file deletions last. If the tab closes or
+    /// a storage write rejects mid-sync, the previously stored metadata.json
+    /// still references a complete file set, so the index stays openable.
     async fn sync_to_storage(&mut self) -> Result<(), JsValue> {
         let adapter = match &self.storage {
             Some(a) => a,
@@ -457,29 +463,125 @@ impl LocalIndex {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
+        let (writes, removed) = plan_storage_sync(&current_set, &self.persisted_files);
+
         // Write new files and metadata.json (always changes on commit)
-        for path in &current_files {
-            let path_str = path.to_string_lossy();
-            if !self.persisted_files.contains(path_str.as_ref()) || path_str == "metadata.json" {
-                let data = dir
-                    .read_file_sync(path)
-                    .map_err(|e| JsValue::from_str(&format!("Read error: {}", e)))?;
-                adapter.write(&path_str, &data).await?;
-            }
+        for path_str in &writes {
+            let data = dir
+                .read_file_sync(Path::new(path_str))
+                .map_err(|e| JsValue::from_str(&format!("Read error: {}", e)))?;
+            adapter.write(path_str, &data).await?;
         }
 
-        // Delete removed files (e.g. after merge)
-        let removed: Vec<String> = self
-            .persisted_files
-            .iter()
-            .filter(|p| !current_set.contains(p.as_str()))
-            .cloned()
-            .collect();
+        // Delete removed files (e.g. after merge) — only after the new
+        // metadata is stored, so a crash mid-sync cannot drop files that the
+        // stored metadata still references.
         if !removed.is_empty() {
             adapter.delete(&removed).await?;
         }
 
         self.persisted_files = current_set;
         Ok(())
+    }
+}
+
+/// Name of the index metadata file — the durable commit point for a synced index.
+const METADATA_FILE: &str = "metadata.json";
+
+/// Compute the storage sync plan for [`LocalIndex::sync_to_storage`].
+///
+/// Returns `(writes, deletes)`:
+/// - `writes`: new files in deterministic (sorted) order, with
+///   `metadata.json` (rewritten on every commit) strictly LAST. The order is
+///   crash-safety-critical: metadata.json is the commit point that names the
+///   other files, so persisting it before them would let a crash/tab-close
+///   mid-sync store metadata referencing files that were never written,
+///   bricking the index on reload.
+/// - `deletes`: previously persisted files no longer present; removed only
+///   after the new metadata is stored.
+fn plan_storage_sync(
+    current: &HashSet<String>,
+    persisted: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut writes: Vec<String> = current
+        .iter()
+        .filter(|name| name.as_str() != METADATA_FILE && !persisted.contains(name.as_str()))
+        .cloned()
+        .collect();
+    writes.sort_unstable();
+    if current.contains(METADATA_FILE) {
+        writes.push(METADATA_FILE.to_string());
+    }
+
+    let mut deletes: Vec<String> = persisted
+        .iter()
+        .filter(|name| !current.contains(name.as_str()))
+        .cloned()
+        .collect();
+    deletes.sort_unstable();
+
+    (writes, deletes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_storage_sync;
+    use std::collections::HashSet;
+
+    /// A crash/tab-close between persisting metadata.json and the segment
+    /// files it references leaves the stored index permanently unopenable.
+    /// The sync plan must therefore order every new data file BEFORE
+    /// metadata.json, deterministically.
+    #[test]
+    fn test_sync_plan_persists_metadata_json_last_after_all_new_data_files() {
+        let mut current: HashSet<String> = HashSet::new();
+        let mut persisted: HashSet<String> = HashSet::new();
+
+        // Previous generation, already persisted.
+        for name in ["seg_old.term_dict", "seg_old.postings", "seg_old.store"] {
+            current.insert(name.to_string());
+            persisted.insert(name.to_string());
+        }
+        persisted.insert("metadata.json".to_string());
+        // Retired by a merge — present in storage, gone from the directory.
+        persisted.insert("seg_retired.store".to_string());
+
+        // New commit output: enough files that arbitrary HashSet iteration
+        // order cannot accidentally satisfy the assertions.
+        for i in 0..64 {
+            current.insert(format!("seg_new_{i:02}.store"));
+        }
+        current.insert("metadata.json".to_string());
+
+        let (writes, deletes) = plan_storage_sync(&current, &persisted);
+
+        // metadata.json is the commit point: it must be stored strictly
+        // after every data file it references.
+        assert_eq!(
+            writes.last().map(String::as_str),
+            Some("metadata.json"),
+            "metadata.json must be persisted last: {writes:?}"
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|w| w.as_str() == "metadata.json")
+                .count(),
+            1
+        );
+
+        // Exactly the new data files are written, in deterministic order;
+        // unchanged persisted files are not rewritten.
+        let data_writes = &writes[..writes.len() - 1];
+        assert_eq!(data_writes.len(), 64);
+        assert!(data_writes.iter().all(|w| w.starts_with("seg_new_")));
+        assert!(
+            data_writes.windows(2).all(|w| w[0] < w[1]),
+            "data files must be written in deterministic sorted order: {data_writes:?}"
+        );
+
+        // Retired files are deleted (sync_to_storage runs deletions only
+        // after the metadata write).
+        assert_eq!(deletes, vec!["seg_retired.store".to_string()]);
     }
 }

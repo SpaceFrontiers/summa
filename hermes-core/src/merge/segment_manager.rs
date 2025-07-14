@@ -73,6 +73,12 @@ use super::{MergePolicy, SegmentInfo};
 struct ActiveOperationState {
     segment_ids: HashSet<String>,
     operation_tokens: HashSet<u64>,
+    /// Subset of `operation_tokens` owned by indexing producers. Their guards
+    /// travel with built-but-uncommitted `PreparedSegment`s and are released
+    /// only by a later commit/abort, so drain barriers must not wait on them:
+    /// the commit that would release them can be blocked on the barrier's own
+    /// caller (writer write lock / `&mut self`).
+    indexing_tokens: HashSet<u64>,
     next_operation_token: u64,
     accepting: bool,
 }
@@ -89,6 +95,7 @@ impl ActiveSegmentOperations {
             inner: parking_lot::Mutex::new(ActiveOperationState {
                 segment_ids: HashSet::new(),
                 operation_tokens: HashSet::new(),
+                indexing_tokens: HashSet::new(),
                 next_operation_token: 0,
                 accepting: true,
             }),
@@ -97,9 +104,27 @@ impl ActiveSegmentOperations {
         }
     }
 
-    /// Try to claim IDs for an operation. Returns a guard on success, `None`
-    /// if any requested ID is already owned by another active operation.
+    /// Try to claim IDs for a self-draining lifecycle operation (merge,
+    /// reorder, cleanup). Returns a guard on success, `None` if any requested
+    /// ID is already owned by another active operation.
     fn try_register(self: &Arc<Self>, segment_ids: Vec<String>) -> Option<SegmentOperationGuard> {
+        self.try_register_kind(segment_ids, false)
+    }
+
+    /// Try to claim IDs for an indexing producer whose guard is held until
+    /// metadata publication (commit) rather than task completion.
+    fn try_register_indexing(
+        self: &Arc<Self>,
+        segment_ids: Vec<String>,
+    ) -> Option<SegmentOperationGuard> {
+        self.try_register_kind(segment_ids, true)
+    }
+
+    fn try_register_kind(
+        self: &Arc<Self>,
+        segment_ids: Vec<String>,
+        indexing: bool,
+    ) -> Option<SegmentOperationGuard> {
         let mut inner = self.inner.lock();
         if !inner.accepting {
             log::debug!("[segment_lifecycle] rejected operation during shutdown");
@@ -128,6 +153,9 @@ impl ActiveSegmentOperations {
         }
         inner.next_operation_token = next_operation_token;
         inner.operation_tokens.insert(operation_token);
+        if indexing {
+            inner.indexing_tokens.insert(operation_token);
+        }
         Some(SegmentOperationGuard {
             active_operations: Arc::clone(self),
             segment_ids,
@@ -140,12 +168,24 @@ impl ActiveSegmentOperations {
         self.inner.lock().segment_ids.clone()
     }
 
-    /// Exact operation identities active at one instant. Unlike segment IDs,
-    /// tokens cannot be reused by a later retry, so an artifact-update barrier
-    /// can drain only pre-gate producers without being starved by new flat
-    /// producers.
-    fn operation_tokens_snapshot(&self) -> HashSet<u64> {
-        self.inner.lock().operation_tokens.clone()
+    /// Exact identities of self-draining operations (merge/reorder/cleanup)
+    /// active at one instant, plus the number of indexing tokens excluded.
+    /// Unlike segment IDs, tokens cannot be reused by a later retry, so an
+    /// artifact-update barrier can drain only pre-gate producers without being
+    /// starved by new flat producers.
+    ///
+    /// Indexing tokens are deliberately excluded: their guards are parked in
+    /// built-but-uncommitted `PreparedSegment`s and only a later commit — which
+    /// may be blocked on the barrier's caller — releases them, so waiting on
+    /// them deadlocks (see `begin_vector_artifact_update`).
+    fn draining_operation_tokens_snapshot(&self) -> (HashSet<u64>, usize) {
+        let inner = self.inner.lock();
+        let tokens = inner
+            .operation_tokens
+            .difference(&inner.indexing_tokens)
+            .copied()
+            .collect();
+        (tokens, inner.indexing_tokens.len())
     }
 
     /// Atomically prevent new lifecycle work from starting. Existing guards
@@ -215,6 +255,7 @@ impl Drop for SegmentOperationGuard {
             inner.segment_ids.remove(id);
         }
         inner.operation_tokens.remove(&self.operation_token);
+        inner.indexing_tokens.remove(&self.operation_token);
         // Token barriers need notification on every completion, not only the
         // transition to complete global idleness.
         self.active_operations.idle.notify_waiters();
@@ -266,6 +307,48 @@ fn merge_retry_delay(consecutive_failures: u32) -> std::time::Duration {
         .checked_mul(1u32 << shift)
         .unwrap_or(MERGE_RETRY_MAX_DELAY)
         .min(MERGE_RETRY_MAX_DELAY)
+}
+
+/// Merge JoinHandles taken out of the shared list for draining.
+///
+/// Drain futures are awaited inline by RPC handlers (force_merge/reorder) and
+/// can be dropped at any await when a client disconnects. Handles are awaited
+/// through this guard and removed only after completion, so a cancelled drain
+/// returns every un-awaited (and possibly still-running) merge to the shared
+/// list instead of silently detaching it from shutdown, abort, and
+/// force-merge tracking.
+struct DrainedMergeHandles<'a> {
+    shared: &'a parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    drained: Vec<JoinHandle<()>>,
+}
+
+impl<'a> DrainedMergeHandles<'a> {
+    fn take(shared: &'a parking_lot::Mutex<Vec<JoinHandle<()>>>) -> Self {
+        let drained = std::mem::take(&mut *shared.lock());
+        Self { shared, drained }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.drained.is_empty()
+    }
+
+    /// Await the next handle. It stays owned by this guard while being polled
+    /// and is discarded only once it has completed, so cancellation at the
+    /// await reinserts it via `Drop`.
+    async fn join_next(&mut self) -> Option<std::result::Result<(), tokio::task::JoinError>> {
+        let handle = self.drained.last_mut()?;
+        let result = handle.await;
+        self.drained.pop();
+        Some(result)
+    }
+}
+
+impl Drop for DrainedMergeHandles<'_> {
+    fn drop(&mut self) {
+        if !self.drained.is_empty() {
+            self.shared.lock().append(&mut self.drained);
+        }
+    }
 }
 
 /// Spawn and register auxiliary lifecycle work as one synchronous operation.
@@ -416,6 +499,11 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// forever when no later commit happens to re-run merge policy evaluation.
     global_merge_wakeup_pending: AtomicBool,
 
+    /// Times `force_merge` observed a conflicting active operation and retried.
+    /// Test-only observability for the conflict-retry backoff.
+    #[cfg(test)]
+    force_merge_conflict_retries: std::sync::atomic::AtomicU64,
+
     /// Auxiliary lifecycle tasks: metadata transactions, deferred deletes,
     /// and capacity wakeups. Handles registered here are drained before index
     /// removal.
@@ -557,6 +645,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             reorder_retries: parking_lot::Mutex::new(HashMap::new()),
             merge_handles: parking_lot::Mutex::new(Vec::new()),
             global_merge_wakeup_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            force_merge_conflict_retries: std::sync::atomic::AtomicU64::new(0),
             lifecycle_handles,
             trained: Arc::new(ArcSwapOption::new(None)),
             vector_artifact_update: Arc::new(AtomicBool::new(false)),
@@ -698,7 +788,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     pub(crate) fn protect_new_segment(&self, segment_id: String) -> Result<SegmentOperationGuard> {
         match self
             .active_operations
-            .try_register(vec![segment_id.clone()])
+            .try_register_indexing(vec![segment_id.clone()])
         {
             Some(operation) => Ok(operation),
             None if !self.active_operations.is_accepting() => Err(Error::IndexClosed),
@@ -944,13 +1034,21 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Start an exclusive trained-artifact update and drain producers that may
-    /// already hold the previous generation.
+    /// Start an exclusive trained-artifact update and drain merge/reorder
+    /// producers that may already hold the previous generation.
     ///
     /// New segment operations may continue while this waits, but they observe
     /// the gate through `trained_for_segment_build` and therefore emit flat
     /// vector data. The guard is cancellation-safe: dropping the requesting
     /// future reopens ANN production without leaving the manager wedged.
+    ///
+    /// Indexing tokens are NOT waited on: their guards are parked inside
+    /// built-but-uncommitted `PreparedSegment`s and are released only by a
+    /// later commit. That commit typically needs the writer this update's
+    /// caller already holds (server write lock / embedded `&mut self`), so
+    /// waiting on them would permanently wedge build/rebuild_vector_index.
+    /// Segments those tokens own were built against the previous generation
+    /// and surface to the rebuild safety check once committed.
     pub(crate) async fn begin_vector_artifact_update(&self) -> Result<VectorArtifactUpdateGuard> {
         self.vector_artifact_update
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -962,7 +1060,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 updating: Arc::clone(&self.vector_artifact_update),
             }),
         };
-        let preexisting = self.active_operations.operation_tokens_snapshot();
+        let (preexisting, parked_indexing) =
+            self.active_operations.draining_operation_tokens_snapshot();
+        if parked_indexing > 0 {
+            log::warn!(
+                "[trained] artifact update proceeding past {} in-flight/uncommitted indexing \
+                 segment(s); segments built before this update keep the previous artifact \
+                 generation and become visible to rebuild safety checks once committed",
+                parked_indexing,
+            );
+        }
         self.active_operations
             .wait_until_operations_finish(&preexisting)
             .await;
@@ -1366,16 +1473,36 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 sm.maybe_merge().await;
             } else if let Some(retry_delay) = retry_delay {
                 // A backoff without a wakeup can strand eligible segments
-                // forever when no later commit happens. Keep this sleep inside
-                // the tracked merge task so shutdown can await it safely.
-                tokio::select! {
-                    () = tokio::time::sleep(retry_delay) => {
-                        sm.maybe_merge().await;
-                    }
-                    () = sm.active_operations.wait_for_shutdown() => {}
-                }
+                // forever when no later commit happens. The sleep runs as a
+                // tracked *lifecycle* task, not inside this merge JoinHandle:
+                // wait_for_all_merges/force_merge/reorder drain merge handles,
+                // and a pure backoff timer with no work in flight must not
+                // stall them for up to MERGE_RETRY_MAX_DELAY.
+                sm.schedule_merge_retry_wakeup(retry_delay);
             }
         }))
+    }
+
+    /// Re-evaluate merge policy after a failure backoff, outside the tracked
+    /// merge JoinHandles that merge waiters drain. Shutdown still drains this
+    /// task deterministically (lifecycle handles) and interrupts its sleep.
+    fn schedule_merge_retry_wakeup(self: &Arc<Self>, retry_delay: std::time::Duration) {
+        let manager = Arc::clone(self);
+        let future = async move {
+            tokio::select! {
+                () = tokio::time::sleep(retry_delay) => {
+                    manager.maybe_merge().await;
+                }
+                () = manager.active_operations.wait_for_shutdown() => {}
+            }
+        };
+        let runtime = tokio::runtime::Handle::current();
+        if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
+            log::warn!(
+                "[merge] runtime rejected merge-retry wakeup task; eligible segments may stay \
+                 unmerged until the next commit re-runs merge policy evaluation"
+            );
+        }
     }
 
     /// Atomically replace old segments with a new merged segment.
@@ -1685,14 +1812,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// merge-time BP still owned an `OffsetWriter`, allowing index deletion or
     /// orphan cleanup to race a live writer. Awaiting is the only sound generic
     /// behavior until every merge phase supports cooperative cancellation.
+    ///
+    /// Cancellation-safe: dropping this future mid-drain returns un-awaited
+    /// handles to `merge_handles` so later drains still see in-flight merges.
     pub async fn abort_merges(&self) {
         loop {
-            let handles: Vec<JoinHandle<()>> = { std::mem::take(&mut *self.merge_handles.lock()) };
+            let mut handles = DrainedMergeHandles::take(&self.merge_handles);
             if handles.is_empty() {
                 return;
             }
-            for handle in handles {
-                if let Err(error) = handle.await
+            while let Some(result) = handles.join_next().await {
+                if let Err(error) = result
                     && error.is_panic()
                 {
                     log::error!("[merge] background task panicked while draining: {}", error);
@@ -1702,27 +1832,29 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Wait for all current in-flight merges to complete.
+    ///
+    /// Cancellation-safe: dropping this future mid-drain returns un-awaited
+    /// handles to `merge_handles` so later drains still see in-flight merges.
     pub async fn wait_for_merging_thread(self: &Arc<Self>) {
-        let handles: Vec<JoinHandle<()>> = { std::mem::take(&mut *self.merge_handles.lock()) };
-        for h in handles {
-            let _ = h.await;
-        }
+        let mut handles = DrainedMergeHandles::take(&self.merge_handles);
+        while handles.join_next().await.is_some() {}
     }
 
     /// Wait for all eligible merges to complete, including cascading merges.
     ///
     /// Drains current handles, then loops. Each completed merge auto-triggers
     /// `maybe_merge` (which pushes new handles) before its JoinHandle resolves,
-    /// so by the time `h.await` returns all cascading handles are registered.
+    /// so by the time `join_next` returns all cascading handles are registered.
+    ///
+    /// Cancellation-safe: dropping this future mid-drain returns un-awaited
+    /// handles to `merge_handles` so later drains still see in-flight merges.
     pub async fn wait_for_all_merges(self: &Arc<Self>) {
         loop {
-            let handles: Vec<JoinHandle<()>> = { std::mem::take(&mut *self.merge_handles.lock()) };
+            let mut handles = DrainedMergeHandles::take(&self.merge_handles);
             if handles.is_empty() {
                 break;
             }
-            for h in handles {
-                let _ = h.await;
-            }
+            while handles.join_next().await.is_some() {}
         }
     }
 
@@ -1758,6 +1890,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// `maybe_merge` from spawning a conflicting background merge.
     pub async fn force_merge(self: &Arc<Self>) -> Result<()> {
         const FORCE_MERGE_BATCH: usize = 64;
+        // Conflicting owners that never appear in `merge_handles` (background
+        // reorders, a concurrent force-merge) can hold a batch segment for
+        // minutes to hours; retrying without parking would busy-spin a runtime
+        // worker and hammer the state mutex for that whole window.
+        const FORCE_MERGE_CONFLICT_BACKOFF: std::time::Duration =
+            std::time::Duration::from_millis(100);
 
         let max_segment_docs = {
             let st = self.state.lock().await;
@@ -1848,8 +1986,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     return Err(Error::IndexClosed);
                 }
                 None => {
-                    // A background merge slipped in — wait for it, then retry the loop
+                    #[cfg(test)]
+                    self.force_merge_conflict_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Do not reserve application-wide merge capacity while
+                    // parked on a conflict.
+                    drop(_global_merge_permit);
+                    // A tracked background merge may have slipped in — drain
+                    // those first. The conflicting owner can also be a reorder
+                    // or another force-merge, which never appear in
+                    // merge_handles; back off so the retry loop cannot spin hot
+                    // for their entire duration.
+                    let had_tracked_merges = !self.merge_handles.lock().is_empty();
                     self.wait_for_merging_thread().await;
+                    if !had_tracked_merges {
+                        tokio::time::sleep(FORCE_MERGE_CONFLICT_BACKOFF).await;
+                    }
                     continue;
                 }
             };
@@ -2375,7 +2527,8 @@ mod tests {
     async fn operation_barrier_ignores_producers_started_after_snapshot() {
         let active = Arc::new(ActiveSegmentOperations::new());
         let before_gate = active.try_register(vec!["old".into()]).unwrap();
-        let barrier = active.operation_tokens_snapshot();
+        let (barrier, parked_indexing) = active.draining_operation_tokens_snapshot();
+        assert_eq!(parked_indexing, 0);
         let after_gate = active.try_register(vec!["new-flat".into()]).unwrap();
 
         let waiter = {
@@ -2562,5 +2715,281 @@ mod tests {
         assert!(manager.paused_reorder_segments().contains("source"));
         manager.clear_reorder_retry("source");
         assert!(!manager.paused_reorder_segments().contains("source"));
+    }
+
+    /// Fails `exists` with the transient I/O error class that sends a
+    /// background merge into its generic retry backoff (not source quarantine).
+    #[derive(Default)]
+    struct FailingExistsDirectory(crate::directories::RamDirectory);
+
+    #[async_trait::async_trait]
+    impl crate::directories::Directory for FailingExistsDirectory {
+        async fn exists(&self, _path: &std::path::Path) -> std::io::Result<bool> {
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+
+        async fn file_size(&self, path: &std::path::Path) -> std::io::Result<u64> {
+            self.0.file_size(path).await
+        }
+
+        async fn open_read(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<crate::directories::FileHandle> {
+            self.0.open_read(path).await
+        }
+
+        async fn read_range(
+            &self,
+            path: &std::path::Path,
+            range: std::ops::Range<u64>,
+        ) -> std::io::Result<crate::directories::OwnedBytes> {
+            self.0.read_range(path, range).await
+        }
+
+        async fn list_files(
+            &self,
+            prefix: &std::path::Path,
+        ) -> std::io::Result<Vec<std::path::PathBuf>> {
+            self.0.list_files(prefix).await
+        }
+
+        async fn open_lazy(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<crate::directories::FileHandle> {
+            self.0.open_lazy(path).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::directories::DirectoryWriter for FailingExistsDirectory {
+        async fn write(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+            self.0.write(path, data).await
+        }
+
+        async fn delete(&self, path: &std::path::Path) -> std::io::Result<()> {
+            self.0.delete(path).await
+        }
+
+        async fn rename(
+            &self,
+            from: &std::path::Path,
+            to: &std::path::Path,
+        ) -> std::io::Result<()> {
+            self.0.rename(from, to).await
+        }
+
+        async fn sync(&self) -> std::io::Result<()> {
+            self.0.sync().await
+        }
+
+        async fn streaming_writer(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<Box<dyn crate::directories::StreamingWriter>> {
+            self.0.streaming_writer(path).await
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MergeEverythingPolicy;
+
+    impl MergePolicy for MergeEverythingPolicy {
+        fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<crate::merge::MergeCandidate> {
+            if segments.len() < 2 {
+                return Vec::new();
+            }
+            vec![crate::merge::MergeCandidate {
+                segment_ids: segments.iter().map(|s| s.id.clone()).collect(),
+            }]
+        }
+
+        fn clone_box(&self) -> Box<dyn MergePolicy> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_update_does_not_wait_for_built_uncommitted_indexing_segments() {
+        let manager = lifecycle_test_manager();
+        // Simulates a memory-budget mid-cycle segment build whose guard is
+        // parked inside a PreparedSegment: only a later commit releases this
+        // token, and that commit can be blocked on the very caller of the
+        // artifact update (writer write lock / &mut self).
+        let parked_indexing = manager
+            .protect_new_segment("00000000000000000000000000000abc".into())
+            .unwrap();
+
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.begin_vector_artifact_update(),
+        )
+        .await
+        .expect("begin_vector_artifact_update deadlocked on a built-but-uncommitted segment")
+        .unwrap();
+
+        drop(guard);
+        drop(parked_indexing);
+    }
+
+    #[tokio::test]
+    async fn artifact_update_still_drains_preexisting_lifecycle_operations() {
+        let manager = lifecycle_test_manager();
+        let merge_like = manager
+            .active_operations
+            .try_register(vec!["merge-source".into()])
+            .unwrap();
+
+        let waiter = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.begin_vector_artifact_update().await })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "artifact update must drain merge/reorder producers that may hold the previous generation"
+        );
+
+        drop(merge_like);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("artifact update missed the lifecycle guard release")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_merge_drain_returns_unawaited_handles_to_shared_state() {
+        let manager = lifecycle_test_manager();
+        let release = Arc::new(Semaphore::new(0));
+        let merge_task = {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let _permit = release.acquire().await.unwrap();
+            })
+        };
+        manager.merge_handles.lock().push(merge_task);
+
+        let waiter = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.wait_for_all_merges().await })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiter.is_finished());
+        // Simulates tonic dropping a force_merge/reorder RPC future at the
+        // JoinHandle await when the client disconnects.
+        waiter.abort();
+        let join_error = waiter.await.unwrap_err();
+        assert!(join_error.is_cancelled());
+
+        assert!(
+            !manager.merge_handles.lock().is_empty(),
+            "cancelled drain detached an in-flight merge from shutdown/force-merge tracking"
+        );
+
+        // A later drain must still see and await the real in-flight merge.
+        release.add_permits(1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.wait_for_all_merges(),
+        )
+        .await
+        .expect("subsequent drain missed the reinserted merge handle");
+        assert!(manager.merge_handles.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_merge_conflict_retry_backs_off_instead_of_busy_spinning() {
+        let manager = lifecycle_test_manager();
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .metadata
+                .add_segment("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), 10);
+            state
+                .metadata
+                .add_segment("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(), 10);
+        }
+        // A background reorder (or a concurrent force-merge) owns one segment
+        // in the batch but never appears in merge_handles.
+        let reorder_like = manager
+            .active_operations
+            .try_register(vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()])
+            .unwrap();
+
+        let force_merge = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.force_merge().await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let retries = manager.force_merge_conflict_retries.load(Ordering::Relaxed);
+        assert!(
+            retries >= 1,
+            "force_merge never observed the conflicting owner (retries={retries})"
+        );
+        assert!(
+            retries < 20,
+            "force_merge busy-spun on a conflict that is not a tracked merge (retries={retries})"
+        );
+
+        drop(reorder_like);
+        // With the conflict gone the loop proceeds; the batch then fails fast
+        // in do_merge (the test IDs have no files), proving the loop exited.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), force_merge)
+            .await
+            .expect("force_merge kept spinning after the conflicting owner released")
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn merge_failure_retry_backoff_does_not_stall_merge_waiters() {
+        let schema = crate::dsl::SchemaBuilder::default().build();
+        let mut metadata = IndexMetadata::new(schema.clone());
+        metadata.add_segment("00000000000000000000000000000001".into(), 10);
+        metadata.add_segment("00000000000000000000000000000002".into(), 10);
+        let manager = Arc::new(SegmentManager::new(
+            Arc::new(FailingExistsDirectory::default()),
+            Arc::new(schema),
+            metadata,
+            Box::new(MergeEverythingPolicy),
+            0,
+            1,
+            Arc::new(Semaphore::new(1)),
+            None,
+            1024,
+            Arc::new(Semaphore::new(1)),
+            None,
+        ));
+
+        // Spawns a background merge that fails with a transient I/O error and
+        // arms the 30s..30min retry backoff.
+        manager.maybe_merge().await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.wait_for_all_merges(),
+        )
+        .await
+        .expect("wait_for_all_merges stalled behind a pure retry-backoff timer");
+        assert!(
+            manager.merge_retry_is_paused(),
+            "the failed merge should have armed the retry backoff"
+        );
+
+        // Shutdown still drains the pending backoff wakeup deterministically.
+        manager.begin_shutdown();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.wait_for_shutdown(),
+        )
+        .await
+        .expect("shutdown did not drain the merge retry wakeup task");
     }
 }

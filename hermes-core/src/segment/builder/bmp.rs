@@ -227,6 +227,22 @@ pub(crate) fn build_bmp_blob(
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
     dim_ids.sort_unstable();
 
+    // The block-max grid only has rows for dim_id < dims; postings beyond
+    // that would be written into block data but never into the grid, making
+    // those dimensions silently unsearchable. Fail loud instead.
+    if let Some(&max_dim) = dim_ids.last()
+        && max_dim >= dims
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "BMP postings contain dim_id {max_dim} out of range for the configured \
+                 dims={dims}: dimensions >= dims have no block-max grid row and can never \
+                 match a query; raise `dims` in the field's sparse_vector config"
+            ),
+        ));
+    }
+
     // Phase 2: K-way merge over per-dim cursors
     //
     // Take ownership of per-dim posting Vecs. This drains the HashMap so
@@ -695,6 +711,21 @@ pub(crate) fn stream_write_grids(
     }
     let packed_bytes = (num_dims * packed_row_size) as u64;
 
+    // Entries with dim_id >= num_dims sort past the cursor and have no grid
+    // row: they would be dropped silently, leaving those dimensions
+    // unsearchable. The segment builder rejects them at add/build time, so
+    // leftovers here mean a legacy blob or a caller bug — say so loudly.
+    if gi < grid_entries.len() {
+        log::warn!(
+            "[bmp] {} grid entries with dim_id >= dims={} dropped from the block-max grid \
+             (first dim_id={}); these dimensions are unsearchable — raise `dims` in the \
+             field's sparse_vector config and rebuild",
+            grid_entries.len() - gi,
+            num_dims,
+            grid_entries[gi].0,
+        );
+    }
+
     // Section E: 8-bit superblock grid, one dim row at a time
     gi = 0;
     for dim_id in 0..num_dims as u32 {
@@ -834,6 +865,20 @@ pub(crate) fn stream_write_grids_merged(
     }
     let packed_bytes = (num_dims * packed_row_size) as u64;
 
+    // Same silent-drop hazard as `stream_write_grids`: any entry still
+    // pending after the dim sweep has dim_id >= dims and no grid row.
+    for reader in run_readers.iter() {
+        if let Some((dim_id, _, _)) = reader.current {
+            log::warn!(
+                "[bmp] grid run contains entries with dim_id >= dims={num_dims} \
+                 (first dim_id={dim_id}) that were dropped from the block-max grid; \
+                 these dimensions are unsearchable — raise `dims` in the field's \
+                 sparse_vector config and rebuild",
+            );
+            break;
+        }
+    }
+
     // Reset all readers for pass 2
     for reader in run_readers.iter_mut() {
         reader.reset()?;
@@ -909,6 +954,25 @@ mod tests {
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
         assert_eq!(magic, BMP_BLOB_MAGIC_V14);
+    }
+
+    #[test]
+    fn test_build_bmp_blob_rejects_dim_id_out_of_range() {
+        // The grid only has rows for dim_id < dims; postings beyond that were
+        // silently dropped from the grid (unsearchable). Must fail loud.
+        let mut postings = FxHashMap::default();
+        postings.insert(2u32, vec![(0u32, 0u16, 1.0f32)]);
+        postings.insert(7u32, vec![(1u32, 0u16, 0.5f32)]); // >= dims (4)
+
+        let mut buf = Vec::new();
+        let err = build_bmp_blob(postings, 64, 4, 0.0, None, 4, 5.0, 4, &mut buf)
+            .expect_err("dim_id >= dims must be rejected at build time");
+        let msg = err.to_string();
+        assert!(msg.contains('7'), "error must name the dim_id: {msg}");
+        assert!(
+            msg.contains('4'),
+            "error must name the configured dims: {msg}"
+        );
     }
 
     #[test]
