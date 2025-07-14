@@ -113,9 +113,9 @@ cubek = { git = "https://github.com/ppodolsky/cubek", rev = "058827ffef7231d4890
 # fix + asynchronous cuBLAS BF16 GEMM server dispatch) for Burn's direct
 # CubeCL dependencies as well as hermes-llm's.
 [patch."https://github.com/tracel-ai/cubecl"]
-cubecl = { git = "https://github.com/ppodolsky/cubecl", rev = "463c295252157294429779dfcb594a708cbf5284" }
-cubecl-common = { git = "https://github.com/ppodolsky/cubecl", rev = "463c295252157294429779dfcb594a708cbf5284" }
-cubecl-zspace = { git = "https://github.com/ppodolsky/cubecl", rev = "463c295252157294429779dfcb594a708cbf5284" }
+cubecl = { git = "https://github.com/ppodolsky/cubecl", rev = "bda6a68d86df41f468cac78d713f1563869daa8e" }
+cubecl-common = { git = "https://github.com/ppodolsky/cubecl", rev = "bda6a68d86df41f468cac78d713f1563869daa8e" }
+cubecl-zspace = { git = "https://github.com/ppodolsky/cubecl", rev = "bda6a68d86df41f468cac78d713f1563869daa8e" }
 
 # Route every Burn crate to the pinned fork: upstream `bd6e8fa2f` plus the
 # BF16 native-GEMM matmul dispatch (autotune-arbitrated against fused CubeK)

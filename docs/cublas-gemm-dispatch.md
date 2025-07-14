@@ -74,3 +74,22 @@ async cuBLAS server GEMM (`463c2952`, fast-forward of the production pin).
 
 F16 prepared-weight decode dispatch (M=1, N≈50304) remains unevaluated — it
 targets inference decode, not training, and needs the F16 dtype mapping first.
+
+## cublasLt (measured neutral, kept)
+
+The dispatch now goes through `cublasLtMatmul` with a per-shape cached
+execution plan: descriptor + layouts + the algorithm
+`cublasLtMatmulAlgoGetHeuristic` selects with a 32 MiB per-stream workspace
+(fork branch `cublaslt`, rev bda6a68d). This is the same machinery PyTorch's
+linear uses, replacing `cublasGemmEx` + `CUBLAS_GEMM_DEFAULT_TENSOR_OP`.
+
+Measured (A100, retriever-100m, T1024/ga8, 2026-07-17): 43,214 → 43,217
+tok/s @B20 and 44,193 → 44,201 @B26 — flat within noise, gates green,
+gradient norms identical. At these shapes the legacy heuristic was already
+picking equivalent kernels, and the autotune arbitration against
+CubeK-fused had already captured the remaining arbitrage. Kept anyway: no
+regression, and the heuristic + workspace machinery is what future shapes
+(and an eventual FLOPS-aware preference pass) build on. Together with the
+five measured scan-backward rejections this pins BOTH the GEMM pool
+(~23.6%) and the scan pool (15.1%) at their practical floors for the
+current kernel architectures.
