@@ -478,18 +478,29 @@ impl SegmentMerger {
             .count();
 
         // --- Try O(1) cluster merge for homogeneous ScaNN ---
+        // Pair each ANN index with its own segment's doc offset BEFORE
+        // filtering: segments without the field are dropped from the list, so
+        // zipping the filtered list against the full `doc_offs` array would
+        // remap every later segment's vectors with the wrong offset.
         let scann_indexes: Vec<_> = segments
             .iter()
-            .filter_map(|s| s.get_scann_vector_index(field))
+            .enumerate()
+            .filter_map(|(seg_idx, s)| {
+                s.get_scann_vector_index(field)
+                    .map(|index| (doc_offs[seg_idx], index))
+            })
             .collect();
 
         if scann_indexes.len() == segments_with_flat && !scann_indexes.is_empty() {
-            let refs: Vec<&crate::structures::IVFPQIndex> =
-                scann_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
-            let codebook = scann_indexes.first().map(|(_, cb)| cb);
+            let refs: Vec<&crate::structures::IVFPQIndex> = scann_indexes
+                .iter()
+                .map(|(_, (idx, _))| idx.as_ref())
+                .collect();
+            let offsets: Vec<u32> = scann_indexes.iter().map(|(off, _)| *off).collect();
+            let codebook = scann_indexes.first().map(|(_, (_, cb))| cb);
 
             match (
-                crate::structures::IVFPQIndex::merge(&refs, doc_offs),
+                crate::structures::IVFPQIndex::merge(&refs, &offsets),
                 codebook,
             ) {
                 (Ok(merged), Some(codebook)) => {
@@ -512,18 +523,26 @@ impl SegmentMerger {
         }
 
         // --- Try O(1) cluster merge for homogeneous IVF-RaBitQ ---
+        // Same offset pairing as ScaNN above: enumerate before filtering.
         let ivf_indexes: Vec<_> = segments
             .iter()
-            .filter_map(|s| s.get_ivf_vector_index(field))
+            .enumerate()
+            .filter_map(|(seg_idx, s)| {
+                s.get_ivf_vector_index(field)
+                    .map(|index| (doc_offs[seg_idx], index))
+            })
             .collect();
 
         if ivf_indexes.len() == segments_with_flat && !ivf_indexes.is_empty() {
-            let refs: Vec<&crate::structures::IVFRaBitQIndex> =
-                ivf_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
-            let codebook = ivf_indexes.first().map(|(_, cb)| cb);
+            let refs: Vec<&crate::structures::IVFRaBitQIndex> = ivf_indexes
+                .iter()
+                .map(|(_, (idx, _))| idx.as_ref())
+                .collect();
+            let offsets: Vec<u32> = ivf_indexes.iter().map(|(off, _)| *off).collect();
+            let codebook = ivf_indexes.first().map(|(_, (_, cb))| cb);
 
             match (
-                crate::structures::IVFRaBitQIndex::merge(&refs, doc_offs),
+                crate::structures::IVFRaBitQIndex::merge(&refs, &offsets),
                 codebook,
             ) {
                 (Ok(merged), Some(codebook)) => {
@@ -673,5 +692,158 @@ impl SegmentMerger {
             ann_start.elapsed().as_secs_f64()
         );
         Ok(Some((index_type, bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::SegmentMerger;
+    use crate::directories::RamDirectory;
+    use crate::dsl::{DenseVectorConfig, Document, SchemaBuilder};
+    use crate::index::{IndexConfig, IndexWriter};
+    use crate::segment::reader::SegmentReader;
+    use crate::segment::types::SegmentId;
+
+    async fn committed_segment_ids(dir: &RamDirectory) -> Vec<String> {
+        crate::index::IndexMetadata::load(dir)
+            .await
+            .unwrap()
+            .segment_ids()
+    }
+
+    async fn newly_committed_segment(dir: &RamDirectory, known: &mut Vec<String>) -> String {
+        let ids = committed_segment_ids(dir).await;
+        let new: Vec<String> = ids
+            .iter()
+            .filter(|id| !known.contains(id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            new.len(),
+            1,
+            "expected exactly one new segment, got {new:?}"
+        );
+        *known = ids;
+        new.into_iter().next().unwrap()
+    }
+
+    /// Regression: the O(1) IVF/ScaNN cluster merge used to zip the FILTERED
+    /// list of per-field ANN indexes against the FULL per-segment doc-offset
+    /// array. With merge sources [A(has field), B(no field), C(has field)],
+    /// C's vectors were remapped with B's offset instead of its own, silently
+    /// persisting wrong doc ids in the merged ANN index.
+    #[tokio::test]
+    async fn o1_ann_cluster_merge_skips_offsets_of_segments_without_the_field() {
+        let dim = 8;
+        let mut sb = SchemaBuilder::default();
+        let title = sb.add_text_field("title", true, true);
+        let embedding = sb.add_dense_vector_field_with_config(
+            "embedding",
+            true,
+            true,
+            DenseVectorConfig::with_scann(dim, Some(1), 1),
+        );
+        let schema = sb.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config)
+            .await
+            .unwrap();
+
+        // Training segment: provides the sample, stays out of the merge.
+        for i in 0..4 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("train {i}"));
+            doc.add_dense_vector(embedding, vec![i as f32 + 1.0; dim]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let mut known = committed_segment_ids(&dir).await;
+        writer.build_vector_index().await.unwrap();
+
+        // Segment A: 2 docs WITH the field (gets a per-segment IVF at flush).
+        for i in 0..2 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("a {i}"));
+            doc.add_dense_vector(embedding, vec![0.5; dim]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let seg_a = newly_committed_segment(&dir, &mut known).await;
+
+        // Segment B: 3 docs WITHOUT the field (no flat entry, no ANN entry).
+        for i in 0..3 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("b {i}"));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let seg_b = newly_committed_segment(&dir, &mut known).await;
+
+        // Segment C: 2 docs WITH the field.
+        for i in 0..2 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("c {i}"));
+            doc.add_dense_vector(embedding, vec![0.25; dim]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let seg_c = newly_committed_segment(&dir, &mut known).await;
+
+        // Open the merge sources in a fixed order: [A, B, C].
+        let schema = Arc::new(schema);
+        let mut readers = Vec::new();
+        for id in [&seg_a, &seg_b, &seg_c] {
+            readers.push(
+                SegmentReader::open(
+                    &dir,
+                    SegmentId::from_hex(id).unwrap(),
+                    Arc::clone(&schema),
+                    16,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert!(readers[0].get_scann_vector_index(embedding).is_some());
+        assert!(
+            readers[1].get_scann_vector_index(embedding).is_none(),
+            "segment B must not carry the dense field"
+        );
+        assert!(readers[2].get_scann_vector_index(embedding).is_some());
+
+        let merged_id = SegmentId::new();
+        SegmentMerger::new(Arc::clone(&schema))
+            .merge(&dir, &readers, merged_id, None)
+            .await
+            .unwrap();
+
+        let merged = SegmentReader::open(&dir, merged_id, Arc::clone(&schema), 16)
+            .await
+            .unwrap();
+        let (scann, _codebook) = merged
+            .get_scann_vector_index(embedding)
+            .expect("homogeneous ScaNN sources must take the O(1) cluster-merge path");
+
+        let mut doc_ids: Vec<u32> = scann
+            .clusters
+            .iter()
+            .flat_map(|(_, cluster)| cluster.iter().map(|(doc_id, _, _)| doc_id))
+            .collect();
+        doc_ids.sort_unstable();
+        // A occupies merged docs 0..2, B (no vectors) 2..5, C 5..7. C's
+        // vectors must be remapped with C's own offset (5), not B's (2).
+        assert_eq!(
+            doc_ids,
+            vec![0, 1, 5, 6],
+            "merged ANN doc ids must use each field-bearing segment's own offset"
+        );
     }
 }

@@ -38,7 +38,7 @@ pub use reader::IndexReader;
 #[cfg(all(feature = "wasm", not(feature = "native")))]
 pub use wasm_writer::IndexWriter as WasmIndexWriter;
 #[cfg(feature = "native")]
-pub use writer::{IndexWriter, PreparedCommit};
+pub use writer::{IndexWriter, PreparedCommit, WRITER_LOCK_FILENAME};
 
 mod metadata;
 pub use metadata::{
@@ -242,6 +242,22 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         let schema = Arc::new(schema);
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());
+
+        // Refuse to clobber an existing index: persisting a fresh empty
+        // metadata.json would orphan every committed segment, and the next
+        // writer open's orphan sweep would permanently delete them.
+        if directory
+            .exists(std::path::Path::new(INDEX_META_FILENAME))
+            .await?
+        {
+            return Err(crate::Error::Internal(format!(
+                "refusing to create index: {} already exists in this directory; \
+                 use Index::open to open the existing index, or delete the \
+                 directory first if you really want to start over",
+                INDEX_META_FILENAME
+            )));
+        }
+
         let metadata = IndexMetadata::new((*schema).clone());
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(

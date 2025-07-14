@@ -167,13 +167,30 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .collect_vectors_for_training(segment_ids, &fields_to_build)
             .await?;
 
-        // Train every requested field before changing metadata. If any field
-        // fails, all durable field states remain Flat and the successfully
-        // written files are merely unreferenced retry targets.
+        self.train_and_publish_fields(
+            &fields_to_build,
+            &all_vectors,
+            &total_vectors,
+            artifact_update,
+        )
+        .await
+    }
+
+    /// Train every requested field from pre-collected samples, then durably
+    /// publish the artifacts. If any field fails, all durable field states
+    /// remain Flat and the successfully written files are merely unreferenced
+    /// retry targets.
+    async fn train_and_publish_fields(
+        &self,
+        fields_to_build: &[(Field, DenseVectorConfig)],
+        all_vectors: &FxHashMap<u32, Vec<Vec<f32>>>,
+        total_vectors: &FxHashMap<u32, usize>,
+        artifact_update: &crate::merge::VectorArtifactUpdateGuard,
+    ) -> Result<()> {
         let mut updates = Vec::with_capacity(fields_to_build.len());
-        for (field, config) in &fields_to_build {
+        for (field, config) in fields_to_build {
             if let Some(update) = self
-                .train_field_index(*field, config, &all_vectors, &total_vectors)
+                .train_field_index(*field, config, all_vectors, total_vectors)
                 .await?
             {
                 updates.push(update);
@@ -181,8 +198,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         if updates.is_empty() {
-            log::info!("No vectors available for trained vector-index fields");
-            return Ok(());
+            // Fail loud: training was explicitly requested and produced
+            // nothing — reporting success would leave callers believing the
+            // fields are Built.
+            let field_ids: Vec<u32> = fields_to_build.iter().map(|(field, _)| field.0).collect();
+            return Err(Error::Schema(format!(
+                "cannot train vector index: no training vectors were collected for \
+                 field(s) {field_ids:?}; commit documents containing these fields \
+                 before building"
+            )));
         }
 
         // Durable metadata and the complete validated ArcSwap set advance in a
@@ -228,6 +252,42 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.reject_rebuild_with_ann_segments(snapshot.segment_ids(), &field_ids)
             .await?;
 
+        // Reject malformed explicit settings before collecting samples.
+        for (_, config) in &dense_fields {
+            if config.uses_ivf() {
+                validate_explicit_ivf_num_clusters(config)?;
+            }
+        }
+
+        // Collect the retraining samples BEFORE the durable Built -> Flat
+        // reset: a read failure (propagated by collect_vectors_for_training)
+        // or an empty sample for a Built field must not destructively
+        // downgrade the published artifact generation.
+        let (all_vectors, total_vectors) = self
+            .collect_vectors_for_training(snapshot.segment_ids(), &dense_fields)
+            .await?;
+        let built_fields: Vec<u32> = self
+            .segment_manager
+            .read_metadata(|meta| {
+                field_ids
+                    .iter()
+                    .filter(|field_id| meta.is_field_built(**field_id))
+                    .copied()
+                    .collect()
+            })
+            .await;
+        let starved_built: Vec<u32> = built_fields
+            .into_iter()
+            .filter(|field_id| all_vectors.get(field_id).is_none_or(|v| v.is_empty()))
+            .collect();
+        if !starved_built.is_empty() {
+            return Err(Error::Schema(format!(
+                "cannot retrain vector index: no training vectors could be collected \
+                 for built field(s) {starved_built:?}; the existing trained artifacts \
+                 are left in place"
+            )));
+        }
+
         // Reset metadata and the ArcSwap set together. Old fixed-name artifact
         // files are left in place until the atomic writer replaces them; this
         // avoids a cancellation window and does not accumulate generations.
@@ -244,10 +304,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             })
             .await?;
 
-        log::info!("Reset vector index state to Flat, triggering rebuild...");
+        log::info!("Reset vector index state to Flat, retraining from collected samples...");
 
-        self.build_vector_index_locked(&dense_fields, &artifact_update)
-            .await
+        self.train_and_publish_fields(
+            &dense_fields,
+            &all_vectors,
+            &total_vectors,
+            &artifact_update,
+        )
+        .await
     }
 
     // ========================================================================
@@ -403,7 +468,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     total_skipped += n - indices.len();
                 }
 
-                // Batch-read and dequantize instead of one-by-one get_vector()
+                // Batch-read and dequantize instead of one-by-one get_vector().
+                // Read failures propagate: silently skipping vectors would
+                // train on an arbitrarily biased sample (or none at all) with
+                // no observability.
                 const BATCH: usize = 1024;
                 let mut f32_buf = vec![0f32; BATCH * dim];
                 for chunk in indices.chunks(BATCH) {
@@ -412,29 +480,31 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     let end = *chunk.last().unwrap();
                     if end - start + 1 == chunk.len() {
                         // Contiguous — single batch read
-                        if let Ok(batch_bytes) =
-                            lazy_flat.read_vectors_batch(start, chunk.len()).await
-                        {
-                            let floats = chunk.len() * dim;
-                            f32_buf.resize(floats, 0.0);
-                            crate::segment::dequantize_raw(
-                                batch_bytes.as_slice(),
-                                quant,
-                                floats,
-                                &mut f32_buf,
-                            )
+                        let batch_bytes = lazy_flat
+                            .read_vectors_batch(start, chunk.len())
+                            .await
                             .map_err(crate::Error::Io)?;
-                            for i in 0..chunk.len() {
-                                entry.push(f32_buf[i * dim..(i + 1) * dim].to_vec());
-                            }
+                        let floats = chunk.len() * dim;
+                        f32_buf.resize(floats, 0.0);
+                        crate::segment::dequantize_raw(
+                            batch_bytes.as_slice(),
+                            quant,
+                            floats,
+                            &mut f32_buf,
+                        )
+                        .map_err(crate::Error::Io)?;
+                        for i in 0..chunk.len() {
+                            entry.push(f32_buf[i * dim..(i + 1) * dim].to_vec());
                         }
                     } else {
                         // Non-contiguous (sampled) — read individually but reuse buffer
                         f32_buf.resize(dim, 0.0);
                         for &idx in chunk {
-                            if let Ok(()) = lazy_flat.read_vector_into(idx, &mut f32_buf).await {
-                                entry.push(f32_buf[..dim].to_vec());
-                            }
+                            lazy_flat
+                                .read_vector_into(idx, &mut f32_buf)
+                                .await
+                                .map_err(crate::Error::Io)?;
+                            entry.push(f32_buf[..dim].to_vec());
                         }
                     }
                 }
@@ -697,5 +767,245 @@ mod tests {
         let error = writer.write_all(&[3, 4]).unwrap_err().to_string();
         assert!(error.contains("3-byte safety limit"), "{error}");
         assert_eq!(output, vec![1, 2]);
+    }
+
+    // ===== rebuild destructive-downgrade regression tests =====
+
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::directories::{
+        Directory, DirectoryWriter as DirectoryWriterTrait, FileHandle, RamDirectory, RangeReadFn,
+    };
+    use crate::dsl::{Document, SchemaBuilder};
+    use crate::index::{IndexConfig, IndexWriter};
+
+    const READ_FAIL_DOCS: usize = 5;
+    const READ_FAIL_DIM: usize = 4;
+    /// Flat entry layout of a single-field, flat-only `.vectors` file written
+    /// by the segment builder (data-first format): header (16 bytes) + raw f32
+    /// vectors + doc-id map + TOC + footer. Only the raw vector region is read
+    /// by training collection; segment open touches the header, doc-id map,
+    /// TOC, and footer, which all live outside this byte range.
+    const VEC_REGION_START: u64 = 16;
+    const VEC_REGION_END: u64 = VEC_REGION_START + (READ_FAIL_DOCS * READ_FAIL_DIM * 4) as u64;
+
+    /// RamDirectory wrapper whose `.vectors` handles fail range reads of the
+    /// raw vector region while `fail_vector_reads` is armed. Segment open
+    /// keeps succeeding, so exactly the training-collection batch reads fail —
+    /// the I/O the rebuild path used to swallow with `if let Ok`.
+    #[derive(Clone, Default)]
+    struct VectorReadFailDirectory {
+        inner: RamDirectory,
+        fail_vector_reads: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Directory for VectorReadFailDirectory {
+        async fn exists(&self, path: &Path) -> std::io::Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+            self.inner.file_size(path).await
+        }
+
+        async fn open_read(&self, path: &Path) -> std::io::Result<FileHandle> {
+            self.inner.open_read(path).await
+        }
+
+        async fn read_range(
+            &self,
+            path: &Path,
+            range: std::ops::Range<u64>,
+        ) -> std::io::Result<crate::directories::OwnedBytes> {
+            self.inner.read_range(path, range).await
+        }
+
+        async fn list_files(&self, prefix: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+            self.inner.list_files(prefix).await
+        }
+
+        async fn open_lazy(&self, path: &Path) -> std::io::Result<FileHandle> {
+            let handle = self.inner.open_lazy(path).await?;
+            if path.extension().is_some_and(|ext| ext == "vectors") {
+                let armed = Arc::clone(&self.fail_vector_reads);
+                let len = handle.len();
+                let read_fn: RangeReadFn = Arc::new(move |range: std::ops::Range<u64>| {
+                    let handle = handle.clone();
+                    let armed = Arc::clone(&armed);
+                    Box::pin(async move {
+                        if armed.load(Ordering::SeqCst)
+                            && range.start >= VEC_REGION_START
+                            && range.end <= VEC_REGION_END
+                        {
+                            return Err(std::io::Error::other("injected vector data read failure"));
+                        }
+                        handle.read_bytes_range(range).await
+                    })
+                });
+                return Ok(FileHandle::lazy(len, read_fn));
+            }
+            Ok(handle)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DirectoryWriterTrait for VectorReadFailDirectory {
+        async fn write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.inner.write(path, data).await
+        }
+
+        async fn delete(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.inner.rename(from, to).await
+        }
+
+        async fn sync(&self) -> std::io::Result<()> {
+            self.inner.sync().await
+        }
+
+        async fn streaming_writer(
+            &self,
+            path: &Path,
+        ) -> std::io::Result<Box<dyn crate::directories::StreamingWriter>> {
+            self.inner.streaming_writer(path).await
+        }
+    }
+
+    /// Regression: rebuild_vector_index used to durably reset Built fields to
+    /// Flat first and then swallow per-batch vector read errors with
+    /// `if let Ok` during training collection, reporting success while the
+    /// published trained generation had been destroyed. Read failures must
+    /// propagate, and the durable Built -> Flat reset must not happen.
+    #[tokio::test]
+    async fn rebuild_propagates_vector_read_errors_without_downgrading_built_state() {
+        let mut sb = SchemaBuilder::default();
+        let embedding = sb.add_dense_vector_field_with_config(
+            "embedding",
+            true,
+            true,
+            DenseVectorConfig::with_ivf(READ_FAIL_DIM, Some(1), 1),
+        );
+        let schema = sb.build();
+
+        let dir = VectorReadFailDirectory::default();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), schema, config)
+            .await
+            .unwrap();
+        for i in 0..READ_FAIL_DOCS {
+            let mut doc = Document::new();
+            doc.add_dense_vector(embedding, vec![i as f32 + 1.0; READ_FAIL_DIM]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        writer.build_vector_index().await.unwrap();
+        assert!(
+            writer
+                .segment_manager
+                .read_metadata(|meta| meta.is_field_built(embedding.0))
+                .await
+        );
+        assert!(writer.segment_manager.trained().is_some());
+
+        // Vector data reads now fail (transient I/O error).
+        dir.fail_vector_reads.store(true, Ordering::SeqCst);
+        let error = writer
+            .rebuild_vector_index()
+            .await
+            .expect_err("failed sample collection must fail the rebuild")
+            .to_string();
+        assert!(
+            error.contains("injected vector data read failure"),
+            "{error}"
+        );
+
+        // The published generation survives: no durable Built -> Flat reset.
+        assert!(
+            writer
+                .segment_manager
+                .read_metadata(|meta| meta.is_field_built(embedding.0))
+                .await,
+            "a failed rebuild must not durably downgrade the field to Flat"
+        );
+        assert!(
+            writer.segment_manager.trained().is_some(),
+            "a failed rebuild must not clear the published trained artifacts"
+        );
+    }
+
+    /// Regression: rebuild_vector_index used to return Ok(()) after durably
+    /// resetting a Built field to Flat even when no training vectors could be
+    /// collected at all, silently discarding the trained generation. An empty
+    /// training sample for a Built field must be a hard error raised BEFORE
+    /// the durable reset.
+    #[tokio::test]
+    async fn rebuild_errors_before_reset_when_built_field_has_no_training_vectors() {
+        let mut sb = SchemaBuilder::default();
+        let title = sb.add_text_field("title", true, true);
+        let embedding = sb.add_dense_vector_field_with_config(
+            "embedding",
+            true,
+            true,
+            DenseVectorConfig::with_ivf(4, Some(1), 1),
+        );
+        let schema = sb.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), schema, config)
+            .await
+            .unwrap();
+        // Committed segments carry no vectors for the field.
+        for i in 0..3 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("doc {i}"));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        // Metadata says Built while no committed segment holds vectors for the
+        // field — the state a crash/degradation can leave behind. Rebuilding
+        // must refuse to destroy the referenced artifacts.
+        writer
+            .segment_manager
+            .update_metadata(|meta| {
+                meta.init_field(embedding.0, VectorIndexType::IvfRaBitQ);
+                meta.mark_field_built(
+                    embedding.0,
+                    5,
+                    1,
+                    format!("field_{}_centroids.bin", embedding.0),
+                    None,
+                );
+            })
+            .await
+            .unwrap();
+
+        let error = writer
+            .rebuild_vector_index()
+            .await
+            .expect_err("an empty training sample must fail the rebuild")
+            .to_string();
+        assert!(error.contains("no training vectors"), "{error}");
+        assert!(
+            writer
+                .segment_manager
+                .read_metadata(|meta| meta.is_field_built(embedding.0))
+                .await,
+            "an empty training sample must not durably downgrade the field to Flat"
+        );
     }
 }

@@ -23,6 +23,14 @@ pub const INDEX_META_FILENAME: &str = "metadata.json";
 /// Temp file for atomic writes (write here, then rename to INDEX_META_FILENAME)
 const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 
+/// Current metadata.json format version written by this build.
+///
+/// `load` refuses metadata stamped with a newer version: serde_json silently
+/// drops fields it does not know about, so loading newer metadata would
+/// misread index state and the next save would destructively rewrite the
+/// unknown fields away.
+pub const INDEX_META_FORMAT_VERSION: u32 = 1;
+
 /// Index-level centroids/codebooks are deliberately bounded before they are
 /// read or decoded. Besides limiting ordinary corruption damage, the matching
 /// bincode limit prevents a tiny forged collection length from requesting an
@@ -121,7 +129,7 @@ impl IndexMetadata {
     /// Create new metadata with schema
     pub fn new(schema: Schema) -> Self {
         Self {
-            version: 1,
+            version: INDEX_META_FORMAT_VERSION,
             schema,
             segment_metas: HashMap::new(),
             vector_fields: HashMap::new(),
@@ -277,21 +285,39 @@ impl IndexMetadata {
         match dir.open_read(path).await {
             Ok(slice) => {
                 let bytes = slice.read_bytes().await?;
-                serde_json::from_slice(bytes.as_slice())
-                    .map_err(|e| Error::Serialization(e.to_string()))
+                Self::deserialize_versioned(bytes.as_slice())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Try recovering from temp file (crash between write and rename)
                 let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
                 let slice = dir.open_read(tmp_path).await?;
                 let bytes = slice.read_bytes().await?;
-                let meta: Self = serde_json::from_slice(bytes.as_slice())
-                    .map_err(|e| Error::Serialization(e.to_string()))?;
+                let meta = Self::deserialize_versioned(bytes.as_slice())?;
                 log::warn!("Recovered metadata from temp file (previous crash during save)");
                 Ok(meta)
             }
             Err(e) => Err(Error::Io(e)),
         }
+    }
+
+    /// Deserialize metadata bytes, refusing formats newer than this build.
+    ///
+    /// serde_json silently drops unknown fields, so loading newer metadata
+    /// would misread index state and the next save would destructively
+    /// rewrite the newer fields away. Fail loud instead.
+    fn deserialize_versioned(bytes: &[u8]) -> Result<Self> {
+        let meta: Self =
+            serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
+        if meta.version > INDEX_META_FORMAT_VERSION {
+            return Err(Error::Corruption(format!(
+                "metadata.json format version {} is newer than this build supports (max {}). \
+                 Refusing to load: unknown fields would be silently dropped and destructively \
+                 rewritten on the next save. Open this index with a hermes build that \
+                 understands metadata format version {}",
+                meta.version, INDEX_META_FORMAT_VERSION, meta.version
+            )));
+        }
+        Ok(meta)
     }
 
     /// Save to directory (atomic: write temp file, then rename)
@@ -743,6 +769,40 @@ mod tests {
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
         assert!(!meta.is_field_built(0));
         assert!(meta.vector_fields.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn load_refuses_metadata_stamped_with_a_newer_format_version() {
+        let directory = crate::directories::RamDirectory::new();
+        let mut metadata = IndexMetadata::new(test_schema());
+        metadata.version = 2;
+        metadata.save(&directory).await.unwrap();
+
+        let error = IndexMetadata::load(&directory)
+            .await
+            .expect_err("metadata from a newer format version must be refused, not silently pruned")
+            .to_string();
+        assert!(error.contains("version 2"), "{error}");
+        assert!(error.contains("newer"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tmp_recovery_refuses_metadata_stamped_with_a_newer_format_version() {
+        let directory = crate::directories::RamDirectory::new();
+        let mut metadata = IndexMetadata::new(test_schema());
+        metadata.version = 2;
+        let bytes = metadata.serialize_to_bytes().unwrap();
+        // Simulate a crash between write and rename: only the temp file exists.
+        directory
+            .write(Path::new(INDEX_META_TMP_FILENAME), &bytes)
+            .await
+            .unwrap();
+
+        let error = IndexMetadata::load(&directory)
+            .await
+            .expect_err("temp-file recovery must apply the same version gate")
+            .to_string();
+        assert!(error.contains("version 2"), "{error}");
     }
 
     #[tokio::test]

@@ -60,6 +60,7 @@ async fn index_from_reader<R: BufRead>(
     let schema = writer.schema().clone();
     let mut count = 0usize;
     let mut errors = 0usize;
+    let mut duplicates = 0usize;
     let start_time = std::time::Instant::now();
 
     for line in reader.lines() {
@@ -90,7 +91,17 @@ async fn index_from_reader<R: BufRead>(
             }
         };
 
-        writer.add_document(doc)?;
+        match writer.add_document(doc) {
+            Ok(()) => {}
+            Err(hermes_core::Error::DuplicatePrimaryKey(key)) => {
+                if duplicates < 10 {
+                    tracing::warn!("Skipping document with duplicate primary key: {}", key);
+                }
+                duplicates += 1;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
         count += 1;
 
         if progress_interval > 0 && count.is_multiple_of(progress_interval) {
@@ -117,6 +128,12 @@ async fn index_from_reader<R: BufRead>(
 
     if errors > 0 {
         tracing::warn!("Skipped {} documents due to parse errors", errors);
+    }
+    if duplicates > 0 {
+        tracing::warn!(
+            "Skipped {} documents with duplicate primary keys",
+            duplicates
+        );
     }
 
     info!(
@@ -153,6 +170,11 @@ pub async fn index_documents(
         ..default_config
     };
     let mut writer = IndexWriter::open(dir, config.clone()).await?;
+
+    // Enforce the schema's primary-key unique constraint (no-op when the
+    // schema declares no primary key). Mirrors hermes-server, which always
+    // initializes dedup when opening a writer.
+    writer.init_primary_key_dedup().await?;
 
     info!("Opened index at {:?}", index_path);
     info!(
@@ -577,4 +599,95 @@ pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> 
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the CLI `index` command must enforce a schema-declared
+    /// primary-key unique constraint (init_primary_key_dedup, mirroring
+    /// hermes-server). Duplicate keys are skipped with a warning, both within
+    /// one run and against keys committed by a previous run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cli_index_enforces_primary_key_dedup() {
+        let tmp = std::env::temp_dir().join(format!(
+            "hermes_tool_pk_dedup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let index_path = tmp.join("idx");
+
+        let schema_path = tmp.join("schema.sdl");
+        fs::write(
+            &schema_path,
+            "index t {\n    field id: text [indexed, stored, primary]\n    field body: text [indexed, stored]\n}\n",
+        )
+        .unwrap();
+        create_index(index_path.clone(), schema_path).await.unwrap();
+
+        let docs_path = tmp.join("docs.jsonl");
+        fs::write(
+            &docs_path,
+            concat!(
+                "{\"id\":\"a\",\"body\":\"one\"}\n",
+                "{\"id\":\"b\",\"body\":\"two\"}\n",
+                "{\"id\":\"a\",\"body\":\"duplicate\"}\n",
+            ),
+        )
+        .unwrap();
+
+        index_documents(
+            index_path.clone(),
+            Some(docs_path.clone()),
+            false,
+            0,
+            256,
+            None,
+            None,
+            hermes_core::structures::IndexOptimization::default(),
+        )
+        .await
+        .unwrap();
+
+        let index = hermes_core::Index::open(FsDirectory::new(&index_path), IndexConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            2,
+            "duplicate primary key must be rejected during CLI ingestion"
+        );
+        drop(index);
+
+        // Second run over the same file: every id is already committed, so
+        // nothing new must be indexed (committed-key dedup on a fresh writer).
+        index_documents(
+            index_path.clone(),
+            Some(docs_path),
+            false,
+            0,
+            256,
+            None,
+            None,
+            hermes_core::structures::IndexOptimization::default(),
+        )
+        .await
+        .unwrap();
+
+        let index = hermes_core::Index::open(FsDirectory::new(&index_path), IndexConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            2,
+            "keys committed by a previous CLI run must still dedup"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

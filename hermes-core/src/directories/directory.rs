@@ -655,6 +655,21 @@ pub trait DirectoryWriter: Directory {
     /// Create/overwrite a file with data
     async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
 
+    /// Create/overwrite a file with data, durably.
+    ///
+    /// [`Self::write`] does not guarantee the bytes reach stable storage
+    /// before returning (filesystem implementations leave them in the OS
+    /// page cache). Any file that durably-published metadata will reference
+    /// (e.g. segment `.meta`) must be written through this method instead:
+    /// it routes through [`Self::streaming_writer`], whose `finish()` fsyncs
+    /// on filesystem implementations.
+    async fn write_durable(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        use io::Write as _;
+        let mut writer = self.streaming_writer(path).await?;
+        writer.write_all(data)?;
+        writer.finish()
+    }
+
     /// Delete a file
     async fn delete(&self, path: &Path) -> io::Result<()>;
 
@@ -850,7 +865,12 @@ impl FsDirectory {
 impl Directory for FsDirectory {
     async fn exists(&self, path: &Path) -> io::Result<bool> {
         let full_path = self.resolve(path);
-        Ok(tokio::fs::try_exists(&full_path).await.unwrap_or(false))
+        // `try_exists` maps NotFound to Ok(false); any other stat failure
+        // (EACCES, EIO, ...) must propagate so callers can distinguish a
+        // genuinely missing file from a transient IO error — swallowing it
+        // as `false` quarantines a healthy segment as "missing mandatory
+        // files" instead of retrying.
+        tokio::fs::try_exists(&full_path).await
     }
 
     async fn file_size(&self, path: &Path) -> io::Result<u64> {
@@ -1105,6 +1125,42 @@ mod tests {
         // Delete
         dir.delete(Path::new("test.txt")).await.unwrap();
         assert!(!dir.exists(Path::new("test.txt")).await.unwrap());
+    }
+
+    /// A transient stat failure (EACCES here, EIO on flaky storage) must
+    /// surface as `Err`, not `Ok(false)`: callers classify a missing
+    /// mandatory segment file as deterministic corruption and quarantine
+    /// the segment until restart.
+    #[cfg(all(unix, feature = "native"))]
+    #[tokio::test]
+    async fn test_fs_exists_propagates_stat_errors_instead_of_reporting_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let dir = FsDirectory::new(temp_dir.path());
+        dir.write(Path::new("locked/seg.meta"), b"data")
+            .await
+            .unwrap();
+
+        // Removing search permission from the parent makes stat on the child
+        // fail with EACCES while the file itself still exists.
+        let locked = temp_dir.path().join("locked");
+        let original = std::fs::metadata(&locked).unwrap().permissions();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::metadata(locked.join("seg.meta")).is_ok() {
+            // Running as root: directory permissions are not enforced, so the
+            // stat failure cannot be provoked.
+            std::fs::set_permissions(&locked, original).unwrap();
+            return;
+        }
+        let result = dir.exists(Path::new("locked/seg.meta")).await;
+        std::fs::set_permissions(&locked, original).unwrap();
+
+        let error =
+            result.expect_err("stat failure must propagate as Err, not be misreported as missing");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        // Once stat succeeds again the file is reported present.
+        assert!(dir.exists(Path::new("locked/seg.meta")).await.unwrap());
     }
 
     #[tokio::test]

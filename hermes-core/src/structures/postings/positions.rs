@@ -438,10 +438,14 @@ impl PositionPostingList {
     /// Block data flows source → output writer without intermediate buffering.
     ///
     /// Returns `(doc_count, bytes_written)`.
+    ///
+    /// Returns `Error::Corruption` if any source is shorter than its footer:
+    /// metas are paired with sources positionally, so a short/corrupt source
+    /// must fail loudly instead of misassigning every subsequent source.
     pub fn concatenate_streaming<W: Write>(
         sources: &[(&[u8], u32)],
         writer: &mut W,
-    ) -> io::Result<(u32, usize)> {
+    ) -> crate::Result<(u32, usize)> {
         // Parse only footers (16 bytes each) — no skip entries materialized
         struct SourceMeta {
             data_len: usize,
@@ -451,9 +455,13 @@ impl PositionPostingList {
         let mut metas: Vec<SourceMeta> = Vec::with_capacity(sources.len());
         let mut total_docs = 0u32;
 
-        for (raw, _) in sources {
+        for (source_index, (raw, _)) in sources.iter().enumerate() {
             if raw.len() < 16 {
-                continue;
+                return Err(crate::Error::Corruption(format!(
+                    "position posting source {} is shorter than its footer: {} bytes < 16",
+                    source_index,
+                    raw.len(),
+                )));
             }
             let f = raw.len() - 16;
             let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
@@ -995,6 +1003,27 @@ mod tests {
             assert_eq!(r.0, s.0, "doc_id mismatch at {}", i);
             assert_eq!(r.1, s.1, "positions mismatch at doc {}", r.0);
         }
+    }
+
+    #[test]
+    fn test_position_concatenate_streaming_short_source_returns_corruption() {
+        // A source shorter than the 16-byte footer must fail loudly.
+        // Silently skipping it pairs every later source with the wrong
+        // metadata (metas[i] vs sources[i]) — panicking or emitting garbage.
+        let ppl_a = build_ppl(&[(0, vec![1, 5]), (3, vec![2])]);
+        let ppl_c = build_ppl(&[(1, vec![4]), (2, vec![7, 9])]);
+        let bytes_a = serialize_ppl(&ppl_a);
+        let bytes_c = serialize_ppl(&ppl_c);
+        let short = vec![0u8; 15]; // corrupt: shorter than footer
+
+        let sources: Vec<(&[u8], u32)> = vec![(&bytes_a, 0), (&short, 100), (&bytes_c, 200)];
+        let mut out = Vec::new();
+        let result = PositionPostingList::concatenate_streaming(&sources, &mut out);
+        assert!(
+            matches!(result, Err(crate::Error::Corruption(_))),
+            "short/corrupt source must be a Corruption error, not silently skipped: {:?}",
+            result.map(|r| r.0)
+        );
     }
 
     #[test]

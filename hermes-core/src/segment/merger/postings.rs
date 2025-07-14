@@ -295,8 +295,7 @@ impl SegmentMerger {
                     .collect();
                 let offset = positions_out.offset();
                 let (_doc_count, bytes_written) =
-                    PositionPostingList::concatenate_streaming(&refs, positions_out)
-                        .map_err(crate::Error::Io)?;
+                    PositionPostingList::concatenate_streaming(&refs, positions_out)?;
                 return Ok(TermInfo::external_with_positions(
                     posting_offset,
                     posting_len,

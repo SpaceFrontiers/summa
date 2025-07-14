@@ -14,6 +14,11 @@ fn bmp_config() -> SparseVectorConfig {
         format: SparseFormat::Bmp,
         weight_quantization: WeightQuantization::UInt8,
         bmp_block_size: 64,
+        // The rare-dim corpora emit dim_ids up to ~108k, past the default
+        // SPLADE vocabulary (105879). Out-of-range dims are now rejected at
+        // add time instead of silently dropped from the grid, so declare a
+        // vocabulary large enough for every corpus in this file.
+        dims: Some(120_000),
         ..SparseVectorConfig::default()
     }
 }
@@ -2064,6 +2069,8 @@ fn bmp_schema_with_config(
 async fn test_bmp_block_size_256_build_merge_reorder_search() {
     let (schema, _title, sparse) = bmp_schema_with_config(SparseVectorConfig {
         bmp_block_size: 256,
+        // This corpus carries shared "hay" dims at 900_000+.
+        dims: Some(1_000_000),
         ..bmp_config()
     });
     let dir = RamDirectory::new();

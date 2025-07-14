@@ -827,10 +827,16 @@ impl SchemaBuilder {
         }
     }
 
-    /// Mark a field as the primary key (unique constraint)
+    /// Mark a field as the primary key (unique constraint).
+    ///
+    /// Primary key implies fast + indexed (dedup looks committed keys up in
+    /// the fast-field text dictionary) — kept in sync with the SDL path,
+    /// which forces the same attributes.
     pub fn set_primary_key(&mut self, field: Field) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.primary_key = true;
+            entry.fast = true;
+            entry.indexed = true;
         }
     }
 
@@ -1255,6 +1261,26 @@ mod tests {
         assert_eq!(schema.get_field("body"), Some(body));
         assert_eq!(schema.get_field("count"), Some(count));
         assert_eq!(schema.get_field("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_set_primary_key_forces_fast_and_indexed() {
+        // Regression: the SDL path forces fast + indexed on primary-key fields
+        // (needed for dedup lookups against the fast-field text dict). The
+        // programmatic builder must do the same, otherwise committed-key dedup
+        // is silently inert after every commit.
+        let mut builder = Schema::builder();
+        let id = builder.add_text_field("id", false, true);
+        builder.set_primary_key(id);
+        let schema = builder.build();
+
+        let entry = schema.get_field_entry(id).unwrap();
+        assert!(entry.primary_key);
+        assert!(
+            entry.fast,
+            "primary key must imply fast (dedup reads the fast-field text dict)"
+        );
+        assert!(entry.indexed, "primary key must imply indexed");
     }
 
     #[test]
