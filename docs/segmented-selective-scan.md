@@ -61,19 +61,18 @@ length is also measured and rejected (interval 16 → −2.3% end-to-end,
 8 → −8.3%): block-level parallelism is already sufficient, so further gains
 must come from removing the per-step barrier + serial walk inside the block.
 
-## Next: warp-cooperative backward (design, not yet implemented)
+## Measured and rejected: warp-cooperative backward
 
-One warp owns one `(batch, channel, segment)` with lanes over the 32
-timesteps; the forward-state rebuild and the adjoint both become 5-round
-Kogge–Stone shuffle scans per state lane instead of 32 serial steps with a
-barrier each. `grad_delta`/`grad_x` reduce over the state dimension in
-registers (lane-local), eliminating their shared-memory round-trips.
-Constraints to respect, from the current kernel's numbers:
-
-- Lanes-over-time breaks global-load coalescing (adjacent lanes stride by
-  `channels`); loads must stage through shared memory in channel-major order
-  first (one barrier per segment, not per step).
-- `grad_B`/`grad_C` are per `(t, n)` sums over channels: naive per-warp
-  atomics would raise contention 16× versus today's per-16-channel-block
-  reduction. Reduce across the block's warps in shared memory (a few
-  barriers per segment) before the atomic, keeping today's atomic count.
+A lanes-over-time rewrite (one warp per `(batch, channel, segment)`,
+Kogge–Stone shuffle scans for the state rebuild and the adjoint, channel-major
+shared staging for coalescing, block-level `grad_B`/`grad_C` reduction before
+one atomic per cell) passed all CUDA/Metal parity suites but ran **1.85×
+slower** than the segmented kernel (7.51 ms vs 4.06 ms per call; end-to-end
+40,607 → 36,592 tok/s @B20). Halving the channel tile to shrink the ~41 KB
+shared footprint (occupancy hypothesis) changed nothing (36,453). The
+per-state-lane shuffle chains and staging round-trips cost more than the
+segmented kernel's one barrier per step at this problem size
+(`d_inner 1024 × N 16 × segment 32`). Together with the interval sweep and
+the unroll experiment, this pins the segmented backward as the local optimum;
+further scan gains would need a different decomposition (e.g. BF16 kernel
+I/O to halve traffic) rather than more parallelism.
