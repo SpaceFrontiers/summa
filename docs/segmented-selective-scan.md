@@ -76,6 +76,13 @@ segmented kernel's one barrier per step at this problem size
 the unroll experiment, this pins the segmented backward as the local optimum
 for f32 traffic; the follow-up that did land is BF16 kernel I/O below.
 
+A fourth rewrite was also measured and rejected (2026-07-17): moving the
+per-thread rebuilt-state array (`segment_len` floats, runtime-indexed local
+memory) into shared memory. Parity held, but end-to-end throughput dropped
+2.0% (44,193 → 43,321 tok/s @B26): the 36 KB shared footprint halves
+resident blocks per SM (8 → 4), and the kernel is latency-bound — occupancy
+buys more than the spill traffic costs. The local array stays.
+
 ## BF16 kernel I/O (landed)
 
 The segment kernels (and the depthwise conv) are generic over the sequence

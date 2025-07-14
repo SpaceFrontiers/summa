@@ -85,8 +85,11 @@ bridge — unresolved upstream, tracked for the cubecl fork. Until then the
 guard keeps the fast path exactly where it is proven, and
 `cuda_attention_backward_matches_cpu_reference_for_small_shapes` pins the
 fallback branch (gradient tolerance 0.08 there: BF16 tensor-core gradient
-GEMMs at small odd-K shapes reach 0.0403 deterministically per kernel and
-0.024–0.051 across autotune states; the canonical 64/64 test stays at 0.02).
+GEMMs at small odd-K shapes reach 0.0403 deterministically; the canonical
+64/64 test stays at 0.02). Sequence length 96 is excluded from that sweep:
+the runtime defect produces run-to-run varying gradients there on both
+branches (query 0.024/0.051, value 0.131 across processes), so the shape
+gates nothing but the runtime lottery.
 
 Two hardening changes shipped with the guard: the backward kernels assert
 their FP32 input dtypes at the launch boundary (a mismatched buffer was
