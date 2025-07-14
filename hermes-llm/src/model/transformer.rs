@@ -16,6 +16,52 @@ use super::{InferenceState, Norm, TransformerBlock};
 const EMBEDDING_STD: f64 = 0.02;
 const LOSS_CHUNKS: usize = 4;
 
+fn pad_embedding(mut embedding: Embedding, stored_vocab_size: usize) -> Embedding {
+    let [vocab_size, hidden_size] = embedding.weight.shape().dims();
+    if vocab_size < stored_vocab_size {
+        embedding.weight = embedding.weight.map(|weight| {
+            let device = weight.device();
+            Tensor::cat(
+                vec![
+                    weight,
+                    Tensor::zeros([stored_vocab_size - vocab_size, hidden_size], &device),
+                ],
+                0,
+            )
+        });
+    }
+    embedding
+}
+
+fn pad_output_linear(mut output: Linear, stored_vocab_size: usize) -> Linear {
+    let [hidden_size, vocab_size] = output.weight.shape().dims();
+    if vocab_size < stored_vocab_size {
+        output.weight = output.weight.map(|weight| {
+            let device = weight.device();
+            Tensor::cat(
+                vec![
+                    weight,
+                    Tensor::zeros([hidden_size, stored_vocab_size - vocab_size], &device),
+                ],
+                1,
+            )
+        });
+        output.bias = output.bias.map(|bias| {
+            bias.map(|bias| {
+                let device = bias.device();
+                Tensor::cat(
+                    vec![
+                        bias,
+                        Tensor::zeros([stored_vocab_size - vocab_size], &device),
+                    ],
+                    0,
+                )
+            })
+        });
+    }
+    output
+}
+
 #[derive(Module, Debug)]
 pub struct Transformer {
     embedding: Embedding,
@@ -132,12 +178,16 @@ impl Transformer {
 
         // Burn's Embedding default is N(0, 1), which makes tied-output logits
         // unusably large for language models. Use the standard small LLM scale.
-        let embedding = EmbeddingConfig::new(config.vocab_size, config.hidden_size)
-            .with_initializer(Initializer::Normal {
-                mean: 0.0,
-                std: EMBEDDING_STD,
-            })
-            .init(device);
+        let stored_vocab_size = config.padded_vocab_size();
+        let embedding = pad_embedding(
+            EmbeddingConfig::new(config.vocab_size, config.hidden_size)
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: EMBEDDING_STD,
+                })
+                .init(device),
+            stored_vocab_size,
+        );
         let embedding_dropout = DropoutConfig::new(config.embeddings.dropout).init();
         let layers = (0..config.num_layers)
             .map(|i| TransformerBlock::new(config, config.block_for_layer(i), device))
@@ -151,12 +201,15 @@ impl Transformer {
         };
         let final_norm = Norm::new(norm_config.norm_type, config.hidden_size, norm_eps, device);
         let lm_head = (!config.embeddings.tie_weights).then(|| {
-            LinearConfig::new(config.hidden_size, config.vocab_size)
-                .with_bias(config.output.bias)
-                .init(device)
+            pad_output_linear(
+                LinearConfig::new(config.hidden_size, config.vocab_size)
+                    .with_bias(config.output.bias)
+                    .init(device),
+                stored_vocab_size,
+            )
         });
         let tied_output_bias = (config.embeddings.tie_weights && config.output.bias)
-            .then(|| Initializer::Zeros.init([config.vocab_size], device));
+            .then(|| Initializer::Zeros.init([stored_vocab_size], device));
         let rope_config = RotaryEncodingConfig::new(config.max_seq_len, rope_head_dim)
             .with_theta(rope_theta as f32);
         let rope = match rope_scaling {
@@ -221,21 +274,28 @@ impl Transformer {
             weight,
             bias,
             targets.reshape([tokens]),
+            self.config.vocab_size,
             tokens.div_ceil(LOSS_CHUNKS),
         )
     }
 
     fn project_logits(&self, x: Tensor<3>) -> Tensor<3> {
         let [batch, seq_len, hidden] = x.dims();
+        let stored_vocab_size = self.config.padded_vocab_size();
         let (weight, bias) = self.output_parameters();
         let logits = matmul_2(x.reshape([batch * seq_len, hidden]), weight.transpose()).reshape([
             batch,
             seq_len,
-            self.config.vocab_size,
+            stored_vocab_size,
         ]);
-        match bias {
-            Some(bias) => logits + bias.reshape([1, 1, self.config.vocab_size]),
+        let logits = match bias {
+            Some(bias) => logits + bias.reshape([1, 1, stored_vocab_size]),
             None => logits,
+        };
+        if stored_vocab_size == self.config.vocab_size {
+            logits
+        } else {
+            logits.slice([0..batch, 0..seq_len, 0..self.config.vocab_size])
         }
     }
 
@@ -244,11 +304,17 @@ impl Transformer {
         let x = x
             .slice([0..batch, seq_len - 1..seq_len, 0..hidden])
             .reshape([batch, hidden]);
+        let stored_vocab_size = self.config.padded_vocab_size();
         let (weight, bias) = self.output_parameters();
         let logits = matmul_2(x, weight.transpose());
-        match bias {
-            Some(bias) => logits + bias.reshape([1, self.config.vocab_size]),
+        let logits = match bias {
+            Some(bias) => logits + bias.reshape([1, stored_vocab_size]),
             None => logits,
+        };
+        if stored_vocab_size == self.config.vocab_size {
+            logits
+        } else {
+            logits.slice([0..batch, 0..self.config.vocab_size])
         }
     }
 
@@ -373,6 +439,60 @@ impl ModuleVisitor for MatrixParameterVisitor {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
         if D == 2 {
             self.ids.push(param.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mal::get_builtin_model;
+    use burn::tensor::TensorData;
+
+    #[test]
+    fn unaligned_vocabulary_uses_zero_padded_parameters() {
+        let mut config = get_builtin_model("tiny").unwrap();
+        config.vocab_size = 65;
+        config.hidden_size = 8;
+        config.num_layers = 1;
+        config.block.attention.num_heads = Some(2);
+        config.block.attention.num_kv_heads = Some(1);
+        config.block.attention.head_dim = Some(4);
+        config.block.ffn.hidden_dim = Some(16);
+        config.output.bias = true;
+        let device = Device::ndarray();
+
+        for tied in [false, true] {
+            config.embeddings.tie_weights = tied;
+            device.seed(31);
+            let model = Transformer::new(&config, &device).unwrap();
+            assert_eq!(model.config.vocab_size, 65);
+            assert_eq!(model.embedding.weight.shape().dims(), [128, 8]);
+            let input =
+                Tensor::<2, Int>::from_data(TensorData::new(vec![1_i64, 2], [1, 2]), &device);
+            assert_eq!(model.forward(input, 0).dims(), [1, 2, 65]);
+            assert!(
+                model
+                    .embedding
+                    .weight
+                    .val()
+                    .slice([65..128, 0..8])
+                    .into_data()
+                    .convert::<f32>()
+                    .to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .all(|value| value == 0.0)
+            );
+
+            match (&model.lm_head, &model.tied_output_bias) {
+                (Some(head), None) if !tied => {
+                    assert_eq!(head.weight.shape().dims(), [8, 128]);
+                    assert_eq!(head.bias.as_ref().unwrap().shape().dims(), [128]);
+                }
+                (None, Some(bias)) if tied => assert_eq!(bias.shape().dims(), [128]),
+                _ => panic!("output parameters do not match weight tying"),
+            }
         }
     }
 }

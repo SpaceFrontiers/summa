@@ -312,6 +312,8 @@ pub struct OutputConfig {
 pub struct ModelDef {
     pub name: String,
     pub description: Option<String>,
+    /// Number of token IDs exposed by the tokenizer and model API. Parameter
+    /// storage is padded internally for efficient accelerator kernels.
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub hidden_size: usize,
@@ -454,10 +456,19 @@ impl ModelDef {
         }
     }
 
+    /// Vocabulary rows stored by embeddings and the output projection.
+    ///
+    /// Keeping this derived preserves a single logical vocabulary in MAL and
+    /// checkpoint configs while giving GPU kernels an aligned output dimension.
+    pub fn padded_vocab_size(&self) -> usize {
+        self.vocab_size.next_multiple_of(64)
+    }
+
     /// Count trainable parameters implied by the model definition.
     pub fn estimated_params(&self) -> usize {
         let h = self.hidden_size;
-        let embed_params = self.vocab_size * h;
+        let stored_vocab_size = self.padded_vocab_size();
+        let embed_params = stored_vocab_size * h;
         let norm_params = |norm: &NormConfig| match norm.norm_type {
             NormType::RmsNorm => h,
             NormType::LayerNorm => 2 * h,
@@ -515,8 +526,8 @@ impl ModelDef {
             .norm
             .as_ref()
             .unwrap_or(&self.block_for_layer(0).norm);
-        let head_weights = (!self.embeddings.tie_weights) as usize * h * self.vocab_size;
-        let head_bias = self.output.bias as usize * self.vocab_size;
+        let head_weights = (!self.embeddings.tie_weights) as usize * h * stored_vocab_size;
+        let head_bias = self.output.bias as usize * stored_vocab_size;
         embed_params + layer_params + norm_params(final_norm) + head_weights + head_bias
     }
 
@@ -1545,13 +1556,13 @@ mod tests {
         let back: ModelDef = serde_json::from_str(&json).unwrap();
         assert!(back.pattern.as_ref().unwrap()[0].is_ssm());
 
-        // Legacy JSON without ssm/pattern still deserializes
-        let legacy: ModelDef = serde_json::from_str(
+        // Attention-only JSON leaves the optional hybrid fields empty.
+        let attention_only: ModelDef = serde_json::from_str(
             &serde_json::to_string(&get_builtin_model("tiny").unwrap()).unwrap(),
         )
         .unwrap();
-        assert!(legacy.pattern.is_none());
-        assert!(!legacy.block.is_ssm());
+        assert!(attention_only.pattern.is_none());
+        assert!(!attention_only.block.is_ssm());
     }
 
     #[test]
@@ -1606,5 +1617,21 @@ mod tests {
         let block = file.blocks.get("my_block").unwrap();
         assert!(matches!(block.norm_position, NormPosition::Pre));
         assert!(block.residual);
+    }
+
+    #[test]
+    fn vocabulary_storage_alignment_is_derived() {
+        let mut model = ModelDef {
+            vocab_size: 50_277,
+            ..ModelDef::default()
+        };
+        assert_eq!(model.padded_vocab_size(), 50_304);
+
+        model.vocab_size = 32_000;
+        assert_eq!(model.padded_vocab_size(), 32_000);
+
+        let serialized = serde_json::to_value(&model).unwrap();
+        assert_eq!(serialized["vocab_size"], 32_000);
+        assert!(serialized.get("padded_vocab_size").is_none());
     }
 }

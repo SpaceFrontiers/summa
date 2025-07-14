@@ -43,9 +43,9 @@ The trainer uses batched Muon updates for hidden 2D matrices and AdamW for
 embeddings, output weights, norms, biases, and convolution kernels. Muon uses a
 20x learning rate; AdamW uses beta2 0.95; global gradient norm clipping covers
 both parameter sets. It supports cosine or warmup-stable-decay scheduling and
-fine-tuning from safetensors. On CUDA, linear algebra uses relaxed FP32 storage
-with FP16 Tensor Core staging and FP32 accumulation. Model parameters and
-optimizer state remain FP32; Muon's Newton-Schulz iterations use BF16.
+fine-tuning from safetensors. CUDA training uses BF16 Tensor Core operands while
+model parameters and optimizer state remain FP32; Muon's Newton-Schulz
+iterations also use BF16.
 It writes the latest checkpoint every 100 optimizer steps by default; pass
 `--checkpoint-every 0` to save only at completion. Files are staged behind an
 in-progress marker and the training-state file is published last, so resume and
@@ -58,7 +58,8 @@ on Metal and CUDA; CPU uses the tensor-operation reference implementation.
 
 Outputs are deliberately minimal:
 
-- `config.json`, with tokenizer vocabulary size applied
+- `config.json`, with the logical tokenizer vocabulary size applied; embedding
+  and output tensors use a derived 64-row storage alignment
 - `metrics.jsonl`, flushed after every optimizer step for live reporters
 - `weights.safetensors`, using the shared model's parameter names
 - `adamw-state.bpk`, `muon-state.bpk`, and `training-state.json` for resume

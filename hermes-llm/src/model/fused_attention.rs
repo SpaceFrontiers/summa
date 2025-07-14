@@ -65,6 +65,22 @@ pub trait AttentionBackend: Backend {
     fn attention_causal_mask(scores: FloatTensor<Self>, row_offset: usize) -> FloatTensor<Self> {
         panic!("custom causal masking is only available on CUDA")
     }
+
+    /// Softmax probabilities and score gradients for one backward chunk,
+    /// fused: the causal bound replaces any mask tensor, the softmax scale
+    /// and gradient chain factor are folded in, and both outputs are emitted
+    /// in the matmul compute dtype.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn attention_backward_probabilities(
+        scores: FloatTensor<Self>,
+        grad_probabilities: FloatTensor<Self>,
+        correction: FloatTensor<Self>,
+        scale: f32,
+        row_offset: usize,
+        causal: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        panic!("fused attention probabilities are only available on CUDA")
+    }
 }
 
 pub(super) fn fused_attention(
@@ -263,23 +279,27 @@ where
             grad_output_compute
                 .clone()
                 .slice([0..batch, 0..heads, start..end, 0..head_dim]);
-        let mut scores = matmul_4(query_chunk.clone(), key_transposed.clone()) * scale;
-        if causal {
-            let scores_primitive = scores
-                .try_into_primitive::<B>()
-                .expect("attention scores stayed on their input backend");
-            scores = Tensor::from_primitive::<B>(B::attention_causal_mask(scores_primitive, start));
-        }
-        let probabilities = softmax(scores, 3);
+        let scores = matmul_4(query_chunk.clone(), key_transposed.clone());
         let output_chunk = output_chunk.cast(grad_output_chunk.dtype());
         let correction = (grad_output_chunk.clone() * output_chunk).sum_dim(3);
         let probability_gradient =
             matmul_4(grad_output_compute_chunk.clone(), value_transposed.clone());
-        let compute_dtype = probability_gradient.dtype();
-        let probabilities = probabilities.cast(compute_dtype);
-        let correction = correction.cast(compute_dtype);
-        let score_gradient = probabilities.clone() * (probability_gradient - correction) * scale;
-        let score_gradient_compute = matmul_input(score_gradient);
+        let (probabilities, score_gradient_compute) = B::attention_backward_probabilities(
+            scores
+                .try_into_primitive::<B>()
+                .expect("attention scores stayed on their input backend"),
+            probability_gradient
+                .try_into_primitive::<B>()
+                .expect("probability gradient stayed on its input backend"),
+            correction
+                .try_into_primitive::<B>()
+                .expect("attention correction stayed on its input backend"),
+            scale,
+            start,
+            causal,
+        );
+        let probabilities = Tensor::<4>::from_primitive::<B>(probabilities);
+        let score_gradient_compute = Tensor::<4>::from_primitive::<B>(score_gradient_compute);
 
         query_gradients.push(matmul_4(score_gradient_compute.clone(), key.clone()));
         let key_chunk = matmul_4(score_gradient_compute.transpose(), query_chunk);

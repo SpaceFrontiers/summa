@@ -8,7 +8,7 @@ use burn_nn::{Dropout, DropoutConfig, Linear, LinearConfig};
 
 use crate::mal::{Activation, BlockDef, ModelDef};
 
-use super::matmul::{linear, prepare_linear_for_inference};
+use super::matmul::{linear, linear_low_precision, prepare_linear_for_inference};
 
 #[derive(Module, Debug)]
 pub struct FeedForward {
@@ -56,7 +56,9 @@ impl FeedForward {
             Activation::ReLU => relu(t),
             Activation::GELUNew | Activation::GELUTanh => gelu_approximate(t),
         };
-        let projected = linear(&self.in_proj, x);
+        // Keep the activation path in BF16 during CUDA training. `linear` on
+        // the down projection promotes only its final result for the residual.
+        let projected = linear_low_precision(&self.in_proj, x);
         let hidden = if self.gated {
             let mut ranges = projected.dims().map(|size| 0..size);
             ranges[D - 1] = 0..self.intermediate;

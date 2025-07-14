@@ -66,7 +66,9 @@ let generator = TextGenerator::new(&model, &device);
 ```
 
 The safetensors loader is strict and consumes the checkpoint written by
-`hermes-train` without conversion.
+`hermes-train` without conversion. Checkpoint configs retain the tokenizer's
+logical vocabulary size while embedding and output tensors use a derived
+64-row storage alignment.
 
 ## Architecture support
 

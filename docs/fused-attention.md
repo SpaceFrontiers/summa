@@ -29,7 +29,27 @@ FlashAttention-2 is the relevant algorithm family for the SM80 A100.
 FlashAttention-3 targets Hopper; FlashAttention-4 targets Hopper and Blackwell.
 Their hardware-specific mechanisms are not emulated on Ampere.
 
-Burn's optional whole-graph fusion is separate from these explicit kernels. It
-is disabled because the tested global fusion bridge produced invalid CubeCL MSL
-for this model. Explicit Burn/CubeK kernels remain enabled and are the optimized
-path.
+CUDA training enables Burn's lazy fusion for the ordinary elementwise and
+reduction graph. Attention and selective scan are explicit custom-operation
+boundaries, so their kernels are scheduled on the same stream without exposing
+their internals to the fusion planner.
+
+## Fused backward probabilities
+
+The chunked attention backward previously materialized each score chunk and
+ran mask, softmax, dtype casts, and the score-gradient elementwise as ~8
+separate full `[batch, heads, rows, seq]` passes. Two kernels replace them
+(`attention_softmax_stats` + `attention_backward_probabilities_kernel` in
+`cube_attention.rs`): a per-row online-softmax statistics pass that iterates
+only the causally-visible prefix (the bound replaces any mask tensor, the
+softmax scale is folded in), and a single pass emitting both the
+probabilities and `P ⊙ (dP − correction) · scale` directly in BF16 for the
+following tensor-core matmuls. Positions past the causal bound are exact
+zeros. The op crosses the lazy-fusion boundary through the same CustomOpIr
+bridge as the scan and cross-entropy ops.
+
+Measured (A100, retriever-100m, T1024/ga8, 2026-07-17): 37,029 → 39,253
+tok/s at batch 16 (+6.0%) and 38,164 → 40,607 at batch 20 (+6.4%), with the
+`cuda_attention_backward_matches_cpu_reference_for_causal_gqa` autodiff
+parity test green and identical loss trajectories. The standalone causal-mask
+kernel and the 1.9 ms score casts no longer appear in the profile.

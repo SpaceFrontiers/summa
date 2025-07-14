@@ -555,6 +555,7 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
 mod gpu {
     use burn::backend::TensorMetadata;
     use burn::tensor::Shape;
+    use burn_cubecl::cubecl::ir::FastMath;
     use burn_cubecl::cubecl::prelude::*;
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
@@ -793,6 +794,255 @@ mod gpu {
         }
     }
 
+    /// Per-segment forward transition from a zero entering state. One thread
+    /// owns a `(batch, segment, channel)` triple, so every checkpoint segment
+    /// of every scan is in flight at once instead of one thread walking the
+    /// whole sequence. `decay` is `exp(A · Σdt)`, the exact product of the
+    /// per-step decays of a diagonal state matrix.
+    #[allow(clippy::manual_div_ceil)]
+    #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
+    fn selective_scan_forward_segment_partials(
+        delta: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        partial: &mut Tensor<f32>,
+        decay: &mut Tensor<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+        #[comptime] segment_len: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let segments = (seq_len + segment_len - 1) / segment_len;
+        let idx = ABSOLUTE_POS;
+        if idx < partial.len() / state_dim {
+            let channel = idx % channels;
+            let segment = (idx / channels) % segments;
+            let batch = idx / (channels * segments);
+            let a_base = channel * state_dim;
+            let start = segment * segment_len;
+            let mut state = Array::<f32>::new(state_dim);
+            let mut a_row = Array::<f32>::new(state_dim);
+            #[unroll]
+            for n in 0..state_dim {
+                state[n] = 0.0f32;
+                a_row[n] = a[a_base + n];
+            }
+            let mut sum_dt = 0.0f32;
+            for i in 0..segment_len {
+                let t = start + i;
+                if t < seq_len {
+                    let btc = (batch * seq_len + t) * channels + channel;
+                    let btn = (batch * seq_len + t) * state_dim;
+                    let dt = delta[btc];
+                    let x = xs[btc];
+                    sum_dt += dt;
+                    #[unroll]
+                    for n in 0..state_dim {
+                        state[n] = state[n] * (dt * a_row[n]).exp() + dt * b_mat[btn + n] * x;
+                    }
+                }
+            }
+            let out_base = idx * state_dim;
+            #[unroll]
+            for n in 0..state_dim {
+                partial[out_base + n] = state[n];
+                decay[out_base + n] = (a_row[n] * sum_dt).exp();
+            }
+        }
+    }
+
+    /// Folds segment transitions serially into each segment's entering state.
+    /// The fold touches `segments × state_dim` values per scan — a negligible
+    /// stitch pass that unlocks segment-parallel recurrence kernels.
+    #[cube(launch)]
+    fn selective_scan_forward_segment_carry(
+        h_in: &Tensor<f32>,
+        partial: &Tensor<f32>,
+        decay: &Tensor<f32>,
+        carry: &mut Tensor<f32>,
+        channels: u32,
+        segments: u32,
+        #[comptime] state_dim: usize,
+    ) {
+        let channels = channels as usize;
+        let segments = segments as usize;
+        let idx = ABSOLUTE_POS;
+        if idx < h_in.len() {
+            let n = idx % state_dim;
+            let bc = idx / state_dim;
+            let channel = bc % channels;
+            let batch = bc / channels;
+            let mut state = h_in[idx];
+            for s in 0..segments {
+                let base = ((batch * segments + s) * channels + channel) * state_dim + n;
+                carry[base] = state;
+                state = partial[base] + decay[base] * state;
+            }
+        }
+    }
+
+    /// Re-runs each segment from its stitched entering state, producing the
+    /// outputs, the per-segment checkpoints consumed by backward, and the
+    /// final state.
+    #[allow(clippy::manual_div_ceil)]
+    #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
+    fn selective_scan_forward_segment_apply(
+        delta: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        d: &Tensor<f32>,
+        carry: &Tensor<f32>,
+        y: &mut Tensor<f32>,
+        checkpoints: &mut Tensor<f32>,
+        h_out: &mut Tensor<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+        #[comptime] segment_len: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let segments = (seq_len + segment_len - 1) / segment_len;
+        let idx = ABSOLUTE_POS;
+        if idx < carry.len() / state_dim {
+            let channel = idx % channels;
+            let segment = (idx / channels) % segments;
+            let batch = idx / (channels * segments);
+            let a_base = channel * state_dim;
+            let start = segment * segment_len;
+            let carry_base = idx * state_dim;
+            let mut state = Array::<f32>::new(state_dim);
+            let mut a_row = Array::<f32>::new(state_dim);
+            #[unroll]
+            for n in 0..state_dim {
+                state[n] = carry[carry_base + n];
+                a_row[n] = a[a_base + n];
+            }
+            for i in 0..segment_len {
+                let t = start + i;
+                if t < seq_len {
+                    let btc = (batch * seq_len + t) * channels + channel;
+                    let btn = (batch * seq_len + t) * state_dim;
+                    let dt = delta[btc];
+                    let x = xs[btc];
+                    let mut out = 0.0f32;
+                    #[unroll]
+                    for n in 0..state_dim {
+                        state[n] = state[n] * (dt * a_row[n]).exp() + dt * b_mat[btn + n] * x;
+                        out += state[n] * c_mat[btn + n];
+                    }
+                    y[btc] = out + x * d[channel];
+                }
+            }
+            let checkpoint_base = ((batch * segments + segment) * channels + channel) * state_dim;
+            #[unroll]
+            for n in 0..state_dim {
+                checkpoints[checkpoint_base + n] = state[n];
+            }
+            if segment + 1 == segments {
+                let state_base = (batch * channels + channel) * state_dim;
+                #[unroll]
+                for n in 0..state_dim {
+                    h_out[state_base + n] = state[n];
+                }
+            }
+        }
+    }
+
+    /// Per-segment adjoint transition from a zero adjoint. The adjoint
+    /// recurrence `adj_{t-1} = (adj_t + dy_t·C_t)·α_t` is linear in `adj`, so
+    /// segments compose exactly like the forward pass, just right-to-left.
+    #[allow(clippy::manual_div_ceil)]
+    #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
+    fn selective_scan_backward_segment_partials(
+        delta: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        grad_y: &Tensor<f32>,
+        inj: &mut Tensor<f32>,
+        decay: &mut Tensor<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+        #[comptime] segment_len: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let segments = (seq_len + segment_len - 1) / segment_len;
+        let idx = ABSOLUTE_POS;
+        if idx < inj.len() / state_dim {
+            let channel = idx % channels;
+            let segment = (idx / channels) % segments;
+            let batch = idx / (channels * segments);
+            let a_base = channel * state_dim;
+            let start = segment * segment_len;
+            let mut adj = Array::<f32>::new(state_dim);
+            let mut a_row = Array::<f32>::new(state_dim);
+            #[unroll]
+            for n in 0..state_dim {
+                adj[n] = 0.0f32;
+                a_row[n] = a[a_base + n];
+            }
+            let mut sum_dt = 0.0f32;
+            for i_rev in 0..segment_len {
+                let i = segment_len - i_rev - 1;
+                let t = start + i;
+                if t < seq_len {
+                    let btc = (batch * seq_len + t) * channels + channel;
+                    let btn = (batch * seq_len + t) * state_dim;
+                    let dt = delta[btc];
+                    let dy = grad_y[btc];
+                    sum_dt += dt;
+                    #[unroll]
+                    for n in 0..state_dim {
+                        adj[n] = (adj[n] + dy * c_mat[btn + n]) * (dt * a_row[n]).exp();
+                    }
+                }
+            }
+            let out_base = idx * state_dim;
+            #[unroll]
+            for n in 0..state_dim {
+                inj[out_base + n] = adj[n];
+                decay[out_base + n] = (a_row[n] * sum_dt).exp();
+            }
+        }
+    }
+
+    /// Folds adjoint segment transitions from the sequence end backwards,
+    /// producing the adjoint entering each segment from its right boundary.
+    #[cube(launch)]
+    fn selective_scan_backward_segment_carry(
+        inj: &Tensor<f32>,
+        decay: &Tensor<f32>,
+        carry: &mut Tensor<f32>,
+        channels: u32,
+        segments: u32,
+        batch_channels_states: u32,
+        #[comptime] state_dim: usize,
+    ) {
+        let channels = channels as usize;
+        let segments = segments as usize;
+        let idx = ABSOLUTE_POS;
+        if idx < batch_channels_states as usize {
+            let n = idx % state_dim;
+            let bc = idx / state_dim;
+            let channel = bc % channels;
+            let batch = bc / channels;
+            let mut adj = 0.0f32;
+            for s_rev in 0..segments {
+                let s = segments - s_rev - 1;
+                let base = ((batch * segments + s) * channels + channel) * state_dim + n;
+                carry[base] = adj;
+                adj = inj[base] + decay[base] * adj;
+            }
+        }
+    }
+
     /// One block owns a `(batch, channel tile)` and computes every scan
     /// gradient while following the reverse recurrence exactly once. The
     /// channel and state reductions share the per-token contributions in
@@ -944,6 +1194,152 @@ mod gpu {
         }
     }
 
+    /// Segment-parallel variant of the fused backward kernel: one block owns a
+    /// `(batch, channel tile, segment)` and re-derives its forward states from
+    /// the segment checkpoint, while the adjoint entering from the right
+    /// boundary comes from the stitched carry. All segments run concurrently
+    /// instead of one block walking the whole reverse recurrence.
+    #[allow(clippy::manual_div_ceil, clippy::useless_conversion)]
+    #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
+    fn selective_scan_backward_segmented(
+        delta: &Tensor<f32>,
+        delta_raw: &Tensor<f32>,
+        xs: &Tensor<f32>,
+        b_mat: &Tensor<f32>,
+        c_mat: &Tensor<f32>,
+        a: &Tensor<f32>,
+        d: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        checkpoints: &Tensor<f32>,
+        adj_carry: &Tensor<f32>,
+        grad_y: &Tensor<f32>,
+        grad_delta: &mut Tensor<f32>,
+        grad_xs: &mut Tensor<f32>,
+        grad_b: &mut Tensor<Atomic<f32>>,
+        grad_c: &mut Tensor<Atomic<f32>>,
+        grad_a: &mut Tensor<Atomic<f32>>,
+        grad_d: &mut Tensor<Atomic<f32>>,
+        grad_h: &mut Tensor<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+        #[comptime] segment_len: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let local_channel = UNIT_POS_X as usize;
+        let n = UNIT_POS_Y as usize;
+        let batch = CUBE_POS_Y as usize;
+        let segment = CUBE_POS_Z as usize;
+        let channel = CUBE_POS_X as usize * BACKWARD_CHANNELS + local_channel;
+        let active_channel = channel < channels;
+        let active = active_channel && n < state_dim;
+        let state_index = (batch * channels + channel) * state_dim + n;
+        let a_index = channel * state_dim + n;
+        let shared_index = n * BACKWARD_CHANNELS + local_channel;
+        let shared_len = BACKWARD_CHANNELS * state_dim;
+        // Ping-pong buffers avoid a second barrier; the intervening step's
+        // barrier completes before either buffer is reused.
+        let mut grad_dt_shared = Shared::new_slice(2 * shared_len);
+        let mut grad_x_shared = Shared::new_slice(2 * shared_len);
+        let mut grad_a_local = 0.0f32;
+        let mut grad_d_local = 0.0f32;
+        let segments = (seq_len + segment_len - 1) / segment_len;
+        let segment_base = ((batch * segments + segment) * channels + channel) * state_dim + n;
+        let mut adjoint = if active {
+            adj_carry[segment_base]
+        } else {
+            0.0f32
+        };
+
+        let start = segment * segment_len;
+        let mut end = start + segment_len;
+        if end > seq_len {
+            end = seq_len;
+        }
+        let chunk_len = end - start;
+        let state_before = if active {
+            if segment == 0 {
+                h_in[state_index]
+            } else {
+                checkpoints[((batch * segments + segment - 1) * channels + channel) * state_dim + n]
+            }
+        } else {
+            0.0f32
+        };
+        let av = if active { a[a_index] } else { 0.0f32 };
+        let mut state = state_before;
+        let mut chunk_states = Array::<f32>::new(segment_len);
+
+        for offset in 0..chunk_len {
+            let t = start + offset;
+            let btc = (batch * seq_len + t) * channels + channel;
+            let btn = (batch * seq_len + t) * state_dim;
+            let dt = if active { delta[btc] } else { 0.0f32 };
+            let x = if active { xs[btc] } else { 0.0f32 };
+            let bv = if active { b_mat[btn + n] } else { 0.0f32 };
+            state = state * (dt * av).exp() + dt * bv * x;
+            chunk_states[offset] = state;
+        }
+
+        for reverse_offset in 0..chunk_len {
+            let offset = chunk_len - reverse_offset - 1;
+            let t = start + offset;
+            let btc = (batch * seq_len + t) * channels + channel;
+            let btn = (batch * seq_len + t) * state_dim;
+            let dt = if active { delta[btc] } else { 0.0f32 };
+            let raw_dt = if active { delta_raw[btc] } else { 0.0f32 };
+            let x = if active { xs[btc] } else { 0.0f32 };
+            let dy = if active { grad_y[btc] } else { 0.0f32 };
+            let bv = if active { b_mat[btn + n] } else { 0.0f32 };
+            let cv = if active { c_mat[btn + n] } else { 0.0f32 };
+            let alpha = (dt * av).exp();
+            let h_prev = if offset == 0 {
+                state_before
+            } else {
+                chunk_states[offset - 1]
+            };
+            let h_t = chunk_states[offset];
+            let g = adjoint + dy * cv;
+            let step = seq_len - t - 1;
+            let shared_offset = (step % 2) * shared_len;
+            grad_dt_shared[shared_offset + shared_index] = g * (h_prev * alpha * av + bv * x);
+            grad_x_shared[shared_offset + shared_index] = g * dt * bv;
+            let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
+            let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
+            sync_cube();
+
+            if n == 0 && active_channel {
+                let mut grad_dt = 0.0f32;
+                let mut grad_x = 0.0f32;
+                for state in 0..state_dim {
+                    let index = shared_offset + state * BACKWARD_CHANNELS + local_channel;
+                    grad_dt += grad_dt_shared[index];
+                    grad_x += grad_x_shared[index];
+                }
+                grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
+                grad_xs[btc] = dy * d[channel] + grad_x;
+                grad_d_local += dy * x;
+            }
+            if local_channel == 0 {
+                atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
+                atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
+            }
+            grad_a_local += g * h_prev * alpha * dt;
+            adjoint = g * alpha;
+        }
+
+        if active {
+            atomic_add_f32(&mut grad_a[a_index], grad_a_local);
+            if segment == 0 {
+                grad_h[state_index] = adjoint;
+            }
+        }
+        if n == 0 && active_channel {
+            atomic_add_f32(&mut grad_d[channel], grad_d_local);
+        }
+    }
+
     impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
         fn selective_scan_inner(
             delta: CubeTensor<R>,
@@ -996,7 +1392,65 @@ mod gpu {
                 delta_raw.into_tensor_arg(),
                 delta.clone().into_tensor_arg(),
             );
-            if full_sequence_scan {
+            let segments = seq_len.div_ceil(checkpoint_interval);
+            if full_sequence_scan && save_states && checkpoint_interval > 1 && segments > 1 {
+                // Training path: segment-parallel scan. Segment transitions
+                // compose exactly for a diagonal recurrence, so every
+                // checkpoint segment runs concurrently and a cheap fold
+                // stitches the carries.
+                let partial_shape = Shape::new([batch, segments, channels, state_dim]);
+                let partial = empty_like(&xs, partial_shape.clone());
+                let decay = empty_like(&xs, partial_shape.clone());
+                let carry = empty_like(&xs, partial_shape);
+                let segment_threads = (batch * segments * channels) as u32;
+                selective_scan_forward_segment_partials::launch::<R>(
+                    &client,
+                    CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta.clone().into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.clone().into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    partial.clone().into_tensor_arg(),
+                    decay.clone().into_tensor_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                    checkpoint_interval,
+                );
+                let carry_threads = (batch * channels * state_dim) as u32;
+                selective_scan_forward_segment_carry::launch::<R>(
+                    &client,
+                    CubeCount::Static(carry_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    h.clone().into_tensor_arg(),
+                    partial.into_tensor_arg(),
+                    decay.into_tensor_arg(),
+                    carry.clone().into_tensor_arg(),
+                    channels as u32,
+                    segments as u32,
+                    state_dim,
+                );
+                selective_scan_forward_segment_apply::launch::<R>(
+                    &client,
+                    CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta.clone().into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.clone().into_tensor_arg(),
+                    c_mat.into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    d.into_tensor_arg(),
+                    carry.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    states.clone().into_tensor_arg(),
+                    h_out.clone().into_tensor_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                    checkpoint_interval,
+                );
+            } else if full_sequence_scan {
                 let serial_blocks = ((batch * channels) as u32).div_ceil(THREADS_PER_CUBE);
                 if serial_blocks >= SERIAL_SCAN_MIN_BLOCKS {
                     selective_scan_forward_serial::launch::<R>(
@@ -1122,36 +1576,107 @@ mod gpu {
                 delta.clone().into_tensor_arg(),
             );
 
-            selective_scan_backward_fused::launch::<R>(
-                &client,
-                CubeCount::Static(
-                    (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
-                    batch as u32,
-                    1,
-                ),
-                CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
-                delta.clone().into_tensor_arg(),
-                delta_raw.into_tensor_arg(),
-                xs.clone().into_tensor_arg(),
-                b_mat.into_tensor_arg(),
-                c_mat.clone().into_tensor_arg(),
-                a.clone().into_tensor_arg(),
-                d.into_tensor_arg(),
-                h.clone().into_tensor_arg(),
-                states.clone().into_tensor_arg(),
-                grad_y.clone().into_tensor_arg(),
-                grad_delta.clone().into_tensor_arg(),
-                grad_xs.clone().into_tensor_arg(),
-                grad_b.clone().into_tensor_arg(),
-                grad_c.clone().into_tensor_arg(),
-                grad_a.clone().into_tensor_arg(),
-                grad_d.clone().into_tensor_arg(),
-                grad_h.clone().into_tensor_arg(),
-                channels as u32,
-                seq_len as u32,
-                state_dim,
-                checkpoint_interval,
-            );
+            let segments = seq_len.div_ceil(checkpoint_interval);
+            if checkpoint_interval > 1 && segments > 1 {
+                // Segment-parallel adjoint: stitch the linear adjoint
+                // recurrence across checkpoint segments, then run every
+                // segment's gradient block concurrently.
+                let partial_shape = Shape::new([batch, segments, channels, state_dim]);
+                let inj = empty_like(&xs, partial_shape.clone());
+                let adecay = empty_like(&xs, partial_shape.clone());
+                let acarry = empty_like(&xs, partial_shape);
+                let segment_threads = (batch * segments * channels) as u32;
+                selective_scan_backward_segment_partials::launch::<R>(
+                    &client,
+                    CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta.clone().into_tensor_arg(),
+                    c_mat.clone().into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    grad_y.clone().into_tensor_arg(),
+                    inj.clone().into_tensor_arg(),
+                    adecay.clone().into_tensor_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                    checkpoint_interval,
+                );
+                let carry_threads = (batch * channels * state_dim) as u32;
+                selective_scan_backward_segment_carry::launch::<R>(
+                    &client,
+                    CubeCount::Static(carry_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    inj.into_tensor_arg(),
+                    adecay.into_tensor_arg(),
+                    acarry.clone().into_tensor_arg(),
+                    channels as u32,
+                    segments as u32,
+                    carry_threads,
+                    state_dim,
+                );
+                selective_scan_backward_segmented::launch::<R>(
+                    &client,
+                    CubeCount::Static(
+                        (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                        batch as u32,
+                        segments as u32,
+                    ),
+                    CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                    delta.clone().into_tensor_arg(),
+                    delta_raw.into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.into_tensor_arg(),
+                    c_mat.clone().into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    d.into_tensor_arg(),
+                    h.clone().into_tensor_arg(),
+                    states.clone().into_tensor_arg(),
+                    acarry.into_tensor_arg(),
+                    grad_y.clone().into_tensor_arg(),
+                    grad_delta.clone().into_tensor_arg(),
+                    grad_xs.clone().into_tensor_arg(),
+                    grad_b.clone().into_tensor_arg(),
+                    grad_c.clone().into_tensor_arg(),
+                    grad_a.clone().into_tensor_arg(),
+                    grad_d.clone().into_tensor_arg(),
+                    grad_h.clone().into_tensor_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                    checkpoint_interval,
+                );
+            } else {
+                selective_scan_backward_fused::launch::<R>(
+                    &client,
+                    CubeCount::Static(
+                        (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                        batch as u32,
+                        1,
+                    ),
+                    CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                    delta.clone().into_tensor_arg(),
+                    delta_raw.into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.into_tensor_arg(),
+                    c_mat.clone().into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    d.into_tensor_arg(),
+                    h.clone().into_tensor_arg(),
+                    states.clone().into_tensor_arg(),
+                    grad_y.clone().into_tensor_arg(),
+                    grad_delta.clone().into_tensor_arg(),
+                    grad_xs.clone().into_tensor_arg(),
+                    grad_b.clone().into_tensor_arg(),
+                    grad_c.clone().into_tensor_arg(),
+                    grad_a.clone().into_tensor_arg(),
+                    grad_d.clone().into_tensor_arg(),
+                    grad_h.clone().into_tensor_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                    checkpoint_interval,
+                );
+            }
 
             (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h)
         }
