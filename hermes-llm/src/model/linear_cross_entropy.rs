@@ -575,6 +575,11 @@ mod gpu {
         let [tokens, hidden_size] = hidden.shape().dims();
         let [vocab_size, _] = weight.shape().dims();
         let device = hidden.device.clone();
+        // The hidden gradient re-enters autodiff where the activation lives,
+        // so it must match the incoming activation dtype (BF16 residual
+        // stream during training-fusion, FP32 elsewhere) — the fusion IR
+        // rejects mismatched gradients at runtime.
+        let hidden_dtype = hidden.dtype;
         let bias = into_contiguous(bias);
         let targets = into_contiguous(targets);
         let scale = into_contiguous(B::<R>::float_div_scalar(
@@ -626,11 +631,13 @@ mod gpu {
                 use_bias,
             );
             let logits_gradient_compute = bf16_operand(logits_gradient.clone(), bf16_matmul);
-            hidden_gradients.push(chunk_matmul(
-                logits_gradient_compute.clone(),
-                weight.clone(),
-                bf16_matmul,
-            ));
+            let hidden_gradient =
+                B::<R>::float_matmul(logits_gradient_compute.clone(), weight.clone());
+            hidden_gradients.push(if hidden_gradient.dtype == hidden_dtype {
+                hidden_gradient
+            } else {
+                burn_cubecl::kernel::cast(hidden_gradient, hidden_dtype)
+            });
             weight_gradient = B::<R>::float_add(
                 weight_gradient,
                 chunk_matmul(

@@ -81,6 +81,25 @@ pub(super) fn linear_low_precision<const D: usize>(layer: &Linear, input: Tensor
     linear(layer, input)
 }
 
+/// Cast an activation onto the training residual-stream dtype.
+///
+/// Under CUDA training-fusion the whole residual stream runs in BF16 — the
+/// same layout PyTorch autocast produces — so residual adds, activations, and
+/// projection inputs move half the bytes and the promote/recast passes around
+/// every matmul disappear. Norm statistics still accumulate in FP32 (see
+/// [`super::Norm::forward`]) and the attention Q/K/V path keeps its FP32
+/// RoPE + F16 saved tensors. Identity on every other build.
+pub(super) fn stream_cast<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
+    #[cfg(feature = "training-fusion")]
+    {
+        if let Some(dtype) = matmul_dtype(&tensor.device()) {
+            return tensor.cast(dtype);
+        }
+    }
+
+    tensor
+}
+
 pub(super) fn matmul_2(lhs: Tensor<2>, rhs: Tensor<2>) -> Tensor<2> {
     #[cfg(feature = "cuda")]
     {

@@ -10,7 +10,7 @@ use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
 use crate::mal::{BlockDef, ModelDef, PositionEncoding};
 
 use super::linear_cross_entropy::linear_cross_entropy;
-use super::matmul::{matmul_2, matmul_input, prepare_linear_for_inference};
+use super::matmul::{matmul_2, matmul_input, prepare_linear_for_inference, stream_cast};
 use super::{InferenceState, Norm, TransformerBlock};
 
 const EMBEDDING_STD: f64 = 0.02;
@@ -253,7 +253,11 @@ impl Transformer {
             start_pos + seq_len,
             self.config.max_seq_len
         );
-        let mut x = self.embed(input_ids);
+        // The full-sequence path runs the residual stream in the training
+        // compute dtype (BF16 under CUDA training-fusion). Incremental decode
+        // (`forward_hidden_with_state`) keeps FP32: its scan/conv step kernels
+        // are FP32-only.
+        let mut x = stream_cast(self.embed(input_ids));
         for layer in &self.layers {
             x = layer.forward(x, &self.rope, start_pos);
         }
@@ -448,6 +452,101 @@ mod tests {
     use super::*;
     use crate::mal::get_builtin_model;
     use burn::tensor::TensorData;
+
+    /// End-to-end BF16-residual-stream gate: the model must run forward_loss
+    /// + backward under lazy fusion, where dtype mismatches between custom-op
+    /// gradients and the BF16 stream only surface at runtime (the plain-CUDA
+    /// suite never exercises them). Probes attention-only, mamba-only, and
+    /// hybrid variants so a failure localizes to a block type.
+    #[cfg(all(feature = "training-fusion", target_os = "linux"))]
+    #[test]
+    fn training_fusion_bf16_stream_loss_and_gradients_are_finite() {
+        use burn::tensor::DType;
+
+        struct GradProbe<'a> {
+            grads: &'a burn::tensor::Gradients,
+            checked: usize,
+            bad: Vec<String>,
+        }
+        impl ModuleVisitor for GradProbe<'_> {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+                self.checked += 1;
+                let Some(grad) = param.grad(self.grads) else {
+                    self.bad.push(format!("{:?} MISSING", param.shape()));
+                    return;
+                };
+                let scalars =
+                    |t: Tensor<1>| t.into_data().convert::<f32>().to_vec::<f32>().unwrap()[0];
+                let sum = scalars(grad.clone().sum());
+                let amax = scalars(grad.abs().max());
+                if !sum.is_finite() || amax == 0.0 {
+                    self.bad
+                        .push(format!("{:?} sum={sum} amax={amax}", param.shape()));
+                }
+            }
+        }
+
+        let run = |label: &str, config: &crate::mal::ModelDef, device: &Device| {
+            device.seed(17);
+            let model = Transformer::new(config, device).unwrap();
+            let (batch, seq_len) = (2, 48);
+            let ids: Vec<i64> = (0..batch * (seq_len + 1))
+                .map(|i| (i * 7 % config.vocab_size) as i64)
+                .collect();
+            let tokens =
+                Tensor::<2, Int>::from_data(TensorData::new(ids, [batch, seq_len + 1]), device);
+            let inputs = tokens.clone().slice([0..batch, 0..seq_len]);
+            let targets = tokens.slice([0..batch, 1..seq_len + 1]);
+
+            let loss = model.forward_loss(inputs, targets);
+            assert_eq!(loss.dtype(), DType::F32, "{label}: loss must stay FP32");
+            let value = loss
+                .clone()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap()[0];
+            let grads = loss.backward();
+            let mut probe = GradProbe {
+                grads: &grads,
+                checked: 0,
+                bad: Vec::new(),
+            };
+            model.visit(&mut probe);
+            println!(
+                "{label}: loss={value} params={} bad={}",
+                probe.checked,
+                probe.bad.len()
+            );
+            for line in &probe.bad {
+                println!("{label}: BAD {line}");
+            }
+            assert!(
+                value.is_finite(),
+                "{label}: loss must be finite, got {value}"
+            );
+            assert!(
+                probe.bad.is_empty(),
+                "{label}: every parameter gradient must be finite and non-zero"
+            );
+        };
+
+        let hybrid = get_builtin_model("hybrid_tiny").unwrap();
+        let device = Device::cuda(0).autodiff();
+
+        let mut attention_only = hybrid.clone();
+        attention_only.pattern = None;
+        run("attention-only", &attention_only, &device);
+
+        let mut mamba_only = hybrid.clone();
+        mamba_only.pattern = hybrid
+            .pattern
+            .as_ref()
+            .map(|pattern| vec![pattern[0].clone()]);
+        run("mamba-only", &mamba_only, &device);
+
+        run("hybrid", &hybrid, &device);
+    }
 
     #[test]
     fn unaligned_vocabulary_uses_zero_padded_parameters() {

@@ -56,8 +56,14 @@ impl TransformerBlock {
     }
 
     fn residual(&self, x: Tensor<3>, branch: Tensor<3>) -> Tensor<3> {
-        let branch = self.residual_dropout.forward(branch);
+        let mut branch = self.residual_dropout.forward(branch);
         if self.use_residual {
+            // Incremental decode keeps an FP32 stream while the training
+            // projections emit the BF16 compute dtype; align the branch to
+            // the stream. During training both sides already match (BF16).
+            if branch.dtype() != x.dtype() {
+                branch = branch.cast(x.dtype());
+            }
             x + branch
         } else {
             branch

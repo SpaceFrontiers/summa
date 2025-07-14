@@ -1408,11 +1408,30 @@ mod gpu {
             assert_eq!(delta_raw.dtype, io_dtype);
             assert_eq!(b_mat.dtype, io_dtype);
             assert_eq!(c_mat.dtype, io_dtype);
+            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+            let full_sequence_scan = save_states || seq_len > 1;
+            let segments = seq_len.div_ceil(checkpoint_interval);
+            let segmented =
+                full_sequence_scan && save_states && checkpoint_interval > 1 && segments > 1;
+            // Only the segment-parallel training path has BF16 kernels. The
+            // remaining paths (decode, prefill without saved states, the
+            // small-problem full-state path) normalize a BF16 stream to FP32
+            // here and hand BF16 back at the return.
+            let normalize_fp32 = io_dtype == DType::BF16 && !segmented;
+            let (delta_raw, xs, b_mat, c_mat, io_dtype) = if normalize_fp32 {
+                (
+                    burn_cubecl::kernel::cast(delta_raw, DType::F32),
+                    burn_cubecl::kernel::cast(xs, DType::F32),
+                    burn_cubecl::kernel::cast(b_mat, DType::F32),
+                    burn_cubecl::kernel::cast(c_mat, DType::F32),
+                    DType::F32,
+                )
+            } else {
+                (delta_raw, xs, b_mat, c_mat, io_dtype)
+            };
             let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let h_out = empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
             let delta = empty_like_dtype(&xs, Shape::new([batch, seq_len, channels]), DType::F32);
-            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
-            let full_sequence_scan = save_states || seq_len > 1;
             let states = if save_states {
                 empty_like_dtype(
                     &xs,
@@ -1446,8 +1465,7 @@ mod gpu {
                     delta.clone().into_tensor_arg(),
                 ),
             }
-            let segments = seq_len.div_ceil(checkpoint_interval);
-            if full_sequence_scan && save_states && checkpoint_interval > 1 && segments > 1 {
+            if segmented {
                 // Training path: segment-parallel scan. Segment transitions
                 // compose exactly for a diagonal recurrence, so every
                 // checkpoint segment runs concurrently and a cheap fold
@@ -1589,6 +1607,11 @@ mod gpu {
                 );
             }
 
+            let y = if normalize_fp32 {
+                burn_cubecl::kernel::cast(y, DType::BF16)
+            } else {
+                y
+            };
             (y, h_out, states)
         }
 
@@ -1635,6 +1658,25 @@ mod gpu {
                 grad_y.dtype, io_dtype,
                 "selective scan output gradient dtype must match the sequence dtype"
             );
+            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+            let segments = seq_len.div_ceil(checkpoint_interval);
+            let segmented = checkpoint_interval > 1 && segments > 1;
+            // Only the segment-parallel training backward has BF16 kernels;
+            // the fused fallback normalizes the sequence tensors to FP32 and
+            // hands the gradients back in the caller's dtype at the return.
+            let normalize_fp32 = io_dtype == DType::BF16 && !segmented;
+            let (delta_raw, xs, b_mat, c_mat, grad_y, io_dtype) = if normalize_fp32 {
+                (
+                    burn_cubecl::kernel::cast(delta_raw, DType::F32),
+                    burn_cubecl::kernel::cast(xs, DType::F32),
+                    burn_cubecl::kernel::cast(b_mat, DType::F32),
+                    burn_cubecl::kernel::cast(c_mat, DType::F32),
+                    burn_cubecl::kernel::cast(grad_y, DType::F32),
+                    DType::F32,
+                )
+            } else {
+                (delta_raw, xs, b_mat, c_mat, grad_y, io_dtype)
+            };
             let grad_delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let grad_xs = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let grad_b = zeros_like_dtype(&xs, Shape::new([batch, seq_len, state_dim]), DType::F32);
@@ -1644,7 +1686,6 @@ mod gpu {
             let grad_h =
                 empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
             let delta = empty_like_dtype(&xs, Shape::new([batch, seq_len, channels]), DType::F32);
-            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
             let client = xs.client.clone();
 
             let delta_total = (batch * seq_len * channels) as u32;
@@ -1665,8 +1706,7 @@ mod gpu {
                 ),
             }
 
-            let segments = seq_len.div_ceil(checkpoint_interval);
-            if checkpoint_interval > 1 && segments > 1 {
+            if segmented {
                 // Segment-parallel adjoint: stitch the linear adjoint
                 // recurrence across checkpoint segments, then run every
                 // segment's gradient block concurrently.
@@ -1787,6 +1827,17 @@ mod gpu {
                 );
             }
 
+            if normalize_fp32 {
+                return (
+                    burn_cubecl::kernel::cast(grad_delta, DType::BF16),
+                    burn_cubecl::kernel::cast(grad_xs, DType::BF16),
+                    burn_cubecl::kernel::cast(grad_b, DType::BF16),
+                    burn_cubecl::kernel::cast(grad_c, DType::BF16),
+                    grad_a,
+                    grad_d,
+                    grad_h,
+                );
+            }
             (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h)
         }
     }

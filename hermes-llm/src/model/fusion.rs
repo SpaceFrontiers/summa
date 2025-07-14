@@ -229,7 +229,9 @@ where
         use_bias: bool,
     ) -> FloatTensor<Self> {
         let client = hidden.client.clone();
-        let loss = TensorIr::uninit(client.create_empty_handle(), Shape::new([1]), hidden.dtype);
+        // The loss statistics chain always computes in FP32, even when the
+        // hidden activations arrive in the BF16 residual-stream dtype.
+        let loss = TensorIr::uninit(client.create_empty_handle(), Shape::new([1]), DType::F32);
         let desc = CustomOpIr::with_scalars(
             "hermes_linear_cross_entropy",
             &[

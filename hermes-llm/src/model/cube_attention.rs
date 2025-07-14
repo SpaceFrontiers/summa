@@ -132,6 +132,7 @@ fn attention_backward_probabilities_kernel(
     correction: &Tensor<f32>,
     probabilities: &mut Tensor<bf16>,
     score_gradient: &mut Tensor<bf16>,
+    total: u32,
     cols: u32,
     chunk_rows: u32,
     row_offset: u32,
@@ -141,7 +142,7 @@ fn attention_backward_probabilities_kernel(
     let cols = cols as usize;
     let chunk_rows = chunk_rows as usize;
     let idx = ABSOLUTE_POS;
-    if idx < probabilities.len() {
+    if idx < total as usize {
         let row = idx / cols;
         let col = idx % cols;
         let mut bound = cols;
@@ -236,6 +237,19 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         let scores = into_contiguous(scores);
         let grad_probabilities = into_contiguous(grad_probabilities);
         let correction = into_contiguous(correction);
+        // The kernels read these buffers as raw FP32; a mismatched dtype is
+        // reinterpreted bit-for-bit (NaN garbage), never an error downstream.
+        for (name, tensor) in [
+            ("scores", &scores),
+            ("probability gradient", &grad_probabilities),
+            ("correction", &correction),
+        ] {
+            assert_eq!(
+                tensor.dtype,
+                burn::tensor::DType::F32,
+                "attention backward {name} must be FP32"
+            );
+        }
         let [batch, heads, chunk_rows, cols] = scores.shape().dims();
         let rows = batch * heads * chunk_rows;
         let client = scores.client.clone();
@@ -267,6 +281,7 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
             correction.into_tensor_arg(),
             probabilities.clone().into_tensor_arg(),
             score_gradient.clone().into_tensor_arg(),
+            total,
             cols as u32,
             chunk_rows as u32,
             row_offset as u32,

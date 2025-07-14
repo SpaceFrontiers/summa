@@ -12,7 +12,7 @@ use burn_nn::{Linear, LinearConfig};
 use crate::mal::{ModelDef, SsmDef};
 
 use super::conv::depthwise_conv1d;
-use super::matmul::{linear, linear_low_precision, prepare_linear_for_inference};
+use super::matmul::{linear_low_precision, prepare_linear_for_inference};
 use super::scan::selective_scan;
 
 /// Recurrent state for one Mamba layer.
@@ -206,6 +206,6 @@ impl MambaMixer {
             s.h = h;
         }
 
-        linear(&self.out_proj, y * silu(z))
+        linear_low_precision(&self.out_proj, y * silu(z))
     }
 }

@@ -53,3 +53,43 @@ tok/s at batch 16 (+6.0%) and 38,164 → 40,607 at batch 20 (+6.4%), with the
 `cuda_attention_backward_matches_cpu_reference_for_causal_gqa` autodiff
 parity test green and identical loss trajectories. The standalone causal-mask
 kernel and the 1.9 ms score casts no longer appear in the profile.
+
+## Shape guard on the fused probabilities op
+
+The fused probabilities custom op only runs when the chunk row count and the
+sequence length are both powers of two — the class every production shape
+belongs to (T = 1024, backward chunk = 2048). Other shapes take a tensor-op
+branch inside `chunked_attention_backward` (masked softmax + the same
+correction algebra in FP32, quantized once by the matmul input casts).
+
+Why: the BF16-residual-stream end-to-end gate (`hybrid_tiny`, seq 48) caught
+NaN gradients whose source took a long bisect — loss finite, all parameter
+gradients NaN, nondeterministic onset. The trail, for the record:
+
+- CPU recompute from the very buffers the kernel reads (scores, stats) is
+  finite and correct, yet the op's output rows land displaced (`row r`'s
+  values written at `32·r + c + 16` for a 48-column chunk) with whole
+  regions unwritten — recycled pool garbage then reads as NaN once the pool
+  fills with poisoned gradients.
+- `compute-sanitizer --tool memcheck`: zero invalid accesses.
+- The compiled CUDA source of the kernel (via `CUBECL_DEBUG_LOG`) is
+  provably correct — dense scalar indexing, runtime scalars, clamped writes.
+- Failures reproduce only at non-power-of-two sequence lengths (40, 48, 96);
+  32, 64, and every production shape pass a strict CPU-reference parity
+  sweep repeatedly.
+
+A correct kernel whose writes land displaced points at the fork's
+multi-stream fusion runtime (the run that first tripped also crashed with
+burn-fusion's "Ordering is bigger than operations"), not at the kernel or the
+bridge — unresolved upstream, tracked for the cubecl fork. Until then the
+guard keeps the fast path exactly where it is proven, and
+`cuda_attention_backward_matches_cpu_reference_for_small_shapes` pins the
+fallback branch (gradient tolerance 0.08 there: BF16 tensor-core gradient
+GEMMs at small odd-K shapes reach 0.0403 deterministically per kernel and
+0.024–0.051 across autotune states; the canonical 64/64 test stays at 0.02).
+
+Two hardening changes shipped with the guard: the backward kernels assert
+their FP32 input dtypes at the launch boundary (a mismatched buffer was
+previously reinterpreted bit-for-bit — the BF16 stream's first failure mode),
+and the elementwise kernel takes an explicit element count instead of
+trusting `Tensor::len()`.
