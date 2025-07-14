@@ -560,8 +560,13 @@ mod gpu {
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
+    use burn::tensor::DType;
+    use half::bf16;
+
     use super::{MambaBackend, scan_checkpoint_interval};
-    use crate::model::cube_tensor::{empty_like, into_contiguous, zeros_like};
+    use crate::model::cube_tensor::{
+        empty_like, empty_like_dtype, into_contiguous, zeros_like_dtype,
+    };
 
     const THREADS_PER_CUBE: u32 = 128;
     const PLANE_WIDTH: u32 = 32;
@@ -618,10 +623,10 @@ mod gpu {
     }
 
     #[cube(launch)]
-    fn softplus_forward(input: &Tensor<f32>, output: &mut Tensor<f32>) {
+    fn softplus_forward<F: Float>(input: &Tensor<F>, output: &mut Tensor<f32>) {
         let idx = ABSOLUTE_POS;
         if idx < input.len() {
-            output[idx] = stable_softplus(input[idx]);
+            output[idx] = stable_softplus(f32::cast_from(input[idx]));
         }
     }
 
@@ -801,10 +806,10 @@ mod gpu {
     /// per-step decays of a diagonal state matrix.
     #[allow(clippy::manual_div_ceil)]
     #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
-    fn selective_scan_forward_segment_partials(
+    fn selective_scan_forward_segment_partials<F: Float>(
         delta: &Tensor<f32>,
-        xs: &Tensor<f32>,
-        b_mat: &Tensor<f32>,
+        xs: &Tensor<F>,
+        b_mat: &Tensor<F>,
         a: &Tensor<f32>,
         partial: &mut Tensor<f32>,
         decay: &mut Tensor<f32>,
@@ -837,11 +842,12 @@ mod gpu {
                     let btc = (batch * seq_len + t) * channels + channel;
                     let btn = (batch * seq_len + t) * state_dim;
                     let dt = delta[btc];
-                    let x = xs[btc];
+                    let x = f32::cast_from(xs[btc]);
                     sum_dt += dt;
                     #[unroll]
                     for n in 0..state_dim {
-                        state[n] = state[n] * (dt * a_row[n]).exp() + dt * b_mat[btn + n] * x;
+                        state[n] = state[n] * (dt * a_row[n]).exp()
+                            + dt * f32::cast_from(b_mat[btn + n]) * x;
                     }
                 }
             }
@@ -889,15 +895,15 @@ mod gpu {
     /// final state.
     #[allow(clippy::manual_div_ceil)]
     #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
-    fn selective_scan_forward_segment_apply(
+    fn selective_scan_forward_segment_apply<F: Float>(
         delta: &Tensor<f32>,
-        xs: &Tensor<f32>,
-        b_mat: &Tensor<f32>,
-        c_mat: &Tensor<f32>,
+        xs: &Tensor<F>,
+        b_mat: &Tensor<F>,
+        c_mat: &Tensor<F>,
         a: &Tensor<f32>,
         d: &Tensor<f32>,
         carry: &Tensor<f32>,
-        y: &mut Tensor<f32>,
+        y: &mut Tensor<F>,
         checkpoints: &mut Tensor<f32>,
         h_out: &mut Tensor<f32>,
         channels: u32,
@@ -929,14 +935,15 @@ mod gpu {
                     let btc = (batch * seq_len + t) * channels + channel;
                     let btn = (batch * seq_len + t) * state_dim;
                     let dt = delta[btc];
-                    let x = xs[btc];
+                    let x = f32::cast_from(xs[btc]);
                     let mut out = 0.0f32;
                     #[unroll]
                     for n in 0..state_dim {
-                        state[n] = state[n] * (dt * a_row[n]).exp() + dt * b_mat[btn + n] * x;
-                        out += state[n] * c_mat[btn + n];
+                        state[n] = state[n] * (dt * a_row[n]).exp()
+                            + dt * f32::cast_from(b_mat[btn + n]) * x;
+                        out += state[n] * f32::cast_from(c_mat[btn + n]);
                     }
-                    y[btc] = out + x * d[channel];
+                    y[btc] = F::cast_from(out + x * d[channel]);
                 }
             }
             let checkpoint_base = ((batch * segments + segment) * channels + channel) * state_dim;
@@ -959,11 +966,11 @@ mod gpu {
     /// segments compose exactly like the forward pass, just right-to-left.
     #[allow(clippy::manual_div_ceil)]
     #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
-    fn selective_scan_backward_segment_partials(
+    fn selective_scan_backward_segment_partials<F: Float>(
         delta: &Tensor<f32>,
-        c_mat: &Tensor<f32>,
+        c_mat: &Tensor<F>,
         a: &Tensor<f32>,
-        grad_y: &Tensor<f32>,
+        grad_y: &Tensor<F>,
         inj: &mut Tensor<f32>,
         decay: &mut Tensor<f32>,
         channels: u32,
@@ -996,11 +1003,12 @@ mod gpu {
                     let btc = (batch * seq_len + t) * channels + channel;
                     let btn = (batch * seq_len + t) * state_dim;
                     let dt = delta[btc];
-                    let dy = grad_y[btc];
+                    let dy = f32::cast_from(grad_y[btc]);
                     sum_dt += dt;
                     #[unroll]
                     for n in 0..state_dim {
-                        adj[n] = (adj[n] + dy * c_mat[btn + n]) * (dt * a_row[n]).exp();
+                        adj[n] =
+                            (adj[n] + dy * f32::cast_from(c_mat[btn + n])) * (dt * a_row[n]).exp();
                     }
                 }
             }
@@ -1201,20 +1209,20 @@ mod gpu {
     /// instead of one block walking the whole reverse recurrence.
     #[allow(clippy::manual_div_ceil, clippy::useless_conversion)]
     #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
-    fn selective_scan_backward_segmented(
+    fn selective_scan_backward_segmented<F: Float>(
         delta: &Tensor<f32>,
-        delta_raw: &Tensor<f32>,
-        xs: &Tensor<f32>,
-        b_mat: &Tensor<f32>,
-        c_mat: &Tensor<f32>,
+        delta_raw: &Tensor<F>,
+        xs: &Tensor<F>,
+        b_mat: &Tensor<F>,
+        c_mat: &Tensor<F>,
         a: &Tensor<f32>,
         d: &Tensor<f32>,
         h_in: &Tensor<f32>,
         checkpoints: &Tensor<f32>,
         adj_carry: &Tensor<f32>,
-        grad_y: &Tensor<f32>,
-        grad_delta: &mut Tensor<f32>,
-        grad_xs: &mut Tensor<f32>,
+        grad_y: &Tensor<F>,
+        grad_delta: &mut Tensor<F>,
+        grad_xs: &mut Tensor<F>,
         grad_b: &mut Tensor<Atomic<f32>>,
         grad_c: &mut Tensor<Atomic<f32>>,
         grad_a: &mut Tensor<Atomic<f32>>,
@@ -1276,8 +1284,16 @@ mod gpu {
             let btc = (batch * seq_len + t) * channels + channel;
             let btn = (batch * seq_len + t) * state_dim;
             let dt = if active { delta[btc] } else { 0.0f32 };
-            let x = if active { xs[btc] } else { 0.0f32 };
-            let bv = if active { b_mat[btn + n] } else { 0.0f32 };
+            let x = if active {
+                f32::cast_from(xs[btc])
+            } else {
+                0.0f32
+            };
+            let bv = if active {
+                f32::cast_from(b_mat[btn + n])
+            } else {
+                0.0f32
+            };
             state = state * (dt * av).exp() + dt * bv * x;
             chunk_states[offset] = state;
         }
@@ -1288,11 +1304,31 @@ mod gpu {
             let btc = (batch * seq_len + t) * channels + channel;
             let btn = (batch * seq_len + t) * state_dim;
             let dt = if active { delta[btc] } else { 0.0f32 };
-            let raw_dt = if active { delta_raw[btc] } else { 0.0f32 };
-            let x = if active { xs[btc] } else { 0.0f32 };
-            let dy = if active { grad_y[btc] } else { 0.0f32 };
-            let bv = if active { b_mat[btn + n] } else { 0.0f32 };
-            let cv = if active { c_mat[btn + n] } else { 0.0f32 };
+            let raw_dt = if active {
+                f32::cast_from(delta_raw[btc])
+            } else {
+                0.0f32
+            };
+            let x = if active {
+                f32::cast_from(xs[btc])
+            } else {
+                0.0f32
+            };
+            let dy = if active {
+                f32::cast_from(grad_y[btc])
+            } else {
+                0.0f32
+            };
+            let bv = if active {
+                f32::cast_from(b_mat[btn + n])
+            } else {
+                0.0f32
+            };
+            let cv = if active {
+                f32::cast_from(c_mat[btn + n])
+            } else {
+                0.0f32
+            };
             let alpha = (dt * av).exp();
             let h_prev = if offset == 0 {
                 state_before
@@ -1317,8 +1353,8 @@ mod gpu {
                     grad_dt += grad_dt_shared[index];
                     grad_x += grad_x_shared[index];
                 }
-                grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
-                grad_xs[btc] = dy * d[channel] + grad_x;
+                grad_delta[btc] = F::cast_from(grad_dt * stable_sigmoid(raw_dt));
+                grad_xs[btc] = F::cast_from(dy * d[channel] + grad_x);
                 grad_d_local += dy * x;
             }
             if local_channel == 0 {
@@ -1364,13 +1400,21 @@ mod gpu {
             let a = into_contiguous(a);
             let d = into_contiguous(d);
             let h = into_contiguous(h);
+            let io_dtype = xs.dtype;
+            assert!(
+                io_dtype == DType::F32 || io_dtype == DType::BF16,
+                "selective scan supports F32 or BF16 sequence tensors, got {io_dtype:?}"
+            );
+            assert_eq!(delta_raw.dtype, io_dtype);
+            assert_eq!(b_mat.dtype, io_dtype);
+            assert_eq!(c_mat.dtype, io_dtype);
             let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
-            let h_out = empty_like(&xs, Shape::new([batch, channels, state_dim]));
-            let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let h_out = empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
+            let delta = empty_like_dtype(&xs, Shape::new([batch, seq_len, channels]), DType::F32);
             let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
             let full_sequence_scan = save_states || seq_len > 1;
             let states = if save_states {
-                empty_like(
+                empty_like_dtype(
                     &xs,
                     Shape::new([
                         batch,
@@ -1378,6 +1422,7 @@ mod gpu {
                         channels,
                         state_dim,
                     ]),
+                    DType::F32,
                 )
             } else {
                 h_out.clone()
@@ -1385,13 +1430,22 @@ mod gpu {
 
             let client = xs.client.clone();
             let delta_total = (batch * seq_len * channels) as u32;
-            softplus_forward::launch::<R>(
-                &client,
-                CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
-                CubeDim::new_1d(THREADS_PER_CUBE),
-                delta_raw.into_tensor_arg(),
-                delta.clone().into_tensor_arg(),
-            );
+            match io_dtype {
+                DType::BF16 => softplus_forward::launch::<bf16, R>(
+                    &client,
+                    CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta_raw.into_tensor_arg(),
+                    delta.clone().into_tensor_arg(),
+                ),
+                _ => softplus_forward::launch::<f32, R>(
+                    &client,
+                    CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta_raw.into_tensor_arg(),
+                    delta.clone().into_tensor_arg(),
+                ),
+            }
             let segments = seq_len.div_ceil(checkpoint_interval);
             if full_sequence_scan && save_states && checkpoint_interval > 1 && segments > 1 {
                 // Training path: segment-parallel scan. Segment transitions
@@ -1399,58 +1453,70 @@ mod gpu {
                 // checkpoint segment runs concurrently and a cheap fold
                 // stitches the carries.
                 let partial_shape = Shape::new([batch, segments, channels, state_dim]);
-                let partial = empty_like(&xs, partial_shape.clone());
-                let decay = empty_like(&xs, partial_shape.clone());
-                let carry = empty_like(&xs, partial_shape);
+                let partial = empty_like_dtype(&xs, partial_shape.clone(), DType::F32);
+                let decay = empty_like_dtype(&xs, partial_shape.clone(), DType::F32);
+                let carry = empty_like_dtype(&xs, partial_shape, DType::F32);
                 let segment_threads = (batch * segments * channels) as u32;
-                selective_scan_forward_segment_partials::launch::<R>(
-                    &client,
-                    CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    delta.clone().into_tensor_arg(),
-                    xs.clone().into_tensor_arg(),
-                    b_mat.clone().into_tensor_arg(),
-                    a.clone().into_tensor_arg(),
-                    partial.clone().into_tensor_arg(),
-                    decay.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                    checkpoint_interval,
-                );
-                let carry_threads = (batch * channels * state_dim) as u32;
-                selective_scan_forward_segment_carry::launch::<R>(
-                    &client,
-                    CubeCount::Static(carry_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    h.clone().into_tensor_arg(),
-                    partial.into_tensor_arg(),
-                    decay.into_tensor_arg(),
-                    carry.clone().into_tensor_arg(),
-                    channels as u32,
-                    segments as u32,
-                    state_dim,
-                );
-                selective_scan_forward_segment_apply::launch::<R>(
-                    &client,
-                    CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    delta.clone().into_tensor_arg(),
-                    xs.clone().into_tensor_arg(),
-                    b_mat.clone().into_tensor_arg(),
-                    c_mat.into_tensor_arg(),
-                    a.clone().into_tensor_arg(),
-                    d.into_tensor_arg(),
-                    carry.into_tensor_arg(),
-                    y.clone().into_tensor_arg(),
-                    states.clone().into_tensor_arg(),
-                    h_out.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                    checkpoint_interval,
-                );
+                macro_rules! launch_forward {
+                    ($float:ty) => {{
+                        selective_scan_forward_segment_partials::launch::<$float, R>(
+                            &client,
+                            CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                            CubeDim::new_1d(THREADS_PER_CUBE),
+                            delta.clone().into_tensor_arg(),
+                            xs.clone().into_tensor_arg(),
+                            b_mat.clone().into_tensor_arg(),
+                            a.clone().into_tensor_arg(),
+                            partial.clone().into_tensor_arg(),
+                            decay.clone().into_tensor_arg(),
+                            channels as u32,
+                            seq_len as u32,
+                            state_dim,
+                            checkpoint_interval,
+                        );
+                        let carry_threads = (batch * channels * state_dim) as u32;
+                        selective_scan_forward_segment_carry::launch::<R>(
+                            &client,
+                            CubeCount::Static(carry_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                            CubeDim::new_1d(THREADS_PER_CUBE),
+                            h.clone().into_tensor_arg(),
+                            partial.into_tensor_arg(),
+                            decay.into_tensor_arg(),
+                            carry.clone().into_tensor_arg(),
+                            channels as u32,
+                            segments as u32,
+                            state_dim,
+                        );
+                        selective_scan_forward_segment_apply::launch::<$float, R>(
+                            &client,
+                            CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                            CubeDim::new_1d(THREADS_PER_CUBE),
+                            delta.clone().into_tensor_arg(),
+                            xs.clone().into_tensor_arg(),
+                            b_mat.clone().into_tensor_arg(),
+                            c_mat.into_tensor_arg(),
+                            a.clone().into_tensor_arg(),
+                            d.into_tensor_arg(),
+                            carry.into_tensor_arg(),
+                            y.clone().into_tensor_arg(),
+                            states.clone().into_tensor_arg(),
+                            h_out.clone().into_tensor_arg(),
+                            channels as u32,
+                            seq_len as u32,
+                            state_dim,
+                            checkpoint_interval,
+                        );
+                    }};
+                }
+                match io_dtype {
+                    DType::BF16 => launch_forward!(bf16),
+                    _ => launch_forward!(f32),
+                }
             } else if full_sequence_scan {
+                assert!(
+                    io_dtype == DType::F32,
+                    "BF16 selective scan requires the checkpointed training path"
+                );
                 let serial_blocks = ((batch * channels) as u32).div_ceil(THREADS_PER_CUBE);
                 if serial_blocks >= SERIAL_SCAN_MIN_BLOCKS {
                     selective_scan_forward_serial::launch::<R>(
@@ -1500,6 +1566,10 @@ mod gpu {
                     );
                 }
             } else {
+                assert!(
+                    io_dtype == DType::F32,
+                    "BF16 selective scan requires the checkpointed training path"
+                );
                 let total = (batch * channels) as u32;
                 selective_scan_step::launch::<R>(
                     &client,
@@ -1556,25 +1626,44 @@ mod gpu {
             let h = into_contiguous(h);
             let states = into_contiguous(states);
             let grad_y = into_contiguous(grad_y);
+            let io_dtype = xs.dtype;
+            assert!(
+                io_dtype == DType::F32 || io_dtype == DType::BF16,
+                "selective scan supports F32 or BF16 sequence tensors, got {io_dtype:?}"
+            );
+            assert_eq!(
+                grad_y.dtype, io_dtype,
+                "selective scan output gradient dtype must match the sequence dtype"
+            );
             let grad_delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let grad_xs = empty_like(&xs, Shape::new([batch, seq_len, channels]));
-            let grad_b = zeros_like(&xs, Shape::new([batch, seq_len, state_dim]));
-            let grad_c = zeros_like(&xs, Shape::new([batch, seq_len, state_dim]));
-            let grad_a = zeros_like(&xs, Shape::new([channels, state_dim]));
-            let grad_d = zeros_like(&xs, Shape::new([channels]));
-            let grad_h = empty_like(&xs, Shape::new([batch, channels, state_dim]));
-            let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let grad_b = zeros_like_dtype(&xs, Shape::new([batch, seq_len, state_dim]), DType::F32);
+            let grad_c = zeros_like_dtype(&xs, Shape::new([batch, seq_len, state_dim]), DType::F32);
+            let grad_a = zeros_like_dtype(&xs, Shape::new([channels, state_dim]), DType::F32);
+            let grad_d = zeros_like_dtype(&xs, Shape::new([channels]), DType::F32);
+            let grad_h =
+                empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
+            let delta = empty_like_dtype(&xs, Shape::new([batch, seq_len, channels]), DType::F32);
             let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
             let client = xs.client.clone();
 
             let delta_total = (batch * seq_len * channels) as u32;
-            softplus_forward::launch::<R>(
-                &client,
-                CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
-                CubeDim::new_1d(THREADS_PER_CUBE),
-                delta_raw.clone().into_tensor_arg(),
-                delta.clone().into_tensor_arg(),
-            );
+            match io_dtype {
+                DType::BF16 => softplus_forward::launch::<bf16, R>(
+                    &client,
+                    CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta_raw.clone().into_tensor_arg(),
+                    delta.clone().into_tensor_arg(),
+                ),
+                _ => softplus_forward::launch::<f32, R>(
+                    &client,
+                    CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                    CubeDim::new_1d(THREADS_PER_CUBE),
+                    delta_raw.clone().into_tensor_arg(),
+                    delta.clone().into_tensor_arg(),
+                ),
+            }
 
             let segments = seq_len.div_ceil(checkpoint_interval);
             if checkpoint_interval > 1 && segments > 1 {
@@ -1582,70 +1671,90 @@ mod gpu {
                 // recurrence across checkpoint segments, then run every
                 // segment's gradient block concurrently.
                 let partial_shape = Shape::new([batch, segments, channels, state_dim]);
-                let inj = empty_like(&xs, partial_shape.clone());
-                let adecay = empty_like(&xs, partial_shape.clone());
-                let acarry = empty_like(&xs, partial_shape);
+                let inj = empty_like_dtype(&xs, partial_shape.clone(), DType::F32);
+                let adecay = empty_like_dtype(&xs, partial_shape.clone(), DType::F32);
+                let acarry = empty_like_dtype(&xs, partial_shape, DType::F32);
                 let segment_threads = (batch * segments * channels) as u32;
-                selective_scan_backward_segment_partials::launch::<R>(
-                    &client,
-                    CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    delta.clone().into_tensor_arg(),
-                    c_mat.clone().into_tensor_arg(),
-                    a.clone().into_tensor_arg(),
-                    grad_y.clone().into_tensor_arg(),
-                    inj.clone().into_tensor_arg(),
-                    adecay.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                    checkpoint_interval,
-                );
-                let carry_threads = (batch * channels * state_dim) as u32;
-                selective_scan_backward_segment_carry::launch::<R>(
-                    &client,
-                    CubeCount::Static(carry_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
-                    CubeDim::new_1d(THREADS_PER_CUBE),
-                    inj.into_tensor_arg(),
-                    adecay.into_tensor_arg(),
-                    acarry.clone().into_tensor_arg(),
-                    channels as u32,
-                    segments as u32,
-                    carry_threads,
-                    state_dim,
-                );
-                selective_scan_backward_segmented::launch::<R>(
-                    &client,
-                    CubeCount::Static(
-                        (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
-                        batch as u32,
-                        segments as u32,
-                    ),
-                    CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
-                    delta.clone().into_tensor_arg(),
-                    delta_raw.into_tensor_arg(),
-                    xs.clone().into_tensor_arg(),
-                    b_mat.into_tensor_arg(),
-                    c_mat.clone().into_tensor_arg(),
-                    a.clone().into_tensor_arg(),
-                    d.into_tensor_arg(),
-                    h.clone().into_tensor_arg(),
-                    states.clone().into_tensor_arg(),
-                    acarry.into_tensor_arg(),
-                    grad_y.clone().into_tensor_arg(),
-                    grad_delta.clone().into_tensor_arg(),
-                    grad_xs.clone().into_tensor_arg(),
-                    grad_b.clone().into_tensor_arg(),
-                    grad_c.clone().into_tensor_arg(),
-                    grad_a.clone().into_tensor_arg(),
-                    grad_d.clone().into_tensor_arg(),
-                    grad_h.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                    checkpoint_interval,
-                );
+                macro_rules! launch_backward {
+                    ($float:ty) => {{
+                        selective_scan_backward_segment_partials::launch::<$float, R>(
+                            &client,
+                            CubeCount::Static(segment_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                            CubeDim::new_1d(THREADS_PER_CUBE),
+                            delta.clone().into_tensor_arg(),
+                            c_mat.clone().into_tensor_arg(),
+                            a.clone().into_tensor_arg(),
+                            grad_y.clone().into_tensor_arg(),
+                            inj.clone().into_tensor_arg(),
+                            adecay.clone().into_tensor_arg(),
+                            channels as u32,
+                            seq_len as u32,
+                            state_dim,
+                            checkpoint_interval,
+                        );
+                        let carry_threads = (batch * channels * state_dim) as u32;
+                        selective_scan_backward_segment_carry::launch::<R>(
+                            &client,
+                            CubeCount::Static(carry_threads.div_ceil(THREADS_PER_CUBE), 1, 1),
+                            CubeDim::new_1d(THREADS_PER_CUBE),
+                            inj.into_tensor_arg(),
+                            adecay.into_tensor_arg(),
+                            acarry.clone().into_tensor_arg(),
+                            channels as u32,
+                            segments as u32,
+                            carry_threads,
+                            state_dim,
+                        );
+                        selective_scan_backward_segmented::launch::<$float, R>(
+                            &client,
+                            CubeCount::Static(
+                                (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                                batch as u32,
+                                segments as u32,
+                            ),
+                            CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                            delta.clone().into_tensor_arg(),
+                            delta_raw.into_tensor_arg(),
+                            xs.clone().into_tensor_arg(),
+                            b_mat.into_tensor_arg(),
+                            c_mat.clone().into_tensor_arg(),
+                            a.clone().into_tensor_arg(),
+                            d.into_tensor_arg(),
+                            h.clone().into_tensor_arg(),
+                            states.clone().into_tensor_arg(),
+                            acarry.into_tensor_arg(),
+                            grad_y.clone().into_tensor_arg(),
+                            grad_delta.clone().into_tensor_arg(),
+                            grad_xs.clone().into_tensor_arg(),
+                            grad_b.clone().into_tensor_arg(),
+                            grad_c.clone().into_tensor_arg(),
+                            grad_a.clone().into_tensor_arg(),
+                            grad_d.clone().into_tensor_arg(),
+                            grad_h.clone().into_tensor_arg(),
+                            channels as u32,
+                            seq_len as u32,
+                            state_dim,
+                            checkpoint_interval,
+                        );
+                    }};
+                }
+                match io_dtype {
+                    DType::BF16 => launch_backward!(bf16),
+                    _ => launch_backward!(f32),
+                }
+                // grad_B/grad_C accumulate through f32 atomics; hand them back
+                // in the sequence dtype so autodiff composes without dtype
+                // mismatches. The tensors are [batch, seq, state_dim] — tiny.
+                if io_dtype != DType::F32 {
+                    let grad_b = burn_cubecl::kernel::cast(grad_b, io_dtype);
+                    let grad_c = burn_cubecl::kernel::cast(grad_c, io_dtype);
+                    return (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h);
+                }
             } else {
+                assert!(
+                    io_dtype == DType::F32,
+                    "BF16 selective scan backward requires the checkpointed training path"
+                );
                 selective_scan_backward_fused::launch::<R>(
                     &client,
                     CubeCount::Static(
@@ -1841,6 +1950,127 @@ mod tests {
     #[test]
     fn test_cubecl_selective_scan_full_state_backward_matches_ndarray() {
         assert_cubecl_selective_scan_backward(2);
+    }
+
+    /// BF16 sequence tensors through the checkpointed training path against
+    /// the f32 CPU reference over the same bf16-quantized data: differences
+    /// are bounded by the BF16 output/gradient quantization, not kernel math.
+    #[test]
+    fn test_cubecl_selective_scan_bf16_io_matches_f32_reference() {
+        use burn::tensor::FloatDType;
+
+        fn quantize(values: Vec<f32>) -> Vec<f32> {
+            values
+                .into_iter()
+                .map(|value| half::bf16::from_f32(value).to_f32())
+                .collect()
+        }
+
+        let cpu = Device::ndarray().autodiff();
+        let gpu = gpu_device().autodiff();
+        let (batch, seq_len, channels, state_dim) = (3, 37, 3, 4);
+        let shapes = (
+            [batch, seq_len, channels],
+            [batch, seq_len, state_dim],
+            [channels, state_dim],
+            [channels],
+            [batch, channels, state_dim],
+        );
+        // Strictly negative state matrix keeps the recurrence bounded, so the
+        // comparison measures kernel arithmetic rather than the BF16
+        // quantization of a geometrically growing output.
+        let a_data: Vec<f32> = values(channels * state_dim, 0.11, -0.4)
+            .into_iter()
+            .map(|value| -value.abs() - 0.05)
+            .collect();
+        let data = (
+            quantize(values(batch * seq_len * channels, 0.13, 0.08)),
+            quantize(values(batch * seq_len * channels, 0.17, -0.03)),
+            quantize(values(batch * seq_len * state_dim, 0.19, 0.02)),
+            quantize(values(batch * seq_len * state_dim, 0.23, -0.01)),
+            a_data,
+            values(channels, 0.07, 0.9),
+            values(batch * channels * state_dim, 0.05, 0.01),
+        );
+        let weight_data = quantize(values(batch * seq_len * channels, 0.29, 0.5));
+
+        macro_rules! run {
+            ($device:expr, $bf16:expr) => {{
+                let cast = |tensor: Tensor<3>| {
+                    if $bf16 {
+                        tensor.cast(FloatDType::BF16)
+                    } else {
+                        tensor
+                    }
+                };
+                let delta = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.0.clone(), shapes.0),
+                    $device,
+                ))
+                .require_grad();
+                let xs = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.1.clone(), shapes.0),
+                    $device,
+                ))
+                .require_grad();
+                let b = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.2.clone(), shapes.1),
+                    $device,
+                ))
+                .require_grad();
+                let c = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.3.clone(), shapes.1),
+                    $device,
+                ))
+                .require_grad();
+                let a = Tensor::<2>::from_data(TensorData::new(data.4.clone(), shapes.2), $device)
+                    .require_grad();
+                let d = Tensor::<1>::from_data(TensorData::new(data.5.clone(), shapes.3), $device)
+                    .require_grad();
+                let h = Tensor::<3>::from_data(TensorData::new(data.6.clone(), shapes.4), $device)
+                    .require_grad();
+                let (y, _) = selective_scan(
+                    delta.clone(),
+                    xs.clone(),
+                    b.clone(),
+                    c.clone(),
+                    a.clone(),
+                    d.clone(),
+                    h.clone(),
+                    state_dim,
+                );
+                let weights = cast(Tensor::<3>::from_data(
+                    TensorData::new(weight_data.clone(), shapes.0),
+                    $device,
+                ));
+                let mut grads = (y.clone() * weights).sum().backward();
+                (
+                    y.into_data(),
+                    [
+                        delta.grad_remove(&mut grads).unwrap().into_data(),
+                        xs.grad_remove(&mut grads).unwrap().into_data(),
+                        b.grad_remove(&mut grads).unwrap().into_data(),
+                        c.grad_remove(&mut grads).unwrap().into_data(),
+                        a.grad_remove(&mut grads).unwrap().into_data(),
+                        d.grad_remove(&mut grads).unwrap().into_data(),
+                        h.grad_remove(&mut grads).unwrap().into_data(),
+                    ],
+                )
+            }};
+        }
+
+        let (cpu_y, cpu_grads) = run!(&cpu, false);
+        let (gpu_y, gpu_grads) = run!(&gpu, true);
+        let y_difference = max_diff(cpu_y, gpu_y);
+        assert!(y_difference < 2e-2, "y max diff: {y_difference}");
+        for ((name, cpu), gpu) in ["delta", "xs", "b", "c", "a", "d", "h"]
+            .into_iter()
+            .zip(cpu_grads)
+            .zip(gpu_grads)
+        {
+            let difference = max_diff(cpu, gpu);
+            assert!(difference < 2e-2, "{name} gradient max diff: {difference}");
+        }
     }
 
     #[test]

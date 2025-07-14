@@ -127,7 +127,7 @@ where
         let grad_bias = TensorIr::uninit(
             client.create_empty_handle(),
             Shape::new([channels]),
-            grad.dtype,
+            weight.dtype,
         );
         let desc = CustomOpIr::new(
             "hermes_depthwise_conv1d_backward",
@@ -420,7 +420,7 @@ where
         let h_out = TensorIr::uninit(
             client.create_empty_handle(),
             Shape::new([batch, channels, state_dim]),
-            dtype,
+            DType::F32,
         );
         let states_shape = if save_states {
             Shape::new([
@@ -432,7 +432,7 @@ where
         } else {
             Shape::new([batch, channels, state_dim])
         };
-        let states = TensorIr::uninit(client.create_empty_handle(), states_shape, dtype);
+        let states = TensorIr::uninit(client.create_empty_handle(), states_shape, DType::F32);
         let desc = CustomOpIr::with_scalars(
             "hermes_selective_scan",
             &[
@@ -500,9 +500,9 @@ where
             TensorIr::uninit(client.create_empty_handle(), delta_shape, dtype),
             TensorIr::uninit(client.create_empty_handle(), bc_shape.clone(), dtype),
             TensorIr::uninit(client.create_empty_handle(), bc_shape, dtype),
-            TensorIr::uninit(client.create_empty_handle(), a_shape, dtype),
-            TensorIr::uninit(client.create_empty_handle(), d_shape, dtype),
-            TensorIr::uninit(client.create_empty_handle(), h_shape, dtype),
+            TensorIr::uninit(client.create_empty_handle(), a_shape, DType::F32),
+            TensorIr::uninit(client.create_empty_handle(), d_shape, DType::F32),
+            TensorIr::uninit(client.create_empty_handle(), h_shape, DType::F32),
         ];
         let desc = CustomOpIr::with_scalars(
             "hermes_selective_scan_backward",

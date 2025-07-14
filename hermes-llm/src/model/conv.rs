@@ -161,17 +161,20 @@ mod gpu {
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
     use super::DepthwiseConv1dBackend;
-    use crate::model::cube_tensor::{empty_like, into_contiguous};
+    use burn::tensor::DType;
+    use half::bf16;
+
+    use crate::model::cube_tensor::{empty_like, empty_like_dtype, into_contiguous};
 
     const ELEMENTWISE_THREADS: u32 = 256;
     const REDUCTION_THREADS: u32 = 32;
 
     #[cube(launch)]
-    fn depthwise_conv1d_forward(
-        input: &Tensor<f32>,
+    fn depthwise_conv1d_forward<F: Float>(
+        input: &Tensor<F>,
         weight: &Tensor<f32>,
         bias: &Tensor<f32>,
-        output: &mut Tensor<f32>,
+        output: &mut Tensor<F>,
         channels: u32,
         input_len: u32,
         output_len: u32,
@@ -189,17 +192,17 @@ mod gpu {
             let weight_base = channel * kernel_size;
             let mut value = bias[channel];
             for k in 0..kernel_size {
-                value += input[input_base + k] * weight[weight_base + k];
+                value += f32::cast_from(input[input_base + k]) * weight[weight_base + k];
             }
-            output[idx] = value;
+            output[idx] = F::cast_from(value);
         }
     }
 
     #[cube(launch)]
-    fn depthwise_conv1d_backward_input(
+    fn depthwise_conv1d_backward_input<F: Float>(
         weight: &Tensor<f32>,
-        grad: &Tensor<f32>,
-        grad_input: &mut Tensor<f32>,
+        grad: &Tensor<F>,
+        grad_input: &mut Tensor<F>,
         channels: u32,
         input_len: u32,
         output_len: u32,
@@ -220,18 +223,18 @@ mod gpu {
                 if input_t >= k {
                     let t = input_t - k;
                     if t < output_len {
-                        value += grad[grad_base + t] * weight[weight_base + k];
+                        value += f32::cast_from(grad[grad_base + t]) * weight[weight_base + k];
                     }
                 }
             }
-            grad_input[idx] = value;
+            grad_input[idx] = F::cast_from(value);
         }
     }
 
     #[cube(launch)]
-    fn depthwise_conv1d_backward_params(
-        input: &Tensor<f32>,
-        grad: &Tensor<f32>,
+    fn depthwise_conv1d_backward_params<F: Float>(
+        input: &Tensor<F>,
+        grad: &Tensor<F>,
         grad_weight: &mut Tensor<f32>,
         grad_bias: &mut Tensor<f32>,
         batch: u32,
@@ -256,9 +259,9 @@ mod gpu {
             let batch_idx = sample / output_len;
             let t = sample % output_len;
             let grad_idx = (batch_idx * channels + channel) * output_len + t;
-            let grad_value = grad[grad_idx];
+            let grad_value = f32::cast_from(grad[grad_idx]);
             let input_idx = (batch_idx * channels + channel) * input_len + t + k;
-            weight_sum += grad_value * input[input_idx];
+            weight_sum += grad_value * f32::cast_from(input[input_idx]);
             if k == 0 {
                 bias_sum += grad_value;
             }
@@ -289,22 +292,35 @@ mod gpu {
             let input = into_contiguous(input);
             let weight = into_contiguous(weight);
             let bias = into_contiguous(bias);
+            let io_dtype = input.dtype;
+            assert!(
+                io_dtype == DType::F32 || io_dtype == DType::BF16,
+                "depthwise conv supports F32 or BF16 inputs, got {io_dtype:?}"
+            );
             let output = empty_like(&input, Shape::new([batch, channels, output_len]));
             let total = (batch * channels * output_len) as u32;
             let client = input.client.clone();
-            depthwise_conv1d_forward::launch::<R>(
-                &client,
-                CubeCount::Static(total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
-                CubeDim::new_1d(ELEMENTWISE_THREADS),
-                input.into_tensor_arg(),
-                weight.into_tensor_arg(),
-                bias.into_tensor_arg(),
-                output.clone().into_tensor_arg(),
-                channels as u32,
-                input_len as u32,
-                output_len as u32,
-                kernel_size,
-            );
+            macro_rules! launch_forward {
+                ($float:ty) => {
+                    depthwise_conv1d_forward::launch::<$float, R>(
+                        &client,
+                        CubeCount::Static(total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
+                        CubeDim::new_1d(ELEMENTWISE_THREADS),
+                        input.into_tensor_arg(),
+                        weight.into_tensor_arg(),
+                        bias.into_tensor_arg(),
+                        output.clone().into_tensor_arg(),
+                        channels as u32,
+                        input_len as u32,
+                        output_len as u32,
+                        kernel_size,
+                    )
+                };
+            }
+            match io_dtype {
+                DType::BF16 => launch_forward!(bf16),
+                _ => launch_forward!(f32),
+            }
             output
         }
 
@@ -320,38 +336,56 @@ mod gpu {
             let input = into_contiguous(input);
             let weight = into_contiguous(weight);
             let grad = into_contiguous(grad);
+            let io_dtype = input.dtype;
+            assert!(
+                io_dtype == DType::F32 || io_dtype == DType::BF16,
+                "depthwise conv supports F32 or BF16 inputs, got {io_dtype:?}"
+            );
+            assert_eq!(
+                grad.dtype, io_dtype,
+                "depthwise conv gradient dtype must match the input dtype"
+            );
             let grad_input = empty_like(&input, Shape::new([batch, channels, input_len]));
-            let grad_weight = empty_like(&weight, Shape::new([channels, 1, kernel_size]));
-            let grad_bias = empty_like(&weight, Shape::new([channels]));
+            let grad_weight =
+                empty_like_dtype(&weight, Shape::new([channels, 1, kernel_size]), DType::F32);
+            let grad_bias = empty_like_dtype(&weight, Shape::new([channels]), DType::F32);
             let client = input.client.clone();
 
             let input_total = (batch * channels * input_len) as u32;
-            depthwise_conv1d_backward_input::launch::<R>(
-                &client,
-                CubeCount::Static(input_total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
-                CubeDim::new_1d(ELEMENTWISE_THREADS),
-                weight.into_tensor_arg(),
-                grad.clone().into_tensor_arg(),
-                grad_input.clone().into_tensor_arg(),
-                channels as u32,
-                input_len as u32,
-                output_len as u32,
-                kernel_size,
-            );
-            depthwise_conv1d_backward_params::launch::<R>(
-                &client,
-                CubeCount::Static((channels * kernel_size) as u32, 1, 1),
-                CubeDim::new_1d(REDUCTION_THREADS),
-                input.into_tensor_arg(),
-                grad.into_tensor_arg(),
-                grad_weight.clone().into_tensor_arg(),
-                grad_bias.clone().into_tensor_arg(),
-                batch as u32,
-                channels as u32,
-                input_len as u32,
-                output_len as u32,
-                kernel_size,
-            );
+            macro_rules! launch_backward {
+                ($float:ty) => {{
+                    depthwise_conv1d_backward_input::launch::<$float, R>(
+                        &client,
+                        CubeCount::Static(input_total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
+                        CubeDim::new_1d(ELEMENTWISE_THREADS),
+                        weight.into_tensor_arg(),
+                        grad.clone().into_tensor_arg(),
+                        grad_input.clone().into_tensor_arg(),
+                        channels as u32,
+                        input_len as u32,
+                        output_len as u32,
+                        kernel_size,
+                    );
+                    depthwise_conv1d_backward_params::launch::<$float, R>(
+                        &client,
+                        CubeCount::Static((channels * kernel_size) as u32, 1, 1),
+                        CubeDim::new_1d(REDUCTION_THREADS),
+                        input.into_tensor_arg(),
+                        grad.into_tensor_arg(),
+                        grad_weight.clone().into_tensor_arg(),
+                        grad_bias.clone().into_tensor_arg(),
+                        batch as u32,
+                        channels as u32,
+                        input_len as u32,
+                        output_len as u32,
+                        kernel_size,
+                    );
+                }};
+            }
+            match io_dtype {
+                DType::BF16 => launch_backward!(bf16),
+                _ => launch_backward!(f32),
+            }
 
             (grad_input, grad_weight, grad_bias)
         }

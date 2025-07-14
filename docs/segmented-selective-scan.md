@@ -73,6 +73,29 @@ shared footprint (occupancy hypothesis) changed nothing (36,453). The
 per-state-lane shuffle chains and staging round-trips cost more than the
 segmented kernel's one barrier per step at this problem size
 (`d_inner 1024 × N 16 × segment 32`). Together with the interval sweep and
-the unroll experiment, this pins the segmented backward as the local optimum;
-further scan gains would need a different decomposition (e.g. BF16 kernel
-I/O to halve traffic) rather than more parallelism.
+the unroll experiment, this pins the segmented backward as the local optimum
+for f32 traffic; the follow-up that did land is BF16 kernel I/O below.
+
+## BF16 kernel I/O (landed)
+
+The segment kernels (and the depthwise conv) are generic over the sequence
+dtype: `x`, `B`, `C`, `delta_raw`, `grad_y` are read in BF16 and `y`,
+`grad_delta`, `grad_x` are emitted in BF16, while the recurrent state,
+`A`/`D`, checkpoints, carries, and parameter gradients stay f32 (compute is
+f32 in registers either way). `grad_B`/`grad_C` accumulate through f32
+atomics and are cast to the sequence dtype on the way out so autodiff
+composes without dtype mismatches — the fusion IR builder rejects a f32
+gradient flowing into a BF16 slice backward at runtime, which the end-to-end
+gate caught (the plain-CUDA test suite does not exercise lazy fusion).
+The Mamba projections feed the chain via `linear_low_precision`, so the
+promote-to-f32 / recast passes around every SSM layer disappear. Non-training
+paths (decode, prefill-without-states, the small-batch full-state path) are
+f32-only and guarded with loud asserts.
+
+Measured (same A100 setup, 2026-07-17): 39,253 → **41,237 tok/s** @B16 and
+40,607 → **42,664** @B20 (+5.1%), peak memory **−7.3 GB** (29.6 GB @B20),
+loss and gradient-norm trajectories on the established curve. Parity:
+`test_cubecl_selective_scan_bf16_io_matches_f32_reference` compares the BF16
+path against the f32 CPU reference over bf16-pre-quantized inputs with
+bounded dynamics (strictly negative A), so the bound measures kernel
+arithmetic rather than the quantization of a growing state.

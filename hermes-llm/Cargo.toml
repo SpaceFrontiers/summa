@@ -62,7 +62,7 @@ dirs = { version = "6", optional = true }
 default = ["remote"]
 # Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
 remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
-metal = ["burn/metal", "burn/autotune", "dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl"]
+metal = ["burn/metal", "burn/autotune", "dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl", "dep:half"]
 cuda = ["burn/cuda", "burn/autotune", "dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cubek", "dep:half"]
 # Lazy fusion pays off for large training graphs, but adds substantial graph
 # planning and kernel-launch overhead to single-token autoregressive decoding.
