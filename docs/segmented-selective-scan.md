@@ -92,6 +92,23 @@ segmented backward is at its local optimum for this work decomposition;
 further gains require a ground-up redesign of the parallelization (e.g. a
 tri-dao-style chunked backward), not tuning.
 
+The first such redesign was also measured and rejected (2026-07-17): a
+register-parallel backward with one thread per `(batch, segment, channel)`
+looping the state dimension with a scalar recurrent state — the forward
+kernels' decomposition, which makes `grad_delta`/`grad_xs` thread-local
+(zero barriers) and reduces `grad_B`/`grad_C` with one plane sum + atomic
+per warp. Parity was exact, but end-to-end throughput dropped 20%
+(44,201 → 35,360 tok/s @B26): folding all 16 states into one thread
+multiplies the serial dependency chain to ~1024 dependent exp+FMA steps
+with no instruction-level parallelism, and latency dominates everything
+the barrier removal saved. The per-`(channel, state)` thread split — 64
+steps per thread with 16-way ILP across the block — is what makes the
+current kernel fast; the register budget (a full segment of rebuilt states
+per thread) forbids widening it. Breaking this trade needs a
+block-scan-based rebuild (log-depth, state-at-a-time) plus dim-major
+layout transposes for coalescing — a materially larger design whose
+transpose overhead eats an estimated quarter of the theoretical win.
+
 ## BF16 kernel I/O (landed)
 
 The segment kernels (and the depthwise conv) are generic over the sequence
