@@ -285,7 +285,7 @@ mod gpu {
     use burn::backend::ops::FloatTensorOps;
 
     use super::{FloatTensor, IntTensor, LinearCrossEntropyBackend};
-    use crate::model::cube_tensor::{empty_like, into_contiguous};
+    use crate::model::cube_tensor::{empty_like, empty_like_dtype, into_contiguous};
 
     const CE_THREADS: u32 = 256;
 
@@ -378,15 +378,18 @@ mod gpu {
 
     /// Softmax gradient with the target correction and loss scale folded in:
     /// `(softmax(x) - onehot(target)) * scale` in a single pass over the
-    /// chunk. Padded columns receive exact zeros.
+    /// chunk. Padded columns receive exact zeros. The gradient is emitted
+    /// directly in the matmul compute dtype (BF16 on CUDA) — the following
+    /// tensor-core matmuls consumed a BF16 cast of it anyway, so writing it
+    /// once removes a full-vocabulary FP32 round trip per chunk.
     #[cube(launch)]
-    fn ce_row_gradient(
+    fn ce_row_gradient<G: Float>(
         logits: &Tensor<f32>,
         bias: &Tensor<f32>,
         stats: &Tensor<f32>,
         targets: &Tensor<i32>,
         scale: &Tensor<f32>,
-        grad: &mut Tensor<f32>,
+        grad: &mut Tensor<G>,
         row_offset: u32,
         stored_vocab: u32,
         logical_vocab: u32,
@@ -410,9 +413,9 @@ mod gpu {
                 if col == usize::cast_from(targets[row_offset as usize + row]) {
                     value -= step;
                 }
-                grad[idx] = value;
+                grad[idx] = G::cast_from(value);
             } else {
-                grad[idx] = 0.0f32;
+                grad[idx] = G::cast_from(0.0f32);
             }
         }
     }
@@ -453,25 +456,35 @@ mod gpu {
         row_offset: usize,
         logical_vocab_size: usize,
         use_bias: bool,
+        grad_dtype: burn::tensor::DType,
     ) -> CubeTensor<R> {
         let [rows, stored_vocab] = logits.shape().dims();
-        let grad = empty_like(logits, Shape::new([rows, stored_vocab]));
+        let grad = empty_like_dtype(logits, Shape::new([rows, stored_vocab]), grad_dtype);
         let total = (rows * stored_vocab) as u32;
-        ce_row_gradient::launch::<R>(
-            &logits.client.clone(),
-            CubeCount::Static(total.div_ceil(CE_THREADS), 1, 1),
-            CubeDim::new_1d(CE_THREADS),
-            logits.clone().into_tensor_arg(),
-            bias.clone().into_tensor_arg(),
-            stats.clone().into_tensor_arg(),
-            targets.clone().into_tensor_arg(),
-            scale.clone().into_tensor_arg(),
-            grad.clone().into_tensor_arg(),
-            row_offset as u32,
-            stored_vocab as u32,
-            logical_vocab_size as u32,
-            use_bias,
-        );
+        macro_rules! launch {
+            ($float:ty) => {
+                ce_row_gradient::launch::<$float, R>(
+                    &logits.client.clone(),
+                    CubeCount::Static(total.div_ceil(CE_THREADS), 1, 1),
+                    CubeDim::new_1d(CE_THREADS),
+                    logits.clone().into_tensor_arg(),
+                    bias.clone().into_tensor_arg(),
+                    stats.clone().into_tensor_arg(),
+                    targets.clone().into_tensor_arg(),
+                    scale.clone().into_tensor_arg(),
+                    grad.clone().into_tensor_arg(),
+                    row_offset as u32,
+                    stored_vocab as u32,
+                    logical_vocab_size as u32,
+                    use_bias,
+                )
+            };
+        }
+        match grad_dtype {
+            burn::tensor::DType::BF16 => launch!(half::bf16),
+            burn::tensor::DType::F32 => launch!(f32),
+            other => panic!("cross-entropy gradient dtype {other:?} is not supported"),
+        }
         grad
     }
 
@@ -629,6 +642,11 @@ mod gpu {
                 start,
                 logical_vocab_size,
                 use_bias,
+                if bf16_matmul {
+                    burn::tensor::DType::BF16
+                } else {
+                    burn::tensor::DType::F32
+                },
             );
             let logits_gradient_compute = bf16_operand(logits_gradient.clone(), bf16_matmul);
             let hidden_gradient =
@@ -647,10 +665,17 @@ mod gpu {
                 ),
             );
             if use_bias {
+                // The bias gradient accumulates in FP32; sum the BF16 chunk
+                // gradient in FP32 so 6k-row column sums keep full precision.
+                let gradient_f32 = if logits_gradient.dtype == burn::tensor::DType::F32 {
+                    logits_gradient
+                } else {
+                    burn_cubecl::kernel::cast(logits_gradient, burn::tensor::DType::F32)
+                };
                 bias_gradient = B::<R>::float_add(
                     bias_gradient,
                     B::<R>::float_reshape(
-                        B::<R>::float_sum_dim(logits_gradient, 0),
+                        B::<R>::float_sum_dim(gradient_f32, 0),
                         Shape::new([vocab_size]),
                     ),
                 );
