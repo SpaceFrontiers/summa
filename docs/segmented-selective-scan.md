@@ -83,6 +83,15 @@ memory) into shared memory. Parity held, but end-to-end throughput dropped
 resident blocks per SM (8 → 4), and the kernel is latency-bound — occupancy
 buys more than the spill traffic costs. The local array stays.
 
+Fifth and final variant (2026-07-17): halving the per-step barriers (one
+`sync_cube` per pair of reverse steps, quad-buffered term slabs,
+occupancy-neutral) measured flat to slightly negative (44,193 → 44,073
+tok/s @B26). With unrolling, warp-cooperative lanes, shorter segments,
+shared-state storage, and barrier batching all measured and rejected, the
+segmented backward is at its local optimum for this work decomposition;
+further gains require a ground-up redesign of the parallelization (e.g. a
+tri-dao-style chunked backward), not tuning.
+
 ## BF16 kernel I/O (landed)
 
 The segment kernels (and the depthwise conv) are generic over the sequence
