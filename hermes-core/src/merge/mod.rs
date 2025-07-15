@@ -163,7 +163,7 @@ impl TieredMergePolicy {
     ///
     /// Enables budget-aware triggering and scored candidate selection to avoid
     /// unnecessary IO on already well-structured indexes. Oversized segments
-    /// (>10M docs) are excluded from merge candidates.
+    /// (>2.5M docs) are excluded from merge candidates.
     ///
     /// Good for live read/write workloads at scale.
     pub fn large_scale() -> Self {
@@ -177,13 +177,20 @@ impl TieredMergePolicy {
             max_merge_at_once: 24,
             tier_factor: 10.0,
             tier_floor: 50_000,
-            max_merged_docs: 20_000_000,
+            // 5M docs, not more: BP reorder cost scales with (doc, ordinal)
+            // sparse entries, not docs. A 20M-doc segment with multi-vector
+            // docs (~5 ordinals/doc observed in prod) reached ~95M BMP
+            // entries / 5.7B postings — beyond what the 600s BP time budget
+            // or the 24GB BP memory budget can converge, so the optimizer
+            // could never finish it. 5M docs keeps worst-case entries near
+            // ~25M, inside the budgets.
+            max_merged_docs: 5_000_000,
             floor_segment_docs: 50_000,
             oversized_threshold: 0.5,
             min_growth_ratio: 0.5,
             budget_trigger: true,
             scored_selection: true,
-            max_segment_docs: 20_000_000,
+            max_segment_docs: 5_000_000,
         }
     }
 
@@ -927,8 +934,12 @@ mod tests {
     fn test_large_scale_preset_values() {
         let p = TieredMergePolicy::large_scale();
         assert_eq!(p.tier_floor, 50_000);
-        assert_eq!(p.max_merged_docs, 20_000_000);
-        assert_eq!(p.max_segment_docs, 20_000_000);
+        // 5M cap (was 20M): BP reorder scales with sparse (doc, ordinal)
+        // entries (~5x docs in prod), and a 20M-doc segment produced ~95M
+        // entries that could never converge within the BP time/memory
+        // budgets. See large_scale() comment.
+        assert_eq!(p.max_merged_docs, 5_000_000);
+        assert_eq!(p.max_segment_docs, 5_000_000);
         assert_eq!(p.floor_segment_docs, 50_000);
         assert!(p.budget_trigger);
         assert!(p.scored_selection);
