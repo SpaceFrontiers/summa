@@ -201,3 +201,16 @@ before. At production shape the grid still has thousands of independent
 blocks, which A100 measurements already showed is enough to prefer serial
 recurrence over stitching (`SERIAL_SCAN_MIN_BLOCKS`). `grad_A`/`grad_D`
 atomics fire once per kernel instead of once per segment.
+
+## Register-carried forward sweep
+
+The forward chain went the same way as the backward: one block per
+`(batch, channel tile)` sweeps the segments left-to-right with the running
+state in registers — a single launch and a single read of every input
+element, replacing partials/carry/apply (which scanned the sequence twice
+and round-tripped `[batch, segments, channels, state]` partial/decay/carry
+tensors). The per-`(channel, state)` thread layout keeps the serial
+recurrence the warp-scan experiment showed is load-bearing; the
+cross-state reduction for `y` uses the reverse sweep's flush machinery
+(per-warp disjoint slots, `BACKWARD_FLUSH` windows). With no retained
+chunk states the kernel runs at full occupancy.
