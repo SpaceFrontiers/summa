@@ -1,4 +1,21 @@
 //! Shared language-model stack for training and inference.
+//!
+//! One [`Transformer`](transformer::Transformer) implementation serves
+//! training (`hermes-train`), generation, and retrieval — there is no
+//! second model or checkpoint adapter. The module tree is layered:
+//!
+//! - **Model** — [`transformer`], [`block`], [`attention`], [`mamba`],
+//!   [`ffn`], [`norm`]: architecture built from Burn modules.
+//! - **Kernel families** — [`scan`], [`linear_cross_entropy`], [`conv`],
+//!   plus [`fused_attention`]/[`cube_attention`]: each exposes a backend
+//!   extension trait, a differentiable tensor-op reference (the
+//!   correctness oracle), an autodiff node, and CubeCL GPU kernels, with
+//!   CPU-vs-GPU parity tests per family. Size limits and measured tuning
+//!   are catalogued in `docs/kernel-tuning-surface.md`.
+//! - **Runtime glue** — [`backend`] (device selection), [`matmul`]
+//!   (precision-policy matmul entry points), [`cube_tensor`] (raw-tensor
+//!   helpers), and [`fusion`] (CustomOpIr bridges that let the custom ops
+//!   cross Burn's lazy-fusion boundary under `training-fusion`).
 
 mod attention;
 pub mod backend;
