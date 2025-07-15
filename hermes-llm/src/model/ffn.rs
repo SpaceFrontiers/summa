@@ -8,7 +8,7 @@ use burn_nn::{Dropout, DropoutConfig, Linear, LinearConfig};
 
 use crate::mal::{Activation, BlockDef, ModelDef};
 
-use super::matmul::{linear, prepare_linear_for_inference};
+use super::matmul::{linear_low_precision, prepare_linear_for_inference};
 
 #[derive(Module, Debug)]
 pub struct FeedForward {
@@ -56,7 +56,10 @@ impl FeedForward {
             Activation::ReLU => relu(t),
             Activation::GELUNew | Activation::GELUTanh => gelu_approximate(t),
         };
-        let projected = linear(&self.in_proj, x);
+        // The whole chain stays in the residual-stream dtype (BF16 during
+        // CUDA training): the down projection feeds the residual add without
+        // an FP32 promotion.
+        let projected = linear_low_precision(&self.in_proj, x);
         let hidden = if self.gated {
             let mut ranges = projected.dims().map(|size| 0..size);
             ranges[D - 1] = 0..self.intermediate;
@@ -66,7 +69,7 @@ impl FeedForward {
         } else {
             act(projected)
         };
-        linear(&self.down_proj, self.dropout.forward(hidden))
+        linear_low_precision(&self.down_proj, self.dropout.forward(hidden))
     }
 
     pub(crate) fn prepare_inference(&mut self) {

@@ -555,12 +555,18 @@ impl<B: MambaBackend, C: CheckpointStrategy> MambaBackend for Autodiff<B, C> {
 mod gpu {
     use burn::backend::TensorMetadata;
     use burn::tensor::Shape;
+    use burn_cubecl::cubecl::ir::FastMath;
     use burn_cubecl::cubecl::prelude::*;
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::{CubeBackend, CubeRuntime};
 
+    use burn::tensor::DType;
+    use half::bf16;
+
     use super::{MambaBackend, scan_checkpoint_interval};
-    use crate::model::cube_tensor::{empty_like, into_contiguous, zeros_like};
+    use crate::model::cube_tensor::{
+        empty_like, empty_like_dtype, into_contiguous, zeros_like_dtype,
+    };
 
     const THREADS_PER_CUBE: u32 = 128;
     const PLANE_WIDTH: u32 = 32;
@@ -569,6 +575,10 @@ mod gpu {
     // blocks are available; smaller grids benefit from parallel state lanes.
     const SERIAL_SCAN_MIN_BLOCKS: u32 = 128;
     const BACKWARD_CHANNELS: usize = 16;
+    // Reverse-sweep steps buffered between flush barriers in the segmented
+    // backward. Sized so the per-warp partial slots fit Metal's 32KB
+    // threadgroup budget at state_dim 16; must divide the segment length.
+    const BACKWARD_FLUSH: usize = 8;
 
     #[cube]
     fn atomic_add_f32(target: &mut Atomic<f32>, value: f32) {
@@ -617,10 +627,10 @@ mod gpu {
     }
 
     #[cube(launch)]
-    fn softplus_forward(input: &Tensor<f32>, output: &mut Tensor<f32>) {
+    fn softplus_forward<F: Float>(input: &Tensor<F>, output: &mut Tensor<f32>) {
         let idx = ABSOLUTE_POS;
         if idx < input.len() {
-            output[idx] = stable_softplus(input[idx]);
+            output[idx] = stable_softplus(f32::cast_from(input[idx]));
         }
     }
 
@@ -793,6 +803,165 @@ mod gpu {
         }
     }
 
+    /// Checkpointed forward: one block owns a `(batch, channel tile)` and
+    /// sweeps the segments left-to-right with the running state carried in
+    /// registers — a single launch and a single read of every input element,
+    /// replacing the partials/carry/apply chain that scanned the sequence
+    /// twice. The per-`(channel, state)` thread layout keeps the serial
+    /// recurrence with 16-wide state parallelism that A100 measurements
+    /// favor; the cross-state reduction for `y` lands in disjoint per-warp
+    /// slots flushed every `BACKWARD_FLUSH` steps, exactly like the reverse
+    /// sweep's gradient flush.
+    #[allow(clippy::manual_div_ceil, clippy::manual_is_multiple_of)]
+    #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
+    fn selective_scan_forward_swept<F: Float>(
+        delta_raw: &Tensor<F>,
+        xs: &Tensor<F>,
+        b_mat: &Tensor<F>,
+        c_mat: &Tensor<F>,
+        a: &Tensor<f32>,
+        d: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        y: &mut Tensor<F>,
+        checkpoints: &mut Tensor<f32>,
+        h_out: &mut Tensor<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+        #[comptime] segment_len: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let local_channel = UNIT_POS_X as usize;
+        let n = UNIT_POS_Y as usize;
+        let batch = CUBE_POS_Y as usize;
+        let channel = CUBE_POS_X as usize * BACKWARD_CHANNELS + local_channel;
+        let active_channel = channel < channels;
+        let active = active_channel && n < state_dim;
+        let tid = n * BACKWARD_CHANNELS + local_channel;
+        let block_threads = BACKWARD_CHANNELS * state_dim;
+        let state_index = (batch * channels + channel) * state_dim + n;
+        let a_index = channel * state_dim + n;
+        let segments = (seq_len + segment_len - 1) / segment_len;
+
+        let tile_len = segment_len * BACKWARD_CHANNELS;
+        let mut delta_tile = Shared::new_slice(tile_len);
+        let mut xs_tile = Shared::new_slice(tile_len);
+        let state_tile_len = segment_len * state_dim;
+        let mut b_tile = Shared::new_slice(state_tile_len);
+        let mut c_tile = Shared::new_slice(state_tile_len);
+        let warp_rows = (state_dim + 1) / 2;
+        let mut y_part = Shared::new_slice(BACKWARD_FLUSH * warp_rows * BACKWARD_CHANNELS);
+
+        let av = if active { a[a_index] } else { 0.0f32 };
+        let mut state = if active { h_in[state_index] } else { 0.0f32 };
+
+        for segment in 0..segments {
+            let start = segment * segment_len;
+            let mut end = start + segment_len;
+            if end > seq_len {
+                end = seq_len;
+            }
+            let chunk_len = end - start;
+
+            let mut index = tid;
+            while index < tile_len {
+                let t_local = index / BACKWARD_CHANNELS;
+                let ch = CUBE_POS_X as usize * BACKWARD_CHANNELS + index % BACKWARD_CHANNELS;
+                let mut raw = 0.0f32;
+                let mut x = 0.0f32;
+                if t_local < chunk_len && ch < channels {
+                    let btc = (batch * seq_len + start + t_local) * channels + ch;
+                    raw = f32::cast_from(delta_raw[btc]);
+                    x = f32::cast_from(xs[btc]);
+                }
+                delta_tile[index] = stable_softplus(raw);
+                xs_tile[index] = x;
+                index += block_threads;
+            }
+            let mut index = tid;
+            while index < state_tile_len {
+                let t_local = index / state_dim;
+                let st = index % state_dim;
+                let mut bv = 0.0f32;
+                let mut cv = 0.0f32;
+                if t_local < chunk_len {
+                    let btn = (batch * seq_len + start + t_local) * state_dim + st;
+                    bv = f32::cast_from(b_mat[btn]);
+                    cv = f32::cast_from(c_mat[btn]);
+                }
+                b_tile[index] = bv;
+                c_tile[index] = cv;
+                index += block_threads;
+            }
+            sync_cube();
+
+            let flush_windows = segment_len / BACKWARD_FLUSH;
+            #[unroll]
+            for window in 0..flush_windows {
+                #[unroll]
+                for step in 0..BACKWARD_FLUSH {
+                    let offset = window * BACKWARD_FLUSH + step;
+                    let slot = offset % BACKWARD_FLUSH;
+                    if offset < chunk_len {
+                        let cidx = offset * BACKWARD_CHANNELS + local_channel;
+                        let nidx = offset * state_dim + n;
+                        let dt = delta_tile[cidx];
+                        let x = xs_tile[cidx];
+                        let bv = b_tile[nidx];
+                        let cv = c_tile[nidx];
+                        state = state * (dt * av).exp() + dt * bv * x;
+                        let y_term = state * cv;
+                        // A warp spans two state rows of the channel tile;
+                        // fold the odd row into the even one so each warp
+                        // writes one disjoint partial row per step.
+                        let mut partner = plane_shuffle_down(y_term, 16);
+                        if n + 1 >= state_dim {
+                            partner = 0.0f32;
+                        }
+                        if n % 2 == 0 {
+                            let part =
+                                (slot * warp_rows + n / 2) * BACKWARD_CHANNELS + local_channel;
+                            y_part[part] = y_term + partner;
+                        }
+                    }
+                }
+                sync_cube();
+
+                let window_lo = window * BACKWARD_FLUSH;
+                let mut index = tid;
+                while index < BACKWARD_FLUSH * BACKWARD_CHANNELS {
+                    let slot = index / BACKWARD_CHANNELS;
+                    let c_local = index % BACKWARD_CHANNELS;
+                    let offset = window_lo + slot;
+                    let ch = CUBE_POS_X as usize * BACKWARD_CHANNELS + c_local;
+                    if offset < chunk_len && ch < channels {
+                        let mut y_sum = 0.0f32;
+                        #[unroll]
+                        for warp_row in 0..warp_rows {
+                            let part = (slot * warp_rows + warp_row) * BACKWARD_CHANNELS + c_local;
+                            y_sum += y_part[part];
+                        }
+                        let tidx = offset * BACKWARD_CHANNELS + c_local;
+                        let btc = (batch * seq_len + start + offset) * channels + ch;
+                        y[btc] = F::cast_from(y_sum + xs_tile[tidx] * d[ch]);
+                    }
+                    index += block_threads;
+                }
+                sync_cube();
+            }
+
+            if active {
+                checkpoints[((batch * segments + segment) * channels + channel) * state_dim + n] =
+                    state;
+            }
+        }
+
+        if active {
+            h_out[state_index] = state;
+        }
+    }
+
     /// One block owns a `(batch, channel tile)` and computes every scan
     /// gradient while following the reverse recurrence exactly once. The
     /// channel and state reductions share the per-token contributions in
@@ -944,6 +1113,290 @@ mod gpu {
         }
     }
 
+    /// Checkpointed backward: one block owns a `(batch, channel tile)` and
+    /// sweeps the segments right-to-left with the adjoint carried in
+    /// registers — the exact reverse recurrence, no stitched-carry
+    /// approximation and no partials/carry launches. Each segment re-derives
+    /// its forward states from its checkpoint. The channel-grouped block
+    /// shape is deliberate: it buys the 16:1 cross-channel pre-reduction of
+    /// `grad_B`/`grad_C` before the global atomics, which a sequence-major
+    /// thread layout would forfeit.
+    #[allow(clippy::manual_div_ceil, clippy::useless_conversion)]
+    // `n % 2` must stay literal: the cube macro has no expansion for
+    // `is_multiple_of`.
+    #[allow(clippy::manual_is_multiple_of)]
+    #[cube(launch, fast_math = FastMath::ReducedPrecision | FastMath::NotNaN | FastMath::NotInf)]
+    fn selective_scan_backward_segmented<F: Float>(
+        delta_raw: &Tensor<F>,
+        xs: &Tensor<F>,
+        b_mat: &Tensor<F>,
+        c_mat: &Tensor<F>,
+        a: &Tensor<f32>,
+        d: &Tensor<f32>,
+        h_in: &Tensor<f32>,
+        checkpoints: &Tensor<f32>,
+        grad_y: &Tensor<F>,
+        grad_delta: &mut Tensor<F>,
+        grad_xs: &mut Tensor<F>,
+        grad_b: &mut Tensor<Atomic<f32>>,
+        grad_c: &mut Tensor<Atomic<f32>>,
+        grad_a: &mut Tensor<Atomic<f32>>,
+        grad_d: &mut Tensor<Atomic<f32>>,
+        grad_h: &mut Tensor<f32>,
+        channels: u32,
+        seq_len: u32,
+        #[comptime] state_dim: usize,
+        #[comptime] segment_len: usize,
+    ) {
+        let channels = channels as usize;
+        let seq_len = seq_len as usize;
+        let local_channel = UNIT_POS_X as usize;
+        let n = UNIT_POS_Y as usize;
+        let batch = CUBE_POS_Y as usize;
+        let channel = CUBE_POS_X as usize * BACKWARD_CHANNELS + local_channel;
+        let active_channel = channel < channels;
+        let active = active_channel && n < state_dim;
+        let tid = n * BACKWARD_CHANNELS + local_channel;
+        let block_threads = BACKWARD_CHANNELS * state_dim;
+        let state_index = (batch * channels + channel) * state_dim + n;
+        let a_index = channel * state_dim + n;
+        let segments = (seq_len + segment_len - 1) / segment_len;
+
+        // Every segment's sequence tiles stage through workgroup memory once;
+        // both the rebuild and the reverse sweep read them from there, and
+        // softplus runs in-kernel so the launcher never materializes a full
+        // [batch, seq, channels] activation. Dead slots (sequence tail,
+        // channel-tile overhang) load zeros; every consumer term multiplies
+        // by an adjoint or gradient that is exactly zero there.
+        let tile_len = segment_len * BACKWARD_CHANNELS;
+        let mut raw_tile = Shared::new_slice(tile_len);
+        let mut delta_tile = Shared::new_slice(tile_len);
+        let mut xs_tile = Shared::new_slice(tile_len);
+        let mut dy_tile = Shared::new_slice(tile_len);
+        let state_tile_len = segment_len * state_dim;
+        let mut b_tile = Shared::new_slice(state_tile_len);
+        let mut c_tile = Shared::new_slice(state_tile_len);
+        // Cross-thread reductions land in disjoint per-warp slots covering a
+        // window of `BACKWARD_FLUSH` steps: two barriers per window instead
+        // of one per step, and small enough for Metal's 32KB threadgroups.
+        let warp_rows = (state_dim + 1) / 2;
+        let mut dt_part = Shared::new_slice(BACKWARD_FLUSH * warp_rows * BACKWARD_CHANNELS);
+        let mut dx_part = Shared::new_slice(BACKWARD_FLUSH * warp_rows * BACKWARD_CHANNELS);
+        let mut gb_acc = Shared::new_slice(BACKWARD_FLUSH * state_dim);
+        let mut gc_acc = Shared::new_slice(BACKWARD_FLUSH * state_dim);
+
+        let av = if active { a[a_index] } else { 0.0f32 };
+        // The adjoint is exactly zero at the right sequence boundary and
+        // rides in a register across the whole reverse sweep.
+        let mut adjoint = 0.0f32;
+        let mut grad_a_local = 0.0f32;
+        let mut grad_d_local = 0.0f32;
+
+        for segment_rev in 0..segments {
+            let segment = segments - 1 - segment_rev;
+            let start = segment * segment_len;
+            let mut end = start + segment_len;
+            if end > seq_len {
+                end = seq_len;
+            }
+            let chunk_len = end - start;
+
+            let mut index = tid;
+            while index < tile_len {
+                let t_local = index / BACKWARD_CHANNELS;
+                let ch = CUBE_POS_X as usize * BACKWARD_CHANNELS + index % BACKWARD_CHANNELS;
+                let mut raw = 0.0f32;
+                let mut x = 0.0f32;
+                let mut dy = 0.0f32;
+                if t_local < chunk_len && ch < channels {
+                    let btc = (batch * seq_len + start + t_local) * channels + ch;
+                    raw = f32::cast_from(delta_raw[btc]);
+                    x = f32::cast_from(xs[btc]);
+                    dy = f32::cast_from(grad_y[btc]);
+                }
+                raw_tile[index] = raw;
+                delta_tile[index] = stable_softplus(raw);
+                xs_tile[index] = x;
+                dy_tile[index] = dy;
+                index += block_threads;
+            }
+            let mut index = tid;
+            while index < state_tile_len {
+                let t_local = index / state_dim;
+                let state = index % state_dim;
+                let mut bv = 0.0f32;
+                let mut cv = 0.0f32;
+                if t_local < chunk_len {
+                    let btn = (batch * seq_len + start + t_local) * state_dim + state;
+                    bv = f32::cast_from(b_mat[btn]);
+                    cv = f32::cast_from(c_mat[btn]);
+                }
+                b_tile[index] = bv;
+                c_tile[index] = cv;
+                index += block_threads;
+            }
+            sync_cube();
+
+            // Rebuild the segment's states from the entering checkpoint. The
+            // fully unrolled loop keeps `chunk_states` register-resident
+            // instead of spilling a per-thread array to local memory.
+            // Inactive channels hold zeros: their `a` row loads as zero, so
+            // the recurrence is a fixed point at zero and never overflows.
+            let state_before = if active {
+                if segment == 0 {
+                    h_in[state_index]
+                } else {
+                    checkpoints
+                        [((batch * segments + segment - 1) * channels + channel) * state_dim + n]
+                }
+            } else {
+                0.0f32
+            };
+            let mut state = state_before;
+            let mut chunk_states = Array::<f32>::new(segment_len);
+            #[unroll]
+            for offset in 0..segment_len {
+                if offset < chunk_len {
+                    let cidx = offset * BACKWARD_CHANNELS + local_channel;
+                    let dt = delta_tile[cidx];
+                    let x = xs_tile[cidx];
+                    let bv = b_tile[offset * state_dim + n];
+                    state = state * (dt * av).exp() + dt * bv * x;
+                    chunk_states[offset] = state;
+                }
+            }
+
+            let flush_windows = segment_len / BACKWARD_FLUSH;
+            #[unroll]
+            for window in 0..flush_windows {
+                #[unroll]
+                for step in 0..BACKWARD_FLUSH {
+                    let offset = segment_len - 1 - (window * BACKWARD_FLUSH + step);
+                    // Windows are BACKWARD_FLUSH-aligned, so the accumulator
+                    // slot is just the offset's position within its window.
+                    let slot = offset % BACKWARD_FLUSH;
+                    if offset < chunk_len {
+                        let cidx = offset * BACKWARD_CHANNELS + local_channel;
+                        let nidx = offset * state_dim + n;
+                        let dt = delta_tile[cidx];
+                        let x = xs_tile[cidx];
+                        let dy = dy_tile[cidx];
+                        let bv = b_tile[nidx];
+                        let cv = c_tile[nidx];
+                        let alpha = (dt * av).exp();
+                        let mut h_prev = state_before;
+                        if offset > 0 {
+                            h_prev = chunk_states[offset - 1];
+                        }
+                        let h_t = chunk_states[offset];
+                        let g = adjoint + dy * cv;
+                        let dt_term = g * (h_prev * alpha * av + bv * x);
+                        let dx_term = g * dt * bv;
+                        // A warp spans two state rows of the channel tile;
+                        // fold the odd row into the even one so each warp
+                        // writes one disjoint partial row per step — no
+                        // barrier needed.
+                        let mut partner_dt = plane_shuffle_down(dt_term, 16);
+                        let mut partner_dx = plane_shuffle_down(dx_term, 16);
+                        if n + 1 >= state_dim {
+                            partner_dt = 0.0f32;
+                            partner_dx = 0.0f32;
+                        }
+                        if n % 2 == 0 {
+                            let part =
+                                (slot * warp_rows + n / 2) * BACKWARD_CHANNELS + local_channel;
+                            dt_part[part] = dt_term + partner_dt;
+                            dx_part[part] = dx_term + partner_dx;
+                        }
+                        let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
+                        let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
+                        if local_channel == 0 {
+                            gb_acc[slot * state_dim + n] = grad_b_sum;
+                            gc_acc[slot * state_dim + n] = grad_c_sum;
+                        }
+                        grad_a_local += g * h_prev * alpha * dt;
+                        if n == 0 && active_channel {
+                            grad_d_local += dy * x;
+                        }
+                        adjoint = g * alpha;
+                    }
+                }
+                sync_cube();
+
+                let window_lo = segment_len - (window + 1) * BACKWARD_FLUSH;
+                let mut index = tid;
+                while index < BACKWARD_FLUSH * BACKWARD_CHANNELS {
+                    let slot = index / BACKWARD_CHANNELS;
+                    let c_local = index % BACKWARD_CHANNELS;
+                    let offset = window_lo + slot;
+                    let ch = CUBE_POS_X as usize * BACKWARD_CHANNELS + c_local;
+                    if offset < chunk_len && ch < channels {
+                        let mut dt_sum = 0.0f32;
+                        let mut dx_sum = 0.0f32;
+                        #[unroll]
+                        for warp_row in 0..warp_rows {
+                            let part = (slot * warp_rows + warp_row) * BACKWARD_CHANNELS + c_local;
+                            dt_sum += dt_part[part];
+                            dx_sum += dx_part[part];
+                        }
+                        let tidx = offset * BACKWARD_CHANNELS + c_local;
+                        let btc = (batch * seq_len + start + offset) * channels + ch;
+                        grad_delta[btc] = F::cast_from(dt_sum * stable_sigmoid(raw_tile[tidx]));
+                        grad_xs[btc] = F::cast_from(dy_tile[tidx] * d[ch] + dx_sum);
+                    }
+                    index += block_threads;
+                }
+                let mut index = tid;
+                while index < BACKWARD_FLUSH * state_dim {
+                    let slot = index / state_dim;
+                    let state = index % state_dim;
+                    let offset = window_lo + slot;
+                    if offset < chunk_len {
+                        let btn = (batch * seq_len + start + offset) * state_dim + state;
+                        atomic_add_f32(&mut grad_b[btn], gb_acc[slot * state_dim + state]);
+                        atomic_add_f32(&mut grad_c[btn], gc_acc[slot * state_dim + state]);
+                    }
+                    index += block_threads;
+                }
+                sync_cube();
+            }
+        }
+
+        if active {
+            atomic_add_f32(&mut grad_a[a_index], grad_a_local);
+            grad_h[state_index] = adjoint;
+        }
+        if n == 0 && active_channel {
+            atomic_add_f32(&mut grad_d[channel], grad_d_local);
+        }
+    }
+
+    /// Materializes the softplus activation for the non-segmented scan
+    /// paths (decode, prefill without states, the fused small-problem
+    /// backward). The segmented training kernels compute softplus in-kernel
+    /// from the raw delta instead and never allocate this tensor.
+    fn materialize_softplus<R: CubeRuntime>(
+        delta_raw: &CubeTensor<R>,
+        batch: usize,
+        seq_len: usize,
+        channels: usize,
+    ) -> CubeTensor<R> {
+        let delta = empty_like_dtype(
+            delta_raw,
+            Shape::new([batch, seq_len, channels]),
+            DType::F32,
+        );
+        let delta_total = (batch * seq_len * channels) as u32;
+        softplus_forward::launch::<f32, R>(
+            &delta_raw.client,
+            CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+            CubeDim::new_1d(THREADS_PER_CUBE),
+            delta_raw.clone().into_tensor_arg(),
+            delta.clone().into_tensor_arg(),
+        );
+        delta
+    }
+
     impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
         fn selective_scan_inner(
             delta: CubeTensor<R>,
@@ -968,13 +1421,39 @@ mod gpu {
             let a = into_contiguous(a);
             let d = into_contiguous(d);
             let h = into_contiguous(h);
-            let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
-            let h_out = empty_like(&xs, Shape::new([batch, channels, state_dim]));
-            let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let io_dtype = xs.dtype;
+            assert!(
+                io_dtype == DType::F32 || io_dtype == DType::BF16,
+                "selective scan supports F32 or BF16 sequence tensors, got {io_dtype:?}"
+            );
+            assert_eq!(delta_raw.dtype, io_dtype);
+            assert_eq!(b_mat.dtype, io_dtype);
+            assert_eq!(c_mat.dtype, io_dtype);
             let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
             let full_sequence_scan = save_states || seq_len > 1;
+            let segments = seq_len.div_ceil(checkpoint_interval);
+            let segmented =
+                full_sequence_scan && save_states && checkpoint_interval > 1 && segments > 1;
+            // Only the segment-parallel training path has BF16 kernels. The
+            // remaining paths (decode, prefill without saved states, the
+            // small-problem full-state path) normalize a BF16 stream to FP32
+            // here and hand BF16 back at the return.
+            let normalize_fp32 = io_dtype == DType::BF16 && !segmented;
+            let (delta_raw, xs, b_mat, c_mat, io_dtype) = if normalize_fp32 {
+                (
+                    burn_cubecl::kernel::cast(delta_raw, DType::F32),
+                    burn_cubecl::kernel::cast(xs, DType::F32),
+                    burn_cubecl::kernel::cast(b_mat, DType::F32),
+                    burn_cubecl::kernel::cast(c_mat, DType::F32),
+                    DType::F32,
+                )
+            } else {
+                (delta_raw, xs, b_mat, c_mat, io_dtype)
+            };
+            let y = empty_like(&xs, Shape::new([batch, seq_len, channels]));
+            let h_out = empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
             let states = if save_states {
-                empty_like(
+                empty_like_dtype(
                     &xs,
                     Shape::new([
                         batch,
@@ -982,21 +1461,55 @@ mod gpu {
                         channels,
                         state_dim,
                     ]),
+                    DType::F32,
                 )
             } else {
                 h_out.clone()
             };
 
             let client = xs.client.clone();
-            let delta_total = (batch * seq_len * channels) as u32;
-            softplus_forward::launch::<R>(
-                &client,
-                CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
-                CubeDim::new_1d(THREADS_PER_CUBE),
-                delta_raw.into_tensor_arg(),
-                delta.clone().into_tensor_arg(),
-            );
-            if full_sequence_scan {
+            if segmented {
+                // Training path: one block per (batch, channel tile) sweeps
+                // the segments left-to-right with the state in registers —
+                // a single launch and a single input read, no stitched-carry
+                // kernels.
+                macro_rules! launch_forward {
+                    ($float:ty) => {{
+                        selective_scan_forward_swept::launch::<$float, R>(
+                            &client,
+                            CubeCount::Static(
+                                (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                                batch as u32,
+                                1,
+                            ),
+                            CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                            delta_raw.clone().into_tensor_arg(),
+                            xs.clone().into_tensor_arg(),
+                            b_mat.clone().into_tensor_arg(),
+                            c_mat.into_tensor_arg(),
+                            a.clone().into_tensor_arg(),
+                            d.into_tensor_arg(),
+                            h.clone().into_tensor_arg(),
+                            y.clone().into_tensor_arg(),
+                            states.clone().into_tensor_arg(),
+                            h_out.clone().into_tensor_arg(),
+                            channels as u32,
+                            seq_len as u32,
+                            state_dim,
+                            checkpoint_interval,
+                        );
+                    }};
+                }
+                match io_dtype {
+                    DType::BF16 => launch_forward!(bf16),
+                    _ => launch_forward!(f32),
+                }
+            } else if full_sequence_scan {
+                assert!(
+                    io_dtype == DType::F32,
+                    "BF16 selective scan requires the checkpointed training path"
+                );
+                let delta = materialize_softplus(&delta_raw, batch, seq_len, channels);
                 let serial_blocks = ((batch * channels) as u32).div_ceil(THREADS_PER_CUBE);
                 if serial_blocks >= SERIAL_SCAN_MIN_BLOCKS {
                     selective_scan_forward_serial::launch::<R>(
@@ -1046,6 +1559,11 @@ mod gpu {
                     );
                 }
             } else {
+                assert!(
+                    io_dtype == DType::F32,
+                    "BF16 selective scan requires the checkpointed training path"
+                );
+                let delta = materialize_softplus(&delta_raw, batch, seq_len, channels);
                 let total = (batch * channels) as u32;
                 selective_scan_step::launch::<R>(
                     &client,
@@ -1065,6 +1583,11 @@ mod gpu {
                 );
             }
 
+            let y = if normalize_fp32 {
+                burn_cubecl::kernel::cast(y, DType::BF16)
+            } else {
+                y
+            };
             (y, h_out, states)
         }
 
@@ -1102,57 +1625,147 @@ mod gpu {
             let h = into_contiguous(h);
             let states = into_contiguous(states);
             let grad_y = into_contiguous(grad_y);
+            let io_dtype = xs.dtype;
+            assert!(
+                io_dtype == DType::F32 || io_dtype == DType::BF16,
+                "selective scan supports F32 or BF16 sequence tensors, got {io_dtype:?}"
+            );
+            assert_eq!(
+                grad_y.dtype, io_dtype,
+                "selective scan output gradient dtype must match the sequence dtype"
+            );
+            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+            let segments = seq_len.div_ceil(checkpoint_interval);
+            let segmented = checkpoint_interval > 1 && segments > 1;
+            // Only the segment-parallel training backward has BF16 kernels;
+            // the fused fallback normalizes the sequence tensors to FP32 and
+            // hands the gradients back in the caller's dtype at the return.
+            let normalize_fp32 = io_dtype == DType::BF16 && !segmented;
+            let (delta_raw, xs, b_mat, c_mat, grad_y, io_dtype) = if normalize_fp32 {
+                (
+                    burn_cubecl::kernel::cast(delta_raw, DType::F32),
+                    burn_cubecl::kernel::cast(xs, DType::F32),
+                    burn_cubecl::kernel::cast(b_mat, DType::F32),
+                    burn_cubecl::kernel::cast(c_mat, DType::F32),
+                    burn_cubecl::kernel::cast(grad_y, DType::F32),
+                    DType::F32,
+                )
+            } else {
+                (delta_raw, xs, b_mat, c_mat, grad_y, io_dtype)
+            };
             let grad_delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let grad_xs = empty_like(&xs, Shape::new([batch, seq_len, channels]));
-            let grad_b = zeros_like(&xs, Shape::new([batch, seq_len, state_dim]));
-            let grad_c = zeros_like(&xs, Shape::new([batch, seq_len, state_dim]));
-            let grad_a = zeros_like(&xs, Shape::new([channels, state_dim]));
-            let grad_d = zeros_like(&xs, Shape::new([channels]));
-            let grad_h = empty_like(&xs, Shape::new([batch, channels, state_dim]));
-            let delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
-            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+            let grad_b = zeros_like_dtype(&xs, Shape::new([batch, seq_len, state_dim]), DType::F32);
+            let grad_c = zeros_like_dtype(&xs, Shape::new([batch, seq_len, state_dim]), DType::F32);
+            let grad_a = zeros_like_dtype(&xs, Shape::new([channels, state_dim]), DType::F32);
+            let grad_d = zeros_like_dtype(&xs, Shape::new([channels]), DType::F32);
+            let grad_h =
+                empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
             let client = xs.client.clone();
 
-            let delta_total = (batch * seq_len * channels) as u32;
-            softplus_forward::launch::<R>(
-                &client,
-                CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
-                CubeDim::new_1d(THREADS_PER_CUBE),
-                delta_raw.clone().into_tensor_arg(),
-                delta.clone().into_tensor_arg(),
-            );
+            if segmented {
+                assert!(
+                    checkpoint_interval.is_multiple_of(BACKWARD_FLUSH),
+                    "scan checkpoint interval {checkpoint_interval} must be a multiple of the \
+                     backward flush window {BACKWARD_FLUSH}"
+                );
+                // One block per (batch, channel tile) sweeps the segments
+                // right-to-left with the adjoint in registers — the exact
+                // reverse recurrence, no stitched-carry kernels.
+                macro_rules! launch_backward {
+                    ($float:ty) => {{
+                        selective_scan_backward_segmented::launch::<$float, R>(
+                            &client,
+                            CubeCount::Static(
+                                (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                                batch as u32,
+                                1,
+                            ),
+                            CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                            delta_raw.into_tensor_arg(),
+                            xs.clone().into_tensor_arg(),
+                            b_mat.into_tensor_arg(),
+                            c_mat.clone().into_tensor_arg(),
+                            a.clone().into_tensor_arg(),
+                            d.into_tensor_arg(),
+                            h.clone().into_tensor_arg(),
+                            states.clone().into_tensor_arg(),
+                            grad_y.clone().into_tensor_arg(),
+                            grad_delta.clone().into_tensor_arg(),
+                            grad_xs.clone().into_tensor_arg(),
+                            grad_b.clone().into_tensor_arg(),
+                            grad_c.clone().into_tensor_arg(),
+                            grad_a.clone().into_tensor_arg(),
+                            grad_d.clone().into_tensor_arg(),
+                            grad_h.clone().into_tensor_arg(),
+                            channels as u32,
+                            seq_len as u32,
+                            state_dim,
+                            checkpoint_interval,
+                        );
+                    }};
+                }
+                match io_dtype {
+                    DType::BF16 => launch_backward!(bf16),
+                    _ => launch_backward!(f32),
+                }
+                // grad_B/grad_C accumulate through f32 atomics; hand them back
+                // in the sequence dtype so autodiff composes without dtype
+                // mismatches. The tensors are [batch, seq, state_dim] — tiny.
+                if io_dtype != DType::F32 {
+                    let grad_b = burn_cubecl::kernel::cast(grad_b, io_dtype);
+                    let grad_c = burn_cubecl::kernel::cast(grad_c, io_dtype);
+                    return (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h);
+                }
+            } else {
+                assert!(
+                    io_dtype == DType::F32,
+                    "BF16 selective scan backward requires the checkpointed training path"
+                );
+                let delta = materialize_softplus(&delta_raw, batch, seq_len, channels);
+                selective_scan_backward_fused::launch::<R>(
+                    &client,
+                    CubeCount::Static(
+                        (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                        batch as u32,
+                        1,
+                    ),
+                    CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                    delta.clone().into_tensor_arg(),
+                    delta_raw.into_tensor_arg(),
+                    xs.clone().into_tensor_arg(),
+                    b_mat.into_tensor_arg(),
+                    c_mat.clone().into_tensor_arg(),
+                    a.clone().into_tensor_arg(),
+                    d.into_tensor_arg(),
+                    h.clone().into_tensor_arg(),
+                    states.clone().into_tensor_arg(),
+                    grad_y.clone().into_tensor_arg(),
+                    grad_delta.clone().into_tensor_arg(),
+                    grad_xs.clone().into_tensor_arg(),
+                    grad_b.clone().into_tensor_arg(),
+                    grad_c.clone().into_tensor_arg(),
+                    grad_a.clone().into_tensor_arg(),
+                    grad_d.clone().into_tensor_arg(),
+                    grad_h.clone().into_tensor_arg(),
+                    channels as u32,
+                    seq_len as u32,
+                    state_dim,
+                    checkpoint_interval,
+                );
+            }
 
-            selective_scan_backward_fused::launch::<R>(
-                &client,
-                CubeCount::Static(
-                    (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
-                    batch as u32,
-                    1,
-                ),
-                CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
-                delta.clone().into_tensor_arg(),
-                delta_raw.into_tensor_arg(),
-                xs.clone().into_tensor_arg(),
-                b_mat.into_tensor_arg(),
-                c_mat.clone().into_tensor_arg(),
-                a.clone().into_tensor_arg(),
-                d.into_tensor_arg(),
-                h.clone().into_tensor_arg(),
-                states.clone().into_tensor_arg(),
-                grad_y.clone().into_tensor_arg(),
-                grad_delta.clone().into_tensor_arg(),
-                grad_xs.clone().into_tensor_arg(),
-                grad_b.clone().into_tensor_arg(),
-                grad_c.clone().into_tensor_arg(),
-                grad_a.clone().into_tensor_arg(),
-                grad_d.clone().into_tensor_arg(),
-                grad_h.clone().into_tensor_arg(),
-                channels as u32,
-                seq_len as u32,
-                state_dim,
-                checkpoint_interval,
-            );
-
+            if normalize_fp32 {
+                return (
+                    burn_cubecl::kernel::cast(grad_delta, DType::BF16),
+                    burn_cubecl::kernel::cast(grad_xs, DType::BF16),
+                    burn_cubecl::kernel::cast(grad_b, DType::BF16),
+                    burn_cubecl::kernel::cast(grad_c, DType::BF16),
+                    grad_a,
+                    grad_d,
+                    grad_h,
+                );
+            }
             (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h)
         }
     }
@@ -1316,6 +1929,127 @@ mod tests {
     #[test]
     fn test_cubecl_selective_scan_full_state_backward_matches_ndarray() {
         assert_cubecl_selective_scan_backward(2);
+    }
+
+    /// BF16 sequence tensors through the checkpointed training path against
+    /// the f32 CPU reference over the same bf16-quantized data: differences
+    /// are bounded by the BF16 output/gradient quantization, not kernel math.
+    #[test]
+    fn test_cubecl_selective_scan_bf16_io_matches_f32_reference() {
+        use burn::tensor::FloatDType;
+
+        fn quantize(values: Vec<f32>) -> Vec<f32> {
+            values
+                .into_iter()
+                .map(|value| half::bf16::from_f32(value).to_f32())
+                .collect()
+        }
+
+        let cpu = Device::ndarray().autodiff();
+        let gpu = gpu_device().autodiff();
+        let (batch, seq_len, channels, state_dim) = (3, 37, 3, 4);
+        let shapes = (
+            [batch, seq_len, channels],
+            [batch, seq_len, state_dim],
+            [channels, state_dim],
+            [channels],
+            [batch, channels, state_dim],
+        );
+        // Strictly negative state matrix keeps the recurrence bounded, so the
+        // comparison measures kernel arithmetic rather than the BF16
+        // quantization of a geometrically growing output.
+        let a_data: Vec<f32> = values(channels * state_dim, 0.11, -0.4)
+            .into_iter()
+            .map(|value| -value.abs() - 0.05)
+            .collect();
+        let data = (
+            quantize(values(batch * seq_len * channels, 0.13, 0.08)),
+            quantize(values(batch * seq_len * channels, 0.17, -0.03)),
+            quantize(values(batch * seq_len * state_dim, 0.19, 0.02)),
+            quantize(values(batch * seq_len * state_dim, 0.23, -0.01)),
+            a_data,
+            values(channels, 0.07, 0.9),
+            values(batch * channels * state_dim, 0.05, 0.01),
+        );
+        let weight_data = quantize(values(batch * seq_len * channels, 0.29, 0.5));
+
+        macro_rules! run {
+            ($device:expr, $bf16:expr) => {{
+                let cast = |tensor: Tensor<3>| {
+                    if $bf16 {
+                        tensor.cast(FloatDType::BF16)
+                    } else {
+                        tensor
+                    }
+                };
+                let delta = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.0.clone(), shapes.0),
+                    $device,
+                ))
+                .require_grad();
+                let xs = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.1.clone(), shapes.0),
+                    $device,
+                ))
+                .require_grad();
+                let b = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.2.clone(), shapes.1),
+                    $device,
+                ))
+                .require_grad();
+                let c = cast(Tensor::<3>::from_data(
+                    TensorData::new(data.3.clone(), shapes.1),
+                    $device,
+                ))
+                .require_grad();
+                let a = Tensor::<2>::from_data(TensorData::new(data.4.clone(), shapes.2), $device)
+                    .require_grad();
+                let d = Tensor::<1>::from_data(TensorData::new(data.5.clone(), shapes.3), $device)
+                    .require_grad();
+                let h = Tensor::<3>::from_data(TensorData::new(data.6.clone(), shapes.4), $device)
+                    .require_grad();
+                let (y, _) = selective_scan(
+                    delta.clone(),
+                    xs.clone(),
+                    b.clone(),
+                    c.clone(),
+                    a.clone(),
+                    d.clone(),
+                    h.clone(),
+                    state_dim,
+                );
+                let weights = cast(Tensor::<3>::from_data(
+                    TensorData::new(weight_data.clone(), shapes.0),
+                    $device,
+                ));
+                let mut grads = (y.clone() * weights).sum().backward();
+                (
+                    y.into_data(),
+                    [
+                        delta.grad_remove(&mut grads).unwrap().into_data(),
+                        xs.grad_remove(&mut grads).unwrap().into_data(),
+                        b.grad_remove(&mut grads).unwrap().into_data(),
+                        c.grad_remove(&mut grads).unwrap().into_data(),
+                        a.grad_remove(&mut grads).unwrap().into_data(),
+                        d.grad_remove(&mut grads).unwrap().into_data(),
+                        h.grad_remove(&mut grads).unwrap().into_data(),
+                    ],
+                )
+            }};
+        }
+
+        let (cpu_y, cpu_grads) = run!(&cpu, false);
+        let (gpu_y, gpu_grads) = run!(&gpu, true);
+        let y_difference = max_diff(cpu_y, gpu_y);
+        assert!(y_difference < 2e-2, "y max diff: {y_difference}");
+        for ((name, cpu), gpu) in ["delta", "xs", "b", "c", "a", "d", "h"]
+            .into_iter()
+            .zip(cpu_grads)
+            .zip(gpu_grads)
+        {
+            let difference = max_diff(cpu, gpu);
+            assert!(difference < 2e-2, "{name} gradient max diff: {difference}");
+        }
     }
 
     #[test]

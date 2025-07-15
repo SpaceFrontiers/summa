@@ -12,7 +12,7 @@ use burn_nn::{Linear, LinearConfig};
 use crate::mal::{ModelDef, SsmDef};
 
 use super::conv::depthwise_conv1d;
-use super::matmul::{linear, prepare_linear_for_inference};
+use super::matmul::{linear_low_precision, prepare_linear_for_inference};
 use super::scan::selective_scan;
 
 /// Recurrent state for one Mamba layer.
@@ -115,7 +115,11 @@ impl MambaMixer {
         let [batch, seq_len, _] = x.dims();
         assert!(seq_len > 0, "Mamba forward requires at least one token");
 
-        let xz = linear(&self.in_proj, x);
+        // The projection chain feeding the scan stays in the matmul compute
+        // dtype (BF16 on CUDA training): the fused conv/scan kernels read it
+        // directly, which removes the promote-and-recast passes around every
+        // SSM layer and halves their sequence-tensor traffic.
+        let xz = linear_low_precision(&self.in_proj, x);
         let xs = xz.clone().slice([0..batch, 0..seq_len, 0..self.d_inner]);
         let z = xz.slice([0..batch, 0..seq_len, self.d_inner..2 * self.d_inner]);
 
@@ -135,13 +139,14 @@ impl MambaMixer {
                 );
                 Tensor::cat(vec![s.conv.clone(), xs_t], 2)
             }
-            None => Tensor::cat(
-                vec![
-                    Tensor::zeros([batch, self.d_inner, self.conv_kernel - 1], &xs_t.device()),
-                    xs_t,
-                ],
-                2,
-            ),
+            None => {
+                let mut padding: Tensor<3> =
+                    Tensor::zeros([batch, self.d_inner, self.conv_kernel - 1], &xs_t.device());
+                if padding.dtype() != xs_t.dtype() {
+                    padding = padding.cast(burn::tensor::FloatDType::BF16);
+                }
+                Tensor::cat(vec![padding, xs_t], 2)
+            }
         };
         if let Some(s) = state.as_deref_mut() {
             let total = padded.dims()[2];
@@ -165,7 +170,7 @@ impl MambaMixer {
         );
 
         // Input-dependent delta, B, C.
-        let x_dbl = linear(&self.x_proj, xs.clone());
+        let x_dbl = linear_low_precision(&self.x_proj, xs.clone());
         let delta = x_dbl.clone().slice([0..batch, 0..seq_len, 0..self.dt_rank]);
         let b_mat = x_dbl.clone().slice([
             0..batch,
@@ -178,7 +183,7 @@ impl MambaMixer {
             self.dt_rank + self.state_dim..self.dt_rank + 2 * self.state_dim,
         ]);
 
-        let delta_raw = linear(&self.dt_proj, delta);
+        let delta_raw = linear_low_precision(&self.dt_proj, delta);
         let a = -self.a_log.val().exp();
 
         let h = match state.as_deref() {
@@ -201,6 +206,6 @@ impl MambaMixer {
             s.h = h;
         }
 
-        linear(&self.out_proj, y * silu(z))
+        linear_low_precision(&self.out_proj, y * silu(z))
     }
 }

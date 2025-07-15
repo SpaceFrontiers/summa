@@ -17,11 +17,28 @@ pub(super) fn empty_like<R: CubeRuntime>(tensor: &CubeTensor<R>, shape: Shape) -
     )
 }
 
-pub(super) fn zeros_like<R: CubeRuntime>(tensor: &CubeTensor<R>, shape: Shape) -> CubeTensor<R> {
+pub(super) fn empty_like_dtype<R: CubeRuntime>(
+    tensor: &CubeTensor<R>,
+    shape: Shape,
+    dtype: burn::tensor::DType,
+) -> CubeTensor<R> {
+    burn_cubecl::ops::numeric::empty_device_contiguous_dtype(
+        tensor.client.clone(),
+        tensor.device.clone(),
+        shape,
+        dtype,
+    )
+}
+
+pub(super) fn zeros_like_dtype<R: CubeRuntime>(
+    tensor: &CubeTensor<R>,
+    shape: Shape,
+    dtype: burn::tensor::DType,
+) -> CubeTensor<R> {
     burn_cubecl::ops::numeric::zeros_client(
         tensor.client.clone(),
         tensor.device.clone(),
         shape,
-        tensor.dtype,
+        dtype,
     )
 }

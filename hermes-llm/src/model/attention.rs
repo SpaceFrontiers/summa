@@ -13,7 +13,7 @@ use burn_nn::{
 use crate::mal::{BlockDef, ModelDef};
 
 use super::fused_attention::{fused_attention, repeat_kv};
-use super::matmul::{linear, prepare_linear_for_inference};
+use super::matmul::{linear, linear_low_precision, prepare_linear_for_inference};
 
 /// Preallocated KV cache for one attention layer, before GQA head expansion.
 #[derive(Debug, Clone)]
@@ -239,7 +239,10 @@ impl MultiHeadAttention {
     pub fn forward(&self, x: Tensor<3>, rope: &RotaryEncoding, start_pos: usize) -> Tensor<3> {
         let (q, k, v) = self.project_qkv(x, rope, start_pos);
         let out = self.sdpa(q, k, v, start_pos);
-        linear(&self.o_proj, self.merge_heads(out))
+        // The output projection joins the training residual stream directly
+        // in the matmul compute dtype; decode (`forward_cached`) keeps the
+        // FP32 promotion for its FP32 stream.
+        linear_low_precision(&self.o_proj, self.merge_heads(out))
     }
 
     /// Incremental attention over a KV cache. `x` holds S new tokens at global

@@ -18,6 +18,7 @@ use cubecl::cuda::CudaRuntime;
 
 use super::conv::DepthwiseConv1dBackend;
 use super::fused_attention::{AttentionBackend, chunked_attention_backward};
+use super::linear_cross_entropy::LinearCrossEntropyBackend;
 use super::scan::{MambaBackend, scan_checkpoint_interval};
 
 const ATTENTION_BACKWARD_CHUNK_ROWS: usize = 2048;
@@ -126,7 +127,7 @@ where
         let grad_bias = TensorIr::uninit(
             client.create_empty_handle(),
             Shape::new([channels]),
-            grad.dtype,
+            weight.dtype,
         );
         let desc = CustomOpIr::new(
             "hermes_depthwise_conv1d_backward",
@@ -145,6 +146,177 @@ where
             .try_into()
             .expect("depthwise backward has three outputs");
         (input, weight, bias)
+    }
+}
+
+#[derive(Debug)]
+struct LinearCrossEntropyForward<B> {
+    desc: CustomOpIr,
+    logical_vocab_size: usize,
+    chunk_size: usize,
+    use_bias: bool,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for LinearCrossEntropyForward<B>
+where
+    B: FusionBackend + LinearCrossEntropyBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([hidden, weight, bias, targets], [loss_ir]) = self.desc.as_fixed();
+        let loss = B::linear_cross_entropy_inner(
+            handles.get_float_tensor::<B>(hidden),
+            handles.get_float_tensor::<B>(weight),
+            handles.get_float_tensor::<B>(bias),
+            handles.get_int_tensor::<B>(targets),
+            self.logical_vocab_size,
+            self.chunk_size,
+            self.use_bias,
+        );
+        handles.register_float_tensor::<B>(&loss_ir.id, loss);
+    }
+}
+
+#[derive(Debug)]
+struct LinearCrossEntropyBackward<B> {
+    desc: CustomOpIr,
+    logical_vocab_size: usize,
+    chunk_size: usize,
+    use_bias: bool,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for LinearCrossEntropyBackward<B>
+where
+    B: FusionBackend + LinearCrossEntropyBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([hidden, weight, bias, targets, grad_output], [grad_hidden, grad_weight, grad_bias]) =
+            self.desc.as_fixed();
+        let output = B::linear_cross_entropy_backward(
+            handles.get_float_tensor::<B>(hidden),
+            handles.get_float_tensor::<B>(weight),
+            handles.get_float_tensor::<B>(bias),
+            handles.get_int_tensor::<B>(targets),
+            handles.get_float_tensor::<B>(grad_output),
+            self.logical_vocab_size,
+            self.chunk_size,
+            self.use_bias,
+        );
+        handles.register_float_tensor::<B>(&grad_hidden.id, output.0);
+        handles.register_float_tensor::<B>(&grad_weight.id, output.1);
+        handles.register_float_tensor::<B>(&grad_bias.id, output.2);
+    }
+}
+
+impl<B> LinearCrossEntropyBackend for Fusion<B>
+where
+    B: FusionBackend + LinearCrossEntropyBackend,
+{
+    fn linear_cross_entropy_inner(
+        hidden: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+        targets: burn::backend::tensor::IntTensor<Self>,
+        logical_vocab_size: usize,
+        chunk_size: usize,
+        use_bias: bool,
+    ) -> FloatTensor<Self> {
+        let client = hidden.client.clone();
+        // The loss statistics chain always computes in FP32, even when the
+        // hidden activations arrive in the BF16 residual-stream dtype.
+        let loss = TensorIr::uninit(client.create_empty_handle(), Shape::new([1]), DType::F32);
+        let desc = CustomOpIr::with_scalars(
+            "hermes_linear_cross_entropy",
+            &[
+                hidden.into_ir(),
+                weight.into_ir(),
+                bias.into_ir(),
+                targets.into_ir(),
+            ],
+            &[loss],
+            vec![
+                ScalarIr::UInt(logical_vocab_size as u64),
+                ScalarIr::UInt(chunk_size as u64),
+                ScalarIr::Bool(use_bias),
+            ],
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                LinearCrossEntropyForward::<B> {
+                    desc,
+                    logical_vocab_size,
+                    chunk_size,
+                    use_bias,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_cross_entropy_backward(
+        hidden: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+        targets: burn::backend::tensor::IntTensor<Self>,
+        grad_output: FloatTensor<Self>,
+        logical_vocab_size: usize,
+        chunk_size: usize,
+        use_bias: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        let client = hidden.client.clone();
+        let grad_hidden = TensorIr::uninit(
+            client.create_empty_handle(),
+            hidden.shape.clone(),
+            hidden.dtype,
+        );
+        let grad_weight = TensorIr::uninit(
+            client.create_empty_handle(),
+            weight.shape.clone(),
+            weight.dtype,
+        );
+        let grad_bias =
+            TensorIr::uninit(client.create_empty_handle(), bias.shape.clone(), bias.dtype);
+        let desc = CustomOpIr::with_scalars(
+            "hermes_linear_cross_entropy_backward",
+            &[
+                hidden.into_ir(),
+                weight.into_ir(),
+                bias.into_ir(),
+                targets.into_ir(),
+                grad_output.into_ir(),
+            ],
+            &[grad_hidden, grad_weight, grad_bias],
+            vec![
+                ScalarIr::UInt(logical_vocab_size as u64),
+                ScalarIr::UInt(chunk_size as u64),
+                ScalarIr::Bool(use_bias),
+            ],
+        );
+        let [grad_hidden, grad_weight, grad_bias] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                LinearCrossEntropyBackward::<B> {
+                    desc,
+                    logical_vocab_size,
+                    chunk_size,
+                    use_bias,
+                    backend: PhantomData,
+                },
+            )
+            .try_into()
+            .expect("linear cross-entropy backward has three outputs");
+        (grad_hidden, grad_weight, grad_bias)
     }
 }
 
@@ -250,7 +422,7 @@ where
         let h_out = TensorIr::uninit(
             client.create_empty_handle(),
             Shape::new([batch, channels, state_dim]),
-            dtype,
+            DType::F32,
         );
         let states_shape = if save_states {
             Shape::new([
@@ -262,7 +434,7 @@ where
         } else {
             Shape::new([batch, channels, state_dim])
         };
-        let states = TensorIr::uninit(client.create_empty_handle(), states_shape, dtype);
+        let states = TensorIr::uninit(client.create_empty_handle(), states_shape, DType::F32);
         let desc = CustomOpIr::with_scalars(
             "hermes_selective_scan",
             &[
@@ -330,9 +502,9 @@ where
             TensorIr::uninit(client.create_empty_handle(), delta_shape, dtype),
             TensorIr::uninit(client.create_empty_handle(), bc_shape.clone(), dtype),
             TensorIr::uninit(client.create_empty_handle(), bc_shape, dtype),
-            TensorIr::uninit(client.create_empty_handle(), a_shape, dtype),
-            TensorIr::uninit(client.create_empty_handle(), d_shape, dtype),
-            TensorIr::uninit(client.create_empty_handle(), h_shape, dtype),
+            TensorIr::uninit(client.create_empty_handle(), a_shape, DType::F32),
+            TensorIr::uninit(client.create_empty_handle(), d_shape, DType::F32),
+            TensorIr::uninit(client.create_empty_handle(), h_shape, DType::F32),
         ];
         let desc = CustomOpIr::with_scalars(
             "hermes_selective_scan_backward",
@@ -401,8 +573,17 @@ impl Operation<FusionCubeRuntime<CudaRuntime>> for AttentionForward {
         >,
     ) {
         type B = CubeBackend<CudaRuntime>;
-        let ([query, key, value], [output, saved_query, saved_key, saved_value, saved_output]) =
-            self.desc.as_fixed();
+        let (
+            [query, key, value],
+            [
+                output,
+                saved_query,
+                saved_key,
+                saved_value,
+                saved_output,
+                log_sum_exp,
+            ],
+        ) = self.desc.as_fixed();
         let result = B::attention_inner(
             handles.get_float_tensor::<B>(query),
             handles.get_float_tensor::<B>(key),
@@ -414,6 +595,41 @@ impl Operation<FusionCubeRuntime<CudaRuntime>> for AttentionForward {
         handles.register_float_tensor::<B>(&saved_key.id, result.2);
         handles.register_float_tensor::<B>(&saved_value.id, result.3);
         handles.register_float_tensor::<B>(&saved_output.id, result.4);
+        handles.register_float_tensor::<B>(&log_sum_exp.id, result.5);
+    }
+}
+
+#[derive(Debug)]
+struct AttentionProbabilities {
+    desc: CustomOpIr,
+    scale: f32,
+    row_offset: usize,
+    causal: bool,
+}
+
+impl Operation<FusionCubeRuntime<CudaRuntime>> for AttentionProbabilities {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<
+            <FusionCubeRuntime<CudaRuntime> as FusionRuntime>::FusionHandle,
+        >,
+    ) {
+        type B = CubeBackend<CudaRuntime>;
+        let (
+            [scores, grad_probabilities, correction, log_sum_exp],
+            [probabilities_ir, score_gradient_ir],
+        ) = self.desc.as_fixed();
+        let (probabilities, score_gradient) = B::attention_backward_probabilities(
+            handles.get_float_tensor::<B>(scores),
+            handles.get_float_tensor::<B>(grad_probabilities),
+            handles.get_float_tensor::<B>(correction),
+            handles.get_float_tensor::<B>(log_sum_exp),
+            self.scale,
+            self.row_offset,
+            self.causal,
+        );
+        handles.register_float_tensor::<B>(&probabilities_ir.id, probabilities);
+        handles.register_float_tensor::<B>(&score_gradient_ir.id, score_gradient);
     }
 }
 
@@ -429,17 +645,21 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
+        FloatTensor<Self>,
     ) {
         let client = query.client.clone();
         let shape = query.shape.clone();
         let dtype = query.dtype;
         let f16 = DType::F16;
+        let query_dims = shape.dims::<4>();
+        let lse_shape = Shape::new([query_dims[0] * query_dims[1], query_dims[2]]);
         let outputs = [
             TensorIr::uninit(client.create_empty_handle(), shape.clone(), dtype),
             TensorIr::uninit(client.create_empty_handle(), shape.clone(), f16),
             TensorIr::uninit(client.create_empty_handle(), key.shape.clone(), f16),
             TensorIr::uninit(client.create_empty_handle(), value.shape.clone(), f16),
             TensorIr::uninit(client.create_empty_handle(), shape, f16),
+            TensorIr::uninit(client.create_empty_handle(), lse_shape, DType::F32),
         ];
         let desc = CustomOpIr::with_scalars(
             "hermes_flash_attention",
@@ -447,15 +667,15 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
             &outputs,
             vec![ScalarIr::Bool(causal)],
         );
-        let [output, query, key, value, saved_output] = client
+        let [output, query, key, value, saved_output, log_sum_exp] = client
             .register(
                 StreamId::current(),
                 OperationIr::Custom(desc.clone()),
                 AttentionForward { desc, causal },
             )
             .try_into()
-            .expect("attention forward has five outputs");
-        (output, query, key, value, saved_output)
+            .expect("attention forward has six outputs");
+        (output, query, key, value, saved_output, log_sum_exp)
     }
 
     fn attention_backward(
@@ -464,6 +684,7 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
         value: FloatTensor<Self>,
         output: FloatTensor<Self>,
         grad_output: FloatTensor<Self>,
+        log_sum_exp: FloatTensor<Self>,
         causal: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         // Keep the recompute graph visible to Burn so its softmax correction,
@@ -474,11 +695,56 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
             value,
             output,
             grad_output,
+            log_sum_exp,
             causal,
             ATTENTION_BACKWARD_CHUNK_ROWS,
         )
     }
 
+    fn attention_backward_probabilities(
+        scores: FloatTensor<Self>,
+        grad_probabilities: FloatTensor<Self>,
+        correction: FloatTensor<Self>,
+        log_sum_exp: FloatTensor<Self>,
+        scale: f32,
+        row_offset: usize,
+        causal: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        let client = scores.client.clone();
+        let shape = scores.shape.clone();
+        let probabilities =
+            TensorIr::uninit(client.create_empty_handle(), shape.clone(), DType::BF16);
+        let score_gradient = TensorIr::uninit(client.create_empty_handle(), shape, DType::BF16);
+        let desc = CustomOpIr::with_scalars(
+            "hermes_attention_backward_probabilities",
+            &[
+                scores.into_ir(),
+                grad_probabilities.into_ir(),
+                correction.into_ir(),
+                log_sum_exp.into_ir(),
+            ],
+            &[probabilities, score_gradient],
+            vec![
+                ScalarIr::Float(scale as f64),
+                ScalarIr::UInt(row_offset as u64),
+                ScalarIr::Bool(causal),
+            ],
+        );
+        let [probabilities, score_gradient] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                AttentionProbabilities {
+                    desc,
+                    scale,
+                    row_offset,
+                    causal,
+                },
+            )
+            .try_into()
+            .expect("attention probabilities have two outputs");
+        (probabilities, score_gradient)
+    }
     fn attention_causal_mask(scores: FloatTensor<Self>, row_offset: usize) -> FloatTensor<Self> {
         let client = scores.client.clone();
         let output = TensorIr::uninit(

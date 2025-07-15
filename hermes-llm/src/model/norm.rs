@@ -3,6 +3,7 @@
 //! RMSNorm and LayerNorm are Burn modules; `none` is an identity operation.
 
 use burn::prelude::*;
+use burn::tensor::DType;
 use burn_nn::{LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig};
 
 use crate::mal::NormType;
@@ -29,7 +30,18 @@ impl Norm {
         }
     }
 
+    /// Normalization statistics always accumulate in FP32 (PyTorch autocast's
+    /// layer-norm policy): a BF16 residual stream is cast up on entry and back
+    /// on exit, and both casts fuse into the surrounding elementwise chains.
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
+        let dtype = x.dtype();
+        if matches!(self, Self::Identity(_)) || dtype == DType::F32 {
+            return self.forward_f32(x);
+        }
+        self.forward_f32(x.cast(DType::F32)).cast(dtype)
+    }
+
+    fn forward_f32<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
         match self {
             Self::Rms(n) => n.forward(x),
             Self::Layer(n) => n.forward(x),

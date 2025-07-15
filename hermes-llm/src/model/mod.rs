@@ -212,6 +212,8 @@ mod tests {
 
         let full = model.forward(input, 0);
         assert_eq!(full.dims(), [1, 6, 32]);
+        assert_eq!(model.config().vocab_size, 32);
+        assert_eq!(model.config().padded_vocab_size(), 64);
 
         let mut state = model.make_state(1, &device);
         let prefill = model.forward_with_state(
@@ -270,7 +272,7 @@ mod tests {
         let untied = Transformer::new(&untied, &device).unwrap();
         let tied = Transformer::new(&tied, &device).unwrap();
 
-        assert_eq!(untied.num_parameters() - tied.num_parameters(), 32 * 8);
+        assert_eq!(untied.num_parameters() - tied.num_parameters(), 64 * 8);
     }
 
     #[test]
@@ -290,7 +292,7 @@ mod tests {
             let without = Transformer::new(&config, &device).unwrap().num_parameters();
             config.output.bias = true;
             let with = Transformer::new(&config, &device).unwrap().num_parameters();
-            assert_eq!(with - without, config.vocab_size);
+            assert_eq!(with - without, config.padded_vocab_size());
         }
     }
 }
