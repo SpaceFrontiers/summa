@@ -18,7 +18,6 @@ burn-autodiff = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2
 burn-nn = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", default-features = false, features = ["std"] }
 burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", default-features = false, features = ["std"] }
 burn-wgpu = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std", "metal", "autotune"] }
-burn-cuda = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std", "autotune"] }
 burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", default-features = false, features = [
     "safetensors",
     "std",
@@ -63,7 +62,7 @@ default = ["remote"]
 # Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
 remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
 metal = ["burn/metal", "burn/autotune", "dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl", "dep:half"]
-cuda = ["burn/cuda", "burn/autotune", "dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cubek", "dep:half"]
+cuda = ["burn/cuda", "burn/autotune", "dep:burn-cubecl", "dep:cubecl", "dep:cubek", "dep:half"]
 # Lazy fusion pays off for large training graphs, but adds substantial graph
 # planning and kernel-launch overhead to single-token autoregressive decoding.
 training-fusion = ["cuda", "burn/fusion", "dep:burn-fusion", "dep:burn-ir"]
@@ -71,8 +70,3 @@ training-fusion = ["cuda", "burn/fusion", "dep:burn-fusion", "dep:burn-ir"]
 [[bin]]
 name = "hermes-llm"
 path = "src/main.rs"
-
-[package.metadata.cargo-machete]
-# `#[cube]` macro expansion requires the direct crate even though static source
-# analysis only sees it behind the GPU feature gates.
-ignored = ["cubecl", "cubek"]

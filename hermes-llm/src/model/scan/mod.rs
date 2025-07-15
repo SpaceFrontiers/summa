@@ -39,7 +39,7 @@ use reference::reference_selective_scan_tensor;
 /// every sequence length works via partial-tail guards. The fusion IR and
 /// both dispatch functions must agree on this value, which is why it is
 /// the single source of the saved-states shape.
-#[cfg(any(feature = "metal", feature = "cuda", test))]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 pub(super) const CHECKPOINTED_SCAN_INTERVAL: usize = 32;
 
 fn stable_softplus<const D: usize>(value: Tensor<D>) -> Tensor<D> {

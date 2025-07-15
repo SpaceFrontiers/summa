@@ -3113,7 +3113,6 @@ dependencies = [
  "burn-autodiff",
  "burn-core",
  "burn-cubecl",
- "burn-cuda",
  "burn-fusion",
  "burn-ir",
  "burn-ndarray",
