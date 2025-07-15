@@ -1243,3 +1243,116 @@ async fn test_binary_ivf_end_to_end() {
         results[0].score
     );
 }
+
+/// Multi-valued binary IVF: the IVF probe's exact Hamming scores are reused
+/// for the ordinals it returned, remaining ordinals are exact-scored from
+/// flat storage, and the document combiner sees every ordinal exactly once —
+/// so with a full probe (nprobe = num_clusters) top-k scores must equal
+/// exact brute-force Hamming. Regression for the single-scan +
+/// probe-score-reuse rewrite of the binary IVF search path, on both the
+/// async (current-thread) and sync (multi-thread) scorer paths.
+async fn binary_ivf_multi_value_exact_scores() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::query::BinaryDenseVectorQuery;
+
+    let dim_bits = 64;
+    let byte_len = dim_bits / 8;
+
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let mut cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(4), 4); // full probe
+    cfg.build_threshold = Some(50);
+    let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
+    sb.set_multi(bvec, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Needle doc: one exact-match vector plus one far ordinal — Max combiner
+    // must score the doc by its best ordinal (the probe-scored one).
+    let needle_vec = vec![0xFF_u8; byte_len];
+    let mut needle = Document::new();
+    needle.add_text(title, "needle");
+    needle.add_binary_dense_vector(bvec, needle_vec.clone());
+    needle.add_binary_dense_vector(bvec, vec![0x01_u8; byte_len]);
+    writer.add_document(needle).unwrap();
+
+    // Near doc: single vector, one bit flipped.
+    let mut near_vec = vec![0xFF_u8; byte_len];
+    near_vec[0] = 0xFE;
+    let mut near = Document::new();
+    near.add_text(title, "near");
+    near.add_binary_dense_vector(bvec, near_vec);
+    writer.add_document(near).unwrap();
+
+    // Hay: two vectors per doc, at most half the bits set (score <= ~0.75).
+    for i in 0u32..30 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("hay {i}"));
+        for ordinal in 0u8..2 {
+            let v: Vec<u8> = (0..byte_len)
+                .map(|d| ((i as u8).wrapping_add(d as u8).wrapping_add(ordinal)) & 0x55)
+                .collect();
+            doc.add_binary_dense_vector(bvec, v);
+        }
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert!(
+        matches!(
+            segments[0].get_vector_index(bvec),
+            Some(crate::segment::VectorIndex::BinaryIvf(_))
+        ),
+        "binary IVF index should be built at commit (63 vectors >= threshold 50)"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let results = searcher
+        .search(&BinaryDenseVectorQuery::new(bvec, needle_vec), 3)
+        .await
+        .unwrap();
+    assert!(results.len() >= 2);
+
+    let top = searcher
+        .doc(results[0].segment_id, results[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(top.get_first(title).unwrap().as_text().unwrap(), "needle");
+    assert!(
+        (results[0].score - 1.0).abs() < 1e-6,
+        "needle doc must score by its exact-match ordinal, got {}",
+        results[0].score
+    );
+
+    let second = searcher
+        .doc(results[1].segment_id, results[1].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.get_first(title).unwrap().as_text().unwrap(), "near");
+    let expected_near = 1.0 - 1.0 / dim_bits as f32;
+    assert!(
+        (results[1].score - expected_near).abs() < 1e-6,
+        "near doc must keep its exact Hamming score {expected_near}, got {}",
+        results[1].score
+    );
+}
+
+#[tokio::test]
+async fn test_binary_ivf_multi_value_exact_scores_async_path() {
+    binary_ivf_multi_value_exact_scores().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_ivf_multi_value_exact_scores_sync_path() {
+    binary_ivf_multi_value_exact_scores().await;
+}

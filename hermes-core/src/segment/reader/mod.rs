@@ -358,6 +358,73 @@ where
     }
 }
 
+/// Single-scan variant of [`progressive_ann_search`] for indexes whose
+/// `search(k)` cost does not depend on `k`.
+///
+/// Binary IVF scans every vector of every probed cluster regardless of the
+/// collector size, so each doubling retry of [`progressive_ann_search`]
+/// repeated the identical full scan (~nprobe/num_clusters of the segment's
+/// codes) just to grow the collector. Here the closure runs ONCE at the
+/// fetch cap and the doubling schedule is replayed over prefixes of the
+/// single ranked list, returning exactly what the retry loop would have
+/// returned (a `search(f)` that returns the top-`f` of a fixed ranking makes
+/// the two observationally identical, including the candidate-limit error).
+fn single_scan_ann_search<F>(
+    target_docs: usize,
+    initial_fetch: usize,
+    max_vectors: usize,
+    search: F,
+) -> Result<Vec<RawVectorCandidate>>
+where
+    F: FnOnce(usize) -> Vec<RawVectorCandidate>,
+{
+    let max_fetch = max_vectors.min(MAX_DENSE_CANDIDATES_PER_SEGMENT);
+    if target_docs == 0 || max_fetch == 0 {
+        return Ok(Vec::new());
+    }
+    let target_docs = target_docs.min(max_fetch);
+
+    let mut results = search(max_fetch);
+    results.truncate(max_fetch);
+
+    // Ranked-list length at which `target_docs` distinct documents are first
+    // covered (None if the whole list falls short).
+    let mut docs = rustc_hash::FxHashSet::with_capacity_and_hasher(target_docs, Default::default());
+    let mut satisfied_len = None;
+    for (i, &(doc_id, _, _)) in results.iter().enumerate() {
+        docs.insert(doc_id);
+        if docs.len() >= target_docs {
+            satisfied_len = Some(i + 1);
+            break;
+        }
+    }
+
+    let mut fetch = initial_fetch.max(target_docs).min(max_fetch);
+    loop {
+        let round_len = fetch.min(results.len());
+        if satisfied_len.is_some_and(|len| len <= round_len) {
+            results.truncate(round_len);
+            return Ok(results);
+        }
+        if results.len() < fetch || fetch == max_vectors {
+            return Ok(results);
+        }
+        if fetch == max_fetch {
+            return Err(Error::Query(format!(
+                "ANN search reached the per-segment candidate limit of \
+                 {MAX_DENSE_CANDIDATES_PER_SEGMENT} with only {} of {target_docs} requested \
+                 documents; reduce k or the number of vector values per document",
+                docs.len()
+            )));
+        }
+        let next_fetch = fetch.saturating_mul(2).min(max_fetch);
+        if next_fetch == fetch {
+            return Ok(results);
+        }
+        fetch = next_fetch;
+    }
+}
+
 #[inline]
 fn bounded_vector_score_batch(vector_byte_size: usize, preferred: usize) -> usize {
     preferred.min((MAX_VECTOR_SCORE_BATCH_BYTES / vector_byte_size.max(1)).max(1))
@@ -433,6 +500,39 @@ fn expand_ann_candidate_documents(
     Ok((expanded, resolved))
 }
 
+/// Reuse the probe's scores for (doc, ordinal) pairs it already returned.
+///
+/// Binary IVF clusters store the same packed codes as flat storage and score
+/// them with the same exact SIMD Hamming kernel, so re-reading those vectors
+/// from flat storage recomputes an identical score at the cost of one random
+/// read (and potential page fault on cold mmap) per candidate. Only the
+/// candidate documents' remaining ordinals still need flat reads. The
+/// per-query map is justified by removing one flat read per reused entry.
+fn fill_probe_scores_and_prune_resolved(
+    ann_results: &[RawVectorCandidate],
+    expanded: &mut [RawVectorCandidate],
+    resolved: Vec<ResolvedVectorCandidate>,
+) -> Vec<ResolvedVectorCandidate> {
+    let mut probe_scores: FxHashMap<(DocId, u16), f32> =
+        FxHashMap::with_capacity_and_hasher(ann_results.len(), Default::default());
+    for &(doc_id, ordinal, score) in ann_results {
+        probe_scores.insert((doc_id, ordinal), score);
+    }
+    resolved
+        .into_iter()
+        .filter(|&(result_index, _)| {
+            let (doc_id, ordinal, _) = expanded[result_index];
+            match probe_scores.get(&(doc_id, ordinal)) {
+                Some(&score) => {
+                    expanded[result_index].2 = score;
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
+
 async fn exact_score_binary_candidate_documents(
     ann_results: &[RawVectorCandidate],
     flat: &LazyFlatVectorData,
@@ -440,6 +540,7 @@ async fn exact_score_binary_candidate_documents(
     dim_bits: usize,
 ) -> Result<Vec<RawVectorCandidate>> {
     let (mut expanded, resolved) = expand_ann_candidate_documents(ann_results, flat)?;
+    let resolved = fill_probe_scores_and_prune_resolved(ann_results, &mut expanded, resolved);
     let vector_byte_size = flat.vector_byte_size();
     let batch_len = bounded_vector_score_batch(vector_byte_size, BINARY_SCORE_BATCH);
     let raw_capacity = batch_len
@@ -486,6 +587,7 @@ fn exact_score_binary_candidate_documents_sync(
     dim_bits: usize,
 ) -> Result<Vec<RawVectorCandidate>> {
     let (mut expanded, resolved) = expand_ann_candidate_documents(ann_results, flat)?;
+    let resolved = fill_probe_scores_and_prune_resolved(ann_results, &mut expanded, resolved);
     let vector_byte_size = flat.vector_byte_size();
     let batch_len = bounded_vector_score_batch(vector_byte_size, BINARY_SCORE_BATCH);
     let raw_capacity = batch_len
@@ -1801,7 +1903,10 @@ impl SegmentReader {
             let nprobe = self.binary_ivf_nprobe(field);
             let initial_fetch =
                 ann_ordinal_fetch_k(k, flat.num_vectors, flat.num_docs_with_vectors());
-            let ann_results = progressive_ann_search(
+            // Single scan: BinaryIvfIndex::search scans all probed clusters
+            // regardless of candidate_k, so progressive doubling would repeat
+            // the identical scan on every retry.
+            let ann_results = single_scan_ann_search(
                 k.min(flat.num_docs_with_vectors()),
                 initial_fetch,
                 ivf.len().min(flat.num_vectors),
@@ -2432,7 +2537,10 @@ impl SegmentReader {
             let nprobe = self.binary_ivf_nprobe(field);
             let initial_fetch =
                 ann_ordinal_fetch_k(k, flat.num_vectors, flat.num_docs_with_vectors());
-            let ann_results = progressive_ann_search(
+            // Single scan: BinaryIvfIndex::search scans all probed clusters
+            // regardless of candidate_k, so progressive doubling would repeat
+            // the identical scan on every retry.
+            let ann_results = single_scan_ann_search(
                 k.min(flat.num_docs_with_vectors()),
                 initial_fetch,
                 ivf.len().min(flat.num_vectors),
@@ -2633,5 +2741,74 @@ mod dense_search_safety_tests {
         assert_eq!(checked_file_range(4, 3, 7, "test").unwrap(), 4..7);
         assert!(checked_file_range(u64::MAX, 1, u64::MAX, "test").is_err());
         assert!(checked_file_range(5, 3, 7, "test").is_err());
+    }
+
+    /// The single-scan replay must return exactly what the doubling retry
+    /// loop returns for any (target, initial fetch, population) combination
+    /// when `search(f)` yields the top-`f` prefix of one fixed ranking —
+    /// while invoking the search closure exactly once.
+    #[test]
+    fn single_scan_ann_search_matches_progressive_with_one_search_call() {
+        // Skewed ranking: doc 1 owns the best six vectors, then a sparse tail.
+        let ranked: Vec<RawVectorCandidate> = vec![
+            (1, 0, 1.0),
+            (1, 1, 0.99),
+            (1, 2, 0.98),
+            (1, 3, 0.97),
+            (1, 4, 0.96),
+            (1, 5, 0.95),
+            (2, 0, 0.9),
+            (3, 0, 0.8),
+            (2, 1, 0.7),
+            (4, 0, 0.6),
+            (5, 0, 0.5),
+        ];
+
+        for target_docs in 0..=6 {
+            for initial_fetch in [0, 1, 2, 3, 8, 16, 64] {
+                for max_vectors in [0, 1, 2, 8, ranked.len(), 100] {
+                    let progressive =
+                        progressive_ann_search(target_docs, initial_fetch, max_vectors, |fetch| {
+                            ranked.iter().copied().take(fetch).collect()
+                        });
+                    let mut calls = 0;
+                    let single =
+                        single_scan_ann_search(target_docs, initial_fetch, max_vectors, |fetch| {
+                            calls += 1;
+                            ranked.iter().copied().take(fetch).collect()
+                        });
+                    let case =
+                        format!("target={target_docs} initial={initial_fetch} max={max_vectors}");
+                    match (progressive, single) {
+                        (Ok(a), Ok(b)) => assert_eq!(a, b, "{case}"),
+                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{case}"),
+                        (a, b) => panic!("verdict mismatch for {case}: {a:?} vs {b:?}"),
+                    }
+                    assert!(calls <= 1, "{case}: search must run at most once");
+                }
+            }
+        }
+    }
+
+    /// Probe-returned (doc, ordinal) pairs keep their probe scores and are
+    /// pruned from the flat-read list; only the candidate documents'
+    /// remaining ordinals still need reads.
+    #[test]
+    fn probe_scored_candidates_skip_flat_rereads() {
+        let ann_results: Vec<RawVectorCandidate> = vec![(7, 0, 0.75), (9, 2, 0.5)];
+        // Expansion of docs 7 and 9 to all their ordinals (scores unfilled).
+        let mut expanded: Vec<RawVectorCandidate> =
+            vec![(7, 0, 0.0), (7, 1, 0.0), (9, 0, 0.0), (9, 2, 0.0)];
+        let resolved: Vec<ResolvedVectorCandidate> = vec![(0, 10), (1, 11), (2, 20), (3, 22)];
+
+        let remaining = fill_probe_scores_and_prune_resolved(&ann_results, &mut expanded, resolved);
+
+        // Probe-scored pairs (7,0) and (9,2) are filled and pruned.
+        assert_eq!(expanded[0].2, 0.75);
+        assert_eq!(expanded[3].2, 0.5);
+        // Unseen ordinals (7,1) and (9,0) still need flat reads.
+        assert_eq!(remaining, vec![(1, 11), (2, 20)]);
+        assert_eq!(expanded[1].2, 0.0);
+        assert_eq!(expanded[2].2, 0.0);
     }
 }
