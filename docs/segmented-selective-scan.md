@@ -221,3 +221,23 @@ ceiling: B27 now fits and is the new optimum at **51,769 tok/s** (B28
 OOMs) — past the eager-PyTorch + fused-mamba-ssm reference (~51,400 at
 its own best batch, same box and configuration). Session total for the
 scan pool: 45,077 → 51,769 (+14.9%).
+
+## Gate fusion into the scan (measured, rejected)
+
+Folding the `y ⊙ silu(z)` output gate into the scan kernels was implemented
+end-to-end (gated forward flush; backward staging transforms the incoming
+gradient by `silu(z)` and recovers `grad_z` from the rebuilt pre-gate
+output through a third per-warp slot set; `grad_z` pinned against CPU
+autodiff on all paths) and measured 51,210 → 47,488 tok/s @B26 and
+51,877 → 48,066 @B27 — a 7.3% regression despite numerically exact
+gradients and a genuine ~350MB/layer-micro traffic saving inside the scan.
+
+The cost sits outside the kernels: making `z` a custom-op input (and
+`grad_z` a custom-op output) changes the lazy-fusion graph around every
+Mamba layer. The gate factor previously lived inside fused elementwise
+segments that read the projection buffer virtually; as a custom-op operand
+it must materialize, and the surrounding segments fragment — the
+elementwise pool this was meant to shrink grew by far more than the kernel
+saved. Lesson for this fork's runtime: moving elementwise work into a
+custom op is only a win when the tensors it touches already terminate
+fusion segments; `z` did not. The scan keeps its ungated contract.
