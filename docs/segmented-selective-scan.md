@@ -214,3 +214,10 @@ recurrence the warp-scan experiment showed is load-bearing; the
 cross-state reduction for `y` uses the reverse sweep's flush machinery
 (per-warp disjoint slots, `BACKWARD_FLUSH` windows). With no retained
 chunk states the kernel runs at full occupancy.
+
+Measured (A100 40GB, retriever-100m, T1024/ga8): 50,101 → **51,261
+tok/s** @B26 (+2.3%). The deleted round-trip tensors also moved the batch
+ceiling: B27 now fits and is the new optimum at **51,769 tok/s** (B28
+OOMs) — past the eager-PyTorch + fused-mamba-ssm reference (~51,400 at
+its own best batch, same box and configuration). Session total for the
+scan pool: 45,077 → 51,769 (+14.9%).
