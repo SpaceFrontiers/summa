@@ -241,3 +241,17 @@ elementwise pool this was meant to shrink grew by far more than the kernel
 saved. Lesson for this fork's runtime: moving elementwise work into a
 custom op is only a win when the tensors it touches already terminate
 fusion segments; `z` did not. The scan keeps its ungated contract.
+
+## Single training path (cleanup pass)
+
+The interval-1 "full state" regime and its fused single-block backward
+kernel are deleted: training takes the swept checkpointed kernels at every
+batch and sequence length (a single-segment sweep degenerates cleanly),
+which removes a second backward implementation, the batch/bytes policy
+that chose between them, and the backward's FP32-normalization fallback.
+Small batches now also get the 32x smaller saved-state tensor. The
+inference paths (decode step, prefill without saved states) are untouched.
+
+State widths on GPU are constrained to powers of two in 4..=16 by the
+runtime (not the kernels) — the sweep and its verdict live in
+`docs/kernel-tuning-surface.md`.

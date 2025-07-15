@@ -19,7 +19,7 @@ use cubecl::cuda::CudaRuntime;
 use super::conv::DepthwiseConv1dBackend;
 use super::fused_attention::{AttentionBackend, chunked_attention_backward};
 use super::linear_cross_entropy::LinearCrossEntropyBackend;
-use super::scan::{MambaBackend, scan_checkpoint_interval};
+use super::scan::{CHECKPOINTED_SCAN_INTERVAL, MambaBackend};
 
 const ATTENTION_BACKWARD_CHUNK_ROWS: usize = 2048;
 
@@ -413,7 +413,7 @@ where
         let [batch, seq_len, channels] = xs.shape.dims();
         let client = xs.client.clone();
         let dtype = xs.dtype;
-        let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+        let checkpoint_interval = CHECKPOINTED_SCAN_INTERVAL;
         let y = TensorIr::uninit(
             client.create_empty_handle(),
             Shape::new([batch, seq_len, channels]),
