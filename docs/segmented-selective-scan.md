@@ -132,3 +132,43 @@ loss and gradient-norm trajectories on the established curve. Parity:
 path against the f32 CPU reference over bf16-pre-quantized inputs with
 bounded dynamics (strictly negative A), so the bound measures kernel
 arithmetic rather than the quantization of a growing state.
+
+## Barrier-free register-resident backward (stage 28)
+
+The segmented backward kernel is restructured around the three costs the
+rejection ledger isolated (local-memory rebuilt states, a `sync_cube` per
+reverse step, every sequence input read twice):
+
+- **Staged tiles.** The block's segment slice of `delta_raw`/`xs`/`grad_y`
+  (`[segment, 16 channels]`) and `B`/`C` (`[segment, state_dim]`) loads into
+  workgroup memory once; the rebuild and the reverse sweep both read from
+  there. Softplus runs in-kernel on the staged raw delta, so the launcher no
+  longer materializes the full `[batch, seq, channels]` f32 softplus
+  activation on the training path (one 164MB-per-layer write plus two full
+  reads at production shape) — the partials kernel computes it inline too.
+  The fused small-problem fallback keeps the materialized form.
+- **Register-resident rebuild.** The rebuild and reverse loops are fully
+  unrolled against the comptime segment length (tail segments keep a uniform
+  `offset < chunk_len` guard per step), so the per-thread `chunk_states`
+  array promotes to registers instead of spilling to local memory. The
+  `h_prev` access folds the `offset == 0` case at expansion, so no trip ever
+  forms an out-of-range constant index.
+- **Two barriers per flush window instead of one per step.** A warp spans
+  two state rows of the channel tile (block layout is `16 channels ×
+state_dim`). A `plane_shuffle_down(·, 16)` folds the odd state row into
+  the even one, and each warp then owns a disjoint per-step partial slot for
+  `grad_delta`/`grad_xs` — no cross-warp coordination while sweeping. The
+  existing `half_plane_sum` channel reduction feeds per-step `grad_B`/
+  `grad_C` slots the same way. Slots cover a window of `BACKWARD_FLUSH = 8`
+  steps; a cooperative flush then writes `grad_delta`/`grad_xs` (summing the
+  per-warp rows) and fires the pre-reduced `grad_B`/`grad_C` atomics. Eight
+  barriers per 32-step segment replace 32, and the window sizing keeps the
+  whole footprint (~21KB at state_dim 16) inside Metal's 32KB threadgroup
+  budget, which the local parity suite runs under.
+
+Cross-channel pre-reduction of `grad_B`/`grad_C` (16:1 before global
+atomics) is the reason the block keeps its channel-grouped shape: a
+dim-major block-per-`(batch, channel)` layout with sequence-parallel
+threads — the mamba-ssm structure — would multiply global atomic traffic on
+`grad_B`/`grad_C` by the channel-tile width, which at 1536 channels costs
+more than the layout saves.
