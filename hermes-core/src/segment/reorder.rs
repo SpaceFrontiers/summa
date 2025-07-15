@@ -343,7 +343,10 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
         num_docs: src_meta.num_docs,
         field_stats: src_meta.field_stats.clone(),
     };
-    dir.write(&dst_files.meta, &meta.serialize()?).await?;
+    // Durable: the reordered segment replaces its fsynced source, so a
+    // non-durable .meta could be the only copy across a power failure.
+    dir.write_durable(&dst_files.meta, &meta.serialize()?)
+        .await?;
 
     Ok((output_id.to_hex(), num_docs, bp_converged))
 }

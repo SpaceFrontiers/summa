@@ -302,12 +302,19 @@ impl<D: Directory + 'static> Searcher<D> {
             .map(|seg| (seg.meta().id, Arc::clone(seg)))
             .collect();
 
-        // Parse segment IDs and filter invalid ones
-        let valid_segments: Vec<(usize, SegmentId)> = segment_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, id_str)| SegmentId::from_hex(id_str).map(|sid| (idx, sid)))
-            .collect();
+        // Parse segment IDs from metadata. A key that fails to parse means the
+        // metadata is corrupt; fail loud instead of silently serving results
+        // without that segment's documents (the merge path errors with
+        // Corruption on the same input — search must not disagree).
+        let mut valid_segments: Vec<(usize, SegmentId)> = Vec::with_capacity(segment_ids.len());
+        for (idx, id_str) in segment_ids.iter().enumerate() {
+            let sid = SegmentId::from_hex(id_str).ok_or_else(|| {
+                crate::error::Error::Corruption(format!(
+                    "Invalid segment ID in metadata: {id_str:?}"
+                ))
+            })?;
+            valid_segments.push((idx, sid));
+        }
 
         // Separate into reusable and new segments
         let mut reused: Vec<(usize, Arc<SegmentReader>)> = Vec::new();
@@ -1102,6 +1109,31 @@ fn process_rss_mb() -> f64 {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod load_segments_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn searcher_open_fails_loud_on_corrupt_metadata_segment_id() {
+        let directory = Arc::new(crate::directories::RamDirectory::new());
+        let schema = Arc::new(crate::dsl::SchemaBuilder::default().build());
+
+        let result =
+            Searcher::open(directory, schema, &["not-a-hex-segment-id".to_string()], 8).await;
+
+        match result {
+            Ok(searcher) => panic!(
+                "corrupt segment ID must fail loud instead of silently serving {} segments",
+                searcher.segment_readers().len()
+            ),
+            Err(crate::error::Error::Corruption(message)) => {
+                assert!(message.contains("not-a-hex-segment-id"), "{message}");
+            }
+            Err(other) => panic!("expected Corruption error for invalid segment ID, got: {other}"),
+        }
     }
 }
 

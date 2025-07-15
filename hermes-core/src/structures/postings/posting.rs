@@ -564,10 +564,14 @@ impl BlockPostingList {
     /// Block data flows source → output writer without intermediate buffering.
     ///
     /// Returns `(doc_count, bytes_written)`.
+    ///
+    /// Returns `Error::Corruption` if any source is shorter than its footer:
+    /// metas are paired with sources positionally, so a short/corrupt source
+    /// must fail loudly instead of misassigning every subsequent source.
     pub fn concatenate_streaming<W: Write>(
         sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
         writer: &mut W,
-    ) -> io::Result<(u32, usize)> {
+    ) -> crate::Result<(u32, usize)> {
         struct SourceMeta {
             stream_len: usize,
             l0_count: usize,
@@ -577,9 +581,14 @@ impl BlockPostingList {
         let mut total_docs = 0u32;
         let mut merged_max_tf = 0u32;
 
-        for (raw, _) in sources {
+        for (source_index, (raw, _)) in sources.iter().enumerate() {
             if raw.len() < FOOTER_SIZE {
-                continue;
+                return Err(crate::Error::Corruption(format!(
+                    "posting list source {} is shorter than its footer: {} bytes < {}",
+                    source_index,
+                    raw.len(),
+                    FOOTER_SIZE,
+                )));
             }
             let f = raw.len() - FOOTER_SIZE;
             let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
@@ -622,7 +631,8 @@ impl BlockPostingList {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "posting list stream exceeds u32::MAX bytes during streaming merge",
-                    ));
+                    )
+                    .into());
                 }
                 write_l0(
                     &mut out_l0,
@@ -1209,6 +1219,28 @@ mod tests {
         for (i, (r, s)) in ref_postings.iter().zip(stream_postings.iter()).enumerate() {
             assert_eq!(r, s, "mismatch at posting {}", i);
         }
+    }
+
+    #[test]
+    fn test_concatenate_streaming_short_source_returns_corruption() {
+        // A source shorter than the 24-byte footer (e.g. a corrupt TermInfo
+        // (offset, len) pointing at truncated bytes) must fail loudly.
+        // Silently skipping it pairs every later source with the wrong
+        // metadata (metas[i] vs sources[i]) — panicking or emitting garbage.
+        let seg_a: Vec<(u32, u32)> = (0..250).map(|i| (i * 2, (i % 7) + 1)).collect();
+        let seg_c: Vec<(u32, u32)> = (0..90).map(|i| (i * 10, (i % 11) + 1)).collect();
+        let bytes_a = serialize_bpl(&build_bpl(&seg_a));
+        let bytes_c = serialize_bpl(&build_bpl(&seg_c));
+        let short = vec![0u8; FOOTER_SIZE - 1]; // corrupt: shorter than footer
+
+        let sources: Vec<(&[u8], u32)> = vec![(&bytes_a, 0), (&short, 1000), (&bytes_c, 2000)];
+        let mut out = Vec::new();
+        let result = BlockPostingList::concatenate_streaming(&sources, &mut out);
+        assert!(
+            matches!(result, Err(crate::Error::Corruption(_))),
+            "short/corrupt source must be a Corruption error, not silently skipped: {:?}",
+            result.map(|r| r.0)
+        );
     }
 
     #[test]

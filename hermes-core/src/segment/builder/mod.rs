@@ -121,6 +121,49 @@ const INTERN_OVERHEAD: usize = size_of::<Spur>() + 2 * size_of::<usize>();
 const NEW_POS_TERM_OVERHEAD: usize =
     size_of::<TermKey>() + size_of::<PositionPostingListBuilder>() + 24;
 
+/// Packed position encoding is `(element_ordinal << 20) | token_position`:
+/// 12 bits of element ordinal, 20 bits of token position. Values beyond these
+/// maxima must saturate — a plain shift/or silently corrupts the neighboring
+/// bit field (ordinal 4096 wraps to 0 and aliases element 0; token positions
+/// >= 2^20 bleed into the ordinal bits).
+const MAX_POSITION_ELEMENT_ORDINAL: u32 = (1 << 12) - 1;
+const MAX_TOKEN_POSITION: u32 = (1 << 20) - 1;
+
+/// Default BMP vocabulary size when `dims` is unset in the sparse vector
+/// config (SPLADE unigram vocabulary). Must match the build-time defaults in
+/// `builder/sparse.rs` and `merger/sparse.rs`.
+const DEFAULT_BMP_SPARSE_DIMS: u32 = 105879;
+
+/// Human-readable name of a schema field type (matches the SDL/serde names).
+fn field_type_name(field_type: &FieldType) -> &'static str {
+    match field_type {
+        FieldType::Text => "text",
+        FieldType::U64 => "u64",
+        FieldType::I64 => "i64",
+        FieldType::F64 => "f64",
+        FieldType::Bytes => "bytes",
+        FieldType::SparseVector => "sparse_vector",
+        FieldType::DenseVector => "dense_vector",
+        FieldType::Json => "json",
+        FieldType::BinaryDenseVector => "binary_dense_vector",
+    }
+}
+
+/// Human-readable name of a document field value's type (matches SDL names).
+fn field_value_type_name(value: &FieldValue) -> &'static str {
+    match value {
+        FieldValue::Text(_) => "text",
+        FieldValue::U64(_) => "u64",
+        FieldValue::I64(_) => "i64",
+        FieldValue::F64(_) => "f64",
+        FieldValue::Bytes(_) => "bytes",
+        FieldValue::SparseVector(_) => "sparse_vector",
+        FieldValue::DenseVector(_) => "dense_vector",
+        FieldValue::Json(_) => "json",
+        FieldValue::BinaryDenseVector(_) => "binary_dense_vector",
+    }
+}
+
 /// Segment builder with optimized memory usage
 ///
 /// Features:
@@ -204,6 +247,10 @@ pub struct SegmentBuilder {
 
     /// Current element ordinal for multi-valued fields (reset per document)
     current_element_ordinal: FxHashMap<u32, u32>,
+
+    /// Whether the once-per-segment position-encoding saturation warning
+    /// has already been emitted (see MAX_POSITION_ELEMENT_ORDINAL).
+    position_saturation_warned: bool,
 
     /// Incrementally tracked memory estimate (avoids expensive stats() calls)
     estimated_memory: usize,
@@ -326,6 +373,7 @@ impl SegmentBuilder {
             position_index: HashMap::new(),
             position_enabled_fields,
             current_element_ordinal: FxHashMap::default(),
+            position_saturation_warned: false,
             estimated_memory: 0,
             doc_serialize_buffer: Vec::with_capacity(256),
             fast_fields,
@@ -496,8 +544,88 @@ impl SegmentBuilder {
         }
     }
 
+    /// Fail-loud pre-validation of a document's field values against the
+    /// schema. Runs BEFORE any builder state is mutated, so a rejected
+    /// document never poisons the builder (doc id advanced, postings written,
+    /// store write skipped).
+    ///
+    /// - A value whose runtime type does not match the schema field type
+    ///   would previously fall through `add_document`'s match silently: the
+    ///   value was stored but never indexed, so queries on the field could
+    ///   never match the document. Reject it loudly instead.
+    /// - Sparse entries destined for a BMP-format field must fit the
+    ///   configured `dims`: the block-max grid only has rows for
+    ///   `dim_id < dims`, so out-of-range entries would be silently dropped
+    ///   from the grid and silently filtered from queries — permanently
+    ///   unsearchable.
+    fn validate_document_against_schema(&self, doc: &Document) -> Result<()> {
+        for (field, value) in doc.field_values() {
+            let Some(entry) = self.schema.get_field_entry(*field) else {
+                continue;
+            };
+
+            // Mirror the indexing skip below: values that are neither indexed
+            // nor fast (and are not vector types) are only stored verbatim.
+            if !matches!(
+                &entry.field_type,
+                FieldType::DenseVector | FieldType::BinaryDenseVector
+            ) && !entry.indexed
+                && !entry.fast
+            {
+                continue;
+            }
+
+            match (&entry.field_type, value) {
+                (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
+                    if let Some(config) = entry.sparse_vector_config.as_ref()
+                        && config.format == crate::structures::SparseFormat::Bmp
+                    {
+                        let dims = config.dims.unwrap_or(DEFAULT_BMP_SPARSE_DIMS);
+                        if let Some(&(dim_id, _)) =
+                            entries.iter().find(|&&(dim_id, _)| dim_id >= dims)
+                        {
+                            return Err(crate::Error::Schema(format!(
+                                "sparse vector for field '{}' contains dim_id {} out of \
+                                 range for the configured BMP dims={}: dimensions >= dims \
+                                 are never written to the block-max grid and can never \
+                                 match a query; raise `dims` in the field's sparse_vector \
+                                 config or fix the embedding model",
+                                entry.name, dim_id, dims
+                            )));
+                        }
+                    }
+                }
+                // Matching (type, value) pairs — indexed by `add_document`.
+                (FieldType::Text, FieldValue::Text(_))
+                | (FieldType::U64, FieldValue::U64(_))
+                | (FieldType::I64, FieldValue::I64(_))
+                | (FieldType::F64, FieldValue::F64(_))
+                | (FieldType::DenseVector, FieldValue::DenseVector(_))
+                | (FieldType::BinaryDenseVector, FieldValue::BinaryDenseVector(_))
+                // Stored-only types: no indexing support, value stored verbatim.
+                | (FieldType::Bytes, FieldValue::Bytes(_))
+                | (FieldType::Json, FieldValue::Json(_)) => {}
+                (expected, got) => {
+                    return Err(crate::Error::Schema(format!(
+                        "type mismatch for field '{}': schema expects a {} value, got {}; \
+                         the value would be stored but never indexed, so queries on this \
+                         field could never match the document — fix the document or the \
+                         schema",
+                        entry.name,
+                        field_type_name(expected),
+                        field_value_type_name(got),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Add a document - streams to disk immediately
     pub fn add_document(&mut self, doc: Document) -> Result<DocId> {
+        // Reject schema-mismatched values before mutating any builder state.
+        self.validate_document_against_schema(&doc)?;
+
         let doc_id = self.next_doc_id;
         self.next_doc_id += 1;
 
@@ -589,6 +717,10 @@ impl SegmentBuilder {
                     let ordinal = self.next_vector_ordinal(field.0)?;
                     self.index_sparse_vector_field(*field, doc_id, ordinal, entries)?;
                 }
+                // Only reachable for stored-only types (bytes/json) and for
+                // vector values on fields that are neither indexed nor
+                // stored: type-mismatched values are rejected loudly by
+                // `validate_document_against_schema` before this loop.
                 _ => {}
             }
         }
@@ -623,6 +755,21 @@ impl SegmentBuilder {
             .copied()
             .flatten();
 
+        // Saturate the packed 12-bit ordinal field instead of letting the
+        // shift silently wrap (ordinal 4096 << 20 == 0, aliasing element 0).
+        let encoded_ordinal = if position_mode.is_some_and(|m| m.tracks_ordinal())
+            && element_ordinal > MAX_POSITION_ELEMENT_ORDINAL
+        {
+            self.warn_position_saturation(
+                "element ordinal",
+                element_ordinal,
+                MAX_POSITION_ELEMENT_ORDINAL,
+            );
+            MAX_POSITION_ELEMENT_ORDINAL
+        } else {
+            element_ordinal
+        };
+
         // Phase 1: Aggregate term frequencies within this document
         // Also collect positions if enabled
         // Reuse buffers to avoid allocations
@@ -653,9 +800,11 @@ impl SegmentBuilder {
 
                 if let Some(mode) = position_mode {
                     let encoded_pos = match mode {
-                        PositionMode::Ordinal => element_ordinal << 20,
+                        PositionMode::Ordinal => encoded_ordinal << 20,
                         PositionMode::TokenPosition => token.position,
-                        PositionMode::Full => (element_ordinal << 20) | token.position,
+                        PositionMode::Full => {
+                            (encoded_ordinal << 20) | self.saturate_token_position(token.position)
+                        }
                     };
                     self.local_positions
                         .entry(term_spur)
@@ -691,9 +840,11 @@ impl SegmentBuilder {
 
                 if let Some(mode) = position_mode {
                     let encoded_pos = match mode {
-                        PositionMode::Ordinal => element_ordinal << 20,
+                        PositionMode::Ordinal => encoded_ordinal << 20,
                         PositionMode::TokenPosition => token_position,
-                        PositionMode::Full => (element_ordinal << 20) | token_position,
+                        PositionMode::Full => {
+                            (encoded_ordinal << 20) | self.saturate_token_position(token_position)
+                        }
                     };
                     self.local_positions
                         .entry(term_spur)
@@ -788,6 +939,32 @@ impl SegmentBuilder {
         }
 
         Ok(token_position)
+    }
+
+    /// Saturate a token position at the 20-bit packed-encoding maximum so it
+    /// cannot bleed into the element-ordinal bits.
+    #[inline]
+    fn saturate_token_position(&mut self, token_position: u32) -> u32 {
+        if token_position > MAX_TOKEN_POSITION {
+            self.warn_position_saturation("token position", token_position, MAX_TOKEN_POSITION);
+            MAX_TOKEN_POSITION
+        } else {
+            token_position
+        }
+    }
+
+    /// Warn once per segment when the packed position encoding saturates.
+    #[cold]
+    fn warn_position_saturation(&mut self, what: &str, value: u32, max: u32) {
+        if !self.position_saturation_warned {
+            self.position_saturation_warned = true;
+            log::warn!(
+                "[segment_builder] {what} {value} exceeds the position-encoding limit {max}; \
+                 saturating — phrase/ordinal matching degrades for the overflowing \
+                 elements/tokens instead of corrupting other documents' matches \
+                 (further occurrences in this segment are not logged)"
+            );
+        }
     }
 
     fn index_numeric_field(&mut self, field: Field, doc_id: DocId, value: u64) -> Result<()> {
@@ -1019,6 +1196,10 @@ impl SegmentBuilder {
             self.store_buffer
                 .write_u32::<LittleEndian>(self.doc_serialize_buffer.len() as u32)?;
             self.store_buffer.write_all(&self.doc_serialize_buffer)?;
+            // The in-memory store buffer is often the largest allocation on
+            // the wasm branch (native streams docs to a temp file instead).
+            // Count it so the memory-budget flush check can see it.
+            self.estimated_memory += size_of::<u32>() + self.doc_serialize_buffer.len();
         }
 
         Ok(())
@@ -1260,7 +1441,11 @@ impl SegmentBuilder {
             field_stats: self.field_stats.clone(),
         };
 
-        dir.write(&files.meta, &meta.serialize()?).await?;
+        // Durable: committed metadata.json will reference this segment, so a
+        // torn/unsynced .meta after power loss would make the commit
+        // unreadable (every other segment file is fsynced by its streaming
+        // writer's finish()).
+        dir.write_durable(&files.meta, &meta.serialize()?).await?;
 
         // Cleanup temp files
         #[cfg(feature = "native")]
@@ -1315,5 +1500,277 @@ impl Drop for SegmentBuilder {
         if self.posting_spill_file.is_some() {
             let _ = std::fs::remove_file(&self.posting_spill_path);
         }
+    }
+}
+
+#[cfg(test)]
+impl SegmentBuilder {
+    /// Test helper: all encoded positions recorded for `(field, term)`.
+    fn positions_for_term(&self, field: Field, term: &str) -> Vec<u32> {
+        let Some(spur) = self.term_interner.get(term) else {
+            return Vec::new();
+        };
+        let key = TermKey {
+            field: field.0,
+            term: spur,
+        };
+        self.position_index
+            .get(&key)
+            .map(|b| {
+                b.postings
+                    .iter()
+                    .flat_map(|(_, ps)| ps.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::SchemaBuilder;
+
+    fn builder_for(schema: Schema) -> SegmentBuilder {
+        SegmentBuilder::new(Arc::new(schema), SegmentBuilderConfig::default()).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // Finding: field values whose runtime type does not match the schema
+    // field type fell into `_ => {}` and were silently not indexed while
+    // still being stored — queries could never match the document.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_add_document_rejects_type_mismatched_field_value() {
+        let mut sb = SchemaBuilder::default();
+        let views = sb.add_u64_field("views", true, true);
+        let mut builder = builder_for(sb.build());
+
+        let mut doc = Document::new();
+        doc.add_text(views, "123");
+        let err = builder
+            .add_document(doc)
+            .expect_err("schema-mismatched value must be rejected loudly, not silently unindexed");
+        let msg = err.to_string();
+        assert!(msg.contains("views"), "error must name the field: {msg}");
+        assert!(
+            msg.contains("u64"),
+            "error must name the expected type: {msg}"
+        );
+        assert!(msg.contains("text"), "error must name the got type: {msg}");
+
+        // The rejected document must not have consumed a doc id (no poisoning).
+        assert_eq!(builder.num_docs(), 0);
+
+        // A well-typed document still indexes fine afterwards.
+        let mut doc = Document::new();
+        doc.add_u64(views, 123);
+        builder.add_document(doc).unwrap();
+        assert_eq!(builder.num_docs(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Finding: sparse entries with dim_id >= the configured BMP `dims`
+    // were accepted at index time but silently dropped from the BMP grid
+    // and silently filtered from queries — permanently unsearchable.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_add_document_rejects_bmp_sparse_dim_out_of_range() {
+        use crate::structures::{SparseFormat, SparseVectorConfig};
+
+        let mut sb = SchemaBuilder::default();
+        let config = SparseVectorConfig {
+            format: SparseFormat::Bmp,
+            dims: Some(100),
+            ..Default::default()
+        };
+        let spv = sb.add_sparse_vector_field_with_config("spv", true, false, config);
+        let mut builder = builder_for(sb.build());
+
+        // In-range dims are accepted.
+        let mut doc = Document::new();
+        doc.add_sparse_vector(spv, vec![(50, 1.0)]);
+        builder.add_document(doc).unwrap();
+
+        // dim_id >= dims must be rejected with an actionable error.
+        let mut doc = Document::new();
+        doc.add_sparse_vector(spv, vec![(50, 1.0), (150, 2.0)]);
+        let err = builder
+            .add_document(doc)
+            .expect_err("out-of-range BMP dim must be rejected, not silently unsearchable");
+        let msg = err.to_string();
+        assert!(msg.contains("spv"), "error must name the field: {msg}");
+        assert!(msg.contains("150"), "error must name the dim_id: {msg}");
+        assert!(
+            msg.contains("100"),
+            "error must name the configured dims: {msg}"
+        );
+        assert_eq!(
+            builder.num_docs(),
+            1,
+            "rejected doc must not consume a doc id"
+        );
+    }
+
+    #[test]
+    fn test_add_document_maxscore_sparse_dims_unbounded() {
+        // MaxScore-format sparse fields have no dims bound — large dim ids
+        // stay legal (the per-dim TOC addresses any u32 dimension).
+        let mut sb = SchemaBuilder::default();
+        let spv = sb.add_sparse_vector_field("spv", true, false);
+        let mut builder = builder_for(sb.build());
+
+        let mut doc = Document::new();
+        doc.add_sparse_vector(spv, vec![(3_000_000, 1.0)]);
+        builder.add_document(doc).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Finding: `(element_ordinal << 20) | token_position` silently
+    // corrupted when element_ordinal >= 4096 (shifted out of the u32,
+    // aliasing element 0) or token_position >= 2^20 (bleeding into the
+    // ordinal bits). Both must saturate at their field maxima.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_position_element_ordinal_overflow_saturates_instead_of_wrapping() {
+        use crate::dsl::PositionMode;
+
+        let mut sb = SchemaBuilder::default();
+        let body = sb.add_text_field("body", true, false);
+        sb.set_positions(body, PositionMode::Full);
+        let mut builder = builder_for(sb.build());
+
+        // 4097 values: element ordinal 4096 does not fit the 12-bit ordinal
+        // field ((4096u32 << 20) wraps to 0, colliding with element 0).
+        let mut doc = Document::new();
+        doc.add_text(body, "anchor");
+        for _ in 0..4095 {
+            doc.add_text(body, "filler");
+        }
+        doc.add_text(body, "needle");
+        builder.add_document(doc).unwrap();
+
+        let positions = builder.positions_for_term(body, "needle");
+        assert_eq!(positions.len(), 1);
+        let encoded = positions[0];
+        assert_ne!(
+            encoded >> 20,
+            0,
+            "element ordinal 4096 must not alias element 0"
+        );
+        assert_eq!(
+            encoded >> 20,
+            4095,
+            "overflowing element ordinal must saturate at 4095"
+        );
+    }
+
+    #[test]
+    fn test_position_token_position_overflow_saturates_instead_of_bleeding() {
+        use crate::dsl::PositionMode;
+
+        let mut sb = SchemaBuilder::default();
+        let body = sb.add_text_field("body", true, false);
+        sb.set_positions(body, PositionMode::Full);
+        let mut builder = builder_for(sb.build());
+
+        // One value with 2^20 + 1 tokens: the last token's position does not
+        // fit the 20-bit position field and would bleed into ordinal bit 0.
+        let mut text = "w ".repeat(1 << 20);
+        text.push_str("needle");
+        let mut doc = Document::new();
+        doc.add_text(body, text);
+        builder.add_document(doc).unwrap();
+
+        let positions = builder.positions_for_term(body, "needle");
+        assert_eq!(positions.len(), 1);
+        let encoded = positions[0];
+        assert_eq!(
+            encoded >> 20,
+            0,
+            "token position overflow must not decode as a different element ordinal"
+        );
+        assert_eq!(
+            encoded & 0xFFFFF,
+            0xFFFFF,
+            "overflowing token position must saturate at 2^20 - 1"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Finding: a posting-list spill firing between two values of the same
+    // document split that document's postings across the spilled range and
+    // the in-memory tail; the build-time merge concatenated them without
+    // deduplication (inflated doc_freq, doc visited twice, split tf).
+    // ------------------------------------------------------------------
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn test_spill_mid_document_does_not_duplicate_postings() {
+        use crate::directories::RamDirectory;
+        use crate::structures::TERMINATED;
+
+        let mut sb = SchemaBuilder::default();
+        let body = sb.add_text_field("body", true, false);
+        let schema = Arc::new(sb.build());
+        let mut builder =
+            SegmentBuilder::new(Arc::clone(&schema), SegmentBuilderConfig::default()).unwrap();
+
+        // Docs 0..16382 each contribute one posting for "hot", leaving the
+        // in-memory posting list one entry short of SPILL_THRESHOLD (16384).
+        for _ in 0..16383 {
+            let mut doc = Document::new();
+            doc.add_text(body, "hot");
+            builder.add_document(doc).unwrap();
+        }
+
+        // Doc 16383 has TWO values containing "hot": indexing the first value
+        // reaches the spill threshold and spills the list INCLUDING this doc's
+        // entry; the second value then re-adds the same doc to the now-empty
+        // in-memory tail.
+        let mut doc = Document::new();
+        doc.add_text(body, "hot");
+        doc.add_text(body, "hot");
+        let boundary_doc = builder.add_document(doc).unwrap();
+        assert_eq!(boundary_doc, 16383);
+
+        let dir = RamDirectory::new();
+        let segment_id = crate::segment::SegmentId::new();
+        builder.build(&dir, segment_id, None).await.unwrap();
+
+        let reader = crate::segment::SegmentReader::open(&dir, segment_id, schema, 16)
+            .await
+            .unwrap();
+        let postings = reader
+            .get_postings(body, b"hot")
+            .await
+            .unwrap()
+            .expect("postings for 'hot'");
+        assert_eq!(
+            postings.doc_count(),
+            16384,
+            "each document must appear exactly once per term (spill-boundary duplicate)"
+        );
+
+        // Doc ids must be strictly increasing and the boundary document's
+        // split term frequency must be merged into a single posting.
+        let mut it = postings.iterator();
+        let mut prev: Option<DocId> = None;
+        let mut boundary_tf = 0u32;
+        let mut d = it.doc();
+        while d != TERMINATED {
+            if let Some(p) = prev {
+                assert!(p < d, "duplicate/unordered doc id {d} after {p}");
+            }
+            if d == boundary_doc {
+                boundary_tf = it.term_freq();
+            }
+            prev = Some(d);
+            d = it.advance();
+        }
+        assert_eq!(prev, Some(boundary_doc));
+        assert_eq!(
+            boundary_tf, 2,
+            "boundary doc's term frequency must combine both values"
+        );
     }
 }

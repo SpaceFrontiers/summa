@@ -202,6 +202,22 @@ pub(super) fn build_postings_streaming(
             for (term_key, mut spilled) in per_term {
                 if let Some(builder) = index.get_mut(&term_key) {
                     spilled.append(&mut builder.postings);
+                    // A spill can fire mid-document (between two values of a
+                    // multi-valued field), splitting one document's postings
+                    // for this term across the spilled range and the in-memory
+                    // tail — or, with repeated spills, across two spilled
+                    // ranges. Doc ids are non-decreasing across the
+                    // concatenation, so merge adjacent same-doc entries to
+                    // keep one posting per (term, doc) with the combined
+                    // term frequency.
+                    spilled.dedup_by(|later, earlier| {
+                        if earlier.doc_id == later.doc_id {
+                            earlier.term_freq = earlier.term_freq.saturating_add(later.term_freq);
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     builder.postings = spilled;
                     builder.spilled_count = 0;
                 }

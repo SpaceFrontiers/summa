@@ -18,7 +18,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::directories::DirectoryWriter;
-use crate::dsl::{Document, Field, FieldType, Schema};
+use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::error::Result;
 use crate::index::IndexMetadata;
 use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
@@ -63,6 +63,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
+        Self::reject_primary_key_schema(&schema)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
         let metadata = IndexMetadata::new((*schema).clone());
@@ -90,6 +91,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ) -> Result<Self> {
         let directory = Arc::new(directory);
         let metadata = IndexMetadata::load(directory.as_ref()).await?;
+        Self::reject_primary_key_schema(&metadata.schema)?;
         let schema = Arc::new(metadata.schema.clone());
 
         Ok(Self::new_with_parts(
@@ -155,6 +157,25 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.tokenizers.insert(field, Box::new(tokenizer));
     }
 
+    /// Primary-key deduplication is native-only (`index/primary_key.rs` does
+    /// not exist on the wasm branch), so a `[primary]` schema constraint would
+    /// be silently unenforced here: duplicate keys would be durably committed.
+    /// Fail loud at writer creation instead.
+    fn reject_primary_key_schema(schema: &Schema) -> Result<()> {
+        if let Some(field) = schema.primary_field() {
+            let name = schema
+                .get_field_entry(field)
+                .map(|e| e.name.as_str())
+                .unwrap_or("<unknown>");
+            return Err(crate::Error::Schema(format!(
+                "schema declares primary key field '{name}', but primary-key \
+                 deduplication is not supported by the WASM IndexWriter; remove \
+                 the [primary] attribute from the schema or index natively"
+            )));
+        }
+        Ok(())
+    }
+
     fn ensure_builder(&mut self) -> Result<&mut SegmentBuilder> {
         if self.builder.is_none() {
             let mut b = SegmentBuilder::new(Arc::clone(&self.schema), self.builder_config.clone())?;
@@ -166,11 +187,169 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(self.builder.as_mut().unwrap())
     }
 
+    /// Pre-validate a document against the schema before it reaches the
+    /// `SegmentBuilder`.
+    ///
+    /// `SegmentBuilder::add_document` is not transactional: it advances its
+    /// internal doc id and writes postings before the fallible per-field work
+    /// and only writes the document store afterwards, so an error part-way
+    /// through leaves the store one document short of the doc count. Every
+    /// later `build()` of that builder then fails with a "Store doc count
+    /// mismatch", losing the whole buffered batch. The builder cannot be
+    /// rolled back from here, so invalid documents are rejected BEFORE any
+    /// builder state is mutated. These checks mirror the fallible validations
+    /// reachable in `SegmentBuilder::add_document` on the wasm build (the
+    /// native-only spill paths do not exist here); all of them are pure
+    /// functions of (document, schema).
+    fn validate_document(&self, doc: &Document) -> Result<()> {
+        let mut vector_values_per_field: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut stored_count: usize = 0;
+
+        for (field, value) in doc.field_values() {
+            let Some(entry) = self.schema.get_field_entry(*field) else {
+                continue;
+            };
+
+            // Mirrors `write_document_to_store` / `serialize_document_into`
+            // limits: stored field ids and the stored-field count are u16 on
+            // the wire.
+            let stored_in_store = entry.stored
+                && !matches!(
+                    value,
+                    FieldValue::DenseVector(_) | FieldValue::BinaryDenseVector(_)
+                );
+            if stored_in_store {
+                stored_count += 1;
+                if field.0 > u16::MAX as u32 {
+                    return Err(crate::Error::Document(format!(
+                        "stored field id {} exceeds u16",
+                        field.0
+                    )));
+                }
+            }
+
+            // Mirrors `SegmentBuilder::next_vector_ordinal`: vector ordinals
+            // are u16, so at most u16::MAX + 1 values per field per document.
+            let mut count_vector_value = |field_id: u32| -> Result<()> {
+                let count = vector_values_per_field.entry(field_id).or_insert(0);
+                *count += 1;
+                if *count > u16::MAX as u32 + 1 {
+                    return Err(crate::Error::Document(format!(
+                        "field {field_id} has more than {} vector values in one document",
+                        u16::MAX as usize + 1
+                    )));
+                }
+                Ok(())
+            };
+
+            match (&entry.field_type, value) {
+                (FieldType::DenseVector, FieldValue::DenseVector(vec))
+                    if entry.indexed || entry.stored =>
+                {
+                    count_vector_value(field.0)?;
+                    let expected_dim = entry
+                        .dense_vector_config
+                        .as_ref()
+                        .map(|config| config.dim)
+                        .ok_or_else(|| {
+                            crate::Error::Schema("DenseVector field missing config".to_string())
+                        })?;
+                    if vec.len() != expected_dim {
+                        return Err(crate::Error::Schema(format!(
+                            "Dense vector dimension mismatch: schema expects {}, got {}",
+                            expected_dim,
+                            vec.len()
+                        )));
+                    }
+                    if let Some((index, v)) = vec.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                        return Err(crate::Error::Document(format!(
+                            "dense vector contains non-finite value {v} at index {index}"
+                        )));
+                    }
+                }
+                (FieldType::BinaryDenseVector, FieldValue::BinaryDenseVector(bytes))
+                    if entry.indexed || entry.stored =>
+                {
+                    count_vector_value(field.0)?;
+                    let dim_bits = entry
+                        .binary_dense_vector_config
+                        .as_ref()
+                        .map(|c| c.dim)
+                        .ok_or_else(|| {
+                            crate::Error::Schema(
+                                "BinaryDenseVector field missing config".to_string(),
+                            )
+                        })?;
+                    if dim_bits == 0 || !dim_bits.is_multiple_of(8) {
+                        return Err(crate::Error::Schema(format!(
+                            "Binary vector dimension must be a positive multiple of 8, got {dim_bits}"
+                        )));
+                    }
+                    let expected_byte_len = dim_bits.div_ceil(8);
+                    if bytes.len() != expected_byte_len {
+                        return Err(crate::Error::Schema(format!(
+                            "Binary vector byte length mismatch: expected {} (dim={}), got {}",
+                            expected_byte_len,
+                            dim_bits,
+                            bytes.len()
+                        )));
+                    }
+                }
+                (FieldType::SparseVector, FieldValue::SparseVector(entries))
+                    if entry.indexed || entry.fast =>
+                {
+                    count_vector_value(field.0)?;
+                    if let Some((index, (_, weight))) = entries
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (_, weight))| !weight.is_finite())
+                    {
+                        return Err(crate::Error::Document(format!(
+                            "sparse vector contains non-finite weight {weight} at index {index}"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if stored_count > u16::MAX as usize {
+            return Err(crate::Error::Document(
+                "too many stored fields in one document (max 65535)".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Add a document. Automatically builds a segment when memory budget is exceeded.
+    ///
+    /// All-or-nothing: an invalid document is rejected without mutating any
+    /// writer/builder state, so buffered documents stay committable.
     pub async fn add_document(&mut self, doc: Document) -> Result<()> {
+        // Validate before touching the builder — see `validate_document`.
+        self.validate_document(&doc)?;
         self.ensure_builder()?;
         let b = self.builder.as_mut().unwrap();
-        b.add_document(doc)?;
+        if let Err(e) = b.add_document(doc) {
+            // Defensive: `validate_document` mirrors every fallible path in
+            // `SegmentBuilder::add_document`, so this should be unreachable.
+            // If a new fallible path slips through, the builder is poisoned
+            // (doc id advanced without a store write) and committing it would
+            // fail with a doc-count mismatch, silently losing every buffered
+            // document. Drop the poisoned builder loudly and keep the writer
+            // (and already-flushed pending segments) usable.
+            let buffered = self.builder.take().map(|b| b.num_docs()).unwrap_or(0);
+            let lost = buffered.saturating_sub(1);
+            log::warn!(
+                "[wasm_writer] segment builder poisoned by failed add_document ({e}); \
+                 discarding {lost} buffered document(s)"
+            );
+            return Err(crate::Error::Internal(format!(
+                "document failed mid-indexing and poisoned the segment builder: {e}; \
+                 {lost} buffered document(s) were discarded — re-add and commit them"
+            )));
+        }
 
         // Check memory budget (with 20% headroom for build overhead)
         let effective_budget = self.memory_budget * 4 / 5;
@@ -224,11 +403,20 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(false);
         }
 
-        // Update in-memory metadata and save to directory
-        for (seg_hex, num_docs) in self.pending_segments.drain(..) {
-            self.metadata.add_segment(seg_hex, num_docs);
+        // Stage the fallible durable save on a clone first: if the save
+        // fails, in-memory metadata and pending_segments are left untouched,
+        // so the caller can retry commit() without stranding the built
+        // segments (durable-before-visible, same invariant as the native
+        // SegmentManager::commit).
+        let mut next = self.metadata.clone();
+        for (seg_hex, num_docs) in &self.pending_segments {
+            next.add_segment(seg_hex.clone(), *num_docs);
         }
-        self.metadata.save(self.directory.as_ref()).await?;
+        next.save(self.directory.as_ref()).await?;
+
+        // The save succeeded — publish the new state in memory.
+        self.metadata = next;
+        self.pending_segments.clear();
 
         Ok(true)
     }

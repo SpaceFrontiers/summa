@@ -46,6 +46,81 @@ use super::IndexConfig;
 /// Total pipeline capacity (in documents).
 const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
+/// File name of the advisory single-writer lock inside the index directory.
+pub const WRITER_LOCK_FILENAME: &str = ".hermes_writer.lock";
+
+/// Advisory single-writer lock state.
+///
+/// Two independent writers on one index directory silently destroy each
+/// other's data: the orphan sweep at writer open deletes the other process's
+/// unpublished segment files, and metadata saves are last-writer-wins. For
+/// directories rooted on a local filesystem the writer therefore holds an OS
+/// advisory lock for its whole lifetime; the kernel releases it automatically
+/// when the process dies.
+enum WriterLock {
+    /// Lock acquired. Closing the file (writer drop) releases it.
+    Held { _file: std::fs::File },
+    /// The directory has no lockable local filesystem root (e.g. RAM or
+    /// remote directories) — cross-process locking is not applicable.
+    NotApplicable,
+    /// Another writer holds the lock. Every mutating operation fails loudly
+    /// with this message instead of silently double-writing.
+    Unavailable { reason: String },
+}
+
+/// Local filesystem root of the index directory, when the directory type
+/// exposes one.
+fn writer_lock_root<D: DirectoryWriter + 'static>(directory: &D) -> Option<std::path::PathBuf> {
+    let any: &dyn std::any::Any = directory;
+    if let Some(mmap) = any.downcast_ref::<crate::directories::MmapDirectory>() {
+        return Some(mmap.root().to_path_buf());
+    }
+    // FsDirectory does not expose its root path, so the single-writer lock
+    // cannot be enforced for it yet. Say so loudly instead of silently
+    // skipping protection for a filesystem-backed writer.
+    if any
+        .downcast_ref::<crate::directories::FsDirectory>()
+        .is_some()
+    {
+        log::warn!(
+            "[writer_lock] FsDirectory exposes no root path; single-writer locking \
+             is not enforced for this writer — do not open a second writer for the \
+             same index directory"
+        );
+    }
+    None
+}
+
+/// Try to take the exclusive single-writer lock for `directory`.
+///
+/// Returns `WriterLock::Unavailable` (not `Err`) on conflict so infallible
+/// constructors can defer the failure to their first mutating operation.
+fn try_acquire_writer_lock<D: DirectoryWriter + 'static>(directory: &D) -> Result<WriterLock> {
+    let Some(root) = writer_lock_root(directory) else {
+        return Ok(WriterLock::NotApplicable);
+    };
+    std::fs::create_dir_all(&root)?;
+    let lock_path = root.join(WRITER_LOCK_FILENAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(WriterLock::Held { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(WriterLock::Unavailable {
+            reason: format!(
+                "another IndexWriter already holds the single-writer lock for this \
+                 index ({}); Hermes supports one writer per index directory — stop \
+                 the other writer (e.g. a running hermes-server or hermes-tool) \
+                 before opening this one",
+                lock_path.display()
+            ),
+        }),
+        Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
+    }
+}
+
 /// Async IndexWriter for adding documents and committing segments.
 ///
 /// **Backpressure:** `add_document()` is sync and O(1). It returns
@@ -81,6 +156,13 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     /// requesting future may disappear, but a second commit generation must
     /// not start until this one has made publication and worker state agree.
     commit_finalization: Arc<CommitFinalizationState>,
+    /// True while a failed post-commit PK refresh has left the uncommitted
+    /// reservations as the ONLY record of already-committed keys (fail-closed,
+    /// see `finalize_prepared_commit`). While set, abort paths must NOT clear
+    /// the reservations or duplicate primary keys could be admitted.
+    pk_reservations_retained: Arc<AtomicBool>,
+    /// Advisory single-writer lock, held for the writer's lifetime.
+    writer_lock: WriterLock,
 }
 
 #[derive(Default)]
@@ -226,6 +308,27 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let schema = Arc::new(schema);
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());
+
+        // Refuse a second writer before touching any index state.
+        let writer_lock = try_acquire_writer_lock(directory.as_ref())?;
+        if let WriterLock::Unavailable { reason } = &writer_lock {
+            return Err(Error::Internal(reason.clone()));
+        }
+        // Refuse to clobber an existing index: persisting a fresh empty
+        // metadata.json would orphan every committed segment, and the next
+        // writer open's orphan sweep would permanently delete them.
+        if directory
+            .exists(std::path::Path::new(super::INDEX_META_FILENAME))
+            .await?
+        {
+            return Err(Error::Internal(format!(
+                "refusing to create index: {} already exists in this directory; \
+                 use IndexWriter::open to open the existing index, or delete the \
+                 directory first if you really want to start over",
+                super::INDEX_META_FILENAME
+            )));
+        }
+
         let metadata = super::IndexMetadata::new((*schema).clone());
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
@@ -249,15 +352,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config,
             builder_config,
             segment_manager,
+            writer_lock,
         ))
     }
 
     /// Open an existing index for exclusive writing.
     ///
-    /// Multiple independent writers for the same directory are unsupported:
-    /// this path removes crash-leftover outputs before starting its workers.
-    /// Use [`Index::writer`](super::Index::writer) to share lifecycle state
-    /// with an already-open search index.
+    /// Multiple independent writers for the same directory are unsupported;
+    /// for filesystem-rooted directories this is enforced with an advisory
+    /// single-writer lock ([`WRITER_LOCK_FILENAME`]) held for the writer's
+    /// lifetime. This path removes crash-leftover outputs before starting its
+    /// workers. Use [`Index::writer`](super::Index::writer) to share lifecycle
+    /// state with an already-open search index.
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
         Self::open_with_config(directory, config, SegmentBuilderConfig::default()).await
     }
@@ -269,6 +375,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
         let directory = Arc::new(directory);
+
+        // The lock must be held before the orphan sweep below: sweeping while
+        // another process's writer is live deletes its in-flight outputs.
+        let writer_lock = try_acquire_writer_lock(directory.as_ref())?;
+        if let WriterLock::Unavailable { reason } = &writer_lock {
+            return Err(Error::Internal(reason.clone()));
+        }
+
         let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
@@ -302,18 +416,33 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config,
             builder_config,
             segment_manager,
+            writer_lock,
         ))
     }
 
     /// Create an IndexWriter from an existing Index.
     /// Shares the SegmentManager for consistent segment lifecycle management.
+    ///
+    /// This constructor is infallible, so a single-writer lock conflict is
+    /// deferred: the returned writer fails loudly on its first mutating
+    /// operation instead of silently double-writing next to another writer.
     pub fn from_index(index: &super::Index<D>) -> Self {
+        let writer_lock = match try_acquire_writer_lock(index.directory.as_ref()) {
+            Ok(lock) => lock,
+            Err(error) => WriterLock::Unavailable {
+                reason: format!("failed to acquire the single-writer lock: {error}"),
+            },
+        };
+        if let WriterLock::Unavailable { reason } = &writer_lock {
+            log::error!("[writer_lock] {reason}");
+        }
         Self::new_with_parts(
             Arc::clone(&index.directory),
             Arc::clone(&index.schema),
             index.config.clone(),
             SegmentBuilderConfig::default(),
             Arc::clone(&index.segment_manager),
+            writer_lock,
         )
     }
 
@@ -328,6 +457,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
+        writer_lock: WriterLock,
     ) -> Self {
         // Auto-configure tokenizers from schema for all text fields
         let registry = crate::tokenizer::TokenizerRegistry::new();
@@ -374,6 +504,38 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             flushed_segments: Arc::new(parking_lot::Mutex::new(Vec::new())),
             primary_key_index: Arc::new(parking_lot::RwLock::new(None)),
             commit_finalization: Arc::new(CommitFinalizationState::default()),
+            pk_reservations_retained: Arc::new(AtomicBool::new(false)),
+            writer_lock,
+        }
+    }
+
+    /// Fail loudly when another writer owns the single-writer lock.
+    fn ensure_writer_lock(&self) -> Result<()> {
+        if let WriterLock::Unavailable { reason } = &self.writer_lock {
+            return Err(Error::Internal(reason.clone()));
+        }
+        Ok(())
+    }
+
+    /// Clear primary-key reservations after an aborted or failed generation.
+    ///
+    /// Skipped while a failed post-commit PK refresh has left the uncommitted
+    /// reservations as the ONLY record of already-committed keys (fail-closed,
+    /// see `finalize_prepared_commit`): wiping them would admit duplicate
+    /// primary keys. Retaining the aborted generation's keys as well is
+    /// deliberately conservative — they clear on the next successful commit's
+    /// refresh.
+    fn clear_uncommitted_pk_reservations(&self) {
+        if self.pk_reservations_retained.load(Ordering::Acquire) {
+            log::warn!(
+                "[primary_key] keeping uncommitted reservations through abort: a \
+                 failed post-commit refresh left them as the only record of \
+                 committed keys; they are cleared by the next successful commit"
+            );
+            return;
+        }
+        if let Some(pk_index) = self.primary_key_index.write().as_mut() {
+            pk_index.clear_uncommitted();
         }
     }
 
@@ -549,6 +711,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             *self.primary_key_index.write() = Some(pk_index);
         }
 
+        // The freshly built index covers every committed segment, so any
+        // reservations retained after a failed post-commit refresh are
+        // superseded by committed_data.
+        self.pk_reservations_retained
+            .store(false, Ordering::Release);
+
         Ok(())
     }
 
@@ -578,6 +746,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Returns an explicit backpressure error when the queue is at capacity or
     /// a prepared commit generation is not yet resolved.
     pub fn add_document(&self, doc: Document) -> Result<()> {
+        self.ensure_writer_lock()?;
         if self.worker_state.shutdown.load(Ordering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -749,9 +918,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // prepare_commit from hanging)
             let prev = state.flush_count.fetch_add(1, Ordering::Release);
             if prev + 1 == state.num_workers {
-                // Last worker — wake prepare_commit
+                // Last worker — wake prepare_commit. notify_all, not
+                // notify_one: a cancelled commit leaves its detached
+                // spawn_blocking waiter parked on this condvar, and with a
+                // single notification that dead waiter would consume the
+                // only wakeup, stalling a retried prepare_commit for its
+                // full deadline.
                 let _lock = state.flush_mutex.lock();
-                state.flush_cvar.notify_one();
+                state.flush_cvar.notify_all();
             }
 
             // Wait for resume (new channel) or shutdown.
@@ -949,7 +1123,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     }
 
     /// Clean up orphan segment files not registered in metadata.
+    ///
+    /// Requires the single-writer lock: sweeping while another process's
+    /// writer is live would delete its in-flight segment outputs.
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
+        self.ensure_writer_lock()?;
         self.segment_manager.cleanup_orphan_segments().await
     }
 
@@ -964,6 +1142,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///
     /// `add_document` returns `CommitInProgress` until commit/abort resumes workers.
     pub async fn prepare_commit(&mut self) -> Result<PreparedCommit<'_, D>> {
+        self.ensure_writer_lock()?;
         if self.worker_state.shutdown.load(Ordering::Acquire) {
             return Err(Error::IndexClosed);
         }
@@ -1024,9 +1203,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // guarantee. Their RAII drops retain ownership through deletion.
             self.flushed_segments.lock().clear();
             self.worker_state.built_segments.lock().clear();
-            if let Some(pk_index) = self.primary_key_index.write().as_mut() {
-                pk_index.clear_uncommitted();
-            }
+            self.clear_uncommitted_pk_reservations();
             self.resume_workers();
             return Err(Error::Internal(format!(
                 "indexing generation failed; no documents from this batch were committed: {error}"
@@ -1211,6 +1388,7 @@ struct OwnedCommitFinalization<D: DirectoryWriter + 'static> {
     prepared: PreparedSegmentsGuard<D>,
     finalization: Option<CommitFinalizationGuard<D>>,
     publication_observed: Arc<AtomicBool>,
+    pk_reservations_retained: Arc<AtomicBool>,
 }
 
 async fn refresh_primary_key_after_commit<D: DirectoryWriter + 'static>(
@@ -1296,7 +1474,7 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     // retaining the generation's uncommitted keys may cause conservative
     // duplicate rejections, but can never admit a duplicate or turn a durable
     // commit into an API error.
-    if let Err(error) = refresh_primary_key_after_commit(
+    match refresh_primary_key_after_commit(
         &commit.directory,
         &commit.schema,
         &commit.segment_manager,
@@ -1304,11 +1482,25 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     )
     .await
     {
-        log::error!(
-            "[primary_key] committed metadata but failed to refresh dedup state; \
-             retaining reservations until a later successful commit: {}",
-            error,
-        );
+        // A successful refresh folded every committed key into committed_data
+        // and cleared the reservations — nothing retained anymore.
+        Ok(()) => commit
+            .pk_reservations_retained
+            .store(false, Ordering::Release),
+        Err(error) => {
+            // The retained reservations are now the ONLY record of the
+            // published segments' keys. Abort paths must not clear them
+            // (see clear_uncommitted_pk_reservations) or duplicates would
+            // be admitted.
+            commit
+                .pk_reservations_retained
+                .store(true, Ordering::Release);
+            log::error!(
+                "[primary_key] committed metadata but failed to refresh dedup state; \
+                 retaining reservations until a later successful commit: {}",
+                error,
+            );
+        }
     }
 
     // Merge scheduling is optional post-commit work and may briefly wait on
@@ -1360,6 +1552,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
                 resume_workers: false,
             }),
             publication_observed: Arc::clone(&publication_observed),
+            pk_reservations_retained: Arc::clone(&self.writer.pk_reservations_retained),
         };
 
         // From this point the owned value, not this cancel-sensitive guard,
@@ -1411,9 +1604,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     pub fn abort(mut self) {
         self.is_resolved = true;
         self.writer.flushed_segments.lock().clear();
-        if let Some(pk_index) = self.writer.primary_key_index.write().as_mut() {
-            pk_index.clear_uncommitted();
-        }
+        self.writer.clear_uncommitted_pk_reservations();
         self.writer.resume_workers();
     }
 }
@@ -1423,9 +1614,7 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
         if !self.is_resolved {
             log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
             self.writer.flushed_segments.lock().clear();
-            if let Some(pk_index) = self.writer.primary_key_index.write().as_mut() {
-                pk_index.clear_uncommitted();
-            }
+            self.writer.clear_uncommitted_pk_reservations();
             self.writer.resume_workers();
         }
     }

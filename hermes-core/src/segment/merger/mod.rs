@@ -373,7 +373,10 @@ impl SegmentMerger {
             field_stats: merged_field_stats,
         };
 
-        dir.write(&files.meta, &meta.serialize()?).await?;
+        // Durable: replace_segments deletes the fsynced source segments right
+        // after publishing this output, so a non-durable .meta could be the
+        // only copy of the merged documents across a power failure.
+        dir.write_durable(&files.meta, &meta.serialize()?).await?;
 
         let label = if trained.is_some() {
             "ANN merge"
