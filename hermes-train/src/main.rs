@@ -675,21 +675,35 @@ fn train(args: TrainArgs) -> Result<()> {
             };
             let mut batch = Vec::with_capacity(args.batch_size);
             let shuffle_seed = args.seed.wrapping_add((stage * args.epochs + epoch) as u64);
-            visit_samples(
-                path,
-                &tokenizer,
-                args.seq_len,
-                args.shuffle_buffer,
-                shuffle_seed,
-                |sample| {
+            // Reading, decompression, and tokenization run on a background
+            // thread; the bounded channel keeps two batches of samples ready
+            // so the accelerator never idles on batch preparation. Dropping
+            // the receiver (early stop or an error) hangs up the sender and
+            // the reader unwinds cleanly.
+            let seq_len = args.seq_len;
+            let shuffle_buffer = args.shuffle_buffer;
+            let tokenizer_ref = &tokenizer;
+            std::thread::scope(|threads| -> Result<()> {
+                let (sender, receiver) = std::sync::mpsc::sync_channel(args.batch_size * 2);
+                let reader = threads.spawn(move || {
+                    visit_samples(
+                        path,
+                        tokenizer_ref,
+                        seq_len,
+                        shuffle_buffer,
+                        shuffle_seed,
+                        |sample| Ok(sender.send(sample).is_ok()),
+                    )
+                });
+                for sample in &receiver {
                     samples_in_stage += 1;
                     training_state.samples_in_stage = samples_in_stage;
                     if samples_in_stage <= samples_to_skip {
-                        return Ok(true);
+                        continue;
                     }
                     batch.push(sample);
                     if batch.len() < args.batch_size {
-                        return Ok(true);
+                        continue;
                     }
 
                     let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
@@ -780,10 +794,17 @@ fn train(args: TrainArgs) -> Result<()> {
                             println!("checkpointed {}", args.output.display());
                         }
                         micro_step = 0;
+                        if step >= total_steps {
+                            break;
+                        }
                     }
-                    Ok(step < total_steps)
-                },
-            )?;
+                }
+                drop(receiver);
+                reader
+                    .join()
+                    .expect("sample reader thread panicked")
+                    .map(|_| ())
+            })?;
             if step >= total_steps {
                 break 'stages;
             }
