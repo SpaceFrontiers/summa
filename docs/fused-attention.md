@@ -156,3 +156,17 @@ hermes-side dispatch was reverted; the chunked backward (with LSE reuse)
 remains the production path. The kernels stay parked in the cubek fork
 should long-sequence configs (seq ≥ 4k, where materialization traffic
 dominates) ever matter.
+
+## Runtime defect, second signature (state-tensor stride displacement)
+
+The scan-kernel geometry sweep produced a cleaner signature of the same
+fork-runtime defect this document tracks for attention shapes: with a
+`[batch, seq, state]` atomic gradient tensor of minor width 5, every value
+the kernel emits is correct but lands as if the tensor had minor stride 8
+(`gpu[5t + n] == truth[8t + n]`, deterministic, identical across launch
+geometries; delta/x gradients through the same kernel are clean). Widths
+4/8/16/32 are clean, 2/5/6/12 corrupt, and Metal is correct at every
+width, so this is CUDA-runtime tensor binding, not kernel logic or shuffle
+semantics. The scan dispatch now refuses non-power-of-two state widths
+loudly; if the fork runtime's binding layer is ever fixed, that assert and
+this note are the two things to relax.

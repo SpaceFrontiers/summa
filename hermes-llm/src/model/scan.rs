@@ -22,33 +22,15 @@ use burn_autodiff::ops::{Backward, Ops, OpsKind};
 
 use super::conv::DepthwiseConv1dBackend;
 
+/// Recurrent-state checkpoint spacing for the GPU training scan: the
+/// backward re-derives each segment's states from its entering checkpoint,
+/// trading one recompute of the recurrence for a 32x smaller saved-state
+/// tensor. Measured optimal at production scale (16 cost -2.3%, 8 -8.3%);
+/// every sequence length works via partial-tail guards. The fusion IR and
+/// both dispatch functions must agree on this value, which is why it is
+/// the single source of the saved-states shape.
 #[cfg(any(feature = "metal", feature = "cuda", test))]
-const CHECKPOINTED_SCAN_INTERVAL: usize = 32;
-#[cfg(any(feature = "metal", feature = "cuda", test))]
-const MAX_FULL_STATE_BATCH: usize = 2;
-#[cfg(any(feature = "metal", feature = "cuda", test))]
-const MAX_FULL_STATE_BYTES: usize = 512 * 1024 * 1024;
-
-/// Keep every recurrent state when a small training batch fits a bounded
-/// per-layer budget; larger batches trade one recurrence recompute for memory.
-#[cfg(any(feature = "metal", feature = "cuda", test))]
-pub(super) fn scan_checkpoint_interval(
-    batch: usize,
-    seq_len: usize,
-    channels: usize,
-    state_dim: usize,
-) -> usize {
-    let state_bytes = batch
-        .saturating_mul(seq_len)
-        .saturating_mul(channels)
-        .saturating_mul(state_dim)
-        .saturating_mul(size_of::<f32>());
-    if batch <= MAX_FULL_STATE_BATCH && state_bytes <= MAX_FULL_STATE_BYTES {
-        1
-    } else {
-        CHECKPOINTED_SCAN_INTERVAL
-    }
-}
+pub(super) const CHECKPOINTED_SCAN_INTERVAL: usize = 32;
 
 fn stable_softplus<const D: usize>(value: Tensor<D>) -> Tensor<D> {
     relu(value.clone()) + (-value.abs()).exp().add_scalar(1.0).log()
@@ -563,7 +545,7 @@ mod gpu {
     use burn::tensor::DType;
     use half::bf16;
 
-    use super::{MambaBackend, scan_checkpoint_interval};
+    use super::{CHECKPOINTED_SCAN_INTERVAL, MambaBackend};
     use crate::model::cube_tensor::{
         empty_like, empty_like_dtype, into_contiguous, zeros_like_dtype,
     };
@@ -579,6 +561,18 @@ mod gpu {
     // backward. Sized so the per-warp partial slots fit Metal's 32KB
     // threadgroup budget at state_dim 16; must divide the segment length.
     const BACKWARD_FLUSH: usize = 8;
+    // The sweep kernels' warp geometry: one plane spans exactly two state
+    // rows of a BACKWARD_CHANNELS-wide channel tile, so the partner-row
+    // shuffle offset is BACKWARD_CHANNELS and `half_plane_sum` reduces
+    // BACKWARD_CHANNELS-lane groups. Changing the tile width means
+    // revisiting both, and the flush windows must tile the segment.
+    const _: () = assert!(BACKWARD_CHANNELS * 2 == PLANE_WIDTH as usize);
+    const _: () = assert!(CHECKPOINTED_SCAN_INTERVAL.is_multiple_of(BACKWARD_FLUSH));
+    // The dispatch caps state_dim at 16: 32 works on CUDA but exceeds
+    // Metal's 32KB threadgroup budget in the reverse sweep, and the CUDA
+    // runtime displaces writes into state tensors whose minor stride is
+    // not a power of two (4/8/16/32 measured clean, 2/5/6/12 corrupt) —
+    // the kernels themselves are shape-generic, as Metal demonstrates.
 
     #[cube]
     fn atomic_add_f32(target: &mut Atomic<f32>, value: f32) {
@@ -604,27 +598,32 @@ mod gpu {
         }
     }
 
+    /// Folds a BACKWARD_CHANNELS-lane group (half a plane) down to its
+    /// lane 0. Both halves of a plane reduce independently, which is what
+    /// the sweep kernels' two-state-rows-per-warp layout needs.
     #[cube]
     fn half_plane_sum(value: f32, lane: usize) -> f32 {
         let mut sum = value;
-        let other = plane_shuffle_down(sum, 8);
-        if lane < 8 {
+        let other = plane_shuffle_down(sum, (BACKWARD_CHANNELS / 2) as u32);
+        if lane < BACKWARD_CHANNELS / 2 {
             sum += other;
         }
-        let other = plane_shuffle_down(sum, 4);
-        if lane < 4 {
+        let other = plane_shuffle_down(sum, (BACKWARD_CHANNELS / 4) as u32);
+        if lane < BACKWARD_CHANNELS / 4 {
             sum += other;
         }
-        let other = plane_shuffle_down(sum, 2);
-        if lane < 2 {
+        let other = plane_shuffle_down(sum, (BACKWARD_CHANNELS / 8) as u32);
+        if lane < BACKWARD_CHANNELS / 8 {
             sum += other;
         }
-        let other = plane_shuffle_down(sum, 1);
-        if lane == 0 {
+        let other = plane_shuffle_down(sum, (BACKWARD_CHANNELS / 16) as u32);
+        if lane < BACKWARD_CHANNELS / 16 {
             sum += other;
         }
         sum
     }
+    // The reduction ladder above is written for a 16-wide tile.
+    const _: () = assert!(BACKWARD_CHANNELS == 16);
 
     #[cube(launch)]
     fn softplus_forward<F: Float>(input: &Tensor<F>, output: &mut Tensor<f32>) {
@@ -915,7 +914,7 @@ mod gpu {
                         // A warp spans two state rows of the channel tile;
                         // fold the odd row into the even one so each warp
                         // writes one disjoint partial row per step.
-                        let mut partner = plane_shuffle_down(y_term, 16);
+                        let mut partner = plane_shuffle_down(y_term, BACKWARD_CHANNELS as u32);
                         if n + 1 >= state_dim {
                             partner = 0.0f32;
                         }
@@ -959,157 +958,6 @@ mod gpu {
 
         if active {
             h_out[state_index] = state;
-        }
-    }
-
-    /// One block owns a `(batch, channel tile)` and computes every scan
-    /// gradient while following the reverse recurrence exactly once. The
-    /// channel and state reductions share the per-token contributions in
-    /// workgroup memory instead of launching a second recurrent kernel.
-    #[allow(clippy::manual_div_ceil, clippy::useless_conversion)]
-    #[cube(launch)]
-    fn selective_scan_backward_fused(
-        delta: &Tensor<f32>,
-        delta_raw: &Tensor<f32>,
-        xs: &Tensor<f32>,
-        b_mat: &Tensor<f32>,
-        c_mat: &Tensor<f32>,
-        a: &Tensor<f32>,
-        d: &Tensor<f32>,
-        h_in: &Tensor<f32>,
-        checkpoints: &Tensor<f32>,
-        grad_y: &Tensor<f32>,
-        grad_delta: &mut Tensor<f32>,
-        grad_xs: &mut Tensor<f32>,
-        grad_b: &mut Tensor<Atomic<f32>>,
-        grad_c: &mut Tensor<Atomic<f32>>,
-        grad_a: &mut Tensor<Atomic<f32>>,
-        grad_d: &mut Tensor<Atomic<f32>>,
-        grad_h: &mut Tensor<f32>,
-        channels: u32,
-        seq_len: u32,
-        #[comptime] state_dim: usize,
-        #[comptime] checkpoint_interval: usize,
-    ) {
-        let channels = channels as usize;
-        let seq_len = seq_len as usize;
-        let local_channel = UNIT_POS_X as usize;
-        let n = UNIT_POS_Y as usize;
-        let batch = CUBE_POS_Y as usize;
-        let channel = CUBE_POS_X as usize * BACKWARD_CHANNELS + local_channel;
-        let active_channel = channel < channels;
-        let active = active_channel && n < state_dim;
-        let state_index = (batch * channels + channel) * state_dim + n;
-        let a_index = channel * state_dim + n;
-        let shared_index = n * BACKWARD_CHANNELS + local_channel;
-        let shared_len = BACKWARD_CHANNELS * state_dim;
-        // Ping-pong buffers avoid a second barrier; the intervening step's
-        // barrier completes before either buffer is reused.
-        let mut grad_dt_shared = Shared::new_slice(2 * shared_len);
-        let mut grad_x_shared = Shared::new_slice(2 * shared_len);
-        let mut adjoint = 0.0f32;
-        let mut grad_a_local = 0.0f32;
-        let mut grad_d_local = 0.0f32;
-        let checkpoint_count = (seq_len + checkpoint_interval - 1) / checkpoint_interval;
-
-        for checkpoint_step in 0..checkpoint_count {
-            let checkpoint = checkpoint_count - checkpoint_step - 1;
-            let start = checkpoint * checkpoint_interval;
-            let mut end = start + checkpoint_interval;
-            if end > seq_len {
-                end = seq_len;
-            }
-            let chunk_len = end - start;
-            let state_before = if active {
-                if checkpoint == 0 {
-                    h_in[state_index]
-                } else {
-                    checkpoints[((batch * checkpoint_count + checkpoint - 1) * channels + channel)
-                        * state_dim
-                        + n]
-                }
-            } else {
-                0.0f32
-            };
-            let av = if active { a[a_index] } else { 0.0f32 };
-            let mut state = state_before;
-            let mut chunk_states = Array::<f32>::new(checkpoint_interval);
-
-            if checkpoint_interval == 1 {
-                chunk_states[0] = if active {
-                    checkpoints[((batch * checkpoint_count + checkpoint) * channels + channel)
-                        * state_dim
-                        + n]
-                } else {
-                    0.0f32
-                };
-            } else {
-                for offset in 0..chunk_len {
-                    let t = start + offset;
-                    let btc = (batch * seq_len + t) * channels + channel;
-                    let btn = (batch * seq_len + t) * state_dim;
-                    let dt = if active { delta[btc] } else { 0.0f32 };
-                    let x = if active { xs[btc] } else { 0.0f32 };
-                    let bv = if active { b_mat[btn + n] } else { 0.0f32 };
-                    state = state * (dt * av).exp() + dt * bv * x;
-                    chunk_states[offset] = state;
-                }
-            }
-
-            for reverse_offset in 0..chunk_len {
-                let offset = chunk_len - reverse_offset - 1;
-                let t = start + offset;
-                let btc = (batch * seq_len + t) * channels + channel;
-                let btn = (batch * seq_len + t) * state_dim;
-                let dt = if active { delta[btc] } else { 0.0f32 };
-                let raw_dt = if active { delta_raw[btc] } else { 0.0f32 };
-                let x = if active { xs[btc] } else { 0.0f32 };
-                let dy = if active { grad_y[btc] } else { 0.0f32 };
-                let bv = if active { b_mat[btn + n] } else { 0.0f32 };
-                let cv = if active { c_mat[btn + n] } else { 0.0f32 };
-                let alpha = (dt * av).exp();
-                let h_prev = if offset == 0 {
-                    state_before
-                } else {
-                    chunk_states[offset - 1]
-                };
-                let h_t = chunk_states[offset];
-                let g = adjoint + dy * cv;
-                let step = seq_len - t - 1;
-                let shared_offset = (step % 2) * shared_len;
-                grad_dt_shared[shared_offset + shared_index] = g * (h_prev * alpha * av + bv * x);
-                grad_x_shared[shared_offset + shared_index] = g * dt * bv;
-                let grad_b_sum = half_plane_sum(g * dt * x, local_channel);
-                let grad_c_sum = half_plane_sum(dy * h_t, local_channel);
-                sync_cube();
-
-                if n == 0 && active_channel {
-                    let mut grad_dt = 0.0f32;
-                    let mut grad_x = 0.0f32;
-                    for state in 0..state_dim {
-                        let index = shared_offset + state * BACKWARD_CHANNELS + local_channel;
-                        grad_dt += grad_dt_shared[index];
-                        grad_x += grad_x_shared[index];
-                    }
-                    grad_delta[btc] = grad_dt * stable_sigmoid(raw_dt);
-                    grad_xs[btc] = dy * d[channel] + grad_x;
-                    grad_d_local += dy * x;
-                }
-                if local_channel == 0 {
-                    atomic_add_f32(&mut grad_b[btn + n], grad_b_sum);
-                    atomic_add_f32(&mut grad_c[btn + n], grad_c_sum);
-                }
-                grad_a_local += g * h_prev * alpha * dt;
-                adjoint = g * alpha;
-            }
-        }
-
-        if active {
-            atomic_add_f32(&mut grad_a[a_index], grad_a_local);
-            grad_h[state_index] = adjoint;
-        }
-        if n == 0 && active_channel {
-            atomic_add_f32(&mut grad_d[channel], grad_d_local);
         }
     }
 
@@ -1296,8 +1144,8 @@ mod gpu {
                         // fold the odd row into the even one so each warp
                         // writes one disjoint partial row per step — no
                         // barrier needed.
-                        let mut partner_dt = plane_shuffle_down(dt_term, 16);
-                        let mut partner_dx = plane_shuffle_down(dx_term, 16);
+                        let mut partner_dt = plane_shuffle_down(dt_term, BACKWARD_CHANNELS as u32);
+                        let mut partner_dx = plane_shuffle_down(dx_term, BACKWARD_CHANNELS as u32);
                         if n + 1 >= state_dim {
                             partner_dt = 0.0f32;
                             partner_dx = 0.0f32;
@@ -1372,9 +1220,9 @@ mod gpu {
     }
 
     /// Materializes the softplus activation for the non-segmented scan
-    /// paths (decode, prefill without states, the fused small-problem
-    /// backward). The segmented training kernels compute softplus in-kernel
-    /// from the raw delta instead and never allocate this tensor.
+    /// inference paths (decode, prefill without states). The training
+    /// kernels compute softplus in-kernel from the raw delta and never
+    /// allocate this tensor.
     fn materialize_softplus<R: CubeRuntime>(
         delta_raw: &CubeTensor<R>,
         batch: usize,
@@ -1411,8 +1259,12 @@ mod gpu {
         ) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
             let [batch, seq_len, channels] = xs.shape().dims();
             assert!(
-                state_dim <= PLANE_WIDTH as usize,
-                "GPU selective scan supports at most {PLANE_WIDTH} states"
+                state_dim.is_power_of_two() && (4..=16).contains(&state_dim),
+                "GPU selective scan requires a power-of-two state_dim in 4..=16, got \
+                 {state_dim}: the CUDA runtime displaces writes into state tensors with \
+                 other minor strides, and 32 exceeds Metal's threadgroup budget (see \
+                 docs/kernel-tuning-surface.md); the CPU reference backend supports any \
+                 state_dim"
             );
             let delta_raw = into_contiguous(delta);
             let xs = into_contiguous(xs);
@@ -1429,15 +1281,16 @@ mod gpu {
             assert_eq!(delta_raw.dtype, io_dtype);
             assert_eq!(b_mat.dtype, io_dtype);
             assert_eq!(c_mat.dtype, io_dtype);
-            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
+            let checkpoint_interval = CHECKPOINTED_SCAN_INTERVAL;
             let full_sequence_scan = save_states || seq_len > 1;
-            let segments = seq_len.div_ceil(checkpoint_interval);
-            let segmented =
-                full_sequence_scan && save_states && checkpoint_interval > 1 && segments > 1;
-            // Only the segment-parallel training path has BF16 kernels. The
-            // remaining paths (decode, prefill without saved states, the
-            // small-problem full-state path) normalize a BF16 stream to FP32
-            // here and hand BF16 back at the return.
+            // Training (states saved for backward) always takes the swept
+            // checkpointed kernels — any batch, any sequence length; the
+            // remaining paths serve inference (decode, prefill).
+            let segmented = save_states;
+            // Only the training sweep kernels are BF16-native. The
+            // inference paths (decode, prefill without saved states)
+            // normalize a BF16 stream to FP32 here and hand BF16 back at
+            // the return.
             let normalize_fp32 = io_dtype == DType::BF16 && !segmented;
             let (delta_raw, xs, b_mat, c_mat, io_dtype) = if normalize_fp32 {
                 (
@@ -1613,8 +1466,12 @@ mod gpu {
         ) {
             let [batch, seq_len, channels] = xs.shape().dims();
             assert!(
-                state_dim <= PLANE_WIDTH as usize,
-                "GPU selective scan supports at most {PLANE_WIDTH} states"
+                state_dim.is_power_of_two() && (4..=16).contains(&state_dim),
+                "GPU selective scan requires a power-of-two state_dim in 4..=16, got \
+                 {state_dim}: the CUDA runtime displaces writes into state tensors with \
+                 other minor strides, and 32 exceeds Metal's threadgroup budget (see \
+                 docs/kernel-tuning-surface.md); the CPU reference backend supports any \
+                 state_dim"
             );
             let delta_raw = into_contiguous(delta);
             let xs = into_contiguous(xs);
@@ -1634,25 +1491,6 @@ mod gpu {
                 grad_y.dtype, io_dtype,
                 "selective scan output gradient dtype must match the sequence dtype"
             );
-            let checkpoint_interval = scan_checkpoint_interval(batch, seq_len, channels, state_dim);
-            let segments = seq_len.div_ceil(checkpoint_interval);
-            let segmented = checkpoint_interval > 1 && segments > 1;
-            // Only the segment-parallel training backward has BF16 kernels;
-            // the fused fallback normalizes the sequence tensors to FP32 and
-            // hands the gradients back in the caller's dtype at the return.
-            let normalize_fp32 = io_dtype == DType::BF16 && !segmented;
-            let (delta_raw, xs, b_mat, c_mat, grad_y, io_dtype) = if normalize_fp32 {
-                (
-                    burn_cubecl::kernel::cast(delta_raw, DType::F32),
-                    burn_cubecl::kernel::cast(xs, DType::F32),
-                    burn_cubecl::kernel::cast(b_mat, DType::F32),
-                    burn_cubecl::kernel::cast(c_mat, DType::F32),
-                    burn_cubecl::kernel::cast(grad_y, DType::F32),
-                    DType::F32,
-                )
-            } else {
-                (delta_raw, xs, b_mat, c_mat, grad_y, io_dtype)
-            };
             let grad_delta = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let grad_xs = empty_like(&xs, Shape::new([batch, seq_len, channels]));
             let grad_b = zeros_like_dtype(&xs, Shape::new([batch, seq_len, state_dim]), DType::F32);
@@ -1663,129 +1501,59 @@ mod gpu {
                 empty_like_dtype(&xs, Shape::new([batch, channels, state_dim]), DType::F32);
             let client = xs.client.clone();
 
-            if segmented {
-                assert!(
-                    checkpoint_interval.is_multiple_of(BACKWARD_FLUSH),
-                    "scan checkpoint interval {checkpoint_interval} must be a multiple of the \
-                     backward flush window {BACKWARD_FLUSH}"
-                );
-                // One block per (batch, channel tile) sweeps the segments
-                // right-to-left with the adjoint in registers — the exact
-                // reverse recurrence, no stitched-carry kernels.
-                macro_rules! launch_backward {
-                    ($float:ty) => {{
-                        selective_scan_backward_segmented::launch::<$float, R>(
-                            &client,
-                            CubeCount::Static(
-                                (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
-                                batch as u32,
-                                1,
-                            ),
-                            CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
-                            delta_raw.into_tensor_arg(),
-                            xs.clone().into_tensor_arg(),
-                            b_mat.into_tensor_arg(),
-                            c_mat.clone().into_tensor_arg(),
-                            a.clone().into_tensor_arg(),
-                            d.into_tensor_arg(),
-                            h.clone().into_tensor_arg(),
-                            states.clone().into_tensor_arg(),
-                            grad_y.clone().into_tensor_arg(),
-                            grad_delta.clone().into_tensor_arg(),
-                            grad_xs.clone().into_tensor_arg(),
-                            grad_b.clone().into_tensor_arg(),
-                            grad_c.clone().into_tensor_arg(),
-                            grad_a.clone().into_tensor_arg(),
-                            grad_d.clone().into_tensor_arg(),
-                            grad_h.clone().into_tensor_arg(),
-                            channels as u32,
-                            seq_len as u32,
-                            state_dim,
-                            checkpoint_interval,
-                        );
-                    }};
-                }
-                match io_dtype {
-                    DType::BF16 => launch_backward!(bf16),
-                    _ => launch_backward!(f32),
-                }
-                // grad_B/grad_C accumulate through f32 atomics; hand them back
-                // in the sequence dtype so autodiff composes without dtype
-                // mismatches. The tensors are [batch, seq, state_dim] — tiny.
-                if io_dtype != DType::F32 {
-                    let grad_b = burn_cubecl::kernel::cast(grad_b, io_dtype);
-                    let grad_c = burn_cubecl::kernel::cast(grad_c, io_dtype);
-                    return (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h);
-                }
+            // One block per (batch, channel tile) sweeps the checkpoint
+            // segments right-to-left with the adjoint in registers — the
+            // exact reverse recurrence, native in both F32 and BF16.
+            macro_rules! launch_backward {
+                ($float:ty) => {{
+                    selective_scan_backward_segmented::launch::<$float, R>(
+                        &client,
+                        CubeCount::Static(
+                            (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                            batch as u32,
+                            1,
+                        ),
+                        CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
+                        delta_raw.into_tensor_arg(),
+                        xs.clone().into_tensor_arg(),
+                        b_mat.into_tensor_arg(),
+                        c_mat.clone().into_tensor_arg(),
+                        a.clone().into_tensor_arg(),
+                        d.into_tensor_arg(),
+                        h.clone().into_tensor_arg(),
+                        states.clone().into_tensor_arg(),
+                        grad_y.clone().into_tensor_arg(),
+                        grad_delta.clone().into_tensor_arg(),
+                        grad_xs.clone().into_tensor_arg(),
+                        grad_b.clone().into_tensor_arg(),
+                        grad_c.clone().into_tensor_arg(),
+                        grad_a.clone().into_tensor_arg(),
+                        grad_d.clone().into_tensor_arg(),
+                        grad_h.clone().into_tensor_arg(),
+                        channels as u32,
+                        seq_len as u32,
+                        state_dim,
+                        CHECKPOINTED_SCAN_INTERVAL,
+                    );
+                }};
+            }
+            match io_dtype {
+                DType::BF16 => launch_backward!(bf16),
+                _ => launch_backward!(f32),
+            }
+            // grad_B/grad_C accumulate through f32 atomics; hand them back
+            // in the sequence dtype so autodiff composes without dtype
+            // mismatches. The tensors are [batch, seq, state_dim] — tiny.
+            let (grad_b, grad_c) = if io_dtype != DType::F32 {
+                (
+                    burn_cubecl::kernel::cast(grad_b, io_dtype),
+                    burn_cubecl::kernel::cast(grad_c, io_dtype),
+                )
             } else {
-                assert!(
-                    io_dtype == DType::F32,
-                    "BF16 selective scan backward requires the checkpointed training path"
-                );
-                let delta = materialize_softplus(&delta_raw, batch, seq_len, channels);
-                selective_scan_backward_fused::launch::<R>(
-                    &client,
-                    CubeCount::Static(
-                        (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
-                        batch as u32,
-                        1,
-                    ),
-                    CubeDim::new_2d(BACKWARD_CHANNELS as u32, state_dim as u32),
-                    delta.clone().into_tensor_arg(),
-                    delta_raw.into_tensor_arg(),
-                    xs.clone().into_tensor_arg(),
-                    b_mat.into_tensor_arg(),
-                    c_mat.clone().into_tensor_arg(),
-                    a.clone().into_tensor_arg(),
-                    d.into_tensor_arg(),
-                    h.clone().into_tensor_arg(),
-                    states.clone().into_tensor_arg(),
-                    grad_y.clone().into_tensor_arg(),
-                    grad_delta.clone().into_tensor_arg(),
-                    grad_xs.clone().into_tensor_arg(),
-                    grad_b.clone().into_tensor_arg(),
-                    grad_c.clone().into_tensor_arg(),
-                    grad_a.clone().into_tensor_arg(),
-                    grad_d.clone().into_tensor_arg(),
-                    grad_h.clone().into_tensor_arg(),
-                    channels as u32,
-                    seq_len as u32,
-                    state_dim,
-                    checkpoint_interval,
-                );
-            }
-
-            if normalize_fp32 {
-                return (
-                    burn_cubecl::kernel::cast(grad_delta, DType::BF16),
-                    burn_cubecl::kernel::cast(grad_xs, DType::BF16),
-                    burn_cubecl::kernel::cast(grad_b, DType::BF16),
-                    burn_cubecl::kernel::cast(grad_c, DType::BF16),
-                    grad_a,
-                    grad_d,
-                    grad_h,
-                );
-            }
+                (grad_b, grad_c)
+            };
             (grad_delta, grad_xs, grad_b, grad_c, grad_a, grad_d, grad_h)
         }
-    }
-}
-
-#[cfg(test)]
-mod policy_tests {
-    use super::{CHECKPOINTED_SCAN_INTERVAL, scan_checkpoint_interval};
-
-    #[test]
-    fn full_states_are_limited_to_small_bounded_batches() {
-        assert_eq!(scan_checkpoint_interval(2, 4096, 1024, 16), 1);
-        assert_eq!(
-            scan_checkpoint_interval(16, 1024, 1024, 16),
-            CHECKPOINTED_SCAN_INTERVAL
-        );
-        assert_eq!(
-            scan_checkpoint_interval(2, 8192, 1024, 16),
-            CHECKPOINTED_SCAN_INTERVAL
-        );
     }
 }
 
@@ -1850,9 +1618,17 @@ mod tests {
     }
 
     fn assert_cubecl_selective_scan_backward(batch: usize) {
+        assert_cubecl_selective_scan_backward_geometry(batch, 37, 3, 4);
+    }
+
+    fn assert_cubecl_selective_scan_backward_geometry(
+        batch: usize,
+        seq_len: usize,
+        channels: usize,
+        state_dim: usize,
+    ) {
         let cpu = Device::ndarray().autodiff();
         let gpu = gpu_device().autodiff();
-        let (seq_len, channels, state_dim) = (37, 3, 4);
         let shapes = (
             [batch, seq_len, channels],
             [batch, seq_len, state_dim],
@@ -1927,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cubecl_selective_scan_full_state_backward_matches_ndarray() {
+    fn test_cubecl_selective_scan_small_batch_backward_matches_ndarray() {
         assert_cubecl_selective_scan_backward(2);
     }
 
@@ -2055,5 +1831,30 @@ mod tests {
     #[test]
     fn test_cubecl_selective_scan_checkpointed_backward_matches_ndarray() {
         assert_cubecl_selective_scan_backward(3);
+    }
+
+    /// Pins the sweep kernels' geometry guards off the production shape:
+    /// a channel count spanning two tiles with a partial second tile and a
+    /// sequence with a partial tail segment.
+    #[test]
+    fn test_cubecl_selective_scan_channel_overhang_backward_matches_ndarray() {
+        assert_cubecl_selective_scan_backward_geometry(3, 37, 19, 4);
+    }
+
+    /// The remaining supported state width (4 is covered above, 16 by the
+    /// bf16 and production tests).
+    #[test]
+    fn test_cubecl_selective_scan_state_dim_8_backward_matches_ndarray() {
+        assert_cubecl_selective_scan_backward_geometry(3, 37, 16, 8);
+    }
+
+    /// Unsupported state widths must refuse loudly instead of silently
+    /// corrupting: the CUDA runtime displaces writes into state tensors
+    /// with non-power-of-two minor strides (kernel logic itself is
+    /// shape-generic — Metal passes any width).
+    #[test]
+    #[should_panic(expected = "power-of-two state_dim")]
+    fn test_gpu_selective_scan_rejects_unsupported_state_dim() {
+        assert_cubecl_selective_scan_backward_geometry(3, 37, 16, 5);
     }
 }
