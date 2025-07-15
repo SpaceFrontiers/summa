@@ -172,3 +172,32 @@ dim-major block-per-`(batch, channel)` layout with sequence-parallel
 threads — the mamba-ssm structure — would multiply global atomic traffic on
 `grad_B`/`grad_C` by the channel-tile width, which at 1536 channels costs
 more than the layout saves.
+
+## Warp-scan forward (measured, rejected)
+
+A single-launch replacement for the partials/carry/apply chain was
+implemented and measured: one warp per channel walking the sequence in
+128-step chunks, each lane composing four timesteps into a (decay,
+injection) transform, a Hillis-Steele shuffle scan stitching the lanes,
+`n`-at-a-time state loop, inputs staged once (vs. the chain reading the
+sequence twice). All parity suites passed. Measured (A100, same config):
+47,644 → 47,061 @B20 (−1.2%) and 48,871 → 48,203 @B26 (−1.4%) — rejected.
+The chain's two passes are pure independent per-thread recurrences with
+16-wide state ILP, no barriers, and no shared memory; the warp scan trades
+that for five dependent shuffle rounds per state per chunk plus three
+barriers per chunk, and the halved input traffic does not pay for the lost
+instruction-level parallelism. The softplus-in-kernel piece of the idea
+survives (previous section); the scan structure itself does not.
+
+## Register-carried reverse sweep
+
+The backward's stitched-carry machinery goes the same way: the adjoint
+partials and carry-fold kernels (and their `[batch, segments, channels,
+state]` round-trip tensors) are deleted. One block per `(batch, channel
+tile)` sweeps the segments right-to-left with the adjoint carried in a
+register — the exact reverse recurrence rather than a composed
+approximation — re-deriving each segment's states from its checkpoint as
+before. At production shape the grid still has thousands of independent
+blocks, which A100 measurements already showed is enough to prefer serial
+recurrence over stitching (`SERIAL_SCAN_MIN_BLOCKS`). `grad_A`/`grad_D`
+atomics fire once per kernel instead of once per segment.

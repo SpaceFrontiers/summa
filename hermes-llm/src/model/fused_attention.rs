@@ -265,6 +265,7 @@ where
 /// backend's accelerated matmuls while memory remains linear in sequence
 /// length for a fixed block size.
 #[cfg(feature = "training-fusion")]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn chunked_attention_backward<B: AttentionBackend>(
     query: FloatTensor<B>,
     key: FloatTensor<B>,
