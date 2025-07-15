@@ -119,6 +119,40 @@ recomputed from a materialized score matrix (test-scale shapes only).
 Measured (A100 40GB, retriever-100m, T1024/ga8, 2026-07-17): 43,217 →
 **44,044 tok/s** @B20 (+1.9%) and 44,201 → **45,077** @B26 (+2.0%), all
 parity gates green — the canonical 64/64 CPU-reference test now validates
-cubek's emitted LSE against CPU autodiff directly. This is steps 1–2 of the
-flash-backward arc; step 3 replaces the remaining backward GEMM chain with
-tiled dq/dkdv kernels composed from cubek-matmul components.
+cubek's emitted LSE against CPU autodiff directly. This was steps 1–2 of
+the flash-backward arc; step 3 (below) was measured and rejected.
+
+## Tensor-core flash backward (measured, rejected)
+
+Step 3 replaced the chunked backward's five GEMMs + materialized
+scores/P/dS with true FlashAttention-style backward kernels: a `D =
+rowsum(dO ⊙ O)` prepass, a query-outer dQ kernel, and a key-outer dK/dV
+kernel, all bf16 cmma (m16n16k16) against fp32 accumulators, staging
+operands through shared memory, recomputing `S`/`P` per tile from the
+forward LSE, never materializing a `[seq, seq]` tensor. Specialized to
+`head_dim == 64`, `seq % 64 == 0`, square self-attention (all production
+shapes); the fusion-layer arbitration fell back to the chunked path
+elsewhere. Kernels live in the cubek fork, branch `fwd-lse`, rev ee57892
+(`crates/cubek-attention/src/backward/launch/tiled.rs`) with CPU-reference
+tests (4/4 green on A100, n64/n128/n256, causal and dense).
+
+Measured (same box/config, 2026-07-17): 44,044 → **43,442** @B20 (−1.4%),
+45,077 → **44,248** @B26 (−1.8%). Rejected. Two compounding reasons:
+
+- The hand-rolled kernels run 4 planes (128 threads, ~25% occupancy by
+  shared memory) with scalar staging loads, no cp.async double-buffering,
+  and a per-tile fp32 shared-memory bounce with two plane-syncs between
+  cmma stages — well below the ~80%-of-peak cuBLAS GEMMs they replace,
+  which recompute nothing.
+- The traffic saving the flash structure buys is small here: the chunked
+  path already bounds materialization to pow2 sequence chunks, so at
+  seq 1024 the recoverable bandwidth is ~1–2% of step time, not enough to
+  amortize a 2–3× less efficient tensor-core inner loop.
+
+Closing the kernel-efficiency gap needs cutlass-grade work (8-plane
+128-row blocks, cp.async pipelines, vectorized staging, smem swizzling)
+for a ~1–2% end-to-end ceiling — poor EV against the remaining arcs. The
+hermes-side dispatch was reverted; the chunked backward (with LSE reuse)
+remains the production path. The kernels stay parked in the cubek fork
+should long-sequence configs (seq ≥ 4k, where materialization traffic
+dominates) ever matter.
