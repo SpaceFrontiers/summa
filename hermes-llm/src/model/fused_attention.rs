@@ -35,6 +35,10 @@ use super::matmul::{matmul_4, matmul_input};
     backend_extension(NdArray, Autodiff)
 )]
 pub trait AttentionBackend: Backend {
+    /// Returns `(output, saved_query, saved_key, saved_value, saved_output,
+    /// log_sum_exp)` — the LSE is the per-row softmax normalizer
+    /// (`[batch * heads, seq_q]`, FP32, scaled-score units) the backward
+    /// uses to recompute probabilities without a statistics pass.
     #[allow(clippy::type_complexity)]
     fn attention_inner(
         query: FloatTensor<Self>,
@@ -42,6 +46,7 @@ pub trait AttentionBackend: Backend {
         value: FloatTensor<Self>,
         causal: bool,
     ) -> (
+        FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -56,6 +61,7 @@ pub trait AttentionBackend: Backend {
         value: FloatTensor<Self>,
         output: FloatTensor<Self>,
         grad_output: FloatTensor<Self>,
+        log_sum_exp: FloatTensor<Self>,
         causal: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         panic!("custom attention only supports first-order autodiff")
@@ -75,6 +81,7 @@ pub trait AttentionBackend: Backend {
         scores: FloatTensor<Self>,
         grad_probabilities: FloatTensor<Self>,
         correction: FloatTensor<Self>,
+        log_sum_exp: FloatTensor<Self>,
         scale: f32,
         row_offset: usize,
         causal: bool,
@@ -140,7 +147,7 @@ fn causal_mask(sequence: usize, device: &Device) -> Tensor<4, Bool> {
         .reshape([1, 1, sequence, sequence])
 }
 
-fn attention_probabilities(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Tensor<4> {
+fn attention_scaled_scores(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Tensor<4> {
     let [_, query_heads, sequence, head_dim] = query.dims();
     let key = repeat_kv(key, query_heads);
     let mut scores = query
@@ -150,7 +157,20 @@ fn attention_probabilities(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Te
         let device = scores.device();
         scores = scores.mask_fill(causal_mask(sequence, &device), f32::NEG_INFINITY);
     }
-    softmax(scores, 3)
+    scores
+}
+
+fn attention_probabilities(query: Tensor<4>, key: Tensor<4>, causal: bool) -> Tensor<4> {
+    softmax(attention_scaled_scores(query, key, causal), 3)
+}
+
+/// Per-row softmax log-sum-exp of the scaled, masked scores, flattened to
+/// `[batch * heads, seq_q]` — the same convention the flash forward emits.
+fn attention_log_sum_exp(scores: Tensor<4>) -> Tensor<2> {
+    let [batch, heads, seq_q, _] = scores.dims();
+    let max = scores.clone().max_dim(3);
+    let sum = (scores - max.clone()).exp().sum_dim(3);
+    (sum.log() + max).reshape([batch * heads, seq_q])
 }
 
 #[allow(clippy::type_complexity)]
@@ -160,6 +180,7 @@ fn reference_attention<B: Backend>(
     value: FloatTensor<B>,
     causal: bool,
 ) -> (
+    FloatTensor<B>,
     FloatTensor<B>,
     FloatTensor<B>,
     FloatTensor<B>,
@@ -176,12 +197,23 @@ where
     let key = Tensor::<4>::from_primitive::<B>(key);
     let value = Tensor::<4>::from_primitive::<B>(value);
     let [_, query_heads, _, _] = query.dims();
-    let probabilities = attention_probabilities(query, key, causal);
+    let scores = attention_scaled_scores(query, key, causal);
+    let log_sum_exp = attention_log_sum_exp(scores.clone())
+        .try_into_primitive::<B>()
+        .expect("attention log-sum-exp stayed on its input backend");
+    let probabilities = softmax(scores, 3);
     let output = probabilities.matmul(repeat_kv(value, query_heads));
     let output = output
         .try_into_primitive::<B>()
         .expect("attention output stayed on its input backend");
-    (output.clone(), saved_query, saved_key, saved_value, output)
+    (
+        output.clone(),
+        saved_query,
+        saved_key,
+        saved_value,
+        output,
+        log_sum_exp,
+    )
 }
 
 fn reference_attention_backward<B: Backend>(
@@ -239,6 +271,7 @@ pub(super) fn chunked_attention_backward<B: AttentionBackend>(
     value: FloatTensor<B>,
     output: FloatTensor<B>,
     grad_output: FloatTensor<B>,
+    log_sum_exp: FloatTensor<B>,
     causal: bool,
     chunk_size: usize,
 ) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>)
@@ -330,6 +363,7 @@ where
                 correction
                     .try_into_primitive::<B>()
                     .expect("attention correction stayed on its input backend"),
+                log_sum_exp.clone(),
                 scale,
                 start,
                 causal,
@@ -382,6 +416,7 @@ macro_rules! impl_reference_attention {
                 FloatTensor<Self>,
                 FloatTensor<Self>,
                 FloatTensor<Self>,
+                FloatTensor<Self>,
             ) {
                 reference_attention::<Self>(query, key, value, causal)
             }
@@ -392,6 +427,7 @@ macro_rules! impl_reference_attention {
                 value: FloatTensor<Self>,
                 output: FloatTensor<Self>,
                 grad_output: FloatTensor<Self>,
+                _log_sum_exp: FloatTensor<Self>,
                 causal: bool,
             ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
                 reference_attention_backward::<Self>(query, key, value, output, grad_output, causal)
@@ -411,6 +447,7 @@ struct AttentionState<B: AttentionBackend> {
     key: FloatTensor<B>,
     value: FloatTensor<B>,
     output: FloatTensor<B>,
+    log_sum_exp: FloatTensor<B>,
     causal: bool,
 }
 
@@ -435,6 +472,7 @@ impl<B: AttentionBackend> Backward<B, 3> for AttentionBackward {
             state.value,
             state.output,
             grad_output,
+            state.log_sum_exp,
             state.causal,
         );
         for (node, grad) in [
@@ -461,6 +499,7 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
+        FloatTensor<Self>,
     ) {
         match AttentionBackward
             .prepare::<C>([query.node.clone(), key.node.clone(), value.node.clone()])
@@ -468,7 +507,7 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let (output, saved_query, saved_key, saved_value, saved_output) =
+                let (output, saved_query, saved_key, saved_value, saved_output, log_sum_exp) =
                     B::attention_inner(
                         query.primitive.clone(),
                         key.primitive.clone(),
@@ -480,6 +519,7 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
                     key: saved_key.clone(),
                     value: saved_value.clone(),
                     output: saved_output.clone(),
+                    log_sum_exp: log_sum_exp.clone(),
                     causal,
                 };
                 (
@@ -488,10 +528,11 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_key),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_value),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_output),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(log_sum_exp),
                 )
             }
             OpsKind::UnTracked(prep) => {
-                let (output, saved_query, saved_key, saved_value, saved_output) =
+                let (output, saved_query, saved_key, saved_value, saved_output, log_sum_exp) =
                     B::attention_inner(query.primitive, key.primitive, value.primitive, causal);
                 (
                     prep.finish(output),
@@ -499,6 +540,7 @@ impl<B: AttentionBackend, C: CheckpointStrategy> AttentionBackend for Autodiff<B
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_key),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_value),
                     <Self as burn::backend::AutodiffBackend>::from_inner(saved_output),
+                    <Self as burn::backend::AutodiffBackend>::from_inner(log_sum_exp),
                 )
             }
         }

@@ -96,3 +96,29 @@ their FP32 input dtypes at the launch boundary (a mismatched buffer was
 previously reinterpreted bit-for-bit — the BF16 stream's first failure mode),
 and the elementwise kernel takes an explicit element count instead of
 trusting `Tensor::len()`.
+
+## Forward LSE emission (landed)
+
+The flash forward now runs through cubek's `launch_ref_with_lse` directly
+(hermes depends on cubek; burn's module op has no LSE surface), emitting the
+per-row softmax log-sum-exp as a sixth saved tensor (`[batch * heads,
+seq_q]`, FP32, scaled-score units, natural log, exactly `-inf` on
+fully-masked rows). The cubek side (fork branch `fwd-lse`, rev b4fe978)
+threads an additive `execute_with_lse` path through the batch → global →
+stage layers; `BounceTile::store_row_lse` maps unit-local rows to absolute
+rows through the whitebox fragment layout, and the unit owning a row's
+first column writes after the cross-plane reductions synchronize the state.
+
+The chunked backward consumes the LSE instead of recomputing softmax
+statistics: `attention_softmax_stats` (a block-per-row reduction over every
+score chunk plus a sync boundary) is deleted, and the probabilities kernel
+computes `P = exp(score·scale − lse)` in one expression. Shapes the flash
+kernel rejects fall back to burn's tensor-op attention with the LSE
+recomputed from a materialized score matrix (test-scale shapes only).
+
+Measured (A100 40GB, retriever-100m, T1024/ga8, 2026-07-17): 43,217 →
+**44,044 tok/s** @B20 (+1.9%) and 44,201 → **45,077** @B26 (+2.0%), all
+parity gates green — the canonical 64/64 CPU-reference test now validates
+cubek's emitted LSE against CPU autodiff directly. This is steps 1–2 of the
+flash-backward arc; step 3 replaces the remaining backward GEMM chain with
+tiled dq/dkdv kernels composed from cubek-matmul components.

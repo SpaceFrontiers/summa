@@ -107,7 +107,7 @@ uuid = { version = "1.19", features = ["v4"] }
 # Keep Burn's CubeK dependency on the same strided-attention fix used directly
 # by hermes-llm.
 [patch."https://github.com/tracel-ai/cubek"]
-cubek = { git = "https://github.com/ppodolsky/cubek", rev = "058827ffef7231d48901983cbc1121f897ced752" }
+cubek = { git = "https://github.com/ppodolsky/cubek", rev = "b4fe9788a774c0f5e5af26122776b5bf4c8ee94d" }
 
 # Burn main still points at upstream CubeCL. Use our fork (allocation-retry
 # fix + asynchronous cuBLAS BF16 GEMM server dispatch) for Burn's direct

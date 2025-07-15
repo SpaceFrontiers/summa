@@ -10,6 +10,10 @@ use burn_cubecl::CubeBackend;
 use burn_cubecl::cubecl::{cuda::CudaRuntime, prelude::*};
 use burn_cubecl::kernel::attention::{AttentionStrategy, attention};
 use burn_cubecl::tensor::CubeTensor;
+use cubek::attention::forward::definition::{
+    AccumulatorPrecision, AttentionGlobalTypes, AttentionOptions,
+};
+use cubek::attention::forward::launch as cubek_launch;
 use cubek::attention::forward::routines::blackbox_accelerated::BlackboxAcceleratedStrategy;
 use half::bf16;
 
@@ -41,93 +45,13 @@ fn causal_mask_kernel(
 
 const SOFTMAX_THREADS: u32 = 256;
 
-/// Per-row online softmax statistics over the causally-visible prefix. The
-/// causal bound replaces any materialized mask, and the softmax scale is
-/// folded into the pass.
-#[allow(clippy::manual_div_ceil)]
-#[cube(launch)]
-fn attention_softmax_stats(
-    scores: &Tensor<f32>,
-    stats: &mut Tensor<f32>,
-    cols: u32,
-    chunk_rows: u32,
-    row_offset: u32,
-    scale: f32,
-    #[comptime] causal: bool,
-) {
-    let cols = cols as usize;
-    let chunk_rows = chunk_rows as usize;
-    let row = CUBE_POS_X as usize;
-    let lane = UNIT_POS_X as usize;
-    let threads = SOFTMAX_THREADS as usize;
-    let mut bound = cols;
-    if causal {
-        let visible = row % chunk_rows + row_offset as usize + 1;
-        if visible < cols {
-            bound = visible;
-        }
-    }
-    let base = row * cols;
-
-    let mut running_max = f32::cast_from(f32::NEG_INFINITY);
-    let mut running_sum = 0.0f32;
-    let iterations = (bound + threads - 1) / threads;
-    for i in 0..iterations {
-        let col = lane + i * threads;
-        if col < bound {
-            let x = scores[base + col] * scale;
-            if x > running_max {
-                running_sum = running_sum * (running_max - x).exp() + 1.0;
-                running_max = x;
-            } else {
-                running_sum += (x - running_max).exp();
-            }
-        }
-    }
-
-    let mut shared_max = Shared::new_slice(SOFTMAX_THREADS as usize);
-    let mut shared_sum = Shared::new_slice(SOFTMAX_THREADS as usize);
-    shared_max[lane] = running_max;
-    shared_sum[lane] = running_sum;
-    sync_cube();
-
-    #[unroll]
-    for level in 0..8 {
-        let stride = (SOFTMAX_THREADS as usize) >> (level + 1);
-        if lane < stride {
-            let m_a = shared_max[lane];
-            let s_a = shared_sum[lane];
-            let m_b = shared_max[lane + stride];
-            let s_b = shared_sum[lane + stride];
-            let m = if m_a > m_b { m_a } else { m_b };
-            // Lanes past the causal bound carry (-inf, 0); guard the exp so
-            // they combine as exact zeros instead of NaN.
-            let mut sum = 0.0f32;
-            if s_a > 0.0 {
-                sum += s_a * (m_a - m).exp();
-            }
-            if s_b > 0.0 {
-                sum += s_b * (m_b - m).exp();
-            }
-            shared_max[lane] = m;
-            shared_sum[lane] = sum;
-        }
-        sync_cube();
-    }
-
-    if lane == 0 {
-        stats[row * 2] = shared_max[0];
-        stats[row * 2 + 1] = shared_sum[0];
-    }
-}
-
 /// Emits softmax probabilities and score gradients for the backward chunk in
 /// one pass, both in BF16 for the following tensor-core matmuls. Positions
 /// past the causal bound receive exact zeros.
 #[cube(launch)]
 fn attention_backward_probabilities_kernel(
     scores: &Tensor<f32>,
-    stats: &Tensor<f32>,
+    log_sum_exp: &Tensor<f32>,
     grad_probabilities: &Tensor<f32>,
     correction: &Tensor<f32>,
     probabilities: &mut Tensor<bf16>,
@@ -153,9 +77,9 @@ fn attention_backward_probabilities_kernel(
             }
         }
         if col < bound {
-            let m = stats[row * 2];
-            let s = stats[row * 2 + 1];
-            let p = (scores[idx] * scale - m).exp() / s;
+            // Square attention: the LSE row stride equals the column count.
+            let lse_index = (row / chunk_rows) * cols + row_offset as usize + row % chunk_rows;
+            let p = (scores[idx] * scale - log_sum_exp[lse_index]).exp();
             let ds = p * (grad_probabilities[idx] - correction[row]) * scale;
             probabilities[idx] = bf16::cast_from(p);
             score_gradient[idx] = bf16::cast_from(ds);
@@ -164,6 +88,32 @@ fn attention_backward_probabilities_kernel(
             score_gradient[idx] = bf16::cast_from(0.0f32);
         }
     }
+}
+
+/// Log-sum-exp for the tensor-op fallback path: materializes the scaled,
+/// causally-masked score matrix and reduces it row-wise. Only runs at the
+/// small shapes the flash kernel rejects.
+fn fallback_log_sum_exp(
+    query: &CubeTensor<CudaRuntime>,
+    key: &CubeTensor<CudaRuntime>,
+    causal: bool,
+) -> CubeTensor<CudaRuntime> {
+    type B = CubeBackend<CudaRuntime>;
+    let [batch, heads, sequence, head_dim] = query.shape().dims();
+    let query = B::float_cast(query.clone(), FloatDType::F32);
+    let key = B::float_cast(key.clone(), FloatDType::F32);
+    let scores = B::float_matmul(query, B::float_swap_dims(key, 2, 3));
+    let scores = B::float_div_scalar(scores, ((head_dim as f32).sqrt()).into());
+    let scores = if causal {
+        <B as AttentionBackend>::attention_causal_mask(scores, 0)
+    } else {
+        scores
+    };
+    let max = B::float_max_dim(scores.clone(), 3);
+    let shifted = B::float_exp(B::float_sub(scores, max.clone()));
+    let sum = B::float_sum_dim(shifted, 3);
+    let log_sum_exp = B::float_add(B::float_log(sum), max);
+    B::float_reshape(log_sum_exp, Shape::new([batch * heads, sequence]))
 }
 
 fn dimensions(query: &CubeTensor<CudaRuntime>, key: &CubeTensor<CudaRuntime>) -> [usize; 4] {
@@ -185,6 +135,7 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         CubeTensor<CudaRuntime>,
         CubeTensor<CudaRuntime>,
         CubeTensor<CudaRuntime>,
+        CubeTensor<CudaRuntime>,
     ) {
         let output_dtype = query.dtype;
         let query = Self::float_cast(into_contiguous(query), FloatDType::F16);
@@ -193,43 +144,85 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         let [batch, heads, sequence, head_dim] = dimensions(&query, &key);
         assert_eq!(value.shape().dims(), [batch, heads, sequence, head_dim]);
 
-        let options = AttentionModuleOptions {
-            is_causal: causal,
-            ..Default::default()
+        // Flash forward through cubek directly so the kernel also emits the
+        // per-row log-sum-exp the backward needs; burn's module op has no
+        // LSE surface.
+        let device = query.device.clone();
+        let output = empty_like(&query, Shape::new([batch, heads, sequence, head_dim]));
+        let log_sum_exp = Self::float_empty(
+            Shape::new([batch * heads, sequence]),
+            &device,
+            FloatDType::F32,
+        );
+        let dtypes = AttentionGlobalTypes {
+            query: burn::backend::cubecl::dtype_to_storage_type(query.dtype),
+            key: burn::backend::cubecl::dtype_to_storage_type(key.dtype),
+            value: burn::backend::cubecl::dtype_to_storage_type(value.dtype),
+            mask: burn::backend::cubecl::dtype_to_storage_type(burn::tensor::DType::U8),
+            out: burn::backend::cubecl::dtype_to_storage_type(output.dtype),
         };
-        let output = attention(
-            query.clone(),
-            key.clone(),
-            value.clone(),
+        let flash = cubek_launch::launch_ref_with_lse::<CudaRuntime>(
+            cubek_launch::Strategy::BlackboxAccelerated(cubek_launch::BlueprintStrategy::Inferred(
+                BlackboxAcceleratedStrategy {
+                    num_planes: 4,
+                    seq_q: 1,
+                    seq_kv: 1,
+                },
+            )),
+            &query.client.clone(),
+            query.clone().binding(),
+            key.clone().binding(),
+            value.clone().binding(),
             None,
-            None,
-            options,
-            AttentionStrategy::FlashBlackboxAccelerated(BlackboxAcceleratedStrategy {
-                num_planes: 4,
-                seq_q: 1,
-                seq_kv: 1,
-            }),
-        )
-        .or_else(|_| {
-            attention(
-                query.clone(),
-                key.clone(),
-                value.clone(),
-                None,
-                None,
-                options,
-                AttentionStrategy::Fallback,
-            )
-        })
-        .expect("Burn attention fallback must support the validated Hermes shape");
+            output.clone().binding(),
+            log_sum_exp.clone().binding(),
+            &dtypes,
+            AttentionOptions {
+                causal,
+                accumulator_precision: AccumulatorPrecision::Strict(
+                    burn_cubecl::cubecl::ir::StorageType::Scalar(
+                        burn_cubecl::cubecl::ir::ElemType::Float(
+                            burn_cubecl::cubecl::ir::FloatKind::F32,
+                        ),
+                    ),
+                ),
+            },
+        );
+
+        let (output, log_sum_exp) = match flash {
+            Ok(()) => (output, log_sum_exp),
+            Err(_) => {
+                // Shapes the flash kernel rejects take burn's tensor-op
+                // fallback; the log-sum-exp is then recomputed from a
+                // materialized score matrix (test-scale shapes only).
+                let options = AttentionModuleOptions {
+                    is_causal: causal,
+                    ..Default::default()
+                };
+                let output = attention(
+                    query.clone(),
+                    key.clone(),
+                    value.clone(),
+                    None,
+                    None,
+                    options,
+                    AttentionStrategy::Fallback,
+                )
+                .expect("Burn attention fallback must support the validated Hermes shape");
+                let log_sum_exp = fallback_log_sum_exp(&query, &key, causal);
+                (output, log_sum_exp)
+            }
+        };
+
         let output_default = Self::float_cast(output.clone(), output_dtype.into());
-        (output_default, query, key, value, output)
+        (output_default, query, key, value, output, log_sum_exp)
     }
 
     fn attention_backward_probabilities(
         scores: CubeTensor<CudaRuntime>,
         grad_probabilities: CubeTensor<CudaRuntime>,
         correction: CubeTensor<CudaRuntime>,
+        log_sum_exp: CubeTensor<CudaRuntime>,
         scale: f32,
         row_offset: usize,
         causal: bool,
@@ -237,12 +230,14 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         let scores = into_contiguous(scores);
         let grad_probabilities = into_contiguous(grad_probabilities);
         let correction = into_contiguous(correction);
+        let log_sum_exp = into_contiguous(log_sum_exp);
         // The kernels read these buffers as raw FP32; a mismatched dtype is
         // reinterpreted bit-for-bit (NaN garbage), never an error downstream.
         for (name, tensor) in [
             ("scores", &scores),
             ("probability gradient", &grad_probabilities),
             ("correction", &correction),
+            ("log-sum-exp", &log_sum_exp),
         ] {
             assert_eq!(
                 tensor.dtype,
@@ -251,22 +246,14 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
             );
         }
         let [batch, heads, chunk_rows, cols] = scores.shape().dims();
+        assert_eq!(
+            log_sum_exp.shape().dims(),
+            [batch * heads, cols],
+            "attention backward LSE must be [batch * heads, seq] for square attention"
+        );
         let rows = batch * heads * chunk_rows;
         let client = scores.client.clone();
         let device = scores.device.clone();
-        let stats = empty_like(&scores, Shape::new([rows, 2]));
-        attention_softmax_stats::launch::<CudaRuntime>(
-            &client,
-            CubeCount::Static(rows as u32, 1, 1),
-            CubeDim::new_1d(SOFTMAX_THREADS),
-            scores.clone().into_tensor_arg(),
-            stats.clone().into_tensor_arg(),
-            cols as u32,
-            chunk_rows as u32,
-            row_offset as u32,
-            scale,
-            causal,
-        );
         let shape = Shape::new([batch, heads, chunk_rows, cols]);
         let probabilities = Self::float_empty(shape.clone(), &device, FloatDType::BF16);
         let score_gradient = Self::float_empty(shape, &device, FloatDType::BF16);
@@ -276,7 +263,7 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
             CubeCount::Static(total.div_ceil(SOFTMAX_THREADS), 1, 1),
             CubeDim::new_1d(SOFTMAX_THREADS),
             scores.into_tensor_arg(),
-            stats.into_tensor_arg(),
+            log_sum_exp.into_tensor_arg(),
             grad_probabilities.into_tensor_arg(),
             correction.into_tensor_arg(),
             probabilities.clone().into_tensor_arg(),

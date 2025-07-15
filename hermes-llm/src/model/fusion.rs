@@ -573,8 +573,17 @@ impl Operation<FusionCubeRuntime<CudaRuntime>> for AttentionForward {
         >,
     ) {
         type B = CubeBackend<CudaRuntime>;
-        let ([query, key, value], [output, saved_query, saved_key, saved_value, saved_output]) =
-            self.desc.as_fixed();
+        let (
+            [query, key, value],
+            [
+                output,
+                saved_query,
+                saved_key,
+                saved_value,
+                saved_output,
+                log_sum_exp,
+            ],
+        ) = self.desc.as_fixed();
         let result = B::attention_inner(
             handles.get_float_tensor::<B>(query),
             handles.get_float_tensor::<B>(key),
@@ -586,6 +595,7 @@ impl Operation<FusionCubeRuntime<CudaRuntime>> for AttentionForward {
         handles.register_float_tensor::<B>(&saved_key.id, result.2);
         handles.register_float_tensor::<B>(&saved_value.id, result.3);
         handles.register_float_tensor::<B>(&saved_output.id, result.4);
+        handles.register_float_tensor::<B>(&log_sum_exp.id, result.5);
     }
 }
 
@@ -605,12 +615,15 @@ impl Operation<FusionCubeRuntime<CudaRuntime>> for AttentionProbabilities {
         >,
     ) {
         type B = CubeBackend<CudaRuntime>;
-        let ([scores, grad_probabilities, correction], [probabilities_ir, score_gradient_ir]) =
-            self.desc.as_fixed();
+        let (
+            [scores, grad_probabilities, correction, log_sum_exp],
+            [probabilities_ir, score_gradient_ir],
+        ) = self.desc.as_fixed();
         let (probabilities, score_gradient) = B::attention_backward_probabilities(
             handles.get_float_tensor::<B>(scores),
             handles.get_float_tensor::<B>(grad_probabilities),
             handles.get_float_tensor::<B>(correction),
+            handles.get_float_tensor::<B>(log_sum_exp),
             self.scale,
             self.row_offset,
             self.causal,
@@ -632,17 +645,21 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
+        FloatTensor<Self>,
     ) {
         let client = query.client.clone();
         let shape = query.shape.clone();
         let dtype = query.dtype;
         let f16 = DType::F16;
+        let query_dims = shape.dims::<4>();
+        let lse_shape = Shape::new([query_dims[0] * query_dims[1], query_dims[2]]);
         let outputs = [
             TensorIr::uninit(client.create_empty_handle(), shape.clone(), dtype),
             TensorIr::uninit(client.create_empty_handle(), shape.clone(), f16),
             TensorIr::uninit(client.create_empty_handle(), key.shape.clone(), f16),
             TensorIr::uninit(client.create_empty_handle(), value.shape.clone(), f16),
             TensorIr::uninit(client.create_empty_handle(), shape, f16),
+            TensorIr::uninit(client.create_empty_handle(), lse_shape, DType::F32),
         ];
         let desc = CustomOpIr::with_scalars(
             "hermes_flash_attention",
@@ -650,15 +667,15 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
             &outputs,
             vec![ScalarIr::Bool(causal)],
         );
-        let [output, query, key, value, saved_output] = client
+        let [output, query, key, value, saved_output, log_sum_exp] = client
             .register(
                 StreamId::current(),
                 OperationIr::Custom(desc.clone()),
                 AttentionForward { desc, causal },
             )
             .try_into()
-            .expect("attention forward has five outputs");
-        (output, query, key, value, saved_output)
+            .expect("attention forward has six outputs");
+        (output, query, key, value, saved_output, log_sum_exp)
     }
 
     fn attention_backward(
@@ -667,6 +684,7 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
         value: FloatTensor<Self>,
         output: FloatTensor<Self>,
         grad_output: FloatTensor<Self>,
+        log_sum_exp: FloatTensor<Self>,
         causal: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         // Keep the recompute graph visible to Burn so its softmax correction,
@@ -677,6 +695,7 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
             value,
             output,
             grad_output,
+            log_sum_exp,
             causal,
             ATTENTION_BACKWARD_CHUNK_ROWS,
         )
@@ -686,6 +705,7 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
         scores: FloatTensor<Self>,
         grad_probabilities: FloatTensor<Self>,
         correction: FloatTensor<Self>,
+        log_sum_exp: FloatTensor<Self>,
         scale: f32,
         row_offset: usize,
         causal: bool,
@@ -701,6 +721,7 @@ impl AttentionBackend for Fusion<CubeBackend<CudaRuntime>> {
                 scores.into_ir(),
                 grad_probabilities.into_ir(),
                 correction.into_ir(),
+                log_sum_exp.into_ir(),
             ],
             &[probabilities, score_gradient],
             vec![
