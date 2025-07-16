@@ -1,6 +1,10 @@
-# hermes-mal (Python)
+# hermes-mal Python bindings
 
 PyO3 bindings for the Hermes Model Architecture Language (MAL) parser.
+
+The repository directory and Rust extension crate are named
+`hermes-mal-python`; the published Python distribution remains `hermes-mal`
+and its import module remains `hermes_mal`.
 
 This wheel is a thin wrapper around the Rust `hermes-mal` crate — the single
 source of truth for parsing `.mal` model definitions. It exposes one function:

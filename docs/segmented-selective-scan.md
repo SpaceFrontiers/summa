@@ -1,44 +1,31 @@
 # Segment-parallel selective scan
 
-The Mamba selective scan is a linear recurrence `h_t = α_t·h_{t-1} + β_t` with
-a diagonal state transition, so transitions compose associatively: a run of
-timesteps collapses to one `(decay, partial)` pair. The CUDA/Metal training
-kernels exploit this by cutting each sequence at the existing checkpoint
-boundaries (`CHECKPOINTED_SCAN_INTERVAL = 32`) and running every segment
-concurrently instead of walking the whole sequence serially per scan.
+## Current GPU training path
 
-## Forward (training, `save_states` path)
+- `selective_scan_forward_swept` launches one block per `(batch, channel
+tile)` and walks checkpoint segments left-to-right with the recurrent state
+  in registers. It reads each sequence input once and writes a state checkpoint
+  every `CHECKPOINTED_SCAN_INTERVAL = 32` tokens.
+- `selective_scan_backward_segmented` launches the same block ownership in
+  reverse. It carries the adjoint in registers, reconstructs each segment from
+  its entering checkpoint, and pre-reduces shared `B`/`C` gradients across the
+  channel tile before global atomics.
+- Training sequence I/O may be BF16, while recurrent state, checkpoints, and
+  parameter-gradient accumulation stay FP32. State widths are validated as
+  powers of two in `4..=16` at the GPU dispatch boundary.
 
-1. `selective_scan_forward_segment_partials` — one thread per
-   `(batch, segment, channel)`: scans its segment from a zero state, emitting
-   the segment's `partial` state and `decay = exp(A·Σdt)` (the exact product
-   of per-step decays for a diagonal `A`).
-2. `selective_scan_forward_segment_carry` — one thread per
-   `(batch, channel, n)`: serially folds the per-segment transitions into the
-   state _entering_ each segment. Touches `segments × state_dim` values per
-   scan — microseconds.
-3. `selective_scan_forward_segment_apply` — same grid as (1): re-runs each
-   segment from its stitched entering state, writing outputs, per-segment
-   checkpoints (the same tensor backward always consumed), and the final
-   state.
+Inference decode and prefill without saved states retain their dedicated FP32
+paths. There is no interval-1 training implementation.
 
-## Backward
+The sweep kernels use CubeCL fast-math (`ReducedPrecision | NotNaN | NotInf`),
+which lowers `exp` to the hardware `__expf`; state loops are unrolled so the
+16-wide recurrent state stays in registers.
 
-The adjoint recurrence `adj_{t-1} = (adj_t + dy_t·C_t)·α_t` is linear in
-`adj`, so the same trick applies right-to-left:
-`selective_scan_backward_segment_partials` + `_carry` stitch the adjoint
-across segments, then `selective_scan_backward_segmented` launches one block
-per `(batch, channel-tile, segment)` — the fused gradient kernel with the
-sequence walk replaced by a single segment and the incoming adjoint read from
-the carry. Gradients for `A`/`D` accumulate through the pre-existing atomics.
+## Historical optimization ledger
 
-Inference decode, prefill without saved states, and the small-batch
-full-state path (`checkpoint_interval == 1`) keep the serial/parallel/step
-kernels.
-
-The segment kernels run with CubeCL fast-math (`ReducedPrecision | NotNaN |
-NotInf`), which lowers `exp` to the hardware `__expf`; state loops are
-unrolled so the 16-wide recurrent state stays in registers.
+The sections below preserve the measured progression and rejected experiments.
+Names such as partials/carry/apply describe superseded implementations unless
+a later section explicitly says the change landed.
 
 ## Measured (A100 40GB, retriever-100m, B16/T1024/ga8, steps 5–8, 2026-07-16)
 

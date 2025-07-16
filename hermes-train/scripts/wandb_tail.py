@@ -14,8 +14,9 @@ Usage: WANDB_API_KEY=... wandb_tail.py <path/to/metrics.jsonl>
 
 import json
 import os
+import signal
 import sys
-import time
+import threading
 
 
 def main() -> int:
@@ -29,41 +30,71 @@ def main() -> int:
 
     import wandb  # deferred so a missing package never blocks training setup
 
+    project = os.environ.get("WANDB_PROJECT", "hermes-retriever")
     name = os.environ.get("WANDB_NAME", "retriever-100m")
+    run_id = os.environ.get("WANDB_RUN_ID", f"{name}-stage1")
     run = wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "hermes-retriever"),
+        project=project,
         name=name,
-        id=os.environ.get("WANDB_RUN_ID", f"{name}-stage1"),
+        id=run_id,
         resume="allow",
     )
 
-    last_step = run.step or 0
+    # `run.step` starts from zero in some W&B SDK versions even when attaching
+    # to an existing run. The public run record is authoritative and prevents
+    # a resumed reporter from attempting to emit thousands of duplicate steps.
+    remote_run = wandb.Api().run(f"{run.entity}/{project}/{run_id}")
+    last_step = max(run.step or 0, remote_run.lastHistoryStep or 0)
     position = 0
-    while True:
-        if not os.path.exists(path):
-            time.sleep(5)
-            continue
-        with open(path, encoding="utf-8") as handle:
-            handle.seek(position)
-            while True:
-                line = handle.readline()
-                if not line:
+    identity = None
+    stop = threading.Event()
+
+    def request_stop(_signum, _frame):
+        stop.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    try:
+        while not stop.is_set():
+            try:
+                stat = os.stat(path)
+            except FileNotFoundError:
+                stop.wait(5)
+                continue
+            current_identity = (stat.st_dev, stat.st_ino)
+            if current_identity != identity or stat.st_size < position:
+                # A restore may atomically replace or truncate metrics.jsonl.
+                # Re-read it; last_step filters the overlapping history.
+                identity = current_identity
+                position = 0
+            with open(path, encoding="utf-8") as handle:
+                handle.seek(position)
+                while True:
+                    line_position = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        position = handle.tell()
+                        break
+                    if not line.endswith("\n"):
+                        # Partial write: re-read this line on the next pass.
+                        position = line_position
+                        break
                     position = handle.tell()
-                    break
-                if not line.endswith("\n"):
-                    # Partial write: re-read this line on the next pass.
-                    break
-                position = handle.tell()
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                step = int(record.get("step", 0))
-                if step <= last_step:
-                    continue  # already logged before a resume/backfill overlap
-                wandb.log(record, step=step)
-                last_step = step
-        time.sleep(5)
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    raw_step = record.get("step")
+                    if not isinstance(raw_step, int) or isinstance(raw_step, bool):
+                        continue
+                    step = raw_step
+                    if step <= last_step:
+                        continue  # already logged before a resume/backfill overlap
+                    wandb.log(record, step=step)
+                    last_step = step
+            stop.wait(5)
+    finally:
+        run.finish()
 
 
 if __name__ == "__main__":

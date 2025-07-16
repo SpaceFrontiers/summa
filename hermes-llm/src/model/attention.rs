@@ -153,9 +153,16 @@ impl MultiHeadAttention {
         (q, k, v)
     }
 
-    /// Scaled-dot-product attention over K/V ([B, H, T, hd]) for queries at
-    /// global positions `q_start..q_start+S`. Applies causal + window masking.
-    fn sdpa(&self, q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, q_start: usize) -> Tensor<4> {
+    /// Scaled-dot-product attention over K/V ([B, H, T, hd]) for queries and
+    /// keys at their respective global offsets. Applies causal + window masking.
+    fn sdpa(
+        &self,
+        q: Tensor<4>,
+        k: Tensor<4>,
+        v: Tensor<4>,
+        q_start: usize,
+        key_start: usize,
+    ) -> Tensor<4> {
         let device = q.device();
         let [_, _, seq_q, _] = q.dims();
         let total = k.dims()[2];
@@ -165,7 +172,7 @@ impl MultiHeadAttention {
             let mut scores = q
                 .matmul(k.transpose())
                 .div_scalar((self.head_dim as f32).sqrt());
-            if let Some(mask) = self.build_mask(seq_q, total, q_start, &device) {
+            if let Some(mask) = self.build_mask(seq_q, total, q_start, key_start, &device) {
                 scores = scores.mask_fill(mask, f32::NEG_INFINITY);
             }
             let weights = self.attention_dropout.forward(softmax(scores, 3));
@@ -174,14 +181,14 @@ impl MultiHeadAttention {
 
         // Full-sequence attention has a custom fused backward on CUDA. Cached,
         // offset, and sliding-window attention retain Burn's mask-capable path.
-        let fused_causal =
-            self.causal && self.window_size.is_none() && q_start == 0 && seq_q == total;
+        let aligned_full_sequence = q_start == key_start && seq_q == total;
+        let fused_causal = self.causal && self.window_size.is_none() && aligned_full_sequence;
         let mask = if fused_causal {
             None
         } else {
-            self.build_mask(seq_q, total, q_start, &device)
+            self.build_mask(seq_q, total, q_start, key_start, &device)
         };
-        if mask.is_none() && q_start == 0 && seq_q == total {
+        if mask.is_none() && aligned_full_sequence {
             fused_attention(q, k, v, fused_causal)
         } else {
             attention(
@@ -200,16 +207,18 @@ impl MultiHeadAttention {
     }
 
     /// Bool mask [1, 1, S, T] (true = blocked), or None when nothing is masked.
-    /// Position `q_start + i` (query row i) attends to key j in `0..T`.
+    /// Position `q_start + i` (query row i) attends to position
+    /// `key_start + j` (key column j).
     fn build_mask(
         &self,
         seq_q: usize,
         total: usize,
         q_start: usize,
+        key_start: usize,
         device: &Device,
     ) -> Option<Tensor<4, Bool>> {
-        let needs =
-            (self.causal && total > q_start + 1) || (self.window_size.is_some() && total > 1);
+        let last_key = key_start + total.saturating_sub(1);
+        let needs = (self.causal && last_key > q_start) || self.window_size.is_some();
         if !needs {
             return None;
         }
@@ -217,10 +226,11 @@ impl MultiHeadAttention {
         for i in 0..seq_q {
             let gi = q_start + i;
             for j in 0..total {
-                let causal_block = self.causal && j > gi;
+                let gj = key_start + j;
+                let causal_block = self.causal && gj > gi;
                 let window_block = self
                     .window_size
-                    .map(|w| gi.saturating_sub(j) > w || j.saturating_sub(gi) > w)
+                    .map(|window| gi.abs_diff(gj) > window)
                     .unwrap_or(false);
                 mask[i * total + j] = causal_block || window_block;
             }
@@ -238,7 +248,7 @@ impl MultiHeadAttention {
     /// Full (stateless) attention over the given sequence.
     pub fn forward(&self, x: Tensor<3>, rope: &RotaryEncoding, start_pos: usize) -> Tensor<3> {
         let (q, k, v) = self.project_qkv(x, rope, start_pos);
-        let out = self.sdpa(q, k, v, start_pos);
+        let out = self.sdpa(q, k, v, start_pos, start_pos);
         // The output projection joins the training residual stream directly
         // in the matmul compute dtype; decode (`forward_cached`) keeps the
         // FP32 promotion for its FP32 stream.
@@ -294,7 +304,7 @@ impl MultiHeadAttention {
         cache.v = Some(v_cache);
         cache.len = end;
 
-        let out = self.sdpa(q, k, v, start_pos);
+        let out = self.sdpa(q, k, v, start_pos, 0);
         linear(&self.o_proj, self.merge_heads(out))
     }
 }

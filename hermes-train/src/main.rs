@@ -1,27 +1,26 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail, ensure};
-use burn::module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param, ParamId};
-use burn::tensor::{Device, Int, Tensor, TensorData};
-use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer};
+use anyhow::{Result, bail, ensure};
+use burn::module::{Module, ModuleVisitor, Param};
+use burn::tensor::Tensor;
+use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
 use clap::{Parser, Subcommand, ValueEnum};
-use hermes_llm::{ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors};
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
-use serde::{Deserialize, Serialize};
+use hermes_llm::{ModelDef, Tokenizer, Transformer, load_safetensors};
 
+mod checkpoint;
+mod data;
 mod muon;
 
+use checkpoint::{
+    AdamWOptimizer, TrainingState, load_training_state, parameter_ids, save_training_checkpoint,
+};
+use data::{count_samples, make_batch, visit_samples};
 use muon::BatchedMuon;
 
-type AdamWOptimizer = ModuleOptimizer;
-
 const MUON_LR_SCALE: f64 = 20.0;
-const TOKENIZE_BATCH: usize = 1_000;
 
 #[derive(Parser)]
 #[command(name = "hermes-train", about = "Hermes model training")]
@@ -91,254 +90,11 @@ struct TrainArgs {
     seed: u64,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-struct TrainingState {
-    step: usize,
-    stage: usize,
-    epoch: usize,
-    samples_in_stage: usize,
-    parameter_ids: Vec<u64>,
-}
-
 fn load_config(path: &Path) -> Result<ModelDef> {
     if path.extension().is_some_and(|ext| ext == "mal") {
         return hermes_llm::parse_mal_file(path);
     }
     ModelDef::from_json(path)
-}
-
-fn open_data(path: &Path) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open training data {}", path.display()))?;
-    if path.extension().is_some_and(|ext| ext == "zst") {
-        let decoder = zstd::stream::read::Decoder::new(file)
-            .with_context(|| format!("failed to open zstd stream {}", path.display()))?;
-        Ok(Box::new(BufReader::new(decoder)))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
-}
-
-struct ShuffleBuffer {
-    samples: Vec<Vec<i64>>,
-    rng: StdRng,
-    capacity: usize,
-}
-
-impl ShuffleBuffer {
-    fn new(capacity: usize, seed: u64) -> Self {
-        assert!(capacity > 0);
-        Self {
-            samples: Vec::with_capacity(capacity),
-            rng: StdRng::seed_from_u64(seed),
-            capacity,
-        }
-    }
-
-    fn push(&mut self, sample: Vec<i64>) -> Option<Vec<i64>> {
-        if self.samples.len() < self.capacity {
-            self.samples.push(sample);
-            return None;
-        }
-        let index = self.rng.random_range(0..self.samples.len());
-        Some(std::mem::replace(&mut self.samples[index], sample))
-    }
-
-    fn finish(mut self) -> Vec<Vec<i64>> {
-        self.samples.shuffle(&mut self.rng);
-        self.samples
-    }
-}
-
-struct SamplePacker {
-    pending: Vec<i64>,
-    consumed: usize,
-    seq_len: usize,
-}
-
-impl SamplePacker {
-    fn new(seq_len: usize) -> Self {
-        Self {
-            pending: Vec::new(),
-            consumed: 0,
-            seq_len,
-        }
-    }
-
-    fn push(
-        &mut self,
-        tokens: impl IntoIterator<Item = i64>,
-        count: &mut usize,
-        visit: &mut impl FnMut(Vec<i64>) -> Result<bool>,
-    ) -> Result<bool> {
-        if self.consumed > 0 {
-            self.pending.drain(..self.consumed);
-            self.consumed = 0;
-        }
-        self.pending.extend(tokens);
-        while self.pending.len() - self.consumed > self.seq_len {
-            let end = self.consumed + self.seq_len + 1;
-            let sample = self.pending[self.consumed..end].to_vec();
-            self.consumed += self.seq_len;
-            *count += 1;
-            if !visit(sample)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-}
-
-fn push_documents(
-    documents: &mut Vec<String>,
-    tokenizer: &Tokenizer,
-    packer: &mut SamplePacker,
-    count: &mut usize,
-    visit: &mut impl FnMut(Vec<i64>) -> Result<bool>,
-) -> Result<bool> {
-    if documents.is_empty() {
-        return Ok(true);
-    }
-    let encodings = tokenizer.encode_batch(std::mem::take(documents), false)?;
-    for tokens in encodings {
-        let tokens = tokens
-            .into_iter()
-            .map(i64::from)
-            .chain(std::iter::once(i64::from(tokenizer.eos_token_id())));
-        if !packer.push(tokens, count, visit)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Pack the EOS-joined token stream into fixed-length next-token samples.
-fn visit_samples_in_order(
-    path: &Path,
-    tokenizer: &Tokenizer,
-    seq_len: usize,
-    mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
-) -> Result<usize> {
-    ensure!(seq_len > 0, "seq_len must be positive");
-    let mut count = 0;
-    let mut packer = SamplePacker::new(seq_len);
-    let is_jsonl = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"));
-    let mut reader = open_data(path)?;
-    if is_jsonl {
-        let mut documents = Vec::with_capacity(TOKENIZE_BATCH);
-        let mut line = String::new();
-        let mut line_number = 0;
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            line_number += 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_str(&line)
-                .with_context(|| format!("invalid JSONL at {}:{line_number}", path.display()))?;
-            let document = value
-                .get("text")
-                .and_then(|value| value.as_str())
-                .with_context(|| {
-                    format!(
-                        "JSONL row at {}:{line_number} must contain a string `text` field",
-                        path.display()
-                    )
-                })?;
-            documents.push(document.to_owned());
-            if documents.len() == TOKENIZE_BATCH
-                && !push_documents(
-                    &mut documents,
-                    tokenizer,
-                    &mut packer,
-                    &mut count,
-                    &mut visit,
-                )?
-            {
-                return Ok(count);
-            }
-        }
-        if !push_documents(
-            &mut documents,
-            tokenizer,
-            &mut packer,
-            &mut count,
-            &mut visit,
-        )? {
-            return Ok(count);
-        }
-    } else {
-        let mut document = String::new();
-        reader.read_to_string(&mut document)?;
-        if !push_documents(
-            &mut vec![document],
-            tokenizer,
-            &mut packer,
-            &mut count,
-            &mut visit,
-        )? {
-            return Ok(count);
-        }
-    }
-    Ok(count)
-}
-
-fn visit_samples(
-    path: &Path,
-    tokenizer: &Tokenizer,
-    seq_len: usize,
-    shuffle_buffer: usize,
-    seed: u64,
-    mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
-) -> Result<usize> {
-    if shuffle_buffer == 0 {
-        return visit_samples_in_order(path, tokenizer, seq_len, visit);
-    }
-
-    let mut shuffler = ShuffleBuffer::new(shuffle_buffer, seed);
-    let mut keep_going = true;
-    let count = visit_samples_in_order(path, tokenizer, seq_len, |sample| {
-        if let Some(sample) = shuffler.push(sample) {
-            keep_going = visit(sample)?;
-        }
-        Ok(keep_going)
-    })?;
-
-    if keep_going {
-        for sample in shuffler.finish() {
-            if !visit(sample)? {
-                break;
-            }
-        }
-    }
-    Ok(count)
-}
-
-fn count_samples(path: &Path, tokenizer: &Tokenizer, seq_len: usize) -> Result<usize> {
-    visit_samples_in_order(path, tokenizer, seq_len, |_| Ok(true))
-}
-
-fn make_batch(
-    samples: &[Vec<i64>],
-    seq_len: usize,
-    device: &Device,
-) -> (Tensor<2, Int>, Tensor<2, Int>) {
-    let mut inputs = Vec::with_capacity(samples.len() * seq_len);
-    let mut targets = Vec::with_capacity(samples.len() * seq_len);
-    for sample in samples {
-        inputs.extend_from_slice(&sample[..seq_len]);
-        targets.extend_from_slice(&sample[1..]);
-    }
-    (
-        Tensor::from_data(TensorData::new(inputs, [samples.len(), seq_len]), device),
-        Tensor::from_data(TensorData::new(targets, [samples.len(), seq_len]), device),
-    )
 }
 
 struct SquaredGradientNorm<'a> {
@@ -428,100 +184,36 @@ fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
     min_lr + cosine * (args.lr - min_lr)
 }
 
-fn parameter_ids(model: &Transformer) -> Vec<u64> {
-    burn::module::list_param_ids(model)
-        .into_iter()
-        .map(|id| id.val())
-        .collect()
-}
-
-struct ParameterIdMapper<'a> {
-    ids: std::slice::Iter<'a, u64>,
-}
-
-impl ModuleMapper for ParameterIdMapper<'_> {
-    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
-        let (_, tensor, mapper) = param.consume();
-        let id = self
-            .ids
-            .next()
-            .copied()
-            .expect("checkpoint contains too few parameter IDs");
-        Param::from_mapped_value(ParamId::from(id), tensor, mapper)
-    }
-}
-
-fn restore_parameter_ids(model: &mut Transformer, ids: &[u64]) -> Result<()> {
+fn validate_train_args(args: &TrainArgs) -> Result<()> {
     ensure!(
-        ids.len() == burn::module::list_param_ids(model).len(),
-        "checkpoint has {} parameter IDs, model has {}",
-        ids.len(),
-        burn::module::list_param_ids(model).len()
+        !args.data.is_empty(),
+        "at least one data source is required"
     );
-    let mut mapper = ParameterIdMapper { ids: ids.iter() };
-    *model = model.clone().map(&mut mapper);
-    ensure!(
-        mapper.ids.next().is_none(),
-        "checkpoint contains too many parameter IDs"
-    );
-    Ok(())
-}
-
-fn save_training_checkpoint(
-    model: &Transformer,
-    adamw: &AdamWOptimizer,
-    muon: &BatchedMuon,
-    state: &TrainingState,
-    output: &Path,
-) -> Result<()> {
-    let marker = output.join(".checkpoint-in-progress");
-    let weights_temporary = output.join("weights.safetensors.tmp");
-    let adamw_temporary = output.join("adamw-state.bpk.tmp");
-    let muon_temporary = output.join("muon-state.bpk.tmp");
-    let state_temporary = output.join("training-state.json.tmp");
-
-    fs::write(&marker, state.step.to_string())?;
-    save_safetensors(&model.clone().valid(), &weights_temporary)?;
-    adamw
-        .save(&adamw_temporary)
-        .context("failed to save AdamW state")?;
-    muon.save(&muon_temporary)?;
-    fs::write(&state_temporary, serde_json::to_vec_pretty(&state)?)?;
-    fs::rename(weights_temporary, output.join("weights.safetensors"))?;
-    fs::rename(adamw_temporary, output.join("adamw-state.bpk"))?;
-    fs::rename(muon_temporary, output.join("muon-state.bpk"))?;
-    fs::rename(state_temporary, output.join("training-state.json"))?;
-    fs::remove_file(marker)?;
-    Ok(())
-}
-
-fn load_training_state(
-    model: &mut Transformer,
-    adamw: AdamWOptimizer,
-    muon: &mut BatchedMuon,
-    output: &Path,
-    device: &Device,
-) -> Result<(AdamWOptimizer, TrainingState)> {
-    ensure!(
-        !output.join(".checkpoint-in-progress").exists(),
-        "checkpoint was interrupted while being saved"
-    );
-    let state: TrainingState =
-        serde_json::from_slice(&fs::read(output.join("training-state.json"))?)?;
-    restore_parameter_ids(model, &state.parameter_ids)?;
-    load_safetensors(model, output.join("weights.safetensors"))?;
-    muon.set_parameter_ids(model.muon_parameter_ids());
-    muon.load(output.join("muon-state.bpk"), &device.clone().inner())?;
-    let adamw = adamw
-        .load(output.join("adamw-state.bpk"))
-        .context("failed to load AdamW state")?;
-    Ok((adamw, state))
-}
-
-fn train(args: TrainArgs) -> Result<()> {
     ensure!(args.batch_size > 0, "batch_size must be positive");
     ensure!(args.grad_accum > 0, "grad_accum must be positive");
     ensure!(args.epochs > 0, "epochs must be positive");
+    ensure!(args.seq_len > 0, "seq_len must be positive");
+    ensure!(
+        args.lr.is_finite() && args.lr > 0.0,
+        "lr must be finite and positive"
+    );
+    ensure!(
+        args.weight_decay.is_finite() && args.weight_decay >= 0.0,
+        "weight_decay must be finite and non-negative"
+    );
+    ensure!(
+        args.grad_clip.is_finite() && args.grad_clip >= 0.0,
+        "grad_clip must be finite and non-negative"
+    );
+    ensure!(
+        args.max_steps.is_none_or(|steps| steps > 0),
+        "max_steps must be positive when set"
+    );
+    Ok(())
+}
+
+fn train(args: TrainArgs) -> Result<()> {
+    validate_train_args(&args)?;
 
     let tokenizer = Tokenizer::from_file(&args.tokenizer)?;
     let mut config = load_config(&args.config)?;
@@ -842,8 +534,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use burn::module::{AutodiffModule, ParamId};
+    use burn::tensor::{Int, TensorData};
     use hermes_llm::get_builtin_model;
-    use std::io::Cursor;
 
     use super::*;
 
@@ -863,6 +556,51 @@ mod tests {
             block.ffn.hidden_dim = Some(16);
         }
         config
+    }
+
+    fn valid_train_args() -> TrainArgs {
+        TrainArgs {
+            config: "config.mal".into(),
+            tokenizer: "tokenizer.json".into(),
+            data: vec!["corpus.jsonl".into()],
+            shuffle_buffer: 8,
+            output: "checkpoint".into(),
+            batch_size: 2,
+            grad_accum: 1,
+            epochs: 1,
+            seq_len: 8,
+            lr: 3e-4,
+            weight_decay: 0.1,
+            grad_clip: 1.0,
+            warmup_steps: 10,
+            schedule: Schedule::Wsd,
+            max_steps: Some(1),
+            checkpoint_every: 0,
+            checkpoint: None,
+            resume: false,
+            seed: 0,
+        }
+    }
+
+    #[test]
+    fn invalid_numeric_training_arguments_fail_before_loading_files() {
+        type Invalidate = fn(&mut TrainArgs);
+        let cases: [(&str, Invalidate); 8] = [
+            ("batch_size", |args| args.batch_size = 0),
+            ("grad_accum", |args| args.grad_accum = 0),
+            ("epochs", |args| args.epochs = 0),
+            ("seq_len", |args| args.seq_len = 0),
+            ("lr", |args| args.lr = f64::NAN),
+            ("weight_decay", |args| args.weight_decay = -0.1),
+            ("grad_clip", |args| args.grad_clip = f32::INFINITY),
+            ("max_steps", |args| args.max_steps = Some(0)),
+        ];
+        for (field, invalidate) in cases {
+            let mut args = valid_train_args();
+            invalidate(&mut args);
+            let err = validate_train_args(&args).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
     }
 
     #[test]
@@ -986,60 +724,5 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
         assert!(max_diff < 1e-6, "checkpoint max diff: {max_diff}");
-    }
-
-    #[test]
-    fn zstd_data_reader_streams_decompressed_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.jsonl.zst");
-        let source = b"{\"text\":\"one\"}\n{\"text\":\"two\"}\n";
-        let compressed = zstd::stream::encode_all(Cursor::new(source), 1).unwrap();
-        fs::write(&path, compressed).unwrap();
-
-        let mut reader = open_data(&path).unwrap();
-        let mut decoded = String::new();
-        reader.read_to_string(&mut decoded).unwrap();
-        assert_eq!(decoded.as_bytes(), source);
-    }
-
-    #[test]
-    fn streaming_shuffle_is_bounded_and_deterministic() {
-        let shuffle = |seed| {
-            let mut buffer = ShuffleBuffer::new(4, seed);
-            let mut output = Vec::new();
-            for value in 0..32_i64 {
-                if let Some(sample) = buffer.push(vec![value]) {
-                    output.push(sample[0]);
-                }
-                assert!(buffer.samples.len() <= 4);
-            }
-            output.extend(buffer.finish().into_iter().map(|sample| sample[0]));
-            output
-        };
-
-        let first = shuffle(7);
-        assert_eq!(first, shuffle(7));
-        assert_ne!(first, (0..32_i64).collect::<Vec<_>>());
-        let mut sorted = first;
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..32_i64).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn sample_packer_joins_documents_without_dropping_tokens() {
-        let mut packer = SamplePacker::new(3);
-        let mut samples = Vec::new();
-        let mut count = 0;
-        let mut collect = |sample| {
-            samples.push(sample);
-            Ok(true)
-        };
-
-        for document in [vec![1, 2, 0], vec![3, 4, 0], vec![5, 6, 0]] {
-            assert!(packer.push(document, &mut count, &mut collect).unwrap());
-        }
-
-        assert_eq!(count, 2);
-        assert_eq!(samples, [vec![1, 2, 0, 3], vec![3, 4, 0, 5]]);
     }
 }

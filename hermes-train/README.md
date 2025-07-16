@@ -67,3 +67,41 @@ Outputs are deliberately minimal:
 The checkpoint loads directly in `hermes-llm` with strict tensor and shape
 validation. Experiment services such as W&B can tail `metrics.jsonl` without
 being linked into the training process.
+
+## Reliable relaunch and W&B
+
+[`scripts/relaunch.sh`](scripts/relaunch.sh) is the boot-safe supervisor for
+long-running or spot-instance jobs. It owns `--output` and automatically adds
+`--resume` only when all model, AdamW, Muon, and training-state files form a
+complete checkpoint. A lock makes repeated boot hooks idempotent, failed
+trainer processes are relaunched after a configurable delay, and termination
+attempts one final remote sync.
+
+Remote backups use either `gs://` (through `gcloud storage`) or `file://`.
+Checkpoints are uploaded to an immutable `checkpoints/<step>/` directory and
+`latest.json` is published last. On boot, a newer complete remote checkpoint
+is restored, while a newer persistent-disk checkpoint is never overwritten by
+an older backup. The first sync migrates the earlier flat `gcloud rsync`
+layout automatically. An interrupted local checkpoint is not resumed unless a
+complete remote copy can replace it.
+
+Copy and edit the example configuration, then run the supervisor as the same
+user that owns the training files:
+
+```bash
+cp hermes-train/scripts/relaunch.conf.example /opt/hermes-run/relaunch.conf
+hermes-train/scripts/relaunch.sh /opt/hermes-run/relaunch.conf
+```
+
+For boot and process supervision, use that command as `ExecStart` in a systemd
+service with `Restart=on-failure`, or from an `@reboot` cron entry. The script
+itself keeps the trainer alive after ordinary process failures, so systemd is
+mainly protection for the supervisor and machine lifecycle.
+
+Set `HERMES_TRAIN_WANDB_ENV` and `HERMES_TRAIN_WANDB_PYTHON` in the run
+configuration to supervise [`scripts/wandb_tail.py`](scripts/wandb_tail.py)
+with the trainer. The environment file should be mode 600 and contain the API
+key plus a stable `WANDB_RUN_ID`; the reporter then backfills `metrics.jsonl`,
+survives file replacement during restore, and reconnects to the same run after
+every restart. W&B configuration is validated before training starts so a
+requested reporter cannot silently disappear.

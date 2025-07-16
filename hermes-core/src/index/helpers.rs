@@ -1,7 +1,7 @@
 //! Indexing helper functions
 //!
 //! This module provides high-level helper functions for creating indexes
-//! and indexing documents, used by hermes-tool, hermes-server, and hermes-core-python.
+//! and indexing documents, used by `hermes-tool` and `hermes-server`.
 
 use std::io::BufRead;
 use std::path::Path;

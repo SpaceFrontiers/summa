@@ -1,0 +1,43 @@
+# Trusted Bash configuration for scripts/relaunch.sh.
+# Keep credentials out of this file; point HERMES_TRAIN_WANDB_ENV at a mode-600
+# file containing `WANDB_API_KEY=...` and the non-secret W&B run settings.
+
+HERMES_TRAIN_OUTPUT=/opt/hermes-run/checkpoint
+HERMES_TRAIN_STATE_DIR=/opt/hermes-run/relaunch-state
+HERMES_TRAIN_REMOTE_URL=gs://example-training-bucket/retriever-100m-stage1
+
+# `--output` and `--resume` are owned by relaunch.sh and must not appear here.
+HERMES_TRAIN_COMMAND=(
+  /opt/hermes-run/bin/hermes-train
+  train
+  --config /opt/hermes-run/retriever-100m.json
+  --tokenizer /opt/hermes-run/tokenizer.json
+  --data /opt/hermes-run/corpus/stage1.jsonl.zst
+  --batch-size 6
+  --grad-accum 22
+  --seq-len 4096
+  --epochs 2
+  --max-steps 19000
+  --checkpoint-every 100
+)
+
+# A failed trainer is resumed indefinitely by default. Set a positive value to
+# stop after that many retries so a boot-time service can apply its own policy.
+HERMES_TRAIN_RESTART_DELAY=30
+HERMES_TRAIN_MAX_RESTARTS=0
+
+# A complete checkpoint is published under checkpoints/<step>/ and latest.json
+# is updated last. The interval also controls retries after a cloud error.
+HERMES_TRAIN_SYNC_INTERVAL=900
+
+# Install W&B once in this virtual environment; relaunch.sh deliberately never
+# installs packages or prints credentials during a boot.
+HERMES_TRAIN_WANDB_ENV=/opt/hermes-run/wandb.env
+HERMES_TRAIN_WANDB_PYTHON=/opt/hermes-run/wandb-venv/bin/python
+
+# Example /opt/hermes-run/wandb.env (chmod 600):
+# WANDB_API_KEY=replace-me
+# WANDB_ENTITY=space-frontiers
+# WANDB_PROJECT=hermes-retriever
+# WANDB_NAME=retriever-100m
+# WANDB_RUN_ID=retriever-100m-stage1

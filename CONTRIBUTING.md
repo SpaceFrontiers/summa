@@ -42,7 +42,8 @@ cargo test --all-features
 | `cargo fmt --all`                                          | Format all Rust code     |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Run lints                |
 | `cd hermes-wasm && wasm-pack build --release --target web` | Build WASM package       |
-| `cd hermes-core-python && maturin build --release`         | Build Python wheel       |
+| `cd hermes-client-python && uv build`                      | Build Python gRPC client |
+| `cd hermes-mal-python && maturin build --release`          | Build MAL Python binding |
 | `pre-commit run --all-files`                               | Run all pre-commit hooks |
 
 ## Project Structure
@@ -54,11 +55,16 @@ cargo test --all-features
 | **hermes-tool**          | CLI for index management and data processing pipelines                                     |
 | **hermes-wasm**          | WebAssembly bindings for browser-based search                                              |
 | **hermes-web**           | Vue.js web UI                                                                              |
-| **hermes-llm**           | LLM training framework built on Candle ML                                                  |
+| **hermes-mal**           | Model Architecture Language parser and well-known definitions                              |
+| **hermes-mal-python**    | Thin PyO3 binding around the shared `hermes-mal` parser                                    |
+| **hermes-llm**           | Burn-based shared model, inference, generation, and accelerator kernels                    |
+| **hermes-train**         | Autodiff training for the same `hermes-llm` model and safetensors checkpoints              |
 | **hermes-proto**         | Protocol Buffer definitions for gRPC services                                              |
 | **hermes-client-python** | Python gRPC client library                                                                 |
 
-For a deeper look at the core architecture, see `CLAUDE.md`.
+For a deeper look at the core architecture, see `CLAUDE.md`. The shared LLM
+stack is mapped in `docs/llm-code-map.md`; temporary GPU forks and their
+upstream exit criteria live in `docs/forked-dependencies.md`.
 
 ## Submitting Pull Requests
 

@@ -7,7 +7,7 @@ use burn::tensor::Int;
 use burn_nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
 
-use crate::mal::{BlockDef, ModelDef, PositionEncoding};
+use crate::mal::{BlockDef, ModelDef, NormConfig, PositionEncoding};
 
 use super::linear_cross_entropy::linear_cross_entropy;
 use super::matmul::{matmul_2, matmul_input, prepare_linear_for_inference, stream_cast};
@@ -15,6 +15,125 @@ use super::{InferenceState, Norm, TransformerBlock};
 
 const EMBEDDING_STD: f64 = 0.02;
 const LOSS_CHUNKS: usize = 4;
+
+fn validate_norm(name: &str, norm: &NormConfig) -> Result<()> {
+    if norm.eps != 0.0 && (!norm.eps.is_finite() || norm.eps <= 0.0) {
+        bail!(
+            "{name} epsilon must be finite and positive, got {}",
+            norm.eps
+        );
+    }
+    Ok(())
+}
+
+fn validate_config(config: &ModelDef) -> Result<()> {
+    if config.num_layers == 0 {
+        bail!("model must contain at least one layer");
+    }
+    if config.hidden_size == 0 || config.vocab_size == 0 || config.max_seq_len == 0 {
+        bail!("vocab_size, hidden_size, and max_seq_len must all be positive");
+    }
+    if !(0.0..1.0).contains(&config.embeddings.dropout) {
+        bail!(
+            "embedding dropout must be in [0, 1), got {}",
+            config.embeddings.dropout
+        );
+    }
+    if config
+        .embeddings
+        .scale
+        .is_some_and(|scale| !scale.is_finite() || scale <= 0.0)
+    {
+        bail!("embedding scale must be finite and positive");
+    }
+    if let Some(norm) = &config.output.norm {
+        validate_norm("output norm", norm)?;
+    }
+
+    for i in 0..config.num_layers {
+        let block = config.block_for_layer(i);
+        for (name, dropout) in [
+            ("block", block.dropout),
+            ("attention", block.attention.dropout),
+            ("ffn", block.ffn.dropout),
+        ] {
+            if !(0.0..1.0).contains(&dropout) {
+                bail!("layer {i} {name} dropout must be in [0, 1), got {dropout}");
+            }
+        }
+        validate_norm(&format!("layer {i} norm"), &block.norm)?;
+        let intermediate = match block.ffn.hidden_dim {
+            Some(size) => size,
+            None => config
+                .hidden_size
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("layer {i} default FFN size overflows usize"))?,
+        };
+        if intermediate == 0 {
+            bail!("layer {i} FFN hidden_dim must be positive");
+        }
+
+        if let Some(ssm) = &block.ssm {
+            for (name, size) in [
+                ("expand", ssm.expand),
+                ("state_dim", ssm.state_dim),
+                ("conv_kernel", ssm.conv_kernel),
+                ("dt_rank", config.dt_rank(ssm)),
+            ] {
+                if size == 0 {
+                    bail!("layer {i} Mamba {name} must be positive");
+                }
+            }
+            if ssm.expand.checked_mul(config.hidden_size).is_none() {
+                bail!("layer {i} Mamba expand * hidden_size overflows usize");
+            }
+            continue;
+        }
+
+        let heads = block.attention.num_heads.unwrap_or(12);
+        if heads == 0 {
+            bail!("layer {i} attention num_heads must be positive");
+        }
+        let kv_heads = block.attention.num_kv_heads.unwrap_or(heads);
+        let head_dim = block
+            .attention
+            .head_dim
+            .unwrap_or(config.hidden_size / heads);
+        if kv_heads == 0 || head_dim == 0 {
+            bail!("layer {i} attention num_kv_heads and head_dim must be positive");
+        }
+        if !heads.is_multiple_of(kv_heads) {
+            bail!("layer {i} num_heads ({heads}) must be divisible by num_kv_heads ({kv_heads})");
+        }
+        if heads.checked_mul(head_dim) != Some(config.hidden_size) {
+            bail!(
+                "layer {i} num_heads ({heads}) * head_dim ({head_dim}) must equal hidden_size ({})",
+                config.hidden_size
+            );
+        }
+        if block.attention.window_size == Some(0) {
+            bail!("layer {i} attention window_size must be positive");
+        }
+        match &block.attention.position_encoding {
+            PositionEncoding::Rope { theta, scaling } => {
+                if !head_dim.is_multiple_of(2) {
+                    bail!("layer {i} RoPE head_dim must be even, got {head_dim}");
+                }
+                if !theta.is_finite()
+                    || *theta <= 0.0
+                    || scaling.is_some_and(|scale| !scale.is_finite() || scale <= 0.0)
+                {
+                    bail!("layer {i} RoPE theta and scaling must be finite and positive");
+                }
+            }
+            PositionEncoding::None => {}
+            other => {
+                bail!("position_encoding {other:?} is not implemented; use rope or none")
+            }
+        }
+    }
+    Ok(())
+}
 
 fn pad_embedding(mut embedding: Embedding, stored_vocab_size: usize) -> Embedding {
     let [vocab_size, hidden_size] = embedding.weight.shape().dims();
@@ -84,67 +203,12 @@ pub struct Transformer {
 
 impl Transformer {
     pub fn new(config: &ModelDef, device: &Device) -> Result<Self> {
-        if config.num_layers == 0 {
-            bail!("model must contain at least one layer");
-        }
-        if config.hidden_size == 0 || config.vocab_size == 0 || config.max_seq_len == 0 {
-            bail!("vocab_size, hidden_size, and max_seq_len must all be positive");
-        }
+        validate_config(config)?;
 
         let attn_blocks: Vec<&BlockDef> = (0..config.num_layers)
             .map(|i| config.block_for_layer(i))
             .filter(|block| !block.is_ssm())
             .collect();
-        for block in &attn_blocks {
-            let heads = block.num_heads();
-            let kv_heads = block.num_kv_heads();
-            let head_dim = block.head_dim(config.hidden_size);
-            if heads == 0 || kv_heads == 0 || head_dim == 0 {
-                bail!("attention head counts and head_dim must be positive");
-            }
-            if heads % kv_heads != 0 {
-                bail!("num_heads ({heads}) must be divisible by num_kv_heads ({kv_heads})");
-            }
-            if heads * head_dim != config.hidden_size {
-                bail!(
-                    "num_heads ({heads}) * head_dim ({head_dim}) must equal hidden_size ({})",
-                    config.hidden_size
-                );
-            }
-            match &block.attention.position_encoding {
-                PositionEncoding::Rope { theta, scaling } => {
-                    if head_dim % 2 != 0 {
-                        bail!("RoPE head_dim must be even, got {head_dim}");
-                    }
-                    if *theta <= 0.0 || scaling.is_some_and(|scale| scale <= 0.0) {
-                        bail!("RoPE theta and scaling must be positive");
-                    }
-                }
-                PositionEncoding::None => {}
-                other => bail!("position_encoding {other:?} is not implemented; use rope or none"),
-            }
-        }
-        for i in 0..config.num_layers {
-            let block = config.block_for_layer(i);
-            for (name, dropout) in [
-                ("block", block.dropout),
-                ("attention", block.attention.dropout),
-                ("ffn", block.ffn.dropout),
-            ] {
-                if !(0.0..1.0).contains(&dropout) {
-                    bail!("{name} dropout must be in [0, 1), got {dropout}");
-                }
-            }
-            if block.intermediate_size(config.hidden_size) == 0 {
-                bail!("FFN hidden_dim must be positive");
-            }
-        }
-        if !(0.0..1.0).contains(&config.embeddings.dropout) {
-            bail!(
-                "embedding dropout must be in [0, 1), got {}",
-                config.embeddings.dropout
-            );
-        }
 
         let rope_blocks: Vec<_> = attn_blocks
             .iter()

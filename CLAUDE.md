@@ -70,8 +70,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Build WASM (requires Homebrew LLVM for zstd cross-compilation)
 cd hermes-wasm && bash build.sh
 
-# Build Python wheel
-cd hermes-core-python && maturin build --release
+# Build Python packages
+cd hermes-client-python && uv build
+cd hermes-mal-python && maturin build --release
 
 # hermes-train (LLM training) tests
 cargo test -p hermes-train

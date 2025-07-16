@@ -3,7 +3,7 @@ members = [
     "hermes-core",
     "hermes-llm",
     "hermes-mal",
-    "hermes-mal-py",
+    "hermes-mal-python",
     "hermes-train",
     "hermes-server",
     "hermes-tool",
@@ -104,14 +104,13 @@ hashbrown = "0.17"
 memmap2 = "0.9"
 uuid = { version = "1.19", features = ["v4"] }
 
-# Keep Burn's CubeK dependency on the same strided-attention fix used directly
-# by hermes-llm.
+# Forward softmax-LSE emission used by Hermes attention training. Upstream:
+# https://github.com/tracel-ai/cubek/pull/428
 [patch."https://github.com/tracel-ai/cubek"]
 cubek = { git = "https://github.com/ppodolsky/cubek", rev = "b4fe9788a774c0f5e5af26122776b5bf4c8ee94d" }
 
-# Burn main still points at upstream CubeCL. Use our fork (allocation-retry
-# fix + asynchronous cuBLAS BF16 GEMM server dispatch) for Burn's direct
-# CubeCL dependencies as well as hermes-llm's.
+# Allocation retry and asynchronous cuBLASLt BF16 GEMM dispatch. Consolidated upstream:
+# https://github.com/tracel-ai/cubecl/pull/1440
 [patch."https://github.com/tracel-ai/cubecl"]
 cubecl = { git = "https://github.com/ppodolsky/cubecl", rev = "bda6a68d86df41f468cac78d713f1563869daa8e" }
 cubecl-common = { git = "https://github.com/ppodolsky/cubecl", rev = "bda6a68d86df41f468cac78d713f1563869daa8e" }
@@ -119,7 +118,8 @@ cubecl-zspace = { git = "https://github.com/ppodolsky/cubecl", rev = "bda6a68d86
 
 # Route every Burn crate to the pinned fork: upstream `bd6e8fa2f` plus the
 # BF16 native-GEMM matmul dispatch (autotune-arbitrated against fused CubeK)
-# and the upstream `f31e7513a` foreign-stream drop-ordering backport.
+# and the now-upstream foreign-stream drop-ordering fix. Native GEMM upstream:
+# https://github.com/tracel-ai/burn/pull/5190
 # Measured on A100: +15.6%/+14.8% training tokens/s at batch 16/20 with
 # identical losses (docs/cublas-gemm-dispatch.md).
 [patch."https://github.com/tracel-ai/burn"]

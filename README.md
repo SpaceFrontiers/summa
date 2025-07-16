@@ -261,8 +261,11 @@ cargo build --release
 # Build WASM (requires Homebrew LLVM on macOS for zstd cross-compilation)
 cd hermes-wasm && bash build.sh
 
-# Build Python wheel
-cd hermes-core-python && maturin build --release
+# Build the Python gRPC client
+cd hermes-client-python && uv build
+
+# Build the MAL Python binding
+cd hermes-mal-python && maturin build --release
 ```
 
 Alternatively you may build everything in docker via `docker compose`.
@@ -277,6 +280,10 @@ Examples:
 ```bash
 cargo test --all-features
 ```
+
+LLM contributors should start with the [inference and training code map](docs/llm-code-map.md).
+Temporary GPU dependency forks and their upstream removal criteria are listed
+in [the fork register](docs/forked-dependencies.md).
 
 ### Linting
 

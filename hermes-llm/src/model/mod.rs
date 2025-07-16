@@ -187,6 +187,31 @@ mod tests {
     }
 
     #[test]
+    fn test_attention_stateless_offset_preserves_relative_mask() {
+        let mut config = get_builtin_model("tiny").unwrap();
+        config.hidden_size = 16;
+        config.max_seq_len = 16;
+        config.block.attention.num_heads = Some(4);
+        config.block.attention.num_kv_heads = Some(2);
+        config.block.attention.head_dim = Some(4);
+        config.block.attention.position_encoding = PositionEncoding::None;
+        config.block.attention.causal = true;
+        config.block.attention.window_size = Some(2);
+        let device = Device::ndarray();
+        device.seed(10);
+        let attention = MultiHeadAttention::new(&config, &config.block, &device);
+        let rope = RotaryEncodingConfig::new(16, 4).init(&device);
+        let data: Vec<f32> = (0..4 * config.hidden_size)
+            .map(|i| (i as f32 * 0.089).sin())
+            .collect();
+        let x = Tensor::from_data(TensorData::new(data, [1, 4, config.hidden_size]), &device);
+
+        let at_zero = attention.forward(x.clone(), &rope, 0);
+        let at_offset = attention.forward(x, &rope, 5);
+        assert!(max_abs_diff(at_zero, at_offset) < 1e-6);
+    }
+
+    #[test]
     fn test_mamba_stateful_matches_stateless() {
         let mut config = get_builtin_model("hybrid-tiny").unwrap();
         config.hidden_size = 8;
@@ -245,6 +270,51 @@ mod tests {
         assert!(max_abs_diff(prefill, full.clone().slice([0..1, 0..4, 0..32])) < 1e-4);
         assert!(max_abs_diff(decode, full.slice([0..1, 4..6, 0..32])) < 1e-4);
         assert_eq!(state.pos(), 6);
+    }
+
+    #[test]
+    fn test_transformer_rejects_zero_sized_ssm_dimensions() {
+        let device = Device::ndarray();
+        let mut cases = Vec::new();
+
+        let mut config = hybrid_test_config();
+        config.pattern.as_mut().unwrap()[0]
+            .ssm
+            .as_mut()
+            .unwrap()
+            .expand = 0;
+        cases.push(("expand", config));
+
+        let mut config = hybrid_test_config();
+        config.pattern.as_mut().unwrap()[0]
+            .ssm
+            .as_mut()
+            .unwrap()
+            .state_dim = 0;
+        cases.push(("state_dim", config));
+
+        let mut config = hybrid_test_config();
+        config.pattern.as_mut().unwrap()[0]
+            .ssm
+            .as_mut()
+            .unwrap()
+            .conv_kernel = 0;
+        cases.push(("conv_kernel", config));
+
+        let mut config = hybrid_test_config();
+        config.pattern.as_mut().unwrap()[0]
+            .ssm
+            .as_mut()
+            .unwrap()
+            .dt_rank = Some(0);
+        cases.push(("dt_rank", config));
+
+        for (field, config) in cases {
+            let err = Transformer::new(&config, &device)
+                .err()
+                .unwrap_or_else(|| panic!("zero {field} was accepted"));
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
     }
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]

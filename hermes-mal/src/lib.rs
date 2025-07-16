@@ -2,15 +2,18 @@
 //!
 //! A composable DSL for defining LLM model architectures using pest parser.
 //!
-//! # Example MAL - Simple (flat) style
+//! # Example MAL - Minimal inline style
 //!
 //! ```text
 //! model tiny {
 //!     vocab_size: 32000
+//!     max_seq_len: 2048
 //!     hidden_size: 128
 //!     num_layers: 4
-//!     num_heads: 4
-//!     intermediate_size: 512
+//!     block: {
+//!         attention: { num_heads: 4 }
+//!         ffn: { hidden_dim: 512 }
+//!     }
 //! }
 //! ```
 //!
@@ -714,13 +717,40 @@ fn parse_model_def(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<
     Ok(def)
 }
 
-/// Parse MAL from a string (returns first model found)
+/// Parse a MAL string containing exactly one model definition.
+///
+/// Use [`parse_mal_full`] when a source intentionally defines multiple models.
 pub fn parse_mal(input: &str) -> Result<ModelDef> {
     let file = parse_mal_full(input)?;
-    file.models
-        .into_values()
-        .next()
-        .ok_or_else(|| anyhow!("No model definition found"))
+    match file.models.len() {
+        0 => Err(anyhow!("no model definition found")),
+        1 => Ok(file.models.into_values().next().expect("length checked")),
+        _ => {
+            let mut names = file.models.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            Err(anyhow!(
+                "multiple model definitions found ({}); use parse_mal_full to select one",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+fn insert_unique<T>(
+    definitions: &mut HashMap<String, T>,
+    kind: &str,
+    name: String,
+    value: T,
+) -> Result<()> {
+    match definitions.entry(name) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(value);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            Err(anyhow!("duplicate {kind} '{}'", entry.key()))
+        }
+    }
 }
 
 /// Parse complete MAL file with all definitions
@@ -737,23 +767,38 @@ pub fn parse_mal_full(input: &str) -> Result<MalFile> {
                         match def.as_rule() {
                             Rule::model_def => {
                                 let model = parse_model_def(def, &file)?;
-                                file.models.insert(model.name.clone(), model);
+                                insert_unique(
+                                    &mut file.models,
+                                    "model",
+                                    model.name.clone(),
+                                    model,
+                                )?;
                             }
                             Rule::attention_def => {
                                 let attn = parse_attention_def(def)?;
-                                file.attentions.insert(attn.name.clone(), attn);
+                                insert_unique(
+                                    &mut file.attentions,
+                                    "attention",
+                                    attn.name.clone(),
+                                    attn,
+                                )?;
                             }
                             Rule::ssm_def => {
                                 let ssm = parse_ssm_def(def)?;
-                                file.ssms.insert(ssm.name.clone(), ssm);
+                                insert_unique(&mut file.ssms, "ssm", ssm.name.clone(), ssm)?;
                             }
                             Rule::ffn_def => {
                                 let ffn = parse_ffn_def(def)?;
-                                file.ffns.insert(ffn.name.clone(), ffn);
+                                insert_unique(&mut file.ffns, "ffn", ffn.name.clone(), ffn)?;
                             }
                             Rule::block_def => {
                                 let block = parse_block_def(def, &file)?;
-                                file.blocks.insert(block.name.clone(), block);
+                                insert_unique(
+                                    &mut file.blocks,
+                                    "block",
+                                    block.name.clone(),
+                                    block,
+                                )?;
                             }
                             _ => {}
                         }
@@ -955,12 +1000,10 @@ fn parse_norm_config(pair: pest::iterators::Pair<Rule>) -> Result<NormConfig> {
             };
             for param in cfg.into_inner() {
                 // norm_param -> norm_eps_prop -> number
-                if let Some(eps) = param
-                    .into_inner()
-                    .next()
-                    .and_then(|p| p.into_inner().next().and_then(|n| n.as_str().parse().ok()))
+                if let Some(prop) = param.into_inner().next()
+                    && let Some(number) = prop.into_inner().next()
                 {
-                    norm.eps = eps;
+                    norm.eps = number.as_str().parse()?;
                 }
             }
         }
@@ -1350,6 +1393,28 @@ mod tests {
                 "expected undefined-ref error, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_mal_rejects_multiple_models() {
+        let err = parse_mal(
+            r#"
+            model alpha { vocab_size: 10 hidden_size: 8 num_layers: 1 block: { attention: { num_heads: 1 } ffn: { hidden_dim: 16 } } }
+            model beta { vocab_size: 10 hidden_size: 8 num_layers: 1 block: { attention: { num_heads: 1 } ffn: { hidden_dim: 16 } } }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("multiple model definitions"), "{err}");
+        assert!(err.contains("alpha") && err.contains("beta"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_mal_full_rejects_duplicate_definitions() {
+        let err = parse_mal_full("attention repeated {} attention repeated {}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate attention 'repeated'"), "{err}");
     }
 
     #[test]

@@ -49,6 +49,21 @@ jobs:
       - name: Build
         run: cargo build --release
 
+  training-supervisor:
+    name: Training Relaunch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Check and test relaunch supervisor
+        run: |
+          shellcheck -x hermes-train/scripts/relaunch.sh hermes-train/scripts/relaunch_test.sh
+          python3 -m py_compile hermes-train/scripts/wandb_tail.py
+          hermes-train/scripts/relaunch_test.sh
+
   # Security audit - check for known vulnerabilities
   audit:
     name: Cargo Audit

@@ -64,24 +64,49 @@ mod imp {
         Ok(base)
     }
 
-    /// Cache path: `<hash-of-uri>-<original-filename>` so the extension (e.g.
-    /// `.json`, `.safetensors`) is preserved for downstream loaders while the
-    /// hash keeps distinct URIs (and buckets) from colliding.
-    fn cache_path(uri: &str) -> Result<PathBuf> {
+    /// Return a URI suitable for diagnostics. Authentication material, signed
+    /// query parameters, and fragments are deliberately omitted.
+    pub(super) fn redacted_uri(uri: &str) -> String {
+        let Ok(mut url) = url::Url::parse(uri) else {
+            return "<invalid remote URI>".to_owned();
+        };
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    }
+
+    /// Cache filename: `<hash-of-full-uri>-<path-filename>`. Hashing the full
+    /// URI keeps distinct signed URLs from colliding, while deriving the human
+    /// readable suffix from the URL path prevents credentials and query
+    /// parameters from becoming filenames.
+    pub(super) fn cache_file_name(uri: &str) -> Result<String> {
         let mut h = DefaultHasher::new();
         uri.hash(&mut h);
-        let name = uri.rsplit(['/', '\\']).next().unwrap_or("artifact");
-        let name = if name.is_empty() { "artifact" } else { name };
-        Ok(cache_dir()?.join(format!("{:016x}-{name}", h.finish())))
+
+        let safe_uri = redacted_uri(uri);
+        let url = url::Url::parse(uri).with_context(|| format!("parsing URI {safe_uri}"))?;
+        let name = url
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+            .filter(|name| name.len() <= 160)
+            .unwrap_or("artifact");
+        Ok(format!("{:016x}-{name}", h.finish()))
+    }
+
+    fn cache_path(uri: &str) -> Result<PathBuf> {
+        Ok(cache_dir()?.join(cache_file_name(uri)?))
     }
 
     fn download_cached(uri: &str) -> Result<PathBuf> {
         let dest = cache_path(uri)?;
+        let safe_uri = redacted_uri(uri);
         if dest.exists() {
-            tracing::info!("using cached {} ({})", uri, dest.display());
+            tracing::info!("using cached {} ({})", safe_uri, dest.display());
             return Ok(dest);
         }
-        tracing::info!("downloading {} …", uri);
+        tracing::info!("downloading {} …", safe_uri);
         // Publish only after the complete object has been written and synced, so
         // an interrupted run never exposes a partial cache file.
         let tmp = dest.with_extension("part");
@@ -90,7 +115,7 @@ mod imp {
             .with_context(|| format!("publishing cache file {}", dest.display()))?;
         tracing::info!(
             "downloaded {} ({:.1} MiB) → {}",
-            uri,
+            safe_uri,
             size as f64 / (1024.0 * 1024.0),
             dest.display()
         );
@@ -106,10 +131,11 @@ mod imp {
     fn download(uri: &str, dest: &std::path::Path) -> Result<u64> {
         use object_store::{ObjectStore, ObjectStoreExt};
 
-        let url = url::Url::parse(uri).with_context(|| format!("parsing URI {uri}"))?;
+        let safe_uri = redacted_uri(uri);
+        let url = url::Url::parse(uri).with_context(|| format!("parsing URI {safe_uri}"))?;
         let (store, path): (Box<dyn ObjectStore>, object_store::path::Path) =
             object_store::parse_url(&url)
-                .with_context(|| format!("no object-store backend for {uri}"))?;
+                .with_context(|| format!("no object-store backend for {safe_uri}"))?;
 
         // object_store is async; run a single-threaded runtime for this blocking
         // CLI call rather than making the whole inference path async.
@@ -209,6 +235,23 @@ mod tests {
                 DOWNLOAD_CHUNK_BYTES..DOWNLOAD_CHUNK_BYTES * 2,
                 DOWNLOAD_CHUNK_BYTES * 2..size,
             ]
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn signed_http_uri_is_redacted_and_not_used_as_cache_filename() {
+        use super::imp::{cache_file_name, redacted_uri};
+
+        let uri = "https://alice:secret@example.com/models/weights.safetensors?X-Amz-Signature=private#fragment";
+        let display = redacted_uri(uri);
+        assert_eq!(display, "https://example.com/models/weights.safetensors");
+
+        let name = cache_file_name(uri).unwrap();
+        assert!(name.ends_with("-weights.safetensors"), "{name}");
+        assert!(
+            !name.contains("secret") && !name.contains("X-Amz"),
+            "{name}"
         );
     }
 

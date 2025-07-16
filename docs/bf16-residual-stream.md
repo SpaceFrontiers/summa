@@ -34,12 +34,10 @@ Boundary contracts this forced:
   fails at runtime, which the plain-CUDA suite never exercises. The
   end-to-end gate for that class is
   `training_fusion_hybrid_bf16_stream_loss_and_gradients_are_finite`.
-- The selective scan's non-segmented paths (decode, prefill without saved
-  states, and the small-problem `checkpoint_interval == 1` full-state path)
-  have no BF16 kernels: the dispatcher normalizes those to FP32 at the
-  boundary and returns BF16 to the caller. The training hot path
-  (segment-parallel forward/backward) is BF16-native and unaffected. The
-  ran.
+- The selective scan's inference paths (decode and prefill without saved
+  states) have no BF16 kernels: the dispatcher normalizes those to FP32 at the
+  boundary and returns BF16 to the caller. The single checkpointed training
+  path is BF16-native. The e2e gate caught this boundary on a small hybrid
 - The same gate then surfaced two attention-backward issues at small-model
   shapes: the fused probabilities kernel read a BF16 `correction` tensor as
   raw FP32 (fixed by pinning the correction product to FP32 + loud dtype
