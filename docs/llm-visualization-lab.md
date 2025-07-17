@@ -100,8 +100,16 @@ limits. Static assets and the API share an origin; no CORS permission is added.
 After a live response, the page selects the generated answer token and plays the
 captured sequence from embedding through every block to final norm. Play/pause,
 previous/next, and speed controls update the existing stage selector, heatmap,
-attention/Mamba view, and selected layer; no synthetic intermediate values are
-invented.
+attention/Mamba view, and selected layer. A labeled flow rail makes that route
+explicit and lets a user jump to any captured stage.
+
+Playback interpolates the displayed residual values between adjacent captured
+stages with a bounded ease curve. Those animation frames are presentation only:
+the endpoints are the exact captured tensors and no interpolated frame is
+reported as a model checkpoint. The activation canvas remains allocated while
+values move so stage changes do not flash through an empty chart; controls and
+secondary charts update once at the captured endpoint. Reduced-motion clients
+switch stages immediately without interpolation.
 
 ## Failure and safety behavior
 

@@ -4,6 +4,7 @@ import {
   availableMetrics,
   formatCount,
   formatValue,
+  interpolateHeatmap,
   layerGradientHeatmap,
   metricSeries,
   normalizedMetricHeatmap,
@@ -14,6 +15,7 @@ import {
 const $ = (id) => document.getElementById(id)
 const css = (name) => window.getComputedStyle(document.documentElement).getPropertyValue(name).trim()
 const svgNamespace = 'http://www.w3.org/2000/svg'
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
 
 const state = {
   trace: null,
@@ -30,6 +32,9 @@ const state = {
   playing: false,
   playbackDelay: 700,
   playbackTimer: null,
+  animationFrame: null,
+  animating: false,
+  animationTarget: null,
 }
 
 function showError(message) {
@@ -116,9 +121,8 @@ function renderArchitecture() {
       stopPlayback()
       state.selectedLayer = index
       const stageIndex = state.trace.inference.stages.findIndex((stage) => stage.layer_index === layer.index)
-      if (stageIndex >= 0) state.selectedStage = stageIndex
-      syncArchitectureSelection()
-      $('stage-select').value = String(state.selectedStage)
+      if (stageIndex >= 0) commitStage(stageIndex, { render: false })
+      else syncArchitectureSelection()
     })
     grid.append(button)
   })
@@ -205,63 +209,199 @@ function populateInferenceControls() {
     tokenSelect.append(option)
   })
   tokenSelect.value = String(state.selectedToken)
+  renderFlowRail()
 }
 
-function updatePlaybackControls() {
+function renderFlowRail() {
+  const rail = $('flow-rail')
+  rail.replaceChildren()
+  const stages = state.trace.inference.stages
+  stages.forEach((stage, index) => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'flow-node'
+    button.dataset.stageIndex = String(index)
+    button.dataset.mixer = stage.mixer ?? (index === 0 || index === stages.length - 1 ? 'endpoint' : 'block')
+    button.setAttribute('aria-label', `Stage ${index + 1} of ${stages.length}: ${stage.label}`)
+
+    const marker = document.createElement('span')
+    marker.className = 'flow-node-marker'
+    marker.setAttribute('aria-hidden', 'true')
+    const label = document.createElement('span')
+    label.className = 'flow-node-label'
+    label.textContent = index === 0 ? 'Emb' : index === stages.length - 1 ? 'Norm' : `L${stage.layer_index ?? index}`
+    button.append(marker, label)
+    button.addEventListener('click', () => transitionToStage(index))
+    rail.append(button)
+  })
+  updateFlowRail(state.selectedStage)
+}
+
+function updateFlowRail(progress = state.selectedStage) {
+  const rail = $('flow-rail')
+  const current = Math.round(progress)
+  rail.dataset.animating = String(state.animating)
+  rail.querySelectorAll('.flow-node').forEach((button) => {
+    const index = Number(button.dataset.stageIndex)
+    button.dataset.state = index === current ? 'current' : index < progress ? 'past' : 'future'
+    if (index === current) button.setAttribute('aria-current', 'step')
+    else button.removeAttribute('aria-current')
+    const incomingFill = Math.max(0, Math.min(1, progress - index + 1))
+    const segmentFill = Math.max(0, Math.min(1, progress - index))
+    button.style.setProperty('--flow-incoming', `${incomingFill * 100}%`)
+    button.style.setProperty('--flow-fill', `${segmentFill * 100}%`)
+  })
+}
+
+function updatePlaybackControls(progress = state.selectedStage) {
   if (!state.trace) return
   const count = state.trace.inference.stages.length
   const atStart = state.selectedStage === 0
   const atEnd = state.selectedStage === count - 1
-  $('flow-prev').disabled = atStart
-  $('flow-next').disabled = atEnd
+  $('flow-prev').disabled = state.animating || atStart
+  $('flow-next').disabled = state.animating || atEnd
   $('flow-play').textContent = state.playing ? 'Pause' : 'Play'
   $('flow-play').setAttribute('aria-pressed', String(state.playing))
-  $('flow-progress').max = count
-  $('flow-progress').value = state.selectedStage + 1
-  setText('flow-position', `${state.selectedStage + 1} / ${count}`)
+  $('flow-progress').max = Math.max(1, count - 1)
+  $('flow-progress').value = Math.max(0, Math.min(count - 1, progress))
+  const position = state.animating && Number.isInteger(state.animationTarget)
+    ? `${state.selectedStage + 1} → ${state.animationTarget + 1} / ${count}`
+    : `${state.selectedStage + 1} / ${count}`
+  setText('flow-position', position)
+  updateFlowRail(progress)
 }
 
-function stopPlayback() {
+function cancelAnimation() {
+  const wasAnimating = state.animating
+  if (state.animationFrame !== null) window.cancelAnimationFrame(state.animationFrame)
+  state.animationFrame = null
+  state.animating = false
+  state.animationTarget = null
+  $('view-inference').removeAttribute('aria-busy')
+  return wasAnimating
+}
+
+function stopPlayback({ settle = true } = {}) {
   if (state.playbackTimer !== null) window.clearTimeout(state.playbackTimer)
   state.playbackTimer = null
   state.playing = false
-  updatePlaybackControls()
+  const wasAnimating = cancelAnimation()
+  if (settle && wasAnimating && state.trace) renderInference({ renderTokens: false })
+  else updatePlaybackControls()
 }
 
-function setStage(index, { pause = true } = {}) {
-  if (pause) stopPlayback()
+function commitStage(index, { render = true } = {}) {
   const lastStage = state.trace.inference.stages.length - 1
   state.selectedStage = Math.max(0, Math.min(lastStage, index))
   state.selectedHead = 0
   syncLayerFromStage()
   syncArchitectureSelection()
-  renderInference()
+  if (render) renderInference({ renderTokens: false })
+  else {
+    $('stage-select').value = String(state.selectedStage)
+    updatePlaybackControls()
+  }
+}
+
+function easeInOutCubic(progress) {
+  return progress < 0.5
+    ? 4 * progress * progress * progress
+    : 1 - Math.pow(-2 * progress + 2, 3) / 2
+}
+
+function animateAdjacentStage(target, duration, onComplete) {
+  const source = state.selectedStage
+  const from = state.trace.inference.stages[source]
+  const to = state.trace.inference.stages[target]
+  if (reducedMotion.matches || duration <= 0) {
+    commitStage(target)
+    onComplete()
+    return
+  }
+
+  const scale = interpolateHeatmap(from.activation, to.activation, 0)
+  renderScale(scale, $('activation-scale'))
+  setText('activation-title', `${from.label} → ${to.label}`)
+  state.animating = true
+  state.animationTarget = target
+  $('view-inference').setAttribute('aria-busy', 'true')
+  updatePlaybackControls(source)
+  const startedAt = window.performance.now()
+
+  const frame = (now) => {
+    const linear = Math.min(1, (now - startedAt) / duration)
+    const eased = easeInOutCubic(linear)
+    const progress = source + (target - source) * eased
+    const heatmap = interpolateHeatmap(from.activation, to.activation, eased)
+    renderHeatmap($('activation-heatmap'), heatmap, {
+      divergent: true,
+      minHeight: 320,
+      label: `${from.label} to ${to.label} residual-stream transition`,
+    })
+    updatePlaybackControls(progress)
+    if (linear < 1) {
+      state.animationFrame = window.requestAnimationFrame(frame)
+      return
+    }
+
+    state.animationFrame = null
+    state.animating = false
+    state.animationTarget = null
+    $('view-inference').removeAttribute('aria-busy')
+    commitStage(target)
+    onComplete()
+  }
+  state.animationFrame = window.requestAnimationFrame(frame)
+}
+
+function runStageSequence(target, duration, onComplete) {
+  if (state.selectedStage === target) {
+    onComplete?.()
+    return
+  }
+  const next = state.selectedStage + Math.sign(target - state.selectedStage)
+  animateAdjacentStage(next, duration, () => runStageSequence(target, duration, onComplete))
+}
+
+function transitionToStage(index, { pause = true, onComplete = null } = {}) {
+  if (pause) stopPlayback()
+  const lastStage = state.trace.inference.stages.length - 1
+  const target = Math.max(0, Math.min(lastStage, index))
+  if (target === state.selectedStage) {
+    updatePlaybackControls()
+    onComplete?.()
+    return
+  }
+  const distance = Math.abs(target - state.selectedStage)
+  const duration = distance === 1
+    ? Math.max(220, Math.min(650, state.playbackDelay * 0.72))
+    : Math.max(70, Math.min(180, 1000 / distance))
+  runStageSequence(target, duration, onComplete)
 }
 
 function schedulePlayback() {
-  if (!state.playing) return
+  if (!state.playing || state.animating) return
+  const delay = reducedMotion.matches ? state.playbackDelay : Math.max(70, state.playbackDelay * 0.18)
   state.playbackTimer = window.setTimeout(() => {
+    state.playbackTimer = null
     if (state.selectedStage >= state.trace.inference.stages.length - 1) {
       stopPlayback()
       return
     }
-    setStage(state.selectedStage + 1, { pause: false })
-    schedulePlayback()
-  }, state.playbackDelay)
+    transitionToStage(state.selectedStage + 1, { pause: false, onComplete: schedulePlayback })
+  }, delay)
 }
 
 function startPlayback() {
   if (state.trace.inference.stages.length < 2) return
   stopPlayback()
-  if (state.selectedStage >= state.trace.inference.stages.length - 1) {
-    setStage(0, { pause: false })
-  }
+  if (state.selectedStage >= state.trace.inference.stages.length - 1) commitStage(0)
   state.playing = true
   updatePlaybackControls()
   schedulePlayback()
 }
 
-function renderInference() {
+function renderInference({ renderTokens = true } = {}) {
   const { inference } = state.trace
   const stage = inference.stages[state.selectedStage]
   $('stage-select').value = String(state.selectedStage)
@@ -269,7 +409,7 @@ function renderInference() {
   setText('activation-title', stage.label)
   renderScale(stage.activation, $('activation-scale'))
   renderHeatmap($('activation-heatmap'), stage.activation, { divergent: true, minHeight: 320, label: `${stage.label} residual-stream activation` })
-  renderTokenStrip()
+  if (renderTokens) renderTokenStrip()
   renderRmsChart()
   renderMixerTrace(stage)
   setText('generated-text', inference.generated_text || 'The generation stopped without a decoded continuation.')
@@ -295,7 +435,7 @@ function renderTokenStrip() {
     button.dataset.source = token.source
     button.setAttribute('aria-pressed', String(index === state.selectedToken))
     button.textContent = token.display
-    button.setAttribute('aria-label', `Token ${token.original_index}, ${token.piece}, ${token.source}`)
+    button.setAttribute('aria-label', `Token ${token.original_index}, ${token.display}, ${token.source}`)
     button.addEventListener('click', () => {
       stopPlayback()
       state.selectedToken = index
@@ -318,7 +458,7 @@ function renderRmsChart() {
     selectedIndex: state.selectedStage,
     compact: true,
   })
-  setText('rms-selection', `Token ${token.original_index} “${token.piece || token.display}” · ${state.trace.inference.stages[state.selectedStage].label}: ${formatValue(series[state.selectedStage].value)}`)
+  setText('rms-selection', `Token ${token.original_index} “${token.display}” · ${state.trace.inference.stages[state.selectedStage].label}: ${formatValue(series[state.selectedStage].value)}`)
 }
 
 function renderMixerTrace(stage) {
@@ -403,23 +543,31 @@ function parseColor(value) {
 }
 
 function mixColor(left, right, amount) {
-  const a = parseColor(left)
-  const b = parseColor(right)
   const t = Math.max(0, Math.min(1, amount))
-  return `rgb(${a.map((value, index) => Math.round(value + (b[index] - value) * t)).join(' ')})`
+  return `rgb(${left.map((value, index) => Math.round(value + (right[index] - value) * t)).join(' ')})`
 }
 
-function heatColor(value, heatmap, options) {
+function heatPalette() {
+  return {
+    negative: parseColor(css('--heat-negative')),
+    zero: parseColor(css('--heat-zero')),
+    positive: parseColor(css('--heat-positive')),
+    sequentialLow: parseColor(css('--heat-sequential-low')),
+    sequentialHigh: parseColor(css('--heat-sequential-high')),
+  }
+}
+
+function heatColor(value, heatmap, options, palette) {
   if (options.sequential) {
     const range = heatmap.max - heatmap.min
     const t = range === 0 ? 0.5 : (value - heatmap.min) / range
-    return mixColor(css('--heat-sequential-low'), css('--heat-sequential-high'), t)
+    return mixColor(palette.sequentialLow, palette.sequentialHigh, t)
   }
   const maximum = Math.max(Math.abs(heatmap.min), Math.abs(heatmap.max), Number.EPSILON)
   const t = Math.min(1, Math.abs(value) / maximum)
   return value < 0
-    ? mixColor(css('--heat-zero'), css('--heat-negative'), t)
-    : mixColor(css('--heat-zero'), css('--heat-positive'), t)
+    ? mixColor(palette.zero, palette.negative, t)
+    : mixColor(palette.zero, palette.positive, t)
 }
 
 function renderHeatmap(canvas, heatmap, options = {}) {
@@ -427,9 +575,11 @@ function renderHeatmap(canvas, heatmap, options = {}) {
   const cssWidth = Math.max(280, wrap.clientWidth)
   const cssHeight = Math.max(options.minHeight ?? 280, Math.min(520, heatmap.rows * 18 + 82))
   const ratio = Math.min(window.devicePixelRatio || 1, 2)
-  canvas.width = Math.round(cssWidth * ratio)
-  canvas.height = Math.round(cssHeight * ratio)
-  canvas.style.height = `${cssHeight}px`
+  const pixelWidth = Math.round(cssWidth * ratio)
+  const pixelHeight = Math.round(cssHeight * ratio)
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight
+  if (canvas.style.height !== `${cssHeight}px`) canvas.style.height = `${cssHeight}px`
   canvas.setAttribute('role', 'img')
   canvas.setAttribute('aria-label', options.label ?? `${heatmap.rows} by ${heatmap.cols} heatmap`)
   const context = canvas.getContext('2d')
@@ -441,10 +591,11 @@ function renderHeatmap(canvas, heatmap, options = {}) {
   const plotHeight = cssHeight - margins.top - margins.bottom
   const cellWidth = plotWidth / heatmap.cols
   const cellHeight = plotHeight / heatmap.rows
+  const palette = heatPalette()
   for (let row = 0; row < heatmap.rows; row += 1) {
     for (let column = 0; column < heatmap.cols; column += 1) {
       const value = heatmap.values[row * heatmap.cols + column]
-      context.fillStyle = heatColor(value, heatmap, options)
+      context.fillStyle = heatColor(value, heatmap, options, palette)
       context.fillRect(margins.left + column * cellWidth, margins.top + row * cellHeight, Math.ceil(cellWidth + 0.3), Math.ceil(cellHeight + 0.3))
     }
   }
@@ -709,7 +860,7 @@ $('trace-file').addEventListener('change', async (event) => {
 
 $('load-demo').addEventListener('click', () => setTrace(demoTrace, 'Synthetic example'))
 $('stage-select').addEventListener('change', (event) => {
-  setStage(Number(event.target.value))
+  transitionToStage(Number(event.target.value))
 })
 $('token-select').addEventListener('change', (event) => {
   stopPlayback()
@@ -732,15 +883,15 @@ $('live-prompt').addEventListener('keydown', (event) => {
     $('live-query-form').requestSubmit()
   }
 })
-$('flow-prev').addEventListener('click', () => setStage(state.selectedStage - 1))
-$('flow-next').addEventListener('click', () => setStage(state.selectedStage + 1))
+$('flow-prev').addEventListener('click', () => transitionToStage(state.selectedStage - 1))
+$('flow-next').addEventListener('click', () => transitionToStage(state.selectedStage + 1))
 $('flow-play').addEventListener('click', () => {
   if (state.playing) stopPlayback()
   else startPlayback()
 })
 $('flow-speed').addEventListener('change', (event) => {
   state.playbackDelay = Number(event.target.value)
-  if (state.playing) {
+  if (state.playing && !state.animating) {
     if (state.playbackTimer !== null) window.clearTimeout(state.playbackTimer)
     schedulePlayback()
   }
@@ -757,7 +908,7 @@ window.addEventListener('resize', () => {
   window.requestAnimationFrame(() => {
     resizeQueued = false
     const visibleView = document.querySelector('.view:not([hidden])')?.id
-    if (visibleView === 'view-inference') renderInference()
+    if (visibleView === 'view-inference') renderInference({ renderTokens: false })
     if (visibleView === 'view-training') renderTraining()
   })
 })

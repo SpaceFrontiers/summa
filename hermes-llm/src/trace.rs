@@ -301,10 +301,11 @@ pub fn capture_bundle(
         .map(|(local_index, &id)| {
             let original_index = token_offset + local_index;
             let piece = tokenizer.token_piece(id)?;
+            let decoded_piece = tokenizer.display_piece(id)?;
             Ok(TokenTrace {
                 original_index,
                 id,
-                display: visible_token(&piece),
+                display: visible_token(&decoded_piece),
                 piece,
                 source: if original_index < prompt_token_count {
                     "prompt"

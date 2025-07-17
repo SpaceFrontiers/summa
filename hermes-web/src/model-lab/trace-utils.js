@@ -24,6 +24,19 @@ export function validateHeatmap(heatmap, path) {
   return heatmap
 }
 
+export function interpolateHeatmap(from, to, progress) {
+  if (from.rows !== to.rows || from.cols !== to.cols || from.values.length !== to.values.length) {
+    fail('Cannot interpolate heatmaps with different shapes')
+  }
+  const amount = Math.max(0, Math.min(1, progress))
+  return {
+    ...from,
+    values: from.values.map((value, index) => value + (to.values[index] - value) * amount),
+    min: Math.min(from.min, to.min),
+    max: Math.max(from.max, to.max),
+  }
+}
+
 export function validateTrace(trace) {
   if (!isObject(trace)) fail('Trace bundle must be a JSON object')
   if (trace.kind !== TRACE_KIND) fail(`Unsupported trace kind: ${String(trace.kind)}`)
