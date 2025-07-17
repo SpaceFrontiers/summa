@@ -738,7 +738,7 @@ fn channel_labels(columns: usize, bins: usize) -> Vec<String> {
 
 fn visible_token(piece: &str) -> String {
     let visible = piece
-        .replace(' ', "·")
+        .replace([' ', 'Ġ', '▁'], "·")
         .replace('\n', "↵")
         .replace('\r', "⏎")
         .replace('\t', "⇥");
@@ -920,6 +920,13 @@ mod tests {
         assert_eq!(heatmap.values, vec![2.0, -3.0, 3.0, -2.0]);
         assert_eq!(heatmap.original_cols, 4);
         assert_eq!(heatmap.cols, 2);
+    }
+
+    #[test]
+    fn visible_token_normalizes_tokenizer_whitespace_markers() {
+        assert_eq!(visible_token("Ġretrieval"), "·retrieval");
+        assert_eq!(visible_token("▁planning"), "·planning");
+        assert_eq!(visible_token(" literal"), "·literal");
     }
 
     #[test]
