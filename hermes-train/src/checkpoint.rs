@@ -18,12 +18,26 @@ use crate::muon::BatchedMuon;
 
 pub(crate) type AdamWOptimizer = ModuleOptimizer;
 
+pub(crate) const TRAINING_STATE_VERSION: u32 = 1;
+
+fn current_training_state_version() -> u32 {
+    TRAINING_STATE_VERSION
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct TrainingState {
+    #[serde(default = "current_training_state_version")]
+    pub(crate) version: u32,
     pub(crate) step: usize,
     pub(crate) stage: usize,
     pub(crate) epoch: usize,
     pub(crate) samples_in_stage: usize,
+    #[serde(default)]
+    pub(crate) steps_in_stage: usize,
+    #[serde(default)]
+    pub(crate) tokens_seen: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) curriculum_signature: Option<String>,
     pub(crate) parameter_ids: Vec<u64>,
 }
 
@@ -107,6 +121,11 @@ pub(crate) fn load_training_state(
     );
     let state: TrainingState =
         serde_json::from_slice(&fs::read(output.join("training-state.json"))?)?;
+    ensure!(
+        state.version == TRAINING_STATE_VERSION,
+        "unsupported training-state version {}; this build supports version {TRAINING_STATE_VERSION}",
+        state.version
+    );
     restore_parameter_ids(model, &state.parameter_ids)?;
     load_safetensors(model, output.join("weights.safetensors"))?;
     muon.set_parameter_ids(model.muon_parameter_ids());

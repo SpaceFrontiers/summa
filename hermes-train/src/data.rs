@@ -1,19 +1,28 @@
-//! Streaming corpus ingestion, tokenization, shuffling, and batch packing.
+//! Streaming objective data, deterministic shuffling, and tensor batches.
 //!
-//! Documents are joined with EOS and packed without padding. JSONL and plain
-//! text inputs may be Zstandard-compressed; only a bounded shuffle buffer and
-//! one tokenizer batch are retained in memory.
+//! Causal-LM documents are EOS-joined and packed without padding. Structured
+//! objectives use explicit JSONL contracts and fixed shapes: target-only loss
+//! positions prevent EOS padding or prompts from contributing to supervised
+//! losses, while retrieval batches retain positive and hard-negative grouping.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use burn::tensor::{Device, Int, Tensor, TensorData};
 use hermes_llm::Tokenizer;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+
+use crate::curriculum::ObjectiveConfig;
+
+mod batch;
+mod structured;
+
+pub(crate) use batch::{BatchStats, LanguageBatch, RetrievalBatch, TrainingBatch, make_batch};
+use batch::{EncodedText, TrainingSample};
+use structured::visit_structured_samples;
 
 const TOKENIZE_BATCH: usize = 1_000;
 
@@ -30,7 +39,7 @@ fn open_data(path: &Path) -> Result<Box<dyn BufRead>> {
 }
 
 struct ShuffleBuffer {
-    samples: Vec<Vec<i64>>,
+    samples: Vec<TrainingSample>,
     rng: StdRng,
     capacity: usize,
 }
@@ -45,7 +54,7 @@ impl ShuffleBuffer {
         }
     }
 
-    fn push(&mut self, sample: Vec<i64>) -> Option<Vec<i64>> {
+    fn push(&mut self, sample: TrainingSample) -> Option<TrainingSample> {
         if self.samples.len() < self.capacity {
             self.samples.push(sample);
             return None;
@@ -54,7 +63,7 @@ impl ShuffleBuffer {
         Some(std::mem::replace(&mut self.samples[index], sample))
     }
 
-    fn finish(mut self) -> Vec<Vec<i64>> {
+    fn finish(mut self) -> Vec<TrainingSample> {
         self.samples.shuffle(&mut self.rng);
         self.samples
     }
@@ -79,7 +88,7 @@ impl SamplePacker {
         &mut self,
         tokens: impl IntoIterator<Item = i64>,
         count: &mut usize,
-        visit: &mut impl FnMut(Vec<i64>) -> Result<bool>,
+        visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
     ) -> Result<bool> {
         if self.consumed > 0 {
             self.pending.drain(..self.consumed);
@@ -87,11 +96,20 @@ impl SamplePacker {
         }
         self.pending.extend(tokens);
         while self.pending.len() - self.consumed > self.seq_len {
-            let end = self.consumed + self.seq_len + 1;
-            let sample = self.pending[self.consumed..end].to_vec();
-            self.consumed += self.seq_len;
-            *count += 1;
-            if !visit(sample)? {
+            let end = self
+                .consumed
+                .checked_add(self.seq_len)
+                .and_then(|end| end.checked_add(1))
+                .context("packed sample boundary overflows usize")?;
+            let tokens = self.pending[self.consumed..end].to_vec();
+            self.consumed = self
+                .consumed
+                .checked_add(self.seq_len)
+                .context("packed-token cursor overflows usize")?;
+            *count = count
+                .checked_add(1)
+                .context("training sample count overflows usize")?;
+            if !visit(TrainingSample::Causal { tokens })? {
                 return Ok(false);
             }
         }
@@ -104,7 +122,7 @@ fn push_documents(
     tokenizer: &Tokenizer,
     packer: &mut SamplePacker,
     count: &mut usize,
-    visit: &mut impl FnMut(Vec<i64>) -> Result<bool>,
+    visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<bool> {
     if documents.is_empty() {
         return Ok(true);
@@ -122,45 +140,39 @@ fn push_documents(
     Ok(true)
 }
 
-/// Visit fixed-length next-token samples in their source order.
-fn visit_samples_in_order(
+fn is_jsonl(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+}
+
+fn visit_causal_samples(
     path: &Path,
     tokenizer: &Tokenizer,
     seq_len: usize,
-    mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
+    mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
-    ensure!(seq_len > 0, "seq_len must be positive");
     let mut count = 0;
     let mut packer = SamplePacker::new(seq_len);
-    let is_jsonl = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"));
     let mut reader = open_data(path)?;
-    if is_jsonl {
+    if is_jsonl(path) {
         let mut documents = Vec::with_capacity(TOKENIZE_BATCH);
         let mut line = String::new();
-        let mut line_number = 0;
+        let mut line_number = 0usize;
         loop {
             line.clear();
             if reader.read_line(&mut line)? == 0 {
                 break;
             }
-            line_number += 1;
+            line_number = line_number
+                .checked_add(1)
+                .context("JSONL line count overflows usize")?;
             if line.trim().is_empty() {
                 continue;
             }
             let value: serde_json::Value = serde_json::from_str(&line)
                 .with_context(|| format!("invalid JSONL at {}:{line_number}", path.display()))?;
-            let document = value
-                .get("text")
-                .and_then(|value| value.as_str())
-                .with_context(|| {
-                    format!(
-                        "JSONL row at {}:{line_number} must contain a string `text` field",
-                        path.display()
-                    )
-                })?;
+            let document = required_string(&value, "text", path, line_number)?;
             documents.push(document.to_owned());
             if documents.len() == TOKENIZE_BATCH
                 && !push_documents(
@@ -199,21 +211,60 @@ fn visit_samples_in_order(
     Ok(count)
 }
 
+fn required_string<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    path: &Path,
+    line_number: usize,
+) -> Result<&'a str> {
+    let text = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| {
+            format!(
+                "JSONL row at {}:{line_number} must contain a string `{field}` field",
+                path.display()
+            )
+        })?;
+    ensure!(
+        !text.trim().is_empty(),
+        "JSONL row at {}:{line_number} has an empty `{field}` field",
+        path.display()
+    );
+    Ok(text)
+}
+
+/// Visit fixed-shape objective samples in source order.
+fn visit_samples_in_order(
+    path: &Path,
+    objective: &ObjectiveConfig,
+    tokenizer: &Tokenizer,
+    seq_len: usize,
+    visit: impl FnMut(TrainingSample) -> Result<bool>,
+) -> Result<usize> {
+    ensure!(seq_len > 0, "sequence_length must be positive");
+    match objective {
+        ObjectiveConfig::CausalLm => visit_causal_samples(path, tokenizer, seq_len, visit),
+        _ => visit_structured_samples(path, objective, tokenizer, seq_len, visit),
+    }
+}
+
 pub(crate) fn visit_samples(
     path: &Path,
+    objective: &ObjectiveConfig,
     tokenizer: &Tokenizer,
     seq_len: usize,
     shuffle_buffer: usize,
     seed: u64,
-    mut visit: impl FnMut(Vec<i64>) -> Result<bool>,
+    mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
     if shuffle_buffer == 0 {
-        return visit_samples_in_order(path, tokenizer, seq_len, visit);
+        return visit_samples_in_order(path, objective, tokenizer, seq_len, visit);
     }
 
     let mut shuffler = ShuffleBuffer::new(shuffle_buffer, seed);
     let mut keep_going = true;
-    let count = visit_samples_in_order(path, tokenizer, seq_len, |sample| {
+    let count = visit_samples_in_order(path, objective, tokenizer, seq_len, |sample| {
         if let Some(sample) = shuffler.push(sample) {
             keep_going = visit(sample)?;
         }
@@ -230,31 +281,21 @@ pub(crate) fn visit_samples(
     Ok(count)
 }
 
-pub(crate) fn count_samples(path: &Path, tokenizer: &Tokenizer, seq_len: usize) -> Result<usize> {
-    visit_samples_in_order(path, tokenizer, seq_len, |_| Ok(true))
-}
-
-pub(crate) fn make_batch(
-    samples: &[Vec<i64>],
+pub(crate) fn count_samples(
+    path: &Path,
+    objective: &ObjectiveConfig,
+    tokenizer: &Tokenizer,
     seq_len: usize,
-    device: &Device,
-) -> (Tensor<2, Int>, Tensor<2, Int>) {
-    let mut inputs = Vec::with_capacity(samples.len() * seq_len);
-    let mut targets = Vec::with_capacity(samples.len() * seq_len);
-    for sample in samples {
-        inputs.extend_from_slice(&sample[..seq_len]);
-        targets.extend_from_slice(&sample[1..]);
-    }
-    (
-        Tensor::from_data(TensorData::new(inputs, [samples.len(), seq_len]), device),
-        Tensor::from_data(TensorData::new(targets, [samples.len(), seq_len]), device),
-    )
+) -> Result<usize> {
+    visit_samples_in_order(path, objective, tokenizer, seq_len, |_| Ok(true))
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::{Cursor, Read};
+
+    use burn::tensor::Device;
 
     use super::*;
 
@@ -278,12 +319,19 @@ mod tests {
             let mut buffer = ShuffleBuffer::new(4, seed);
             let mut output = Vec::new();
             for value in 0..32_i64 {
-                if let Some(sample) = buffer.push(vec![value]) {
-                    output.push(sample[0]);
+                if let Some(TrainingSample::Causal { tokens }) =
+                    buffer.push(TrainingSample::Causal {
+                        tokens: vec![value],
+                    })
+                {
+                    output.push(tokens[0]);
                 }
                 assert!(buffer.samples.len() <= 4);
             }
-            output.extend(buffer.finish().into_iter().map(|sample| sample[0]));
+            output.extend(buffer.finish().into_iter().map(|sample| match sample {
+                TrainingSample::Causal { tokens } => tokens[0],
+                _ => unreachable!(),
+            }));
             output
         };
 
@@ -301,7 +349,10 @@ mod tests {
         let mut samples = Vec::new();
         let mut count = 0;
         let mut collect = |sample| {
-            samples.push(sample);
+            let TrainingSample::Causal { tokens } = sample else {
+                unreachable!()
+            };
+            samples.push(tokens);
             Ok(true)
         };
 
@@ -311,5 +362,81 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(samples, [vec![1, 2, 0, 3], vec![3, 4, 0, 5]]);
+    }
+
+    #[test]
+    fn supervised_batch_masks_only_target_positions() {
+        let device = Device::ndarray();
+        let samples = vec![
+            TrainingSample::Supervised {
+                tokens: vec![10, 11, 20, 21, 0],
+                loss_positions: vec![1, 2, 3],
+                truncated_tokens: 4,
+            },
+            TrainingSample::Supervised {
+                tokens: vec![12, 13, 22, 23, 0],
+                loss_positions: vec![2, 3],
+                truncated_tokens: 0,
+            },
+        ];
+        let TrainingBatch::Language(batch) = make_batch(&samples, 4, &device).unwrap() else {
+            panic!("expected masked language batch")
+        };
+        let LanguageBatch {
+            loss_positions: Some(positions),
+            stats,
+            ..
+        } = *batch
+        else {
+            panic!("expected target positions")
+        };
+        assert_eq!(
+            positions.into_data().to_vec::<i64>().unwrap(),
+            vec![1, 2, 3, 6, 7]
+        );
+        assert_eq!(stats.supervised_tokens, 5);
+        assert_eq!(stats.truncated_tokens, 4);
+    }
+
+    #[test]
+    fn retrieval_batch_labels_positives_among_all_candidates() {
+        let device = Device::ndarray();
+        let encoded = |start| EncodedText {
+            tokens: vec![start, start + 1, 0],
+            end_position: 1,
+        };
+        let samples = vec![
+            TrainingSample::Retrieval {
+                query: encoded(1),
+                documents: vec![encoded(10), encoded(20)],
+                truncated_tokens: 0,
+            },
+            TrainingSample::Retrieval {
+                query: encoded(2),
+                documents: vec![encoded(30)],
+                truncated_tokens: 0,
+            },
+        ];
+        let TrainingBatch::Retrieval(batch) = make_batch(&samples, 3, &device).unwrap() else {
+            panic!("expected retrieval batch")
+        };
+        let RetrievalBatch {
+            labels,
+            query_end_positions,
+            document_end_positions,
+            stats,
+            ..
+        } = *batch;
+        assert_eq!(labels.into_data().to_vec::<i64>().unwrap(), vec![0, 2]);
+        assert_eq!(
+            query_end_positions.into_data().to_vec::<i64>().unwrap(),
+            vec![1, 4]
+        );
+        assert_eq!(
+            document_end_positions.into_data().to_vec::<i64>().unwrap(),
+            vec![1, 4, 7]
+        );
+        assert_eq!(stats.retrieval_candidates, 3);
+        assert_eq!(stats.compute_tokens, 15);
     }
 }

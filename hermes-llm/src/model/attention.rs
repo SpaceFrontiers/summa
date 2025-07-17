@@ -153,6 +153,41 @@ impl MultiHeadAttention {
         (q, k, v)
     }
 
+    /// Materialize a bounded subset of the attention probabilities for the
+    /// explicit visualization path. Normal inference uses the fused kernel and
+    /// never pays this allocation or projection cost.
+    pub(crate) fn diagnostic_weights(
+        &self,
+        x: Tensor<3>,
+        rope: &RotaryEncoding,
+        start_pos: usize,
+        max_heads: usize,
+    ) -> Tensor<4> {
+        let (q, k, _) = self.project_qkv(x, rope, start_pos);
+        let [batch, _, seq_len, _] = q.dims();
+        let captured_heads = max_heads.min(self.num_heads);
+        let q = q.slice([0..batch, 0..captured_heads, 0..seq_len, 0..self.head_dim]);
+        let k = repeat_kv(k, self.num_heads).slice([
+            0..batch,
+            0..captured_heads,
+            0..seq_len,
+            0..self.head_dim,
+        ]);
+        let mut scores = q
+            .matmul(k.transpose())
+            .div_scalar((self.head_dim as f32).sqrt());
+        if let Some(mask) =
+            self.build_mask(seq_len, seq_len, start_pos, start_pos, &scores.device())
+        {
+            scores = scores.mask_fill(mask, f32::NEG_INFINITY);
+        }
+        softmax(scores, 3)
+    }
+
+    pub(crate) fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+
     /// Scaled-dot-product attention over K/V ([B, H, T, hd]) for queries and
     /// keys at their respective global offsets. Applies causal + window masking.
     fn sdpa(

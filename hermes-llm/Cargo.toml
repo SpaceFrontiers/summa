@@ -33,6 +33,7 @@ half = { version = "2", optional = true, default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
 
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Model Architecture Language (MAL) parser — single source of truth
@@ -49,18 +50,23 @@ anyhow = { workspace = true }
 # Utilities
 rand = { workspace = true }
 
+# Local model-lab server (feature-gated so hermes-train does not pull it in)
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
+tower-http = { version = "0.6", optional = true, default-features = false, features = ["fs"] }
+
 # Remote artifact loading (s3://, gs://, http(s)://). The pinned upstream
 # 0.14.1 revision includes the quick-xml security update not in crates.io 0.14.0.
 # `version` is the crates.io fallback Cargo uses when packaging this crate.
 object_store = { version = "0.14", git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c7316d29face118e7409eead0cda098f38589428", default-features = false, features = ["aws", "gcp", "http"], optional = true }
-tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+tokio = { version = "1", default-features = false, features = ["fs", "macros", "net", "rt", "rt-multi-thread", "signal", "sync"], optional = true }
 url = { version = "2", optional = true }
 dirs = { version = "6", optional = true }
 
 [features]
-default = ["remote"]
+default = ["remote", "lab"]
 # Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
 remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
+lab = ["dep:axum", "dep:tokio", "dep:tower-http"]
 metal = ["burn/metal", "burn/autotune", "dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl", "dep:half"]
 cuda = ["burn/cuda", "burn/autotune", "dep:burn-cubecl", "dep:cubecl", "dep:cubek", "dep:half"]
 # Lazy fusion pays off for large training graphs, but adds substantial graph
@@ -70,3 +76,6 @@ training-fusion = ["cuda", "burn/fusion", "dep:burn-fusion", "dep:burn-ir"]
 [[bin]]
 name = "hermes-llm"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }

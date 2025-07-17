@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use burn::module::{Initializer, ModuleVisitor, Param, ParamId};
 use burn::prelude::*;
-use burn::tensor::Int;
+use burn::tensor::{DType, Int};
 use burn_nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
 
@@ -12,6 +12,19 @@ use crate::mal::{BlockDef, ModelDef, NormConfig, PositionEncoding};
 use super::linear_cross_entropy::linear_cross_entropy;
 use super::matmul::{matmul_2, matmul_input, prepare_linear_for_inference, stream_cast};
 use super::{InferenceState, Norm, TransformerBlock};
+
+pub(crate) struct RawLayerDiagnostic {
+    pub activation: Tensor<3>,
+    pub attention_weights: Option<Tensor<4>>,
+    pub total_attention_heads: Option<usize>,
+    pub mamba_state: Option<Tensor<3>>,
+}
+
+pub(crate) struct RawModelDiagnostic {
+    pub embedding: Tensor<3>,
+    pub layers: Vec<RawLayerDiagnostic>,
+    pub final_norm: Tensor<3>,
+}
 
 const EMBEDDING_STD: f64 = 0.02;
 const LOSS_CHUNKS: usize = 4;
@@ -310,6 +323,15 @@ impl Transformer {
     }
 
     fn forward_hidden(&self, input_ids: Tensor<2, Int>, start_pos: usize) -> Tensor<3> {
+        self.forward_hidden_through(input_ids, start_pos, self.layers.len())
+    }
+
+    fn forward_hidden_through(
+        &self,
+        input_ids: Tensor<2, Int>,
+        start_pos: usize,
+        layer_count: usize,
+    ) -> Tensor<3> {
         let [_, seq_len] = input_ids.dims();
         assert!(
             start_pos + seq_len <= self.config.max_seq_len,
@@ -317,12 +339,17 @@ impl Transformer {
             start_pos + seq_len,
             self.config.max_seq_len
         );
+        assert!(
+            (1..=self.layers.len()).contains(&layer_count),
+            "requested {layer_count} Transformer layers, model has {}",
+            self.layers.len()
+        );
         // The full-sequence path runs the residual stream in the training
         // compute dtype (BF16 under CUDA training-fusion). Incremental decode
         // (`forward_hidden_with_state`) keeps FP32: its scan/conv step kernels
         // are FP32-only.
         let mut x = stream_cast(self.embed(input_ids));
-        for layer in &self.layers {
+        for layer in self.layers.iter().take(layer_count) {
             x = layer.forward(x, &self.rope, start_pos);
         }
         self.final_norm.forward(x)
@@ -345,6 +372,62 @@ impl Transformer {
             self.config.vocab_size,
             tokens.div_ceil(LOSS_CHUNKS),
         )
+    }
+
+    /// Causal cross-entropy over selected flattened token positions.
+    ///
+    /// `positions` indexes the row-major `[batch, sequence]` target tensor.
+    /// This keeps structured fine-tuning target-only without assigning a
+    /// sentinel token ID that could collide with a real vocabulary item.
+    pub fn forward_masked_loss(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Tensor<2, Int>,
+        positions: Tensor<1, Int>,
+    ) -> Tensor<1> {
+        let [batch, seq_len] = targets.dims();
+        assert_eq!(input_ids.dims(), [batch, seq_len]);
+        let [selected_tokens] = positions.dims();
+        assert!(selected_tokens > 0, "masked loss requires target tokens");
+        let tokens = batch * seq_len;
+        let hidden = self
+            .forward_hidden(input_ids, 0)
+            .reshape([tokens, self.config.hidden_size])
+            .select(0, positions.clone());
+        let targets = targets.reshape([tokens]).select(0, positions);
+        let (weight, bias) = self.output_parameters();
+        linear_cross_entropy(
+            hidden,
+            weight,
+            bias,
+            targets,
+            self.config.vocab_size,
+            selected_tokens.div_ceil(LOSS_CHUNKS),
+        )
+    }
+
+    /// L2-normalized last-meaningful-token embeddings for retrieval training.
+    ///
+    /// `end_positions` contains one row-major index into the flattened
+    /// `[batch, sequence]` hidden states per input row. `layer` is one-based;
+    /// `None` reads the final layer. Applying the shared final norm keeps this
+    /// path checkpoint-compatible while allowing a hybrid model to read after
+    /// a selected global-attention layer.
+    pub fn forward_embeddings(
+        &self,
+        input_ids: Tensor<2, Int>,
+        end_positions: Tensor<1, Int>,
+        layer: Option<usize>,
+    ) -> Tensor<2> {
+        let [batch, seq_len] = input_ids.dims();
+        assert_eq!(end_positions.dims(), [batch]);
+        let hidden = self
+            .forward_hidden_through(input_ids, 0, layer.unwrap_or(self.layers.len()))
+            .reshape([batch * seq_len, self.config.hidden_size])
+            .select(0, end_positions)
+            .cast(DType::F32);
+        let norm = hidden.clone().square().sum_dim(1).sqrt().clamp_min(1e-12);
+        hidden / norm
     }
 
     fn project_logits(&self, x: Tensor<3>) -> Tensor<3> {
@@ -424,6 +507,10 @@ impl Transformer {
         &self.config
     }
 
+    pub(crate) fn device(&self) -> Device {
+        self.embedding.weight.val().device()
+    }
+
     pub fn num_parameters(&self) -> usize {
         self.num_params()
     }
@@ -438,6 +525,60 @@ impl Transformer {
             layer.visit(&mut visitor);
         }
         visitor.ids
+    }
+
+    /// Visit one transformer block without exposing its module fields. This is
+    /// used by opt-in trainer diagnostics such as per-layer gradient norms.
+    pub fn visit_layer<V: ModuleVisitor>(&self, index: usize, visitor: &mut V) -> Result<()> {
+        let layer = self.layers.get(index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "layer index {index} is outside model with {} layers",
+                self.layers.len()
+            )
+        })?;
+        layer.visit(visitor);
+        Ok(())
+    }
+
+    /// Full-sequence diagnostic pass used only by `hermes-llm trace`.
+    pub(crate) fn forward_diagnostic(
+        &self,
+        input_ids: Tensor<2, Int>,
+        max_attention_heads: usize,
+    ) -> RawModelDiagnostic {
+        let [batch, seq_len] = input_ids.dims();
+        assert_eq!(batch, 1, "visualization tracing supports one sequence");
+        assert!(seq_len > 0, "visualization tracing requires tokens");
+        assert!(
+            seq_len <= self.config.max_seq_len,
+            "visualization trace length {seq_len} exceeds max_seq_len {}",
+            self.config.max_seq_len
+        );
+        assert!(
+            max_attention_heads > 0,
+            "visualization tracing requires at least one attention head"
+        );
+
+        let mut x = stream_cast(self.embed(input_ids));
+        let embedding = x.clone();
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (output, diagnostic) =
+                layer.forward_diagnostic(x, &self.rope, 0, max_attention_heads);
+            x = output;
+            layers.push(RawLayerDiagnostic {
+                activation: x.clone(),
+                attention_weights: diagnostic.attention_weights,
+                total_attention_heads: diagnostic.total_attention_heads,
+                mamba_state: diagnostic.mamba_state,
+            });
+        }
+        let final_norm = self.final_norm.forward(x);
+        RawModelDiagnostic {
+            embedding,
+            layers,
+            final_norm,
+        }
     }
 
     pub fn make_state(&self, batch: usize, device: &Device) -> InferenceState {
@@ -657,5 +798,160 @@ mod tests {
                 _ => panic!("output parameters do not match weight tying"),
             }
         }
+    }
+
+    #[test]
+    fn masked_loss_matches_full_loss_when_every_target_is_selected() {
+        let mut config = get_builtin_model("tiny").unwrap();
+        config.vocab_size = 32;
+        config.hidden_size = 8;
+        config.num_layers = 1;
+        config.max_seq_len = 8;
+        config.block.attention.num_heads = Some(2);
+        config.block.attention.num_kv_heads = Some(1);
+        config.block.attention.head_dim = Some(4);
+        config.block.ffn.hidden_dim = Some(16);
+        config.block.dropout = 0.0;
+        config.block.attention.dropout = 0.0;
+        config.block.ffn.dropout = 0.0;
+        let device = Device::ndarray().autodiff();
+        device.seed(37);
+        let model = Transformer::new(&config, &device).unwrap();
+        let inputs = vec![1_i64, 2, 3, 4, 5, 6, 7, 8];
+        let targets = vec![2_i64, 3, 4, 5, 6, 7, 8, 9];
+        let batch = || {
+            (
+                Tensor::<2, Int>::from_data(TensorData::new(inputs.clone(), [2, 4]), &device),
+                Tensor::<2, Int>::from_data(TensorData::new(targets.clone(), [2, 4]), &device),
+            )
+        };
+        let (input, target) = batch();
+        let full = model.forward_loss(input, target);
+        let (input, target) = batch();
+        let positions = Tensor::<1, Int>::arange(0..8, &device);
+        let masked = model.forward_masked_loss(input, target, positions);
+        let value = |loss: Tensor<1>| loss.into_data().convert::<f32>().to_vec::<f32>().unwrap()[0];
+        assert!((value(full) - value(masked)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn retrieval_embeddings_use_requested_layer_and_unit_normalization() {
+        let mut config = get_builtin_model("hybrid-tiny").unwrap();
+        config.vocab_size = 32;
+        config.hidden_size = 8;
+        config.num_layers = 3;
+        config.max_seq_len = 8;
+        for block in config.pattern.as_mut().unwrap() {
+            block.dropout = 0.0;
+            block.attention.dropout = 0.0;
+            block.attention.num_heads = Some(2);
+            block.attention.num_kv_heads = Some(1);
+            block.attention.head_dim = Some(4);
+            block.ffn.dropout = 0.0;
+            block.ffn.hidden_dim = Some(16);
+        }
+        let device = Device::ndarray().autodiff();
+        device.seed(43);
+        let model = Transformer::new(&config, &device).unwrap();
+        let input = || {
+            Tensor::<2, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 0, 4, 5, 6, 7], [2, 4]),
+                &device,
+            )
+        };
+        let ends = || Tensor::<1, Int>::from_data(TensorData::new(vec![2_i64, 7], [2]), &device);
+        let early = model.forward_embeddings(input(), ends(), Some(2));
+        let final_layer = model.forward_embeddings(input(), ends(), None);
+        assert_eq!(early.dims(), [2, 8]);
+        let norms = final_layer
+            .clone()
+            .square()
+            .sum_dim(1)
+            .sqrt()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(norms.into_iter().all(|norm| (norm - 1.0).abs() < 1e-5));
+        let max_diff = early
+            .sub(final_layer)
+            .abs()
+            .max()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            max_diff > 1e-6,
+            "different layers produced identical embeddings"
+        );
+    }
+
+    #[test]
+    fn diagnostic_pass_matches_forward_and_respects_causal_attention() {
+        let mut config = get_builtin_model("hybrid-tiny").unwrap();
+        config.vocab_size = 32;
+        config.hidden_size = 8;
+        config.num_layers = 3;
+        config.max_seq_len = 8;
+        for block in config.pattern.as_mut().unwrap() {
+            block.dropout = 0.0;
+            block.attention.dropout = 0.0;
+            block.attention.num_heads = Some(2);
+            block.attention.num_kv_heads = Some(1);
+            block.attention.head_dim = Some(4);
+            block.ffn.dropout = 0.0;
+            block.ffn.hidden_dim = Some(16);
+        }
+        let device = Device::ndarray();
+        device.seed(47);
+        let model = Transformer::new(&config, &device).unwrap();
+        let input =
+            || Tensor::<2, Int>::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device);
+        let expected = model.forward_hidden(input(), 0);
+        let diagnostic = model.forward_diagnostic(input(), 1);
+        let max_diff = expected
+            .sub(diagnostic.final_norm.clone())
+            .abs()
+            .max()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            max_diff < 1e-5,
+            "diagnostic pass changed output by {max_diff}"
+        );
+        assert_eq!(diagnostic.embedding.dims(), [1, 4, 8]);
+        assert_eq!(diagnostic.layers.len(), 3);
+
+        let mut attention_layers = 0;
+        let mut mamba_layers = 0;
+        for layer in diagnostic.layers {
+            if let Some(weights) = layer.attention_weights {
+                attention_layers += 1;
+                assert_eq!(weights.dims(), [1, 1, 4, 4]);
+                let values = weights
+                    .into_data()
+                    .convert::<f32>()
+                    .to_vec::<f32>()
+                    .unwrap();
+                for row in 0..4 {
+                    for column in row + 1..4 {
+                        assert!(
+                            values[row * 4 + column].abs() < 1e-7,
+                            "future attention at ({row}, {column}) was {}",
+                            values[row * 4 + column]
+                        );
+                    }
+                }
+            }
+            if let Some(state) = layer.mamba_state {
+                mamba_layers += 1;
+                assert_eq!(state.dims()[0], 1);
+            }
+        }
+        assert!(attention_layers > 0);
+        assert!(mamba_layers > 0);
     }
 }

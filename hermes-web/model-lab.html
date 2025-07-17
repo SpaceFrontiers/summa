@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Explore Hermes LLM architecture, inference activations, attention, Mamba state, and training dynamics." />
+    <title>Hermes Model Lab</title>
+    <link rel="stylesheet" href="/src/model-lab/styles.css" />
+  </head>
+  <body>
+    <div id="model-lab">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Hermes · model observability</p>
+          <h1>Model Lab</h1>
+          <p class="subtitle">Follow information through a real MAL model, one token and layer at a time.</p>
+        </div>
+        <div class="load-controls">
+          <label class="file-control">
+            <span>Open trace bundle</span>
+            <input id="trace-file" type="file" accept="application/json,.json" />
+          </label>
+          <button id="load-demo" class="secondary-button" type="button">Restore demo</button>
+        </div>
+      </header>
+
+      <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+      <section class="query-console" aria-labelledby="live-query-heading">
+        <div class="query-console-heading">
+          <div>
+            <p class="eyebrow">Live inference</p>
+            <h2 id="live-query-heading">Ask the loaded model</h2>
+          </div>
+          <p id="live-session-status" class="live-session-status" data-state="checking" role="status">Checking local model…</p>
+        </div>
+        <form id="live-query-form" class="live-query-form">
+          <label class="prompt-control" for="live-prompt">
+            <span>Query</span>
+            <textarea id="live-prompt" rows="3" maxlength="16384" placeholder="Enter a question or retrieval task…" required></textarea>
+          </label>
+          <div class="query-options">
+            <label for="live-max-tokens">New tokens
+              <input id="live-max-tokens" type="number" min="1" max="64" value="24" inputmode="numeric" />
+            </label>
+            <label for="live-temperature">Temperature
+              <input id="live-temperature" type="number" min="0" max="5" step="0.1" value="0" inputmode="decimal" />
+            </label>
+            <button id="run-query" class="primary-button" type="submit" disabled>Run &amp; play</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="trace-summary" aria-label="Loaded trace summary">
+        <div class="model-identity">
+          <div class="status-line">
+            <span id="trace-source" class="status-badge">Synthetic example</span>
+            <span id="trace-reductions" class="quiet"></span>
+          </div>
+          <h2 id="model-name"></h2>
+          <p id="model-description" class="quiet"></p>
+        </div>
+        <dl class="summary-stats">
+          <div><dt>Parameters</dt><dd id="parameter-count"></dd></div>
+          <div><dt>Shape</dt><dd id="model-shape"></dd></div>
+          <div><dt>Captured</dt><dd id="capture-shape"></dd></div>
+        </dl>
+      </section>
+
+      <nav class="tabs" aria-label="Model lab views">
+        <button type="button" data-view="architecture" aria-selected="true">Architecture</button>
+        <button type="button" data-view="inference" aria-selected="false">Inference flow</button>
+        <button type="button" data-view="training" aria-selected="false">Training dynamics</button>
+      </nav>
+
+      <main>
+        <section id="view-architecture" class="view" aria-labelledby="architecture-heading">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Resolved from MAL</p>
+              <h2 id="architecture-heading">Layer circuit</h2>
+            </div>
+            <p class="quiet">Select a block to inspect its mixer, feed-forward path, and captured output.</p>
+          </div>
+          <div class="architecture-layout">
+            <div>
+              <div class="endpoint embedding-endpoint"><span>Tokens</span><strong>Embedding</strong></div>
+              <div id="layer-grid" class="layer-grid" aria-label="Model layers"></div>
+              <div class="endpoint output-endpoint"><span>Residual stream</span><strong>Final norm → vocabulary</strong></div>
+            </div>
+            <aside class="inspector" aria-live="polite">
+              <div class="inspector-heading">
+                <span id="layer-kind" class="status-badge"></span>
+                <span id="pattern-position" class="quiet"></span>
+              </div>
+              <h3 id="layer-title"></h3>
+              <dl id="layer-details" class="detail-list"></dl>
+              <div class="mini-flow" aria-label="Selected transformer block flow">
+                <span>residual</span><b>＋</b><span id="mixer-label">mixer</span><b>→</b><span>norm</span><b>→</b><span>FFN</span><b>＋</b>
+              </div>
+              <div class="activation-snapshot">
+                <div><span>Output RMS</span><strong id="selected-layer-rms"></strong></div>
+                <div><span>Largest |value|</span><strong id="selected-layer-max"></strong></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="view-inference" class="view" aria-labelledby="inference-heading" hidden>
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">One diagnostic pass</p>
+              <h2 id="inference-heading">Residual stream</h2>
+            </div>
+            <div class="inline-controls">
+              <label>Stage <select id="stage-select"></select></label>
+              <label>Token <select id="token-select"></select></label>
+            </div>
+          </div>
+          <div class="flow-controls" aria-label="Layer playback controls">
+            <div class="playback-buttons">
+              <button id="flow-prev" class="secondary-button compact-button" type="button">Previous</button>
+              <button id="flow-play" class="primary-button compact-button" type="button">Play</button>
+              <button id="flow-next" class="secondary-button compact-button" type="button">Next</button>
+            </div>
+            <label for="flow-speed">Speed
+              <select id="flow-speed">
+                <option value="1200">Slow</option>
+                <option value="700" selected>Normal</option>
+                <option value="350">Fast</option>
+              </select>
+            </label>
+            <div class="flow-progress-wrap">
+              <progress id="flow-progress" value="0" max="1"></progress>
+              <span id="flow-position" class="quiet" aria-live="polite"></span>
+            </div>
+          </div>
+          <div class="token-context">
+            <span class="quiet">Nearby tokens</span>
+            <div id="token-strip" class="token-strip"></div>
+          </div>
+          <div class="visual-grid">
+            <section class="visual-panel wide-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Token × hidden channel bin</p><h3 id="activation-title"></h3></div>
+                <div id="activation-scale" class="scale-legend"></div>
+              </div>
+              <div class="heatmap-wrap"><canvas id="activation-heatmap"></canvas></div>
+            </section>
+            <section class="visual-panel">
+              <div class="panel-heading"><div><p class="eyebrow">Across depth</p><h3>Selected-token energy</h3></div></div>
+              <svg id="rms-chart" class="line-chart" role="img" aria-label="Selected token RMS across model stages"></svg>
+              <p id="rms-selection" class="chart-selection quiet"></p>
+            </section>
+          </div>
+          <div id="mixer-visuals" class="visual-grid mixer-visuals">
+            <section id="attention-panel" class="visual-panel" hidden>
+              <div class="panel-heading">
+                <div><p class="eyebrow">Query × key probability</p><h3>Attention routing</h3></div>
+                <label>Head <select id="head-select"></select></label>
+              </div>
+              <div class="heatmap-wrap square-map"><canvas id="attention-heatmap"></canvas></div>
+            </section>
+            <section id="mamba-panel" class="visual-panel" hidden>
+              <div class="panel-heading"><div><p class="eyebrow">State dimension × inner channel bin</p><h3>Mamba memory after final token</h3></div></div>
+              <div class="heatmap-wrap"><canvas id="mamba-heatmap"></canvas></div>
+            </section>
+            <section class="visual-panel prose-panel">
+              <p class="eyebrow">Decoded continuation</p>
+              <blockquote id="generated-text"></blockquote>
+              <dl class="detail-list compact-details">
+                <div><dt>Prompt tokens</dt><dd id="prompt-token-count"></dd></div>
+                <div><dt>Generated tokens</dt><dd id="generated-token-count"></dd></div>
+                <div><dt>Sampling</dt><dd id="sampling-description"></dd></div>
+              </dl>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-training" class="view" aria-labelledby="training-heading" hidden>
+          <div id="training-empty" class="empty-state" hidden>
+            <p class="eyebrow">No metrics attached</p>
+            <h2>Export another trace with <code>--metrics path/to/metrics.jsonl</code></h2>
+            <p>The architecture and inference views remain fully available.</p>
+          </div>
+          <div id="training-content">
+            <div class="section-heading">
+              <div><p class="eyebrow">Optimizer steps</p><h2 id="training-heading">Training dynamics</h2></div>
+              <label>Metric <select id="metric-select"></select></label>
+            </div>
+            <section class="visual-panel training-chart-panel">
+              <div class="panel-heading"><div><p id="training-source" class="eyebrow"></p><h3 id="metric-title"></h3></div><span id="metric-latest" class="metric-latest"></span></div>
+              <svg id="training-chart" class="training-chart" role="img" aria-label="Training metric over optimizer steps"></svg>
+            </section>
+            <div class="visual-grid training-grid">
+              <section class="visual-panel">
+                <div class="panel-heading"><div><p class="eyebrow">Normalized within each row</p><h3>Metric correlations</h3></div></div>
+                <div class="heatmap-wrap"><canvas id="metric-heatmap"></canvas></div>
+              </section>
+              <section id="layer-gradient-panel" class="visual-panel">
+                <div class="panel-heading"><div><p class="eyebrow">Pre-clipping L2 norm</p><h3>Gradient flow by layer</h3></div></div>
+                <div class="heatmap-wrap"><canvas id="gradient-heatmap"></canvas></div>
+                <p id="gradient-note" class="chart-selection quiet"></p>
+              </section>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div id="heatmap-tooltip" class="heatmap-tooltip" role="status" hidden></div>
+      <footer>Local-only inspection · bundle format <span id="bundle-version"></span></footer>
+    </div>
+    <script type="module" src="/src/model-lab/main.js"></script>
+  </body>
+</html>

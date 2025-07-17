@@ -3,21 +3,27 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::tensor::Tensor;
+use burn_nn::loss::CrossEntropyLossConfig;
 use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_llm::{ModelDef, Tokenizer, Transformer, load_safetensors};
+use serde::Serialize;
 
 mod checkpoint;
+mod curriculum;
 mod data;
 mod muon;
+mod trainer;
 
 use checkpoint::{
-    AdamWOptimizer, TrainingState, load_training_state, parameter_ids, save_training_checkpoint,
+    AdamWOptimizer, TRAINING_STATE_VERSION, TrainingState, load_training_state, parameter_ids,
+    save_training_checkpoint,
 };
-use data::{count_samples, make_batch, visit_samples};
+use curriculum::{ObjectiveConfig, ResolvedCurriculum, load_curriculum};
+use data::{BatchStats, TrainingBatch, count_samples, make_batch, visit_samples};
 use muon::BatchedMuon;
 
 const MUON_LR_SCALE: f64 = 20.0;
@@ -35,7 +41,8 @@ enum Command {
     Train(TrainArgs),
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 enum Schedule {
     Wsd,
     Cosine,
@@ -48,23 +55,11 @@ struct TrainArgs {
     config: PathBuf,
     #[arg(short = 't', long)]
     tokenizer: PathBuf,
-    /// Text or JSONL, optionally Zstandard-compressed. Repeat for more files.
-    #[arg(short = 'd', long, required = true)]
-    data: Vec<PathBuf>,
-    /// Number of token sequences held for deterministic streaming shuffle; 0 disables shuffling.
-    #[arg(long, default_value_t = 8192)]
-    shuffle_buffer: usize,
+    /// Versioned JSON curriculum with explicit objectives and stage geometry.
+    #[arg(long)]
+    curriculum: PathBuf,
     #[arg(short = 'o', long, default_value = "checkpoint")]
     output: PathBuf,
-    #[arg(short = 'b', long, default_value_t = 8)]
-    batch_size: usize,
-    /// Number of microbatches per optimizer step.
-    #[arg(long, default_value_t = 1)]
-    grad_accum: usize,
-    #[arg(short = 'e', long, default_value_t = 1)]
-    epochs: usize,
-    #[arg(long, default_value_t = 256)]
-    seq_len: usize,
     #[arg(long, default_value_t = 3e-4)]
     lr: f64,
     #[arg(long, default_value_t = 0.1)]
@@ -75,11 +70,13 @@ struct TrainArgs {
     warmup_steps: usize,
     #[arg(long, value_enum, default_value_t = Schedule::Wsd)]
     schedule: Schedule,
-    #[arg(long)]
-    max_steps: Option<usize>,
     /// Save a resumable checkpoint every N optimizer steps; 0 disables it.
     #[arg(long, default_value_t = 100)]
     checkpoint_every: usize,
+    /// Record pre-clip gradient L2 norm for every layer every N optimizer
+    /// steps; 0 disables this opt-in visualization/debug metric.
+    #[arg(long, default_value_t = 0)]
+    layer_metrics_every: usize,
     /// Safetensors checkpoint to fine-tune from.
     #[arg(long, conflicts_with = "resume")]
     checkpoint: Option<PathBuf>,
@@ -119,6 +116,44 @@ fn squared_gradient_norm(model: &Transformer, grads: &GradientsParams) -> Option
     let mut visitor = SquaredGradientNorm { grads, sum: None };
     model.visit(&mut visitor);
     visitor.sum
+}
+
+fn squared_layer_gradient_norm(
+    model: &Transformer,
+    layer: usize,
+    grads: &GradientsParams,
+) -> Result<Option<Tensor<1>>> {
+    let mut visitor = SquaredGradientNorm { grads, sum: None };
+    model.visit_layer(layer, &mut visitor)?;
+    Ok(visitor.sum)
+}
+
+fn layer_gradient_norms(
+    model: &Transformer,
+    muon_grads: &GradientsParams,
+    adamw_grads: &GradientsParams,
+) -> Result<Vec<f32>> {
+    let mut norms = Vec::with_capacity(model.config().num_layers);
+    for layer in 0..model.config().num_layers {
+        let sum = match (
+            squared_layer_gradient_norm(model, layer, muon_grads)?,
+            squared_layer_gradient_norm(model, layer, adamw_grads)?,
+        ) {
+            (Some(muon), Some(adamw)) => muon + adamw,
+            (Some(sum), None) | (None, Some(sum)) => sum,
+            (None, None) => bail!("layer {} has no gradients", layer + 1),
+        };
+        norms.push(sum.sqrt());
+    }
+    let values = Tensor::cat(norms, 0)
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()?;
+    ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "per-layer gradient norms contain a non-finite value"
+    );
+    Ok(values)
 }
 
 struct GradientScaler<'a> {
@@ -186,14 +221,6 @@ fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
 
 fn validate_train_args(args: &TrainArgs) -> Result<()> {
     ensure!(
-        !args.data.is_empty(),
-        "at least one data source is required"
-    );
-    ensure!(args.batch_size > 0, "batch_size must be positive");
-    ensure!(args.grad_accum > 0, "grad_accum must be positive");
-    ensure!(args.epochs > 0, "epochs must be positive");
-    ensure!(args.seq_len > 0, "seq_len must be positive");
-    ensure!(
         args.lr.is_finite() && args.lr > 0.0,
         "lr must be finite and positive"
     );
@@ -205,330 +232,247 @@ fn validate_train_args(args: &TrainArgs) -> Result<()> {
         args.grad_clip.is_finite() && args.grad_clip >= 0.0,
         "grad_clip must be finite and non-negative"
     );
-    ensure!(
-        args.max_steps.is_none_or(|steps| steps > 0),
-        "max_steps must be positive when set"
-    );
     Ok(())
 }
 
-fn train(args: TrainArgs) -> Result<()> {
-    validate_train_args(&args)?;
+fn resolve_curriculum(args: &TrainArgs) -> Result<ResolvedCurriculum> {
+    load_curriculum(&args.curriculum)
+}
 
-    let tokenizer = Tokenizer::from_file(&args.tokenizer)?;
-    let mut config = load_config(&args.config)?;
-    config.vocab_size = tokenizer.vocab_size();
-    ensure!(
-        args.seq_len <= config.max_seq_len,
-        "seq_len {} exceeds model max_seq_len {}",
-        args.seq_len,
-        config.max_seq_len
-    );
-    let sample_counts = match args.max_steps {
-        Some(_) => None,
-        None => Some(
-            args.data
-                .iter()
-                .map(|path| count_samples(path, &tokenizer, args.seq_len))
-                .collect::<Result<Vec<_>>>()?,
-        ),
-    };
-    let total_steps = match (args.max_steps, &sample_counts) {
-        (Some(steps), _) => steps,
-        (None, Some(counts)) => counts
-            .iter()
-            .map(|samples| {
-                let microbatches = samples / args.batch_size;
-                (microbatches / args.grad_accum).saturating_mul(args.epochs)
-            })
-            .sum(),
-        (None, None) => unreachable!(),
-    };
-    ensure!(
-        total_steps > 0,
-        "training has zero complete optimizer steps"
-    );
-
-    fs::create_dir_all(&args.output)?;
-    fs::write(
-        args.output.join("config.json"),
-        serde_json::to_vec_pretty(&config)?,
-    )?;
-    let metrics_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(args.resume)
-        .truncate(!args.resume)
-        .open(args.output.join("metrics.jsonl"))?;
-    let mut metrics = BufWriter::new(metrics_file);
-
-    let device = hermes_llm::default_device().autodiff();
-    device.seed(args.seed);
-    let mut initial_model = Transformer::new(&config, &device)?;
-    if let Some(path) = &args.checkpoint {
-        load_safetensors(&mut initial_model, path)?;
-    }
-    let mut muon_parameter_ids = initial_model.muon_parameter_ids();
-    ensure!(
-        !muon_parameter_ids.is_empty(),
-        "model has no hidden matrix parameters for Muon"
-    );
-    let mut muon_optimizer = BatchedMuon::new(muon_parameter_ids.clone());
-    let mut adamw_optimizer: AdamWOptimizer = AdamWConfig::new()
-        .with_beta_1(0.9)
-        .with_beta_2(0.95)
-        .with_epsilon(1e-8)
-        .with_weight_decay(args.weight_decay)
-        .init();
-    let resume_state = if args.resume {
-        let (optimizer, state) = load_training_state(
-            &mut initial_model,
-            adamw_optimizer,
-            &mut muon_optimizer,
-            &args.output,
-            &device,
-        )?;
-        adamw_optimizer = optimizer;
-        muon_parameter_ids = initial_model.muon_parameter_ids();
+fn validate_model_curriculum(config: &ModelDef, curriculum: &ResolvedCurriculum) -> Result<()> {
+    for stage in &curriculum.stages {
         ensure!(
-            state.step < total_steps,
-            "checkpoint step {} has already reached requested total {total_steps}",
-            state.step
+            stage.sequence_length <= config.max_seq_len,
+            "curriculum stage `{}` sequence_length {} exceeds model max_seq_len {}",
+            stage.name,
+            stage.sequence_length,
+            config.max_seq_len
         );
-        ensure!(
-            state.stage < args.data.len() && state.epoch < args.epochs,
-            "checkpoint corpus position is outside the requested curriculum"
-        );
-        Some(state)
-    } else {
-        None
-    };
-    let mut muon_accumulator = GradientsAccumulator::new();
-    let mut adamw_accumulator = GradientsAccumulator::new();
-    let initial_parameter_ids = parameter_ids(&initial_model);
-    // Optimizer::step consumes the module; Option lets the streaming callback
-    // move it out and replace it without cloning model parameters.
-    let mut model = Some(initial_model);
-    let mut step = resume_state.as_ref().map_or(0, |state| state.step);
-    let mut micro_step = 0;
-    let mut loss_sum: Option<Tensor<1>> = None;
-    let mut optimizer_step_started = Instant::now();
-    let mut training_state = resume_state.clone().unwrap_or(TrainingState {
-        step: 0,
-        stage: 0,
-        epoch: 0,
-        samples_in_stage: 0,
-        parameter_ids: initial_parameter_ids.clone(),
-    });
-
-    let sample_summary = sample_counts.as_ref().map_or_else(
-        || "streaming".to_owned(),
-        |counts| {
-            counts
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        },
-    );
-    println!(
-        "model={} params={} muon_matrices={} device={device:?} stage_samples={sample_summary} steps={total_steps} shuffle_buffer={}",
-        config.name,
-        model.as_ref().unwrap().num_parameters(),
-        muon_parameter_ids.len(),
-        args.shuffle_buffer,
-    );
-
-    'stages: for (stage, path) in args.data.iter().enumerate() {
-        if resume_state
-            .as_ref()
-            .is_some_and(|state| stage < state.stage)
-        {
-            continue;
-        }
-        for epoch in 0..args.epochs {
-            if resume_state
-                .as_ref()
-                .is_some_and(|state| stage == state.stage && epoch < state.epoch)
-            {
-                continue;
-            }
-            let samples_to_skip = resume_state
-                .as_ref()
-                .filter(|state| state.stage == stage && state.epoch == epoch)
-                .map_or(0, |state| state.samples_in_stage);
-            let mut samples_in_stage = 0;
-            training_state = TrainingState {
-                step,
-                stage,
-                epoch,
-                samples_in_stage,
-                parameter_ids: initial_parameter_ids.clone(),
-            };
-            let mut batch = Vec::with_capacity(args.batch_size);
-            let shuffle_seed = args.seed.wrapping_add((stage * args.epochs + epoch) as u64);
-            // Reading, decompression, and tokenization run on a background
-            // thread; the bounded channel keeps two batches of samples ready
-            // so the accelerator never idles on batch preparation. Dropping
-            // the receiver (early stop or an error) hangs up the sender and
-            // the reader unwinds cleanly.
-            let seq_len = args.seq_len;
-            let shuffle_buffer = args.shuffle_buffer;
-            let tokenizer_ref = &tokenizer;
-            std::thread::scope(|threads| -> Result<()> {
-                let (sender, receiver) = std::sync::mpsc::sync_channel(args.batch_size * 2);
-                let reader = threads.spawn(move || {
-                    visit_samples(
-                        path,
-                        tokenizer_ref,
-                        seq_len,
-                        shuffle_buffer,
-                        shuffle_seed,
-                        |sample| Ok(sender.send(sample).is_ok()),
-                    )
-                });
-                for sample in &receiver {
-                    samples_in_stage += 1;
-                    training_state.samples_in_stage = samples_in_stage;
-                    if samples_in_stage <= samples_to_skip {
-                        continue;
-                    }
-                    batch.push(sample);
-                    if batch.len() < args.batch_size {
-                        continue;
-                    }
-
-                    let (inputs, targets) = make_batch(&batch, args.seq_len, &device);
-                    batch.clear();
-                    let current = model.as_ref().unwrap();
-                    if micro_step == 0 {
-                        optimizer_step_started = Instant::now();
-                    }
-                    let loss = current.forward_loss(inputs, targets);
-                    let detached_loss = loss.clone().detach();
-                    loss_sum = Some(match loss_sum.take() {
-                        Some(sum) => sum + detached_loss,
-                        None => detached_loss,
-                    });
-                    let mut grads = loss.div_scalar(args.grad_accum as f64).backward();
-                    let muon_grads =
-                        GradientsParams::from_params(&mut grads, current, &muon_parameter_ids);
-                    let adamw_grads = GradientsParams::from_module(&mut grads, current);
-                    muon_accumulator.accumulate(current, muon_grads);
-                    adamw_accumulator.accumulate(current, adamw_grads);
-                    micro_step += 1;
-
-                    if micro_step == args.grad_accum {
-                        let lr = learning_rate(&args, step + 1, total_steps);
-                        let muon_lr = lr * MUON_LR_SCALE;
-                        let loss = loss_sum
-                            .take()
-                            .expect("an optimizer step must contain a loss")
-                            .div_scalar(args.grad_accum as f32);
-                        let loss = scalar_value(loss)?;
-                        if !loss.is_finite() {
-                            bail!("non-finite loss at optimizer step {}: {loss}", step + 1);
-                        }
-                        let mut muon_grads = muon_accumulator.grads();
-                        let mut adamw_grads = adamw_accumulator.grads();
-                        let grad_norm = gradient_norm_and_clip(
-                            current,
-                            &mut muon_grads,
-                            &mut adamw_grads,
-                            args.grad_clip,
-                        )?;
-                        if !grad_norm.is_finite() {
-                            bail!(
-                                "non-finite gradient norm at optimizer step {}: {grad_norm}",
-                                step + 1
-                            );
-                        }
-                        let current = model.take().unwrap();
-                        let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
-                        model = Some(adamw_optimizer.step(lr.into(), current, adamw_grads));
-                        step += 1;
-                        training_state.step = step;
-                        let step_seconds = optimizer_step_started.elapsed().as_secs_f64();
-                        let step_tokens = args.batch_size * args.grad_accum * args.seq_len;
-                        let tokens_per_second = step_tokens as f64 / step_seconds;
-                        println!(
-                            "stage={}/{} epoch={} step={step}/{total_steps} loss={:.6} lr={lr:.3e} grad_norm={grad_norm:.3} tokens_per_second={tokens_per_second:.0}",
-                            stage + 1,
-                            args.data.len(),
-                            epoch + 1,
-                            loss
-                        );
-                        serde_json::to_writer(
-                            &mut metrics,
-                            &serde_json::json!({
-                                "step": step,
-                                "stage": stage + 1,
-                                "epoch": epoch + 1,
-                                "loss": loss,
-                                "lr": lr,
-                                "muon_lr": muon_lr,
-                                "grad_norm": grad_norm,
-                                "step_seconds": step_seconds,
-                                "tokens_per_second": tokens_per_second,
-                                "tokens": step * args.batch_size * args.grad_accum * args.seq_len,
-                            }),
-                        )?;
-                        metrics.write_all(b"\n")?;
-                        metrics.flush()?;
-                        if args.checkpoint_every > 0 && step % args.checkpoint_every == 0 {
-                            save_training_checkpoint(
-                                model.as_ref().unwrap(),
-                                &adamw_optimizer,
-                                &muon_optimizer,
-                                &training_state,
-                                &args.output,
-                            )?;
-                            println!("checkpointed {}", args.output.display());
-                        }
-                        micro_step = 0;
-                        if step >= total_steps {
-                            break;
-                        }
-                    }
-                }
-                drop(receiver);
-                reader
-                    .join()
-                    .expect("sample reader thread panicked")
-                    .map(|_| ())
-            })?;
-            if step >= total_steps {
-                break 'stages;
-            }
-            // Optimizer steps never span epoch or curriculum-stage boundaries.
-            if micro_step != 0 {
-                muon_accumulator = GradientsAccumulator::new();
-                adamw_accumulator = GradientsAccumulator::new();
-                micro_step = 0;
-                loss_sum = None;
-            }
+        if matches!(
+            stage.objective,
+            ObjectiveConfig::ContrastiveRetrieval { .. }
+        ) {
+            let layer = stage
+                .objective
+                .retrieval_layer()
+                .unwrap_or(config.num_layers);
+            ensure!(
+                layer <= config.num_layers,
+                "curriculum stage `{}` requests retrieval layer {layer}, model has {} layers",
+                stage.name,
+                config.num_layers
+            );
+            ensure!(
+                (0..layer).any(|index| {
+                    let block = config.block_for_layer(index);
+                    !block.is_ssm() && block.attention.window_size.is_none()
+                }),
+                "curriculum stage `{}` retrieval layer {layer} has no full-attention layer at or before it",
+                stage.name
+            );
         }
     }
-    ensure!(
-        step == total_steps,
-        "requested {total_steps} optimizer steps, but the data produced only {step} complete steps"
-    );
-
-    save_training_checkpoint(
-        model.as_ref().unwrap(),
-        &adamw_optimizer,
-        &muon_optimizer,
-        &training_state,
-        &args.output,
-    )?;
-    println!("saved {}", args.output.display());
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct StagePlan {
+    samples: Option<usize>,
+    steps: usize,
+}
+
+fn plan_training(
+    curriculum: &ResolvedCurriculum,
+    tokenizer: &Tokenizer,
+) -> Result<(Vec<StagePlan>, usize)> {
+    let mut total_steps = 0usize;
+    let mut plan = Vec::with_capacity(curriculum.stages.len());
+    for stage in &curriculum.stages {
+        let (samples, steps) = match stage.steps {
+            Some(steps) => (None, steps),
+            None => {
+                let samples = count_samples(
+                    &stage.data,
+                    &stage.objective,
+                    tokenizer,
+                    stage.sequence_length,
+                )?;
+                let steps_per_epoch =
+                    (samples / stage.batch_size).div_euclid(stage.gradient_accumulation);
+                let optimizer_steps =
+                    steps_per_epoch.checked_mul(stage.epochs).with_context(|| {
+                        format!(
+                            "curriculum stage `{}` optimizer-step count overflows usize",
+                            stage.name
+                        )
+                    })?;
+                (Some(samples), optimizer_steps)
+            }
+        };
+        ensure!(
+            steps > 0,
+            "curriculum stage `{}` produces zero complete optimizer steps",
+            stage.name
+        );
+        total_steps = total_steps
+            .checked_add(steps)
+            .ok_or_else(|| anyhow::anyhow!("curriculum optimizer-step count overflows usize"))?;
+        plan.push(StagePlan { samples, steps });
+    }
+    Ok((plan, total_steps))
+}
+
+fn file_fingerprint(path: &Path) -> Result<String> {
+    // Stable FNV-1a is sufficient for accidental tokenizer/config drift and
+    // avoids making resume depend on a platform-specific standard hasher.
+    let bytes = fs::read(path)
+        .map_err(anyhow::Error::from)
+        .map_err(|error| error.context(format!("failed to fingerprint {}", path.display())))?;
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in &bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("fnv1a64:{hash:016x}:{}", bytes.len()))
+}
+
+#[derive(Serialize)]
+struct RunSignature<'a> {
+    version: u32,
+    curriculum: &'a ResolvedCurriculum,
+    model: &'a ModelDef,
+    tokenizer: String,
+    seed: u64,
+    learning_rate: f64,
+    weight_decay: f32,
+    gradient_clip: f32,
+    warmup_steps: usize,
+    schedule: Schedule,
+    muon_learning_rate_scale: f64,
+}
+
+fn run_signature(
+    args: &TrainArgs,
+    curriculum: &ResolvedCurriculum,
+    config: &ModelDef,
+) -> Result<String> {
+    Ok(serde_json::to_string(&RunSignature {
+        version: TRAINING_STATE_VERSION,
+        curriculum,
+        model: config,
+        tokenizer: file_fingerprint(&args.tokenizer)?,
+        seed: args.seed,
+        learning_rate: args.lr,
+        weight_decay: args.weight_decay,
+        gradient_clip: args.grad_clip,
+        warmup_steps: args.warmup_steps,
+        schedule: args.schedule,
+        muon_learning_rate_scale: MUON_LR_SCALE,
+    })?)
+}
+
+fn add_batch_stats(total: &mut BatchStats, batch: BatchStats) -> Result<()> {
+    total.examples = total
+        .examples
+        .checked_add(batch.examples)
+        .context("optimizer-step example count overflows usize")?;
+    total.compute_tokens = total
+        .compute_tokens
+        .checked_add(batch.compute_tokens)
+        .context("optimizer-step compute-token count overflows usize")?;
+    total.supervised_tokens = total
+        .supervised_tokens
+        .checked_add(batch.supervised_tokens)
+        .context("optimizer-step supervised-token count overflows usize")?;
+    total.truncated_tokens = total
+        .truncated_tokens
+        .checked_add(batch.truncated_tokens)
+        .context("optimizer-step truncated-token count overflows usize")?;
+    total.retrieval_candidates = total
+        .retrieval_candidates
+        .checked_add(batch.retrieval_candidates)
+        .context("optimizer-step retrieval-candidate count overflows usize")?;
+    Ok(())
+}
+
+fn objective_loss(
+    model: &Transformer,
+    batch: TrainingBatch,
+    objective: &ObjectiveConfig,
+) -> Result<(Tensor<1>, BatchStats, Option<Tensor<1>>)> {
+    let stats = batch.stats();
+    let mut retrieval_correct = None;
+    let loss = match batch {
+        TrainingBatch::Language(batch) => {
+            let data::LanguageBatch {
+                input_ids,
+                targets,
+                loss_positions,
+                ..
+            } = *batch;
+            match objective {
+                ObjectiveConfig::CausalLm => {
+                    ensure!(
+                        loss_positions.is_none(),
+                        "causal_lm batch unexpectedly contains a target mask"
+                    );
+                    model.forward_loss(input_ids, targets)
+                }
+                ObjectiveConfig::Summarization { .. }
+                | ObjectiveConfig::RetrievalPlanning { .. } => {
+                    let positions = loss_positions
+                        .ok_or_else(|| anyhow::anyhow!("structured batch has no target mask"))?;
+                    model.forward_masked_loss(input_ids, targets, positions)
+                }
+                ObjectiveConfig::ContrastiveRetrieval { .. } => {
+                    bail!("contrastive_retrieval stage produced a language batch")
+                }
+            }
+        }
+        TrainingBatch::Retrieval(batch) => {
+            ensure!(
+                matches!(objective, ObjectiveConfig::ContrastiveRetrieval { .. }),
+                "non-retrieval stage produced a retrieval batch"
+            );
+            let data::RetrievalBatch {
+                query_ids,
+                query_end_positions,
+                document_ids,
+                document_end_positions,
+                labels,
+                ..
+            } = *batch;
+            let layer = objective.retrieval_layer();
+            let temperature = objective
+                .temperature()
+                .expect("retrieval objective has a temperature");
+            let queries = model.forward_embeddings(query_ids, query_end_positions, layer);
+            let documents = model.forward_embeddings(document_ids, document_end_positions, layer);
+            let logits = queries
+                .matmul(documents.transpose())
+                .div_scalar(temperature);
+            retrieval_correct = Some(
+                logits
+                    .clone()
+                    .argmax(1)
+                    .squeeze_dim::<1>(1)
+                    .equal(labels.clone())
+                    .float()
+                    .sum()
+                    .detach(),
+            );
+            CrossEntropyLossConfig::new()
+                .init(&labels.device())
+                .forward(logits, labels)
+        }
+    };
+    Ok((loss, stats, retrieval_correct))
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().command {
-        Command::Train(args) => train(args),
+        Command::Train(args) => trainer::train(args),
     }
 }
 
@@ -562,20 +506,15 @@ mod tests {
         TrainArgs {
             config: "config.mal".into(),
             tokenizer: "tokenizer.json".into(),
-            data: vec!["corpus.jsonl".into()],
-            shuffle_buffer: 8,
+            curriculum: "curriculum.json".into(),
             output: "checkpoint".into(),
-            batch_size: 2,
-            grad_accum: 1,
-            epochs: 1,
-            seq_len: 8,
             lr: 3e-4,
             weight_decay: 0.1,
             grad_clip: 1.0,
             warmup_steps: 10,
             schedule: Schedule::Wsd,
-            max_steps: Some(1),
             checkpoint_every: 0,
+            layer_metrics_every: 0,
             checkpoint: None,
             resume: false,
             seed: 0,
@@ -585,15 +524,10 @@ mod tests {
     #[test]
     fn invalid_numeric_training_arguments_fail_before_loading_files() {
         type Invalidate = fn(&mut TrainArgs);
-        let cases: [(&str, Invalidate); 8] = [
-            ("batch_size", |args| args.batch_size = 0),
-            ("grad_accum", |args| args.grad_accum = 0),
-            ("epochs", |args| args.epochs = 0),
-            ("seq_len", |args| args.seq_len = 0),
+        let cases: [(&str, Invalidate); 3] = [
             ("lr", |args| args.lr = f64::NAN),
             ("weight_decay", |args| args.weight_decay = -0.1),
             ("grad_clip", |args| args.grad_clip = f32::INFINITY),
-            ("max_steps", |args| args.max_steps = Some(0)),
         ];
         for (field, invalidate) in cases {
             let mut args = valid_train_args();
@@ -636,6 +570,11 @@ mod tests {
             let mut muon_grads =
                 GradientsParams::from_params(&mut grads, &model, &muon_parameter_ids);
             let mut adamw_grads = GradientsParams::from_module(&mut grads, &model);
+            if losses.len() == 1 {
+                let layer_norms = layer_gradient_norms(&model, &muon_grads, &adamw_grads).unwrap();
+                assert_eq!(layer_norms.len(), config.num_layers);
+                assert!(layer_norms.into_iter().all(f32::is_finite));
+            }
             let norm =
                 gradient_norm_and_clip(&model, &mut muon_grads, &mut adamw_grads, 1.0).unwrap();
             assert!(norm.is_finite());
@@ -649,10 +588,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let state = TrainingState {
+            version: TRAINING_STATE_VERSION,
             step: 20,
             stage: 1,
             epoch: 2,
             samples_in_stage: 640,
+            steps_in_stage: 10,
+            tokens_seen: 12_800,
+            curriculum_signature: Some("test-curriculum".to_owned()),
             parameter_ids: parameter_ids(&model),
         };
         save_training_checkpoint(
@@ -684,6 +627,12 @@ mod tests {
         assert_eq!(resumed_state.stage, state.stage);
         assert_eq!(resumed_state.epoch, state.epoch);
         assert_eq!(resumed_state.samples_in_stage, state.samples_in_stage);
+        assert_eq!(resumed_state.steps_in_stage, state.steps_in_stage);
+        assert_eq!(resumed_state.tokens_seen, state.tokens_seen);
+        assert_eq!(
+            resumed_state.curriculum_signature,
+            state.curriculum_signature
+        );
         let restored_ids = resumed.muon_parameter_ids();
         assert_ne!(resumed_ids, restored_ids);
         assert_eq!(muon_parameter_ids, restored_ids);

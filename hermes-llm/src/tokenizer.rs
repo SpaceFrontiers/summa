@@ -64,6 +64,15 @@ impl Tokenizer {
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
+    /// Vocabulary piece for one token ID, without decoder cleanup. This is
+    /// preferable to decoding tokens independently in diagnostic UIs because
+    /// byte-level tokenizers may only form valid text across token boundaries.
+    pub fn token_piece(&self, id: u32) -> Result<String> {
+        self.inner
+            .id_to_token(id)
+            .ok_or_else(|| anyhow::anyhow!("tokenizer has no vocabulary entry for token ID {id}"))
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }

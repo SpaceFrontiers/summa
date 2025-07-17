@@ -56,12 +56,15 @@
 //! ```
 
 pub mod generate;
+#[cfg(feature = "lab")]
+pub mod lab;
 pub mod model;
 /// Model Architecture Language (MAL) — re-exported from the standalone
 /// `hermes-mal` crate, which is the single source of truth.
 pub use hermes_mal as mal;
 pub mod remote;
 pub mod tokenizer;
+pub mod trace;
 
 // Core types
 pub use model::{
@@ -71,6 +74,7 @@ pub use model::{
 
 // Generation
 pub use generate::TextGenerator;
+pub use trace::{TraceGeneration, TraceOptions, TraceRequest, VisualizationBundle, capture_bundle};
 
 // Model Architecture Language (MAL)
 pub use mal::{

@@ -21,6 +21,7 @@ Thumbs.db
 # Node.js
 node_modules/
 hermes-web/dist/
+hermes-web/dist-model-lab/
 
 # Python
 __pycache__/

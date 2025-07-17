@@ -12,13 +12,9 @@ HERMES_TRAIN_COMMAND=(
   train
   --config /opt/hermes-run/retriever-100m.json
   --tokenizer /opt/hermes-run/tokenizer.json
-  --data /opt/hermes-run/corpus/stage1.jsonl.zst
-  --batch-size 6
-  --grad-accum 22
-  --seq-len 4096
-  --epochs 2
-  --max-steps 19000
+  --curriculum /opt/hermes-run/curriculum.json
   --checkpoint-every 100
+  --layer-metrics-every 25
 )
 
 # A failed trainer is resumed indefinitely by default. Set a positive value to

@@ -13,10 +13,30 @@ Usage: WANDB_API_KEY=... wandb_tail.py <path/to/metrics.jsonl>
 """
 
 import json
+import math
 import os
 import signal
 import sys
 import threading
+
+
+def wandb_payload(record: dict) -> dict:
+    """Expand lab-only layer arrays into scalar W&B metric series."""
+    payload = record.copy()
+    layer_norms = payload.pop("layer_grad_norms", None)
+    if layer_norms is None:
+        return payload
+    if not isinstance(layer_norms, list) or not layer_norms:
+        raise ValueError("layer_grad_norms must be a non-empty array")
+    for index, value in enumerate(layer_norms, start=1):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"layer_grad_norms[{index - 1}] is not finite")
+        payload[f"layer_grad_norm/layer_{index}"] = value
+    return payload
 
 
 def main() -> int:
@@ -90,7 +110,15 @@ def main() -> int:
                     step = raw_step
                     if step <= last_step:
                         continue  # already logged before a resume/backfill overlap
-                    wandb.log(record, step=step)
+                    try:
+                        payload = wandb_payload(record)
+                    except ValueError as error:
+                        print(
+                            f"wandb_tail: invalid metrics at step {step}: {error}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    wandb.log(payload, step=step)
                     last_step = step
             stop.wait(5)
     finally:

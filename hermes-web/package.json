@@ -7,6 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "lab:dev": "python3 -m http.server 4173 --bind 127.0.0.1",
+    "lab:build": "vite build --config model-lab.vite.config.js",
+    "lab:preview": "vite preview --config model-lab.vite.config.js",
+    "lab:test": "node --test src/model-lab/*.test.js",
+    "lab:lint": "eslint --config model-lab.eslint.config.js src/model-lab",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix"
   },

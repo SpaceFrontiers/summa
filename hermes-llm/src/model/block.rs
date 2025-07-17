@@ -7,6 +7,12 @@ use crate::mal::{BlockDef, ModelDef, NormPosition};
 
 use super::{AttnCache, FeedForward, MambaMixer, MambaState, MultiHeadAttention, Norm};
 
+pub(crate) struct BlockDiagnostic {
+    pub attention_weights: Option<Tensor<4>>,
+    pub total_attention_heads: Option<usize>,
+    pub mamba_state: Option<Tensor<3>>,
+}
+
 #[derive(Module, Debug)]
 pub struct TransformerBlock {
     attention: Option<MultiHeadAttention>,
@@ -100,6 +106,42 @@ impl TransformerBlock {
 
     pub fn forward(&self, x: Tensor<3>, rope: &RotaryEncoding, start_pos: usize) -> Tensor<3> {
         self.forward_with_mixer(x, |x| self.mix(x, rope, start_pos))
+    }
+
+    /// Run the exact block path while retaining bounded values needed by the
+    /// opt-in visualization command.
+    pub(crate) fn forward_diagnostic(
+        &self,
+        x: Tensor<3>,
+        rope: &RotaryEncoding,
+        start_pos: usize,
+        max_attention_heads: usize,
+    ) -> (Tensor<3>, BlockDiagnostic) {
+        let mut diagnostic = BlockDiagnostic {
+            attention_weights: None,
+            total_attention_heads: None,
+            mamba_state: None,
+        };
+        let output = self.forward_with_mixer(x, |mixer_input| match (&self.attention, &self.ssm) {
+            (Some(attention), None) => {
+                diagnostic.attention_weights = Some(attention.diagnostic_weights(
+                    mixer_input.clone(),
+                    rope,
+                    start_pos,
+                    max_attention_heads,
+                ));
+                diagnostic.total_attention_heads = Some(attention.num_heads());
+                attention.forward(mixer_input, rope, start_pos)
+            }
+            (None, Some(ssm)) => {
+                let mut state = ssm.make_state(mixer_input.dims()[0], &mixer_input.device());
+                let output = ssm.forward_with_state(mixer_input, Some(&mut state));
+                diagnostic.mamba_state = Some(state.h);
+                output
+            }
+            _ => unreachable!("a block has exactly one mixer"),
+        });
+        (output, diagnostic)
     }
 
     pub fn make_state(&self, batch: usize, device: &Device) -> LayerState {

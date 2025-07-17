@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "stages": [
+    {
+      "name": "foundation-1024",
+      "data": "corpus/foundation.jsonl.zst",
+      "objective": {
+        "type": "causal_lm"
+      },
+      "sequence_length": 1024,
+      "batch_size": 27,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "steps": 8000
+    },
+    {
+      "name": "foundation-4096",
+      "data": "corpus/foundation-long.jsonl.zst",
+      "objective": {
+        "type": "causal_lm"
+      },
+      "sequence_length": 4096,
+      "batch_size": 6,
+      "gradient_accumulation": 22,
+      "epochs": 1,
+      "steps": 11000
+    },
+    {
+      "name": "retrieval",
+      "data": "corpus/retrieval.jsonl.zst",
+      "objective": {
+        "type": "contrastive_retrieval",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "sequence_length": 512,
+      "batch_size": 16,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "steps": 2000,
+      "learning_rate_scale": 0.25
+    },
+    {
+      "name": "summarization",
+      "data": "corpus/summaries.jsonl.zst",
+      "objective": {
+        "type": "summarization"
+      },
+      "sequence_length": 2048,
+      "batch_size": 12,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "steps": 1500,
+      "learning_rate_scale": 0.15
+    },
+    {
+      "name": "retrieval-planning",
+      "data": "corpus/retrieval-plans.jsonl.zst",
+      "objective": {
+        "type": "retrieval_planning"
+      },
+      "sequence_length": 2048,
+      "batch_size": 12,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "steps": 1500,
+      "learning_rate_scale": 0.15
+    },
+    {
+      "name": "retrieval-refresh",
+      "data": "corpus/retrieval.jsonl.zst",
+      "objective": {
+        "type": "contrastive_retrieval",
+        "temperature": 0.04,
+        "layer": 24
+      },
+      "sequence_length": 512,
+      "batch_size": 16,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "steps": 500,
+      "learning_rate_scale": 0.1
+    }
+  ]
+}

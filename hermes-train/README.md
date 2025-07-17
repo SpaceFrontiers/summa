@@ -22,22 +22,25 @@ cargo build --release -p hermes-train --features cuda
 hermes-train train \
   --config models/hybrid-tiny.mal \
   --tokenizer tokenizer.json \
-  --data corpus.jsonl \
+  --curriculum curriculum.json \
   --output checkpoint \
-  --batch-size 8 \
-  --grad-accum 4 \
-  --shuffle-buffer 8192 \
-  --checkpoint-every 100 \
-  --seq-len 256 \
-  --epochs 1
+  --checkpoint-every 100
 ```
 
-Training data is either a text file or JSONL with a string `text` field; both
-formats may be Zstandard-compressed (`.zst`). The reader EOS-joins documents,
-packs every complete fixed-length sample, and streams samples through a
-deterministic bounded shuffle buffer instead of retaining the corpus in memory.
-Repeat `--data` for curriculum stages; each file is trained completely before
-the next. Set `--shuffle-buffer 0` only for ordered diagnostic runs.
+Training is defined by a versioned JSON curriculum; stage geometry is not split
+between CLI flags and a data manifest. Start from
+[`curriculum.example.json`](curriculum.example.json), then set its data paths,
+step budgets, and measured batch sizes. Relative paths resolve against the
+curriculum file. Set a stage's `shuffle_buffer` to zero only for ordered
+diagnostic runs.
+
+The four objectives are causal LM (`text`), target-only summarization
+(`document`, `summary`), target-only retrieval planning (`request`, `plan`, and
+optional `context`), and normalized in-batch contrastive retrieval (`query`,
+`positive`, and optional `negatives`). Structured objectives require JSONL;
+causal LM also accepts plain text. All formats may be Zstandard-compressed.
+The complete schema, loss masks, truncation behavior, and resume contract are in
+[`docs/training-objectives-and-curricula.md`](../docs/training-objectives-and-curricula.md).
 
 The trainer uses batched Muon updates for hidden 2D matrices and AdamW for
 embeddings, output weights, norms, biases, and convolution kernels. Muon uses a
@@ -53,6 +56,9 @@ remote sync never consume a partially replaced checkpoint.
 Each training checkpoint includes weights, AdamW and Muon state, and the exact
 curriculum position. Relaunch the same command with `--resume` to replay the
 deterministic bounded shuffle up to that position and continue the schedule.
+Resume verifies the entire curriculum and optimization signature. Use
+`--checkpoint` instead when warm-starting a new curriculum from existing
+safetensors.
 On Mamba models, training and inference use fused CubeCL selective-scan kernels
 on Metal and CUDA; CPU uses the tensor-operation reference implementation.
 
@@ -60,6 +66,7 @@ Outputs are deliberately minimal:
 
 - `config.json`, with the logical tokenizer vocabulary size applied; embedding
   and output tensors use a derived 64-row storage alignment
+- `resolved-curriculum.json`, with defaults applied and relative paths resolved
 - `metrics.jsonl`, flushed after every optimizer step for live reporters
 - `weights.safetensors`, using the shared model's parameter names
 - `adamw-state.bpk`, `muon-state.bpk`, and `training-state.json` for resume
@@ -67,6 +74,12 @@ Outputs are deliberately minimal:
 The checkpoint loads directly in `hermes-llm` with strict tensor and shape
 validation. Experiment services such as W&B can tail `metrics.jsonl` without
 being linked into the training process.
+
+Pass `--layer-metrics-every N` to add pre-clipping `layer_grad_norms` every N
+optimizer steps for the model visualization lab. This diagnostic is disabled by
+default because it walks every layer and copies the resulting norms to the CPU.
+The W&B sidecar expands the array into `layer_grad_norm/layer_N` scalar series,
+while the local JSONL retains the dense row used by the lab heatmap.
 
 ## Reliable relaunch and W&B
 
@@ -89,6 +102,7 @@ Copy and edit the example configuration, then run the supervisor as the same
 user that owns the training files:
 
 ```bash
+cp hermes-train/curriculum.example.json /opt/hermes-run/curriculum.json
 cp hermes-train/scripts/relaunch.conf.example /opt/hermes-run/relaunch.conf
 hermes-train/scripts/relaunch.sh /opt/hermes-run/relaunch.conf
 ```
