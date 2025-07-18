@@ -568,8 +568,23 @@ pub async fn collect_segment_with_limit<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
+    collect_segment_with_limit_seeded(reader, query, collector, limit, 0.0).await
+}
+
+/// Async `collect_segment_with_limit` with a cross-segment threshold seed.
+///
+/// `initial_threshold` is passed to the scorer so exact MaxScore/BMP paths can
+/// start pruning from a nonzero floor carried over from earlier segments.
+pub async fn collect_segment_with_limit_seeded<C: Collector>(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    collector: &mut C,
+    limit: usize,
+    initial_threshold: f32,
+) -> Result<()> {
     let options = super::ScorerOptions {
         collect_positions: collector.needs_positions(),
+        initial_threshold,
     };
     let mut scorer = query.scorer_with_options(reader, limit, options).await?;
     drive_scorer(scorer.as_mut(), collector);
@@ -628,12 +643,81 @@ pub fn collect_segment_with_limit_sync<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
+    collect_segment_with_limit_seeded_sync(reader, query, collector, limit, 0.0)
+}
+
+/// Synchronous `collect_segment_with_limit_sync` with a cross-segment threshold
+/// seed (see `collect_segment_with_limit_seeded`).
+#[cfg(feature = "sync")]
+pub fn collect_segment_with_limit_seeded_sync<C: Collector>(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    collector: &mut C,
+    limit: usize,
+    initial_threshold: f32,
+) -> Result<()> {
     let options = super::ScorerOptions {
         collect_positions: collector.needs_positions(),
+        initial_threshold,
     };
     let mut scorer = query.scorer_sync_with_options(reader, limit, options)?;
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
+}
+
+/// Per-segment search seeded with a cross-segment top-k floor (sync).
+///
+/// Behaves like `search_segment_with_count_sync` / its positions variant, but
+/// threads `initial_threshold` into the scorer so exact MaxScore/BMP paths
+/// prune from the running global k-th score. Used by the multi-segment
+/// searcher to propagate the threshold across segments.
+#[cfg(feature = "sync")]
+pub fn search_segment_seeded_sync(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+    initial_threshold: f32,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = if collect_positions {
+        TopKCollector::with_positions(segment_limit)
+    } else {
+        TopKCollector::new(segment_limit)
+    };
+    collect_segment_with_limit_seeded_sync(
+        reader,
+        query,
+        &mut collector,
+        segment_limit,
+        initial_threshold,
+    )?;
+    Ok(collector.into_results_with_count())
+}
+
+/// Per-segment search seeded with a cross-segment top-k floor (async).
+pub async fn search_segment_seeded(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+    initial_threshold: f32,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = if collect_positions {
+        TopKCollector::with_positions(segment_limit)
+    } else {
+        TopKCollector::new(segment_limit)
+    };
+    collect_segment_with_limit_seeded(
+        reader,
+        query,
+        &mut collector,
+        segment_limit,
+        initial_threshold,
+    )
+    .await?;
+    Ok(collector.into_results_with_count())
 }
 
 #[cfg(test)]

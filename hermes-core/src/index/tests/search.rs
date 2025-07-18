@@ -453,3 +453,104 @@ async fn test_russian_stemmer_search() {
         "Russian stemmer: field-qualified search should find 1 doc"
     );
 }
+
+/// Cross-segment top-k threshold propagation must not change results.
+///
+/// When a query runs over many segments, each segment seeds its MaxScore
+/// pruning from the running global k-th score (`SharedThreshold`) and raises
+/// that floor once it fills its own heap. This is a performance optimization
+/// and MUST be exact: the seeded top-k over many segments has to equal the
+/// exhaustive (un-pruned) top-k. A regression that seeded too aggressively
+/// (e.g. from partial per-field scores) would drop or reorder a valid hit and
+/// trip this test.
+#[tokio::test]
+async fn test_cross_segment_threshold_topk_matches_exhaustive() {
+    use crate::query::{BooleanQuery, TermQuery};
+
+    // Single text field so a multi-term OR hits the single-field MaxScore path
+    // that consumes the cross-segment threshold seed.
+    let mut schema_builder = SchemaBuilder::default();
+    let content = schema_builder.add_text_field("content", true, true);
+    let schema = schema_builder.build();
+
+    let dir = RamDirectory::new();
+    // A commit per batch + no merging => many small segments kept separate, so
+    // the cross-segment threshold is actually exercised.
+    let config = IndexConfig {
+        max_indexing_memory_bytes: 1024,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Varied term frequencies so BM25 scores spread out and pruning has teeth.
+    let terms = ["alpha", "beta", "gamma", "delta"];
+    let mut n_docs = 0u32;
+    for batch in 0..12 {
+        for i in 0..8 {
+            let mut text = String::new();
+            let repeats = (i % 4) + 1;
+            for _ in 0..repeats {
+                text.push_str(terms[(i + batch) % terms.len()]);
+                text.push(' ');
+            }
+            if i % 2 == 0 {
+                text.push_str("alpha ");
+            }
+            if i % 3 == 0 {
+                text.push_str("beta beta ");
+            }
+            let mut doc = Document::new();
+            doc.add_text(content, text.trim());
+            writer.add_document(doc).unwrap();
+            n_docs += 1;
+        }
+        writer.commit().await.unwrap();
+    }
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), n_docs);
+    assert!(
+        index.segment_readers().await.unwrap().len() >= 3,
+        "test needs multiple segments to exercise the cross-segment threshold"
+    );
+
+    let query = BooleanQuery::new()
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"))
+        .should(TermQuery::text(content, "gamma"));
+
+    // Ground truth: fetching all matches never fills a per-segment top-k of
+    // size n_docs, so no pruning and no cross-segment seeding occur.
+    let exhaustive = index.search(&query, n_docs as usize).await.unwrap();
+    assert!(
+        exhaustive.hits.len() > 5,
+        "need enough matches for the comparison to be meaningful"
+    );
+
+    // Seeded top-k for several small k must equal the exhaustive prefix exactly.
+    for k in [1usize, 3, 5, 10] {
+        let topk = index.search(&query, k).await.unwrap();
+        let expected = &exhaustive.hits[..k.min(exhaustive.hits.len())];
+        assert_eq!(
+            topk.hits.len(),
+            expected.len(),
+            "k={k}: cross-segment pruning changed the result count"
+        );
+        // Compare the score *sequence*, not doc identity: seeding prunes at the
+        // exact k-th score, so which of several docs tied at the boundary is
+        // returned may differ from the exhaustive run — that's a valid top-k
+        // either way. A dropped/mis-scored hit still changes the sequence.
+        for (got, want) in topk.hits.iter().zip(expected.iter()) {
+            assert!(
+                (got.score - want.score).abs() < 1e-5,
+                "k={k}: top-k score sequence diverged from exhaustive ({} vs {}) => \
+                 threshold pruning dropped a valid hit",
+                got.score,
+                want.score
+            );
+        }
+    }
+}
