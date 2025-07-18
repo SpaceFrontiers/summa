@@ -18,6 +18,7 @@ use log::{info, warn};
 use tonic::{codec::CompressionEncoding, transport::Server};
 
 use hermes_core::IndexConfig;
+use hermes_core::segment::pin::{PinMode, PinPolicy, set_pin_policy};
 
 pub mod proto {
     tonic::include_proto!("hermes");
@@ -124,10 +125,37 @@ struct Args {
     #[arg(long, default_value = "24576")]
     bp_memory_budget_mb: usize,
 
+    /// Budget (MB) for pinning hot per-segment metadata resident in RAM
+    /// (BMP block-offset tables, sparse skip sections, doc-id maps). 0 = off.
+    /// Overrides the HERMES_PIN_METADATA_BUDGET_MB env var when set.
+    #[arg(long)]
+    pin_metadata_budget_mb: Option<u64>,
+
+    /// How pinned metadata is held resident: `mlock` (lock mmap pages in place,
+    /// needs RLIMIT_MEMLOCK headroom) or `copy` (heap copy, no permissions).
+    /// Overrides the HERMES_PIN_MODE env var when set.
+    #[arg(long, value_enum)]
+    pin_mode: Option<PinModeArg>,
+
     /// Address for the Prometheus /metrics HTTP endpoint.
     /// Set to "off" to disable the exporter.
     #[arg(long, default_value = "0.0.0.0:9184")]
     metrics_addr: String,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum PinModeArg {
+    Mlock,
+    Copy,
+}
+
+impl From<PinModeArg> for PinMode {
+    fn from(m: PinModeArg) -> Self {
+        match m {
+            PinModeArg::Mlock => PinMode::Mlock,
+            PinModeArg::Copy => PinMode::Copy,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -196,6 +224,29 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
 
     // Create data directory if needed
     std::fs::create_dir_all(&args.data_dir)?;
+
+    // Hot-metadata pinning policy. CLI flags take precedence; each unset flag
+    // falls back to its HERMES_PIN_* env var (backward compat). Must be set
+    // before the first segment is opened (registry cleanup / doctor below).
+    let env_policy = PinPolicy::from_env();
+    let pin_budget_bytes = match args.pin_metadata_budget_mb {
+        Some(mb) => mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("--pin-metadata-budget-mb is too large"))?,
+        None => env_policy.budget_bytes,
+    };
+    let pin_policy = PinPolicy {
+        budget_bytes: pin_budget_bytes,
+        mode: args.pin_mode.map(PinMode::from).unwrap_or(env_policy.mode),
+    };
+    set_pin_policy(pin_policy);
+    if pin_policy.is_enabled() {
+        info!(
+            "Hot-metadata pinning: {} MB budget, {:?} mode",
+            pin_budget_bytes / (1024 * 1024),
+            pin_policy.mode,
+        );
+    }
 
     let addr: SocketAddr = args.addr.parse()?;
 

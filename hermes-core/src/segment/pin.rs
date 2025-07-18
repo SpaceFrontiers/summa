@@ -50,7 +50,12 @@ impl PinPolicy {
     /// Read policy from environment:
     /// `HERMES_PIN_METADATA_BUDGET_MB` (default 0 = off),
     /// `HERMES_PIN_MODE` = `mlock` (default) | `copy`.
-    fn from_env() -> Self {
+    ///
+    /// Used as the default initializer for [`pin_policy`], and as the
+    /// backward-compatible fallback for consumers (e.g. hermes-server) that
+    /// surface these as CLI flags but still honor the env vars when the flags
+    /// are left unset.
+    pub fn from_env() -> Self {
         let budget_mb: u64 = std::env::var("HERMES_PIN_METADATA_BUDGET_MB")
             .ok()
             .and_then(|v| v.parse().ok())
