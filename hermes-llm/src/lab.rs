@@ -19,7 +19,8 @@ use crate::trace::{TraceGeneration, TraceOptions, TraceRequest, VisualizationBun
 use crate::{Device, TextGenerator, Tokenizer, Transformer, capture_bundle};
 
 const DEFAULT_MAX_TOKENS: usize = 32;
-const DEFAULT_TEMPERATURE: f64 = 0.0;
+const DEFAULT_TEMPERATURE: f64 = 0.9;
+const DEFAULT_REPETITION_PENALTY: f64 = 1.05;
 
 #[derive(Debug, Clone)]
 pub struct LabServerConfig {
@@ -42,6 +43,8 @@ pub struct LiveTraceRequest {
     pub temperature: f64,
     #[serde(default)]
     pub top_k: Option<usize>,
+    #[serde(default = "default_repetition_penalty")]
+    pub repetition_penalty: f64,
     #[serde(default)]
     pub seed: Option<u64>,
 }
@@ -52,6 +55,10 @@ fn default_max_tokens() -> usize {
 
 fn default_temperature() -> f64 {
     DEFAULT_TEMPERATURE
+}
+
+fn default_repetition_penalty() -> f64 {
+    DEFAULT_REPETITION_PENALTY
 }
 
 #[derive(Clone, Serialize)]
@@ -115,6 +122,7 @@ impl InferenceWorker {
             max_new_tokens: request.max_tokens,
             temperature: request.temperature,
             top_k: request.top_k,
+            repetition_penalty: request.repetition_penalty,
             eos_token: Some(self.tokenizer.eos_token_id()),
             seed: Some(seed),
         };
@@ -132,6 +140,7 @@ impl InferenceWorker {
                     max_new_tokens: request.max_tokens,
                     temperature: request.temperature,
                     top_k: request.top_k,
+                    repetition_penalty: request.repetition_penalty,
                     seed,
                     stop_at_eos: true,
                 },
@@ -164,6 +173,12 @@ fn validate_request(request: &LiveTraceRequest, status: &LabStatus) -> Result<()
     ensure!(
         request.temperature.is_finite() && request.temperature >= 0.0 && request.temperature <= 5.0,
         "temperature must be finite and between 0 and 5"
+    );
+    ensure!(
+        request.repetition_penalty.is_finite()
+            && request.repetition_penalty >= 1.0
+            && request.repetition_penalty <= 5.0,
+        "repetition_penalty must be finite and between 1 and 5"
     );
     ensure!(
         request
@@ -348,6 +363,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.8,
             top_k: Some(10),
+            repetition_penalty: 1.05,
             seed: Some(7),
         };
         validate_request(&valid, &status()).unwrap();
@@ -368,6 +384,21 @@ mod tests {
                 .to_string()
                 .contains("server limit")
         );
+        blank.max_tokens = 8;
+        blank.repetition_penalty = 0.99;
+        assert!(
+            validate_request(&blank, &status())
+                .unwrap_err()
+                .to_string()
+                .contains("repetition_penalty")
+        );
+    }
+
+    #[test]
+    fn live_request_defaults_enable_moderate_sampling_controls() {
+        let request = serde_json::from_str::<LiveTraceRequest>(r#"{"prompt":"hello"}"#).unwrap();
+        assert_eq!(request.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(request.repetition_penalty, DEFAULT_REPETITION_PENALTY);
     }
 
     #[test]

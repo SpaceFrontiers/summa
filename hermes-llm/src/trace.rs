@@ -161,6 +161,7 @@ pub struct SamplingTrace {
     pub temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
+    pub repetition_penalty: f64,
     pub seed: u64,
     pub stop_at_eos: bool,
 }
@@ -255,6 +256,7 @@ pub struct TraceGeneration {
     pub max_new_tokens: usize,
     pub temperature: f64,
     pub top_k: Option<usize>,
+    pub repetition_penalty: f64,
     pub seed: u64,
     pub stop_at_eos: bool,
 }
@@ -416,6 +418,7 @@ pub fn capture_bundle(
                 max_new_tokens: generation.max_new_tokens,
                 temperature: generation.temperature,
                 top_k: generation.top_k,
+                repetition_penalty: generation.repetition_penalty,
                 seed: generation.seed,
                 stop_at_eos: generation.stop_at_eos,
             },

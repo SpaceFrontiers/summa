@@ -164,7 +164,7 @@ export const demoTrace = {
     generated_token_count: tokenPieces.length - 7,
     token_offset: 0,
     tokens: tokenPieces.map((piece, index) => ({ original_index: index, id: 120 + index * 7, piece: piece.replaceAll('·', ' '), display: piece, source: index < 7 ? 'prompt' : 'generated' })),
-    sampling: { max_new_tokens: 32, temperature: 0.7, top_k: 40, seed: 42, stop_at_eos: true },
+    sampling: { max_new_tokens: 32, temperature: 0.7, top_k: 40, repetition_penalty: 1.05, seed: 42, stop_at_eos: true },
     stages,
   },
   training: {
