@@ -56,6 +56,12 @@ remote sync never consume a partially replaced checkpoint.
 Each training checkpoint includes weights, AdamW and Muon state, and the exact
 curriculum position. Relaunch the same command with `--resume` to replay the
 deterministic bounded shuffle up to that position and continue the schedule.
+For causal stages, `.token-cache/<run-signature>/` stores an append-only local
+cache of tokenized documents. Resume reconstructs the exact packer/shuffle
+state from this stream without re-running the tokenizer; an interrupted tail
+record is discarded and rebuilt from the corpus. The cache is derived, may be
+deleted safely between runs, and is intentionally not uploaded as part of the
+authoritative model/optimizer checkpoint.
 Resume verifies the entire curriculum and optimization signature. Use
 `--checkpoint` instead when warm-starting a new curriculum from existing
 safetensors.
@@ -68,12 +74,18 @@ Outputs are deliberately minimal:
   and output tensors use a derived 64-row storage alignment
 - `resolved-curriculum.json`, with defaults applied and relative paths resolved
 - `metrics.jsonl`, flushed after every optimizer step for live reporters
+- `.token-cache/`, a repairable local causal-token cache for fast resume
 - `weights.safetensors`, using the shared model's parameter names
 - `adamw-state.bpk`, `muon-state.bpk`, and `training-state.json` for resume
 
 The checkpoint loads directly in `hermes-llm` with strict tensor and shape
 validation. Experiment services such as W&B can tail `metrics.jsonl` without
 being linked into the training process.
+
+MoE models add `router_aux_loss` and `optimized_loss` to each metrics row. The
+task-specific `loss` remains directly comparable with dense runs. See
+[`docs/moe-design.md`](../docs/moe-design.md) for the MAL schema, routing
+semantics, research basis, and current grouped-kernel limitation.
 
 Pass `--layer-metrics-every N` to add pre-clipping `layer_grad_norms` every N
 optimizer steps for the model visualization lab. This diagnostic is disabled by

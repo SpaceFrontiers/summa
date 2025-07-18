@@ -257,7 +257,8 @@ mod tests {
         assert_eq!(model.config().vocab_size, 32);
         assert_eq!(model.config().padded_vocab_size(), 64);
 
-        let mut state = model.make_state(1, &device);
+        let mut state = model.make_state_with_capacity(1, ids.len(), &device);
+        assert_eq!(state.capacity(), ids.len());
         let prefill = model.forward_with_state(
             Tensor::<2, Int>::from_data(TensorData::new(ids[..4].to_vec(), [1, 4]), &device),
             &mut state,

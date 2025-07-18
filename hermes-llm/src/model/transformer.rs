@@ -85,6 +85,26 @@ fn validate_config(config: &ModelDef) -> Result<()> {
         if intermediate == 0 {
             bail!("layer {i} FFN hidden_dim must be positive");
         }
+        if let Some(moe) = &block.ffn.moe {
+            if moe.experts < 2 {
+                bail!("layer {i} MoE experts must be at least 2");
+            }
+            if moe.top_k == 0 || moe.top_k > moe.experts {
+                bail!(
+                    "layer {i} MoE top_k must be in 1..={}, got {}",
+                    moe.experts,
+                    moe.top_k
+                );
+            }
+            for (name, weight) in [
+                ("load_balance_loss_weight", moe.load_balance_loss_weight),
+                ("router_z_loss_weight", moe.router_z_loss_weight),
+            ] {
+                if !weight.is_finite() || weight < 0.0 {
+                    bail!("layer {i} MoE {name} must be finite and non-negative");
+                }
+            }
+        }
 
         if let Some(ssm) = &block.ssm {
             for (name, size) in [
@@ -332,6 +352,16 @@ impl Transformer {
         start_pos: usize,
         layer_count: usize,
     ) -> Tensor<3> {
+        self.forward_hidden_through_with_aux(input_ids, start_pos, layer_count)
+            .0
+    }
+
+    fn forward_hidden_through_with_aux(
+        &self,
+        input_ids: Tensor<2, Int>,
+        start_pos: usize,
+        layer_count: usize,
+    ) -> (Tensor<3>, Option<Tensor<1>>) {
         let [_, seq_len] = input_ids.dims();
         assert!(
             start_pos + seq_len <= self.config.max_seq_len,
@@ -349,29 +379,47 @@ impl Transformer {
         // (`forward_hidden_with_state`) keeps FP32: its scan/conv step kernels
         // are FP32-only.
         let mut x = stream_cast(self.embed(input_ids));
+        let mut auxiliary = None;
         for layer in self.layers.iter().take(layer_count) {
-            x = layer.forward(x, &self.rope, start_pos);
+            let (output, layer_auxiliary) = layer.forward_with_aux(x, &self.rope, start_pos);
+            x = output;
+            if let Some(layer_loss) = layer_auxiliary {
+                auxiliary = Some(match auxiliary {
+                    Some(loss) => loss + layer_loss,
+                    None => layer_loss,
+                });
+            }
         }
-        self.final_norm.forward(x)
+        (self.final_norm.forward(x), auxiliary)
     }
 
     /// Next-token cross-entropy for training. The output projection is chunked
     /// so full-vocabulary logits are never retained for every input token.
     pub fn forward_loss(&self, input_ids: Tensor<2, Int>, targets: Tensor<2, Int>) -> Tensor<1> {
+        self.forward_loss_with_router(input_ids, targets).0
+    }
+
+    /// Next-token loss plus the configured MoE router regularization.
+    pub fn forward_loss_with_router(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Tensor<2, Int>,
+    ) -> (Tensor<1>, Option<Tensor<1>>) {
         let [batch, seq_len] = targets.dims();
         let tokens = batch * seq_len;
-        let hidden = self
-            .forward_hidden(input_ids, 0)
-            .reshape([tokens, self.config.hidden_size]);
+        let (hidden, router_loss) =
+            self.forward_hidden_through_with_aux(input_ids, 0, self.layers.len());
+        let hidden = hidden.reshape([tokens, self.config.hidden_size]);
         let (weight, bias) = self.output_parameters();
-        linear_cross_entropy(
+        let loss = linear_cross_entropy(
             hidden,
             weight,
             bias,
             targets.reshape([tokens]),
             self.config.vocab_size,
             tokens.div_ceil(LOSS_CHUNKS),
-        )
+        );
+        (loss, router_loss)
     }
 
     /// Causal cross-entropy over selected flattened token positions.
@@ -385,25 +433,38 @@ impl Transformer {
         targets: Tensor<2, Int>,
         positions: Tensor<1, Int>,
     ) -> Tensor<1> {
+        self.forward_masked_loss_with_router(input_ids, targets, positions)
+            .0
+    }
+
+    /// Selected-position language loss plus configured MoE regularization.
+    pub fn forward_masked_loss_with_router(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Tensor<2, Int>,
+        positions: Tensor<1, Int>,
+    ) -> (Tensor<1>, Option<Tensor<1>>) {
         let [batch, seq_len] = targets.dims();
         assert_eq!(input_ids.dims(), [batch, seq_len]);
         let [selected_tokens] = positions.dims();
         assert!(selected_tokens > 0, "masked loss requires target tokens");
         let tokens = batch * seq_len;
-        let hidden = self
-            .forward_hidden(input_ids, 0)
+        let (hidden, router_loss) =
+            self.forward_hidden_through_with_aux(input_ids, 0, self.layers.len());
+        let hidden = hidden
             .reshape([tokens, self.config.hidden_size])
             .select(0, positions.clone());
         let targets = targets.reshape([tokens]).select(0, positions);
         let (weight, bias) = self.output_parameters();
-        linear_cross_entropy(
+        let loss = linear_cross_entropy(
             hidden,
             weight,
             bias,
             targets,
             self.config.vocab_size,
             selected_tokens.div_ceil(LOSS_CHUNKS),
-        )
+        );
+        (loss, router_loss)
     }
 
     /// L2-normalized last-meaningful-token embeddings for retrieval training.
@@ -419,15 +480,27 @@ impl Transformer {
         end_positions: Tensor<1, Int>,
         layer: Option<usize>,
     ) -> Tensor<2> {
+        self.forward_embeddings_with_router(input_ids, end_positions, layer)
+            .0
+    }
+
+    /// Retrieval embeddings plus configured router regularization.
+    pub fn forward_embeddings_with_router(
+        &self,
+        input_ids: Tensor<2, Int>,
+        end_positions: Tensor<1, Int>,
+        layer: Option<usize>,
+    ) -> (Tensor<2>, Option<Tensor<1>>) {
         let [batch, seq_len] = input_ids.dims();
         assert_eq!(end_positions.dims(), [batch]);
-        let hidden = self
-            .forward_hidden_through(input_ids, 0, layer.unwrap_or(self.layers.len()))
+        let (hidden, router_loss) =
+            self.forward_hidden_through_with_aux(input_ids, 0, layer.unwrap_or(self.layers.len()));
+        let hidden = hidden
             .reshape([batch * seq_len, self.config.hidden_size])
             .select(0, end_positions)
             .cast(DType::F32);
         let norm = hidden.clone().square().sum_dim(1).sqrt().clamp_min(1e-12);
-        hidden / norm
+        (hidden / norm, router_loss)
     }
 
     fn project_logits(&self, x: Tensor<3>) -> Tensor<3> {
@@ -524,6 +597,12 @@ impl Transformer {
         for layer in &self.layers {
             layer.visit(&mut visitor);
         }
+        let router_ids = self
+            .layers
+            .iter()
+            .filter_map(TransformerBlock::router_parameter_id)
+            .collect::<Vec<_>>();
+        visitor.ids.retain(|id| !router_ids.contains(id));
         visitor.ids
     }
 
@@ -582,12 +661,33 @@ impl Transformer {
     }
 
     pub fn make_state(&self, batch: usize, device: &Device) -> InferenceState {
+        self.make_state_with_capacity(batch, self.config.max_seq_len, device)
+    }
+
+    /// Build recurrent state with a right-sized attention KV allocation.
+    /// Mamba state is constant-sized and is unaffected by `capacity`.
+    pub fn make_state_with_capacity(
+        &self,
+        batch: usize,
+        capacity: usize,
+        device: &Device,
+    ) -> InferenceState {
+        assert!(capacity > 0, "inference state capacity must be positive");
+        assert!(
+            capacity <= self.config.max_seq_len,
+            "inference state capacity {capacity} exceeds max_seq_len {}",
+            self.config.max_seq_len
+        );
         let layers = self
             .layers
             .iter()
-            .map(|layer| layer.make_state(batch, device))
+            .map(|layer| layer.make_state_with_capacity(batch, capacity, device))
             .collect();
-        InferenceState { layers, pos: 0 }
+        InferenceState {
+            layers,
+            pos: 0,
+            capacity,
+        }
     }
 
     pub fn forward_with_state(
@@ -618,11 +718,11 @@ impl Transformer {
             "incremental inference requires non-empty input"
         );
         assert!(
-            state.pos + seq_len <= self.config.max_seq_len,
-            "inference state at position {} + {} tokens exceeds max_seq_len {}",
+            state.pos + seq_len <= state.capacity,
+            "inference state at position {} + {} tokens exceeds cache capacity {}",
             state.pos,
             seq_len,
-            self.config.max_seq_len
+            state.capacity
         );
         assert_eq!(
             state.layers.len(),
@@ -657,6 +757,68 @@ mod tests {
     use super::*;
     use crate::mal::get_builtin_model;
     use burn::tensor::TensorData;
+
+    fn run_configurable_moe_backward(device: Device) {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn routed {
+                hidden_dim: 16
+                moe {
+                    experts: 4
+                    top_k: 2
+                    shared_experts: 1
+                    load_balance_loss_weight: 0.01
+                    router_z_loss_weight: 0.001
+                }
+            }
+            model moe_test {
+                vocab_size: 32
+                max_seq_len: 8
+                hidden_size: 8
+                num_layers: 1
+                block: {
+                    attention: { num_heads: 1 position_encoding: none }
+                    ffn: routed
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let device = device.autodiff();
+        let model = Transformer::new(&config, &device).unwrap();
+        let input = Tensor::<2, Int>::from_data([[1, 2, 3, 4]], &device);
+        let targets = Tensor::<2, Int>::from_data([[2, 3, 4, 5]], &device);
+        let (task, router) = model.forward_loss_with_router(input, targets);
+        let router = router.expect("MoE must emit its configured router objective");
+        let total = task + router;
+        assert!(
+            total
+                .clone()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap()[0]
+                .is_finite()
+        );
+        let _grads = total.backward();
+    }
+
+    #[test]
+    fn configurable_moe_runs_task_and_router_backward() {
+        run_configurable_moe_backward(Device::ndarray());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn configurable_moe_runs_on_metal() {
+        run_configurable_moe_backward(Device::metal(burn::tensor::DeviceKind::DefaultDevice));
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn configurable_moe_runs_on_cuda() {
+        run_configurable_moe_backward(Device::cuda(0));
+    }
 
     /// End-to-end BF16-residual-stream gate: the model must run forward_loss
     /// + backward under lazy fusion, where dtype mismatches between custom-op

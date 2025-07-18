@@ -105,11 +105,28 @@ ffn_prop = {
     activation_prop |
     bias_prop |
     dropout_prop |
-    gate_prop
+    gate_prop |
+    moe_prop
 }
 
 hidden_dim_prop = { ("hidden_dim" | "intermediate_size") ~ ":" ~ integer }
 gate_prop = { "gate" ~ ":" ~ boolean }
+
+// Optional sparse mixture-of-experts routing. Omitting this block preserves a
+// conventional dense FFN and its checkpoint layout.
+moe_prop = { "moe" ~ "{" ~ moe_param* ~ "}" }
+moe_param = {
+    experts_prop |
+    top_k_prop |
+    shared_experts_prop |
+    load_balance_loss_weight_prop |
+    router_z_loss_weight_prop
+}
+experts_prop = { "experts" ~ ":" ~ integer }
+top_k_prop = { "top_k" ~ ":" ~ integer }
+shared_experts_prop = { "shared_experts" ~ ":" ~ integer }
+load_balance_loss_weight_prop = { "load_balance_loss_weight" ~ ":" ~ number }
+router_z_loss_weight_prop = { "router_z_loss_weight" ~ ":" ~ number }
 
 // ============================================================================
 // SSM (MAMBA) DEFINITION

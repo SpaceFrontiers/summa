@@ -189,6 +189,26 @@ pub struct FfnDef {
     pub bias: bool,
     pub dropout: f64,
     pub gate: bool,
+    /// Sparse token-choice routing. Omitted for an ordinary dense FFN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<MoeDef>,
+}
+
+/// Configurable dropless token-choice mixture of experts.
+///
+/// `experts` are routed experts; `shared_experts` are always active. Router
+/// regularization belongs to the architecture config so every training entry
+/// point applies the same stable objective.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoeDef {
+    pub experts: usize,
+    pub top_k: usize,
+    #[serde(default)]
+    pub shared_experts: usize,
+    #[serde(default)]
+    pub load_balance_loss_weight: f64,
+    #[serde(default)]
+    pub router_z_loss_weight: f64,
 }
 
 impl Default for FfnDef {
@@ -200,6 +220,7 @@ impl Default for FfnDef {
             bias: false,
             dropout: 0.0,
             gate: true,
+            moe: None,
         }
     }
 }
@@ -515,13 +536,19 @@ impl ModelDef {
             };
             let intermediate = block.intermediate_size(h);
             let projections = if block.ffn.gate { 3 } else { 2 };
-            let ff_weights = projections * h * intermediate;
+            let expert_count = block
+                .ffn
+                .moe
+                .as_ref()
+                .map_or(1, |moe| moe.experts + moe.shared_experts);
+            let ff_weights = expert_count * projections * h * intermediate;
             let ff_bias = if block.ffn.bias {
-                (if block.ffn.gate { 2 } else { 1 }) * intermediate + h
+                expert_count * ((if block.ffn.gate { 2 } else { 1 }) * intermediate + h)
             } else {
                 0
             };
-            layer_params += mixer + ff_weights + ff_bias + 2 * norm_params(&block.norm);
+            let router = block.ffn.moe.as_ref().map_or(0, |moe| h * moe.experts);
+            layer_params += mixer + ff_weights + ff_bias + router + 2 * norm_params(&block.norm);
         }
 
         let final_norm = self
@@ -1057,6 +1084,39 @@ fn parse_ffn_prop(pair: pest::iterators::Pair<Rule>, def: &mut FfnDef) -> Result
                     def.gate = val.as_str() == "true";
                 }
             }
+            Rule::moe_prop => {
+                let mut moe = MoeDef {
+                    experts: 0,
+                    top_k: 0,
+                    shared_experts: 0,
+                    load_balance_loss_weight: 0.0,
+                    router_z_loss_weight: 0.0,
+                };
+                for param in inner.into_inner() {
+                    let Some(prop) = param.into_inner().next() else {
+                        continue;
+                    };
+                    let value = prop
+                        .clone()
+                        .into_inner()
+                        .next()
+                        .map(|value| value.as_str())
+                        .unwrap_or_default();
+                    match prop.as_rule() {
+                        Rule::experts_prop => moe.experts = value.parse()?,
+                        Rule::top_k_prop => moe.top_k = value.parse()?,
+                        Rule::shared_experts_prop => moe.shared_experts = value.parse()?,
+                        Rule::load_balance_loss_weight_prop => {
+                            moe.load_balance_loss_weight = value.parse()?
+                        }
+                        Rule::router_z_loss_weight_prop => {
+                            moe.router_z_loss_weight = value.parse()?
+                        }
+                        _ => {}
+                    }
+                }
+                def.moe = Some(moe);
+            }
             _ => {}
         }
     }
@@ -1330,6 +1390,44 @@ mod tests {
         // building every block as the default RMSNorm regardless of config.
         assert!(matches!(def.block.norm.norm_type, NormType::LayerNorm));
         assert_eq!(def.block.norm.eps, 1e-6);
+    }
+
+    #[test]
+    fn moe_is_optional_and_fully_configurable() {
+        let dense = parse_mal(
+            "model d { vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1 \
+             block: { attention: { num_heads: 1 } ffn: { hidden_dim: 12 } } }",
+        )
+        .unwrap();
+        assert!(dense.block.ffn.moe.is_none());
+
+        let moe = parse_mal(
+            r#"
+            ffn experts {
+                hidden_dim: 12
+                activation: swiglu
+                moe {
+                    experts: 8
+                    top_k: 2
+                    shared_experts: 1
+                    load_balance_loss_weight: 0.01
+                    router_z_loss_weight: 0.001
+                }
+            }
+            model m {
+                vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } ffn: experts }
+            }
+            "#,
+        )
+        .unwrap();
+        let config = moe.block.ffn.moe.as_ref().unwrap();
+        assert_eq!(config.experts, 8);
+        assert_eq!(config.top_k, 2);
+        assert_eq!(config.shared_experts, 1);
+        assert_eq!(config.load_balance_loss_weight, 0.01);
+        assert_eq!(config.router_z_loss_weight, 0.001);
+        assert!(moe.estimated_params() > dense.estimated_params());
     }
 
     #[test]

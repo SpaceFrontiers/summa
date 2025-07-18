@@ -80,9 +80,18 @@ wrong examples. Earlier safetensors can warm-start a curriculum with
 `--checkpoint`; optimizer/corpus cursor state without a curriculum signature is
 rejected.
 
+Causal stages persist tokenized documents under the output directory, keyed by
+the full run signature. Replaying this cache reconstructs the exact EOS packer
+and seeded bounded shuffle but avoids repeated tokenizer work. Length-prefixed
+records make a process-killed tail detectable and repairable. The source corpus
+remains authoritative; structured objectives retain their direct streaming
+path.
+
 Each metrics row includes the active objective and its named loss, stage name
 and step, raw and weighted loss, effective learning rates, gradient norm,
 compute/supervised tokens, examples, truncation count, and throughput.
 Contrastive stages additionally report candidate count and top-1 retrieval
 accuracy. The existing W&B sidecar forwards these fields without special-case
 configuration.
+When MAL enables MoE, rows also contain `router_aux_loss` and
+`optimized_loss`; the named objective loss remains the unmodified task loss.

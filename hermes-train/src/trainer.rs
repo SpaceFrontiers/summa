@@ -10,14 +10,18 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
     let mut config = load_config(&args.config)?;
     config.vocab_size = tokenizer.vocab_size();
     validate_model_curriculum(&config, &curriculum)?;
-    let (stage_plan, total_steps) = plan_training(&curriculum, &tokenizer)?;
+    let signature = run_signature(&args, &curriculum, &config)?;
+    fs::create_dir_all(&args.output)?;
+    let token_cache_root = args
+        .output
+        .join(".token-cache")
+        .join(stable_cache_id(&signature));
+    fs::create_dir_all(&token_cache_root)?;
+    let (stage_plan, total_steps) = plan_training(&curriculum, &tokenizer, &token_cache_root)?;
     ensure!(
         total_steps > 0,
         "training has zero complete optimizer steps"
     );
-    let signature = run_signature(&args, &curriculum, &config)?;
-
-    fs::create_dir_all(&args.output)?;
     let metrics_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -117,6 +121,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
     let mut tokens_seen = resume_state.as_ref().map_or(0, |state| state.tokens_seen);
     let mut micro_step = 0;
     let mut loss_sum: Option<Tensor<1>> = None;
+    let mut router_loss_sum: Option<Tensor<1>> = None;
     let mut retrieval_correct_sum: Option<Tensor<1>> = None;
     let mut step_stats = BatchStats::default();
     let mut optimizer_step_started = Instant::now();
@@ -201,6 +206,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 .wrapping_add(epoch as u64);
             let tokenizer_ref = &tokenizer;
             let objective = stage.objective.clone();
+            let token_cache_path = token_cache_root.join(format!("stage-{stage_index:03}.tokens"));
             std::thread::scope(|threads| -> Result<()> {
                 let prefetch_capacity = stage
                     .batch_size
@@ -212,9 +218,12 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         &stage.data,
                         &objective,
                         tokenizer_ref,
-                        stage.sequence_length,
-                        stage.shuffle_buffer,
-                        shuffle_seed,
+                        SampleStreamConfig {
+                            seq_len: stage.sequence_length,
+                            shuffle_buffer: stage.shuffle_buffer,
+                            seed: shuffle_seed,
+                            token_cache: Some(&token_cache_path),
+                        },
                         |sample| Ok(sender.send(sample).is_ok()),
                     )
                 });
@@ -237,13 +246,20 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     if micro_step == 0 {
                         optimizer_step_started = Instant::now();
                     }
-                    let (loss, batch_stats, retrieval_correct) =
+                    let (task_loss, router_loss, batch_stats, retrieval_correct) =
                         objective_loss(current, training_batch, &stage.objective)?;
-                    let detached_loss = loss.clone().detach();
+                    let detached_loss = task_loss.clone().detach();
                     loss_sum = Some(match loss_sum.take() {
                         Some(sum) => sum + detached_loss,
                         None => detached_loss,
                     });
+                    if let Some(router_loss) = &router_loss {
+                        let detached = router_loss.clone().detach();
+                        router_loss_sum = Some(match router_loss_sum.take() {
+                            Some(sum) => sum + detached,
+                            None => detached,
+                        });
+                    }
                     add_batch_stats(&mut step_stats, batch_stats)?;
                     if let Some(correct) = retrieval_correct {
                         retrieval_correct_sum = Some(match retrieval_correct_sum.take() {
@@ -251,7 +267,11 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             None => correct,
                         });
                     }
-                    let mut grads = loss
+                    let optimized_loss = match router_loss {
+                        Some(router_loss) => task_loss + router_loss,
+                        None => task_loss,
+                    };
+                    let mut grads = optimized_loss
                         .mul_scalar(stage.loss_weight)
                         .div_scalar(stage.gradient_accumulation as f64)
                         .backward();
@@ -271,15 +291,25 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             .expect("an optimizer step must contain a loss")
                             .div_scalar(stage.gradient_accumulation as f32);
                         let loss = scalar_value(loss)?;
-                        let weighted_loss = loss * stage.loss_weight as f32;
+                        let router_loss = router_loss_sum
+                            .take()
+                            .map(|sum| {
+                                scalar_value(sum.div_scalar(stage.gradient_accumulation as f32))
+                            })
+                            .transpose()?;
+                        let optimized_loss = loss + router_loss.unwrap_or(0.0);
+                        let weighted_loss = optimized_loss * stage.loss_weight as f32;
                         let retrieval_accuracy = retrieval_correct_sum
                             .take()
                             .map(scalar_value)
                             .transpose()?
                             .map(|correct| correct / step_stats.examples as f32);
-                        if !loss.is_finite() || !weighted_loss.is_finite() {
+                        if !loss.is_finite()
+                            || router_loss.is_some_and(|loss| !loss.is_finite())
+                            || !weighted_loss.is_finite()
+                        {
                             bail!(
-                                "non-finite loss at optimizer step {}: raw={loss}, weighted={weighted_loss}",
+                                "non-finite loss at optimizer step {}: task={loss}, router={router_loss:?}, weighted={weighted_loss}",
                                 step + 1
                             );
                         }
@@ -334,6 +364,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             "epoch": epoch + 1,
                             "loss": loss,
                             "weighted_loss": weighted_loss,
+                            "optimized_loss": optimized_loss,
                             "loss_weight": stage.loss_weight,
                             "lr": lr,
                             "muon_lr": muon_lr,
@@ -354,6 +385,12 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             format!("{}_loss", stage.objective.name()),
                             serde_json::json!(loss),
                         );
+                        if let Some(router_loss) = router_loss {
+                            metric.as_object_mut().unwrap().insert(
+                                "router_aux_loss".to_owned(),
+                                serde_json::json!(router_loss),
+                            );
+                        }
                         if let Some(accuracy) = retrieval_accuracy {
                             metric.as_object_mut().unwrap().insert(
                                 "retrieval_accuracy".to_owned(),
@@ -414,6 +451,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 adamw_accumulator = GradientsAccumulator::new();
                 micro_step = 0;
                 loss_sum = None;
+                router_loss_sum = None;
                 retrieval_correct_sum = None;
                 step_stats = BatchStats::default();
             }

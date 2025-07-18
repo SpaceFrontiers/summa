@@ -50,9 +50,12 @@ impl<'a> TextGenerator<'a> {
         Tensor::from_data(TensorData::new(values, [1, tokens.len()]), self.device)
     }
 
-    fn prefill(&self, context: &[u32]) -> (InferenceState, Tensor<1>) {
+    fn prefill(&self, context: &[u32], capacity: usize) -> (InferenceState, Tensor<1>) {
         debug_assert!(!context.is_empty());
-        let mut state = self.model.make_state(1, self.device);
+        debug_assert!(capacity >= context.len());
+        let mut state = self
+            .model
+            .make_state_with_capacity(1, capacity, self.device);
         let logits = self
             .model
             .forward_next_logits_with_state(self.input(context), &mut state);
@@ -89,19 +92,26 @@ impl<'a> TextGenerator<'a> {
         self.device.seed(seed);
         let mut rng = StdRng::seed_from_u64(seed);
         let context_len = tokens.len().min(max_seq_len);
-        let (mut state, mut last_logits) = self.prefill(&tokens[tokens.len() - context_len..]);
+        let initial_capacity = context_len
+            .saturating_add(config.max_new_tokens.saturating_sub(1))
+            .min(max_seq_len);
+        let (mut state, mut last_logits) =
+            self.prefill(&tokens[tokens.len() - context_len..], initial_capacity);
 
-        for _ in 0..config.max_new_tokens {
+        for generated in 0..config.max_new_tokens {
             let next_token = select_next_token(last_logits.clone(), &tokens, config, &mut rng)?;
             tokens.push(next_token);
 
-            if config.eos_token == Some(next_token) {
+            if config.eos_token == Some(next_token) || generated + 1 == config.max_new_tokens {
                 break;
             }
 
-            if state.pos() >= max_seq_len {
+            if state.pos() >= state.capacity() {
                 let keep = (max_seq_len / 2).max(1);
-                (state, last_logits) = self.prefill(&tokens[tokens.len() - keep..]);
+                let remaining = config.max_new_tokens - generated - 1;
+                let kept = keep.min(tokens.len());
+                let capacity = kept.saturating_add(remaining).min(max_seq_len);
+                (state, last_logits) = self.prefill(&tokens[tokens.len() - kept..], capacity);
             } else {
                 let logits = self
                     .model

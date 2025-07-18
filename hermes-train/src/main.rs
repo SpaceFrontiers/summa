@@ -23,7 +23,9 @@ use checkpoint::{
     save_training_checkpoint,
 };
 use curriculum::{ObjectiveConfig, ResolvedCurriculum, load_curriculum};
-use data::{BatchStats, TrainingBatch, count_samples, make_batch, visit_samples};
+use data::{
+    BatchStats, SampleStreamConfig, TrainingBatch, count_samples, make_batch, visit_samples,
+};
 use muon::BatchedMuon;
 
 const MUON_LR_SCALE: f64 = 20.0;
@@ -284,10 +286,11 @@ struct StagePlan {
 fn plan_training(
     curriculum: &ResolvedCurriculum,
     tokenizer: &Tokenizer,
+    token_cache_root: &Path,
 ) -> Result<(Vec<StagePlan>, usize)> {
     let mut total_steps = 0usize;
     let mut plan = Vec::with_capacity(curriculum.stages.len());
-    for stage in &curriculum.stages {
+    for (stage_index, stage) in curriculum.stages.iter().enumerate() {
         let (samples, steps) = match stage.steps {
             Some(steps) => (None, steps),
             None => {
@@ -296,6 +299,7 @@ fn plan_training(
                     &stage.objective,
                     tokenizer,
                     stage.sequence_length,
+                    Some(&token_cache_root.join(format!("stage-{stage_index:03}.tokens"))),
                 )?;
                 let steps_per_epoch =
                     (samples / stage.batch_size).div_euclid(stage.gradient_accumulation);
@@ -334,6 +338,15 @@ fn file_fingerprint(path: &Path) -> Result<String> {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     Ok(format!("fnv1a64:{hash:016x}:{}", bytes.len()))
+}
+
+fn stable_cache_id(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[derive(Serialize)]
@@ -399,10 +412,10 @@ fn objective_loss(
     model: &Transformer,
     batch: TrainingBatch,
     objective: &ObjectiveConfig,
-) -> Result<(Tensor<1>, BatchStats, Option<Tensor<1>>)> {
+) -> Result<(Tensor<1>, Option<Tensor<1>>, BatchStats, Option<Tensor<1>>)> {
     let stats = batch.stats();
     let mut retrieval_correct = None;
-    let loss = match batch {
+    let (loss, router_loss) = match batch {
         TrainingBatch::Language(batch) => {
             let data::LanguageBatch {
                 input_ids,
@@ -416,13 +429,13 @@ fn objective_loss(
                         loss_positions.is_none(),
                         "causal_lm batch unexpectedly contains a target mask"
                     );
-                    model.forward_loss(input_ids, targets)
+                    model.forward_loss_with_router(input_ids, targets)
                 }
                 ObjectiveConfig::Summarization { .. }
                 | ObjectiveConfig::RetrievalPlanning { .. } => {
                     let positions = loss_positions
                         .ok_or_else(|| anyhow::anyhow!("structured batch has no target mask"))?;
-                    model.forward_masked_loss(input_ids, targets, positions)
+                    model.forward_masked_loss_with_router(input_ids, targets, positions)
                 }
                 ObjectiveConfig::ContrastiveRetrieval { .. } => {
                     bail!("contrastive_retrieval stage produced a language batch")
@@ -446,8 +459,10 @@ fn objective_loss(
             let temperature = objective
                 .temperature()
                 .expect("retrieval objective has a temperature");
-            let queries = model.forward_embeddings(query_ids, query_end_positions, layer);
-            let documents = model.forward_embeddings(document_ids, document_end_positions, layer);
+            let (queries, query_router_loss) =
+                model.forward_embeddings_with_router(query_ids, query_end_positions, layer);
+            let (documents, document_router_loss) =
+                model.forward_embeddings_with_router(document_ids, document_end_positions, layer);
             let logits = queries
                 .matmul(documents.transpose())
                 .div_scalar(temperature);
@@ -461,12 +476,18 @@ fn objective_loss(
                     .sum()
                     .detach(),
             );
-            CrossEntropyLossConfig::new()
+            let loss = CrossEntropyLossConfig::new()
                 .init(&labels.device())
-                .forward(logits, labels)
+                .forward(logits, labels);
+            let router_loss = match (query_router_loss, document_router_loss) {
+                (Some(query), Some(document)) => Some(query + document),
+                (Some(loss), None) | (None, Some(loss)) => Some(loss),
+                (None, None) => None,
+            };
+            (loss, router_loss)
         }
     };
-    Ok((loss, stats, retrieval_correct))
+    Ok((loss, router_loss, stats, retrieval_correct))
 }
 
 fn main() -> Result<()> {
