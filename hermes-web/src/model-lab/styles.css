@@ -210,8 +210,31 @@ select { min-height: 36px; margin-left: 7px; border: 1px solid var(--line-strong
 .token-chip[data-source="generated"] { border-bottom-color: var(--attention); }
 .token-chip[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
 
+.signal-flow-panel { margin-bottom: 18px; }
+.signal-flow-compression { margin: 0; font-size: .76rem; text-align: right; }
+.signal-flow-chart { display: block; width: 100%; height: 330px; overflow: visible; }
+.signal-flow-encoding, .signal-flow-axis-label, .signal-flow-stage-label { fill: var(--muted); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+.signal-flow-encoding, .signal-flow-axis-label { font-size: 11px; }
+.signal-flow-stage-label { font-size: 10px; font-variant-numeric: tabular-nums; }
+.signal-flow-grid { stroke: var(--grid); stroke-width: 1; }
+.signal-flow-sign-axis { stroke: var(--line-strong); stroke-width: 1; }
+.signal-flow-edge { fill: none; stroke: var(--line-strong); stroke-linecap: round; opacity: .55; }
+.signal-flow-edge[data-state="past"] { stroke: var(--accent); opacity: .45; }
+.signal-flow-edge[data-state="current"] { stroke: var(--accent); opacity: .95; }
+.signal-flow-stage .signal-flow-node-shape { fill: var(--surface); stroke: var(--line-strong); stroke-width: 2; }
+.signal-flow-stage[data-mixer="attention"] .signal-flow-node-shape { stroke: var(--attention); }
+.signal-flow-stage[data-mixer="mamba"] .signal-flow-node-shape { stroke: var(--mamba); }
+.signal-flow-stage[data-state="past"] .signal-flow-node-shape { fill: var(--accent-soft); stroke: var(--accent); }
+.signal-flow-stage[data-state="current"] .signal-flow-node-shape { fill: var(--accent); stroke: var(--surface); stroke-width: 3; }
+.signal-flow-positive { fill: var(--heat-positive); opacity: .78; }
+.signal-flow-negative { fill: var(--heat-negative); opacity: .78; }
+.signal-flow-probe-guide { stroke: var(--accent); stroke-width: 1; opacity: .25; }
+.signal-flow-probe-halo { fill: var(--accent-soft); opacity: .8; }
+.signal-flow-probe { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+.signal-flow-probe-value { fill: var(--ink); stroke: var(--surface); stroke-width: 4; paint-order: stroke; font-size: 11px; font-weight: 500; }
+
 .visual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
-.wide-panel { grid-column: span 1; }
+.wide-panel { grid-column: 1 / -1; }
 .visual-panel { min-width: 0; padding: 18px; }
 .panel-heading { align-items: flex-start; margin-bottom: 14px; }
 .panel-heading .eyebrow { margin-bottom: 5px; }
@@ -221,8 +244,7 @@ select { min-height: 36px; margin-left: 7px; border: 1px solid var(--line-strong
 .square-map canvas { min-height: 420px; }
 .scale-legend { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: .72rem; }
 .scale-gradient { width: 88px; height: 8px; border-radius: 999px; background: linear-gradient(90deg, var(--heat-negative), var(--heat-zero), var(--heat-positive)); }
-.line-chart, .training-chart { display: block; width: 100%; overflow: visible; }
-.line-chart { min-height: 300px; }
+.training-chart { display: block; width: 100%; overflow: visible; }
 .training-chart { min-height: 330px; }
 .chart-selection { margin: 8px 0 0; }
 .mixer-visuals { margin-top: 18px; }
@@ -270,6 +292,8 @@ footer { margin-top: 30px; border-top: 1px solid var(--line); padding-top: 18px;
   .inline-controls { justify-content: flex-start; }
   .layer-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .token-context { align-items: flex-start; flex-direction: column; }
+  .signal-flow-compression { text-align: left; }
+  .signal-flow-chart { height: 310px; }
   .heatmap-wrap, .heatmap-wrap canvas { min-height: 240px; }
   .square-map, .square-map canvas { min-height: 310px; }
 }

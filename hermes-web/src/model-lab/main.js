@@ -9,6 +9,7 @@ import {
   metricSeries,
   normalizedMetricHeatmap,
   parseTraceJson,
+  tokenSignalSeries,
   validateTrace,
 } from './trace-utils.js'
 
@@ -269,6 +270,7 @@ function updatePlaybackControls(progress = state.selectedStage) {
     : `${state.selectedStage + 1} / ${count}`
   setText('flow-position', position)
   updateFlowRail(progress)
+  updateSignalFlow(progress)
 }
 
 function cancelAnimation() {
@@ -401,7 +403,7 @@ function startPlayback() {
   schedulePlayback()
 }
 
-function renderInference({ renderTokens = true } = {}) {
+function renderInference({ renderTokens = true, renderSignal = renderTokens } = {}) {
   const { inference } = state.trace
   const stage = inference.stages[state.selectedStage]
   $('stage-select').value = String(state.selectedStage)
@@ -410,7 +412,7 @@ function renderInference({ renderTokens = true } = {}) {
   renderScale(stage.activation, $('activation-scale'))
   renderHeatmap($('activation-heatmap'), stage.activation, { divergent: true, minHeight: 320, label: `${stage.label} residual-stream activation` })
   if (renderTokens) renderTokenStrip()
-  renderRmsChart()
+  if (renderSignal) renderSignalFlowChart()
   renderMixerTrace(stage)
   setText('generated-text', inference.generated_text || 'The generation stopped without a decoded continuation.')
   setText('prompt-token-count', inference.prompt_token_count)
@@ -443,22 +445,6 @@ function renderTokenStrip() {
     })
     strip.append(button)
   }
-}
-
-function renderRmsChart() {
-  const token = state.trace.inference.tokens[state.selectedToken]
-  const series = state.trace.inference.stages.map((stage, index) => ({
-    step: index,
-    value: stage.token_rms[state.selectedToken],
-    stage: stage.label,
-  }))
-  renderLineChart($('rms-chart'), series, {
-    xLabel: 'model depth',
-    yLabel: 'RMS',
-    selectedIndex: state.selectedStage,
-    compact: true,
-  })
-  setText('rms-selection', `Token ${token.original_index} “${token.display}” · ${state.trace.inference.stages[state.selectedStage].label}: ${formatValue(series[state.selectedStage].value)}`)
 }
 
 function renderMixerTrace(stage) {
@@ -656,6 +642,265 @@ function svgElement(name, attributes = {}) {
   const element = document.createElementNS(svgNamespace, name)
   for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value))
   return element
+}
+
+function renderSignalFlowChart() {
+  const svg = $('signal-flow-chart')
+  const series = tokenSignalSeries(state.trace.inference, state.selectedToken)
+  svg.replaceChildren()
+  if (series.length < 2) return
+
+  const measuredWidth = svg.getBoundingClientRect().width
+  const width = Math.max(300, Math.round(measuredWidth || 960))
+  const height = 330
+  const margin = { left: width < 480 ? 42 : 54, right: 18, top: 42 }
+  const rmsBottom = 190
+  const signBaseline = 242
+  const labelY = 286
+  const plotWidth = width - margin.left - margin.right
+  const positiveRms = series.map((point) => point.rms).filter((value) => value > 0)
+  const rmsMin = Math.max(Math.min(...positiveRms, 1) * 0.82, Number.EPSILON)
+  const rmsMax = Math.max(...series.map((point) => point.rms), rmsMin) * 1.08
+  const logMin = Math.log10(rmsMin)
+  const logMax = Math.max(Math.log10(rmsMax), logMin + 0.1)
+  const updateMax = Math.max(...series.map((point) => point.updateRms ?? 0), Number.EPSILON)
+  const x = (stageIndex) => margin.left + stageIndex / (series.length - 1) * plotWidth
+  const y = (rms) => {
+    const normalized = (Math.log10(Math.max(rms, rmsMin)) - logMin) / (logMax - logMin)
+    return rmsBottom - normalized * (rmsBottom - margin.top)
+  }
+
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`)
+  const title = svgElement('title')
+  title.textContent = 'Selected-token signal flow across model depth'
+  const description = svgElement('desc')
+  description.textContent = 'Log-scaled vertical position reports exact token RMS, edge width reports residual update RMS, node shape is mixer type, and diverging bars approximate positive and negative energy in captured channel bins.'
+  svg.append(title, description)
+
+  const encoding = svgElement('text', {
+    x: margin.left,
+    y: 17,
+    class: 'signal-flow-encoding',
+  })
+  encoding.textContent = width < 590
+    ? 'RMS(log) line · Δ edge · +/− bins'
+    : 'height: token RMS (log) · edge width: residual update · bars: +/− captured-bin energy'
+  svg.append(encoding)
+  if (width >= 700) {
+    const mixers = svgElement('text', {
+      x: width - margin.right,
+      y: 17,
+      class: 'signal-flow-encoding',
+      'text-anchor': 'end',
+    })
+    mixers.textContent = '○ attention · ◇ Mamba'
+    svg.append(mixers)
+  }
+
+  const rmsTicks = [rmsMin, Math.sqrt(rmsMin * rmsMax), rmsMax]
+  for (const value of rmsTicks) {
+    const position = y(value)
+    svg.append(svgElement('line', {
+      x1: margin.left,
+      x2: width - margin.right,
+      y1: position,
+      y2: position,
+      class: 'signal-flow-grid',
+    }))
+    const label = svgElement('text', {
+      x: margin.left - 8,
+      y: position + 4,
+      class: 'signal-flow-axis-label',
+      'text-anchor': 'end',
+    })
+    label.textContent = formatValue(value)
+    svg.append(label)
+  }
+
+  const yLabel = svgElement('text', {
+    x: 13,
+    y: (margin.top + rmsBottom) / 2,
+    class: 'signal-flow-axis-label',
+    transform: `rotate(-90 13 ${(margin.top + rmsBottom) / 2})`,
+    'text-anchor': 'middle',
+  })
+  yLabel.textContent = 'token RMS · log'
+  const signLine = svgElement('line', {
+    x1: margin.left,
+    x2: width - margin.right,
+    y1: signBaseline,
+    y2: signBaseline,
+    class: 'signal-flow-sign-axis',
+  })
+  const signLabel = svgElement('text', {
+    x: margin.left - 8,
+    y: signBaseline + 4,
+    class: 'signal-flow-axis-label',
+    'text-anchor': 'end',
+  })
+  signLabel.textContent = '+/−'
+  const xLabel = svgElement('text', {
+    x: margin.left + plotWidth / 2,
+    y: height - 5,
+    class: 'signal-flow-axis-label',
+    'text-anchor': 'middle',
+  })
+  xLabel.textContent = 'embedding → transformer depth → final norm'
+  svg.append(yLabel, signLine, signLabel, xLabel)
+
+  const edges = []
+  for (let index = 1; index < series.length; index += 1) {
+    const from = series[index - 1]
+    const to = series[index]
+    const left = x(from.stageIndex)
+    const right = x(to.stageIndex)
+    const middle = (left + right) / 2
+    const update = to.updateRms ?? 0
+    const edge = svgElement('path', {
+      d: `M ${left.toFixed(2)} ${y(from.rms).toFixed(2)} C ${middle.toFixed(2)} ${y(from.rms).toFixed(2)}, ${middle.toFixed(2)} ${y(to.rms).toFixed(2)}, ${right.toFixed(2)} ${y(to.rms).toFixed(2)}`,
+      class: 'signal-flow-edge',
+      'stroke-width': 1.4 + 7 * Math.log1p(update) / Math.log1p(updateMax),
+    })
+    const edgeTitle = svgElement('title')
+    edgeTitle.textContent = `${from.label} → ${to.label}: residual update RMS ${formatValue(to.updateRms)}`
+    edge.append(edgeTitle)
+    svg.append(edge)
+    edges.push({ stageIndex: index, element: edge })
+  }
+
+  const probeGuide = svgElement('line', {
+    y1: margin.top,
+    y2: signBaseline + 31,
+    class: 'signal-flow-probe-guide',
+  })
+  svg.append(probeGuide)
+
+  const glyphTarget = Math.max(8, Math.floor(width / 34))
+  const glyphStride = Math.max(1, Math.ceil(series.length / glyphTarget))
+  const labelTarget = Math.max(4, Math.floor(width / 72))
+  const labelStride = Math.max(1, Math.ceil(series.length / labelTarget))
+  const nodes = []
+  series.forEach((point, index) => {
+    const showGlyph = index === 0 || index === series.length - 1 || index % glyphStride === 0
+    const showLabel = index === 0 || index === series.length - 1 || index % labelStride === 0
+    if (showGlyph) {
+      const group = svgElement('g', {
+        class: 'signal-flow-stage',
+        'data-stage-index': index,
+        'data-mixer': point.mixer ?? 'endpoint',
+      })
+      const stageTitle = svgElement('title')
+      stageTitle.textContent = `${point.label}: RMS ${formatValue(point.rms)}, update ${formatValue(point.updateRms)}, positive-bin energy ${(point.positiveBinEnergy * 100).toFixed(1)}%`
+      group.append(stageTitle)
+
+      const positiveHeight = point.positiveBinEnergy * 30
+      const negativeHeight = point.negativeBinEnergy * 30
+      group.append(
+        svgElement('rect', {
+          x: x(index) - 3,
+          y: signBaseline - positiveHeight,
+          width: 6,
+          height: positiveHeight,
+          class: 'signal-flow-positive',
+        }),
+        svgElement('rect', {
+          x: x(index) - 3,
+          y: signBaseline,
+          width: 6,
+          height: negativeHeight,
+          class: 'signal-flow-negative',
+        }),
+      )
+
+      const yPosition = y(point.rms)
+      let shape
+      if (point.mixer === 'attention') {
+        shape = svgElement('circle', { cx: x(index), cy: yPosition, r: 5.5, class: 'signal-flow-node-shape' })
+      } else if (point.mixer === 'mamba') {
+        shape = svgElement('polygon', {
+          points: `${x(index)},${yPosition - 6} ${x(index) + 6},${yPosition} ${x(index)},${yPosition + 6} ${x(index) - 6},${yPosition}`,
+          class: 'signal-flow-node-shape',
+        })
+      } else {
+        shape = svgElement('rect', { x: x(index) - 7, y: yPosition - 5, width: 14, height: 10, rx: 3, class: 'signal-flow-node-shape' })
+      }
+      group.append(shape)
+      svg.append(group)
+      nodes.push({ stageIndex: index, element: group })
+    }
+
+    if (showLabel) {
+      const label = svgElement('text', {
+        x: x(index),
+        y: labelY,
+        class: 'signal-flow-stage-label',
+        'text-anchor': 'middle',
+      })
+      label.textContent = index === 0 ? 'Emb' : index === series.length - 1 ? 'Norm' : `L${point.layerIndex ?? index}`
+      svg.append(label)
+    }
+  })
+
+  const probeHalo = svgElement('circle', { r: 10, class: 'signal-flow-probe-halo' })
+  const probe = svgElement('circle', { r: 4.5, class: 'signal-flow-probe' })
+  const probeValue = svgElement('text', { class: 'signal-flow-probe-value' })
+  svg.append(probeHalo, probe, probeValue)
+  svg.__signalFlow = { series, width, x, y, probe, probeHalo, probeGuide, probeValue, nodes, edges }
+
+  const hiddenChannels = state.trace.capture?.original_hidden_channels ?? state.trace.model.hidden_size
+  setText('signal-flow-compression', `${formatCount(hiddenChannels)} hidden values → ${series[0].capturedBins} signed bins · RMS/Δ exact`)
+  updateSignalFlow(state.selectedStage)
+}
+
+function updateSignalFlow(progress = state.selectedStage) {
+  const svg = $('signal-flow-chart')
+  const rendered = svg.__signalFlow
+  if (!rendered) return
+  const last = rendered.series.length - 1
+  const bounded = Math.max(0, Math.min(last, progress))
+  const leftIndex = Math.floor(bounded)
+  const rightIndex = Math.ceil(bounded)
+  const amount = bounded - leftIndex
+  const left = rendered.series[leftIndex]
+  const right = rendered.series[rightIndex]
+  const interpolate = (from, to) => from + (to - from) * amount
+  const rms = interpolate(left.rms, right.rms)
+  const positive = interpolate(left.positiveBinEnergy, right.positiveBinEnergy)
+  const negative = interpolate(left.negativeBinEnergy, right.negativeBinEnergy)
+  const binMean = interpolate(left.binMean, right.binMean)
+  const xPosition = rendered.x(bounded)
+  const yPosition = rendered.y(rms)
+  for (const element of [rendered.probe, rendered.probeHalo]) {
+    element.setAttribute('cx', xPosition)
+    element.setAttribute('cy', yPosition)
+  }
+  rendered.probeGuide.setAttribute('x1', xPosition)
+  rendered.probeGuide.setAttribute('x2', xPosition)
+  const labelOnLeft = xPosition > rendered.width - 92
+  rendered.probeValue.setAttribute('x', xPosition + (labelOnLeft ? -10 : 10))
+  rendered.probeValue.setAttribute('y', Math.max(34, yPosition - 11))
+  rendered.probeValue.setAttribute('text-anchor', labelOnLeft ? 'end' : 'start')
+  rendered.probeValue.textContent = `RMS ${formatValue(rms)}`
+
+  const current = Math.round(bounded)
+  rendered.nodes.forEach((node) => {
+    node.element.dataset.state = node.stageIndex === current ? 'current' : node.stageIndex < bounded ? 'past' : 'future'
+  })
+  const activeEdge = Number.isInteger(bounded) ? -1 : Math.ceil(bounded)
+  rendered.edges.forEach((edge) => {
+    edge.element.dataset.state = edge.stageIndex === activeEdge ? 'current' : edge.stageIndex <= bounded ? 'past' : 'future'
+  })
+
+  const token = state.trace.inference.tokens[state.selectedToken]
+  const stageLabel = leftIndex === rightIndex ? left.label : `${left.label} → ${right.label}`
+  const update = leftIndex === rightIndex
+    ? left.updateRms
+    : (right.updateRms ?? 0) * amount
+  const signedMean = `${binMean > 0 ? '+' : ''}${formatValue(binMean)}`
+  setText(
+    'signal-flow-description',
+    `Token ${token.original_index} “${token.display}” · ${stageLabel} · RMS ${formatValue(rms)} · ${update === null ? 'input embedding' : `Δ ${formatValue(update)}`} · bins +${(positive * 100).toFixed(0)}% / −${(negative * 100).toFixed(0)}% · mean ${signedMean}`,
+  )
 }
 
 function renderLineChart(svg, series, options = {}) {
@@ -908,7 +1153,9 @@ window.addEventListener('resize', () => {
   window.requestAnimationFrame(() => {
     resizeQueued = false
     const visibleView = document.querySelector('.view:not([hidden])')?.id
-    if (visibleView === 'view-inference') renderInference({ renderTokens: false })
+    if (visibleView === 'view-inference' && !state.animating) {
+      renderInference({ renderTokens: false, renderSignal: true })
+    }
     if (visibleView === 'view-training') renderTraining()
   })
 })

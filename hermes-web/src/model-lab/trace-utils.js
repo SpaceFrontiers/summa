@@ -37,6 +37,36 @@ export function interpolateHeatmap(from, to, progress) {
   }
 }
 
+export function tokenSignalSeries(inference, tokenIndex) {
+  if (!isObject(inference) || !Array.isArray(inference.tokens) || !Array.isArray(inference.stages)) {
+    fail('Inference trace is malformed')
+  }
+  if (!integer(tokenIndex) || tokenIndex >= inference.tokens.length) {
+    fail(`Token index ${tokenIndex} is outside the captured trace`)
+  }
+  return inference.stages.map((stage, stageIndex) => {
+    const start = tokenIndex * stage.activation.cols
+    const bins = stage.activation.values.slice(start, start + stage.activation.cols)
+    const totalEnergy = bins.reduce((sum, value) => sum + value * value, 0)
+    const positiveEnergy = bins.reduce((sum, value) => value > 0 ? sum + value * value : sum, 0)
+    const negativeEnergy = bins.reduce((sum, value) => value < 0 ? sum + value * value : sum, 0)
+    return {
+      stageIndex,
+      stage: stage.stage,
+      label: stage.label,
+      layerIndex: stage.layer_index,
+      mixer: stage.mixer,
+      rms: stage.token_rms[tokenIndex],
+      updateRms: finite(stage.token_delta_rms?.[tokenIndex]) ? stage.token_delta_rms[tokenIndex] : null,
+      binMean: bins.reduce((sum, value) => sum + value, 0) / bins.length,
+      binRms: Math.sqrt(totalEnergy / bins.length),
+      positiveBinEnergy: totalEnergy === 0 ? 0 : positiveEnergy / totalEnergy,
+      negativeBinEnergy: totalEnergy === 0 ? 0 : negativeEnergy / totalEnergy,
+      capturedBins: bins.length,
+    }
+  })
+}
+
 export function validateTrace(trace) {
   if (!isObject(trace)) fail('Trace bundle must be a JSON object')
   if (trace.kind !== TRACE_KIND) fail(`Unsupported trace kind: ${String(trace.kind)}`)
