@@ -84,15 +84,10 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             resume_stage.name,
             stage_plan[state.stage].steps
         );
-        match &state.curriculum_signature {
-            Some(saved) => ensure!(
-                saved == &signature,
-                "checkpoint curriculum or training configuration differs from this invocation"
-            ),
-            None => bail!(
-                "checkpoint has no curriculum signature and cannot safely resume; warm-start its weights with --checkpoint in a new output directory"
-            ),
-        }
+        ensure!(
+            state.curriculum_signature == signature,
+            "checkpoint curriculum or training configuration differs from this invocation"
+        );
         ensure!(
             state.step == 0 || state.tokens_seen > 0,
             "checkpoint has no cumulative token count and cannot safely resume"
@@ -133,7 +128,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         samples_in_stage: 0,
         steps_in_stage: 0,
         tokens_seen: 0,
-        curriculum_signature: Some(signature.clone()),
+        curriculum_signature: signature.clone(),
         parameter_ids: initial_parameter_ids.clone(),
     });
 
@@ -196,7 +191,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 samples_in_stage,
                 steps_in_stage,
                 tokens_seen,
-                curriculum_signature: Some(signature.clone()),
+                curriculum_signature: signature.clone(),
                 parameter_ids: initial_parameter_ids.clone(),
             };
             let mut batch = Vec::with_capacity(stage.batch_size);

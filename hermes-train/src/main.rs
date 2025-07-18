@@ -616,7 +616,7 @@ mod tests {
             samples_in_stage: 640,
             steps_in_stage: 10,
             tokens_seen: 12_800,
-            curriculum_signature: Some("test-curriculum".to_owned()),
+            curriculum_signature: "test-curriculum".to_owned(),
             parameter_ids: parameter_ids(&model),
         };
         save_training_checkpoint(

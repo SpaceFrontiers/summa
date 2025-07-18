@@ -20,24 +20,16 @@ pub(crate) type AdamWOptimizer = ModuleOptimizer;
 
 pub(crate) const TRAINING_STATE_VERSION: u32 = 1;
 
-fn current_training_state_version() -> u32 {
-    TRAINING_STATE_VERSION
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct TrainingState {
-    #[serde(default = "current_training_state_version")]
     pub(crate) version: u32,
     pub(crate) step: usize,
     pub(crate) stage: usize,
     pub(crate) epoch: usize,
     pub(crate) samples_in_stage: usize,
-    #[serde(default)]
     pub(crate) steps_in_stage: usize,
-    #[serde(default)]
     pub(crate) tokens_seen: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) curriculum_signature: Option<String>,
+    pub(crate) curriculum_signature: String,
     pub(crate) parameter_ids: Vec<u64>,
 }
 
@@ -134,4 +126,22 @@ pub(crate) fn load_training_state(
         .load(output.join("adamw-state.bpk"))
         .context("failed to load AdamW state")?;
     Ok((adamw, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrainingState;
+
+    #[test]
+    fn pre_curriculum_training_state_is_rejected() {
+        let legacy = r#"{
+            "step": 13500,
+            "stage": 0,
+            "epoch": 0,
+            "samples_in_stage": 1782000,
+            "parameter_ids": []
+        }"#;
+
+        assert!(serde_json::from_str::<TrainingState>(legacy).is_err());
+    }
 }
