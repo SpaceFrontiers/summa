@@ -106,8 +106,7 @@ Remote backups use either `gs://` (through `gcloud storage`) or `file://`.
 Checkpoints are uploaded to an immutable `checkpoints/<step>/` directory and
 `latest.json` is published last. On boot, a newer complete remote checkpoint
 is restored, while a newer persistent-disk checkpoint is never overwritten by
-an older backup. The first sync migrates the earlier flat `gcloud rsync`
-layout automatically. An interrupted local checkpoint is not resumed unless a
+an older backup. An interrupted local checkpoint is not resumed unless a
 complete remote copy can replace it.
 
 Copy and edit the example configuration, then run the supervisor as the same

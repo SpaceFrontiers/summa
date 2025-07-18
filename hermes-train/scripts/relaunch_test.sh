@@ -174,31 +174,6 @@ EOF
     || fail "older remote checkpoint overwrote newer local state"
 }
 
-run_legacy_remote_migration_test() {
-  local case_root=$TEST_ROOT/legacy
-  local config=$case_root/relaunch.conf
-  write_checkpoint "$case_root/output" 5
-  write_checkpoint "$case_root/remote" 5
-  cat >"$config" <<EOF
-HERMES_TRAIN_OUTPUT=$case_root/output
-HERMES_TRAIN_STATE_DIR=$case_root/state
-HERMES_TRAIN_REMOTE_URL=file://$case_root/remote
-HERMES_TRAIN_COMMAND=($fake_trainer train)
-HERMES_TRAIN_SYNC_INTERVAL=60
-HERMES_TRAIN_MAX_RESTARTS=0
-EOF
-  export TEST_CALLS=$case_root/calls
-  export TEST_EXPECT_STEP=5
-  export TEST_FAIL_ONCE=false
-  unset TEST_WANDB_CALLS TEST_FAILURE_MARKER
-
-  "$TEST_SCRIPT_DIR/relaunch.sh" "$config"
-  [[ -s $case_root/remote/checkpoints/5/weights.safetensors ]] \
-    || fail "legacy flat checkpoint was not migrated"
-  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["step"])' \
-    "$case_root/remote/latest.json") == 5 ]] || fail "migrated manifest is invalid"
-}
-
 run_idempotent_lock_test() {
   local case_root=$TEST_ROOT/lock
   local config=$case_root/relaunch.conf
@@ -239,6 +214,5 @@ EOF
 run_restart_and_reporting_test
 run_remote_restore_test
 run_newer_local_wins_test
-run_legacy_remote_migration_test
 run_idempotent_lock_test
 printf 'relaunch_test: ok\n'

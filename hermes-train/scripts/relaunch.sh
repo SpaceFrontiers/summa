@@ -220,23 +220,13 @@ remote_promote_checkpoint() {
 }
 
 REMOTE_STEP=
-REMOTE_LAYOUT=
 refresh_remote_checkpoint() {
   local temporary
   REMOTE_STEP=
-  REMOTE_LAYOUT=
   [[ -n "$REMOTE" ]] || return 1
   temporary=$(mktemp "$STATE_DIR/remote-state.XXXXXX")
   if remote_download latest.json "$temporary" >/dev/null 2>&1; then
     if REMOTE_STEP=$(read_checkpoint_step "$temporary" 2>/dev/null); then
-      REMOTE_LAYOUT=versioned
-      rm -f -- "$temporary"
-      return 0
-    fi
-  elif remote_download training-state.json "$temporary" >/dev/null 2>&1; then
-    # Compatibility with the original flat `gcloud storage rsync` layout.
-    if REMOTE_STEP=$(read_checkpoint_step "$temporary" 2>/dev/null); then
-      REMOTE_LAYOUT=legacy
       rm -f -- "$temporary"
       return 0
     fi
@@ -247,14 +237,12 @@ refresh_remote_checkpoint() {
 
 restore_remote_checkpoint() {
   local expected_step=$1
-  local layout=$2
-  local restore_dir prefix file downloaded_step
+  local restore_dir file downloaded_step
   restore_dir=$(mktemp -d "$STATE_DIR/restore.XXXXXX")
-  prefix=
-  [[ $layout == versioned ]] && prefix="checkpoints/$expected_step/"
 
   for file in "${CHECKPOINT_FILES[@]}"; do
-    if ! remote_download "$prefix$file" "$restore_dir/$file" >>"$SYNC_LOG" 2>&1; then
+    if ! remote_download "checkpoints/$expected_step/$file" \
+      "$restore_dir/$file" >>"$SYNC_LOG" 2>&1; then
       log "remote checkpoint $expected_step is incomplete ($file is unavailable)"
       rm -rf -- "$restore_dir"
       return 1
@@ -292,12 +280,12 @@ prepare_checkpoint() {
   fi
   if [[ -n "$REMOTE" ]] && refresh_remote_checkpoint; then
     remote_available=true
-    log "found remote checkpoint at step $REMOTE_STEP ($REMOTE_LAYOUT layout)"
+    log "found remote checkpoint at step $REMOTE_STEP"
   fi
 
   if [[ $remote_available == true \
     && ( -z "$local_step" || $REMOTE_STEP -gt $local_step ) ]]; then
-    restore_remote_checkpoint "$REMOTE_STEP" "$REMOTE_LAYOUT" \
+    restore_remote_checkpoint "$REMOTE_STEP" \
       || die "cannot restore the newest remote checkpoint"
     local_step=$REMOTE_STEP
   fi
@@ -339,8 +327,7 @@ sync_checkpoint_once() (
   if refresh_remote_checkpoint; then
     remote_step=$REMOTE_STEP
   fi
-  if (( remote_step > step )) \
-    || { (( remote_step == step )) && [[ $REMOTE_LAYOUT == versioned ]]; }; then
+  if (( remote_step >= step )); then
     return 0
   fi
 
