@@ -1,5 +1,6 @@
 //! Hybrid Transformer and Mamba block assembly.
 
+use burn::module::ParamId;
 use burn::prelude::*;
 use burn_nn::{Dropout, DropoutConfig, RotaryEncoding};
 
@@ -91,7 +92,6 @@ impl TransformerBlock {
                 self.attn_norm.forward(self.residual(x, branch))
             }
         };
-
         match self.norm_position {
             NormPosition::Pre => {
                 let branch = self.feed_forward.forward(self.ffn_norm.forward(x.clone()));
@@ -104,8 +104,48 @@ impl TransformerBlock {
         }
     }
 
+    fn forward_with_mixer_and_aux(
+        &self,
+        x: Tensor<3>,
+        mut mix: impl FnMut(Tensor<3>) -> Tensor<3>,
+    ) -> (Tensor<3>, Option<Tensor<1>>) {
+        let x = match self.norm_position {
+            NormPosition::Pre => {
+                let branch = mix(self.attn_norm.forward(x.clone()));
+                self.residual(x, branch)
+            }
+            NormPosition::Post => {
+                let branch = mix(x.clone());
+                self.attn_norm.forward(self.residual(x, branch))
+            }
+        };
+
+        let (output, auxiliary) = match self.norm_position {
+            NormPosition::Pre => {
+                let (branch, auxiliary) = self
+                    .feed_forward
+                    .forward_with_aux(self.ffn_norm.forward(x.clone()));
+                (self.residual(x, branch), auxiliary)
+            }
+            NormPosition::Post => {
+                let (branch, auxiliary) = self.feed_forward.forward_with_aux(x.clone());
+                (self.ffn_norm.forward(self.residual(x, branch)), auxiliary)
+            }
+        };
+        (output, auxiliary)
+    }
+
     pub fn forward(&self, x: Tensor<3>, rope: &RotaryEncoding, start_pos: usize) -> Tensor<3> {
         self.forward_with_mixer(x, |x| self.mix(x, rope, start_pos))
+    }
+
+    pub(crate) fn forward_with_aux(
+        &self,
+        x: Tensor<3>,
+        rope: &RotaryEncoding,
+        start_pos: usize,
+    ) -> (Tensor<3>, Option<Tensor<1>>) {
+        self.forward_with_mixer_and_aux(x, |x| self.mix(x, rope, start_pos))
     }
 
     /// Run the exact block path while retaining bounded values needed by the
@@ -145,8 +185,24 @@ impl TransformerBlock {
     }
 
     pub fn make_state(&self, batch: usize, device: &Device) -> LayerState {
+        self.make_state_with_capacity(batch, usize::MAX, device)
+    }
+
+    pub fn make_state_with_capacity(
+        &self,
+        batch: usize,
+        cache_capacity: usize,
+        device: &Device,
+    ) -> LayerState {
         match (&self.attention, &self.ssm) {
-            (Some(attention), None) => LayerState::Attn(attention.make_cache(batch, device)),
+            (Some(attention), None) => {
+                let cache = if cache_capacity == usize::MAX {
+                    attention.make_cache(batch, device)
+                } else {
+                    attention.make_cache_with_capacity(batch, cache_capacity, device)
+                };
+                LayerState::Attn(cache)
+            }
             (None, Some(ssm)) => LayerState::Mamba(ssm.make_state(batch, device)),
             _ => unreachable!("a block has exactly one mixer"),
         }
@@ -160,6 +216,10 @@ impl TransformerBlock {
             ssm.prepare_inference();
         }
         self.feed_forward.prepare_inference();
+    }
+
+    pub(crate) fn router_parameter_id(&self) -> Option<ParamId> {
+        self.feed_forward.router_parameter_id()
     }
 
     pub fn forward_with_state(
@@ -189,10 +249,16 @@ pub enum LayerState {
 pub struct InferenceState {
     pub(crate) layers: Vec<LayerState>,
     pub(crate) pos: usize,
+    pub(crate) capacity: usize,
 }
 
 impl InferenceState {
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// Maximum number of positions accepted before this state must be rebuilt.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 }

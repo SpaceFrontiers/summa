@@ -44,6 +44,12 @@ default `remote` feature they also accept `s3://`, `gs://`, and HTTP(S) URIs;
 downloads are cached under `~/.hermes-cache` or `$HERMES_CACHE`.
 
 Backend choice is a build decision. A build without `metal` or `cuda` uses CPU.
+Generation preallocates only the KV positions that the prompt and requested
+continuation can consume, instead of every model position. It skips the unused
+final decode step and rebuilds a bounded half-window only when the configured
+context limit is reached. `Transformer::make_state_with_capacity` exposes the
+same right-sized behavior to library callers; `make_state` retains the
+max-context convenience behavior.
 
 ## Inspect or export MAL models
 
@@ -81,10 +87,11 @@ logical vocabulary size while embedding and output tensors use a derived
 - RoPE and sliding-window attention
 - RMSNorm and LayerNorm
 - gated and non-gated FFNs
+- optional configurable top-k MoE FFNs (see `docs/moe-design.md`)
 - Mamba selective state-space blocks
 - mixed Transformer/Mamba layer patterns
 - tied or untied output embeddings
-- incremental KV-cache and recurrent-state decoding
+- right-sized incremental KV-cache and recurrent-state decoding
 
 ## License
 

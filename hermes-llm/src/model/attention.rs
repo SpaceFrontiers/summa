@@ -21,6 +21,7 @@ pub struct AttnCache {
     k: Option<Tensor<4>>,
     v: Option<Tensor<4>>,
     len: usize,
+    capacity: usize,
 }
 
 impl AttnCache {
@@ -30,6 +31,11 @@ impl AttnCache {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Number of token positions allocated for this layer.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 }
 
@@ -102,11 +108,28 @@ impl MultiHeadAttention {
     }
 
     pub fn make_cache(&self, batch: usize, device: &Device) -> AttnCache {
-        let shape = [batch, self.num_kv_heads, self.max_seq_len, self.head_dim];
+        self.make_cache_with_capacity(batch, self.max_seq_len, device)
+    }
+
+    /// Allocate only the positions this decode request can use.
+    pub fn make_cache_with_capacity(
+        &self,
+        batch: usize,
+        capacity: usize,
+        device: &Device,
+    ) -> AttnCache {
+        assert!(capacity > 0, "attention cache capacity must be positive");
+        assert!(
+            capacity <= self.max_seq_len,
+            "attention cache capacity {capacity} exceeds max_seq_len {}",
+            self.max_seq_len
+        );
+        let shape = [batch, self.num_kv_heads, capacity, self.head_dim];
         AttnCache {
             k: Some(Tensor::zeros(shape, device)),
             v: Some(Tensor::zeros(shape, device)),
             len: 0,
+            capacity,
         }
     }
 
@@ -306,7 +329,11 @@ impl MultiHeadAttention {
             "attention cache position does not match inference state"
         );
         let end = start_pos + k.dims()[2];
-        assert!(end <= self.max_seq_len, "attention cache capacity exceeded");
+        assert!(
+            end <= cache.capacity,
+            "attention cache capacity {} exceeded by position {end}",
+            cache.capacity
+        );
         let ranges = [
             0..k.dims()[0],
             0..self.num_kv_heads,
