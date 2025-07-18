@@ -141,6 +141,14 @@
             <span class="quiet">Nearby tokens</span>
             <div id="token-strip" class="token-strip"></div>
           </div>
+          <section class="visual-panel signal-flow-panel" aria-labelledby="signal-flow-title">
+            <div class="panel-heading">
+              <div><p class="eyebrow">Selected token · compressed hidden state</p><h3 id="signal-flow-title">Signal flow across layers</h3></div>
+              <p id="signal-flow-compression" class="signal-flow-compression quiet"></p>
+            </div>
+            <svg id="signal-flow-chart" class="signal-flow-chart" role="img" aria-labelledby="signal-flow-title signal-flow-description"></svg>
+            <p id="signal-flow-description" class="chart-selection quiet" aria-live="polite"></p>
+          </section>
           <div class="visual-grid">
             <section class="visual-panel wide-panel">
               <div class="panel-heading">
@@ -148,11 +156,6 @@
                 <div id="activation-scale" class="scale-legend"></div>
               </div>
               <div class="heatmap-wrap"><canvas id="activation-heatmap"></canvas></div>
-            </section>
-            <section class="visual-panel">
-              <div class="panel-heading"><div><p class="eyebrow">Across depth</p><h3>Selected-token energy</h3></div></div>
-              <svg id="rms-chart" class="line-chart" role="img" aria-label="Selected token RMS across model stages"></svg>
-              <p id="rms-selection" class="chart-selection quiet"></p>
             </section>
           </div>
           <div id="mixer-visuals" class="visual-grid mixer-visuals">

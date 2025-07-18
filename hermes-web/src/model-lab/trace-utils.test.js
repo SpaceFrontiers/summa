@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { demoTrace } from './demo-trace.js'
-import { interpolateHeatmap, layerGradientHeatmap, normalizedMetricHeatmap, validateTrace } from './trace-utils.js'
+import { interpolateHeatmap, layerGradientHeatmap, normalizedMetricHeatmap, tokenSignalSeries, validateTrace } from './trace-utils.js'
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
@@ -38,6 +38,20 @@ test('heatmap interpolation rejects incompatible captures', () => {
   const from = { rows: 1, cols: 1, values: [0], min: 0, max: 0 }
   const to = { rows: 2, cols: 1, values: [0, 1], min: 0, max: 1 }
   assert.throws(() => interpolateHeatmap(from, to, 0.5), /different shapes/)
+})
+
+test('selected-token signal flow preserves exact RMS and summarizes captured bins', () => {
+  const series = tokenSignalSeries(demoTrace.inference, 0)
+  assert.equal(series.length, demoTrace.inference.stages.length)
+  assert.equal(series[0].rms, demoTrace.inference.stages[0].token_rms[0])
+  assert.equal(series[0].updateRms, null)
+  assert.equal(series[0].capturedBins, demoTrace.inference.stages[0].activation.cols)
+  for (const point of series) {
+    assert.ok(Number.isFinite(point.binMean))
+    assert.ok(Number.isFinite(point.binRms))
+    assert.ok(Math.abs(point.positiveBinEnergy + point.negativeBinEnergy - 1) < 1e-12)
+  }
+  assert.throws(() => tokenSignalSeries(demoTrace.inference, -1), /outside the captured trace/)
 })
 
 test('training heatmaps retain metric and layer axes', () => {

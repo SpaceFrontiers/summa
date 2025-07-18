@@ -62,6 +62,19 @@ not channel-binned, but only the requested leading heads are retained. Mamba
 state is reduced over contiguous inner-channel bins. Every reduction records
 the original and captured dimensions in `capture`; nothing is silently dropped.
 
+For the selected token, the inference view also renders a compact signal-flow
+graph across model depth. Its log-scaled vertical position reports the exact RMS
+captured from the full hidden vector, and the thickness of each incoming edge
+reports the exact RMS of that block's residual update. Attention, Mamba, and
+endpoint stages use different node shapes. Small positive/negative bars
+summarize the squared energy of the captured signed channel-bin means; this sign
+balance is explicitly approximate because values were aggregated before they
+reached the browser.
+Dense models retain every graph segment but reduce stage labels and glyphs to
+fit the available width. Playback moves one probe over the graph instead of
+rebuilding it, and the visible readout reports the interpolated display value
+between exact captured endpoints.
+
 Training rows retain the original JSON objects. If their count exceeds the
 configured limit, deterministic evenly spaced sampling keeps the first and last
 row and records total rows, retained rows, and sampling stride.
