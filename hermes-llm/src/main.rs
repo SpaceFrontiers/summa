@@ -42,12 +42,16 @@ enum Commands {
         max_tokens: usize,
 
         /// Sampling temperature
-        #[arg(long, default_value = "0.8")]
+        #[arg(long, default_value = "0.9")]
         temperature: f64,
 
         /// Top-k sampling
         #[arg(long)]
         top_k: Option<usize>,
+
+        /// Penalize tokens already present in the context (1 disables)
+        #[arg(long, default_value = "1.0")]
+        repetition_penalty: f64,
 
         /// RNG seed for reproducible sampling (random if unset)
         #[arg(long)]
@@ -89,12 +93,16 @@ enum Commands {
         max_tokens: usize,
 
         /// Sampling temperature; <= 0 uses greedy decoding
-        #[arg(long, default_value = "0.8")]
+        #[arg(long, default_value = "0.9")]
         temperature: f64,
 
         /// Top-k sampling
         #[arg(long)]
         top_k: Option<usize>,
+
+        /// Penalize tokens already present in the context (1 disables)
+        #[arg(long, default_value = "1.0")]
+        repetition_penalty: f64,
 
         /// RNG seed for reproducible sampling (random if unset)
         #[arg(long)]
@@ -277,6 +285,7 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             top_k,
+            repetition_penalty,
             seed,
             no_eos,
         } => {
@@ -293,6 +302,7 @@ fn main() -> Result<()> {
                 max_new_tokens: max_tokens,
                 temperature,
                 top_k,
+                repetition_penalty,
                 eos_token: (!no_eos).then(|| tokenizer.eos_token_id()),
                 seed,
             };
@@ -312,6 +322,7 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             top_k,
+            repetition_penalty,
             seed,
             no_eos,
             trace_tokens,
@@ -329,6 +340,7 @@ fn main() -> Result<()> {
                 max_new_tokens: max_tokens,
                 temperature,
                 top_k,
+                repetition_penalty,
                 eos_token: (!no_eos).then(|| tokenizer.eos_token_id()),
                 seed: Some(actual_seed),
             };
@@ -354,6 +366,7 @@ fn main() -> Result<()> {
                         max_new_tokens: max_tokens,
                         temperature,
                         top_k,
+                        repetition_penalty,
                         seed: actual_seed,
                         stop_at_eos: !no_eos,
                     },

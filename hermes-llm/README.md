@@ -30,9 +30,14 @@ hermes-llm generate \
   --tokenizer tokenizer.json \
   --prompt "Once upon a time" \
   --max-tokens 100 \
-  --temperature 0.8 \
-  --top-k 40
+  --temperature 0.9 \
+  --top-k 40 \
+  --repetition-penalty 1.1
 ```
+
+`--repetition-penalty` uses the standard sign-aware logit adjustment for
+tokens already present in the context. `1.0` disables it; values around
+`1.05`–`1.2` are useful starting points for repetitive checkpoints.
 
 The checkpoint, config, and tokenizer arguments accept local paths. With the
 default `remote` feature they also accept `s3://`, `gs://`, and HTTP(S) URIs;

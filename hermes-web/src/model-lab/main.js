@@ -418,8 +418,9 @@ function renderInference({ renderTokens = true, renderSignal = renderTokens } = 
   setText('prompt-token-count', inference.prompt_token_count)
   setText('generated-token-count', inference.generated_token_count)
   const sampling = inference.sampling
+  const penalty = Number.isFinite(sampling.repetition_penalty) ? sampling.repetition_penalty : 1
   const method = sampling.temperature <= 0 ? 'greedy' : `T ${sampling.temperature}${sampling.top_k ? ` · top-${sampling.top_k}` : ''}`
-  setText('sampling-description', `${method} · seed ${sampling.seed}`)
+  setText('sampling-description', `${method} · repeat ${penalty} · seed ${sampling.seed}`)
   updatePlaybackControls()
 }
 
@@ -1019,6 +1020,8 @@ async function checkLiveSession() {
     state.liveStatus = status
     $('live-max-tokens').max = String(status.max_new_tokens)
     $('live-max-tokens').value = String(Math.min(Number($('live-max-tokens').value), status.max_new_tokens))
+    $('live-top-k').max = String(status.vocab_size)
+    $('live-top-k').value = String(Math.min(Number($('live-top-k').value), status.vocab_size))
     if (Number.isInteger(status.max_prompt_bytes)) $('live-prompt').maxLength = status.max_prompt_bytes
     $('run-query').disabled = false
     setLiveSessionStatus(`Ready · ${status.model} · ${status.num_layers} layers`, 'ready')
@@ -1039,12 +1042,22 @@ async function runLiveQuery(event) {
   const prompt = $('live-prompt').value.trim()
   const maxTokens = Number($('live-max-tokens').value)
   const temperature = Number($('live-temperature').value)
+  const topK = Number($('live-top-k').value)
+  const repetitionPenalty = Number($('live-repetition-penalty').value)
   if (!Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > state.liveStatus.max_new_tokens) {
     showError(`New tokens must be between 1 and ${state.liveStatus.max_new_tokens}.`)
     return
   }
   if (!Number.isFinite(temperature) || temperature < 0 || temperature > 5) {
     showError('Temperature must be between 0 and 5.')
+    return
+  }
+  if (!Number.isInteger(topK) || topK < 1 || topK > state.liveStatus.vocab_size) {
+    showError(`Top-k must be between 1 and ${state.liveStatus.vocab_size}.`)
+    return
+  }
+  if (!Number.isFinite(repetitionPenalty) || repetitionPenalty < 1 || repetitionPenalty > 5) {
+    showError('Repetition penalty must be between 1 and 5.')
     return
   }
 
@@ -1067,7 +1080,7 @@ async function runLiveQuery(event) {
     const response = await window.fetch('/api/trace', {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, max_tokens: maxTokens, temperature }),
+      body: JSON.stringify({ prompt, max_tokens: maxTokens, temperature, top_k: topK, repetition_penalty: repetitionPenalty }),
     })
     const trace = await readJsonResponse(response)
     if (!response.ok) throw new Error(trace.error ?? `Model Lab returned ${response.status}`)
