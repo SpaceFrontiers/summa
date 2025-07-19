@@ -226,7 +226,7 @@ macro_rules! boolean_plan {
             // Auto-detect: BMP executor if field has BMP index, else MaxScore
             if let Some(infos) = extract_all_sparse_infos(should) {
                 if let Some((raw, info)) =
-                    build_sparse_bmp_results(&infos, reader, limit)
+                    build_sparse_bmp_results(&infos, reader, limit, &scorer_options)
                 {
                     return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
                 }
@@ -270,7 +270,11 @@ macro_rules! boolean_plan {
                     }
                 }
                 for &idx in &grouping.fallback_indices {
-                    scorers.push(should[idx].$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+                    scorers.push(should[idx].$scorer_fn(
+                        reader,
+                        limit,
+                        scorer_options.without_threshold(),
+                    ) $(. $aw)* ?);
                 }
                 return Ok(build_should_scorer(scorers));
             }
@@ -307,11 +311,15 @@ macro_rules! boolean_plan {
                         predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
                     } else {
                         log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
-                        must_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+                        must_verifiers.push(q.$scorer_fn(
+                            reader, limit, scorer_options.without_threshold()
+                        ) $(. $aw)* ?);
                     }
                 } else {
                     log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
-                    must_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+                    must_verifiers.push(q.$scorer_fn(
+                        reader, limit, scorer_options.without_threshold()
+                    ) $(. $aw)* ?);
                 }
             }
             // Compile MUST_NOT → negated predicates vs verifier scorers
@@ -326,10 +334,14 @@ macro_rules! boolean_plan {
                         log::debug!("BooleanQuery planner 3a: MUST_NOT clause → bitset predicate ({})", q);
                         predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
                     } else {
-                        must_not_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+                        must_not_verifiers.push(q.$scorer_fn(
+                            reader, limit, scorer_options.without_threshold()
+                        ) $(. $aw)* ?);
                     }
                 } else {
-                    must_not_verifiers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+                    must_not_verifiers.push(q.$scorer_fn(
+                        reader, limit, scorer_options.without_threshold()
+                    ) $(. $aw)* ?);
                 }
             }
 
@@ -345,7 +357,9 @@ macro_rules! boolean_plan {
                     if let Some(ref bitset) = bitset_result {
                         let bitset_pred = |doc_id: crate::DocId| bitset.contains(doc_id);
                         if let Some((raw, info)) =
-                            build_sparse_bmp_results_filtered(&infos, reader, limit, &bitset_pred)
+                            build_sparse_bmp_results_filtered(
+                                &infos, reader, limit, &bitset_pred, &scorer_options
+                            )
                         {
                             log::debug!(
                                 "BooleanQuery planner: bitset-aware sparse BMP, {} dims, {} matching docs",
@@ -359,7 +373,9 @@ macro_rules! boolean_plan {
                     // Fallback: closure predicate (for queries that don't support bitsets)
                     let combined = chain_predicates(predicates);
                     if let Some((raw, info)) =
-                        build_sparse_bmp_results_filtered(&infos, reader, limit, &*combined)
+                        build_sparse_bmp_results_filtered(
+                            &infos, reader, limit, &*combined, &scorer_options
+                        )
                     {
                         log::debug!(
                             "BooleanQuery planner: predicate-aware sparse BMP, {} dims",
@@ -407,7 +423,9 @@ macro_rules! boolean_plan {
                 || !must_not_verifiers.is_empty();
             let should_limit = if has_filters { limit * 4 } else { limit };
             let should_scorer = if should.len() == 1 {
-                should[0].$scorer_fn(reader, should_limit, scorer_options) $(. $aw)* ?
+                should[0].$scorer_fn(
+                    reader, should_limit, scorer_options.without_threshold()
+                ) $(. $aw)* ?
             } else {
                 let sub = BooleanQuery {
                     must: Vec::new(),
@@ -415,7 +433,9 @@ macro_rules! boolean_plan {
                     must_not: Vec::new(),
                     global_stats: global_stats.cloned(),
                 };
-                sub.$scorer_fn(reader, should_limit, scorer_options) $(. $aw)* ?
+                sub.$scorer_fn(
+                    reader, should_limit, scorer_options.without_threshold()
+                ) $(. $aw)* ?
             };
 
             let use_predicated =
@@ -453,15 +473,21 @@ macro_rules! boolean_plan {
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
         let mut must_scorers = Vec::with_capacity(must.len());
         for q in must {
-            must_scorers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+            must_scorers.push(q.$scorer_fn(
+                reader, limit, scorer_options.without_threshold()
+            ) $(. $aw)* ?);
         }
         let mut should_scorers = Vec::with_capacity(should.len());
         for q in should {
-            should_scorers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+            should_scorers.push(q.$scorer_fn(
+                reader, limit, scorer_options.without_threshold()
+            ) $(. $aw)* ?);
         }
         let mut must_not_scorers = Vec::with_capacity(must_not.len());
         for q in must_not {
-            must_not_scorers.push(q.$scorer_fn(reader, limit, scorer_options) $(. $aw)* ?);
+            must_not_scorers.push(q.$scorer_fn(
+                reader, limit, scorer_options.without_threshold()
+            ) $(. $aw)* ?);
         }
         let mut scorer = BooleanScorer {
             must: must_scorers,

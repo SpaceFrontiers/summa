@@ -37,7 +37,7 @@
 //! - **Thread-local scratch**: Zero per-query allocation for large buffers
 //! - **Early termination**: stop when superblock/block UB < top-k threshold
 
-use super::scoring::{ScoreCollector, ScoredDoc};
+use super::scoring::{ScoreCollector, ScoredDoc, SharedThreshold};
 use crate::segment::{
     BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_grid_u32, block_term_postings, compute_block_masks,
     find_dim_in_block_data,
@@ -155,6 +155,18 @@ thread_local! {
         std::cell::RefCell::new(BmpScratch::default());
 }
 
+/// A correctness-approved cross-segment score floor for BMP. The planner only
+/// supplies this when raw ordinal scores are also final document scores
+/// (physically single-valued data or the `Max` combiner).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BmpThreshold<'a> {
+    pub initial: f32,
+    pub shared: Option<&'a SharedThreshold>,
+    /// A raw BMP heap can publish its k-th score only when its entries are
+    /// guaranteed to represent distinct documents.
+    pub publish: bool,
+}
+
 /// Execute a BMP query against the given index.
 ///
 /// Returns top-k results sorted by score descending.
@@ -175,6 +187,7 @@ thread_local! {
 /// - **>0**: stop after visiting this many superblocks
 ///
 /// Based on Mallia et al. (SIGIR 2024) and Carlson et al. (arXiv 2602.02883).
+#[allow(dead_code)]
 pub fn execute_bmp(
     index: &BmpIndex,
     index_label: &str,
@@ -193,6 +206,32 @@ pub fn execute_bmp(
         heap_factor,
         max_superblocks,
         None,
+        BmpThreshold::default(),
+    )
+}
+
+/// BMP execution with a planner-validated live cross-segment threshold.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_bmp_with_threshold(
+    index: &BmpIndex,
+    index_label: &str,
+    field_label: &str,
+    query_terms: &[(u32, f32)],
+    k: usize,
+    heap_factor: f32,
+    max_superblocks: usize,
+    threshold: BmpThreshold<'_>,
+) -> crate::Result<Vec<ScoredDoc>> {
+    execute_bmp_inner(
+        index,
+        index_label,
+        field_label,
+        query_terms,
+        k,
+        heap_factor,
+        max_superblocks,
+        None,
+        threshold,
     )
 }
 
@@ -202,6 +241,7 @@ pub fn execute_bmp(
 /// The predicate is checked during scoring (not post-filter), so the collector
 /// only contains valid documents and the threshold evolves correctly.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn execute_bmp_filtered(
     index: &BmpIndex,
     index_label: &str,
@@ -221,6 +261,33 @@ pub fn execute_bmp_filtered(
         heap_factor,
         max_superblocks,
         Some(predicate),
+        BmpThreshold::default(),
+    )
+}
+
+/// Filtered BMP execution with a planner-validated live threshold.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_bmp_filtered_with_threshold(
+    index: &BmpIndex,
+    index_label: &str,
+    field_label: &str,
+    query_terms: &[(u32, f32)],
+    k: usize,
+    heap_factor: f32,
+    max_superblocks: usize,
+    predicate: &dyn Fn(crate::DocId) -> bool,
+    threshold: BmpThreshold<'_>,
+) -> crate::Result<Vec<ScoredDoc>> {
+    execute_bmp_inner(
+        index,
+        index_label,
+        field_label,
+        query_terms,
+        k,
+        heap_factor,
+        max_superblocks,
+        Some(predicate),
+        threshold,
     )
 }
 
@@ -234,6 +301,7 @@ fn execute_bmp_inner(
     heap_factor: f32,
     max_superblocks: usize,
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
+    threshold_source: BmpThreshold<'_>,
 ) -> crate::Result<Vec<ScoredDoc>> {
     if query_terms.is_empty() || index.num_blocks == 0 || k == 0 {
         return Ok(Vec::new());
@@ -493,8 +561,17 @@ fn execute_bmp_inner(
         let mut docmap_lookups = 0u32;
         let mut sbs_scored = 0u32;
         let mut collector = ScoreCollector::new(collector_k);
+        let initial_threshold = threshold_source
+            .shared
+            .map(SharedThreshold::get)
+            .unwrap_or(0.0)
+            .max(threshold_source.initial);
+        collector.seed_threshold(initial_threshold);
 
         for (idx, &sb_id) in scratch.sb_order.iter().enumerate() {
+            if let Some(shared) = threshold_source.shared {
+                collector.seed_threshold(shared.get());
+            }
             // LSP/0: hard cap on superblock visits
             if max_superblocks > 0 && idx >= max_superblocks {
                 break;
@@ -626,6 +703,13 @@ fn execute_bmp_inner(
                 },
             );
 
+            if threshold_source.publish
+                && collector.real_len() >= collector_k
+                && let Some(shared) = threshold_source.shared
+            {
+                shared.raise(collector.threshold());
+            }
+
             // Cross-superblock lookahead: prefetch next superblock's block_data_starts.
             // Gives offsets time to arrive during pruning check + UB/mask computation.
             // Range includes the sentinel at next_end (needed by block_data_range).
@@ -643,6 +727,7 @@ fn execute_bmp_inner(
 
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let threshold = collector.threshold();
+        let returned = collector.real_len();
         crate::observe::bmp_query(
             index_label,
             field_label,
@@ -655,25 +740,29 @@ fn execute_bmp_inner(
         );
         if elapsed_ms > 500.0 {
             log::warn!(
-                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}, alpha={:.2}",
+                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, k={}, returned={}, seed={:.4}, threshold={:.4}, alpha={:.2}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
                 blocks_scored,
                 num_blocks,
-                collector.len(),
+                collector_k,
+                returned,
+                initial_threshold,
                 threshold,
                 alpha,
             );
         } else {
             log::debug!(
-                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}, threshold={:.4}, alpha={:.2}",
+                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, k={}, returned={}, seed={:.4}, threshold={:.4}, alpha={:.2}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
                 blocks_scored,
                 num_blocks,
-                collector.len(),
+                collector_k,
+                returned,
+                initial_threshold,
                 threshold,
                 alpha,
             );

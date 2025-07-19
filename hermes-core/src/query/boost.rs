@@ -56,7 +56,14 @@ impl Query for BoostQuery {
                     "boost must be a finite number".to_string(),
                 ));
             }
-            let inner_scorer = inner.scorer_with_options(reader, limit, options).await?;
+            let inner_options = if boost == 1.0 {
+                options
+            } else {
+                options.without_threshold()
+            };
+            let inner_scorer = inner
+                .scorer_with_options(reader, limit, inner_options)
+                .await?;
             Ok(Box::new(BoostScorer {
                 inner: inner_scorer,
                 boost,
@@ -85,9 +92,14 @@ impl Query for BoostQuery {
                 "boost must be a finite number".to_string(),
             ));
         }
+        let inner_options = if self.boost == 1.0 {
+            options
+        } else {
+            options.without_threshold()
+        };
         let inner_scorer = self
             .inner
-            .scorer_sync_with_options(reader, limit, options)?;
+            .scorer_sync_with_options(reader, limit, inner_options)?;
         Ok(Box::new(BoostScorer {
             inner: inner_scorer,
             boost: self.boost,

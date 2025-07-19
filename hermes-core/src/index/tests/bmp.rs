@@ -116,6 +116,116 @@ async fn test_bmp_needle_in_haystack() {
     assert_eq!(results.len(), 0);
 }
 
+/// A live global BMP floor may change traversal work, never the exact top-k.
+/// This also exercises physical single-value detection on many small segments:
+/// each segment should collect `k`, not the sparse query's default `2k`.
+#[tokio::test]
+async fn test_bmp_cross_segment_threshold_matches_exhaustive() {
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        max_indexing_memory_bytes: 1024,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    let mut num_docs = 0usize;
+    for segment in 0..12 {
+        for doc_index in 0..16 {
+            let rank = segment * 16 + doc_index;
+            let mut doc = Document::new();
+            doc.add_sparse_vector(
+                sparse,
+                vec![
+                    (0, 0.1 + rank as f32 * 0.003),
+                    (1, 0.2 + (rank % 11) as f32 * 0.04),
+                    (2, 0.05 + (rank % 7) as f32 * 0.02),
+                ],
+            );
+            writer.add_document(doc).unwrap();
+            num_docs += 1;
+        }
+        writer.commit().await.unwrap();
+    }
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert!(index.segment_readers().await.unwrap().len() >= 10);
+    let query =
+        SparseVectorQuery::new(sparse, vec![(0, 1.0), (1, 0.7), (2, 0.3)]).with_heap_factor(1.0);
+    let exhaustive = index.search(&query, num_docs).await.unwrap();
+    assert!(exhaustive.hits.len() > 32);
+
+    for k in [1usize, 3, 10, 32] {
+        let topk = index.search(&query, k).await.unwrap();
+        let expected = &exhaustive.hits[..k];
+        assert_eq!(topk.hits.len(), expected.len(), "k={k}");
+        for (got, want) in topk.hits.iter().zip(expected) {
+            assert!(
+                (got.score - want.score).abs() < 1e-5,
+                "k={k}: BMP shared-floor score diverged ({} vs {})",
+                got.score,
+                want.score,
+            );
+        }
+    }
+}
+
+/// Multi-value `Max` can safely consume a document-score floor because its
+/// final score is one raw ordinal score. Aggregating combiners cannot: several
+/// individually sub-floor ordinals may combine above it.
+#[tokio::test]
+async fn test_bmp_multi_value_threshold_is_combiner_scoped() {
+    use crate::query::{MultiValueCombiner, SharedThreshold, search_segment_shared};
+
+    let (schema, _title, sparse) = bmp_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for i in 0..20 {
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, vec![(0, 0.5 + i as f32 * 0.1)]);
+        doc.add_sparse_vector(sparse, vec![(1, 0.4 + i as f32 * 0.08)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segment = index.segment_readers().await.unwrap().pop().unwrap();
+
+    let max_query = SparseVectorQuery::new(sparse, vec![(0, 1.0), (1, 1.0)])
+        .with_combiner(MultiValueCombiner::Max)
+        .with_heap_factor(1.0);
+    let exhaustive = index.search(&max_query, 20).await.unwrap();
+    let max_floor = exhaustive.hits[4].score;
+    let max_shared = SharedThreshold::new();
+    max_shared.raise(max_floor);
+    let (seeded_max, _) = search_segment_shared(segment.as_ref(), &max_query, 5, false, max_shared)
+        .await
+        .unwrap();
+    assert_eq!(seeded_max.len(), 5);
+    for (got, want) in seeded_max.iter().zip(&exhaustive.hits[..5]) {
+        assert!((got.score - want.score).abs() < 1e-5);
+    }
+
+    // This deliberately impossible floor would erase every raw ordinal if it
+    // leaked into Sum. The planner must strip it and still produce a full k.
+    let sum_query = SparseVectorQuery::new(sparse, vec![(0, 1.0), (1, 1.0)])
+        .with_combiner(MultiValueCombiner::Sum)
+        .with_heap_factor(1.0);
+    let unsafe_shared = SharedThreshold::new();
+    unsafe_shared.raise(100.0);
+    let (sum_results, _) =
+        search_segment_shared(segment.as_ref(), &sum_query, 5, false, unsafe_shared)
+            .await
+            .unwrap();
+    assert_eq!(sum_results.len(), 5);
+}
+
 /// BMP multi-segment merge: build two segments, merge, verify query correctness.
 #[tokio::test]
 async fn test_bmp_merge() {

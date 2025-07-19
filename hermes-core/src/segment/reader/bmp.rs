@@ -107,6 +107,10 @@ pub struct BmpIndex {
     grid_bits: u8,
     /// Actual vector count before padding
     num_real_docs: u32,
+    /// True when every stored vector is ordinal zero. This is derived from
+    /// the physical document map rather than the schema so legacy segments
+    /// whose `multi` flag was inaccurate still get correct query planning.
+    single_valued: bool,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
     /// Section A: block_data_starts[block_id] = byte offset into block_data_bytes
@@ -228,6 +232,7 @@ impl BmpIndex {
                 packed_row_size: 0,
                 grid_bits,
                 num_real_docs,
+                single_valued: true,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
                 grid_bytes: OwnedBytes::empty(),
@@ -368,6 +373,10 @@ impl BmpIndex {
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
+        let single_valued = doc_map_ordinals_bytes
+            .as_slice()
+            .chunks_exact(2)
+            .all(|ordinal| ordinal == [0, 0]);
 
         // This compact table is cheap to validate in full and is the trust
         // boundary for every later raw-pointer block access.
@@ -418,7 +427,7 @@ impl BmpIndex {
         log::debug!(
             "BMP V14 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
-             packed_row_size={}, block_data={}B, doc_map={}B",
+             packed_row_size={}, single_valued={}, block_data={}B, doc_map={}B",
             num_blocks,
             num_superblocks,
             dims,
@@ -428,6 +437,7 @@ impl BmpIndex {
             max_weight_scale,
             total_postings,
             packed_row_size,
+            single_valued,
             bds_start,
             num_virtual_docs as usize * 6,
         );
@@ -444,6 +454,7 @@ impl BmpIndex {
             packed_row_size,
             grid_bits,
             num_real_docs,
+            single_valued,
             block_data_starts_bytes,
             block_data_bytes,
             grid_bytes,
@@ -713,6 +724,13 @@ impl BmpIndex {
     /// Actual vector count before block-alignment padding.
     pub fn num_real_docs(&self) -> u32 {
         self.num_real_docs
+    }
+
+    /// Whether this segment physically contains at most one vector per
+    /// document. Unlike the schema's `multi` flag, this remains reliable for
+    /// old or externally-created segments with inaccurate metadata.
+    pub fn is_single_valued(&self) -> bool {
+        self.single_valued
     }
 
     /// Estimated memory usage in bytes (mmap-backed region sizes).
@@ -1808,6 +1826,22 @@ mod safety_tests {
         let starts = grid_offset - (num_blocks + 1) * 8;
         blob[starts..starts + 8].copy_from_slice(&1u64.to_le_bytes());
         assert!(matches!(parse(blob), Err(crate::Error::Corruption(_))));
+    }
+
+    #[test]
+    fn physical_single_value_detection_uses_ordinal_map() {
+        let single = parse(test_blob()).unwrap();
+        assert!(single.is_single_valued());
+
+        let mut postings = FxHashMap::default();
+        postings.insert(3, vec![(0, 0, 1.0), (0, 1, 0.8), (1, 0, 0.5)]);
+        let mut blob = Vec::new();
+        crate::segment::builder::bmp::build_bmp_blob(
+            postings, 64, 4, 0.0, None, 16, 5.0, 0, &mut blob,
+        )
+        .unwrap();
+        let multi = parse(blob).unwrap();
+        assert!(!multi.is_single_valued());
     }
 }
 

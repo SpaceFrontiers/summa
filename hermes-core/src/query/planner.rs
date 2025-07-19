@@ -183,6 +183,53 @@ pub(super) fn bounded_sparse_executor_limit(limit: usize, over_fetch_factor: f32
     (derived as usize).min(MAX_SPARSE_EXECUTOR_RESULTS)
 }
 
+/// Physical single-value BMP segments need no ordinal over-fetch: every raw
+/// hit is already a distinct final document. Genuine multi-value segments
+/// retain the configured budget because aggregation can collapse many raw
+/// ordinals into one document.
+fn bmp_executor_limit(
+    limit: usize,
+    over_fetch_factor: f32,
+    bmp: &crate::segment::reader::bmp::BmpIndex,
+) -> usize {
+    bmp_executor_limit_for_counts(
+        limit,
+        over_fetch_factor,
+        bmp.is_single_valued(),
+        bmp.num_real_docs() as usize,
+        bmp.num_virtual_docs as usize,
+    )
+}
+
+fn bmp_executor_limit_for_counts(
+    limit: usize,
+    over_fetch_factor: f32,
+    single_valued: bool,
+    num_real_docs: usize,
+    num_virtual_docs: usize,
+) -> usize {
+    if single_valued {
+        limit.min(num_real_docs)
+    } else {
+        bounded_sparse_executor_limit(limit, over_fetch_factor).min(num_virtual_docs)
+    }
+}
+
+fn bmp_threshold<'a>(
+    options: &'a super::ScorerOptions,
+    combiner: MultiValueCombiner,
+    single_valued: bool,
+) -> super::bmp::BmpThreshold<'a> {
+    if !single_valued && combiner != MultiValueCombiner::Max {
+        return super::bmp::BmpThreshold::default();
+    }
+    super::bmp::BmpThreshold {
+        initial: options.initial_threshold,
+        shared: options.shared_threshold.as_ref(),
+        publish: single_valued,
+    }
+}
+
 /// Build a sparse MaxScoreExecutor from decomposed sparse infos.
 ///
 /// Returns the executor + representative info (for combiner/field), or None
@@ -229,6 +276,7 @@ pub(crate) fn build_sparse_bmp_results(
     infos: &[SparseTermQueryInfo],
     reader: &SegmentReader,
     limit: usize,
+    options: &super::ScorerOptions,
 ) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
     let field = infos[0].field;
     let bmp = reader.bmp_index(field)?;
@@ -239,11 +287,10 @@ pub(crate) fn build_sparse_bmp_results(
     if query_terms.is_empty() {
         return None;
     }
-    let executor_limit = bounded_sparse_executor_limit(limit, infos[0].over_fetch_factor)
-        .min(bmp.num_virtual_docs as usize);
+    let executor_limit = bmp_executor_limit(limit, infos[0].over_fetch_factor, bmp);
     let max_sb = infos[0].max_superblocks;
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
-    match super::bmp::execute_bmp(
+    match super::bmp::execute_bmp_with_threshold(
         bmp,
         reader.schema().index_label(),
         field_label,
@@ -251,6 +298,7 @@ pub(crate) fn build_sparse_bmp_results(
         executor_limit,
         infos[0].heap_factor,
         max_sb,
+        bmp_threshold(options, infos[0].combiner, bmp.is_single_valued()),
     ) {
         Ok(results) => Some((results, infos[0])),
         Err(e) => {
@@ -269,6 +317,7 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     reader: &SegmentReader,
     limit: usize,
     predicate: &dyn Fn(crate::DocId) -> bool,
+    options: &super::ScorerOptions,
 ) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
     let field = infos[0].field;
     let bmp = reader.bmp_index(field)?;
@@ -279,11 +328,10 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     if query_terms.is_empty() {
         return None;
     }
-    let executor_limit = bounded_sparse_executor_limit(limit, infos[0].over_fetch_factor)
-        .min(bmp.num_virtual_docs as usize);
+    let executor_limit = bmp_executor_limit(limit, infos[0].over_fetch_factor, bmp);
     let max_sb = infos[0].max_superblocks;
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
-    match super::bmp::execute_bmp_filtered(
+    match super::bmp::execute_bmp_filtered_with_threshold(
         bmp,
         reader.schema().index_label(),
         field_label,
@@ -292,6 +340,7 @@ pub(crate) fn build_sparse_bmp_results_filtered(
         infos[0].heap_factor,
         max_sb,
         predicate,
+        bmp_threshold(options, infos[0].combiner, bmp.is_single_valued()),
     ) {
         Ok(results) => Some((results, infos[0])),
         Err(e) => {
@@ -594,5 +643,47 @@ impl Scorer for VectorTopKResultScorer {
             .map(|&(ordinal, score)| ScoredPosition::new(ordinal, score))
             .collect();
         Some(vec![(self.field_id, scored_positions)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bmp_single_value_limit_does_not_overfetch() {
+        assert_eq!(
+            bmp_executor_limit_for_counts(320, 2.0, true, 10_000, 10_048),
+            320
+        );
+        assert_eq!(
+            bmp_executor_limit_for_counts(320, 2.0, false, 10_000, 10_048),
+            640
+        );
+    }
+
+    #[test]
+    fn bmp_threshold_is_only_used_in_final_score_space() {
+        let shared = super::super::SharedThreshold::new();
+        shared.raise(7.0);
+        let options = super::super::ScorerOptions {
+            collect_positions: false,
+            initial_threshold: 5.0,
+            shared_threshold: Some(shared),
+        };
+
+        let single_sum = bmp_threshold(&options, MultiValueCombiner::Sum, true);
+        assert_eq!(single_sum.initial, 5.0);
+        assert!(single_sum.shared.is_some());
+        assert!(single_sum.publish);
+
+        let multi_max = bmp_threshold(&options, MultiValueCombiner::Max, false);
+        assert!(multi_max.shared.is_some());
+        assert!(!multi_max.publish);
+
+        let multi_sum = bmp_threshold(&options, MultiValueCombiner::Sum, false);
+        assert_eq!(multi_sum.initial, 0.0);
+        assert!(multi_sum.shared.is_none());
+        assert!(!multi_sum.publish);
     }
 }

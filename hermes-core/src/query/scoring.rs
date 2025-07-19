@@ -68,6 +68,9 @@ pub struct ScoreCollector {
     /// Cached threshold: avoids repeated heap.peek() in hot loops.
     /// Updated only when the heap changes (insert/pop).
     cached_threshold: f32,
+    /// Number of real entries in the heap. Threshold seeding fills unused
+    /// slots with sentinels, so `heap.len()` alone cannot answer this.
+    real_len: usize,
 }
 
 impl ScoreCollector {
@@ -79,6 +82,7 @@ impl ScoreCollector {
             heap: BinaryHeap::with_capacity(capacity),
             k,
             cached_threshold: 0.0,
+            real_len: 0,
         }
     }
 
@@ -119,6 +123,7 @@ impl ScoreCollector {
         };
         if self.heap.len() < self.k {
             self.heap.push(entry);
+            self.real_len += 1;
             // Only recompute threshold when heap just became full
             if self.heap.len() == self.k {
                 self.update_threshold();
@@ -126,7 +131,13 @@ impl ScoreCollector {
             true
         } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
             self.heap.push(entry);
-            self.heap.pop(); // Remove lowest
+            if self
+                .heap
+                .pop()
+                .is_some_and(|evicted| evicted.doc_id == u32::MAX)
+            {
+                self.real_len += 1;
+            }
             self.update_threshold();
             true
         } else {
@@ -161,6 +172,12 @@ impl ScoreCollector {
         self.heap.len()
     }
 
+    /// Number of real results retained, excluding threshold sentinels.
+    #[inline]
+    pub fn real_len(&self) -> usize {
+        self.real_len
+    }
+
     /// Check if collector is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -169,20 +186,37 @@ impl ScoreCollector {
 
     /// Seed the threshold from a cross-segment shared value.
     ///
-    /// Pre-fills the heap with `k` dummy entries at the given score so that
-    /// pruning kicks in immediately. Only has effect if called before any
-    /// real inserts and `initial_threshold > 0.0`.
+    /// Fills unused slots and replaces retained entries below the new floor
+    /// with dummy entries. This can be called repeatedly while another
+    /// segment raises the shared threshold; equal-scoring real candidates win
+    /// the deterministic doc-id tie break over sentinels.
     pub fn seed_threshold(&mut self, initial_threshold: f32) {
-        if initial_threshold > 0.0 && self.heap.is_empty() {
-            for _ in 0..self.k {
-                self.heap.push(HeapEntry {
-                    doc_id: u32::MAX,
-                    score: initial_threshold,
-                    ordinal: 0,
-                });
-            }
-            self.update_threshold();
+        if initial_threshold <= 0.0
+            || self.k == 0
+            || (self.heap.len() >= self.k && initial_threshold <= self.cached_threshold)
+        {
+            return;
         }
+
+        let sentinel = HeapEntry {
+            doc_id: u32::MAX,
+            score: initial_threshold,
+            ordinal: 0,
+        };
+        while self.heap.len() < self.k {
+            self.heap.push(sentinel);
+        }
+        while self.heap.peek().is_some_and(|worst| sentinel < *worst) {
+            self.heap.push(sentinel);
+            if self
+                .heap
+                .pop()
+                .is_some_and(|evicted| evicted.doc_id != u32::MAX)
+            {
+                self.real_len -= 1;
+            }
+        }
+        self.update_threshold();
     }
 
     /// Convert to sorted top-k results (descending by score).
@@ -222,7 +256,7 @@ impl ScoreCollector {
 /// any other segment with `v` can never drop a document that belongs in the
 /// final top-k. Completion order is arbitrary, so the floor is best-effort — it
 /// only changes how aggressively later segments prune, never correctness.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SharedThreshold(std::sync::Arc<std::sync::atomic::AtomicU32>);
 
 impl SharedThreshold {
@@ -1245,6 +1279,28 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1);
         assert_eq!(results[1].0, 2);
+    }
+
+    #[test]
+    fn test_shared_threshold_can_raise_after_real_inserts() {
+        let mut collector = ScoreCollector::new(3);
+        collector.insert(1, 10.0);
+        collector.insert(2, 4.0);
+        assert_eq!(collector.real_len(), 2);
+
+        // Raising the floor after traversal has started removes retained work
+        // that can no longer reach the global top-k.
+        collector.seed_threshold(6.0);
+        assert_eq!(collector.threshold(), 6.0);
+        assert_eq!(collector.real_len(), 1);
+
+        // A real candidate tied with the floor displaces the sentinel because
+        // its doc id wins the canonical tie break.
+        assert!(collector.would_enter_candidate(3, 6.0, 0));
+        assert!(collector.insert(3, 6.0));
+        assert_eq!(collector.real_len(), 2);
+        let results = collector.into_sorted_results();
+        assert_eq!(results, vec![(1, 10.0, 0), (3, 6.0, 0)]);
     }
 
     #[test]

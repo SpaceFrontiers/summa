@@ -35,7 +35,7 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 /// this explicit lets ID/score-only collectors avoid loading them while query
 /// types that need positions for matching (for example phrases) remain free to
 /// load their own internal data.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ScorerOptions {
     pub collect_positions: bool,
     /// Initial top-k score floor to seed into MaxScore/BMP pruning. Used to
@@ -43,6 +43,10 @@ pub struct ScorerOptions {
     /// segments prune from a nonzero threshold (see `SharedThreshold`). 0.0 =
     /// no seed. Only honored on exact, final-score executor paths.
     pub initial_threshold: f32,
+    /// Live form of `initial_threshold`. Exact final-score executors may read
+    /// it during traversal so concurrently searched segments benefit as soon
+    /// as another segment establishes a stronger global floor.
+    pub shared_threshold: Option<super::scoring::SharedThreshold>,
 }
 
 impl ScorerOptions {
@@ -50,6 +54,18 @@ impl ScorerOptions {
         Self {
             collect_positions: true,
             initial_threshold: 0.0,
+            shared_threshold: None,
+        }
+    }
+
+    /// Preserve collection behavior while preventing a nested/component
+    /// scorer from applying a floor expressed in the outer query's score
+    /// space.
+    pub fn without_threshold(&self) -> Self {
+        Self {
+            collect_positions: self.collect_positions,
+            initial_threshold: 0.0,
+            shared_threshold: None,
         }
     }
 }

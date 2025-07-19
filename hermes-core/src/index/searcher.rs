@@ -603,12 +603,12 @@ impl<D: Directory + 'static> Searcher<D> {
             let sid = segment.meta().id;
             let shared = shared.clone();
             async move {
-                let (mut results, segment_seen) = crate::query::search_segment_seeded(
+                let (mut results, segment_seen) = crate::query::search_segment_shared(
                     segment.as_ref(),
                     query,
                     fetch_limit,
                     collect_positions,
-                    shared.get(),
+                    shared.clone(),
                 )
                 .await?;
                 if fetch_limit > 0 && results.len() >= fetch_limit {
@@ -674,12 +674,12 @@ impl<D: Directory + 'static> Searcher<D> {
                 .par_iter()
                 .map(|segment| {
                     let sid = segment.meta().id;
-                    let (mut results, segment_seen) = crate::query::search_segment_seeded_sync(
+                    let (mut results, segment_seen) = crate::query::search_segment_shared_sync(
                         segment.as_ref(),
                         query,
                         fetch_limit,
                         collect_positions,
-                        shared.get(),
+                        shared.clone(),
                     )?;
                     if fetch_limit > 0 && results.len() >= fetch_limit {
                         shared.raise(results[fetch_limit - 1].score);
@@ -725,12 +725,12 @@ impl<D: Directory + 'static> Searcher<D> {
                 .par_iter()
                 .map(|segment| {
                     let sid = segment.meta().id;
-                    let (mut results, segment_seen) = crate::query::search_segment_seeded_sync(
+                    let (mut results, segment_seen) = crate::query::search_segment_shared_sync(
                         segment.as_ref(),
                         query,
                         fetch_limit,
                         false,
-                        shared.get(),
+                        shared.clone(),
                     )?;
                     if fetch_limit > 0 && results.len() >= fetch_limit {
                         shared.raise(results[fetch_limit - 1].score);
