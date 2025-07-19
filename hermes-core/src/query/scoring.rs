@@ -207,6 +207,59 @@ impl ScoreCollector {
     }
 }
 
+/// Cross-segment top-k score floor, shared across the parallel/concurrent
+/// per-segment searches of a single query.
+///
+/// Stores an `f32` as raw bits in an atomic so it can be read and monotonically
+/// raised from many threads without a lock. Each segment reads the current
+/// floor as its initial pruning threshold (`ScorerOptions::initial_threshold`)
+/// and, once it has collected a *full* top-k of its own, raises the floor to
+/// its k-th score.
+///
+/// Safety of seeding: a segment only raises the floor after filling its own
+/// heap, so a floor value `v` is always backed by at least `k` real documents
+/// scoring `>= v`. The final merged k-th score is therefore `>= v`, and seeding
+/// any other segment with `v` can never drop a document that belongs in the
+/// final top-k. Completion order is arbitrary, so the floor is best-effort — it
+/// only changes how aggressively later segments prune, never correctness.
+#[derive(Clone, Default)]
+pub struct SharedThreshold(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl SharedThreshold {
+    /// A fresh floor of 0.0 (no pruning seed).
+    pub fn new() -> Self {
+        // 0.0_f32.to_bits() == 0, matching AtomicU32::default().
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)))
+    }
+
+    /// Current floor.
+    #[inline]
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Raise the floor to `score` if it is strictly higher. Monotonic; a lower
+    /// or non-positive `score` is ignored. Scores here are BM25/sparse and thus
+    /// non-negative, but the comparison is done on `f32` values (not raw bits)
+    /// so it stays correct regardless.
+    pub fn raise(&self, score: f32) {
+        // Ignore non-positive scores; a NaN falls through harmlessly (the CAS
+        // loop condition below is false for NaN, so nothing is stored).
+        if score <= 0.0 {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let bits = score.to_bits();
+        let mut cur = self.0.load(Relaxed);
+        while f32::from_bits(cur) < score {
+            match self.0.compare_exchange_weak(cur, bits, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
 /// Search result from MaxScore execution
 #[derive(Debug, Clone, Copy)]
 pub struct ScoredDoc {
@@ -1145,6 +1198,54 @@ impl<'a> MaxScoreExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shared_threshold_monotonic_raise() {
+        let shared = SharedThreshold::new();
+        assert_eq!(shared.get(), 0.0);
+
+        shared.raise(2.5);
+        assert_eq!(shared.get(), 2.5);
+
+        // Lower values never lower the floor.
+        shared.raise(1.0);
+        assert_eq!(shared.get(), 2.5);
+
+        // Higher values raise it.
+        shared.raise(4.0);
+        assert_eq!(shared.get(), 4.0);
+
+        // Non-positive and NaN are ignored.
+        shared.raise(0.0);
+        shared.raise(-3.0);
+        shared.raise(f32::NAN);
+        assert_eq!(shared.get(), 4.0);
+
+        // Clones share the same atomic cell.
+        let clone = shared.clone();
+        clone.raise(9.0);
+        assert_eq!(shared.get(), 9.0);
+    }
+
+    #[test]
+    fn test_shared_threshold_seed_matches_manual() {
+        // A collector seeded with a floor prunes anything at/below it, matching
+        // the threshold a fully-populated heap would have produced.
+        let mut seeded = ScoreCollector::new(2);
+        seeded.seed_threshold(3.0);
+        assert_eq!(seeded.threshold(), 3.0);
+        // A score at/below the floor cannot enter.
+        assert!(!seeded.would_enter(3.0));
+        assert!(seeded.would_enter(3.5));
+        // Real inserts above the floor evict the sentinels; results contain no
+        // sentinel (doc_id == u32::MAX) entries.
+        seeded.insert(1, 5.0);
+        seeded.insert(2, 4.0);
+        let results = seeded.into_sorted_results();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[1].0, 2);
+    }
 
     #[test]
     fn test_score_collector_basic() {

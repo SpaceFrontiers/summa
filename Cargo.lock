@@ -3065,7 +3065,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "anyhow",
  "axum",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "anyhow",
  "pest",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "anyhow",
  "clap",
@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.69"
+version = "1.8.71"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -3912,9 +3912,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.187"
+version = "0.2.188"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7743783ea728ef5c31194c6590797eed286449b4a4e87d626d8a51f0a94e732"
+checksum = "22053b6a34f84abc97f9129e61334f40174659a1b9bd18c970b83db6a9a6348b"
 
 [[package]]
 name = "libloading"
@@ -6851,13 +6851,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -8332,9 +8333,9 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.17"
+version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "985eec839aaf2a1270af8f4ebcf63cf9401cfd90f0902f97c28d9f104ffbde72"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

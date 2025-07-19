@@ -596,20 +596,24 @@ impl<D: Directory + 'static> Searcher<D> {
         const MAX_ASYNC_SEGMENT_SEARCHES: usize = 8;
         use futures::StreamExt;
         use futures::TryStreamExt;
+        // Cross-segment top-k floor (see search_internal_sync). Concurrent
+        // segments share it via an atomic; ordering is best-effort.
+        let shared = crate::query::SharedThreshold::new();
         let searches = futures::stream::iter(self.segments.iter().cloned().map(|segment| {
             let sid = segment.meta().id;
+            let shared = shared.clone();
             async move {
-                let (mut results, segment_seen) = if collect_positions {
-                    crate::query::search_segment_with_positions_and_count(
-                        segment.as_ref(),
-                        query,
-                        fetch_limit,
-                    )
-                    .await?
-                } else {
-                    crate::query::search_segment_with_count(segment.as_ref(), query, fetch_limit)
-                        .await?
-                };
+                let (mut results, segment_seen) = crate::query::search_segment_seeded(
+                    segment.as_ref(),
+                    query,
+                    fetch_limit,
+                    collect_positions,
+                    shared.get(),
+                )
+                .await?;
+                if fetch_limit > 0 && results.len() >= fetch_limit {
+                    shared.raise(results[fetch_limit - 1].score);
+                }
                 // Stamp segment_id on each result
                 for r in &mut results {
                     r.segment_id = sid;
@@ -662,24 +666,24 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         use rayon::prelude::*;
 
+        // Cross-segment top-k floor: each segment seeds its pruning from the
+        // running global k-th score and raises it once it fills its own heap.
+        let shared = crate::query::SharedThreshold::new();
         let (merged, total_seen) = self.search_pool.install(|| {
             self.segments
                 .par_iter()
                 .map(|segment| {
                     let sid = segment.meta().id;
-                    let (mut results, segment_seen) = if collect_positions {
-                        crate::query::search_segment_with_positions_and_count_sync(
-                            segment.as_ref(),
-                            query,
-                            fetch_limit,
-                        )?
-                    } else {
-                        crate::query::search_segment_with_count_sync(
-                            segment.as_ref(),
-                            query,
-                            fetch_limit,
-                        )?
-                    };
+                    let (mut results, segment_seen) = crate::query::search_segment_seeded_sync(
+                        segment.as_ref(),
+                        query,
+                        fetch_limit,
+                        collect_positions,
+                        shared.get(),
+                    )?;
+                    if fetch_limit > 0 && results.len() >= fetch_limit {
+                        shared.raise(results[fetch_limit - 1].score);
+                    }
                     for r in &mut results {
                         r.segment_id = sid;
                     }
@@ -714,16 +718,23 @@ impl<D: Directory + 'static> Searcher<D> {
 
         let fetch_limit = checked_search_window(limit, offset)?;
 
+        // Cross-segment top-k floor (see search_internal_sync).
+        let shared = crate::query::SharedThreshold::new();
         let (merged, total_seen) = self.search_pool.install(|| {
             self.segments
                 .par_iter()
                 .map(|segment| {
                     let sid = segment.meta().id;
-                    let (mut results, segment_seen) = crate::query::search_segment_with_count_sync(
+                    let (mut results, segment_seen) = crate::query::search_segment_seeded_sync(
                         segment.as_ref(),
                         query,
                         fetch_limit,
+                        false,
+                        shared.get(),
                     )?;
+                    if fetch_limit > 0 && results.len() >= fetch_limit {
+                        shared.raise(results[fetch_limit - 1].score);
+                    }
                     for r in &mut results {
                         r.segment_id = sid;
                     }

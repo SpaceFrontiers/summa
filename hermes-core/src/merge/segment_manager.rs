@@ -1896,6 +1896,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // worker and hammer the state mutex for that whole window.
         const FORCE_MERGE_CONFLICT_BACKOFF: std::time::Duration =
             std::time::Duration::from_millis(100);
+        // When every remaining mergeable segment is owned by another
+        // operation (e.g. background BP reorders), there is nothing to do but
+        // wait for a release; those passes run for minutes, so poll slowly.
+        const FORCE_MERGE_HELD_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
         let max_segment_docs = {
             let st = self.state.lock().await;
@@ -1905,6 +1909,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // Wait for all in-flight background merges (including cascading)
         // before starting forced merges to avoid try_register conflicts.
         self.wait_for_all_merges().await;
+
+        // One INFO line per wait episode, not per 1s poll; DEBUG afterwards.
+        let mut logged_held_wait = false;
 
         loop {
             if !self.active_operations.is_accepting() {
@@ -1926,12 +1933,28 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             segments.sort_by_key(|(_, docs)| *docs);
 
-            // Build a batch respecting max_segment_docs
+            // Route around segments owned by active operations (background
+            // reorders, concurrent force-merges) instead of insisting on the
+            // deterministic smallest-N batch: retrying a batch that contains a
+            // segment mid-BP-pass livelocked here for the whole pass (observed
+            // in prod: the optimizer holds exactly the small fresh segments
+            // force_merge wants first). Held segments are merged on a later
+            // iteration, after their owner releases them.
+            let active_ids = self.active_operations.snapshot();
+            let held: usize = segments
+                .iter()
+                .filter(|(id, _)| active_ids.contains(id))
+                .count();
+
+            // Build a batch of free segments respecting max_segment_docs
             let max_docs = max_segment_docs.map(|m| m as u64).unwrap_or(u64::MAX);
             let mut batch = Vec::new();
             let mut batch_docs = 0u64;
 
             for (id, docs) in &segments {
+                if active_ids.contains(id) {
+                    continue;
+                }
                 if batch.len() >= FORCE_MERGE_BATCH {
                     break;
                 }
@@ -1944,14 +1967,37 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
 
             if batch.len() < 2 {
-                return Ok(());
+                if held == 0 {
+                    // Nothing left that can merge and nobody will release
+                    // more candidates: force merge is complete.
+                    return Ok(());
+                }
+                // All remaining work is behind active owners. Their guards
+                // are RAII and their passes are time-budgeted, so this always
+                // unblocks; poll slowly rather than spinning.
+                if !logged_held_wait {
+                    log::info!(
+                        "[force_merge] waiting: {} segment(s) held by active \
+                         merge/reorder operations, none free to merge",
+                        held
+                    );
+                    logged_held_wait = true;
+                } else {
+                    log::debug!("[force_merge] still waiting on {} held segment(s)", held);
+                }
+                #[cfg(test)]
+                self.force_merge_conflict_retries
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    biased;
+                    () = self.active_operations.wait_for_shutdown() => {
+                        return Err(Error::IndexClosed);
+                    }
+                    () = tokio::time::sleep(FORCE_MERGE_HELD_BACKOFF) => {}
+                }
+                continue;
             }
-
-            log::info!(
-                "[force_merge] merging batch of {} segments ({} docs)",
-                batch.len(),
-                batch_docs
-            );
+            logged_held_wait = false;
 
             let _global_merge_permit = tokio::select! {
                 biased;
@@ -1992,11 +2038,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     // Do not reserve application-wide merge capacity while
                     // parked on a conflict.
                     drop(_global_merge_permit);
-                    // A tracked background merge may have slipped in — drain
-                    // those first. The conflicting owner can also be a reorder
-                    // or another force-merge, which never appear in
-                    // merge_handles; back off so the retry loop cannot spin hot
-                    // for their entire duration.
+                    // The ownership snapshot above is advisory: an operation
+                    // can register one of our batch segments between the
+                    // snapshot and try_register. A tracked background merge
+                    // may also have slipped in — drain those first, then back
+                    // off briefly and rebuild the batch from a fresh snapshot.
+                    log::debug!("[force_merge] batch lost a registration race, rebuilding");
                     let had_tracked_merges = !self.merge_handles.lock().is_empty();
                     self.wait_for_merging_thread().await;
                     if !had_tracked_merges {
@@ -2005,6 +2052,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     continue;
                 }
             };
+            // Announce only after ownership is secured: this line used to
+            // print before registration, spamming once per 100ms retry while
+            // a reorder held a batch segment.
+            log::info!(
+                "[force_merge] merging batch of {} segments ({} docs)",
+                batch.len(),
+                batch_docs
+            );
             let mut output_cleanup = self.output_cleanup_guard(output_id);
 
             let trained_snap = self.trained_for_segment_build();
@@ -2946,6 +3001,49 @@ mod tests {
             .expect("force_merge kept spinning after the conflicting owner released")
             .unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_merge_routes_around_segments_held_by_reorder() {
+        let manager = lifecycle_test_manager();
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .metadata
+                .add_segment("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), 10);
+            state
+                .metadata
+                .add_segment("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(), 10);
+            state
+                .metadata
+                .add_segment("cccccccccccccccccccccccccccccccc".into(), 10);
+        }
+        // A background reorder owns one segment and holds it for the whole
+        // test (in prod: a BP pass runs for minutes while force_merge spins).
+        let _reorder_like = manager
+            .active_operations
+            .try_register(vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()])
+            .unwrap();
+
+        // Regression: force_merge used to rebuild the identical smallest-N
+        // batch (including the held segment) every 100ms and retry-log
+        // forever. It must instead skip the held segment and immediately
+        // make progress on the two free ones — reaching do_merge (which
+        // fails fast here: the test IDs have no files) proves the batch was
+        // built without the held segment while the reorder is STILL active.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), {
+            let manager = Arc::clone(&manager);
+            async move { manager.force_merge().await }
+        })
+        .await
+        .expect("force_merge livelocked on a segment held by an active reorder");
+        assert!(result.is_err(), "fake segment files must fail the merge");
+
+        assert_eq!(
+            manager.force_merge_conflict_retries.load(Ordering::Relaxed),
+            0,
+            "batch built from the ownership snapshot must not collide with the held segment"
+        );
     }
 
     #[tokio::test]

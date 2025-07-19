@@ -206,7 +206,12 @@ macro_rules! boolean_plan {
                         posting_lists.push((pl, idf));
                     }
                 }
-                let shared_threshold = std::cell::Cell::new(0.0f32);
+                // Seed from the cross-segment floor: this path scores final
+                // per-doc BM25 into a top-`limit` heap, so a floor carried from
+                // an already-searched segment prunes exactly (see
+                // SharedThreshold). The per-field path below stays at 0.0 —
+                // its per-field partial scores are not the final doc score.
+                let shared_threshold = std::cell::Cell::new(scorer_options.initial_threshold);
                 return finish_text_maxscore(
                     posting_lists,
                     avg_field_len,

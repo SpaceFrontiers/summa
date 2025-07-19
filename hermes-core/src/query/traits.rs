@@ -35,15 +35,21 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 /// this explicit lets ID/score-only collectors avoid loading them while query
 /// types that need positions for matching (for example phrases) remain free to
 /// load their own internal data.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ScorerOptions {
     pub collect_positions: bool,
+    /// Initial top-k score floor to seed into MaxScore/BMP pruning. Used to
+    /// carry the running k-th score across the segments of one query so later
+    /// segments prune from a nonzero threshold (see `SharedThreshold`). 0.0 =
+    /// no seed. Only honored on exact, final-score executor paths.
+    pub initial_threshold: f32,
 }
 
 impl ScorerOptions {
     pub const fn with_positions() -> Self {
         Self {
             collect_positions: true,
+            initial_threshold: 0.0,
         }
     }
 }
