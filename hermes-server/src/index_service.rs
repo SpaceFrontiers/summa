@@ -443,13 +443,23 @@ impl IndexService for IndexServiceImpl {
         request: Request<RetrainVectorIndexRequest>,
     ) -> Result<Response<RetrainVectorIndexResponse>, Status> {
         let req = request.into_inner();
-        let _index = self.registry.get_or_open_index(&req.index_name).await?;
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
             .write()
             .await
-            .rebuild_vector_index()
+            .retrain_vector_index()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+
+        // New requests must immediately see the atomically published
+        // segment/codebook generation. In-flight searchers retain the old pair.
+        index
+            .reader()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?
+            .reload()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
 

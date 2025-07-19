@@ -6,9 +6,10 @@
 //! - Trained centroids/codebooks paths
 //!
 //! The workflow is:
-//! 1. During accumulation: segments store Flat vectors, state is Flat
-//! 2. When threshold crossed: train ONCE, update state to Built
-//! 3. On index open: load metadata, skip re-training if already built
+//! 1. During initial accumulation, segments store flat vectors.
+//! 2. A manual build trains the first global codebook and ANN generation.
+//! 3. A manual retrain stages and atomically publishes a replacement generation.
+//! 4. On index open, metadata loads the currently published codebooks.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -385,25 +386,6 @@ impl IndexMetadata {
         Ok(())
     }
 
-    /// Compatibility loader for callers that only have the persisted field
-    /// map. Invalid/incomplete state is logged and returns `None` rather than a
-    /// partial set.
-    ///
-    /// Index open/build paths use the fallible, schema-aware
-    /// [`Self::try_load_trained_from_fields`] method below.
-    pub async fn load_trained_from_fields<D: crate::directories::Directory>(
-        vector_fields: &HashMap<u32, FieldVectorMeta>,
-        dir: &D,
-    ) -> Option<crate::segment::TrainedVectorStructures> {
-        match Self::load_trained_from_fields_impl(vector_fields, None, dir).await {
-            Ok(trained) => trained,
-            Err(error) => {
-                log::error!("[trained] refusing incomplete/corrupt artifact set: {error}");
-                None
-            }
-        }
-    }
-
     /// Fallible schema-aware loader used for lifecycle publication.
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub(crate) async fn try_load_trained_from_fields<D: crate::directories::Directory>(
@@ -411,7 +393,7 @@ impl IndexMetadata {
         schema: &Schema,
         dir: &D,
     ) -> Result<Option<crate::segment::TrainedVectorStructures>> {
-        Self::load_trained_from_fields_impl(vector_fields, Some(schema), dir).await
+        Self::load_trained_from_fields_impl(vector_fields, schema, dir).await
     }
 
     /// Load and validate the complete trained-artifact set described by a
@@ -425,7 +407,7 @@ impl IndexMetadata {
     /// restart.
     async fn load_trained_from_fields_impl<D: crate::directories::Directory>(
         vector_fields: &HashMap<u32, FieldVectorMeta>,
-        schema: Option<&Schema>,
+        schema: &Schema,
         dir: &D,
     ) -> Result<Option<crate::segment::TrainedVectorStructures>> {
         use std::sync::Arc;
@@ -476,30 +458,31 @@ impl IndexMetadata {
             })?;
             match field_meta.index_type {
                 VectorFieldIndexType::Float(index_type @ VectorIndexType::IvfPq) => {
-                    let schema_config = schema
-                        .map(|schema| {
-                            let entry = schema
-                                .get_field_entry(crate::dsl::Field(*field_id))
-                                .ok_or_else(|| Error::Corruption(format!(
-                                    "trained vector metadata references missing field {field_id}"
-                                )))?;
-                            let config = entry.dense_vector_config.as_ref().filter(|_| {
-                                entry.field_type == crate::dsl::FieldType::DenseVector
-                            }).ok_or_else(|| Error::Corruption(format!(
+                    let entry = schema
+                        .get_field_entry(crate::dsl::Field(*field_id))
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "trained vector metadata references missing field {field_id}"
+                            ))
+                        })?;
+                    let schema_config = entry
+                        .dense_vector_config
+                        .as_ref()
+                        .filter(|_| entry.field_type == crate::dsl::FieldType::DenseVector)
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
                                 "trained vector metadata field {field_id} is not a float dense field"
-                            )))?;
-                            if config.index_type != index_type {
-                                return Err(Error::Corruption(format!(
-                                    "trained vector metadata field {field_id} uses {index_type:?}, schema requires {:?}",
-                                    config.index_type
-                                )));
-                            }
-                            Ok(config)
-                        })
-                        .transpose()?;
+                            ))
+                        })?;
+                    if schema_config.index_type != index_type {
+                        return Err(Error::Corruption(format!(
+                            "trained vector metadata field {field_id} uses {index_type:?}, schema requires {:?}",
+                            schema_config.index_type
+                        )));
+                    }
                     let c: crate::structures::CoarseCentroids =
                         load_trained_artifact(dir, *field_id, "centroids", centroids_file).await?;
-                    let expected_dim = schema_config.map_or(c.dim, |config| config.dim);
+                    let expected_dim = schema_config.dim;
                     let actual_clusters = c.num_clusters as usize;
                     let expected_values =
                         actual_clusters.checked_mul(expected_dim).ok_or_else(|| {
@@ -518,13 +501,12 @@ impl IndexMetadata {
                             "trained centroids for field {field_id} do not match metadata/schema"
                         )));
                     }
-                    if let Some(config) = schema_config {
-                        c.validate_routing(config.ivf_routing).map_err(|error| {
+                    c.validate_routing(schema_config.ivf_routing)
+                        .map_err(|error| {
                             Error::Corruption(format!(
                                 "invalid trained centroid routing for field {field_id}: {error}"
                             ))
                         })?;
-                    }
                     let codebook_file = field_meta.codebook_file.as_deref().ok_or_else(|| {
                         Error::Corruption(format!(
                             "trained float IVF-PQ field {field_id} has no codebook_file"
@@ -547,21 +529,25 @@ impl IndexMetadata {
                     centroids.insert(*field_id, Arc::new(c));
                 }
                 VectorFieldIndexType::Binary(BinaryIndexType::Ivf) => {
-                    let schema_config = schema
-                        .map(|schema| {
-                            let entry = schema
-                                .get_field_entry(crate::dsl::Field(*field_id))
-                                .ok_or_else(|| Error::Corruption(format!(
-                                    "trained vector metadata references missing field {field_id}"
-                                )))?;
-                            entry.binary_dense_vector_config.as_ref().filter(|config| {
-                                entry.field_type == crate::dsl::FieldType::BinaryDenseVector
-                                    && config.index_type == BinaryIndexType::Ivf
-                            }).ok_or_else(|| Error::Corruption(format!(
-                                "trained vector metadata field {field_id} is not a binary IVF field"
-                            )))
+                    let entry = schema
+                        .get_field_entry(crate::dsl::Field(*field_id))
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "trained vector metadata references missing field {field_id}"
+                            ))
+                        })?;
+                    let schema_config = entry
+                        .binary_dense_vector_config
+                        .as_ref()
+                        .filter(|config| {
+                            entry.field_type == crate::dsl::FieldType::BinaryDenseVector
+                                && config.index_type == BinaryIndexType::Ivf
                         })
-                        .transpose()?;
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "trained vector metadata field {field_id} is not a binary IVF field"
+                            ))
+                        })?;
                     let quantizer: crate::structures::BinaryCoarseQuantizer =
                         load_trained_artifact(dir, *field_id, "binary centroids", centroids_file)
                             .await?;
@@ -572,21 +558,19 @@ impl IndexMetadata {
                     })?;
                     let actual_clusters = quantizer.num_clusters as usize;
                     if actual_clusters > expected_clusters
-                        || schema_config.is_some_and(|config| config.dim != quantizer.dim_bits)
+                        || schema_config.dim != quantizer.dim_bits
                     {
                         return Err(Error::Corruption(format!(
                             "binary coarse quantizer for field {field_id} does not match metadata/schema"
                         )));
                     }
-                    if let Some(config) = schema_config {
-                        quantizer
-                            .validate_routing(config.ivf_routing)
-                            .map_err(|error| {
-                                Error::Corruption(format!(
-                                    "invalid binary centroid routing for field {field_id}: {error}"
-                                ))
-                            })?;
-                    }
+                    quantizer
+                        .validate_routing(schema_config.ivf_routing)
+                        .map_err(|error| {
+                            Error::Corruption(format!(
+                                "invalid binary centroid routing for field {field_id}: {error}"
+                            ))
+                        })?;
                     binary_quantizers.insert(*field_id, Arc::new(quantizer));
                 }
                 unsupported => {
@@ -906,12 +890,6 @@ mod tests {
         .to_string();
         assert!(error.contains("field_1_centroids.bin"), "{error}");
         assert!(error.contains("field 1"), "{error}");
-        assert!(
-            IndexMetadata::load_trained_from_fields(&metadata.vector_fields, &directory)
-                .await
-                .is_none(),
-            "the compatibility API must also fail closed instead of returning the valid subset"
-        );
     }
 
     #[tokio::test]

@@ -88,6 +88,13 @@ impl PqCluster {
         self.ordinals.extend_from_slice(&source.ordinals);
         self.codes.extend_from_slice(&source.codes);
     }
+
+    #[cfg(feature = "native")]
+    fn append_owned(&mut self, mut source: Self) {
+        self.doc_ids.append(&mut source.doc_ids);
+        self.ordinals.append(&mut source.ordinals);
+        self.codes.append(&mut source.codes);
+    }
 }
 
 /// Configuration for IVF-PQ index
@@ -206,6 +213,87 @@ impl IVFPQIndex {
                 vector,
             );
         }
+    }
+
+    /// Add one contiguous vector batch in parallel while preserving input
+    /// order inside every leaf. Callers can install this work on their bounded
+    /// Rayon pool; normal segment builds use the current Rayon pool.
+    #[cfg(feature = "native")]
+    pub fn add_vectors_parallel(
+        &mut self,
+        coarse_centroids: &CoarseCentroids,
+        codebook: &PQCodebook,
+        doc_id_ordinals: &[(u32, u16)],
+        vectors: &[f32],
+    ) -> Result<(), &'static str> {
+        use rayon::prelude::*;
+
+        let vector_count = doc_id_ordinals.len();
+        let expected = vector_count
+            .checked_mul(self.config.dim)
+            .ok_or("IVF-PQ input size overflow")?;
+        if vectors.len() != expected {
+            return Err("IVF-PQ vector and label matrices are inconsistent");
+        }
+        if vector_count == 0 {
+            return Ok(());
+        }
+
+        // A small multiple of the worker count supplies enough tasks for load
+        // balancing without creating one hash map per vector. Indexed collect
+        // retains chunk order, so merging the partials also retains the input
+        // order within each leaf.
+        let target_tasks = rayon::current_num_threads().saturating_mul(4).max(1);
+        let chunk_vectors = vector_count.div_ceil(target_tasks).max(64);
+        let config = self.config.clone();
+        let centroids_version = self.centroids_version;
+        let codebook_version = self.codebook_version;
+        let partials: Vec<Self> = doc_id_ordinals
+            .par_chunks(chunk_vectors)
+            .enumerate()
+            .map(|(chunk_index, labels)| {
+                let first = chunk_index * chunk_vectors;
+                let chunk = &vectors[first * config.dim..(first + labels.len()) * config.dim];
+                let mut partial = Self::new(config.clone(), centroids_version, codebook_version);
+                for (&(doc_id, ordinal), vector) in
+                    labels.iter().zip(chunk.chunks_exact(config.dim))
+                {
+                    partial.add_vector(coarse_centroids, codebook, doc_id, ordinal, vector);
+                }
+                partial
+            })
+            .collect();
+
+        for partial in partials {
+            self.append_owned(partial)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    fn append_owned(&mut self, mut other: Self) -> Result<(), &'static str> {
+        if self.centroids_version != other.centroids_version
+            || self.codebook_version != other.codebook_version
+            || self.config != other.config
+        {
+            return Err("Cannot merge IVF-PQ payloads from different generations");
+        }
+        let other_len = other.len;
+        for (cluster_id, source) in other.clusters.drain() {
+            match self.clusters.entry(cluster_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().append_owned(source);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(source);
+                }
+            }
+        }
+        self.len = self
+            .len
+            .checked_add(other_len)
+            .ok_or("IVF-PQ vector count overflow during parallel build")?;
+        Ok(())
     }
 
     fn add_to_cluster(
@@ -531,6 +619,46 @@ mod tests {
             "IVF-PQ recall too low: {:.1}%",
             avg_recall * 100.0
         );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn parallel_batch_build_matches_sequential_multi_value_payload() {
+        let dim = 8;
+        let vector_count = 512;
+        let vectors: Vec<Vec<f32>> = (0..vector_count)
+            .map(|index| {
+                (0..dim)
+                    .map(|column| ((index * 31 + column * 17) as f32).sin())
+                    .collect()
+            })
+            .collect();
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let labels: Vec<(u32, u16)> = (0..vector_count)
+            .map(|index| ((index / 3) as u32, (index % 3) as u16))
+            .collect();
+        let centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 16), &vectors);
+        let codebook = PQCodebook::train(PQConfig::new(dim).with_opq(false, 0), &vectors, 2);
+        let config = IVFPQConfig::new(dim, codebook.config.num_subspaces);
+
+        let mut sequential = IVFPQIndex::new(config.clone(), centroids.version, codebook.version);
+        for (&(doc_id, ordinal), vector) in labels.iter().zip(vectors.iter()) {
+            sequential.add_vector(&centroids, &codebook, doc_id, ordinal, vector);
+        }
+
+        let mut parallel = IVFPQIndex::new(config, centroids.version, codebook.version);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                parallel
+                    .add_vectors_parallel(&centroids, &codebook, &labels, &flat)
+                    .unwrap();
+            });
+
+        assert_eq!(parallel.len(), sequential.len());
+        assert_eq!(parallel.to_bytes().unwrap(), sequential.to_bytes().unwrap());
     }
 
     #[test]

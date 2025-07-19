@@ -48,7 +48,7 @@ async fn feed_segment(
     segment: &SegmentReader,
     field: crate::dsl::Field,
     doc_id_offset: u32,
-    mut add_fn: impl FnMut(u32, u16, &[f32]),
+    mut add_batch: impl FnMut(&[(u32, u16)], &[f32]) -> Result<()>,
 ) -> crate::Result<usize> {
     let lazy_flat = match segment.flat_vectors().get(&field.0) {
         Some(f) => f,
@@ -64,6 +64,7 @@ async fn feed_segment(
     // Only allocate dequantize buffer for non-f32 quantizations
     let needs_dequant = quant != DenseVectorQuantization::F32;
     let mut f32_buf: Vec<f32> = Vec::new();
+    let mut labels = Vec::with_capacity(VECTOR_BATCH_SIZE);
 
     for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
         let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
@@ -93,15 +94,13 @@ async fn feed_segment(
             unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
         };
 
+        labels.clear();
         for i in 0..batch_count {
             let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-            add_fn(
-                doc_id_offset + doc_id,
-                ordinal,
-                &vectors[i * dim..(i + 1) * dim],
-            );
-            count += 1;
+            labels.push((doc_id_offset + doc_id, ordinal));
         }
+        add_batch(&labels, vectors)?;
+        count += batch_count;
     }
     Ok(count)
 }
@@ -185,7 +184,7 @@ impl SegmentMerger {
     /// is streamed. Peak memory = one ANN blob at a time, not all simultaneously.
     ///
     /// No document store reads — all vector data comes from .vectors files.
-    pub(super) async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
+    pub(crate) async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
@@ -557,7 +556,23 @@ impl SegmentMerger {
             })
             .collect();
 
-        if ivf_pq_indexes.len() == segments_with_flat && !ivf_pq_indexes.is_empty() {
+        let matches_published_generation = trained
+            .and_then(|trained| {
+                trained
+                    .centroids
+                    .get(&field.0)
+                    .zip(trained.codebooks.get(&field.0))
+            })
+            .is_some_and(|(centroids, codebook)| {
+                ivf_pq_indexes.iter().all(|(_, index)| {
+                    index.centroids_version == centroids.version
+                        && index.codebook_version == codebook.version
+                })
+            });
+        if matches_published_generation
+            && ivf_pq_indexes.len() == segments_with_flat
+            && !ivf_pq_indexes.is_empty()
+        {
             let refs: Vec<&crate::structures::IVFPQIndex> = ivf_pq_indexes
                 .iter()
                 .map(|(_, index)| index.as_ref())
@@ -628,8 +643,22 @@ impl SegmentMerger {
 
                 for (seg_idx, segment) in segments.iter().enumerate() {
                     let offset = doc_offs[seg_idx];
-                    let fed = feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
-                        index.add_vector(centroids, codebook, doc_id, ordinal, vec);
+                    let fed = feed_segment(segment, field, offset, |labels, vectors| {
+                        super::block_in_place_if_multithread(|| {
+                            let mut add =
+                                || index.add_vectors_parallel(centroids, codebook, labels, vectors);
+                            if let Some(pool) = &self.background_pool {
+                                pool.install(add)
+                            } else {
+                                add()
+                            }
+                        })
+                        .map_err(|error| {
+                            crate::Error::Internal(format!(
+                                "parallel IVF-PQ rebuild failed for field {}: {error}",
+                                field.0,
+                            ))
+                        })
                     })
                     .await?;
                     total_fed += fed;
@@ -740,8 +769,8 @@ mod tests {
             writer.add_document(doc).unwrap();
         }
         writer.commit().await.unwrap();
-        let mut known = committed_segment_ids(&dir).await;
         writer.build_vector_index().await.unwrap();
+        let mut known = committed_segment_ids(&dir).await;
 
         // Segment A: 2 docs WITH the field (gets a per-segment IVF at flush).
         for i in 0..2 {
@@ -795,8 +824,9 @@ mod tests {
         assert!(readers[2].get_ivf_pq_vector_index(embedding).is_some());
 
         let merged_id = SegmentId::new();
+        let trained = writer.segment_manager().trained().unwrap();
         SegmentMerger::new(Arc::clone(&schema))
-            .merge(&dir, &readers, merged_id, None)
+            .merge(&dir, &readers, merged_id, Some(trained.as_ref()))
             .await
             .unwrap();
 

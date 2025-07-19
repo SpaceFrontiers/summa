@@ -15,10 +15,10 @@ use std::sync::Arc;
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{FieldType, Schema};
-use crate::segment::OffsetWriter;
 use crate::segment::format::{SparseFieldToc, write_sparse_toc_and_footer};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::{SegmentFiles, SegmentId, SegmentMeta};
+use crate::segment::{OffsetWriter, SegmentMerger, TrainedVectorStructures};
 use crate::structures::SparseFormat;
 
 /// Default memory budget for forward index during BP (24 GB). A cap, not an
@@ -316,7 +316,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
             !reader.vector_indexes().is_empty() || !reader.flat_vectors().is_empty(),
         ),
     ] {
-        copy_segment_file(dir, src, dst, required).await?;
+        clone_segment_file(dir, src, dst, required).await?;
     }
     log::info!(
         "[reorder] copied files in {:.1}s",
@@ -351,24 +351,119 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     Ok((output_id.to_hex(), num_docs, bp_converged))
 }
 
-/// Copy a segment file via streaming I/O (4 MB chunks).
+/// Rewrite only a segment's dense-vector file while retaining every immutable
+/// non-vector file. Filesystem backends hard-link unchanged data, so upgrading
+/// a max-sized segment does not duplicate its postings, store, sparse index, or
+/// fast fields. Backends without links use the bounded streaming fallback.
+pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
+    dir: &D,
+    schema: &Arc<Schema>,
+    source_id: SegmentId,
+    output_id: SegmentId,
+    term_cache_blocks: usize,
+    trained: &TrainedVectorStructures,
+    rayon_pool: Option<Arc<rayon::ThreadPool>>,
+) -> Result<(String, u32)> {
+    let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
+    let num_docs = reader.num_docs();
+    let src_files = SegmentFiles::new(source_id.0);
+    let dst_files = SegmentFiles::new(output_id.0);
+
+    log::info!(
+        "[vector_rewrite] finalizing segment {} → {} ({} docs)",
+        source_id.to_hex(),
+        output_id.to_hex(),
+        num_docs,
+    );
+
+    for (src, dst, required) in [
+        (&src_files.term_dict, &dst_files.term_dict, true),
+        (&src_files.postings, &dst_files.postings, true),
+        (
+            &src_files.positions,
+            &dst_files.positions,
+            reader.has_positions_file(),
+        ),
+        (&src_files.store, &dst_files.store, true),
+        (
+            &src_files.fast,
+            &dst_files.fast,
+            !reader.fast_fields().is_empty(),
+        ),
+        (
+            &src_files.sparse,
+            &dst_files.sparse,
+            !reader.sparse_indexes().is_empty() || !reader.bmp_indexes().is_empty(),
+        ),
+    ] {
+        clone_segment_file(dir, src, dst, required).await?;
+    }
+
+    let merger = SegmentMerger::new(Arc::clone(schema)).with_background_pool(rayon_pool);
+    let vector_bytes = merger
+        .merge_dense_vectors(
+            dir,
+            std::slice::from_ref(&reader),
+            &dst_files,
+            Some(trained),
+        )
+        .await?;
+    if vector_bytes == 0 {
+        return Err(crate::Error::Corruption(format!(
+            "vector rewrite source {} has no flat vector payload",
+            source_id.to_hex(),
+        )));
+    }
+
+    let src_meta = reader.meta();
+    let meta = SegmentMeta {
+        id: output_id.0,
+        num_docs: src_meta.num_docs,
+        field_stats: src_meta.field_stats.clone(),
+    };
+    dir.write_durable(&dst_files.meta, &meta.serialize()?)
+        .await?;
+
+    Ok((output_id.to_hex(), num_docs))
+}
+
+/// Retain an immutable segment file with a hard link when possible, falling
+/// back to streaming I/O in 4 MB chunks.
 ///
 /// No-op if an optional source file does not exist. A file observed by the
 /// source reader is required: losing it during the copy is corruption, not an
 /// empty optional field.
 /// Empty files are still created (SegmentReader requires their existence).
-async fn copy_segment_file<D: Directory + DirectoryWriter>(
+async fn clone_segment_file<D: Directory + DirectoryWriter>(
     dir: &D,
     src: &Path,
     dst: &Path,
     required: bool,
 ) -> Result<()> {
+    match dir.link(src, dst).await {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::Error::Corruption(format!(
+                "required segment source file {src:?} disappeared before link"
+            )));
+        }
+        Err(error) => {
+            log::debug!(
+                "[segment_clone] link {:?} → {:?} unavailable ({}), streaming instead",
+                src,
+                dst,
+                error,
+            );
+        }
+    }
+
     let handle = match dir.open_read(src).await {
         Ok(h) => h,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(crate::Error::Corruption(format!(
-                "required reorder source file {src:?} disappeared before copy"
+                "required segment source file {src:?} disappeared before copy"
             )));
         }
         Err(error) => return Err(crate::Error::Io(error)),
@@ -396,14 +491,14 @@ async fn copy_segment_file<D: Directory + DirectoryWriter>(
         })
         .await
         .map_err(|error| {
-            crate::Error::Internal(format!("reorder copy worker failed for {src:?}: {error}"))
+            crate::Error::Internal(format!("segment clone worker failed for {src:?}: {error}"))
         })?
         .map_err(crate::Error::Io)?;
         offset = end;
     }
     if writer.bytes_written() != source_len {
         return Err(crate::Error::Corruption(format!(
-            "short reorder copy from {:?} to {:?}: wrote {} of {} bytes",
+            "short segment clone from {:?} to {:?}: wrote {} of {} bytes",
             src,
             dst,
             writer.bytes_written(),
@@ -414,7 +509,7 @@ async fn copy_segment_file<D: Directory + DirectoryWriter>(
         .await
         .map_err(|error| {
             crate::Error::Internal(format!(
-                "reorder copy finalizer failed for {dst:?}: {error}"
+                "segment clone finalizer failed for {dst:?}: {error}"
             ))
         })?
         .map_err(crate::Error::Io)?;
@@ -477,7 +572,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
             reader.meta().id,
         );
         let src_files = SegmentFiles::new(reader.meta().id);
-        copy_segment_file(dir, &src_files.sparse, &dst_files.sparse, true).await?;
+        clone_segment_file(dir, &src_files.sparse, &dst_files.sparse, true).await?;
         return Ok(true);
     }
 
@@ -532,9 +627,8 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                     .unwrap_or(bmp_idx.max_weight_scale);
                 let total_vectors = bmp_idx.total_vectors;
 
-                // Clone BmpIndex (cheap: Arc ref bumps on OwnedBytes) and move
-                // OffsetWriter + field_tocs into spawn_blocking so the entire
-                // CPU-heavy reorder runs off tokio worker threads.
+                // One field owns the output writer and BP working set at a
+                // time. The field itself still uses the bounded Rayon pool.
                 let bmp_sources = vec![(bmp_idx.clone(), 0u32)];
                 let fid = field.0;
                 let fname = field_name.clone();
@@ -1790,12 +1884,12 @@ mod grid_run_prefix_tests {
         let missing = std::path::Path::new("missing");
         let output = std::path::Path::new("output");
 
-        super::copy_segment_file(&dir, missing, output, false)
+        super::clone_segment_file(&dir, missing, output, false)
             .await
             .unwrap();
         assert!(!dir.exists(output).await.unwrap());
 
-        let error = super::copy_segment_file(&dir, missing, output, true)
+        let error = super::clone_segment_file(&dir, missing, output, true)
             .await
             .unwrap_err();
         assert!(matches!(error, crate::Error::Corruption(_)));
@@ -1809,7 +1903,7 @@ mod grid_run_prefix_tests {
         let data = vec![0x5a; 4 * 1024 * 1024 + 17];
         dir.write(source, &data).await.unwrap();
 
-        super::copy_segment_file(&dir, source, output, true)
+        super::clone_segment_file(&dir, source, output, true)
             .await
             .unwrap();
 

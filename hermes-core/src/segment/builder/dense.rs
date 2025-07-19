@@ -232,10 +232,18 @@ pub(super) fn build_vectors_streaming(
                             centroids,
                             codebook,
                         );
-                        for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
-                            let v = &builder.vectors[i * dim..(i + 1) * dim];
-                            index.add_vector(centroids, codebook, *doc_id, *ordinal, v);
-                        }
+                        index
+                            .add_vectors_parallel(
+                                centroids,
+                                codebook,
+                                &builder.doc_ids,
+                                &builder.vectors,
+                            )
+                            .map_err(|error| {
+                                crate::Error::Internal(format!(
+                                    "parallel IVF-PQ build failed for field {field_id}: {error}"
+                                ))
+                            })?;
                         super::super::ann_build::serialize_ivf_pq(index)
                             .map(|b| (super::super::ann_build::IVF_PQ_TYPE, b))
                     }

@@ -161,6 +161,10 @@ impl DirectoryWriter for MmapDirectory {
         std::fs::rename(&from_path, &to_path)
     }
 
+    async fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::hard_link(self.resolve(from), self.resolve(to))
+    }
+
     async fn sync(&self) -> io::Result<()> {
         // fsync the directory
         let dir = std::fs::File::open(&self.root)?;

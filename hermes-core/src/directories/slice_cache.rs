@@ -797,6 +797,12 @@ impl<D: super::DirectoryWriter> super::DirectoryWriter for SliceCachingDirectory
         self.inner.rename(from, to).await
     }
 
+    async fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // A link creates an immutable alias. Do not copy cache entries: the
+        // destination starts cold and is populated under its own path.
+        self.inner.link(from, to).await
+    }
+
     async fn sync(&self) -> io::Result<()> {
         self.inner.sync().await
     }

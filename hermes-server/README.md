@@ -227,12 +227,13 @@ rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
 
 #### RetrainVectorIndex
 
-Retraining global IVF centroids and PQ codebooks is accepted only while all committed
-segments for the affected fields are flat. ANN segments embed the artifact
-versions used to build them, so replacing the single global generation under
-existing ANN segments would make those segments unreadable. Hermes rejects
-that unsafe lifecycle transition instead of publishing mixed generations.
-Trained artifacts and metadata are validated and published all-or-nothing.
+Train new global IVF-PQ or binary-IVF codebooks from the current corpus and
+rebuild every ANN segment. The complete segment/codebook generation is
+published atomically; existing readers keep the previous generation.
+
+```protobuf
+rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
+```
 
 #### DeleteIndex
 

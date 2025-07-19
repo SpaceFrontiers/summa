@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::dsl::IvfRoutingMode;
-use crate::structures::simd::batch_hamming_scores;
+use crate::structures::simd::{batch_hamming_scores, hamming_distance};
 use crate::structures::vector::ivf::routing::{
     HNSW_AUTO_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
     allocate_child_clusters, binary_probe_fingerprint, effective_routing_mode, parent_probe_count,
@@ -38,16 +38,20 @@ fn argmax_score_lowest_index(scores: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
+#[inline]
+fn nearest_binary_centroid(
+    code: &[u8],
+    centroids: &[u8],
+    byte_len: usize,
+    dim_bits: usize,
+    scores: &mut [f32],
+) -> u32 {
+    batch_hamming_scores(code, centroids, byte_len, dim_bits, scores);
+    argmax_score_lowest_index(scores) as u32
+}
+
 const MAX_BINARY_IVF_CLUSTERS: usize = 1_048_576;
 const BINARY_IVF_SCORE_BATCH: usize = 8_192;
-
-#[inline]
-fn packed_hamming_distance(left: &[u8], right: &[u8]) -> u32 {
-    left.iter()
-        .zip(right)
-        .map(|(&a, &b)| (a ^ b).count_ones())
-        .sum()
-}
 
 /// Global Hamming coarse quantizer shared by every segment of a field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +109,7 @@ impl BinaryCoarseQuantizer {
                     let graph = HnswRoutingGraph::build(
                         config.num_clusters,
                         |left, right| {
-                            packed_hamming_distance(
+                            hamming_distance(
                                 &leaves[left as usize * byte_len..(left as usize + 1) * byte_len],
                                 &leaves[right as usize * byte_len..(right as usize + 1) * byte_len],
                             ) as f32
@@ -225,7 +229,7 @@ impl BinaryCoarseQuantizer {
         (0..self.num_clusters)
             .min_by_key(|&cluster| {
                 let offset = cluster as usize * self.byte_len();
-                packed_hamming_distance(query, &self.centroids[offset..offset + self.byte_len()])
+                hamming_distance(query, &self.centroids[offset..offset + self.byte_len()])
             })
             .unwrap_or(0)
     }
@@ -296,7 +300,7 @@ impl BinaryCoarseQuantizer {
         let byte_len = self.byte_len();
         graph.search(
             |leaf| {
-                packed_hamming_distance(
+                hamming_distance(
                     query,
                     &self.centroids[leaf as usize * byte_len..(leaf as usize + 1) * byte_len],
                 ) as f32
@@ -311,7 +315,7 @@ impl BinaryCoarseQuantizer {
         };
         let byte_len = self.byte_len();
         graph.search_one(|leaf| {
-            packed_hamming_distance(
+            hamming_distance(
                 query,
                 &self.centroids[leaf as usize * byte_len..(leaf as usize + 1) * byte_len],
             ) as f32
@@ -636,12 +640,16 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     let dim_bits = config.dim_bits;
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
-    // Bound training cost: iterate over a sample, assign everything later
+    // Bound training cost: iterate over a sample, assign everything later. Do
+    // not materialize a random permutation when the complete input is used:
+    // the indirection destroys locality for the billion-scale global training
+    // sample without changing which points participate.
     let sample_len = config.max_train_samples.max(k).min(n);
-    let sample = rand::seq::index::sample(&mut rng, n, sample_len).into_vec();
-    let n = sample.len();
+    let sample =
+        (sample_len < n).then(|| rand::seq::index::sample(&mut rng, n, sample_len).into_vec());
+    let n = sample_len;
     let vec_at = |i: usize| -> &[u8] {
-        let vi = sample[i];
+        let vi = sample.as_ref().map_or(i, |sample| sample[i]);
         &codes[vi * byte_len..(vi + 1) * byte_len]
     };
 
@@ -653,25 +661,28 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     let mut min_dist_sq = vec![f64::INFINITY; n];
     for centroid_id in 1..k {
         let previous = &centroids[(centroid_id - 1) * byte_len..centroid_id * byte_len];
-        let mut total_weight = 0.0;
-        for (index, min_distance) in min_dist_sq.iter_mut().enumerate() {
-            let distance: u32 = vec_at(index)
-                .iter()
-                .zip(previous)
-                .map(|(&left, &right)| (left ^ right).count_ones())
-                .sum();
-            *min_distance = min_distance.min((distance as f64) * (distance as f64));
-            total_weight += *min_distance;
-        }
-        let chosen = if total_weight > 0.0 {
-            let mut target = rng.random::<f64>() * total_weight;
+        #[cfg(feature = "native")]
+        {
+            use rayon::prelude::*;
             min_dist_sq
-                .iter()
-                .position(|weight| {
-                    target -= *weight;
-                    target <= 0.0
-                })
-                .unwrap_or(n - 1)
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(index, min_distance)| {
+                    let distance = hamming_distance(vec_at(index), previous);
+                    *min_distance = min_distance.min((distance as f64) * (distance as f64));
+                });
+        }
+        #[cfg(not(feature = "native"))]
+        for (index, min_distance) in min_dist_sq.iter_mut().enumerate() {
+            let distance = hamming_distance(vec_at(index), previous);
+            *min_distance = min_distance.min((distance as f64) * (distance as f64));
+        }
+
+        let chosen = if let Some(chosen) = crate::structures::vector::kmeans::weighted_sample_index(
+            &min_dist_sq,
+            rng.random::<f64>(),
+        ) {
+            chosen
         } else {
             rng.random_range(0..n)
         };
@@ -680,59 +691,139 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     }
 
     let mut assignment = vec![u32::MAX; n];
-    let mut scores = vec![0f32; k];
+    let mut members: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
 
     for _iter in 0..config.train_iters {
-        // Assign
-        let mut changed = 0usize;
-        for (i, slot) in assignment.iter_mut().enumerate().take(n) {
-            let code = vec_at(i);
-            batch_hamming_scores(code, &centroids, byte_len, dim_bits, &mut scores);
-            let best = argmax_score_lowest_index(&scores) as u32;
-            if *slot != best {
-                *slot = best;
-                changed += 1;
-            }
-        }
+        // Assignment is point-independent. Give every rayon worker its own
+        // score buffer so the O(N*K) scan uses all available training CPUs
+        // without synchronization or per-point allocation.
+        #[cfg(feature = "native")]
+        let changed: usize = {
+            use rayon::prelude::*;
+            assignment
+                .par_iter_mut()
+                .enumerate()
+                .map_init(
+                    || vec![0f32; k],
+                    |scores, (i, slot)| {
+                        let best = nearest_binary_centroid(
+                            vec_at(i),
+                            &centroids,
+                            byte_len,
+                            dim_bits,
+                            scores,
+                        );
+                        usize::from(std::mem::replace(slot, best) != best)
+                    },
+                )
+                .sum()
+        };
+        #[cfg(not(feature = "native"))]
+        let changed: usize = {
+            let mut scores = vec![0f32; k];
+            assignment
+                .iter_mut()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let best = nearest_binary_centroid(
+                        vec_at(i),
+                        &centroids,
+                        byte_len,
+                        dim_bits,
+                        &mut scores,
+                    );
+                    usize::from(std::mem::replace(slot, best) != best)
+                })
+                .sum()
+        };
         if changed == 0 {
             break;
         }
 
-        // Update: per-bit majority vote
-        let mut bit_counts = vec![0u32; k * dim_bits];
-        let mut member_counts = vec![0u32; k];
+        // Group point IDs once, in input order. Updating one centroid per task
+        // is both deterministic and much more cache-friendly than writing a
+        // K*D counter matrix at a data-dependent cluster offset for every bit.
+        for cluster_members in &mut members {
+            cluster_members.clear();
+        }
         for (i, &slot) in assignment.iter().enumerate().take(n) {
-            let c = slot as usize;
-            member_counts[c] += 1;
-            let code = vec_at(i);
-            for bit in 0..dim_bits {
-                if (code[bit / 8] >> (bit % 8)) & 1 == 1 {
-                    bit_counts[c * dim_bits + bit] += 1;
-                }
+            members[slot as usize].push(i);
+        }
+
+        #[cfg(feature = "native")]
+        {
+            use rayon::prelude::*;
+            centroids
+                .par_chunks_mut(byte_len)
+                .zip(members.par_iter())
+                .filter(|(_, cluster_members)| !cluster_members.is_empty())
+                .for_each(|(centroid, cluster_members)| {
+                    update_binary_centroid(
+                        centroid,
+                        cluster_members,
+                        sample.as_deref(),
+                        codes,
+                        byte_len,
+                    );
+                });
+        }
+        #[cfg(not(feature = "native"))]
+        for (centroid, cluster_members) in centroids.chunks_mut(byte_len).zip(&members) {
+            if !cluster_members.is_empty() {
+                update_binary_centroid(
+                    centroid,
+                    cluster_members,
+                    sample.as_deref(),
+                    codes,
+                    byte_len,
+                );
             }
         }
 
-        for c in 0..k {
-            let members = member_counts[c];
-            if members == 0 {
+        // Re-seed empty clusters serially so RNG consumption and the resulting
+        // model remain deterministic across thread counts.
+        for (c, cluster_members) in members.iter().enumerate() {
+            if cluster_members.is_empty() {
                 // Re-seed empty cluster with a random sampled vector
-                let vi = sample[rng.random_range(0..n)];
-                centroids[c * byte_len..(c + 1) * byte_len]
-                    .copy_from_slice(&codes[vi * byte_len..(vi + 1) * byte_len]);
-                continue;
-            }
-            let half = members / 2;
-            let centroid = &mut centroids[c * byte_len..(c + 1) * byte_len];
-            centroid.fill(0);
-            for bit in 0..dim_bits {
-                if bit_counts[c * dim_bits + bit] > half {
-                    centroid[bit / 8] |= 1 << (bit % 8);
-                }
+                let sample_index = rng.random_range(0..n);
+                centroids[c * byte_len..(c + 1) * byte_len].copy_from_slice(vec_at(sample_index));
             }
         }
     }
 
     centroids
+}
+
+/// Compute one Hamming-space centroid using a per-byte bit histogram. Member
+/// IDs arrive in input order, so the result is deterministic regardless of
+/// which centroids rayon updates concurrently.
+fn update_binary_centroid(
+    centroid: &mut [u8],
+    members: &[usize],
+    sample: Option<&[usize]>,
+    codes: &[u8],
+    byte_len: usize,
+) {
+    let mut bit_counts = vec![[0usize; 8]; centroid.len()];
+    for &member in members {
+        let vector_index = sample.map_or(member, |sample| sample[member]);
+        let vector = &codes[vector_index * byte_len..(vector_index + 1) * byte_len];
+        for (&byte, counts) in vector.iter().zip(&mut bit_counts) {
+            for (bit, count) in counts.iter_mut().enumerate() {
+                *count += usize::from((byte >> bit) & 1);
+            }
+        }
+    }
+
+    let half = members.len() / 2;
+    for (byte, counts) in centroid.iter_mut().zip(bit_counts) {
+        *byte = counts
+            .into_iter()
+            .enumerate()
+            .fold(0u8, |packed, (bit, count)| {
+                packed | (u8::from(count > half) << bit)
+            });
+    }
 }
 
 /// Hierarchical k-majority training keeps large global codebooks tractable:
@@ -759,14 +850,13 @@ fn train_k_majority_hierarchical(
         assignments.par_iter_mut().enumerate().for_each_init(
             || vec![0.0; parent_count],
             |scores, (index, assignment)| {
-                batch_hamming_scores(
+                *assignment = nearest_binary_centroid(
                     &codes[index * byte_len..(index + 1) * byte_len],
                     &parents,
                     byte_len,
                     config.dim_bits,
                     scores,
                 );
-                *assignment = argmax_score_lowest_index(scores) as u32;
             },
         );
     }
@@ -774,14 +864,13 @@ fn train_k_majority_hierarchical(
     {
         let mut scores = vec![0.0; parent_count];
         for (index, assignment) in assignments.iter_mut().enumerate() {
-            batch_hamming_scores(
+            *assignment = nearest_binary_centroid(
                 &codes[index * byte_len..(index + 1) * byte_len],
                 &parents,
                 byte_len,
                 config.dim_bits,
                 &mut scores,
             );
-            *assignment = argmax_score_lowest_index(&scores) as u32;
         }
     }
     for &assignment in &assignments {
@@ -872,6 +961,33 @@ mod tests {
         });
         expected.truncate(20);
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn k_majority_is_deterministic_across_thread_counts() {
+        let dim_bits = 128;
+        let byte_len = dim_bits / 8;
+        let points = 1_024;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xfeed_cafe);
+        let mut codes = vec![0u8; points * byte_len];
+        rng.fill_bytes(&mut codes);
+
+        let mut config = BinaryIvfConfig::new(dim_bits, 32);
+        config.train_iters = 4;
+        config.max_train_samples = points;
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| train_k_majority(&config, &codes, points));
+        let four_threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| train_k_majority(&config, &codes, points));
+
+        assert_eq!(one_thread, four_threads);
     }
 
     #[test]

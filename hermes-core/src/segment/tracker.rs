@@ -13,6 +13,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::segment::SegmentId;
+use crate::segment::TrainedVectorStructures;
 
 /// Internal state protected by single Mutex
 struct TrackerInner {
@@ -164,6 +165,10 @@ impl Default for SegmentTracker {
 pub struct SegmentSnapshot {
     tracker: Arc<SegmentTracker>,
     segment_ids: Vec<String>,
+    /// The index-global ANN artifacts paired with exactly this segment set.
+    /// Keeping the pair in one snapshot lets a codebook retrain atomically
+    /// replace every segment without old readers observing the new codebook.
+    trained_vectors: Option<Arc<TrainedVectorStructures>>,
     /// Callback to delete segment files when they become ready for deletion.
     delete_fn: Option<Arc<dyn Fn(Vec<SegmentId>) + Send + Sync>>,
 }
@@ -174,6 +179,7 @@ impl SegmentSnapshot {
         Self {
             tracker,
             segment_ids,
+            trained_vectors: None,
             delete_fn: None,
         }
     }
@@ -187,6 +193,23 @@ impl SegmentSnapshot {
         Self {
             tracker,
             segment_ids,
+            trained_vectors: None,
+            delete_fn: Some(delete_fn),
+        }
+    }
+
+    /// Create a native index snapshot whose segment IDs and trained vector
+    /// structures were captured under the same publication lock.
+    pub(crate) fn with_generation(
+        tracker: Arc<SegmentTracker>,
+        segment_ids: Vec<String>,
+        trained_vectors: Option<Arc<TrainedVectorStructures>>,
+        delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync>,
+    ) -> Self {
+        Self {
+            tracker,
+            segment_ids,
+            trained_vectors,
             delete_fn: Some(delete_fn),
         }
     }
@@ -194,6 +217,11 @@ impl SegmentSnapshot {
     /// Get the segment IDs in this snapshot
     pub fn segment_ids(&self) -> &[String] {
         &self.segment_ids
+    }
+
+    /// Return the global ANN artifacts belonging to this segment snapshot.
+    pub(crate) fn trained_vectors(&self) -> Option<Arc<TrainedVectorStructures>> {
+        self.trained_vectors.clone()
     }
 
     /// Check if this snapshot is empty

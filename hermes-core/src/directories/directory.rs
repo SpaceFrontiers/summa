@@ -676,6 +676,18 @@ pub trait DirectoryWriter: Directory {
     /// Atomic rename
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
+    /// Create another immutable name for an existing file without copying its
+    /// contents when the backend supports it. Segment rewrites use this to
+    /// retain unchanged multi-gigabyte files while replacing only one index
+    /// payload. Backends without link semantics return `Unsupported`; callers
+    /// then fall back to a streaming copy.
+    async fn link(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory backend does not support immutable file links",
+        ))
+    }
+
     /// Sync all pending writes
     async fn sync(&self) -> io::Result<()>;
 
@@ -822,6 +834,18 @@ impl DirectoryWriter for RamDirectory {
         if let Some(data) = files.remove(from) {
             files.insert(to.to_path_buf(), data);
         }
+        Ok(())
+    }
+
+    async fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut files = self.files.write();
+        let data = files.get(from).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("source file {from:?} does not exist"),
+            )
+        })?;
+        files.insert(to.to_path_buf(), data);
         Ok(())
     }
 
@@ -976,6 +1000,10 @@ impl DirectoryWriter for FsDirectory {
         // though the rename later succeeded. The caller must update its
         // in-memory metadata in the same poll after this returns.
         std::fs::rename(&from_path, &to_path)
+    }
+
+    async fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::hard_link(self.resolve(from), self.resolve(to))
     }
 
     async fn sync(&self) -> io::Result<()> {
