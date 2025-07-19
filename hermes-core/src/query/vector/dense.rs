@@ -2,6 +2,7 @@
 
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
+use std::sync::{Arc, Mutex};
 
 use super::VectorResultScorer;
 use super::combiner::MultiValueCombiner;
@@ -9,10 +10,9 @@ use crate::query::traits::{CountFuture, Query, Scorer, ScorerFuture};
 
 /// Maximum number of IVF clusters a single dense query may probe.
 ///
-/// Automatic IVF construction caps the cluster count at 4096. Keeping the
-/// query override within the same bound prevents malformed requests from
-/// turning into unbounded work while still permitting a full-cluster scan.
-pub const MAX_DENSE_NPROBE: usize = 4096;
+/// This guard bounds explicit overrides independently of the trained global
+/// leaf count. Automatic billion-scale fields normally use far fewer probes.
+pub const MAX_DENSE_NPROBE: usize = 65_536;
 
 /// Maximum exact-rerank candidate multiplier accepted by dense search.
 ///
@@ -33,6 +33,10 @@ pub struct DenseVectorQuery {
     pub rerank_factor: f32,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
+    /// One global-quantizer route, shared by all segment scorers spawned for
+    /// this query. The cache is versioned, so a query reused after an index
+    /// generation change recomputes safely.
+    probe_cache: Arc<Mutex<Option<Arc<crate::structures::IvfPqQueryPlan>>>>,
 }
 
 impl std::fmt::Display for DenseVectorQuery {
@@ -54,9 +58,10 @@ impl DenseVectorQuery {
         Self {
             field,
             vector,
-            nprobe: 32,
+            nprobe: 64,
             rerank_factor: 3.0,
             combiner: MultiValueCombiner::Max,
+            probe_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -92,9 +97,18 @@ impl Query for DenseVectorQuery {
         let nprobe = self.nprobe;
         let rerank_factor = self.rerank_factor;
         let combiner = self.combiner;
+        let probe_cache = Arc::clone(&self.probe_cache);
         Box::pin(async move {
             let results = reader
-                .search_dense_vector(field, &vector, limit, nprobe, rerank_factor, combiner)
+                .search_dense_vector_with_probe_cache(
+                    field,
+                    &vector,
+                    limit,
+                    nprobe,
+                    rerank_factor,
+                    combiner,
+                    &probe_cache,
+                )
                 .await?;
 
             Ok(Box::new(VectorResultScorer::new(results, field.0)) as Box<dyn Scorer>)
@@ -107,13 +121,14 @@ impl Query for DenseVectorQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        let results = reader.search_dense_vector_sync(
+        let results = reader.search_dense_vector_sync_with_probe_cache(
             self.field,
             &self.vector,
             limit,
             self.nprobe,
             self.rerank_factor,
             self.combiner,
+            &self.probe_cache,
         )?;
         Ok(Box::new(VectorResultScorer::new(results, self.field.0)) as Box<dyn Scorer>)
     }

@@ -28,8 +28,8 @@
 //!     # Raw content hash (not indexed, just stored)
 //!     field content_hash: bytes [stored]
 //!
-//!     # Dense vector with IVF-RaBitQ index
-//!     field embedding: dense_vector<768> [indexed<rabitq, centroids: "centroids.bin", nprobe: 32>]
+//!     # Dense vector with the production IVF-PQ index
+//!     field embedding: dense_vector<768> [indexed<ivf_pq, routing: hnsw, nprobe: 64>]
 //!
 //! }
 //! ```
@@ -37,10 +37,9 @@
 //! # Dense Vector Index Configuration
 //!
 //! Index-related parameters for dense vectors are specified in `indexed<...>`:
-//! - `rabitq` or `scann` - index type
+//! - `ivf_pq` - index type
 //! - `centroids: "path"` - path to pre-trained centroids file
-//! - `codebook: "path"` - path to PQ codebook (ScaNN only)
-//! - `nprobe: N` - number of clusters to probe (default: 32)
+//! - `nprobe: N` - number of clusters to probe (default: 64)
 
 use pest::Parser;
 use pest_derive::Parser;
@@ -258,10 +257,9 @@ struct IndexConfig {
     index_type: Option<super::schema::VectorIndexType>,
     num_clusters: Option<usize>,
     nprobe: Option<usize>,
-    build_threshold: Option<usize>,
+    ivf_routing: Option<super::schema::IvfRoutingMode>,
     soar: Option<crate::structures::SoarConfig>,
-    rabitq_bits: Option<u8>,
-    binary_ivf: bool,
+    binary_index_type: Option<super::schema::BinaryIndexType>,
     // Sparse vector index params
     sparse_format: Option<SparseFormat>,
     quantization: Option<WeightQuantization>,
@@ -373,34 +371,27 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
     use super::schema::VectorIndexType;
 
     match p.as_rule() {
-        Rule::index_type_spec => {
-            if p.as_str() == "ivf" {
-                // Binary dense vector IVF (Hamming clusters)
-                config.binary_ivf = true;
-                return;
+        Rule::index_type_spec => match p.as_str() {
+            "flat" => {
+                config.index_type = Some(VectorIndexType::Flat);
+                config.binary_index_type = Some(super::schema::BinaryIndexType::Flat);
             }
-            config.index_type = Some(match p.as_str() {
-                "flat" => VectorIndexType::Flat,
-                "rabitq" => VectorIndexType::RaBitQ,
-                "ivf_rabitq" => VectorIndexType::IvfRaBitQ,
-                "scann" => VectorIndexType::ScaNN,
-                _ => VectorIndexType::RaBitQ,
-            });
-        }
+            "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
+            "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
+            _ => {}
+        },
         Rule::index_type_kwarg => {
             // index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
             if let Some(t) = p.into_inner().next() {
-                if t.as_str() == "ivf" {
-                    config.binary_ivf = true;
-                    return;
+                match t.as_str() {
+                    "flat" => {
+                        config.index_type = Some(VectorIndexType::Flat);
+                        config.binary_index_type = Some(super::schema::BinaryIndexType::Flat);
+                    }
+                    "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
+                    "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
+                    _ => {}
                 }
-                config.index_type = Some(match t.as_str() {
-                    "flat" => VectorIndexType::Flat,
-                    "rabitq" => VectorIndexType::RaBitQ,
-                    "ivf_rabitq" => VectorIndexType::IvfRaBitQ,
-                    "scann" => VectorIndexType::ScaNN,
-                    _ => VectorIndexType::RaBitQ,
-                });
             }
         }
         Rule::num_clusters_kwarg => {
@@ -415,31 +406,23 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 }));
             }
         }
-        Rule::build_threshold_kwarg => {
-            // build_threshold_kwarg = { "build_threshold" ~ ":" ~ build_threshold_spec }
-            if let Some(n) = p.into_inner().next() {
-                config.build_threshold = Some(n.as_str().parse().unwrap_or_else(|_| {
-                    log::warn!(
-                        "Invalid build_threshold value '{}', using default 10000",
-                        n.as_str()
-                    );
-                    10000
-                }));
-            }
-        }
         Rule::nprobe_kwarg => {
             // nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }
             if let Some(n) = p.into_inner().next() {
                 config.nprobe = Some(n.as_str().parse().unwrap_or_else(|_| {
-                    log::warn!("Invalid nprobe value '{}', using default 32", n.as_str());
-                    32
+                    log::warn!("Invalid nprobe value '{}', using default 64", n.as_str());
+                    64
                 }));
             }
         }
-        Rule::bits_kwarg => {
-            // bits_kwarg = { "bits" ~ ":" ~ bits_spec }
-            if let Some(b) = p.into_inner().next() {
-                config.rabitq_bits = Some(b.as_str().parse::<u8>().unwrap_or(1).clamp(1, 8));
+        Rule::routing_kwarg => {
+            if let Some(value) = p.into_inner().next() {
+                config.ivf_routing = Some(match value.as_str() {
+                    "flat" => super::schema::IvfRoutingMode::Flat,
+                    "two_level" => super::schema::IvfRoutingMode::TwoLevel,
+                    "hnsw" => super::schema::IvfRoutingMode::Hnsw,
+                    _ => super::schema::IvfRoutingMode::Auto,
+                });
             }
         }
         Rule::soar_kwarg => {
@@ -804,8 +787,8 @@ fn apply_index_config_to_binary_dense_vector(
     config: &mut BinaryDenseVectorConfig,
     idx_cfg: IndexConfig,
 ) {
-    if idx_cfg.binary_ivf {
-        config.index_type = super::schema::BinaryIndexType::Ivf;
+    if let Some(index_type) = idx_cfg.binary_index_type {
+        config.index_type = index_type;
     }
     if idx_cfg.num_clusters.is_some() {
         config.num_clusters = idx_cfg.num_clusters;
@@ -813,8 +796,8 @@ fn apply_index_config_to_binary_dense_vector(
     if let Some(nprobe) = idx_cfg.nprobe {
         config.nprobe = nprobe;
     }
-    if idx_cfg.build_threshold.is_some() {
-        config.build_threshold = idx_cfg.build_threshold;
+    if let Some(routing) = idx_cfg.ivf_routing {
+        config.ivf_routing = routing;
     }
 }
 
@@ -834,22 +817,8 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
     if let Some(nprobe) = idx_cfg.nprobe {
         config.nprobe = nprobe;
     }
-
-    // Apply build_threshold if specified
-    if idx_cfg.build_threshold.is_some() {
-        config.build_threshold = idx_cfg.build_threshold;
-    }
-
-    // Apply RaBitQ bit width if specified (IVF-RaBitQ only)
-    if let Some(bits) = idx_cfg.rabitq_bits {
-        if config.index_type == super::schema::VectorIndexType::IvfRaBitQ {
-            config.rabitq_bits = Some(bits);
-        } else {
-            log::warn!(
-                "'bits' requires an ivf_rabitq index; ignoring for index type {:?}",
-                config.index_type
-            );
-        }
+    if let Some(routing) = idx_cfg.ivf_routing {
+        config.ivf_routing = routing;
     }
 
     // Apply SOAR spilling if specified (IVF-based indexes only)
@@ -858,7 +827,7 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
             config.soar = idx_cfg.soar;
         } else {
             log::warn!(
-                "'soar' requires an IVF-based index (ivf_rabitq, scann); \
+                "'soar' requires the IVF-PQ index; \
                  ignoring for index type {:?}",
                 config.index_type
             );
@@ -1776,7 +1745,7 @@ mod tests {
     fn test_dense_vector_with_num_clusters() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256>, stored]
+                field embedding: dense_vector<768> [indexed<ivf_pq, num_clusters: 256>, stored]
             }
         "#;
 
@@ -1790,14 +1759,14 @@ mod tests {
         let config = f.dense_vector_config.as_ref().unwrap();
         assert_eq!(config.dim, 768);
         assert_eq!(config.num_clusters, Some(256));
-        assert_eq!(config.nprobe, 32); // default
+        assert_eq!(config.nprobe, 64); // billion-scale default
     }
 
     #[test]
     fn test_dense_vector_with_soar() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, soar: selective>, stored]
+                field embedding: dense_vector<768> [indexed<ivf_pq, num_clusters: 256, soar: selective>, stored]
             }
         "#;
 
@@ -1811,7 +1780,7 @@ mod tests {
         // aggressive preset: 2 secondary clusters, no selectivity
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<scann, soar: aggressive>]
+                field embedding: dense_vector<768> [indexed<ivf_pq, soar: aggressive>]
             }
         "#;
         let indexes = parse_sdl(sdl).unwrap();
@@ -1823,12 +1792,48 @@ mod tests {
         // off keeps soar disabled
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_rabitq, soar: off>]
+                field embedding: dense_vector<768> [indexed<ivf_pq, soar: off>]
             }
         "#;
         let indexes = parse_sdl(sdl).unwrap();
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
         assert!(config.soar.is_none());
+    }
+
+    #[test]
+    fn test_ivf_routing_modes_apply_to_float_and_binary_fields() {
+        let indexes = parse_sdl(
+            r#"
+            index vectors {
+                field embedding: dense_vector<768> [indexed<ivf_pq, routing: hnsw>]
+                field hash: binary_dense_vector<512> [indexed<ivf, routing: two_level>]
+            }
+            "#,
+        )
+        .unwrap();
+        let schema = indexes[0].to_schema();
+        let embedding = schema.get_field("embedding").unwrap();
+        let hash = schema.get_field("hash").unwrap();
+        assert_eq!(
+            schema
+                .get_field_entry(embedding)
+                .unwrap()
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .ivf_routing,
+            super::super::schema::IvfRoutingMode::Hnsw
+        );
+        assert_eq!(
+            schema
+                .get_field_entry(hash)
+                .unwrap()
+                .binary_dense_vector_config
+                .as_ref()
+                .unwrap()
+                .ivf_routing,
+            super::super::schema::IvfRoutingMode::TwoLevel
+        );
     }
 
     #[test]
@@ -1852,7 +1857,8 @@ mod tests {
         assert_eq!(config.num_clusters, Some(128));
         assert_eq!(config.nprobe, 16);
 
-        // Default stays flat
+        // Default targets the global IVF index; segments remain flat until
+        // build_vector_index is requested.
         let sdl = r#"
             index documents {
                 field hash: binary_dense_vector<512> [indexed]
@@ -1865,38 +1871,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             config.index_type,
-            super::super::schema::BinaryIndexType::Flat
+            super::super::schema::BinaryIndexType::Ivf
         );
-    }
-
-    #[test]
-    fn test_dense_vector_with_rabitq_bits() {
-        let sdl = r#"
-            index documents {
-                field embedding: dense_vector<768> [indexed<ivf_rabitq, bits: 4>, stored]
-            }
-        "#;
-
-        let indexes = parse_sdl(sdl).unwrap();
-        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
-        assert_eq!(config.rabitq_bits, Some(4));
-
-        // Not specified -> classic 1-bit
-        let sdl = r#"
-            index documents {
-                field embedding: dense_vector<768> [indexed<ivf_rabitq>]
-            }
-        "#;
-        let indexes = parse_sdl(sdl).unwrap();
-        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
-        assert_eq!(config.rabitq_bits, None);
     }
 
     #[test]
     fn test_dense_vector_with_num_clusters_and_nprobe() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<1536> [indexed<ivf_rabitq, num_clusters: 512, nprobe: 64>]
+                field embedding: dense_vector<1536> [indexed<ivf_pq, num_clusters: 512, nprobe: 64>]
             }
         "#;
 
@@ -1927,7 +1910,7 @@ mod tests {
     fn test_dense_vector_keyword_syntax_full() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 1536> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 64>]
+                field embedding: dense_vector<dims: 1536> [indexed<ivf_pq, num_clusters: 256, nprobe: 64>]
             }
         "#;
 
@@ -1943,7 +1926,7 @@ mod tests {
     fn test_dense_vector_keyword_syntax_partial() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<ivf_rabitq, num_clusters: 128>]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_pq, num_clusters: 128>]
             }
         "#;
 
@@ -1952,16 +1935,16 @@ mod tests {
 
         assert_eq!(config.dim, 768);
         assert_eq!(config.num_clusters, Some(128));
-        assert_eq!(config.nprobe, 32); // default
+        assert_eq!(config.nprobe, 64); // billion-scale default
     }
 
     #[test]
-    fn test_dense_vector_scann_index() {
+    fn test_dense_vector_ivf_pq_index_with_probe() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<scann, num_clusters: 256, nprobe: 64>]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_pq, num_clusters: 256, nprobe: 64>]
             }
         "#;
 
@@ -1969,18 +1952,18 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::ScaNN);
+        assert_eq!(config.index_type, VectorIndexType::IvfPq);
         assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 64);
     }
 
     #[test]
-    fn test_dense_vector_ivf_rabitq_index() {
+    fn test_dense_vector_ivf_pq_index_without_explicit_probe() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 1536> [indexed<ivf_rabitq, num_clusters: 512>]
+                field embedding: dense_vector<dims: 1536> [indexed<ivf_pq, num_clusters: 512>]
             }
         "#;
 
@@ -1988,17 +1971,17 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 1536);
-        assert_eq!(config.index_type, VectorIndexType::IvfRaBitQ);
+        assert_eq!(config.index_type, VectorIndexType::IvfPq);
         assert_eq!(config.num_clusters, Some(512));
     }
 
     #[test]
-    fn test_dense_vector_rabitq_no_clusters() {
+    fn test_dense_vector_ivf_pq_no_clusters() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<rabitq>]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_pq>]
             }
         "#;
 
@@ -2006,7 +1989,7 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::RaBitQ);
+        assert_eq!(config.index_type, VectorIndexType::IvfPq);
         assert!(config.num_clusters.is_none());
     }
 
@@ -2031,7 +2014,7 @@ mod tests {
     fn test_dense_vector_default_index_type() {
         use crate::dsl::schema::VectorIndexType;
 
-        // When no index type specified, should default to RaBitQ (basic)
+        // Omitting an index type selects the production IVF-PQ path.
         let sdl = r#"
             index documents {
                 field embedding: dense_vector<dims: 768> [indexed]
@@ -2042,7 +2025,7 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::RaBitQ);
+        assert_eq!(config.index_type, VectorIndexType::IvfPq);
     }
 
     #[test]
@@ -2060,7 +2043,7 @@ mod tests {
 
         assert_eq!(config.dim, 768);
         assert_eq!(config.quantization, DenseVectorQuantization::F16);
-        assert_eq!(config.index_type, VectorIndexType::RaBitQ);
+        assert_eq!(config.index_type, VectorIndexType::IvfPq);
     }
 
     #[test]
@@ -2069,7 +2052,7 @@ mod tests {
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<1024, uint8> [indexed<ivf_rabitq>]
+                field embedding: dense_vector<1024, uint8> [indexed<ivf_pq>]
             }
         "#;
 

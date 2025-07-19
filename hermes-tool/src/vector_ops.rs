@@ -87,9 +87,7 @@ pub fn train_centroids(
         output
     );
 
-    centroids
-        .save(&output)
-        .context("Failed to save centroids")?;
+    std::fs::write(&output, centroids.to_bytes()?).context("Failed to save centroids")?;
 
     eprintln!(
         "Trained {} clusters from {} vectors ({} dims) in {:.2}s",
@@ -169,7 +167,7 @@ pub async fn retrain_centroids(
 
     // Save centroids to index directory
     let centroids_path = index_path.join("coarse_centroids.bin");
-    centroids.save(&centroids_path)?;
+    std::fs::write(&centroids_path, centroids.to_bytes()?)?;
 
     info!("Saved centroids to {:?}", centroids_path);
 

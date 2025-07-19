@@ -2,7 +2,7 @@
 //!
 //! Organized into submodules:
 //! - `postings` - Posting list compression formats
-//! - `vector` - Vector indexing (RaBitQ, IVF-RaBitQ, ScaNN)
+//! - `vector` - Global IVF-PQ and binary IVF indexing
 //! - `simd` - SIMD utilities
 //! - `sstable` - SSTable for term dictionary
 
@@ -121,11 +121,10 @@ pub use postings::{
 
 // Re-export vector
 pub use vector::{
+    BinaryCoarseQuantizer,
     BinaryIvfConfig,
     BinaryIvfIndex,
     // IVF core
-    ClusterData,
-    ClusterStorage,
     CoarseCentroids,
     CoarseConfig,
     // Quantization
@@ -133,19 +132,11 @@ pub use vector::{
     // Indexes
     IVFPQConfig,
     IVFPQIndex,
-    IVFRaBitQConfig,
-    IVFRaBitQIndex,
+    IvfPqQueryPlan,
+    IvfProbePlan,
     MultiAssignment,
     PQCodebook,
     PQConfig,
-    PQVector,
-    QuantizedCode,
-    QuantizedQuery,
-    QuantizedVector,
-    Quantizer,
-    RaBitQCodebook,
-    RaBitQConfig,
-    RaBitQIndex,
     SoarConfig,
 };
 

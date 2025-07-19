@@ -20,6 +20,8 @@ pub use builder::{
     BpBudget, MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats,
 };
 #[cfg(feature = "native")]
+pub(crate) use merger::block_in_place_if_multithread;
+#[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub(crate) use reader::BmpIndex;
 pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
@@ -34,9 +36,7 @@ pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{SegmentSnapshot, SegmentTracker};
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta, TrainedVectorStructures};
-pub use vector_data::{
-    FlatVectorData, IVFRaBitQIndexData, LazyFlatVectorData, ScaNNIndexData, dequantize_raw,
-};
+pub use vector_data::{FlatVectorData, LazyFlatVectorData, dequantize_raw};
 
 /// Format byte count as human-readable string
 #[cfg(any(feature = "native", feature = "wasm"))]

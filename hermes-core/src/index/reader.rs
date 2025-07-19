@@ -143,18 +143,16 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         // later reloads.
         let snapshot = segment_manager.acquire_snapshot().await;
 
-        // Read trained centroids from ArcSwap (lock-free)
-        let trained = segment_manager.trained();
-        let trained_centroids = trained
-            .as_ref()
-            .map(|t| t.centroids.clone())
-            .unwrap_or_default();
+        // Read one immutable trained-artifact generation from ArcSwap.
+        let trained = segment_manager
+            .trained()
+            .unwrap_or_else(|| Arc::new(crate::segment::TrainedVectorStructures::default()));
 
         Searcher::from_snapshot(
             segment_manager.directory(),
             Arc::clone(schema),
             snapshot,
-            trained_centroids,
+            trained,
             resources,
         )
         .await
@@ -272,18 +270,17 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         // trained value loaded after the snapshot (see create_reader).
         let snapshot = self.segment_manager.acquire_snapshot().await;
 
-        // Read trained centroids from ArcSwap (lock-free)
-        let trained = self.segment_manager.trained();
-        let trained_centroids = trained
-            .as_ref()
-            .map(|t| t.centroids.clone())
-            .unwrap_or_default();
+        // Read one immutable trained-artifact generation from ArcSwap.
+        let trained = self
+            .segment_manager
+            .trained()
+            .unwrap_or_else(|| Arc::new(crate::segment::TrainedVectorStructures::default()));
 
         let new_reader = Searcher::from_snapshot_reuse(
             self.segment_manager.directory(),
             Arc::clone(&self.schema),
             snapshot,
-            trained_centroids,
+            trained,
             self.resources.clone(),
             &existing_segments,
         )

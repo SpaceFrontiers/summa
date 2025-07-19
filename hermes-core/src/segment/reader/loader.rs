@@ -24,7 +24,7 @@ pub struct SparseFileData {
 
 /// Vectors file loading result
 pub struct VectorsFileData {
-    /// ANN indexes per field (IVF, ScaNN, RaBitQ) — loaded into memory for search
+    /// Segment-level IVF payloads per field, loaded lazily for search.
     pub indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — doc_ids in memory, vectors via mmap for reranking/merge
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
@@ -135,26 +135,12 @@ fn validate_ann_schema(schema: &Schema, field_id: u32, index_type: u8) -> Result
     })?;
 
     let matches_schema = match index_type {
-        ann_build::RABITQ_TYPE => {
+        ann_build::IVF_PQ_TYPE => {
             field.field_type == FieldType::DenseVector
                 && field
                     .dense_vector_config
                     .as_ref()
-                    .is_some_and(|config| config.index_type == VectorIndexType::RaBitQ)
-        }
-        ann_build::IVF_RABITQ_TYPE => {
-            field.field_type == FieldType::DenseVector
-                && field
-                    .dense_vector_config
-                    .as_ref()
-                    .is_some_and(|config| config.index_type == VectorIndexType::IvfRaBitQ)
-        }
-        ann_build::SCANN_TYPE => {
-            field.field_type == FieldType::DenseVector
-                && field
-                    .dense_vector_config
-                    .as_ref()
-                    .is_some_and(|config| config.index_type == VectorIndexType::ScaNN)
+                    .is_some_and(|config| config.index_type == VectorIndexType::IvfPq)
         }
         ann_build::BINARY_IVF_TYPE => {
             field.field_type == FieldType::BinaryDenseVector
@@ -205,10 +191,7 @@ fn is_ann_vector_type(index_type: u8) -> bool {
 
     matches!(
         index_type,
-        ann_build::SCANN_TYPE
-            | ann_build::IVF_RABITQ_TYPE
-            | ann_build::BINARY_IVF_TYPE
-            | ann_build::RABITQ_TYPE
+        ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE
     )
 }
 
@@ -273,8 +256,6 @@ fn validate_vector_toc_ranges(
 /// - [field data...]  — starts at offset 0 (mmap page-aligned)
 /// - [TOC entries]    — field_id(4) + index_type(1) + offset(8) + size(8) per field
 /// - [footer 16B]     — toc_offset(8) + num_fields(4) + magic(4)
-///
-/// Also supports legacy header-first format (no magic) for backwards compatibility.
 pub async fn load_vectors_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
@@ -307,84 +288,40 @@ pub async fn load_vectors_file<D: Directory>(
     if file_size == 0 {
         return Ok(empty());
     }
-    if file_size < 4 {
+    if file_size < FOOTER_SIZE {
         return Err(crate::Error::Corruption(format!(
-            "vector file is {file_size} bytes, shorter than a legacy header"
+            "vector file is {file_size} bytes, shorter than the required footer"
         )));
     }
 
-    // Try new format when a complete footer is present; otherwise validate
-    // the legacy header instead of silently accepting a truncated file.
-    let footer = if file_size >= FOOTER_SIZE {
-        let footer_bytes = handle
-            .read_bytes_range(file_size - FOOTER_SIZE..file_size)
-            .await?;
-        let mut cursor = Cursor::new(footer_bytes.as_slice());
-        Some((
-            cursor.read_u64::<LittleEndian>()?,
-            cursor.read_u32::<LittleEndian>()?,
-            cursor.read_u32::<LittleEndian>()?,
-        ))
-    } else {
-        None
-    };
-
-    let (entries, data_start, data_end): (Vec<DenseVectorTocEntry>, u64, u64) = if let Some((
-        toc_offset,
-        num_fields,
-        _,
-    )) =
-        footer.filter(|(_, _, magic)| *magic == VECTORS_FOOTER_MAGIC)
-    {
-        // New format: TOC at end
-        let footer_start = file_size - FOOTER_SIZE;
-        let toc_size = u64::from(num_fields)
-            .checked_mul(DENSE_TOC_ENTRY_SIZE)
-            .ok_or_else(|| {
-                crate::Error::Corruption("dense-vector TOC size overflows u64".into())
-            })?;
-        let toc_end = toc_offset.checked_add(toc_size).ok_or_else(|| {
-            crate::Error::Corruption("dense-vector TOC range overflows u64".into())
-        })?;
-        if toc_offset > footer_start || toc_end > footer_start {
-            return Err(crate::Error::Corruption(format!(
-                "dense-vector TOC range {toc_offset}..{toc_end} exceeds footer start {footer_start}"
-            )));
-        }
-        let toc_bytes = handle.read_bytes_range(toc_offset..toc_end).await?;
-        (
-            read_dense_toc(toc_bytes.as_slice(), num_fields)?,
-            0,
-            toc_offset,
-        )
-    } else {
-        // Legacy format: header at start (num_fields(4) + entries)
-        let header_bytes = handle.read_bytes_range(0..4).await?;
-        let mut cursor = Cursor::new(header_bytes.as_slice());
-        let num_fields = cursor.read_u32::<LittleEndian>()?;
-        if num_fields == 0 {
-            return Ok(empty());
-        }
-        let entries_size = u64::from(num_fields)
-            .checked_mul(DENSE_TOC_ENTRY_SIZE)
-            .ok_or_else(|| {
-                crate::Error::Corruption("legacy dense-vector TOC size overflows u64".into())
-            })?;
-        let entries_end = 4u64.checked_add(entries_size).ok_or_else(|| {
-            crate::Error::Corruption("legacy dense-vector TOC range overflows u64".into())
-        })?;
-        if entries_end > file_size {
-            return Err(crate::Error::Corruption(format!(
-                "legacy dense-vector TOC ends at {entries_end}, beyond file size {file_size}"
-            )));
-        }
-        let entries_bytes = handle.read_bytes_range(4..entries_end).await?;
-        (
-            read_dense_toc(entries_bytes.as_slice(), num_fields)?,
-            entries_end,
-            file_size,
-        )
-    };
+    let footer_bytes = handle
+        .read_bytes_range(file_size - FOOTER_SIZE..file_size)
+        .await?;
+    let mut cursor = Cursor::new(footer_bytes.as_slice());
+    let toc_offset = cursor.read_u64::<LittleEndian>()?;
+    let num_fields = cursor.read_u32::<LittleEndian>()?;
+    let magic = cursor.read_u32::<LittleEndian>()?;
+    if magic != VECTORS_FOOTER_MAGIC {
+        return Err(crate::Error::Corruption(
+            "dense-vector file has no supported TOC footer".into(),
+        ));
+    }
+    let footer_start = file_size - FOOTER_SIZE;
+    let toc_size = u64::from(num_fields)
+        .checked_mul(DENSE_TOC_ENTRY_SIZE)
+        .ok_or_else(|| crate::Error::Corruption("dense-vector TOC size overflows u64".into()))?;
+    let toc_end = toc_offset
+        .checked_add(toc_size)
+        .ok_or_else(|| crate::Error::Corruption("dense-vector TOC range overflows u64".into()))?;
+    if toc_offset > footer_start || toc_end > footer_start {
+        return Err(crate::Error::Corruption(format!(
+            "dense-vector TOC range {toc_offset}..{toc_end} exceeds footer start {footer_start}"
+        )));
+    }
+    let toc_bytes = handle.read_bytes_range(toc_offset..toc_end).await?;
+    let entries = read_dense_toc(toc_bytes.as_slice(), num_fields)?;
+    let data_start = 0;
+    let data_end = toc_offset;
 
     if entries.is_empty() {
         return Ok(empty());
@@ -461,26 +398,17 @@ pub async fn load_vectors_file<D: Directory>(
                     )));
                 }
             }
-            ann_build::SCANN_TYPE
-            | ann_build::IVF_RABITQ_TYPE
-            | ann_build::BINARY_IVF_TYPE
-            | ann_build::RABITQ_TYPE => {
+            ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE => {
                 validate_ann_schema(schema, field_id, index_type)?;
                 // ANN payloads stay lazy and zero-copy; only their validated
                 // byte range is retained until first search.
                 let data = handle.read_bytes_range(offset..end).await?;
                 let index = match index_type {
-                    ann_build::SCANN_TYPE => {
-                        VectorIndex::ScaNN(Arc::new(super::types::LazyScaNN::new(data)))
-                    }
-                    ann_build::IVF_RABITQ_TYPE => {
-                        VectorIndex::IVF(Arc::new(super::types::LazyIVF::new(data)))
+                    ann_build::IVF_PQ_TYPE => {
+                        VectorIndex::IvfPq(Arc::new(super::types::LazyIvfPq::new(data)))
                     }
                     ann_build::BINARY_IVF_TYPE => {
                         VectorIndex::BinaryIvf(Arc::new(super::types::LazyBinaryIvf::new(data)))
-                    }
-                    ann_build::RABITQ_TYPE => {
-                        VectorIndex::RaBitQ(Arc::new(super::types::LazyRaBitQ::new(data)))
                     }
                     _ => {
                         return Err(crate::Error::Corruption(format!(
@@ -1117,7 +1045,7 @@ mod tests {
         .unwrap();
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, flat),
-            (1, ann_build::RABITQ_TYPE, vec![0]),
+            (1, ann_build::IVF_PQ_TYPE, vec![0]),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1132,7 +1060,12 @@ mod tests {
     #[tokio::test]
     async fn ann_vector_type_must_match_schema_index_type() {
         let mut schema = SchemaBuilder::default();
-        schema.add_dense_vector_field("dense", 2, true, true);
+        schema.add_dense_vector_field_with_config(
+            "dense",
+            true,
+            true,
+            crate::dsl::DenseVectorConfig::flat(2),
+        );
         let schema = schema.build();
         let files = SegmentFiles::new(13);
         let dir = RamDirectory::new();
@@ -1148,8 +1081,7 @@ mod tests {
         .unwrap();
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, flat),
-            // `add_dense_vector_field` configures RaBitQ, not ScaNN.
-            (0, ann_build::SCANN_TYPE, vec![0]),
+            (0, ann_build::IVF_PQ_TYPE, vec![0]),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1161,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flat_only_vectors_are_valid_below_ann_build_threshold() {
+    async fn flat_only_vectors_are_valid_before_ann_build() {
         let mut schema = SchemaBuilder::default();
         schema.add_dense_vector_field("dense", 2, true, true);
         let schema = schema.build();
@@ -1198,7 +1130,7 @@ mod tests {
 
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
-            (0, ann_build::RABITQ_TYPE, Vec::new()),
+            (0, ann_build::IVF_PQ_TYPE, Vec::new()),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1233,7 +1165,7 @@ mod tests {
                 },
                 DenseVectorTocEntry {
                     field_id: 0,
-                    index_type: ann_build::RABITQ_TYPE,
+                    index_type: ann_build::IVF_PQ_TYPE,
                     offset: ann_offset,
                     size: ann_size,
                 },

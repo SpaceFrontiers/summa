@@ -6,17 +6,14 @@
 //!
 //! - `ivf` - Core IVF (Inverted File Index) infrastructure
 //!   - `CoarseCentroids` - k-means clustering for coarse quantization
-//!   - `ClusterData` / `ClusterStorage` - generic cluster storage
 //!   - `SoarConfig` / `MultiAssignment` - SOAR geometry-aware assignment
 //!
-//! - `quantization` - Vector quantization methods
-//!   - `RaBitQCodebook` - RaBitQ binary quantization (32x compression)
-//!   - `PQCodebook` - Product Quantization with OPQ (ScaNN-style)
-//!   - `Quantizer` trait - common interface for quantizers
+//! - `quantization` - Residual product quantization
+//!   - `PQCodebook` - the index-global OPQ codebook
 //!
-//! - `index` - Ready-to-use IVF indexes
-//!   - `IVFRaBitQIndex` - IVF + RaBitQ
-//!   - `IVFPQIndex` - IVF + PQ
+//! - `index` - Segment payloads for the production ANN implementations
+//!   - `IVFPQIndex` - float vectors with residual PQ codes
+//!   - `BinaryIvfIndex` - exact packed binary vectors
 //!
 //! ## SOAR (Spilling with Orthogonality-Amplified Residuals)
 //!
@@ -27,19 +24,26 @@
 
 pub mod index;
 pub mod ivf;
+mod kmeans;
 pub mod quantization;
 
 /// Hard ceiling for a single decoded ANN artifact. Bincode's limit accounts
 /// for claimed container storage as well as bytes consumed, preventing a tiny
 /// corrupt payload from advertising an effectively unbounded allocation.
 ///
-/// The 4 GiB 64-bit ceiling still accommodates a 20M-document classic RaBitQ
-/// segment (roughly 3.5 GB decoded at 768 dimensions), while preventing one
-/// lazy decode from claiming an operationally unbounded fraction of RAM.
+/// A billion-scale 2,560-bit multi-value binary segment can legitimately
+/// exceed 8 GiB. Keep the serialized-input ceiling distinct from bincode's
+/// decode budget: bincode charges both bytes consumed and requested container
+/// allocations, so a valid 9 GiB payload needs more than a 9 GiB limit.
 #[cfg(target_pointer_width = "64")]
-pub(crate) const MAX_DENSE_ANN_DECODE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_DENSE_ANN_PAYLOAD_BYTES: usize = 16 * 1024 * 1024 * 1024;
 #[cfg(not(target_pointer_width = "64"))]
-pub(crate) const MAX_DENSE_ANN_DECODE_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_DENSE_ANN_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+
+#[cfg(target_pointer_width = "64")]
+const MAX_DENSE_ANN_DECODE_BUDGET: usize = 32 * 1024 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "64"))]
+const MAX_DENSE_ANN_DECODE_BUDGET: usize = MAX_DENSE_ANN_PAYLOAD_BYTES;
 
 const ANN_DECODE_EXPANSION_FACTOR: usize = 8;
 const ANN_DECODE_FIXED_HEADROOM: usize = 16 * 1024 * 1024;
@@ -68,8 +72,14 @@ fn decode_ann_with_relative_limit<T: serde::de::DeserializeOwned>(
         decode_ann_with_limit::<T, GIB>(data)
     } else if budget <= 2 * GIB {
         decode_ann_with_limit::<T, { 2 * GIB }>(data)
-    } else {
+    } else if budget <= 4 * GIB {
         decode_ann_with_limit::<T, { 4 * GIB }>(data)
+    } else if budget <= 8 * GIB {
+        decode_ann_with_limit::<T, { 8 * GIB }>(data)
+    } else if budget <= 16 * GIB {
+        decode_ann_with_limit::<T, { 16 * GIB }>(data)
+    } else {
+        decode_ann_with_limit::<T, { 32 * GIB }>(data)
     }
 }
 
@@ -94,13 +104,13 @@ pub(crate) fn decode_ann_bincode_exact<T: serde::de::DeserializeOwned>(
     data: &[u8],
     description: &str,
 ) -> std::io::Result<T> {
-    if data.len() > MAX_DENSE_ANN_DECODE_BYTES {
+    if data.len() > MAX_DENSE_ANN_PAYLOAD_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "{description} payload is {} bytes, exceeding the {}-byte decode limit",
                 data.len(),
-                MAX_DENSE_ANN_DECODE_BYTES
+                MAX_DENSE_ANN_PAYLOAD_BYTES
             ),
         ));
     }
@@ -108,8 +118,8 @@ pub(crate) fn decode_ann_bincode_exact<T: serde::de::DeserializeOwned>(
         .len()
         .checked_mul(ANN_DECODE_EXPANSION_FACTOR)
         .and_then(|bytes| bytes.checked_add(ANN_DECODE_FIXED_HEADROOM))
-        .unwrap_or(MAX_DENSE_ANN_DECODE_BYTES)
-        .min(MAX_DENSE_ANN_DECODE_BYTES);
+        .unwrap_or(MAX_DENSE_ANN_DECODE_BUDGET)
+        .min(MAX_DENSE_ANN_DECODE_BUDGET);
     let (value, consumed) = decode_ann_with_relative_limit(data, budget)?;
     if consumed != data.len() {
         return Err(std::io::Error::new(
@@ -124,26 +134,21 @@ pub(crate) fn decode_ann_bincode_exact<T: serde::de::DeserializeOwned>(
 }
 
 // IVF core
-pub use ivf::{
-    ClusterData, ClusterStorage, CoarseCentroids, CoarseConfig, MultiAssignment, QuantizedCode,
-    SoarConfig,
-};
+pub use ivf::{CoarseCentroids, CoarseConfig, IvfProbePlan, MultiAssignment, SoarConfig};
 
 // Quantization
-pub use quantization::{
-    DistanceTable, PQCodebook, PQConfig, PQVector, QuantizedQuery, QuantizedVector, Quantizer,
-    RaBitQCodebook, RaBitQConfig,
-};
+pub use quantization::{DistanceTable, PQCodebook, PQConfig};
 
 // Indexes
 pub use index::{
-    BinaryIvfConfig, BinaryIvfIndex, IVFPQConfig, IVFPQIndex, IVFRaBitQConfig, IVFRaBitQIndex,
-    RaBitQIndex,
+    BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, IVFPQConfig, IVFPQIndex, IvfPqQueryPlan,
 };
 
 #[cfg(test)]
 mod decode_tests {
     use super::decode_ann_bincode_exact;
+    use super::{ANN_DECODE_EXPANSION_FACTOR, ANN_DECODE_FIXED_HEADROOM};
+    use super::{MAX_DENSE_ANN_DECODE_BUDGET, MAX_DENSE_ANN_PAYLOAD_BYTES};
 
     #[test]
     fn ann_bincode_decode_is_exact_and_rejects_large_claims_from_tiny_payloads() {
@@ -165,5 +170,21 @@ mod decode_tests {
             bincode::serde::encode_to_vec(64usize * 1024 * 1024, bincode::config::standard())
                 .unwrap();
         assert!(decode_ann_bincode_exact::<Vec<u8>>(&oversized_claim, "test").is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn billion_scale_binary_payload_fits_checked_decode_budget() {
+        // Observed production payload: 8,916,876,069 bytes. It must pass the
+        // serialized-input ceiling, while bincode receives enough accounting
+        // budget for bytes consumed plus the decoded SoA allocations.
+        const OBSERVED_BINARY_IVF_BYTES: usize = 8_916_876_069;
+        const { assert!(OBSERVED_BINARY_IVF_BYTES < MAX_DENSE_ANN_PAYLOAD_BYTES) };
+        let budget = OBSERVED_BINARY_IVF_BYTES
+            .checked_mul(ANN_DECODE_EXPANSION_FACTOR)
+            .and_then(|bytes| bytes.checked_add(ANN_DECODE_FIXED_HEADROOM))
+            .unwrap_or(MAX_DENSE_ANN_DECODE_BUDGET)
+            .min(MAX_DENSE_ANN_DECODE_BUDGET);
+        assert_eq!(budget, 32 * 1024 * 1024 * 1024);
     }
 }

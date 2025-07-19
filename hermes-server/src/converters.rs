@@ -650,7 +650,10 @@ pub fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
 /// Produces a faithful round-trippable SDL including tokenizer, multi, fast,
 /// positions, and full vector configuration (dense/sparse).
 pub fn schema_to_sdl(schema: &Schema) -> String {
-    use hermes_core::dsl::{DenseVectorQuantization, FieldType, PositionMode, VectorIndexType};
+    use hermes_core::dsl::{
+        BinaryIndexType, DenseVectorQuantization, FieldType, IvfRoutingMode, PositionMode,
+        VectorIndexType,
+    };
     use hermes_core::structures::{IndexSize, WeightQuantization};
 
     let mut lines = vec!["index _ {".to_string()];
@@ -719,19 +722,58 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             if let Some(ref cfg) = entry.dense_vector_config {
                 let idx_name = match cfg.index_type {
                     VectorIndexType::Flat => "flat",
-                    VectorIndexType::RaBitQ => "rabitq",
-                    VectorIndexType::IvfRaBitQ => "ivf_rabitq",
-                    VectorIndexType::ScaNN => "scann",
+                    VectorIndexType::IvfPq => "ivf_pq",
                 };
                 idx_params.push(idx_name.to_string());
                 if let Some(nc) = cfg.num_clusters {
                     idx_params.push(format!("num_clusters: {}", nc));
                 }
-                if cfg.nprobe != 32 {
+                if cfg.nprobe != 64 {
                     idx_params.push(format!("nprobe: {}", cfg.nprobe));
                 }
-                if let Some(bt) = cfg.build_threshold {
-                    idx_params.push(format!("build_threshold: {}", bt));
+                if cfg.ivf_routing != IvfRoutingMode::Auto {
+                    let routing = match cfg.ivf_routing {
+                        IvfRoutingMode::Auto => unreachable!(),
+                        IvfRoutingMode::Flat => "flat",
+                        IvfRoutingMode::TwoLevel => "two_level",
+                        IvfRoutingMode::Hnsw => "hnsw",
+                    };
+                    idx_params.push(format!("routing: {routing}"));
+                }
+                if let Some(soar) = &cfg.soar {
+                    let mode = if soar.selective {
+                        "selective"
+                    } else if soar.num_secondary > 1 {
+                        "aggressive"
+                    } else {
+                        "full"
+                    };
+                    idx_params.push(format!("soar: {mode}"));
+                }
+            }
+
+            if let Some(ref cfg) = entry.binary_dense_vector_config {
+                idx_params.push(
+                    match cfg.index_type {
+                        BinaryIndexType::Flat => "flat",
+                        BinaryIndexType::Ivf => "ivf",
+                    }
+                    .to_string(),
+                );
+                if let Some(num_clusters) = cfg.num_clusters {
+                    idx_params.push(format!("num_clusters: {num_clusters}"));
+                }
+                if cfg.nprobe != 64 {
+                    idx_params.push(format!("nprobe: {}", cfg.nprobe));
+                }
+                if cfg.ivf_routing != IvfRoutingMode::Auto {
+                    let routing = match cfg.ivf_routing {
+                        IvfRoutingMode::Auto => unreachable!(),
+                        IvfRoutingMode::Flat => "flat",
+                        IvfRoutingMode::TwoLevel => "two_level",
+                        IvfRoutingMode::Hnsw => "hnsw",
+                    };
+                    idx_params.push(format!("routing: {routing}"));
                 }
             }
 
@@ -1346,7 +1388,7 @@ mod tests {
                 field count: u64 [indexed, stored, fast]
                 field tags: text<raw_ci> [indexed, stored<multi>, fast]
                 field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
-                field dense_emb: dense_vector<1024, f16> [indexed<ivf_rabitq, num_clusters: 256>, stored<multi>]
+                field dense_emb: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, num_clusters: 256>, stored<multi>]
                 field meta: json [stored<multi>]
             }
         "#;

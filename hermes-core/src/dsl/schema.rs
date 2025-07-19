@@ -28,7 +28,7 @@ pub enum FieldType {
     /// Sparse vector field - indexed as inverted posting lists with quantized weights
     #[serde(rename = "sparse_vector")]
     SparseVector,
-    /// Dense vector field - indexed using RaBitQ binary quantization for ANN search
+    /// Dense vector field indexed with the global IVF-PQ ANN implementation.
     #[serde(rename = "dense_vector")]
     DenseVector,
     /// JSON field - arbitrary JSON data, stored but not indexed
@@ -110,13 +110,30 @@ impl PositionMode {
 pub enum VectorIndexType {
     /// Flat - brute-force search over raw vectors (accumulating state)
     Flat,
-    /// RaBitQ - binary quantization, good for small datasets (<100K)
+    /// Global IVF with residual product quantization. This is the sole float
+    /// ANN format; Flat remains the accumulation/exact-scan representation.
     #[default]
-    RaBitQ,
-    /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
-    IvfRaBitQ,
-    /// ScaNN - product quantization with OPQ and anisotropic loss, best for large datasets
-    ScaNN,
+    IvfPq,
+}
+
+/// How an IVF coarse codebook is searched.
+///
+/// This is shared by floating-point and packed-binary dense fields. It only
+/// controls centroid routing; vector encoding and the distance metric remain
+/// properties of the concrete dense index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IvfRoutingMode {
+    /// Select flat routing for small codebooks and HNSW routing for large
+    /// codebooks where scanning every centroid would dominate query latency.
+    #[default]
+    Auto,
+    /// Score every leaf centroid exactly.
+    Flat,
+    /// Use a two-level, beam-routed hierarchy over the leaf centroids.
+    TwoLevel,
+    /// Use an HNSW graph over the global leaf centroids.
+    Hnsw,
 }
 
 /// Storage quantization for dense vector elements
@@ -173,59 +190,54 @@ impl DenseVectorQuantization {
     }
 }
 
-/// Configuration for dense vector fields using Flat, RaBitQ, IVF-RaBitQ, or ScaNN
+/// Configuration for dense vector fields using exact Flat accumulation or the
+/// single production IVF-PQ ANN format.
 ///
 /// Indexes operate in two states:
-/// - **Flat (accumulating)**: Brute-force search over raw vectors. Used when vector count
-///   is below `build_threshold` or before `build_index` is called.
+/// - **Flat (accumulating)**: Brute-force search over raw vectors before
+///   `build_vector_index` is called.
 /// - **Built (ANN)**: Fast approximate nearest neighbor search using trained structures.
-///   Centroids and codebooks are trained from data and stored within the segment.
+///   Centroids and codebooks are trained from index-wide data and shared by
+///   every segment; segment payloads contain only assignments and PQ codes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenseVectorConfig {
     /// Dimensionality of vectors
     pub dim: usize,
-    /// Target vector index algorithm (Flat, RaBitQ, IVF-RaBitQ, or ScaNN)
+    /// Target vector index algorithm (Flat or IVF-PQ).
     /// When in accumulating state, search uses brute-force regardless of this setting.
     #[serde(default)]
     pub index_type: VectorIndexType,
     /// Storage quantization for vector elements (f32, f16, uint8)
     #[serde(default)]
     pub quantization: DenseVectorQuantization,
-    /// Number of IVF clusters for IVF-RaBitQ and ScaNN (default: sqrt(n) capped at 4096)
+    /// Number of IVF leaf clusters. If omitted, a billion-scale cost model and
+    /// the available training sample determine the value.
     /// If None, automatically determined based on dataset size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_clusters: Option<usize>,
-    /// Number of clusters to probe during search (default: 32)
+    /// Coarse-codebook routing strategy. This setting is metric agnostic and
+    /// is applied to every IVF-backed dense index.
+    #[serde(default)]
+    pub ivf_routing: IvfRoutingMode,
+    /// Number of leaf clusters to probe during search (default: 64)
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
-    /// Minimum number of vectors required before building ANN index.
-    /// Below this threshold, brute-force (Flat) search is used.
-    /// Default: 1000 for RaBitQ, 10000 for IVF-RaBitQ/ScaNN.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_threshold: Option<usize>,
     /// Whether stored vectors are pre-normalized to unit L2 norm.
     /// When true, scoring skips per-vector norm computation (cosine = dot / ||q||),
     /// reducing compute by ~40%. Common for embedding models (e.g. OpenAI, Cohere).
     /// Default: true (most embedding models produce L2-normalized vectors).
     #[serde(default = "default_unit_norm")]
     pub unit_norm: bool,
-    /// Total RaBitQ bits per dimension for IVF-RaBitQ indexes.
-    /// 1 = classic binary RaBitQ (default). 2-8 = extended multi-bit codes
-    /// with much tighter distance estimates — allows lowering rerank_factor
-    /// (fewer raw-vector reads) at the same recall. Recommended: 4-5 for
-    /// disk-resident indexes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rabitq_bits: Option<u8>,
-    /// SOAR spilled cluster assignments for IVF-based indexes (IVF-RaBitQ, ScaNN).
+    /// SOAR spilled cluster assignments for IVF-PQ.
     /// Assigns vectors to a secondary cluster with an orthogonality-amplified
     /// residual, improving recall at the same nprobe for ~1.2-2x assignment storage.
-    /// Default: None (disabled). Ignored for Flat/RaBitQ index types.
+    /// Default: None (disabled). Ignored while a field remains flat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soar: Option<crate::structures::SoarConfig>,
 }
 
 fn default_nprobe() -> usize {
-    32
+    64
 }
 
 fn default_unit_norm() -> bool {
@@ -236,44 +248,27 @@ impl DenseVectorConfig {
     pub fn new(dim: usize) -> Self {
         Self {
             dim,
-            index_type: VectorIndexType::RaBitQ,
+            index_type: VectorIndexType::IvfPq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
-            nprobe: 32,
-            build_threshold: None,
+            ivf_routing: IvfRoutingMode::Auto,
+            nprobe: 64,
             unit_norm: true,
             soar: None,
-            rabitq_bits: None,
         }
     }
 
-    /// Create IVF-RaBitQ configuration
-    pub fn with_ivf(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
+    /// Create IVF-PQ configuration.
+    pub fn with_ivf_pq(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
         Self {
             dim,
-            index_type: VectorIndexType::IvfRaBitQ,
+            index_type: VectorIndexType::IvfPq,
             quantization: DenseVectorQuantization::F32,
             num_clusters,
+            ivf_routing: IvfRoutingMode::Auto,
             nprobe,
-            build_threshold: None,
             unit_norm: true,
             soar: None,
-            rabitq_bits: None,
-        }
-    }
-
-    /// Create ScaNN configuration
-    pub fn with_scann(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
-        Self {
-            dim,
-            index_type: VectorIndexType::ScaNN,
-            quantization: DenseVectorQuantization::F32,
-            num_clusters,
-            nprobe,
-            build_threshold: None,
-            unit_norm: true,
-            soar: None,
-            rabitq_bits: None,
         }
     }
 
@@ -284,23 +279,16 @@ impl DenseVectorConfig {
             index_type: VectorIndexType::Flat,
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: true,
             soar: None,
-            rabitq_bits: None,
         }
     }
 
     /// Set storage quantization
     pub fn with_quantization(mut self, quantization: DenseVectorQuantization) -> Self {
         self.quantization = quantization;
-        self
-    }
-
-    /// Set build threshold for auto-building ANN index
-    pub fn with_build_threshold(mut self, threshold: usize) -> Self {
-        self.build_threshold = Some(threshold);
         self
     }
 
@@ -316,12 +304,11 @@ impl DenseVectorConfig {
         self
     }
 
-    /// Set RaBitQ total bits per dimension (1 = classic, 2-8 = extended)
-    pub fn with_rabitq_bits(mut self, bits: u8) -> Self {
-        self.rabitq_bits = Some(bits.clamp(1, 8));
+    /// Set flat, two-level, or HNSW IVF centroid routing explicitly.
+    pub fn with_ivf_routing(mut self, routing: IvfRoutingMode) -> Self {
+        self.ivf_routing = routing;
         self
     }
-
     /// Enable SOAR spilled secondary cluster assignments (IVF-based indexes only)
     pub fn with_soar(mut self, soar: crate::structures::SoarConfig) -> Self {
         self.soar = Some(soar);
@@ -330,15 +317,7 @@ impl DenseVectorConfig {
 
     /// Check if this config uses IVF
     pub fn uses_ivf(&self) -> bool {
-        matches!(
-            self.index_type,
-            VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN
-        )
-    }
-
-    /// Check if this config uses ScaNN
-    pub fn uses_scann(&self) -> bool {
-        self.index_type == VectorIndexType::ScaNN
+        self.index_type == VectorIndexType::IvfPq
     }
 
     /// Check if this config is flat (brute-force)
@@ -346,21 +325,14 @@ impl DenseVectorConfig {
         self.index_type == VectorIndexType::Flat
     }
 
-    /// Get the default build threshold for this index type
-    pub fn default_build_threshold(&self) -> usize {
-        self.build_threshold.unwrap_or(match self.index_type {
-            VectorIndexType::Flat => usize::MAX, // Never auto-build
-            VectorIndexType::RaBitQ => 1000,
-            VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN => 10000,
-        })
-    }
-
     /// Calculate optimal number of clusters for given vector count
     pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
         self.num_clusters.unwrap_or_else(|| {
-            // sqrt(n) heuristic, capped at 4096
-            let optimal = (num_vectors as f64).sqrt() as usize;
-            optimal.clamp(16, 4096)
+            // Balanced IVF cost model: practical values are commonly in the
+            // 4-16×sqrt(N) range. Eight is a conservative midpoint; training
+            // quality and artifact memory impose the final bounds.
+            let optimal = 8.0 * (num_vectors as f64).sqrt();
+            (optimal as usize).clamp(16, 1_048_576)
         })
     }
 }
@@ -368,37 +340,37 @@ impl DenseVectorConfig {
 /// Configuration for binary dense vector fields
 ///
 /// Binary dense vectors store packed bits (1 bit per dimension) and use
-/// Hamming distance for scoring. Always uses brute-force flat search
-/// (Hamming popcount is ~10ns/vec for 768-bit, ANN indexes don't help).
+/// Hamming distance for scoring. Segments accumulate exact packed codes and
+/// use the same global IVF router after `build_vector_index`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryDenseVectorConfig {
     /// Number of bits (dimensions). Storage is ceil(dim/8) bytes per vector.
     pub dim: usize,
-    /// ANN index type: Flat (brute-force SIMD Hamming, default) or Ivf
+    /// ANN index type: Flat (brute-force SIMD Hamming) or Ivf (default)
     /// (k-majority Hamming clusters — probe `nprobe` clusters at query time).
     /// IVF pays off for segments past a few million vectors.
     #[serde(default)]
     pub index_type: BinaryIndexType,
-    /// Number of IVF clusters (default: sqrt(n) capped at 4096)
+    /// Number of IVF leaf clusters, selected from corpus and sample size by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_clusters: Option<usize>,
-    /// Clusters to probe during search (default: 32)
+    /// Coarse-codebook routing strategy. Uses the same routing planner as
+    /// floating-point IVF indexes.
+    #[serde(default)]
+    pub ivf_routing: IvfRoutingMode,
+    /// Clusters to probe during search (default: 64)
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
-    /// Minimum vectors before building the IVF index (default: 100_000 —
-    /// below that brute-force SIMD Hamming is faster than probing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_threshold: Option<usize>,
 }
 
 /// ANN index type for binary dense vector fields
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BinaryIndexType {
-    /// Brute-force SIMD Hamming scan (default)
-    #[default]
+    /// Brute-force SIMD Hamming scan
     Flat,
-    /// IVF with k-majority Hamming clustering
+    /// IVF with a global k-majority Hamming quantizer
+    #[default]
     Ivf,
 }
 
@@ -410,10 +382,10 @@ impl BinaryDenseVectorConfig {
         );
         Self {
             dim,
-            index_type: BinaryIndexType::Flat,
+            index_type: BinaryIndexType::Ivf,
             num_clusters: None,
-            nprobe: 32,
-            build_threshold: None,
+            ivf_routing: IvfRoutingMode::Auto,
+            nprobe: 64,
         }
     }
 
@@ -425,22 +397,17 @@ impl BinaryDenseVectorConfig {
         self
     }
 
-    /// Set the build threshold (builder pattern)
-    pub fn with_build_threshold(mut self, threshold: usize) -> Self {
-        self.build_threshold = Some(threshold);
+    /// Set flat, two-level, or HNSW IVF centroid routing explicitly.
+    pub fn with_ivf_routing(mut self, routing: IvfRoutingMode) -> Self {
+        self.ivf_routing = routing;
         self
-    }
-
-    /// Default build threshold: brute-force wins below ~100K vectors.
-    pub fn default_build_threshold(&self) -> usize {
-        self.build_threshold.unwrap_or(100_000)
     }
 
     /// Optimal cluster count for a given vector count (sqrt(n), capped)
     pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
         self.num_clusters.unwrap_or_else(|| {
-            let optimal = (num_vectors as f64).sqrt() as usize;
-            optimal.clamp(16, 4096)
+            let optimal = 8.0 * (num_vectors as f64).sqrt();
+            (optimal as usize).clamp(16, 1_048_576)
         })
     }
 
@@ -678,8 +645,8 @@ impl SchemaBuilder {
 
     /// Add a dense vector field with default configuration
     ///
-    /// Dense vectors are indexed using RaBitQ binary quantization for fast ANN search.
-    /// The dimension must be specified as it determines the quantization structure.
+    /// Dense vectors use the global IVF-PQ ANN implementation. The dimension
+    /// determines both the stored vector shape and PQ structure.
     pub fn add_dense_vector_field(
         &mut self,
         name: &str,
@@ -719,8 +686,9 @@ impl SchemaBuilder {
 
     /// Add a binary dense vector field
     ///
-    /// Binary dense vectors use packed-bit storage (1 bit per dimension)
-    /// and Hamming distance scoring. Always brute-force flat search.
+    /// Binary dense vectors use packed-bit storage (1 bit per dimension),
+    /// exact Hamming scoring inside globally routed IVF leaves, and a flat
+    /// SIMD fallback while the index is accumulating.
     pub fn add_binary_dense_vector_field(
         &mut self,
         name: &str,

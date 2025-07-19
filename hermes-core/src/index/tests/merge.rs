@@ -669,8 +669,7 @@ async fn test_commit_with_vectors_and_background_merge() {
 
     let mut schema_builder = SchemaBuilder::default();
     let title = schema_builder.add_text_field("title", true, true);
-    // RaBitQ with very low build_threshold so vector index building triggers during commit
-    let vec_config = DenseVectorConfig::new(8).with_build_threshold(10);
+    let vec_config = DenseVectorConfig::new(8);
     let embedding =
         schema_builder.add_dense_vector_field_with_config("embedding", true, true, vec_config);
     let schema = schema_builder.build();

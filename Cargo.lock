@@ -486,7 +486,7 @@ dependencies = [
  "oneshot 0.2.1",
  "portable-atomic-util",
  "rand 0.10.2",
- "rand_distr 0.6.0",
+ "rand_distr",
  "serde",
  "spin",
 ]
@@ -783,7 +783,7 @@ dependencies = [
  "num-traits",
  "portable-atomic-util",
  "rand 0.10.2",
- "rand_distr 0.6.0",
+ "rand_distr",
  "serde",
  "smallvec",
  "spin",
@@ -3080,7 +3080,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "hf-hub 1.0.0",
  "instant",
- "kentro",
  "lasso",
  "libc",
  "log",
@@ -3088,7 +3087,6 @@ dependencies = [
  "metrics",
  "metrics-util",
  "nalgebra",
- "ndarray 0.16.1",
  "num_cpus",
  "parking_lot",
  "pest",
@@ -3836,19 +3834,6 @@ dependencies = [
  "cfg-if 1.0.4",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kentro"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a6133886c9ee033ec9f4139fdb3af268ecf641b09112961e9f1e1c0dce8a13"
-dependencies = [
- "ndarray 0.16.1",
- "rand 0.8.7",
- "rand_distr 0.4.3",
- "rayon",
- "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -5386,16 +5371,6 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
-
-[[package]]
-name = "rand_distr"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
-dependencies = [
- "num-traits",
- "rand 0.8.7",
-]
 
 [[package]]
 name = "rand_distr"

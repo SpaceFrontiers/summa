@@ -15,11 +15,13 @@ use crate::dsl::Field;
 /// Trained vector index structures for rebuilding segments with ANN indexes
 ///
 /// Defined here (not in merger) so it's available on all platforms including WASM.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TrainedVectorStructures {
     /// Trained centroids per field_id
     pub centroids: FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
-    /// Trained PQ codebooks per field_id (for ScaNN)
+    /// Global Hamming coarse quantizers per binary dense field.
+    pub binary_quantizers: FxHashMap<u32, Arc<crate::structures::BinaryCoarseQuantizer>>,
+    /// Index-global PQ codebooks per field ID.
     pub codebooks: FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
 }
 

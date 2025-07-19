@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use crate::dsl::{Schema, VectorIndexType};
+use crate::dsl::{BinaryIndexType, Schema, VectorIndexType};
 use crate::error::{Error, Result};
 
 /// Metadata file name at index level
@@ -29,7 +29,7 @@ const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 /// drops fields it does not know about, so loading newer metadata would
 /// misread index state and the next save would destructively rewrite the
 /// unknown fields away.
-pub const INDEX_META_FORMAT_VERSION: u32 = 1;
+pub const INDEX_META_FORMAT_VERSION: u32 = 3;
 
 /// Index-level centroids/codebooks are deliberately bounded before they are
 /// read or decoded. Besides limiting ordinary corruption damage, the matching
@@ -85,18 +85,37 @@ pub struct SegmentMetaInfo {
 }
 
 /// Per-field vector index metadata
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "index", rename_all = "snake_case")]
+pub enum VectorFieldIndexType {
+    Float(VectorIndexType),
+    Binary(BinaryIndexType),
+}
+
+impl From<VectorIndexType> for VectorFieldIndexType {
+    fn from(value: VectorIndexType) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl From<BinaryIndexType> for VectorFieldIndexType {
+    fn from(value: BinaryIndexType) -> Self {
+        Self::Binary(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldVectorMeta {
     /// Field ID
     pub field_id: u32,
     /// Configured index type (target type when built)
-    pub index_type: VectorIndexType,
+    pub index_type: VectorFieldIndexType,
     /// Current state
     pub state: VectorIndexState,
     /// Path to centroids file (relative to index dir)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub centroids_file: Option<String>,
-    /// Path to codebook file (relative to index dir, for ScaNN)
+    /// Path to the index-global codebook file, relative to the index directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codebook_file: Option<String>,
 }
@@ -218,7 +237,8 @@ impl IndexMetadata {
     }
 
     /// Initialize field metadata (called when field is first seen)
-    pub fn init_field(&mut self, field_id: u32, index_type: VectorIndexType) {
+    pub fn init_field(&mut self, field_id: u32, index_type: impl Into<VectorFieldIndexType>) {
+        let index_type = index_type.into();
         self.vector_fields
             .entry(field_id)
             .or_insert(FieldVectorMeta {
@@ -300,21 +320,17 @@ impl IndexMetadata {
         }
     }
 
-    /// Deserialize metadata bytes, refusing formats newer than this build.
-    ///
-    /// serde_json silently drops unknown fields, so loading newer metadata
-    /// would misread index state and the next save would destructively
-    /// rewrite the newer fields away. Fail loud instead.
+    /// Deserialize only the current format. Vector artifacts are intentionally
+    /// rebuilt when the ANN format changes; silently accepting older metadata
+    /// would mix incompatible segment and global-codebook generations.
     fn deserialize_versioned(bytes: &[u8]) -> Result<Self> {
         let meta: Self =
             serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
-        if meta.version > INDEX_META_FORMAT_VERSION {
+        if meta.version != INDEX_META_FORMAT_VERSION {
             return Err(Error::Corruption(format!(
-                "metadata.json format version {} is newer than this build supports (max {}). \
-                 Refusing to load: unknown fields would be silently dropped and destructively \
-                 rewritten on the next save. Open this index with a hermes build that \
-                 understands metadata format version {}",
-                meta.version, INDEX_META_FORMAT_VERSION, meta.version
+                "metadata.json format version {} is incompatible with required version {}; \
+                 rebuild and republish the index with this Hermes version",
+                meta.version, INDEX_META_FORMAT_VERSION
             )));
         }
         Ok(meta)
@@ -415,6 +431,7 @@ impl IndexMetadata {
         use std::sync::Arc;
 
         let mut centroids = rustc_hash::FxHashMap::default();
+        let mut binary_quantizers = rustc_hash::FxHashMap::default();
         let mut codebooks = rustc_hash::FxHashMap::default();
         let mut built_fields: Vec<_> = vector_fields
             .iter()
@@ -442,46 +459,6 @@ impl IndexMetadata {
                 )));
             }
 
-            let schema_config = match schema {
-                None => None,
-                Some(schema) => {
-                    let entry = schema
-                        .get_field_entry(crate::dsl::Field(*field_id))
-                        .ok_or_else(|| {
-                            Error::Corruption(format!(
-                                "trained vector metadata references missing field {field_id}"
-                            ))
-                        })?;
-                    if entry.field_type != crate::dsl::FieldType::DenseVector {
-                        return Err(Error::Corruption(format!(
-                            "trained vector metadata field {field_id} has non-dense schema type {:?}",
-                            entry.field_type
-                        )));
-                    }
-                    let config = entry.dense_vector_config.as_ref().ok_or_else(|| {
-                        Error::Corruption(format!(
-                            "trained vector metadata field {field_id} has no dense-vector configuration"
-                        ))
-                    })?;
-                    if field_meta.index_type != config.index_type {
-                        return Err(Error::Corruption(format!(
-                            "trained vector metadata field {field_id} uses {:?}, schema requires {:?}",
-                            field_meta.index_type, config.index_type
-                        )));
-                    }
-                    Some(config)
-                }
-            };
-            if !matches!(
-                field_meta.index_type,
-                VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN
-            ) {
-                return Err(Error::Corruption(format!(
-                    "field {field_id} is Built for {:?}, which has no index-level trained artifacts",
-                    field_meta.index_type
-                )));
-            }
-
             let expected_clusters = match field_meta.state {
                 VectorIndexState::Built { num_clusters, .. } if num_clusters > 0 => num_clusters,
                 VectorIndexState::Built { .. } => {
@@ -497,81 +474,135 @@ impl IndexMetadata {
                     "trained vector metadata field {field_id} is Built but has no centroids_file"
                 ))
             })?;
-            let c: crate::structures::CoarseCentroids =
-                load_trained_artifact(dir, *field_id, "centroids", centroids_file).await?;
-            let expected_dim = schema_config.map_or(c.dim, |config| config.dim);
-            let actual_clusters = c.num_clusters as usize;
-            let expected_values = actual_clusters.checked_mul(expected_dim).ok_or_else(|| {
-                Error::Corruption(format!(
-                    "trained centroid dimensions overflow for field {field_id}"
-                ))
-            })?;
-            if actual_clusters == 0
-                || actual_clusters > expected_clusters
-                || c.dim == 0
-                || c.dim != expected_dim
-                || c.centroids.len() != expected_values
-                || c.centroids.iter().any(|value| !value.is_finite())
-            {
-                return Err(Error::Corruption(format!(
-                    "trained centroids for field {field_id} do not match metadata/schema: \
-                     clusters={} (metadata maximum {expected_clusters}), dim={} (expected {}), \
-                     values={} (expected {expected_values})",
-                    c.num_clusters,
-                    c.dim,
-                    expected_dim,
-                    c.centroids.len(),
-                )));
-            }
-            if actual_clusters < expected_clusters {
-                // Older writers persisted the requested cluster count even
-                // though the trainer clamps it to the available sample. This
-                // shape is safe and self-describing in the artifact; accepting
-                // it keeps pre-fix indexes openable. New writers persist the
-                // actual count, so no new mismatch is produced.
-                log::warn!(
-                    "[trained] field {} legacy cluster-count clamp: metadata={}, artifact={}",
-                    field_id,
-                    expected_clusters,
-                    actual_clusters,
-                );
-            }
-            log::debug!(
-                "[trained] field {} loaded centroids ({} clusters)",
-                field_id,
-                c.num_clusters
-            );
-
-            if field_meta.index_type == VectorIndexType::ScaNN {
-                let codebook_file = field_meta.codebook_file.as_deref().ok_or_else(|| {
-                    Error::Corruption(format!(
-                        "trained vector metadata field {field_id} is ScaNN Built but has no codebook_file"
-                    ))
-                })?;
-                let codebook: crate::structures::PQCodebook =
-                    load_trained_artifact(dir, *field_id, "codebook", codebook_file).await?;
-                codebook.validate().map_err(|error| {
-                    Error::Corruption(format!(
-                        "invalid trained codebook for field {field_id}: {error}"
-                    ))
-                })?;
-                if codebook.config.dim != expected_dim {
+            match field_meta.index_type {
+                VectorFieldIndexType::Float(index_type @ VectorIndexType::IvfPq) => {
+                    let schema_config = schema
+                        .map(|schema| {
+                            let entry = schema
+                                .get_field_entry(crate::dsl::Field(*field_id))
+                                .ok_or_else(|| Error::Corruption(format!(
+                                    "trained vector metadata references missing field {field_id}"
+                                )))?;
+                            let config = entry.dense_vector_config.as_ref().filter(|_| {
+                                entry.field_type == crate::dsl::FieldType::DenseVector
+                            }).ok_or_else(|| Error::Corruption(format!(
+                                "trained vector metadata field {field_id} is not a float dense field"
+                            )))?;
+                            if config.index_type != index_type {
+                                return Err(Error::Corruption(format!(
+                                    "trained vector metadata field {field_id} uses {index_type:?}, schema requires {:?}",
+                                    config.index_type
+                                )));
+                            }
+                            Ok(config)
+                        })
+                        .transpose()?;
+                    let c: crate::structures::CoarseCentroids =
+                        load_trained_artifact(dir, *field_id, "centroids", centroids_file).await?;
+                    let expected_dim = schema_config.map_or(c.dim, |config| config.dim);
+                    let actual_clusters = c.num_clusters as usize;
+                    let expected_values =
+                        actual_clusters.checked_mul(expected_dim).ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "trained centroid dimensions overflow for field {field_id}"
+                            ))
+                        })?;
+                    if actual_clusters == 0
+                        || actual_clusters > expected_clusters
+                        || c.dim == 0
+                        || c.dim != expected_dim
+                        || c.centroids.len() != expected_values
+                        || c.centroids.iter().any(|value| !value.is_finite())
+                    {
+                        return Err(Error::Corruption(format!(
+                            "trained centroids for field {field_id} do not match metadata/schema"
+                        )));
+                    }
+                    if let Some(config) = schema_config {
+                        c.validate_routing(config.ivf_routing).map_err(|error| {
+                            Error::Corruption(format!(
+                                "invalid trained centroid routing for field {field_id}: {error}"
+                            ))
+                        })?;
+                    }
+                    let codebook_file = field_meta.codebook_file.as_deref().ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "trained float IVF-PQ field {field_id} has no codebook_file"
+                        ))
+                    })?;
+                    let codebook: crate::structures::PQCodebook =
+                        load_trained_artifact(dir, *field_id, "codebook", codebook_file).await?;
+                    codebook.validate().map_err(|error| {
+                        Error::Corruption(format!(
+                            "invalid trained codebook for field {field_id}: {error}"
+                        ))
+                    })?;
+                    if codebook.config.dim != expected_dim {
+                        return Err(Error::Corruption(format!(
+                            "trained codebook for field {field_id} has dimension {}, expected {expected_dim}",
+                            codebook.config.dim
+                        )));
+                    }
+                    codebooks.insert(*field_id, Arc::new(codebook));
+                    centroids.insert(*field_id, Arc::new(c));
+                }
+                VectorFieldIndexType::Binary(BinaryIndexType::Ivf) => {
+                    let schema_config = schema
+                        .map(|schema| {
+                            let entry = schema
+                                .get_field_entry(crate::dsl::Field(*field_id))
+                                .ok_or_else(|| Error::Corruption(format!(
+                                    "trained vector metadata references missing field {field_id}"
+                                )))?;
+                            entry.binary_dense_vector_config.as_ref().filter(|config| {
+                                entry.field_type == crate::dsl::FieldType::BinaryDenseVector
+                                    && config.index_type == BinaryIndexType::Ivf
+                            }).ok_or_else(|| Error::Corruption(format!(
+                                "trained vector metadata field {field_id} is not a binary IVF field"
+                            )))
+                        })
+                        .transpose()?;
+                    let quantizer: crate::structures::BinaryCoarseQuantizer =
+                        load_trained_artifact(dir, *field_id, "binary centroids", centroids_file)
+                            .await?;
+                    quantizer.validate().map_err(|error| {
+                        Error::Corruption(format!(
+                            "invalid binary coarse quantizer for field {field_id}: {error}"
+                        ))
+                    })?;
+                    let actual_clusters = quantizer.num_clusters as usize;
+                    if actual_clusters > expected_clusters
+                        || schema_config.is_some_and(|config| config.dim != quantizer.dim_bits)
+                    {
+                        return Err(Error::Corruption(format!(
+                            "binary coarse quantizer for field {field_id} does not match metadata/schema"
+                        )));
+                    }
+                    if let Some(config) = schema_config {
+                        quantizer
+                            .validate_routing(config.ivf_routing)
+                            .map_err(|error| {
+                                Error::Corruption(format!(
+                                    "invalid binary centroid routing for field {field_id}: {error}"
+                                ))
+                            })?;
+                    }
+                    binary_quantizers.insert(*field_id, Arc::new(quantizer));
+                }
+                unsupported => {
                     return Err(Error::Corruption(format!(
-                        "trained codebook for field {field_id} has dimension {}, expected {}",
-                        codebook.config.dim, expected_dim
+                        "field {field_id} is Built for {unsupported:?}, which has no global IVF artifacts"
                     )));
                 }
-                log::debug!("[trained] field {} loaded codebook", field_id);
-                codebooks.insert(*field_id, Arc::new(codebook));
             }
-            centroids.insert(*field_id, Arc::new(c));
         }
 
-        if centroids.is_empty() {
+        if centroids.is_empty() && binary_quantizers.is_empty() {
             Ok(None)
         } else {
             Ok(Some(crate::segment::TrainedVectorStructures {
                 centroids,
+                binary_quantizers,
                 codebooks,
             }))
         }
@@ -732,8 +763,7 @@ mod tests {
     fn dense_schema(index_type: VectorIndexType) -> (Schema, crate::dsl::Field) {
         let mut builder = crate::dsl::SchemaBuilder::default();
         let config = match index_type {
-            VectorIndexType::IvfRaBitQ => crate::dsl::DenseVectorConfig::with_ivf(2, Some(1), 1),
-            VectorIndexType::ScaNN => crate::dsl::DenseVectorConfig::with_scann(2, Some(1), 1),
+            VectorIndexType::IvfPq => crate::dsl::DenseVectorConfig::with_ivf_pq(2, Some(1), 1),
             other => panic!("unsupported trained test index type: {other:?}"),
         };
         let field = builder.add_dense_vector_field_with_config("embedding", true, true, config);
@@ -747,6 +777,20 @@ mod tests {
             centroids: vec![0.25, 0.75],
             version: 7,
             soar_config: None,
+            routing_index: None,
+        }
+    }
+
+    fn test_codebook() -> crate::structures::PQCodebook {
+        let config = crate::structures::PQConfig::new(2).with_opq(false, 0);
+        crate::structures::PQCodebook {
+            centroids: vec![
+                0.0;
+                config.num_subspaces * config.num_centroids * config.dims_per_block
+            ],
+            rotation_matrix: None,
+            version: 11,
+            config,
         }
     }
 
@@ -766,7 +810,7 @@ mod tests {
         assert!(meta.segment_metas.is_empty());
         assert!(!meta.is_field_built(0));
 
-        meta.init_field(0, VectorIndexType::IvfRaBitQ);
+        meta.init_field(0, VectorIndexType::IvfPq);
         assert!(!meta.is_field_built(0));
         assert!(meta.vector_fields.contains_key(&0));
     }
@@ -775,22 +819,22 @@ mod tests {
     async fn load_refuses_metadata_stamped_with_a_newer_format_version() {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(test_schema());
-        metadata.version = 2;
+        metadata.version = INDEX_META_FORMAT_VERSION + 1;
         metadata.save(&directory).await.unwrap();
 
         let error = IndexMetadata::load(&directory)
             .await
             .expect_err("metadata from a newer format version must be refused, not silently pruned")
             .to_string();
-        assert!(error.contains("version 2"), "{error}");
-        assert!(error.contains("newer"), "{error}");
+        assert!(error.contains("version 4"), "{error}");
+        assert!(error.contains("incompatible"), "{error}");
     }
 
     #[tokio::test]
     async fn tmp_recovery_refuses_metadata_stamped_with_a_newer_format_version() {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(test_schema());
-        metadata.version = 2;
+        metadata.version = INDEX_META_FORMAT_VERSION + 1;
         let bytes = metadata.serialize_to_bytes().unwrap();
         // Simulate a crash between write and rename: only the temp file exists.
         directory
@@ -802,7 +846,7 @@ mod tests {
             .await
             .expect_err("temp-file recovery must apply the same version gate")
             .to_string();
-        assert!(error.contains("version 2"), "{error}");
+        assert!(error.contains("version 4"), "{error}");
     }
 
     #[tokio::test]
@@ -820,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn trained_artifacts_load_only_when_the_complete_built_set_is_valid() {
         let mut builder = crate::dsl::SchemaBuilder::default();
-        let config = crate::dsl::DenseVectorConfig::with_ivf(2, Some(1), 1);
+        let config = crate::dsl::DenseVectorConfig::with_ivf_pq(2, Some(1), 1);
         let first = builder.add_dense_vector_field_with_config(
             "first_embedding",
             true,
@@ -832,11 +876,24 @@ mod tests {
         let schema = builder.build();
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(first.0, VectorIndexType::IvfRaBitQ);
-        metadata.init_field(second.0, VectorIndexType::IvfRaBitQ);
-        metadata.mark_field_built(first.0, 10, 1, "field_0_centroids.bin".into(), None);
-        metadata.mark_field_built(second.0, 10, 1, "field_1_centroids.bin".into(), None);
+        metadata.init_field(first.0, VectorIndexType::IvfPq);
+        metadata.init_field(second.0, VectorIndexType::IvfPq);
+        metadata.mark_field_built(
+            first.0,
+            10,
+            1,
+            "field_0_centroids.bin".into(),
+            Some("field_0_codebook.bin".into()),
+        );
+        metadata.mark_field_built(
+            second.0,
+            10,
+            1,
+            "field_1_centroids.bin".into(),
+            Some("field_1_codebook.bin".into()),
+        );
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
+        write_bincode(&directory, "field_0_codebook.bin", &test_codebook()).await;
 
         let error = IndexMetadata::try_load_trained_from_fields(
             &metadata.vector_fields,
@@ -859,10 +916,10 @@ mod tests {
 
     #[tokio::test]
     async fn index_open_fails_closed_when_built_artifact_is_missing() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfRaBitQ);
+        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema);
-        metadata.init_field(field.0, VectorIndexType::IvfRaBitQ);
+        metadata.init_field(field.0, VectorIndexType::IvfPq);
         metadata.mark_field_built(field.0, 10, 1, "missing_centroids.bin".into(), None);
         metadata.save(&directory).await.unwrap();
 
@@ -876,11 +933,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scann_built_state_requires_a_codebook() {
-        let (schema, field) = dense_schema(VectorIndexType::ScaNN);
+    async fn ivf_pq_built_state_requires_a_codebook() {
+        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::ScaNN);
+        metadata.init_field(field.0, VectorIndexType::IvfPq);
         metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
 
@@ -891,26 +948,33 @@ mod tests {
         )
         .await
         .err()
-        .expect("ScaNN Built state without a codebook must fail")
+        .expect("IVF-PQ Built state without a codebook must fail")
         .to_string();
         assert!(error.contains("has no codebook_file"), "{error}");
     }
 
     #[tokio::test]
-    async fn legacy_requested_cluster_count_accepts_a_clamped_artifact() {
+    async fn requested_cluster_count_accepts_a_quality_clamped_artifact() {
         let mut builder = crate::dsl::SchemaBuilder::default();
         let field = builder.add_dense_vector_field_with_config(
             "embedding",
             true,
             true,
-            crate::dsl::DenseVectorConfig::with_ivf(2, Some(4), 1),
+            crate::dsl::DenseVectorConfig::with_ivf_pq(2, Some(4), 1),
         );
         let schema = builder.build();
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfRaBitQ);
-        metadata.mark_field_built(field.0, 1, 4, "field_0_centroids.bin".into(), None);
+        metadata.init_field(field.0, VectorIndexType::IvfPq);
+        metadata.mark_field_built(
+            field.0,
+            1,
+            4,
+            "field_0_centroids.bin".into(),
+            Some("field_0_codebook.bin".into()),
+        );
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
+        write_bincode(&directory, "field_0_codebook.bin", &test_codebook()).await;
 
         let trained = IndexMetadata::try_load_trained_from_fields(
             &metadata.vector_fields,
@@ -925,10 +989,10 @@ mod tests {
 
     #[tokio::test]
     async fn trained_artifact_loader_rejects_trailing_data() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfRaBitQ);
+        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfRaBitQ);
+        metadata.init_field(field.0, VectorIndexType::IvfPq);
         metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
         let mut bytes =
             bincode::serde::encode_to_vec(test_centroids(), bincode::config::standard()).unwrap();
@@ -966,10 +1030,10 @@ mod tests {
 
     #[tokio::test]
     async fn trained_artifact_decode_limit_rejects_forged_collection_length() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfRaBitQ);
+        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfRaBitQ);
+        metadata.init_field(field.0, VectorIndexType::IvfPq);
         metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
 
         // CoarseCentroids begins with num_clusters=1, dim=2, then the Vec
@@ -1018,7 +1082,7 @@ mod tests {
     #[test]
     fn test_mark_field_built() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.init_field(0, VectorIndexType::IvfRaBitQ);
+        meta.init_field(0, VectorIndexType::IvfPq);
         meta.total_vectors = 10000;
 
         assert!(!meta.is_field_built(0));
@@ -1036,8 +1100,8 @@ mod tests {
     #[test]
     fn total_vectors_is_aggregate_of_built_field_counts() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.init_field(7, VectorIndexType::IvfRaBitQ);
-        meta.init_field(3, VectorIndexType::ScaNN);
+        meta.init_field(7, VectorIndexType::IvfPq);
+        meta.init_field(3, VectorIndexType::IvfPq);
 
         // Build in reverse field-id order to ensure the result is not tied to
         // HashMap or training iteration order.
@@ -1061,7 +1125,7 @@ mod tests {
     #[test]
     fn test_should_build_field() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.init_field(0, VectorIndexType::IvfRaBitQ);
+        meta.init_field(0, VectorIndexType::IvfPq);
 
         // Below threshold
         meta.total_vectors = 500;
@@ -1080,7 +1144,7 @@ mod tests {
     fn test_serialization() {
         let mut meta = IndexMetadata::new(test_schema());
         meta.add_segment("seg1".to_string(), 100);
-        meta.init_field(0, VectorIndexType::IvfRaBitQ);
+        meta.init_field(0, VectorIndexType::IvfPq);
         meta.total_vectors = 5000;
 
         let json = serde_json::to_string_pretty(&meta).unwrap();

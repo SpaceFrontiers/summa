@@ -1,15 +1,12 @@
 //! Types for segment reader
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::DocId;
 use crate::directories::{FileHandle, OwnedBytes};
-use crate::structures::{
-    BlockSparsePostingList, IVFPQIndex, IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex,
-    SparseBlock, SparseSkipEntry,
-};
+use crate::structures::{BlockSparsePostingList, IVFPQIndex, SparseBlock, SparseSkipEntry};
 
-/// Vector index type - RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
+/// Production ANN payloads for float IVF-PQ and packed-binary IVF.
 ///
 /// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
 /// via mmap for reranking and merge. This enum only holds ANN indexes.
@@ -20,12 +17,8 @@ use crate::structures::{
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
-    /// RaBitQ - lazy JSON deserialization on first access
-    RaBitQ(Arc<LazyRaBitQ>),
-    /// IVF-RaBitQ - lazy deserialization on first access
-    IVF(Arc<LazyIVF>),
-    /// ScaNN (IVF-PQ) - lazy deserialization on first access
-    ScaNN(Arc<LazyScaNN>),
+    /// Float IVF-PQ - lazy deserialization on first access
+    IvfPq(Arc<LazyIvfPq>),
     /// Binary IVF (Hamming) - lazy deserialization on first access
     BinaryIvf(Arc<LazyBinaryIvf>),
 }
@@ -35,14 +28,14 @@ pub enum VectorIndex {
 /// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
 /// The mmap pages are only paged into physical RAM when deserialization happens.
 pub struct LazyBinaryIvf {
-    raw: OwnedBytes,
+    raw: Mutex<Option<OwnedBytes>>,
     resolved: OnceLock<Option<Arc<crate::structures::BinaryIvfIndex>>>,
 }
 
 impl LazyBinaryIvf {
     pub fn new(raw: OwnedBytes) -> Self {
         Self {
-            raw,
+            raw: Mutex::new(Some(raw)),
             resolved: OnceLock::new(),
         }
     }
@@ -50,7 +43,16 @@ impl LazyBinaryIvf {
     pub fn get(&self) -> Option<&Arc<crate::structures::BinaryIvfIndex>> {
         self.resolved
             .get_or_init(|| {
-                match crate::structures::BinaryIvfIndex::from_bytes(self.raw.as_slice()) {
+                let raw = self
+                    .raw
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let Some(raw) = raw else {
+                    log::error!("[lazy_binary_ivf] serialized payload was already consumed");
+                    return None;
+                };
+                match crate::structures::BinaryIvfIndex::from_bytes(raw.as_slice()) {
                     Ok(idx) => Some(Arc::new(idx)),
                     Err(e) => {
                         log::warn!("[lazy_binary_ivf] deserialization failed: {}", e);
@@ -64,128 +66,62 @@ impl LazyBinaryIvf {
     pub fn estimated_memory_bytes(&self) -> usize {
         match self.resolved.get() {
             Some(Some(idx)) => idx.estimated_memory_bytes(),
-            _ => self.raw.len(),
+            _ => self
+                .raw
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map_or(0, OwnedBytes::len),
         }
     }
 }
 
-/// Lazy RaBitQ index — defers serde_json deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyRaBitQ {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<Arc<RaBitQIndex>>>,
+/// Lazy float IVF-PQ payload.
+pub struct LazyIvfPq {
+    raw: Mutex<Option<OwnedBytes>>,
+    resolved: OnceLock<Option<Arc<IVFPQIndex>>>,
 }
 
-impl LazyRaBitQ {
+impl LazyIvfPq {
     pub fn new(raw: OwnedBytes) -> Self {
         Self {
-            raw,
+            raw: Mutex::new(Some(raw)),
             resolved: OnceLock::new(),
         }
     }
 
-    pub fn get(&self) -> Option<&Arc<RaBitQIndex>> {
-        self.resolved
-            .get_or_init(|| match RaBitQIndex::from_bytes(self.raw.as_slice()) {
-                Ok(idx) => Some(Arc::new(idx)),
-                Err(e) => {
-                    log::warn!("[lazy_rabitq] deserialization failed: {}", e);
-                    None
-                }
-            })
-            .as_ref()
-    }
-
-    pub fn estimated_memory_bytes(&self) -> usize {
-        match self.resolved.get() {
-            Some(Some(idx)) => idx.estimated_memory_bytes(),
-            _ => self.raw.len(),
-        }
-    }
-}
-
-/// Lazy IVF-RaBitQ index — defers bincode deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyIVF {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<(Arc<IVFRaBitQIndex>, Arc<RaBitQCodebook>)>>,
-}
-
-impl LazyIVF {
-    pub fn new(raw: OwnedBytes) -> Self {
-        Self {
-            raw,
-            resolved: OnceLock::new(),
-        }
-    }
-
-    pub fn get(&self) -> Option<(&Arc<IVFRaBitQIndex>, &Arc<RaBitQCodebook>)> {
+    pub fn get(&self) -> Option<&Arc<IVFPQIndex>> {
         self.resolved
             .get_or_init(|| {
-                match super::super::vector_data::IVFRaBitQIndexData::from_bytes(&self.raw) {
-                    Ok(data) => Some((Arc::new(data.index), Arc::new(data.codebook))),
+                let raw = self
+                    .raw
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let Some(raw) = raw else {
+                    log::error!("[lazy_ivf_pq] serialized payload was already consumed");
+                    return None;
+                };
+                match IVFPQIndex::from_bytes(raw.as_slice()) {
+                    Ok(index) => Some(Arc::new(index)),
                     Err(e) => {
-                        log::warn!("[lazy_ivf] deserialization failed: {}", e);
+                        log::warn!("[lazy_ivf_pq] deserialization failed: {}", e);
                         None
                     }
                 }
             })
             .as_ref()
-            .map(|(i, c)| (i, c))
     }
 
     pub fn estimated_memory_bytes(&self) -> usize {
         match self.resolved.get() {
-            Some(Some((index, codebook))) => {
-                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
-            }
-            _ => self.raw.len(),
-        }
-    }
-}
-
-/// Lazy ScaNN (IVF-PQ) index — defers bincode deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyScaNN {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)>>,
-}
-
-impl LazyScaNN {
-    pub fn new(raw: OwnedBytes) -> Self {
-        Self {
-            raw,
-            resolved: OnceLock::new(),
-        }
-    }
-
-    pub fn get(&self) -> Option<(&Arc<IVFPQIndex>, &Arc<PQCodebook>)> {
-        self.resolved
-            .get_or_init(|| {
-                match super::super::vector_data::ScaNNIndexData::from_bytes(&self.raw) {
-                    Ok(data) => Some((Arc::new(data.index), Arc::new(data.codebook))),
-                    Err(e) => {
-                        log::warn!("[lazy_scann] deserialization failed: {}", e);
-                        None
-                    }
-                }
-            })
-            .as_ref()
-            .map(|(i, c)| (i, c))
-    }
-
-    pub fn estimated_memory_bytes(&self) -> usize {
-        match self.resolved.get() {
-            Some(Some((index, codebook))) => {
-                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
-            }
-            _ => self.raw.len(),
+            Some(Some(index)) => index.estimated_memory_bytes(),
+            _ => self
+                .raw
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map_or(0, OwnedBytes::len),
         }
     }
 }
@@ -194,9 +130,7 @@ impl VectorIndex {
     /// Estimate memory usage of this vector index
     pub fn estimated_memory_bytes(&self) -> usize {
         match self {
-            VectorIndex::RaBitQ(lazy) => lazy.estimated_memory_bytes(),
-            VectorIndex::IVF(lazy) => lazy.estimated_memory_bytes(),
-            VectorIndex::ScaNN(lazy) => lazy.estimated_memory_bytes(),
+            VectorIndex::IvfPq(lazy) => lazy.estimated_memory_bytes(),
             VectorIndex::BinaryIvf(lazy) => lazy.estimated_memory_bytes(),
         }
     }

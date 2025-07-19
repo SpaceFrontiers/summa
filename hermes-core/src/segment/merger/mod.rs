@@ -172,7 +172,7 @@ impl SegmentMerger {
     /// Merge segments into one, streaming postings/positions/store directly to files.
     ///
     /// If `trained` is provided, dense vectors use O(1) cluster merge when possible
-    /// (homogeneous IVF/ScaNN), otherwise rebuilds ANN from trained structures.
+    /// (compatible IVF-PQ), otherwise rebuilds ANN from global artifacts.
     /// Without trained structures, only flat vectors are merged.
     ///
     /// Uses streaming writers so postings, positions, and store data flow directly

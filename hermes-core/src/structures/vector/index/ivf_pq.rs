@@ -1,4 +1,4 @@
-//! IVF-PQ: Inverted File Index with Product Quantization (ScaNN-style)
+//! IVF-PQ: inverted-file search with product-quantized residuals.
 //!
 //! Two-level index for vector search:
 //! - Level 1: Coarse quantizer (k-means centroids)
@@ -10,28 +10,108 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::structures::vector::ivf::{ClusterStorage, CoarseCentroids, MultiAssignment};
-use crate::structures::vector::quantization::{DistanceTable, PQCodebook, PQVector};
+use crate::dsl::IvfRoutingMode;
+use crate::structures::vector::ivf::{CoarseCentroids, IvfProbePlan, MultiAssignment};
+use crate::structures::vector::quantization::{DistanceTable, PQCodebook};
+
+/// Struct-of-arrays payload for one non-empty float IVF leaf. PQ codes are a
+/// single `count * code_size` byte column: no allocation, length prefix, or
+/// `Vec` header exists per vector.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PqCluster {
+    pub(crate) doc_ids: Vec<u32>,
+    ordinals: Vec<u16>,
+    codes: Vec<u8>,
+}
+
+/// Query-global IVF-PQ work shared by every segment. Both leaf routing and
+/// ADC tables depend only on the query and index-level artifacts, so doing
+/// either per segment multiplies identical work by the segment count.
+pub struct IvfPqQueryPlan {
+    pub quantizer_version: u64,
+    pub codebook_version: u64,
+    pub request_fingerprint: u64,
+    pub cluster_ids: std::sync::Arc<[u32]>,
+    distance_tables: Vec<DistanceTable>,
+}
+
+impl std::fmt::Debug for IvfPqQueryPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IvfPqQueryPlan")
+            .field("quantizer_version", &self.quantizer_version)
+            .field("codebook_version", &self.codebook_version)
+            .field("request_fingerprint", &self.request_fingerprint)
+            .field("cluster_count", &self.cluster_ids.len())
+            .field("distance_table_count", &self.distance_tables.len())
+            .finish()
+    }
+}
+
+impl IvfPqQueryPlan {
+    pub fn build(
+        coarse_centroids: &CoarseCentroids,
+        codebook: &PQCodebook,
+        query: &[f32],
+        nprobe: usize,
+        routing: IvfRoutingMode,
+    ) -> Self {
+        let route: IvfProbePlan = coarse_centroids.probe(query, nprobe, routing);
+        let distance_tables = route
+            .cluster_ids
+            .iter()
+            .map(|&cluster_id| {
+                DistanceTable::build(
+                    codebook,
+                    query,
+                    Some(coarse_centroids.get_centroid(cluster_id)),
+                )
+            })
+            .collect();
+        Self {
+            quantizer_version: route.quantizer_version,
+            codebook_version: codebook.version,
+            request_fingerprint: route.request_fingerprint,
+            cluster_ids: route.cluster_ids,
+            distance_tables,
+        }
+    }
+}
+
+impl PqCluster {
+    fn append(&mut self, source: &Self, doc_id_offset: u32) {
+        self.doc_ids.reserve(source.doc_ids.len());
+        self.ordinals.reserve(source.ordinals.len());
+        self.codes.reserve(source.codes.len());
+        self.doc_ids
+            .extend(source.doc_ids.iter().map(|doc_id| doc_id + doc_id_offset));
+        self.ordinals.extend_from_slice(&source.ordinals);
+        self.codes.extend_from_slice(&source.codes);
+    }
+}
 
 /// Configuration for IVF-PQ index
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IVFPQConfig {
     /// Vector dimension
     pub dim: usize,
-    /// Number of clusters to probe during search
-    pub default_nprobe: usize,
+    /// PQ bytes per vector (one centroid ID per subspace).
+    pub code_size: usize,
+    /// Assignment routing used when constructing segment payloads.
+    pub routing: IvfRoutingMode,
 }
 
 impl IVFPQConfig {
-    pub fn new(dim: usize) -> Self {
+    pub fn new(dim: usize, code_size: usize) -> Self {
         Self {
             dim,
-            default_nprobe: 32,
+            code_size,
+            routing: IvfRoutingMode::Auto,
         }
     }
 
-    pub fn with_nprobe(mut self, nprobe: usize) -> Self {
-        self.default_nprobe = nprobe;
+    pub fn with_routing(mut self, routing: IvfRoutingMode) -> Self {
+        self.routing = routing;
         self
     }
 }
@@ -45,8 +125,14 @@ pub struct IVFPQIndex {
     pub centroids_version: u64,
     /// Version of PQ codebook used (for merge compatibility)
     pub codebook_version: u64,
-    /// Cluster storage with PQ codes
-    pub clusters: ClusterStorage<PQVector>,
+    /// Non-empty leaves only. Each leaf stores contiguous PQ bytes.
+    pub(crate) clusters: rustc_hash::FxHashMap<u32, PqCluster>,
+    len: usize,
+    /// Build-only scratch, omitted from the persisted segment payload.
+    #[serde(skip)]
+    residual_scratch: Vec<f32>,
+    #[serde(skip)]
+    rotated_scratch: Vec<f32>,
 }
 
 impl IVFPQIndex {
@@ -56,7 +142,10 @@ impl IVFPQIndex {
             config,
             centroids_version,
             codebook_version,
-            clusters: ClusterStorage::new(),
+            clusters: rustc_hash::FxHashMap::default(),
+            len: 0,
+            residual_scratch: Vec::new(),
+            rotated_scratch: Vec::new(),
         }
     }
 
@@ -90,7 +179,7 @@ impl IVFPQIndex {
         vector: &[f32],
     ) {
         // Get cluster assignment (with SOAR if configured)
-        let assignment = coarse_centroids.assign(vector);
+        let assignment = coarse_centroids.assign_with_routing(vector, self.config.routing);
 
         // Add to primary cluster
         self.add_to_cluster(
@@ -132,69 +221,46 @@ impl IVFPQIndex {
         let centroid = coarse_centroids.get_centroid(cluster_id);
 
         // Encode residual with PQ
-        let code = codebook.encode(vector, Some(centroid));
-
-        self.clusters.add(cluster_id, doc_id, ordinal, code);
+        let cluster = self.clusters.entry(cluster_id).or_default();
+        cluster.doc_ids.push(doc_id);
+        cluster.ordinals.push(ordinal);
+        codebook.encode_into(
+            vector,
+            Some(centroid),
+            &mut cluster.codes,
+            &mut self.residual_scratch,
+            &mut self.rotated_scratch,
+        );
+        self.len += 1;
     }
 
-    /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
-    pub fn search(
+    /// Search a probe plan already computed from the global quantizer.
+    pub fn search_distinct_documents(
         &self,
-        coarse_centroids: &CoarseCentroids,
-        codebook: &PQCodebook,
-        query: &[f32],
         k: usize,
-        nprobe: Option<usize>,
+        plan: &IvfPqQueryPlan,
     ) -> Vec<(u32, u16, f32)> {
-        let nprobe = nprobe.unwrap_or(self.config.default_nprobe);
-
-        // Find nprobe nearest coarse centroids
-        let nearest_clusters = coarse_centroids.find_k_nearest(query, nprobe);
-
-        let mut candidates = super::BoundedDistanceCollector::new(k);
-
-        for &cluster_id in &nearest_clusters {
-            if let Some(cluster) = self.clusters.get(cluster_id) {
-                // Build distance table for this cluster's centroid
-                let centroid = coarse_centroids.get_centroid(cluster_id);
-                let distance_table = DistanceTable::build(codebook, query, Some(centroid));
-
-                // Score all vectors in cluster using ADC (Asymmetric Distance Computation)
-                for (doc_id, ordinal, code) in cluster.iter() {
-                    let dist = distance_table.compute_distance(&code.codes);
-                    candidates.insert(doc_id, ordinal, dist);
-                }
-            }
-        }
-
+        let mut candidates = super::BoundedAnnCollector::<true, false>::new(k);
+        self.visit_cluster_distances(plan, |doc_id, ordinal, distance| {
+            candidates.insert(doc_id, ordinal, distance)
+        });
         candidates.into_sorted_results()
     }
 
-    /// Search using inner product (MIPS - Maximum Inner Product Search)
-    pub fn search_mips(
-        &self,
-        coarse_centroids: &CoarseCentroids,
-        codebook: &PQCodebook,
-        query: &[f32],
-        k: usize,
-        nprobe: Option<usize>,
-    ) -> Vec<(u32, u16, f32)> {
-        // For MIPS, we use the same search but with inner product distance table
-        // The distance table stores negative inner products so we can use min-heap
-        let mut results = self.search(coarse_centroids, codebook, query, k, nprobe);
-
-        // Convert back to inner products (negate distances)
-        for (_, _, dist) in &mut results {
-            *dist = -*dist;
+    fn visit_cluster_distances(&self, plan: &IvfPqQueryPlan, mut visit: impl FnMut(u32, u16, f32)) {
+        for (&cluster_id, distance_table) in plan.cluster_ids.iter().zip(&plan.distance_tables) {
+            if let Some(cluster) = self.clusters.get(&cluster_id) {
+                // Score all vectors in cluster using ADC (Asymmetric Distance Computation)
+                for (index, code) in cluster
+                    .codes
+                    .chunks_exact(self.config.code_size)
+                    .enumerate()
+                {
+                    let dist = distance_table.compute_distance(code);
+                    visit(cluster.doc_ids[index], cluster.ordinals[index], dist);
+                }
+            }
         }
-
-        // Re-sort by inner product (descending)
-        results.sort_unstable_by(|a, b| {
-            b.2.total_cmp(&a.2)
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        results
     }
 
     /// Merge another index into this one (instance method)
@@ -209,28 +275,47 @@ impl IVFPQIndex {
         if self.codebook_version != other.codebook_version {
             return Err("Cannot merge indexes with different codebook versions");
         }
+        if self.config != other.config {
+            return Err("Cannot merge IVF-PQ payloads with different configurations");
+        }
 
-        self.clusters.merge(&other.clusters, doc_id_offset);
+        for (&cluster_id, source) in &other.clusters {
+            self.clusters
+                .entry(cluster_id)
+                .or_default()
+                .append(source, doc_id_offset);
+        }
+        self.len = self
+            .len
+            .checked_add(other.len)
+            .ok_or("IVF-PQ vector count overflow during merge")?;
         Ok(())
     }
 
     /// Number of indexed vectors
     pub fn len(&self) -> usize {
-        self.clusters.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clusters.is_empty()
+        self.len == 0
     }
 
     /// Number of non-empty clusters
     pub fn num_clusters(&self) -> usize {
-        self.clusters.num_clusters()
+        self.clusters.len()
     }
 
     /// Memory usage estimate
     pub fn size_bytes(&self) -> usize {
-        self.clusters.size_bytes()
+        self.clusters
+            .values()
+            .map(|cluster| {
+                cluster.codes.len()
+                    + cluster.doc_ids.len() * size_of::<u32>()
+                    + cluster.ordinals.len() * size_of::<u16>()
+            })
+            .sum()
     }
 
     /// Estimated memory usage in bytes (alias for size_bytes)
@@ -238,22 +323,50 @@ impl IVFPQIndex {
         self.size_bytes()
     }
 
-    /// Serialize to bytes
+    fn validate(&self) -> Result<(), String> {
+        if self.config.dim == 0
+            || self.config.code_size == 0
+            || self.centroids_version == 0
+            || self.codebook_version == 0
+        {
+            return Err("invalid IVF-PQ segment metadata".to_string());
+        }
+        let mut total = 0usize;
+        for cluster in self.clusters.values() {
+            if cluster.doc_ids.len() != cluster.ordinals.len()
+                || cluster.codes.len()
+                    != cluster
+                        .doc_ids
+                        .len()
+                        .checked_mul(self.config.code_size)
+                        .ok_or_else(|| "IVF-PQ code column size overflow".to_string())?
+            {
+                return Err("invalid IVF-PQ cluster columns or codes".to_string());
+            }
+            total = total
+                .checked_add(cluster.doc_ids.len())
+                .ok_or_else(|| "IVF-PQ vector count overflow".to_string())?;
+        }
+        if total != self.len {
+            return Err("inconsistent IVF-PQ vector count".to_string());
+        }
+        Ok(())
+    }
+
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let json =
-            serde_json::to_vec(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(json)
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
-    /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
-        serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let index: Self = crate::structures::vector::decode_ann_bincode_exact(data, "IVF-PQ")?;
+        index
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(index)
     }
 
-    /// Static merge function for backward compatibility with segment merger
-    ///
-    /// Note: This is named `merge` for backward compatibility with existing code.
-    /// It merges multiple indexes into a new one.
+    /// Merge multiple compatible segment payloads into one.
     #[allow(clippy::should_implement_trait)]
     pub fn merge(indexes: &[&IVFPQIndex], doc_offsets: &[u32]) -> Result<Self, &'static str> {
         if indexes.is_empty() {
@@ -304,7 +417,7 @@ mod tests {
         let codebook = PQCodebook::train(pq_config, &vectors, 10);
 
         // Build index
-        let config = IVFPQConfig::new(dim);
+        let config = IVFPQConfig::new(dim, codebook.config.num_subspaces);
         let index = IVFPQIndex::build(config, &coarse_centroids, &codebook, &vectors, None);
 
         assert_eq!(index.len(), n);
@@ -329,11 +442,18 @@ mod tests {
         let pq_config = PQConfig::new(dim).with_opq(false, 0);
         let codebook = PQCodebook::train(pq_config, &vectors, 10);
 
-        let config = IVFPQConfig::new(dim).with_nprobe(4);
+        let config = IVFPQConfig::new(dim, codebook.config.num_subspaces);
         let index = IVFPQIndex::build(config, &coarse_centroids, &codebook, &vectors, None);
 
         let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
-        let results = index.search(&coarse_centroids, &codebook, &query, k, None);
+        let plan = IvfPqQueryPlan::build(
+            &coarse_centroids,
+            &codebook,
+            &query,
+            4,
+            IvfRoutingMode::Flat,
+        );
+        let results = index.search_distinct_documents(k, &plan);
 
         assert_eq!(results.len(), k);
 
@@ -363,7 +483,7 @@ mod tests {
         let pq_config = PQConfig::new(dim).with_opq(false, 0);
         let codebook = PQCodebook::train(pq_config, &vectors, 25);
 
-        let config = IVFPQConfig::new(dim).with_nprobe(32);
+        let config = IVFPQConfig::new(dim, codebook.config.num_subspaces);
         let index = IVFPQIndex::build(config, &coarse_centroids, &codebook, &vectors, None);
 
         // Run multiple queries and compute recall
@@ -387,7 +507,14 @@ mod tests {
                 exact[..k].iter().map(|(i, _)| *i).collect();
 
             // IVF-PQ search
-            let results = index.search(&coarse_centroids, &codebook, &query, k, None);
+            let plan = IvfPqQueryPlan::build(
+                &coarse_centroids,
+                &codebook,
+                &query,
+                32,
+                IvfRoutingMode::Flat,
+            );
+            let results = index.search_distinct_documents(k, &plan);
             let pq_top_k: std::collections::HashSet<usize> =
                 results.iter().map(|(i, _, _)| *i as usize).collect();
 
@@ -426,7 +553,7 @@ mod tests {
         let pq_config = PQConfig::new(dim).with_opq(false, 0);
         let codebook = PQCodebook::train(pq_config, &vectors1, 10);
 
-        let config = IVFPQConfig::new(dim);
+        let config = IVFPQConfig::new(dim, codebook.config.num_subspaces);
         let mut index1 = IVFPQIndex::build(
             config.clone(),
             &coarse_centroids,
@@ -439,5 +566,19 @@ mod tests {
         index1.merge_into(&index2, n as u32).unwrap();
 
         assert_eq!(index1.len(), 2 * n);
+        assert_eq!(
+            index1.size_bytes(),
+            index1.len() * (codebook.config.num_subspaces + size_of::<u32>() + size_of::<u16>())
+        );
+        assert!(index1.clusters.values().all(|cluster| {
+            cluster.codes.len() == cluster.doc_ids.len() * codebook.config.num_subspaces
+        }));
+
+        let bytes = index1.to_bytes().unwrap();
+        let decoded = IVFPQIndex::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.len(), index1.len());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(IVFPQIndex::from_bytes(&trailing).is_err());
     }
 }

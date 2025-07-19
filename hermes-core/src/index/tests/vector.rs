@@ -6,7 +6,7 @@ use crate::index::{Index, IndexConfig, IndexWriter};
 async fn test_vector_index_threshold_switch() {
     use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, VectorIndexType};
 
-    // Create schema with dense vector field configured for IVF-RaBitQ
+    // Create schema with a dense vector field configured for IVF-PQ.
     let mut schema_builder = SchemaBuilder::default();
     let title = schema_builder.add_text_field("title", true, true);
     let embedding = schema_builder.add_dense_vector_field_with_config(
@@ -15,14 +15,13 @@ async fn test_vector_index_threshold_switch() {
         true, // stored
         DenseVectorConfig {
             dim: 8,
-            index_type: VectorIndexType::IvfRaBitQ,
+            index_type: VectorIndexType::IvfPq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: Some(4), // Small for test
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 2,
-            build_threshold: Some(50), // Build when we have 50+ vectors
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = schema_builder.build();
@@ -133,7 +132,7 @@ async fn rebuild_rejects_segments_bound_to_the_current_artifact_generation() {
         "embedding",
         true,
         true,
-        DenseVectorConfig::with_ivf(4, Some(1), 1),
+        DenseVectorConfig::with_ivf_pq(4, Some(1), 1),
     );
     let schema = schema_builder.build();
     let dir = RamDirectory::new();
@@ -171,7 +170,7 @@ async fn rebuild_rejects_segments_bound_to_the_current_artifact_generation() {
             .iter()
             .any(|segment| matches!(
                 segment.vector_indexes().get(&embedding.0),
-                Some(crate::segment::VectorIndex::IVF(_))
+                Some(crate::segment::VectorIndex::IvfPq(_))
             ))
     );
     drop(index);
@@ -181,10 +180,7 @@ async fn rebuild_rejects_segments_bound_to_the_current_artifact_generation() {
         .await
         .expect_err("retraining must reject an existing IVF generation")
         .to_string();
-    assert!(
-        error.contains("already contains an IVF/ScaNN index"),
-        "{error}"
-    );
+    assert!(error.contains("already contains an IVF index"), "{error}");
     assert!(
         writer
             .segment_manager
@@ -217,10 +213,7 @@ async fn rebuild_rejects_segments_bound_to_the_current_artifact_generation() {
         .await
         .expect_err("ordinary training must reject a stale Flat metadata state")
         .to_string();
-    assert!(
-        error.contains("already contains an IVF/ScaNN index"),
-        "{error}"
-    );
+    assert!(error.contains("already contains an IVF index"), "{error}");
     assert!(
         !writer
             .segment_manager
@@ -424,11 +417,10 @@ async fn test_needle_dense_vector_flat() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -786,11 +778,10 @@ async fn test_needle_combined_all_modalities() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -944,11 +935,10 @@ async fn search_fused_hybrid_union_impl() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -1192,8 +1182,7 @@ async fn test_binary_ivf_end_to_end() {
     let byte_len = dim_bits / 8;
 
     let mut sb = SchemaBuilder::default();
-    let mut cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
-    cfg.build_threshold = Some(100); // build IVF once we have 100+ vectors
+    let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
     let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg.clone());
     assert_eq!(cfg.index_type, BinaryIndexType::Ivf);
     let schema = sb.build();
@@ -1219,6 +1208,12 @@ async fn test_binary_ivf_end_to_end() {
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let mut merge_trigger = Document::new();
+    merge_trigger.add_binary_dense_vector(bvec, vec![0; byte_len]);
+    writer.add_document(merge_trigger).unwrap();
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
 
     let index = Index::open(dir, config).await.unwrap();
     let segments = index.segment_readers().await.unwrap();
@@ -1260,8 +1255,7 @@ async fn binary_ivf_multi_value_exact_scores() {
 
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
-    let mut cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(4), 4); // full probe
-    cfg.build_threshold = Some(50);
+    let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(4), 4); // full probe
     let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
     sb.set_multi(bvec, true);
     let schema = sb.build();
@@ -1302,6 +1296,13 @@ async fn binary_ivf_multi_value_exact_scores() {
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let mut merge_trigger = Document::new();
+    merge_trigger.add_text(title, "merge trigger");
+    merge_trigger.add_binary_dense_vector(bvec, vec![0; byte_len]);
+    writer.add_document(merge_trigger).unwrap();
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
 
     let index = Index::open(dir, config).await.unwrap();
     let segments = index.segment_readers().await.unwrap();

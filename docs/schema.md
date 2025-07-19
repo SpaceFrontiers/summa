@@ -266,46 +266,40 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4�
 | `f16`   |         | 2         | <0.1% loss    | Recommended default |
 | `uint8` | `u8`    | 1         | 1-3% loss     | Maximum compression |
 
-### Index Types
+### Index Types and Routing
 
-Dense vectors support multiple ANN index algorithms, specified in `indexed<...>`:
-
-```
-field e: dense_vector<768, f16> [indexed]                                    # default RaBitQ
-field e: dense_vector<768, f16> [indexed<rabitq>]                            # explicit RaBitQ
-field e: dense_vector<768, f16> [indexed<ivf_rabitq, num_clusters: 256>]     # IVF-RaBitQ
-field e: dense_vector<768, f16> [indexed<scann, num_clusters: 1024>]         # ScaNN
-field e: dense_vector<768, f16> [indexed<flat>]                              # brute-force only
-field e: dense_vector<768> [stored]                                          # stored, not indexed
-```
-
-### Extended RaBitQ (multi-bit codes for disk-resident indexes)
-
-IVF-RaBitQ supports extended multi-bit codes (`bits: 2-8`, default 1 = classic
-binary RaBitQ). Extra magnitude bits per dimension give much tighter distance
-estimates — with `bits: 4-5` the exact-rerank pool (`rerank_factor`) can be
-shrunk 2-3x at the same recall, which cuts raw-vector reads on memory-bound /
-disk-resident indexes:
+Float fields have one production ANN format: corpus-trained global IVF-PQ.
+Every segment shares the index's centroid router and residual-PQ codebook;
+segments store only compact assignments and PQ codes. `flat` remains available
+for exact brute-force search and as the accumulation format before ANN build.
 
 ```
-field e: dense_vector<768, f16> [indexed<ivf_rabitq, bits: 5>]
+field e: dense_vector<768, f16> [indexed]                                      # global IVF-PQ
+field e: dense_vector<768, f16> [indexed<ivf_pq, routing: hnsw, nprobe: 64>]
+field e: dense_vector<768, f16> [indexed<flat>]                                # exact full scan
+field e: dense_vector<768> [stored]                                            # stored, not indexed
 ```
 
-Segments built with different `bits` are not merge-compatible (the codebook
-version differs) — pick the value before building.
+When `num_clusters` is omitted, training chooses a corpus-sized leaf count
+using an 8×sqrt(N) target bounded by sample quality and artifact memory. Routing
+can be `auto`, `flat`, `two_level`, or `hnsw`; `auto` uses flat centroid scoring
+below 4,096 leaves and HNSW above it. HNSW is a global coarse-quantizer index,
+so its work is done once per query rather than once per segment. The default
+`nprobe` is 64. Candidate collection keeps distinct documents, is bounded to
+3×k, and exact reranking reads at most that bounded set across all segments.
 
 ### SOAR (higher recall for IVF indexes)
 
-IVF-based indexes (`ivf_rabitq`, `scann`) support SOAR — spilling each vector
+IVF-PQ supports SOAR — spilling each vector
 into a secondary cluster with an orthogonality-amplified residual. This
 improves recall at the same `nprobe` in exchange for larger cluster storage
 (~1.2-2x assignments):
 
 ```
-field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: selective>]  # spill boundary vectors (recommended)
-field e: dense_vector<768, f16> [indexed<scann, soar: full>]            # spill every vector once
-field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: aggressive>] # spill every vector twice
-field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: off>]        # no spilling (default)
+field e: dense_vector<768, f16> [indexed<ivf_pq, soar: selective>]  # spill boundary vectors
+field e: dense_vector<768, f16> [indexed<ivf_pq, soar: full>]       # spill every vector once
+field e: dense_vector<768, f16> [indexed<ivf_pq, soar: aggressive>] # spill every vector twice
+field e: dense_vector<768, f16> [indexed<ivf_pq, soar: off>]        # no spilling (default)
 ```
 
 ### Example
@@ -313,26 +307,23 @@ field e: dense_vector<768, f16> [indexed<ivf_rabitq, soar: off>]        # no spi
 ```
 index documents {
     field title: text<en_stem> [indexed, stored]
-    field embedding: dense_vector<768, f16> [indexed<ivf_rabitq>, stored<multi>]
+    field embedding: dense_vector<768, f16> [indexed<ivf_pq>, stored<multi>]
     field span: json [stored<multi>]
 }
 ```
 
 ### Binary Vector IVF
 
-Binary dense vector fields default to brute-force SIMD Hamming scan (fast up
-to a few million vectors per segment). For larger segments, enable the IVF
-index — k-majority Hamming clustering with exact in-cluster distances (the
-only approximation is which clusters get probed):
+Binary dense vector fields use the same global IVF router and HNSW topology as
+float fields, with metric-specific k-majority centroids and exact packed-code
+leaf scanning. The only approximation is which clusters get probed; there is
+no lossy PQ stage or rerank for exact Hamming codes. Use `flat` explicitly for
+brute-force SIMD Hamming scan:
 
 ```
-field hash: binary_dense_vector<512> [indexed<ivf, num_clusters: 1024, nprobe: 32>]
-field hash: binary_dense_vector<512> [indexed<ivf, build_threshold: 500000>]
+field hash: binary_dense_vector<512> [indexed<ivf, routing: hnsw, nprobe: 64>]
+field hash: binary_dense_vector<512> [indexed<flat>]
 ```
-
-The index is built at commit once the segment crosses `build_threshold`
-(default 100000 vectors) and rebuilt on merge with fresh sample-trained
-centroids.
 
 ## Sparse Vectors
 

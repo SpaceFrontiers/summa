@@ -1,7 +1,7 @@
 //! Dense vector streaming build (footer-based format).
 //!
 //! Streams each field's flat data directly to disk, then writes TOC + footer.
-//! Supports parallel ANN index building (IvfRaBitQ, ScaNN).
+//! Supports parallel segment-level IVF index building.
 
 use std::io::Write;
 
@@ -220,32 +220,24 @@ pub(super) fn build_vectors_streaming(
 
                 let dim = builder.dim;
                 let blob = match config.index_type {
-                    VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(field_id) => {
-                        let centroids = &trained.centroids[field_id];
-                        let bits = config.rabitq_bits.unwrap_or(1);
-                        let (mut index, codebook) =
-                            super::super::ann_build::new_ivf_rabitq(dim, centroids, bits);
-                        for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
-                            let v = &builder.vectors[i * dim..(i + 1) * dim];
-                            index.add_vector(centroids, &codebook, *doc_id, *ordinal, v);
-                        }
-                        super::super::ann_build::serialize_ivf_rabitq(index, codebook)
-                            .map(|b| (super::super::ann_build::IVF_RABITQ_TYPE, b))
-                    }
-                    VectorIndexType::ScaNN
+                    VectorIndexType::IvfPq
                         if trained.centroids.contains_key(field_id)
                             && trained.codebooks.contains_key(field_id) =>
                     {
                         let centroids = &trained.centroids[field_id];
                         let codebook = &trained.codebooks[field_id];
-                        let mut index =
-                            super::super::ann_build::new_scann(dim, centroids, codebook);
+                        let mut index = super::super::ann_build::new_ivf_pq(
+                            dim,
+                            config.ivf_routing,
+                            centroids,
+                            codebook,
+                        );
                         for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
                             let v = &builder.vectors[i * dim..(i + 1) * dim];
                             index.add_vector(centroids, codebook, *doc_id, *ordinal, v);
                         }
-                        super::super::ann_build::serialize_scann(index, codebook)
-                            .map(|b| (super::super::ann_build::SCANN_TYPE, b))
+                        super::super::ann_build::serialize_ivf_pq(index)
+                            .map(|b| (super::super::ann_build::IVF_PQ_TYPE, b))
                     }
                     _ => return Ok(None),
                 };
@@ -368,22 +360,20 @@ pub(super) fn build_vectors_streaming(
             })?;
         }
 
-        // Binary IVF index (native only): built at commit when configured
-        // and the segment is large enough for probing to beat brute force.
+        // Binary IVF payload (native only): assignment uses the same global
+        // quantizer generation as every other segment.
         #[cfg(feature = "native")]
         {
             let binary_config = schema
                 .get_field_entry(Field(field_id))
                 .and_then(|e| e.binary_dense_vector_config.as_ref());
-            if let Some(cfg) = binary_config
+            let quantizer = trained.and_then(|trained| trained.binary_quantizers.get(&field_id));
+            if let (Some(cfg), Some(quantizer)) = (binary_config, quantizer)
                 && cfg.index_type == crate::dsl::BinaryIndexType::Ivf
-                && num_vectors >= cfg.default_build_threshold()
             {
-                let num_clusters = cfg.optimal_num_clusters(num_vectors);
-                let ivf_config =
-                    crate::structures::BinaryIvfConfig::new(builder.dim_bits, num_clusters);
                 let index = crate::structures::BinaryIvfIndex::build(
-                    ivf_config,
+                    quantizer,
+                    cfg.ivf_routing,
                     &builder.vectors,
                     &builder.doc_ids,
                 )
@@ -415,7 +405,7 @@ pub(super) fn build_vectors_streaming(
                     "[build_vectors] field {}: binary IVF built ({} vectors, {} clusters, {} bytes)",
                     field_id,
                     num_vectors,
-                    num_clusters,
+                    quantizer.num_clusters,
                     blob_len,
                 );
             }

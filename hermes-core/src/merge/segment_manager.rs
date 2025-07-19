@@ -1042,13 +1042,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// vector data. The guard is cancellation-safe: dropping the requesting
     /// future reopens ANN production without leaving the manager wedged.
     ///
-    /// Indexing tokens are NOT waited on: their guards are parked inside
+    /// Indexing tokens cannot be waited on: their guards are parked inside
     /// built-but-uncommitted `PreparedSegment`s and are released only by a
     /// later commit. That commit typically needs the writer this update's
     /// caller already holds (server write lock / embedded `&mut self`), so
-    /// waiting on them would permanently wedge build/rebuild_vector_index.
-    /// Segments those tokens own were built against the previous generation
-    /// and surface to the rebuild safety check once committed.
+    /// waiting would permanently wedge build/rebuild_vector_index. They also
+    /// cannot be ignored: such a segment may already contain ANN data bound to
+    /// the previous artifact generation and could otherwise be committed after
+    /// the new generation is published. Reject promptly and let the caller
+    /// commit or abort the pending generation before retrying.
     pub(crate) async fn begin_vector_artifact_update(&self) -> Result<VectorArtifactUpdateGuard> {
         self.vector_artifact_update
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1063,12 +1065,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let (preexisting, parked_indexing) =
             self.active_operations.draining_operation_tokens_snapshot();
         if parked_indexing > 0 {
-            log::warn!(
-                "[trained] artifact update proceeding past {} in-flight/uncommitted indexing \
-                 segment(s); segments built before this update keep the previous artifact \
-                 generation and become visible to rebuild safety checks once committed",
-                parked_indexing,
-            );
+            return Err(Error::Internal(format!(
+                "cannot update trained-vector artifacts while {parked_indexing} indexing \
+                 segment(s) are built but uncommitted; commit or abort the pending \
+                 generation and retry"
+            )));
         }
         self.active_operations
             .wait_until_operations_finish(&preexisting)
@@ -2609,6 +2610,7 @@ mod tests {
             .trained
             .store(Some(Arc::new(TrainedVectorStructures {
                 centroids: rustc_hash::FxHashMap::default(),
+                binary_quantizers: rustc_hash::FxHashMap::default(),
                 codebooks: rustc_hash::FxHashMap::default(),
             })));
 
@@ -2866,7 +2868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_update_does_not_wait_for_built_uncommitted_indexing_segments() {
+    async fn artifact_update_rejects_built_uncommitted_indexing_segments() {
         let manager = lifecycle_test_manager();
         // Simulates a memory-budget mid-cycle segment build whose guard is
         // parked inside a PreparedSegment: only a later commit releases this
@@ -2876,16 +2878,28 @@ mod tests {
             .protect_new_segment("00000000000000000000000000000abc".into())
             .unwrap();
 
-        let guard = tokio::time::timeout(
+        let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             manager.begin_vector_artifact_update(),
         )
         .await
         .expect("begin_vector_artifact_update deadlocked on a built-but-uncommitted segment")
-        .unwrap();
+        .err()
+        .expect("an old-generation prepared segment must block artifact replacement")
+        .to_string();
+        assert!(error.contains("built but uncommitted"), "{error}");
+        assert!(
+            !manager.vector_artifact_update.load(Ordering::Acquire),
+            "a rejected update must release the producer gate"
+        );
 
-        drop(guard);
         drop(parked_indexing);
+
+        let guard = manager
+            .begin_vector_artifact_update()
+            .await
+            .expect("artifact update should succeed after the pending generation is resolved");
+        drop(guard);
     }
 
     #[tokio::test]

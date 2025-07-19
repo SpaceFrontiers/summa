@@ -227,7 +227,7 @@ rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
 
 #### RetrainVectorIndex
 
-Retraining global IVF/ScaNN centroids is accepted only while all committed
+Retraining global IVF centroids and PQ codebooks is accepted only while all committed
 segments for the affected fields are flat. ANN segments embed the artifact
 versions used to build them, so replacing the single global generation under
 existing ANN segments would make those segments unreadable. Hermes rejects
