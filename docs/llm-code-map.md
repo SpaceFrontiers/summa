@@ -31,3 +31,5 @@ Candle model stack.
 
 Temporary dependency forks and their upstream exit criteria are tracked in
 `docs/forked-dependencies.md`.
+Tokenizer compatibility, the measured GigaToken evaluation, and its adoption
+gates are tracked in `docs/tokenizer-backends.md`.
