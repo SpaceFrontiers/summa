@@ -6,7 +6,7 @@
 
 use std::marker::PhantomData;
 
-use burn::backend::tensor::FloatTensor;
+use burn::backend::tensor::{FloatTensor, IntTensor};
 use burn::tensor::{DType, Shape};
 use burn_cubecl::{CubeBackend, fusion::FusionCubeRuntime};
 use burn_fusion::{
@@ -18,7 +18,12 @@ use cubecl::cuda::CudaRuntime;
 
 use super::conv::DepthwiseConv1dBackend;
 use super::fused_attention::{AttentionBackend, chunked_attention_backward};
+use super::fused_swiglu::FusedSwiGluBackend;
+use super::grouped_linear::GroupedLinearBackend;
 use super::linear_cross_entropy::LinearCrossEntropyBackend;
+use super::moe_dispatch::MoeDispatchBackend;
+use super::moe_route::MoeRouteBackend;
+use super::moe_topk::MoeTop2Backend;
 use super::scan::{CHECKPOINTED_SCAN_INTERVAL, MambaBackend};
 
 const ATTENTION_BACKWARD_CHUNK_ROWS: usize = 2048;
@@ -51,6 +56,333 @@ where
 struct DepthwiseBackward<B> {
     desc: CustomOpIr,
     backend: PhantomData<B>,
+}
+
+#[derive(Debug)]
+struct MoeTop2<B> {
+    desc: CustomOpIr,
+    backend: PhantomData<B>,
+}
+
+#[derive(Debug)]
+struct MoeRoutePlan<B> {
+    desc: CustomOpIr,
+    expert_count: usize,
+    backend: PhantomData<B>,
+}
+
+#[derive(Debug)]
+struct MoeRouteGather<B> {
+    desc: CustomOpIr,
+    top_k: usize,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for MoeRouteGather<B>
+where
+    B: FusionBackend + MoeDispatchBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([input, order, inverse], [output_ir]) = self.desc.as_fixed();
+        let output = B::moe_route_gather(
+            handles.get_float_tensor::<B>(input),
+            handles.get_int_tensor::<B>(order),
+            handles.get_int_tensor::<B>(inverse),
+            self.top_k,
+        );
+        handles.register_float_tensor::<B>(&output_ir.id, output);
+    }
+}
+
+#[derive(Debug)]
+struct MoeRouteGatherBackward<B> {
+    desc: CustomOpIr,
+    tokens: usize,
+    top_k: usize,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for MoeRouteGatherBackward<B>
+where
+    B: FusionBackend + MoeDispatchBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([grad, inverse], [grad_input_ir]) = self.desc.as_fixed();
+        let grad_input = B::moe_route_gather_backward(
+            handles.get_float_tensor::<B>(grad),
+            handles.get_int_tensor::<B>(inverse),
+            self.tokens,
+            self.top_k,
+        );
+        handles.register_float_tensor::<B>(&grad_input_ir.id, grad_input);
+    }
+}
+
+#[derive(Debug)]
+struct MoeRouteCombine<B> {
+    desc: CustomOpIr,
+    top_k: usize,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for MoeRouteCombine<B>
+where
+    B: FusionBackend + MoeDispatchBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([routed, weights, inverse], [output_ir]) = self.desc.as_fixed();
+        let output = B::moe_route_combine(
+            handles.get_float_tensor::<B>(routed),
+            handles.get_float_tensor::<B>(weights),
+            handles.get_int_tensor::<B>(inverse),
+            self.top_k,
+        );
+        handles.register_float_tensor::<B>(&output_ir.id, output);
+    }
+}
+
+#[derive(Debug)]
+struct MoeRouteCombineBackward<B> {
+    desc: CustomOpIr,
+    top_k: usize,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for MoeRouteCombineBackward<B>
+where
+    B: FusionBackend + MoeDispatchBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([routed, weights, inverse, grad], [grad_routed_ir, grad_weights_ir]) =
+            self.desc.as_fixed();
+        let (grad_routed, grad_weights) = B::moe_route_combine_backward(
+            handles.get_float_tensor::<B>(routed),
+            handles.get_float_tensor::<B>(weights),
+            handles.get_int_tensor::<B>(inverse),
+            handles.get_float_tensor::<B>(grad),
+            self.top_k,
+        );
+        handles.register_float_tensor::<B>(&grad_routed_ir.id, grad_routed);
+        handles.register_float_tensor::<B>(&grad_weights_ir.id, grad_weights);
+    }
+}
+
+impl<B> Operation<B::FusionRuntime> for MoeRoutePlan<B>
+where
+    B: FusionBackend + MoeRouteBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([indices], [order_ir, inverse_ir, counts_ir]) = self.desc.as_fixed();
+        let (order, inverse, counts) =
+            B::moe_route_plan(handles.get_int_tensor::<B>(indices), self.expert_count);
+        handles.register_int_tensor::<B>(&order_ir.id, order);
+        handles.register_int_tensor::<B>(&inverse_ir.id, inverse);
+        handles.register_int_tensor::<B>(&counts_ir.id, counts);
+    }
+}
+
+#[derive(Debug)]
+struct GroupedLinearForward<B> {
+    desc: CustomOpIr,
+    counts: Vec<usize>,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for GroupedLinearForward<B>
+where
+    B: FusionBackend + GroupedLinearBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([input, weight], [output_ir]) = self.desc.as_fixed();
+        let output = B::grouped_linear_inner(
+            handles.get_float_tensor::<B>(input),
+            handles.get_float_tensor::<B>(weight),
+            self.counts.clone(),
+        );
+        handles.register_float_tensor::<B>(&output_ir.id, output);
+    }
+}
+
+#[derive(Debug)]
+struct GroupedLinearBackward<B> {
+    desc: CustomOpIr,
+    counts: Vec<usize>,
+    backend: PhantomData<B>,
+}
+
+#[derive(Debug)]
+struct FusedSwiGluForward<B> {
+    desc: CustomOpIr,
+    intermediate: usize,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for FusedSwiGluForward<B>
+where
+    B: FusionBackend + FusedSwiGluBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([input], [output_ir]) = self.desc.as_fixed();
+        let output = B::fused_swiglu_inner(handles.get_float_tensor::<B>(input), self.intermediate);
+        handles.register_float_tensor::<B>(&output_ir.id, output);
+    }
+}
+
+#[derive(Debug)]
+struct FusedSwiGluBackward<B> {
+    desc: CustomOpIr,
+    intermediate: usize,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for FusedSwiGluBackward<B>
+where
+    B: FusionBackend + FusedSwiGluBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([input, grad], [grad_input_ir]) = self.desc.as_fixed();
+        let grad_input = B::fused_swiglu_backward(
+            handles.get_float_tensor::<B>(input),
+            handles.get_float_tensor::<B>(grad),
+            self.intermediate,
+        );
+        handles.register_float_tensor::<B>(&grad_input_ir.id, grad_input);
+    }
+}
+
+impl<B> Operation<B::FusionRuntime> for GroupedLinearBackward<B>
+where
+    B: FusionBackend + GroupedLinearBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([input, weight, grad], [grad_input_ir, grad_weight_ir]) = self.desc.as_fixed();
+        let (grad_input, grad_weight) = B::grouped_linear_backward(
+            handles.get_float_tensor::<B>(input),
+            handles.get_float_tensor::<B>(weight),
+            handles.get_float_tensor::<B>(grad),
+            self.counts.clone(),
+        );
+        handles.register_float_tensor::<B>(&grad_input_ir.id, grad_input);
+        handles.register_float_tensor::<B>(&grad_weight_ir.id, grad_weight);
+    }
+}
+
+#[derive(Debug)]
+struct GroupedSwiGluMlpForward<B> {
+    desc: CustomOpIr,
+    intermediate: usize,
+    cache_key: Option<u64>,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for GroupedSwiGluMlpForward<B>
+where
+    B: FusionBackend + GroupedLinearBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([input, in_weight, down_weight, counts], [output_ir, projected_ir, hidden_ir]) =
+            self.desc.as_fixed();
+        let (output, projected, hidden) = B::grouped_swiglu_mlp_inner(
+            handles.get_float_tensor::<B>(input),
+            handles.get_float_tensor::<B>(in_weight),
+            handles.get_float_tensor::<B>(down_weight),
+            handles.get_int_tensor::<B>(counts),
+            self.intermediate,
+            self.cache_key,
+        );
+        handles.register_float_tensor::<B>(&output_ir.id, output);
+        handles.register_float_tensor::<B>(&projected_ir.id, projected);
+        handles.register_float_tensor::<B>(&hidden_ir.id, hidden);
+    }
+}
+
+#[derive(Debug)]
+struct GroupedSwiGluMlpBackward<B> {
+    desc: CustomOpIr,
+    intermediate: usize,
+    cache_key: Option<u64>,
+    backend: PhantomData<B>,
+}
+
+impl<B> Operation<B::FusionRuntime> for GroupedSwiGluMlpBackward<B>
+where
+    B: FusionBackend + GroupedLinearBackend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let (
+            [
+                input,
+                in_weight,
+                down_weight,
+                counts,
+                projected,
+                hidden,
+                grad,
+            ],
+            [grad_input_ir, grad_in_weight_ir, grad_down_weight_ir],
+        ) = self.desc.as_fixed();
+        let (grad_input, grad_in_weight, grad_down_weight) = B::grouped_swiglu_mlp_backward(
+            handles.get_float_tensor::<B>(input),
+            handles.get_float_tensor::<B>(in_weight),
+            handles.get_float_tensor::<B>(down_weight),
+            handles.get_int_tensor::<B>(counts),
+            handles.get_float_tensor::<B>(projected),
+            handles.get_float_tensor::<B>(hidden),
+            handles.get_float_tensor::<B>(grad),
+            self.intermediate,
+            self.cache_key,
+        );
+        handles.register_float_tensor::<B>(&grad_input_ir.id, grad_input);
+        handles.register_float_tensor::<B>(&grad_in_weight_ir.id, grad_in_weight);
+        handles.register_float_tensor::<B>(&grad_down_weight_ir.id, grad_down_weight);
+    }
+}
+
+impl<B> Operation<B::FusionRuntime> for MoeTop2<B>
+where
+    B: FusionBackend + MoeTop2Backend,
+{
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([logits], [output_ir]) = self.desc.as_fixed();
+        let output = B::moe_top2_indices(handles.get_float_tensor::<B>(logits));
+        handles.register_int_tensor::<B>(&output_ir.id, output);
+    }
 }
 
 impl<B> Operation<B::FusionRuntime> for DepthwiseBackward<B>
@@ -146,6 +478,488 @@ where
             .try_into()
             .expect("depthwise backward has three outputs");
         (input, weight, bias)
+    }
+}
+
+impl<B> MoeTop2Backend for Fusion<B>
+where
+    B: FusionBackend + MoeTop2Backend,
+{
+    fn moe_top2_indices(logits: FloatTensor<Self>) -> IntTensor<Self> {
+        let [tokens, _] = logits.shape.dims();
+        let client = logits.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([tokens, 2]),
+            DType::I32,
+        );
+        let desc = CustomOpIr::new("hermes_moe_top2", &[logits.into_ir()], &[output]);
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                MoeTop2::<B> {
+                    desc,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+}
+
+impl<B> MoeRouteBackend for Fusion<B>
+where
+    B: FusionBackend + MoeRouteBackend,
+{
+    fn moe_route_plan(
+        indices: IntTensor<Self>,
+        expert_count: usize,
+    ) -> (IntTensor<Self>, IntTensor<Self>, IntTensor<Self>) {
+        let [tokens, top_k] = indices.shape.dims();
+        let routes = tokens.checked_mul(top_k).expect("MoE route count overflow");
+        let client = indices.client.clone();
+        let order = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes]),
+            DType::I32,
+        );
+        let inverse = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes]),
+            DType::I32,
+        );
+        let counts = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([expert_count]),
+            DType::I32,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_moe_route_plan",
+            &[indices.into_ir()],
+            &[order, inverse, counts],
+            vec![ScalarIr::UInt(expert_count as u64)],
+        );
+        let [order, inverse, counts] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                MoeRoutePlan::<B> {
+                    desc,
+                    expert_count,
+                    backend: PhantomData,
+                },
+            )
+            .try_into()
+            .expect("MoE route plan has three outputs");
+        (order, inverse, counts)
+    }
+}
+
+impl<B> MoeDispatchBackend for Fusion<B>
+where
+    B: FusionBackend + MoeDispatchBackend,
+{
+    fn moe_route_gather(
+        input: FloatTensor<Self>,
+        order: IntTensor<Self>,
+        inverse: IntTensor<Self>,
+        top_k: usize,
+    ) -> FloatTensor<Self> {
+        let [tokens, hidden] = input.shape.dims();
+        let routes = tokens * top_k;
+        let client = input.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes, hidden]),
+            input.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_moe_route_gather",
+            &[input.into_ir(), order.into_ir(), inverse.into_ir()],
+            &[output],
+            vec![ScalarIr::UInt(top_k as u64)],
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                MoeRouteGather::<B> {
+                    desc,
+                    top_k,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+
+    fn moe_route_gather_backward(
+        grad: FloatTensor<Self>,
+        inverse: IntTensor<Self>,
+        tokens: usize,
+        top_k: usize,
+    ) -> FloatTensor<Self> {
+        let [_, hidden] = grad.shape.dims();
+        let client = grad.client.clone();
+        let grad_input = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([tokens, hidden]),
+            grad.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_moe_route_gather_backward",
+            &[grad.into_ir(), inverse.into_ir()],
+            &[grad_input],
+            vec![ScalarIr::UInt(tokens as u64), ScalarIr::UInt(top_k as u64)],
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                MoeRouteGatherBackward::<B> {
+                    desc,
+                    tokens,
+                    top_k,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+
+    fn moe_route_combine(
+        routed: FloatTensor<Self>,
+        weights: FloatTensor<Self>,
+        inverse: IntTensor<Self>,
+        top_k: usize,
+    ) -> FloatTensor<Self> {
+        let [routes, hidden] = routed.shape.dims();
+        let tokens = routes / top_k;
+        let client = routed.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([tokens, hidden]),
+            routed.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_moe_route_combine",
+            &[routed.into_ir(), weights.into_ir(), inverse.into_ir()],
+            &[output],
+            vec![ScalarIr::UInt(top_k as u64)],
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                MoeRouteCombine::<B> {
+                    desc,
+                    top_k,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+
+    fn moe_route_combine_backward(
+        routed: FloatTensor<Self>,
+        weights: FloatTensor<Self>,
+        inverse: IntTensor<Self>,
+        grad: FloatTensor<Self>,
+        top_k: usize,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        let client = routed.client.clone();
+        let grad_routed = TensorIr::uninit(
+            client.create_empty_handle(),
+            routed.shape.clone(),
+            routed.dtype,
+        );
+        let grad_weights = TensorIr::uninit(
+            client.create_empty_handle(),
+            weights.shape.clone(),
+            weights.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_moe_route_combine_backward",
+            &[
+                routed.into_ir(),
+                weights.into_ir(),
+                inverse.into_ir(),
+                grad.into_ir(),
+            ],
+            &[grad_routed, grad_weights],
+            vec![ScalarIr::UInt(top_k as u64)],
+        );
+        let [grad_routed, grad_weights] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                MoeRouteCombineBackward::<B> {
+                    desc,
+                    top_k,
+                    backend: PhantomData,
+                },
+            )
+            .try_into()
+            .expect("MoE route combine backward has two outputs");
+        (grad_routed, grad_weights)
+    }
+}
+
+impl<B> GroupedLinearBackend for Fusion<B>
+where
+    B: FusionBackend + GroupedLinearBackend,
+{
+    fn grouped_linear_inner(
+        input: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        counts: Vec<usize>,
+    ) -> FloatTensor<Self> {
+        let [routes, _] = input.shape.dims();
+        let [_, _, output_width] = weight.shape.dims();
+        let client = input.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes, output_width]),
+            input.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_grouped_linear",
+            &[input.into_ir(), weight.into_ir()],
+            &[output],
+            counts
+                .iter()
+                .map(|count| ScalarIr::UInt(*count as u64))
+                .collect(),
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                GroupedLinearForward::<B> {
+                    desc,
+                    counts,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+
+    fn grouped_linear_backward(
+        input: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        grad: FloatTensor<Self>,
+        counts: Vec<usize>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        let client = input.client.clone();
+        let grad_input = TensorIr::uninit(
+            client.create_empty_handle(),
+            input.shape.clone(),
+            input.dtype,
+        );
+        let grad_weight = TensorIr::uninit(
+            client.create_empty_handle(),
+            weight.shape.clone(),
+            weight.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_grouped_linear_backward",
+            &[input.into_ir(), weight.into_ir(), grad.into_ir()],
+            &[grad_input, grad_weight],
+            counts
+                .iter()
+                .map(|count| ScalarIr::UInt(*count as u64))
+                .collect(),
+        );
+        let [grad_input, grad_weight] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                GroupedLinearBackward::<B> {
+                    desc,
+                    counts,
+                    backend: PhantomData,
+                },
+            )
+            .try_into()
+            .expect("grouped linear backward has two outputs");
+        (grad_input, grad_weight)
+    }
+
+    fn grouped_swiglu_mlp_inner(
+        input: FloatTensor<Self>,
+        in_weight: FloatTensor<Self>,
+        down_weight: FloatTensor<Self>,
+        counts: IntTensor<Self>,
+        intermediate: usize,
+        cache_key: Option<u64>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        let [routes, _] = input.shape.dims();
+        let projected_width = in_weight.shape.dims::<3>()[2];
+        let output_width = down_weight.shape.dims::<3>()[2];
+        let client = input.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes, output_width]),
+            input.dtype,
+        );
+        let projected = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes, projected_width]),
+            input.dtype,
+        );
+        let hidden = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([routes, intermediate]),
+            input.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_grouped_swiglu_mlp",
+            &[
+                input.into_ir(),
+                in_weight.into_ir(),
+                down_weight.into_ir(),
+                counts.into_ir(),
+            ],
+            &[output, projected, hidden],
+            vec![
+                ScalarIr::UInt(intermediate as u64),
+                ScalarIr::Bool(cache_key.is_some()),
+            ],
+        );
+        let [output, projected, hidden] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                GroupedSwiGluMlpForward::<B> {
+                    desc,
+                    intermediate,
+                    cache_key,
+                    backend: PhantomData,
+                },
+            )
+            .try_into()
+            .expect("grouped SwiGLU MLP has three outputs");
+        (output, projected, hidden)
+    }
+
+    fn grouped_swiglu_mlp_backward(
+        input: FloatTensor<Self>,
+        in_weight: FloatTensor<Self>,
+        down_weight: FloatTensor<Self>,
+        counts: IntTensor<Self>,
+        projected: FloatTensor<Self>,
+        hidden: FloatTensor<Self>,
+        grad: FloatTensor<Self>,
+        intermediate: usize,
+        cache_key: Option<u64>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        let client = input.client.clone();
+        let grad_input = TensorIr::uninit(
+            client.create_empty_handle(),
+            input.shape.clone(),
+            input.dtype,
+        );
+        let grad_in_weight = TensorIr::uninit(
+            client.create_empty_handle(),
+            in_weight.shape.clone(),
+            in_weight.dtype,
+        );
+        let grad_down_weight = TensorIr::uninit(
+            client.create_empty_handle(),
+            down_weight.shape.clone(),
+            down_weight.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_grouped_swiglu_mlp_backward",
+            &[
+                input.into_ir(),
+                in_weight.into_ir(),
+                down_weight.into_ir(),
+                counts.into_ir(),
+                projected.into_ir(),
+                hidden.into_ir(),
+                grad.into_ir(),
+            ],
+            &[grad_input, grad_in_weight, grad_down_weight],
+            vec![
+                ScalarIr::UInt(intermediate as u64),
+                ScalarIr::Bool(cache_key.is_some()),
+            ],
+        );
+        let [grad_input, grad_in_weight, grad_down_weight] = client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                GroupedSwiGluMlpBackward::<B> {
+                    desc,
+                    intermediate,
+                    cache_key,
+                    backend: PhantomData,
+                },
+            )
+            .try_into()
+            .expect("grouped SwiGLU MLP backward has three outputs");
+        (grad_input, grad_in_weight, grad_down_weight)
+    }
+}
+
+impl<B> FusedSwiGluBackend for Fusion<B>
+where
+    B: FusionBackend + FusedSwiGluBackend,
+{
+    fn fused_swiglu_inner(input: FloatTensor<Self>, intermediate: usize) -> FloatTensor<Self> {
+        let [rows, _] = input.shape.dims();
+        let client = input.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([rows, intermediate]),
+            input.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_fused_swiglu",
+            &[input.into_ir()],
+            &[output],
+            vec![ScalarIr::UInt(intermediate as u64)],
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                FusedSwiGluForward::<B> {
+                    desc,
+                    intermediate,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
+    }
+
+    fn fused_swiglu_backward(
+        input: FloatTensor<Self>,
+        grad: FloatTensor<Self>,
+        intermediate: usize,
+    ) -> FloatTensor<Self> {
+        let client = input.client.clone();
+        let grad_input = TensorIr::uninit(
+            client.create_empty_handle(),
+            input.shape.clone(),
+            input.dtype,
+        );
+        let desc = CustomOpIr::with_scalars(
+            "hermes_fused_swiglu_backward",
+            &[input.into_ir(), grad.into_ir()],
+            &[grad_input],
+            vec![ScalarIr::UInt(intermediate as u64)],
+        );
+        client
+            .register(
+                StreamId::current(),
+                OperationIr::Custom(desc.clone()),
+                FusedSwiGluBackward::<B> {
+                    desc,
+                    intermediate,
+                    backend: PhantomData,
+                },
+            )
+            .remove(0)
     }
 }
 

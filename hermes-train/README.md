@@ -27,6 +27,38 @@ hermes-train train \
   --checkpoint-every 100
 ```
 
+### Build the education curriculum
+
+[`education-curriculum.example.json`](education-curriculum.example.json)
+defines four ordered tiers: language foundations, school fundamentals,
+university material, and advanced scholarship. Each tier emits a causal-LM
+stage followed by a contrastive-retrieval stage, with deterministic replay of
+earlier tiers.
+
+The builder has a strict data boundary: Search API performs embedding-backed
+hybrid discovery and returns IDs plus lightweight metadata;
+`public.documents_assembled` in `alloydb-documents` supplies the canonical full
+copy for only those IDs. Search-result text can never enter the output. URI
+scheme and prefix do not affect selection; URIs are metadata only. The builder
+requires Search API's `hybrid` mode, which fuses sparse and dense retrieval.
+
+Install the live-only dependencies, set the standard libpq environment
+variables (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`), and
+run:
+
+```bash
+python -m pip install asyncpg zstandard
+python hermes-train/scripts/build_education_curriculum.py \
+  --config hermes-train/education-curriculum.example.json \
+  --output /data/education-curriculum
+```
+
+Use `--search-limit 10` for a live smoke build. The output includes the staged
+JSONL files, validation splits, a directly consumable `curriculum.json`, and a
+checksummed `manifest.json` with Search API query and rejection counts. Selection
+and replay are covered without live services by
+`python3 hermes-train/scripts/test_education_curriculum.py`.
+
 Training is defined by a versioned JSON curriculum; stage geometry is not split
 between CLI flags and a data manifest. Start from
 [`curriculum.example.json`](curriculum.example.json), then set its data paths,
