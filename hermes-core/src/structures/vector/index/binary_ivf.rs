@@ -205,6 +205,7 @@ impl BinaryCoarseQuantizer {
 
     /// Visit compact routing topology and parent arrays before the potentially
     /// much larger leaf centroid matrix.
+    #[cfg(feature = "native")]
     pub(crate) fn visit_routing_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
         if let Some(router) = &self.routing_index {
             match router {
@@ -220,6 +221,7 @@ impl BinaryCoarseQuantizer {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn visit_leaf_centroid_region(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
         visit("binary leaf centroids", &self.centroids);
     }

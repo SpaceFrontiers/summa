@@ -584,14 +584,19 @@ impl IndexMetadata {
         if centroids.is_empty() && binary_quantizers.is_empty() {
             Ok(None)
         } else {
-            let mut trained = crate::segment::TrainedVectorStructures {
+            let trained = crate::segment::TrainedVectorStructures {
+                #[cfg(feature = "native")]
+                _ann_pins: Default::default(),
                 centroids,
                 binary_quantizers,
                 codebooks,
-                ..Default::default()
             };
             #[cfg(feature = "native")]
-            trained.pin_ann_structures(crate::segment::pin::pin_policy());
+            let trained = {
+                let mut trained = trained;
+                trained.pin_ann_structures(crate::segment::pin::pin_policy());
+                trained
+            };
             Ok(Some(trained))
         }
     }

@@ -474,6 +474,7 @@ impl PQCodebook {
 
     /// Visit the small, index-global tables required to build every IVF-PQ
     /// query plan and distance table.
+    #[cfg(feature = "native")]
     pub(crate) fn visit_resident_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
         if let Some(rotation) = &self.rotation_matrix {
             visit(

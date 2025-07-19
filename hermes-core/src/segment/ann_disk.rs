@@ -10,15 +10,21 @@
 use std::cmp::Reverse;
 #[cfg(feature = "native")]
 use std::collections::BinaryHeap;
-use std::io::{self, Write};
+use std::io;
+#[cfg(feature = "native")]
+use std::io::Write;
 use std::ops::Range;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+#[cfg(feature = "native")]
+use byteorder::WriteBytesExt;
+use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::directories::OwnedBytes;
 use crate::dsl::IvfRoutingMode;
+use crate::structures::IvfPqQueryPlan;
 use crate::structures::vector::index::BoundedAnnCollector;
-use crate::structures::{BinaryIvfIndex, IVFPQIndex, IvfPqQueryPlan};
+#[cfg(feature = "native")]
+use crate::structures::{BinaryIvfIndex, IVFPQIndex};
 
 const ANN_HEADER_MAGIC: u32 = 0x3152_4e41; // "ANR1"
 const ANN_FOOTER_MAGIC: u32 = 0x3146_4e41; // "ANF1"
@@ -26,6 +32,7 @@ const ANN_DISK_VERSION: u16 = 1;
 const ANN_HEADER_SIZE: usize = 56;
 const ANN_RUN_SIZE: usize = 48;
 const ANN_FOOTER_SIZE: usize = 24;
+#[cfg(feature = "native")]
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
 const BINARY_SCORE_BATCH: usize = 8_192;
 
@@ -428,6 +435,7 @@ pub(crate) fn write_built_binary_ivf(
     )
 }
 
+#[cfg(feature = "native")]
 struct BuildRun<'a> {
     cluster_id: u32,
     doc_ids: &'a [u32],
@@ -435,6 +443,7 @@ struct BuildRun<'a> {
     codes: &'a [u8],
 }
 
+#[cfg(feature = "native")]
 struct RunRecord {
     cluster_id: u32,
     doc_base: u32,
@@ -627,6 +636,7 @@ pub(crate) fn write_merged_ann(
     finish_footer(writer, directory_offset, written_runs)
 }
 
+#[cfg(feature = "native")]
 fn relocate_payload_offset(output_payload_start: u64, source_offset: usize) -> io::Result<u64> {
     let relative = source_offset
         .checked_sub(ANN_HEADER_SIZE)
@@ -639,6 +649,7 @@ fn relocate_payload_offset(output_payload_start: u64, source_offset: usize) -> i
         .ok_or_else(|| invalid_data("merged ANN payload offset overflows u64"))
 }
 
+#[cfg(feature = "native")]
 fn headers_compatible(left: &AnnDiskHeader, right: &AnnDiskHeader) -> bool {
     left.kind == right.kind
         && left.routing == right.routing
@@ -649,6 +660,7 @@ fn headers_compatible(left: &AnnDiskHeader, right: &AnnDiskHeader) -> bool {
         && left.codebook_version == right.codebook_version
 }
 
+#[cfg(feature = "native")]
 fn finish_layout(
     writer: &mut (impl Write + ?Sized),
     directory_offset: u64,
@@ -660,6 +672,7 @@ fn finish_layout(
     finish_footer(writer, directory_offset, records.len())
 }
 
+#[cfg(feature = "native")]
 fn write_run_record(writer: &mut (impl Write + ?Sized), record: &RunRecord) -> io::Result<()> {
     writer.write_u32::<LittleEndian>(record.cluster_id)?;
     writer.write_u32::<LittleEndian>(record.doc_base)?;
@@ -672,6 +685,7 @@ fn write_run_record(writer: &mut (impl Write + ?Sized), record: &RunRecord) -> i
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn finish_footer(
     writer: &mut (impl Write + ?Sized),
     directory_offset: u64,
@@ -693,6 +707,7 @@ fn finish_footer(
         .ok_or_else(|| invalid_data("ANN final size overflows u64"))
 }
 
+#[cfg(feature = "native")]
 fn write_header(writer: &mut (impl Write + ?Sized), header: &AnnDiskHeader) -> io::Result<()> {
     writer.write_u32::<LittleEndian>(ANN_HEADER_MAGIC)?;
     writer.write_u8(header.kind as u8)?;
@@ -716,6 +731,7 @@ fn write_header(writer: &mut (impl Write + ?Sized), header: &AnnDiskHeader) -> i
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn write_u32_column(
     writer: &mut (impl Write + ?Sized),
     values: &[u32],
@@ -732,6 +748,7 @@ fn write_u32_column(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn write_u16_column(
     writer: &mut (impl Write + ?Sized),
     values: &[u16],
@@ -748,6 +765,7 @@ fn write_u16_column(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn copy_range(
     writer: &mut (impl Write + ?Sized),
     bytes: &[u8],
@@ -759,6 +777,7 @@ fn copy_range(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn checked_advance(offset: u64, length: usize) -> io::Result<u64> {
     offset
         .checked_add(
@@ -804,6 +823,7 @@ fn run_doc_id(bytes: &[u8], run: &AnnRun, index: usize) -> io::Result<u32> {
         .ok_or_else(|| invalid_data("ANN run document ID overflows u32"))
 }
 
+#[cfg(feature = "native")]
 fn routing_to_u8(routing: IvfRoutingMode) -> u8 {
     match routing {
         IvfRoutingMode::Auto => 0,

@@ -370,6 +370,7 @@ impl HnswRoutingGraph {
 
     /// Visit the compact, immutable arrays touched by every HNSW route.
     /// Query scratch is thread-local and intentionally excluded.
+    #[cfg(feature = "native")]
     pub(crate) fn visit_resident_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
         visit("HNSW node levels", bytes_of_slice(&self.node_levels));
         visit("HNSW node offsets", bytes_of_slice(&self.node_offsets));
@@ -622,6 +623,7 @@ impl IvfRoutingTopology {
             }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn visit_resident_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
         visit(
             "two-level child offsets",
@@ -633,6 +635,7 @@ impl IvfRoutingTopology {
 
 /// View an initialized plain-data slice as bytes for residency operations.
 /// The returned slice cannot outlive the source and is never mutated.
+#[cfg(feature = "native")]
 pub(crate) fn bytes_of_slice<T>(slice: &[T]) -> &[u8] {
     let byte_len = std::mem::size_of_val(slice);
     if byte_len == 0 {

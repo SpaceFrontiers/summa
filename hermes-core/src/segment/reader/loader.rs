@@ -30,6 +30,7 @@ pub struct VectorsFileData {
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
     /// ANN field IDs declared by the validated TOC. Training-only callers use
     /// this without opening corpus-sized ANN payloads.
+    #[cfg(feature = "native")]
     pub ann_fields: Vec<u32>,
 }
 
@@ -271,6 +272,7 @@ pub async fn load_vectors_file<D: Directory>(
 /// Open only selected flat-vector fields for training. The TOC and flat
 /// payloads receive the same validation as search loading, but ANN run columns
 /// are not mapped or parsed.
+#[cfg(feature = "native")]
 pub(crate) async fn load_flat_vectors_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
@@ -294,6 +296,7 @@ async fn load_vectors_file_impl<D: Directory>(
     let empty = || VectorsFileData {
         indexes: FxHashMap::default(),
         flat_vectors: FxHashMap::default(),
+        #[cfg(feature = "native")]
         ann_fields: Vec::new(),
     };
 
@@ -384,7 +387,9 @@ async fn load_vectors_file_impl<D: Directory>(
             )));
         }
     }
+    #[cfg(feature = "native")]
     let mut ann_fields: Vec<_> = ann_toc_fields.into_iter().collect();
+    #[cfg(feature = "native")]
     ann_fields.sort_unstable();
 
     // Load each entry — a field can have both flat and mmap-backed ANN data.
@@ -519,6 +524,7 @@ async fn load_vectors_file_impl<D: Directory>(
     Ok(VectorsFileData {
         indexes,
         flat_vectors,
+        #[cfg(feature = "native")]
         ann_fields,
     })
 }
