@@ -137,6 +137,38 @@ struct Args {
     #[arg(long, value_enum)]
     pin_mode: Option<PinModeArg>,
 
+    /// Maximum background segment merges running at once (per index and the
+    /// application-wide cap). Raise it when continuous ingestion outpaces
+    /// merging and segment counts climb; keep it below the CPU/IO the box can
+    /// spare from search. (large_scale default: 4)
+    #[arg(long, default_value = "4")]
+    max_concurrent_merges: usize,
+
+    /// Tiered merge: segments allowed per tier before the tier is merged.
+    /// Lower = fewer, larger segments (ideal count ~= num_tiers * this).
+    /// (large_scale default: 10)
+    #[arg(long, default_value = "10")]
+    segments_per_tier: usize,
+
+    /// Tiered merge: maximum segments merged in a single pass. Wider fan-in
+    /// absorbs floods of small memtable flushes in fewer passes.
+    /// (large_scale default: 24)
+    #[arg(long, default_value = "24")]
+    max_merge_at_once: usize,
+
+    /// Tiered merge: maximum docs produced by one automatic merge. Also caps
+    /// the working set of a single merge-time BP reorder — raising it past
+    /// what the BP memory/time budgets can converge stalls the optimizer.
+    /// (large_scale default: 5000000)
+    #[arg(long, default_value = "5000000")]
+    max_merged_docs: u32,
+
+    /// Tiered merge: absolute cap on docs in one segment, honored by automatic
+    /// merging and force-merge. Sets the floor on segment count
+    /// (>= total_docs / this). (large_scale default: 5000000)
+    #[arg(long, default_value = "5000000")]
+    max_segment_docs: u32,
+
     /// Address for the Prometheus /metrics HTTP endpoint.
     /// Set to "off" to disable the exporter.
     #[arg(long, default_value = "0.0.0.0:9184")]
@@ -298,12 +330,45 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         None
     };
 
+    // Merge tuning: start from the large_scale preset and apply CLI overrides.
+    // Fail loud on values that would disable merging or produce degenerate
+    // tiers rather than silently clamping.
+    if args.max_concurrent_merges == 0 {
+        return Err(anyhow::anyhow!(
+            "--max-concurrent-merges must be greater than zero"
+        ));
+    }
+    if args.segments_per_tier < 2 {
+        return Err(anyhow::anyhow!("--segments-per-tier must be at least 2"));
+    }
+    if args.max_merge_at_once < 2 {
+        return Err(anyhow::anyhow!("--max-merge-at-once must be at least 2"));
+    }
+    if args.max_merged_docs == 0 || args.max_segment_docs == 0 {
+        return Err(anyhow::anyhow!(
+            "--max-merged-docs and --max-segment-docs must be greater than zero"
+        ));
+    }
+    if args.max_merged_docs > args.max_segment_docs {
+        warn!(
+            "--max-merged-docs ({}) exceeds --max-segment-docs ({}); merges are capped by the smaller value",
+            args.max_merged_docs, args.max_segment_docs,
+        );
+    }
+    let mut merge_policy = hermes_core::merge::TieredMergePolicy::large_scale();
+    merge_policy.segments_per_tier = args.segments_per_tier;
+    merge_policy.max_merge_at_once = args.max_merge_at_once;
+    merge_policy.max_merged_docs = args.max_merged_docs;
+    merge_policy.max_segment_docs = args.max_segment_docs;
+
     let config = IndexConfig {
         num_threads: search_threads,
         max_indexing_memory_bytes,
         num_indexing_threads,
         reload_interval_ms: args.reload_interval_ms,
-        merge_policy: Box::new(hermes_core::merge::TieredMergePolicy::large_scale()),
+        merge_policy: Box::new(merge_policy),
+        max_concurrent_merges: args.max_concurrent_merges,
+        background_merge_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent_merges)),
         merge_bp_time_budget: (args.merge_bp_budget_secs > 0)
             .then(|| Duration::from_secs(args.merge_bp_budget_secs)),
         bp_memory_budget_bytes,
@@ -354,6 +419,14 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Search CPU threads: {}", search_threads);
     info!("Maximum concurrent searches: {}", max_concurrent_searches);
     info!("Reload interval: {} ms", args.reload_interval_ms);
+    info!(
+        "Merge: {} concurrent, tiered(segments_per_tier={}, max_merge_at_once={}, max_merged_docs={}, max_segment_docs={})",
+        args.max_concurrent_merges,
+        args.segments_per_tier,
+        args.max_merge_at_once,
+        args.max_merged_docs,
+        args.max_segment_docs,
+    );
     if args.optimizer_threads > 0 {
         info!(
             "Optimizer: {} shared BP threads, {} concurrent pass(es), {}s scan interval, {}-pass unconverged follow-up threshold",
