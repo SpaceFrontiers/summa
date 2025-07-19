@@ -1,7 +1,7 @@
 //! Dense vector streaming build (footer-based format).
 //!
 //! Streams each field's flat data directly to disk, then writes TOC + footer.
-//! Supports parallel ANN index building (IvfRaBitQ, ScaNN).
+//! Supports parallel segment-level IVF index building.
 
 use std::io::Write;
 
@@ -220,32 +220,35 @@ pub(super) fn build_vectors_streaming(
 
                 let dim = builder.dim;
                 let blob = match config.index_type {
-                    VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(field_id) => {
-                        let centroids = &trained.centroids[field_id];
-                        let bits = config.rabitq_bits.unwrap_or(1);
-                        let (mut index, codebook) =
-                            super::super::ann_build::new_ivf_rabitq(dim, centroids, bits);
-                        for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
-                            let v = &builder.vectors[i * dim..(i + 1) * dim];
-                            index.add_vector(centroids, &codebook, *doc_id, *ordinal, v);
-                        }
-                        super::super::ann_build::serialize_ivf_rabitq(index, codebook)
-                            .map(|b| (super::super::ann_build::IVF_RABITQ_TYPE, b))
-                    }
-                    VectorIndexType::ScaNN
+                    VectorIndexType::IvfPq
                         if trained.centroids.contains_key(field_id)
                             && trained.codebooks.contains_key(field_id) =>
                     {
                         let centroids = &trained.centroids[field_id];
                         let codebook = &trained.codebooks[field_id];
-                        let mut index =
-                            super::super::ann_build::new_scann(dim, centroids, codebook);
-                        for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
-                            let v = &builder.vectors[i * dim..(i + 1) * dim];
-                            index.add_vector(centroids, codebook, *doc_id, *ordinal, v);
-                        }
-                        super::super::ann_build::serialize_scann(index, codebook)
-                            .map(|b| (super::super::ann_build::SCANN_TYPE, b))
+                        let mut index = super::super::ann_build::new_ivf_pq(
+                            dim,
+                            config.ivf_routing,
+                            centroids,
+                            codebook,
+                        );
+                        index
+                            .add_vectors_parallel(
+                                centroids,
+                                codebook,
+                                &builder.doc_ids,
+                                &builder.vectors,
+                            )
+                            .map_err(|error| {
+                                crate::Error::Internal(format!(
+                                    "parallel IVF-PQ build failed for field {field_id}: {error}"
+                                ))
+                            })?;
+                        super::super::ann_build::serialize_ivf_pq(
+                            index,
+                            centroids.num_clusters,
+                        )
+                            .map(|b| (super::super::ann_build::IVF_PQ_TYPE, b))
                     }
                     _ => return Ok(None),
                 };
@@ -368,32 +371,32 @@ pub(super) fn build_vectors_streaming(
             })?;
         }
 
-        // Binary IVF index (native only): built at commit when configured
-        // and the segment is large enough for probing to beat brute force.
+        // Binary IVF payload (native only): assignment uses the same global
+        // quantizer generation as every other segment.
         #[cfg(feature = "native")]
         {
             let binary_config = schema
                 .get_field_entry(Field(field_id))
                 .and_then(|e| e.binary_dense_vector_config.as_ref());
-            if let Some(cfg) = binary_config
+            let quantizer = trained.and_then(|trained| trained.binary_quantizers.get(&field_id));
+            if let (Some(cfg), Some(quantizer)) = (binary_config, quantizer)
                 && cfg.index_type == crate::dsl::BinaryIndexType::Ivf
-                && num_vectors >= cfg.default_build_threshold()
             {
-                let num_clusters = cfg.optimal_num_clusters(num_vectors);
-                let ivf_config =
-                    crate::structures::BinaryIvfConfig::new(builder.dim_bits, num_clusters);
                 let index = crate::structures::BinaryIvfIndex::build(
-                    ivf_config,
+                    quantizer,
+                    cfg.ivf_routing,
                     &builder.vectors,
                     &builder.doc_ids,
                 )
                 .map_err(crate::Error::Io)?;
                 let blob_offset = current_offset;
                 let mut output = &mut *writer;
-                let blob_len = u64::try_from(
-                    index.write_to(&mut output).map_err(crate::Error::Io)?,
+                let blob_len = crate::segment::ann_disk::write_built_binary_ivf(
+                    &index,
+                    cfg.ivf_routing,
+                    &mut output,
                 )
-                .map_err(|_| crate::Error::Internal("binary IVF blob size exceeds u64".into()))?;
+                .map_err(crate::Error::Io)?;
                 current_offset = current_offset.checked_add(blob_len).ok_or_else(|| {
                     crate::Error::Internal("binary IVF output offset exceeds u64".into())
                 })?;
@@ -415,7 +418,7 @@ pub(super) fn build_vectors_streaming(
                     "[build_vectors] field {}: binary IVF built ({} vectors, {} clusters, {} bytes)",
                     field_id,
                     num_vectors,
-                    num_clusters,
+                    quantizer.num_clusters,
                     blob_len,
                 );
             }

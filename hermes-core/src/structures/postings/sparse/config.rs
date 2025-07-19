@@ -249,8 +249,8 @@ pub struct SparseVectorConfig {
     /// segment of the field — set per field in SDL (`bmp_block_size: N`).
     /// Smaller = better pruning granularity; larger = smaller grid — the
     /// dense 4-bit grid is `dims × num_blocks / 2` bytes, so grid memory
-    /// scales as 1/block_size. Default 64; large corpora (10M+ docs at
-    /// 100k-dim vocabularies) should set 256 to bound grid memory
+    /// scales as 1/block_size. Default 32 favors pruning granularity; increase
+    /// it explicitly only when the block-grid memory tradeoff requires it
     /// (docs/bmp-grid-compression.md).
     #[serde(default = "default_bmp_block_size")]
     pub bmp_block_size: u32,
@@ -322,7 +322,7 @@ fn default_block_size() -> usize {
 }
 
 fn default_bmp_block_size() -> u32 {
-    64
+    SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE
 }
 
 fn default_bmp_grid_bits() -> u8 {
@@ -360,6 +360,8 @@ impl Default for SparseVectorConfig {
 }
 
 impl SparseVectorConfig {
+    pub const DEFAULT_BMP_BLOCK_SIZE: u32 = 32;
+
     /// SPLADE-optimized config with research-validated defaults
     ///
     /// Optimized for SPLADE, uniCOIL, and similar learned sparse retrieval models.

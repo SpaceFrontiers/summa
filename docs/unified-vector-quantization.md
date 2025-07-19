@@ -1,75 +1,48 @@
-# Unifying the Dense and Binary Vector Code Paths
+# Unified Dense IVF Architecture
 
-Status: investigation (2026-07-07). No format change proposed yet.
+Status: implemented (2026-07-22). The serialized ANN format is version 3 and
+requires rebuilding older vector artifacts.
 
-## The question
+## One global router
 
-Binary vectors look like "dense vectors with 1-bit quantization" — why do we
-keep two field types (`dense_vector` / `binary_dense_vector`), two configs, two
-query types, and two search paths?
+Float and packed-binary dense fields use the same index-wide IVF lifecycle:
 
-## What is already unified
+- one corpus-trained coarse codebook per field and index;
+- one routing implementation with `auto`, `flat`, `two_level`, and `hnsw` modes;
+- HNSW coarse routing for large codebooks and exact flat routing for small ones;
+- one probe plan per query, shared by every segment;
+- bounded distinct-document collection rather than a heap proportional to all
+  vector values or to the number of segments;
+- exact flat accumulation until the explicit ANN build creates global artifacts;
+- strict artifact versions, with no legacy deserialization fallback.
 
-Storage is one path today. Binary fields store into the same `.vectors` flat
-file as dense fields, tagged `DenseVectorQuantization::Binary` — the same
-`FlatVectorData` / `LazyFlatVectorData` machinery, TOC, doc-id maps, mmap
-reads, and merge streaming serve both. `FieldEntry` distinguishes them only by
-config type, and the segment reader keeps both in the same `flat_vectors` map.
+This removes per-segment centroid searches, per-segment codebooks, and the
+former alternative production paths.
 
-## What is genuinely different
+## Metric-specific leaf payloads
 
-The split is about the **metric and the query representation**, not storage:
+The global router is metric-agnostic, but leaf scanning is deliberately not:
 
-|                | dense (`f32/f16/u8`)          | binary                       |
-| -------------- | ----------------------------- | ---------------------------- |
-| Query vector   | `Vec<f32>`                    | packed `Vec<u8>` bits        |
-| Metric         | cosine / dot / L2             | Hamming                      |
-| Scoring kernel | FMA dot-product SIMD          | XOR + popcount SIMD          |
-| ANN structure  | k-means IVF + RaBitQ/PQ codes | k-majority IVF, exact codes  |
-| Rerank         | required (codes are lossy)    | none (codes ARE the vectors) |
+| Field | Coarse metric | Segment payload | Leaf score | Rerank |
+| --- | --- | --- | --- | --- |
+| float dense | squared L2 | residual PQ bytes | asymmetric distance tables | exact, bounded to 3×k distinct docs |
+| binary dense | Hamming | packed source bits | XOR + popcount | unnecessary; leaf scores are exact |
 
-The last row is the deep one: for binary fields the stored code is the exact
-vector, so IVF scanning gives exact distances and there is no L1/L2 refinement
-stage. For dense fields the quantized code is an estimate and everything
-downstream (rerank_factor, extended RaBitQ bits, flat-vector reads) exists to
-correct it. Collapsing the two paths would force the binary path to carry
-machinery it never needs, or fork internally on "is the code exact?" — the
-same split, one level down.
+Treating an already-binary embedding as float PQ would add conversion and
+approximation without information. Conversely, storing full float vectors in
+every IVF leaf would lose PQ's memory and bandwidth benefit. The two scanners
+therefore share routing, collection, persistence rules, and lifecycle while
+retaining their optimal metric kernels.
 
-## Is IVF-RaBitQ applicable to binary embeddings?
+## Billion-scale defaults
 
-Half of it. **IVF transfers** — that's what `BinaryIvfIndex` implements
-(k-majority centroids instead of k-means, same probe-nprobe-clusters shape).
-**RaBitQ does not**: RaBitQ's job is to _produce_ a 1-bit(+ex) code from a
-float residual and estimate float inner products from it asymmetrically. For
-data that is already 1 bit/dim there is no residual magnitude to encode, no
-scale factors to store, and no estimation error to correct — XOR+popcount on
-the raw code is both faster and exact. Running binary data through the RaBitQ
-encoder would only rotate the bits and add per-vector floats that carry no
-information.
+Automatic training targets 8×sqrt(N) leaves, capped by the available training
+sample and a 512 MiB coarse-artifact budget. Training samples at most two
+million vectors or 6 GiB. Large codebooks use hierarchical k-means for
+tractable training and a compact HNSW graph (`M=32`, `efConstruction=200`);
+query routing uses `efSearch=max(128, 4*nprobe)`, with `nprobe=64` by default.
 
-The one place RaBitQ-style thinking would apply: **asymmetric float-query vs
-binary-doc scoring** (e.g. an MRL float query against binarized doc
-embeddings). That is a scoring-kernel addition (`dot(f32_query, unpacked_bits)`
-with a correction term), not a reason to merge index structures — and it would
-slot into the existing binary field as an alternative query form.
-
-## Recommended direction (if/when unification is wanted)
-
-Do not merge the field types. Instead extract the two seams that are
-duplicated today:
-
-1. **A `VectorCodec` trait** covering `{F32, F16, U8, Binary}` with
-   `score_batch(query, raw, out)` — `score_quantized_batch` and
-   `batch_hamming_scores` become impls. The brute-force and rerank loops in
-   `segment/reader/mod.rs` (async + sync × dense + binary = 4 near-identical
-   scan loops) collapse to one generic loop.
-2. **A `CoarseIndex` trait** for IVF probing (`rank_clusters`, `scan_cluster`)
-   with k-means-f32 and k-majority-binary impls, unifying the
-   builder/loader/merger wiring (`try_build_ann` / `try_build_binary_ivf`).
-
-That removes the duplication the split creates while keeping the type-level
-distinction users see (a Hamming field and a cosine field genuinely are
-different things to query). Effort: moderate refactor, no format change, no
-user-facing change — worth doing next time either scan loop needs a third
-variant.
+Float residual PQ uses shared distance tables built once per query. Segment PQ
+payloads use struct-of-arrays columns with `code_size + 6` bytes per assignment
+(PQ code, document ID, and multi-value ordinal), avoiding per-vector heap
+objects. Both float and binary assignment paths reuse HNSW scratch buffers.

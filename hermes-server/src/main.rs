@@ -48,6 +48,16 @@ struct Args {
     #[arg(long, default_value = "16384")]
     max_indexing_memory_mb: usize,
 
+    /// Maximum number of vectors sampled for one field's global ANN training.
+    /// The memory limit below is enforced simultaneously.
+    #[arg(long, default_value = "10000000")]
+    vector_training_max_samples: usize,
+
+    /// Maximum resident raw sample size (MB) for one ANN field during training.
+    /// Fields are sampled and trained serially.
+    #[arg(long, default_value = "4096")]
+    vector_training_memory_mb: usize,
+
     /// Number of parallel indexing threads (defaults to CPU count)
     #[arg(long)]
     indexing_threads: Option<usize>,
@@ -306,6 +316,15 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .max_indexing_memory_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--max-indexing-memory-mb is too large"))?;
+    if args.vector_training_max_samples == 0 || args.vector_training_memory_mb == 0 {
+        return Err(anyhow::anyhow!(
+            "--vector-training-max-samples and --vector-training-memory-mb must be greater than zero"
+        ));
+    }
+    let vector_training_memory_bytes = args
+        .vector_training_memory_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--vector-training-memory-mb is too large"))?;
     let bp_memory_budget_bytes = args
         .bp_memory_budget_mb
         .checked_mul(1024 * 1024)
@@ -364,6 +383,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let config = IndexConfig {
         num_threads: search_threads,
         max_indexing_memory_bytes,
+        vector_training_max_samples: args.vector_training_max_samples,
+        vector_training_memory_bytes,
         num_indexing_threads,
         reload_interval_ms: args.reload_interval_ms,
         merge_policy: Box::new(merge_policy),
@@ -414,6 +435,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Starting Hermes server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
     info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
+    info!(
+        "Vector training sample: max {} vectors / {} MB per field",
+        args.vector_training_max_samples, args.vector_training_memory_mb,
+    );
     info!("Indexing threads: {}", num_indexing_threads);
     info!("Worker threads: {}", worker_threads);
     info!("Search CPU threads: {}", search_threads);
@@ -503,5 +528,28 @@ async fn shutdown_signal() {
         _ = terminate => {
             warn!("Received SIGTERM, starting graceful shutdown...");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_training_sample_cli_defaults_and_overrides() {
+        let defaults = Args::try_parse_from(["hermes-server"]).unwrap();
+        assert_eq!(defaults.vector_training_max_samples, 10_000_000);
+        assert_eq!(defaults.vector_training_memory_mb, 4_096);
+
+        let configured = Args::try_parse_from([
+            "hermes-server",
+            "--vector-training-max-samples",
+            "20000000",
+            "--vector-training-memory-mb",
+            "3072",
+        ])
+        .unwrap();
+        assert_eq!(configured.vector_training_max_samples, 20_000_000);
+        assert_eq!(configured.vector_training_memory_mb, 3_072);
     }
 }

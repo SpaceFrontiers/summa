@@ -1,13 +1,13 @@
 # Hermes
 
-A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and dense vectors (RaBitQ/ScaNN) in a single embeddable Rust library. Runs natively, over gRPC, in browsers via WASM, and over IPFS.
+A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and dense vectors (global IVF-PQ with HNSW coarse routing) in a single embeddable Rust library. Runs natively, over gRPC, in browsers via WASM, and over IPFS.
 
 ## Why Hermes?
 
 | Feature                 | Hermes                 | Tantivy | Qdrant  | Elasticsearch |
 | ----------------------- | ---------------------- | ------- | ------- | ------------- |
 | BM25 Full-text search   | Yes                    | Yes     | No      | Yes           |
-| Dense vectors (ANN)     | Yes (RaBitQ, ScaNN/PQ) | No      | Yes     | Plugin        |
+| Dense vectors (ANN)     | Yes (IVF-PQ + HNSW)    | No      | Yes     | Plugin        |
 | Sparse vectors (SPLADE) | Yes (native)           | No      | Partial | No            |
 | WASM / Browser          | Yes                    | No      | No      | No            |
 | IPFS storage            | Yes                    | No      | No      | No            |
@@ -202,7 +202,7 @@ await index.save_cache_to_idb();
 
 ## Key Features
 
-**Unified hybrid search** -- BM25 text ranking, SPLADE sparse vectors, and IVF-RaBitQ/IVF-PQ dense vectors share the same index, the same segments, and the same query pipeline. No sidecar services required.
+**Unified hybrid search** -- BM25 text ranking, SPLADE sparse vectors, and global IVF-PQ dense vectors share the same index, segments, and query pipeline. No sidecar services required.
 
 **6 posting list formats** -- Adaptive format selection per list: HorizontalBP128, VerticalBP128, Elias-Fano, Partitioned Elias-Fano, Roaring bitmaps, and OptP4D. The engine picks the best format based on list density and length.
 

@@ -3,8 +3,6 @@
 use std::io;
 use std::mem::size_of;
 
-use serde::{Deserialize, Serialize};
-
 use crate::directories::{FileHandle, OwnedBytes};
 use crate::dsl::DenseVectorQuantization;
 use crate::segment::format::{DOC_ID_ENTRY_SIZE, FLAT_BINARY_HEADER_SIZE, FLAT_BINARY_MAGIC};
@@ -416,8 +414,8 @@ pub struct LazyFlatVectorData {
 impl LazyFlatVectorData {
     /// Open from a lazy file slice pointing to the flat binary data region.
     ///
-    /// Reads header (16 bytes) + doc_ids (~6 bytes/vector) into memory.
-    /// Vector data stays lazy on disk.
+    /// Reads and validates the header and zero-copy document map. Vector data
+    /// stays lazy on disk.
     pub async fn open(handle: FileHandle) -> io::Result<Self> {
         Self::open_with_doc_limit(handle, None).await
     }
@@ -430,6 +428,23 @@ impl LazyFlatVectorData {
     pub(crate) async fn open_with_doc_limit(
         handle: FileHandle,
         total_docs: Option<u32>,
+    ) -> io::Result<Self> {
+        Self::open_impl(handle, total_docs, true).await
+    }
+
+    /// Open only the raw-vector region needed by global ANN training.
+    ///
+    /// The complete serialized shape is still checked, but the corpus-sized
+    /// document map is neither faulted in nor scanned: sampling addresses
+    /// vectors by global vector ordinal and never resolves document IDs.
+    pub(crate) async fn open_for_training(handle: FileHandle) -> io::Result<Self> {
+        Self::open_impl(handle, None, false).await
+    }
+
+    async fn open_impl(
+        handle: FileHandle,
+        total_docs: Option<u32>,
+        load_doc_map: bool,
     ) -> io::Result<Self> {
         let header_len = u64::try_from(FLAT_BINARY_HEADER_SIZE).map_err(|_| {
             io::Error::new(
@@ -554,16 +569,21 @@ impl LazyFlatVectorData {
             )
         })?;
 
-        let doc_ids_bytes = handle.read_bytes_range(doc_ids_start..doc_ids_end).await?;
-        if doc_ids_bytes.len() != doc_ids_byte_len_usize {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "flat vector doc-map read returned {} bytes, expected {doc_ids_byte_len_usize}",
-                    doc_ids_bytes.len()
-                ),
-            ));
-        }
+        let doc_ids_bytes = if load_doc_map {
+            let bytes = handle.read_bytes_range(doc_ids_start..doc_ids_end).await?;
+            if bytes.len() != doc_ids_byte_len_usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "flat vector doc-map read returned {} bytes, expected {doc_ids_byte_len_usize}",
+                        bytes.len()
+                    ),
+                ));
+            }
+            bytes
+        } else {
+            OwnedBytes::empty()
+        };
 
         let mut previous = None;
         let mut num_docs_with_vectors = 0usize;
@@ -994,6 +1014,11 @@ impl LazyFlatVectorData {
     /// Read doc_id at index from raw bytes (no ordinal).
     #[inline]
     fn doc_id_at(&self, idx: usize) -> u32 {
+        assert_eq!(
+            self.doc_ids_bytes.len(),
+            self.num_vectors * DOC_ID_ENTRY_SIZE,
+            "document IDs are unavailable on a training-only flat-vector reader",
+        );
         let off = idx * DOC_ID_ENTRY_SIZE;
         let d = &self.doc_ids_bytes[off..];
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
@@ -1002,6 +1027,11 @@ impl LazyFlatVectorData {
     /// Get doc_id and ordinal at index (parsed from zero-copy mmap bytes).
     #[inline]
     pub fn get_doc_id(&self, idx: usize) -> (u32, u16) {
+        assert_eq!(
+            self.doc_ids_bytes.len(),
+            self.num_vectors * DOC_ID_ENTRY_SIZE,
+            "document IDs are unavailable on a training-only flat-vector reader",
+        );
         let off = idx * DOC_ID_ENTRY_SIZE;
         let d = &self.doc_ids_bytes[off..];
         let doc_id = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
@@ -1039,143 +1069,6 @@ impl LazyFlatVectorData {
     /// Estimated memory usage — doc_ids are mmap-backed (only Arc overhead).
     pub fn estimated_memory_bytes(&self) -> usize {
         size_of::<Self>() + size_of::<OwnedBytes>()
-    }
-}
-
-/// IVF-RaBitQ index data (codebook + cluster assignments)
-///
-/// Centroids are stored at the index level (`field_X_centroids.bin`),
-/// not duplicated per segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IVFRaBitQIndexData {
-    pub index: crate::structures::IVFRaBitQIndex,
-    pub codebook: crate::structures::RaBitQCodebook,
-}
-
-impl IVFRaBitQIndexData {
-    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    }
-
-    pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        let value: Self = crate::structures::vector::decode_ann_bincode_exact(data, "IVF-RaBitQ")?;
-        value
-            .codebook
-            .validate()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if value.index.config.default_nprobe == 0
-            || value.index.config.dim != value.codebook.config.dim
-            || value.index.codebook_version != value.codebook.version
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "IVF-RaBitQ index/codebook metadata mismatch",
-            ));
-        }
-        let mut total_vectors = 0usize;
-        for (_, cluster) in value.index.clusters.iter() {
-            if cluster.doc_ids.len() != cluster.ordinals.len()
-                || cluster.doc_ids.len() != cluster.codes.len()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "IVF-RaBitQ cluster column lengths differ",
-                ));
-            }
-            total_vectors = total_vectors
-                .checked_add(cluster.codes.len())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "IVF-RaBitQ vector count overflow",
-                    )
-                })?;
-            for code in &cluster.codes {
-                value
-                    .codebook
-                    .validate_vector(code)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            }
-        }
-        if total_vectors != value.index.clusters.total_vectors {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "IVF-RaBitQ total vector count is inconsistent",
-            ));
-        }
-        Ok(value)
-    }
-}
-
-/// ScaNN index data (codebook + cluster assignments)
-///
-/// Centroids are stored at the index level (`field_X_centroids.bin`),
-/// not duplicated per segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScaNNIndexData {
-    pub index: crate::structures::IVFPQIndex,
-    pub codebook: crate::structures::PQCodebook,
-}
-
-impl ScaNNIndexData {
-    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    }
-
-    pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        let value: Self = crate::structures::vector::decode_ann_bincode_exact(data, "ScaNN")?;
-        value
-            .codebook
-            .validate()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if value.index.config.default_nprobe == 0
-            || value.index.config.dim != value.codebook.config.dim
-            || value.index.codebook_version != value.codebook.version
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ScaNN index/codebook metadata mismatch",
-            ));
-        }
-        let expected_codes = value.codebook.config.num_subspaces;
-        let num_centroids = value.codebook.config.num_centroids;
-        let mut total_vectors = 0usize;
-        for (_, cluster) in value.index.clusters.iter() {
-            if cluster.doc_ids.len() != cluster.ordinals.len()
-                || cluster.doc_ids.len() != cluster.codes.len()
-                || cluster.codes.iter().any(|code| {
-                    code.codes.len() != expected_codes
-                        || !code.norm.is_finite()
-                        || code.norm < 0.0
-                        || code
-                            .codes
-                            .iter()
-                            .any(|&centroid| centroid as usize >= num_centroids)
-                })
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ScaNN cluster columns or PQ code lengths are invalid",
-                ));
-            }
-            total_vectors = total_vectors
-                .checked_add(cluster.codes.len())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "ScaNN vector count overflow",
-                    )
-                })?;
-        }
-        if total_vectors != value.index.clusters.total_vectors {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ScaNN total vector count is inconsistent",
-            ));
-        }
-        Ok(value)
     }
 }
 
@@ -1509,62 +1402,6 @@ mod tests {
         let mut raw = [0; 8];
         let error = flat.read_vector_raw_into(0, &mut raw).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-    }
-
-    #[test]
-    fn ann_bincode_decoders_reject_trailing_and_invalid_semantics() {
-        let rabitq_codebook =
-            crate::structures::RaBitQCodebook::new(crate::structures::RaBitQConfig::new(8));
-        let rabitq = IVFRaBitQIndexData {
-            index: crate::structures::IVFRaBitQIndex::new(
-                crate::structures::IVFRaBitQConfig::new(8),
-                1,
-                rabitq_codebook.version,
-            ),
-            codebook: rabitq_codebook,
-        };
-        let mut rabitq_bytes = rabitq.to_bytes().unwrap();
-        assert!(IVFRaBitQIndexData::from_bytes(&rabitq_bytes).is_ok());
-        let mut invalid_rabitq = rabitq.clone();
-        invalid_rabitq.index.config.default_nprobe = 0;
-        assert!(IVFRaBitQIndexData::from_bytes(&invalid_rabitq.to_bytes().unwrap()).is_err());
-        invalid_rabitq.index.config.default_nprobe = 1;
-        invalid_rabitq.codebook.config.query_bits = 0;
-        assert!(IVFRaBitQIndexData::from_bytes(&invalid_rabitq.to_bytes().unwrap()).is_err());
-        rabitq_bytes.push(0);
-        assert!(IVFRaBitQIndexData::from_bytes(&rabitq_bytes).is_err());
-
-        let pq_config = crate::structures::PQConfig::new(2);
-        let pq_codebook = crate::structures::PQCodebook {
-            centroids: vec![
-                0.0;
-                pq_config.num_subspaces
-                    * pq_config.num_centroids
-                    * pq_config.dims_per_block
-            ],
-            rotation_matrix: None,
-            centroid_norms: None,
-            version: 2,
-            config: pq_config,
-        };
-        let scann = ScaNNIndexData {
-            index: crate::structures::IVFPQIndex::new(
-                crate::structures::IVFPQConfig::new(2),
-                1,
-                pq_codebook.version,
-            ),
-            codebook: pq_codebook,
-        };
-        let mut scann_bytes = scann.to_bytes().unwrap();
-        assert!(ScaNNIndexData::from_bytes(&scann_bytes).is_ok());
-        let mut invalid_scann = scann.clone();
-        invalid_scann.index.config.default_nprobe = 0;
-        assert!(ScaNNIndexData::from_bytes(&invalid_scann.to_bytes().unwrap()).is_err());
-        invalid_scann.index.config.default_nprobe = 1;
-        invalid_scann.codebook.config.aniso_eta = f32::NAN;
-        assert!(ScaNNIndexData::from_bytes(&invalid_scann.to_bytes().unwrap()).is_err());
-        scann_bytes.push(0);
-        assert!(ScaNNIndexData::from_bytes(&scann_bytes).is_err());
     }
 
     #[tokio::test]

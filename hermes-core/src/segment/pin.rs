@@ -11,7 +11,7 @@
 //! data, raw vectors) is never pinned — it is covered by the
 //! `MADV_RANDOM`/`MADV_WILLNEED` discipline instead.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::directories::OwnedBytes;
 
@@ -104,6 +104,134 @@ pub struct PinReport {
     pub skipped_budget_bytes: u64,
     /// Bytes where mlock failed (RLIMIT_MEMLOCK etc.)
     pub failed_bytes: u64,
+}
+
+/// RAII owner for heap pages locked on behalf of one immutable ANN artifact
+/// generation. The referenced allocations are owned by the same
+/// `TrainedVectorStructures`; its field order drops this set before the
+/// artifact `Arc`s, so every address remains valid through `munlock`.
+struct HeapPinGuard {
+    page_start: *mut libc::c_void,
+    page_len: usize,
+}
+
+// The guard never dereferences its pointer. The immutable artifact allocations
+// it describes are safe to share, and mlock/munlock operate on process mappings.
+unsafe impl Send for HeapPinGuard {}
+unsafe impl Sync for HeapPinGuard {}
+
+impl Drop for HeapPinGuard {
+    fn drop(&mut self) {
+        if unsafe { libc::munlock(self.page_start, self.page_len) } != 0 {
+            log::warn!(
+                "[pin] munlock failed for {} ANN heap bytes: {}",
+                self.page_len,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Locked heap allocations associated with one index-global ANN generation.
+/// Segment-local vector/code payloads are intentionally excluded.
+#[derive(Default)]
+pub(crate) struct HeapPinSet {
+    guards: Vec<HeapPinGuard>,
+    /// Keep every allocation owner alive until after its guards are dropped,
+    /// even if a cloned `TrainedVectorStructures` has its public maps mutated.
+    owners: Vec<Arc<dyn std::any::Any + Send + Sync>>,
+    report: PinReport,
+}
+
+impl HeapPinSet {
+    pub(crate) fn report(&self) -> PinReport {
+        self.report
+    }
+
+    pub(crate) fn retain_owner<T: std::any::Any + Send + Sync>(&mut self, owner: Arc<T>) {
+        self.owners.push(owner);
+    }
+
+    /// Keep one immutable heap slice resident, subject to the generation
+    /// budget. `Copy` mode needs no allocation: trained artifacts are already
+    /// heap-owned, which is exactly the residency guarantee that mode provides
+    /// on the supported swapless deployment.
+    pub(crate) fn pin_slice<T>(
+        &mut self,
+        slice: &[T],
+        label: &str,
+        mode: PinMode,
+        remaining: &mut u64,
+    ) {
+        let len = std::mem::size_of_val(slice);
+        if len == 0 {
+            return;
+        }
+        let Ok(len_u64) = u64::try_from(len) else {
+            self.report.failed_bytes = u64::MAX;
+            log::warn!("[pin] ANN region {label} is too large to account");
+            return;
+        };
+        self.report.intended_bytes = self.report.intended_bytes.saturating_add(len_u64);
+        if len_u64 > *remaining {
+            self.report.skipped_budget_bytes =
+                self.report.skipped_budget_bytes.saturating_add(len_u64);
+            log::debug!(
+                "[pin] ANN budget exhausted: skipping {} ({} bytes, {} remaining)",
+                label,
+                len_u64,
+                *remaining
+            );
+            return;
+        }
+
+        if mode == PinMode::Copy {
+            *remaining -= len_u64;
+            self.report.pinned_bytes = self.report.pinned_bytes.saturating_add(len_u64);
+            return;
+        }
+
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page_size = usize::try_from(page_size).ok().filter(|&size| size > 0);
+        let Some(page_size) = page_size else {
+            self.report.failed_bytes = self.report.failed_bytes.saturating_add(len_u64);
+            log::warn!("[pin] cannot determine page size while locking {label}");
+            return;
+        };
+        let address = slice.as_ptr() as usize;
+        let page_start = address / page_size * page_size;
+        let Some(end) = address.checked_add(len) else {
+            self.report.failed_bytes = self.report.failed_bytes.saturating_add(len_u64);
+            log::warn!("[pin] ANN region address overflow while locking {label}");
+            return;
+        };
+        let Some(rounded_end) = end
+            .checked_add(page_size - 1)
+            .map(|value| value / page_size * page_size)
+        else {
+            self.report.failed_bytes = self.report.failed_bytes.saturating_add(len_u64);
+            log::warn!("[pin] ANN region page range overflow while locking {label}");
+            return;
+        };
+        let page_len = rounded_end - page_start;
+        let page_start = page_start as *mut libc::c_void;
+        if unsafe { libc::mlock(page_start.cast_const(), page_len) } == 0 {
+            self.guards.push(HeapPinGuard {
+                page_start,
+                page_len,
+            });
+            *remaining -= len_u64;
+            self.report.pinned_bytes = self.report.pinned_bytes.saturating_add(len_u64);
+        } else {
+            self.report.failed_bytes = self.report.failed_bytes.saturating_add(len_u64);
+            log::warn!(
+                "[pin] mlock failed for ANN {} ({} bytes): {} — check RLIMIT_MEMLOCK/CAP_IPC_LOCK; continuing unpinned",
+                label,
+                len_u64,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 /// Pin one metadata section, updating `remaining` budget and the report.

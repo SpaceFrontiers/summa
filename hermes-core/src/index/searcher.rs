@@ -11,10 +11,9 @@ use crate::directories::Directory;
 use crate::dsl::Schema;
 use crate::error::Result;
 use crate::query::LazyGlobalStats;
-use crate::segment::{SegmentId, SegmentReader};
+use crate::segment::{SegmentId, SegmentReader, TrainedVectorStructures};
 #[cfg(feature = "native")]
 use crate::segment::{SegmentSnapshot, SegmentTracker};
-use crate::structures::CoarseCentroids;
 
 /// Immutable resources that must stay identical across `IndexReader` reloads.
 /// The search pool exists only when synchronous scoring is compiled in; native
@@ -71,8 +70,8 @@ pub struct Searcher<D: Directory + 'static> {
     default_fields: Vec<crate::Field>,
     /// Tokenizers
     tokenizers: Arc<crate::tokenizer::TokenizerRegistry>,
-    /// Trained centroids per field (injected into segment readers for IVF/ScaNN search)
-    trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+    /// One immutable generation of all index-global ANN artifacts.
+    trained_vectors: Arc<TrainedVectorStructures>,
     /// Lazy global statistics for cross-segment IDF computation
     global_stats: Arc<LazyGlobalStats>,
     /// O(1) segment lookup by segment_id
@@ -117,7 +116,7 @@ impl<D: Directory + 'static> Searcher<D> {
             directory,
             schema,
             segment_ids,
-            FxHashMap::default(),
+            Arc::new(TrainedVectorStructures::default()),
             term_cache_blocks,
             store_cache_blocks,
         )
@@ -130,14 +129,14 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: Arc<D>,
         schema: Arc<Schema>,
         snapshot: SegmentSnapshot,
-        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+        trained_vectors: Arc<TrainedVectorStructures>,
         resources: SearcherResources,
     ) -> Result<Self> {
         let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
             &directory,
             &schema,
             snapshot.segment_ids(),
-            &trained_centroids,
+            &trained_vectors,
             resources.term_cache_blocks,
             resources.store_cache_blocks,
             &[],
@@ -151,7 +150,7 @@ impl<D: Directory + 'static> Searcher<D> {
             schema,
             default_fields,
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
-            trained_centroids,
+            trained_vectors,
             global_stats,
             segment_map,
             total_docs,
@@ -168,7 +167,7 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: Arc<D>,
         schema: Arc<Schema>,
         snapshot: SegmentSnapshot,
-        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+        trained_vectors: Arc<TrainedVectorStructures>,
         resources: SearcherResources,
         existing_segments: &[Arc<SegmentReader>],
     ) -> Result<Self> {
@@ -176,7 +175,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &directory,
             &schema,
             snapshot.segment_ids(),
-            &trained_centroids,
+            &trained_vectors,
             resources.term_cache_blocks,
             resources.store_cache_blocks,
             existing_segments,
@@ -190,7 +189,7 @@ impl<D: Directory + 'static> Searcher<D> {
             schema,
             default_fields,
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
-            trained_centroids,
+            trained_vectors,
             global_stats,
             segment_map,
             total_docs,
@@ -204,7 +203,7 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: Arc<D>,
         schema: Arc<Schema>,
         segment_ids: &[String],
-        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+        trained_vectors: Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
         store_cache_blocks: usize,
     ) -> Result<Self> {
@@ -212,7 +211,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &directory,
             &schema,
             segment_ids,
-            &trained_centroids,
+            &trained_vectors,
             term_cache_blocks,
             store_cache_blocks,
             &[],
@@ -237,7 +236,7 @@ impl<D: Directory + 'static> Searcher<D> {
             schema,
             default_fields,
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
-            trained_centroids,
+            trained_vectors,
             global_stats,
             segment_map,
             total_docs,
@@ -251,7 +250,7 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         segment_ids: &[String],
-        trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
+        trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
         store_cache_blocks: usize,
         existing_segments: &[Arc<SegmentReader>],
@@ -266,7 +265,7 @@ impl<D: Directory + 'static> Searcher<D> {
             directory,
             schema,
             segment_ids,
-            trained_centroids,
+            trained_vectors,
             term_cache_blocks,
             store_cache_blocks,
             existing_segments,
@@ -291,7 +290,7 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         segment_ids: &[String],
-        trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
+        trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
         store_cache_blocks: usize,
         existing_segments: &[Arc<SegmentReader>],
@@ -367,10 +366,8 @@ impl<D: Directory + 'static> Searcher<D> {
         for ((idx, sid), result) in to_load.into_iter().zip(results) {
             match result {
                 Ok(mut reader) => {
-                    // Inject per-field centroids into reader for IVF/ScaNN search
-                    if !trained_centroids.is_empty() {
-                        reader.set_coarse_centroids(trained_centroids.clone());
-                    }
+                    // Inject the single immutable index-level artifact generation.
+                    reader.set_trained_vectors(Arc::clone(trained_vectors));
                     loaded.push((idx, Arc::new(reader)));
                 }
                 Err(e) => {
@@ -456,8 +453,14 @@ impl<D: Directory + 'static> Searcher<D> {
     }
 
     /// Get trained centroids
-    pub fn trained_centroids(&self) -> &FxHashMap<u32, Arc<CoarseCentroids>> {
-        &self.trained_centroids
+    pub fn trained_centroids(&self) -> &FxHashMap<u32, Arc<crate::structures::CoarseCentroids>> {
+        &self.trained_vectors.centroids
+    }
+
+    pub fn trained_binary_quantizers(
+        &self,
+    ) -> &FxHashMap<u32, Arc<crate::structures::BinaryCoarseQuantizer>> {
+        &self.trained_vectors.binary_quantizers
     }
 
     /// Get lazy global statistics for cross-segment IDF computation
@@ -603,12 +606,12 @@ impl<D: Directory + 'static> Searcher<D> {
             let sid = segment.meta().id;
             let shared = shared.clone();
             async move {
-                let (mut results, segment_seen) = crate::query::search_segment_seeded(
+                let (mut results, segment_seen) = crate::query::search_segment_shared(
                     segment.as_ref(),
                     query,
                     fetch_limit,
                     collect_positions,
-                    shared.get(),
+                    shared.clone(),
                 )
                 .await?;
                 if fetch_limit > 0 && results.len() >= fetch_limit {
@@ -674,12 +677,12 @@ impl<D: Directory + 'static> Searcher<D> {
                 .par_iter()
                 .map(|segment| {
                     let sid = segment.meta().id;
-                    let (mut results, segment_seen) = crate::query::search_segment_seeded_sync(
+                    let (mut results, segment_seen) = crate::query::search_segment_shared_sync(
                         segment.as_ref(),
                         query,
                         fetch_limit,
                         collect_positions,
-                        shared.get(),
+                        shared.clone(),
                     )?;
                     if fetch_limit > 0 && results.len() >= fetch_limit {
                         shared.raise(results[fetch_limit - 1].score);
@@ -725,12 +728,12 @@ impl<D: Directory + 'static> Searcher<D> {
                 .par_iter()
                 .map(|segment| {
                     let sid = segment.meta().id;
-                    let (mut results, segment_seen) = crate::query::search_segment_seeded_sync(
+                    let (mut results, segment_seen) = crate::query::search_segment_shared_sync(
                         segment.as_ref(),
                         query,
                         fetch_limit,
                         false,
-                        shared.get(),
+                        shared.clone(),
                     )?;
                     if fetch_limit > 0 && results.len() >= fetch_limit {
                         shared.raise(results[fetch_limit - 1].score);
@@ -772,8 +775,9 @@ impl<D: Directory + 'static> Searcher<D> {
     /// carry per-chunk `positions`.
     ///
     /// Each query is paired with a weight scaling its contribution.
-    /// `fetch_limit` is the per-query candidate depth; a common choice is
-    /// `4 * limit` (min 50) for good rank resolution.
+    /// `fetch_limit` is the per-query candidate depth. The server defaults to
+    /// `4 * limit` (min 50) without reranking, but uses the already
+    /// oversubscribed rerank pool directly when one is configured.
     pub async fn search_fused(
         &self,
         queries: &[(&dyn crate::query::Query, f32)],

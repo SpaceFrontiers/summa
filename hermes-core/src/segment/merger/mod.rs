@@ -6,6 +6,8 @@ mod postings;
 mod sparse;
 mod store;
 
+pub(crate) use dense::AnnWriteMode;
+
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -172,7 +174,7 @@ impl SegmentMerger {
     /// Merge segments into one, streaming postings/positions/store directly to files.
     ///
     /// If `trained` is provided, dense vectors use O(1) cluster merge when possible
-    /// (homogeneous IVF/ScaNN), otherwise rebuilds ANN from trained structures.
+    /// (compatible IVF-PQ), otherwise rebuilds ANN from global artifacts.
     /// Without trained structures, only flat vectors are merged.
     ///
     /// Uses streaming writers so postings, positions, and store data flow directly
@@ -285,7 +287,7 @@ impl SegmentMerger {
         let sparse_fut = async { self.merge_sparse_vectors(dir, segments, &files).await };
 
         let dense_fut = async {
-            self.merge_dense_vectors(dir, segments, &files, trained)
+            self.merge_dense_vectors(dir, segments, &files, trained, AnnWriteMode::Copy)
                 .await
         };
 

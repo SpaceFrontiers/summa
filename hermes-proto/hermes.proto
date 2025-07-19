@@ -40,7 +40,7 @@ service IndexService {
   // List all indexes
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
 
-  // Retrain vector index (re-cluster centroids/codebooks from current data)
+  // Retrain global vector codebooks and atomically rebuild every ANN segment
   rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
 }
 

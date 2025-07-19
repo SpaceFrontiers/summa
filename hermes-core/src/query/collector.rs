@@ -585,6 +585,7 @@ pub async fn collect_segment_with_limit_seeded<C: Collector>(
     let options = super::ScorerOptions {
         collect_positions: collector.needs_positions(),
         initial_threshold,
+        shared_threshold: None,
     };
     let mut scorer = query.scorer_with_options(reader, limit, options).await?;
     drive_scorer(scorer.as_mut(), collector);
@@ -659,6 +660,7 @@ pub fn collect_segment_with_limit_seeded_sync<C: Collector>(
     let options = super::ScorerOptions {
         collect_positions: collector.needs_positions(),
         initial_threshold,
+        shared_threshold: None,
     };
     let mut scorer = query.scorer_sync_with_options(reader, limit, options)?;
     drive_scorer(scorer.as_mut(), collector);
@@ -695,6 +697,31 @@ pub fn search_segment_seeded_sync(
     Ok(collector.into_results_with_count())
 }
 
+/// Per-segment search with a live cross-segment top-k floor (sync).
+#[cfg(feature = "sync")]
+pub fn search_segment_shared_sync(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+    shared_threshold: super::SharedThreshold,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = if collect_positions {
+        TopKCollector::with_positions(segment_limit)
+    } else {
+        TopKCollector::new(segment_limit)
+    };
+    let options = super::ScorerOptions {
+        collect_positions,
+        initial_threshold: shared_threshold.get(),
+        shared_threshold: Some(shared_threshold),
+    };
+    let mut scorer = query.scorer_sync_with_options(reader, segment_limit, options)?;
+    drive_scorer(scorer.as_mut(), &mut collector);
+    Ok(collector.into_results_with_count())
+}
+
 /// Per-segment search seeded with a cross-segment top-k floor (async).
 pub async fn search_segment_seeded(
     reader: &SegmentReader,
@@ -717,6 +744,32 @@ pub async fn search_segment_seeded(
         initial_threshold,
     )
     .await?;
+    Ok(collector.into_results_with_count())
+}
+
+/// Per-segment search with a live cross-segment top-k floor (async).
+pub async fn search_segment_shared(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+    shared_threshold: super::SharedThreshold,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let segment_limit = limit.min(reader.num_docs() as usize);
+    let mut collector = if collect_positions {
+        TopKCollector::with_positions(segment_limit)
+    } else {
+        TopKCollector::new(segment_limit)
+    };
+    let options = super::ScorerOptions {
+        collect_positions,
+        initial_threshold: shared_threshold.get(),
+        shared_threshold: Some(shared_threshold),
+    };
+    let mut scorer = query
+        .scorer_with_options(reader, segment_limit, options)
+        .await?;
+    drive_scorer(scorer.as_mut(), &mut collector);
     Ok(collector.into_results_with_count())
 }
 

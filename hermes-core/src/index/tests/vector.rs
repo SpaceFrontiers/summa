@@ -6,7 +6,7 @@ use crate::index::{Index, IndexConfig, IndexWriter};
 async fn test_vector_index_threshold_switch() {
     use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, VectorIndexType};
 
-    // Create schema with dense vector field configured for IVF-RaBitQ
+    // Create schema with a dense vector field configured for IVF-PQ.
     let mut schema_builder = SchemaBuilder::default();
     let title = schema_builder.add_text_field("title", true, true);
     let embedding = schema_builder.add_dense_vector_field_with_config(
@@ -15,20 +15,22 @@ async fn test_vector_index_threshold_switch() {
         true, // stored
         DenseVectorConfig {
             dim: 8,
-            index_type: VectorIndexType::IvfRaBitQ,
+            index_type: VectorIndexType::IvfPq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: Some(4), // Small for test
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 2,
-            build_threshold: Some(50), // Build when we have 50+ vectors
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = schema_builder.build();
 
     let dir = RamDirectory::new();
-    let config = IndexConfig::default();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
 
     // Phase 1: Add vectors below threshold (should use Flat index)
     let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
@@ -98,6 +100,11 @@ async fn test_vector_index_threshold_switch() {
 
     // Search should still work
     let segments = index.segment_readers().await.unwrap();
+    assert_eq!(segments.len(), 2, "test requires two unmerged segments");
+    assert!(segments.iter().all(|segment| matches!(
+        segment.vector_indexes().get(&embedding.0),
+        Some(crate::segment::VectorIndex::IvfPq(_))
+    )));
     let results = segments[0]
         .search_dense_vector(
             embedding,
@@ -125,113 +132,113 @@ async fn test_vector_index_threshold_switch() {
 }
 
 #[tokio::test]
-async fn rebuild_rejects_segments_bound_to_the_current_artifact_generation() {
+async fn test_vector_retrain_atomically_replaces_the_complete_generation() {
+    use crate::directories::Directory;
     use crate::dsl::DenseVectorConfig;
+    use crate::query::DenseVectorQuery;
 
-    let mut schema_builder = SchemaBuilder::default();
-    let embedding = schema_builder.add_dense_vector_field_with_config(
+    let mut sb = SchemaBuilder::default();
+    let embedding = sb.add_dense_vector_field_with_config(
         "embedding",
         true,
         true,
-        DenseVectorConfig::with_ivf(4, Some(1), 1),
+        DenseVectorConfig::with_ivf_pq(8, Some(4), 2),
     );
-    let schema = schema_builder.build();
+    let schema = sb.build();
     let dir = RamDirectory::new();
     let config = IndexConfig {
         merge_policy: Box::new(crate::merge::NoMergePolicy),
+        num_indexing_threads: 1,
         ..Default::default()
     };
-    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+    let live_index = Index::create(dir.clone(), schema, config.clone())
         .await
         .unwrap();
+    let mut writer = live_index.writer();
 
-    // Segments committed before training remain flat and provide the sample.
-    for i in 0..4 {
+    for batch in 0..2 {
+        for i in 0..24 {
+            let n = (batch * 24 + i) as f32;
+            let mut doc = Document::new();
+            doc.add_dense_vector(
+                embedding,
+                (0..8).map(|dim| (n * (dim + 1) as f32).sin()).collect(),
+            );
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    writer.build_vector_index().await.unwrap();
+
+    // Hold a searcher for generation 1 across the complete retrain. It must
+    // retain both its old segments and their matching old codebook.
+    let old_reader = live_index.reader().await.unwrap();
+    let old_searcher = old_reader.searcher().await.unwrap();
+    let first_version = writer.segment_manager.trained().unwrap().codebooks[&embedding.0].version;
+
+    // A materially different third segment changes the training sample and is
+    // initially encoded with generation 1 by normal ingestion.
+    for i in 0..24 {
         let mut doc = Document::new();
-        doc.add_dense_vector(embedding, vec![i as f32; 4]);
+        doc.add_dense_vector(
+            embedding,
+            (0..8)
+                .map(|dim| 1000.0 + i as f32 * 17.0 + dim as f32 * 31.0)
+                .collect(),
+        );
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
-    writer.build_vector_index().await.unwrap();
-    let old_version = writer.segment_manager.trained().unwrap().centroids[&embedding.0].version;
+    let before_ids = writer.segment_manager.get_segment_ids().await;
 
-    // Once trained, a newly committed segment embeds that exact centroid
-    // generation in its IVF data.
-    let mut doc = Document::new();
-    doc.add_dense_vector(embedding, vec![10.0; 4]);
-    writer.add_document(doc).unwrap();
-    writer.commit().await.unwrap();
-
-    let index = Index::open(dir, config).await.unwrap();
-    assert!(
-        index
-            .segment_readers()
-            .await
-            .unwrap()
-            .iter()
-            .any(|segment| matches!(
-                segment.vector_indexes().get(&embedding.0),
-                Some(crate::segment::VectorIndex::IVF(_))
-            ))
+    writer.retrain_vector_index().await.unwrap();
+    let trained = writer.segment_manager.trained().unwrap();
+    let second_version = trained.codebooks[&embedding.0].version;
+    assert_ne!(
+        first_version, second_version,
+        "the expanded corpus must retrain the PQ codebook"
     );
-    drop(index);
 
-    let error = writer
-        .rebuild_vector_index()
+    let after_ids = writer.segment_manager.get_segment_ids().await;
+    assert_eq!(after_ids.len(), before_ids.len());
+    assert!(
+        after_ids.iter().all(|id| !before_ids.contains(id)),
+        "every segment using the old codebook must be replaced in one generation"
+    );
+    let current_index = Index::open(dir.clone(), config).await.unwrap();
+    for segment in current_index.segment_readers().await.unwrap() {
+        let Some(crate::segment::VectorIndex::IvfPq(index)) = segment.get_vector_index(embedding)
+        else {
+            panic!("every current segment must contain IVF-PQ");
+        };
+        let header = index.get().header();
+        assert_eq!(header.codebook_version, second_version);
+        assert_eq!(
+            header.quantizer_version,
+            trained.centroids[&embedding.0].version
+        );
+    }
+
+    let old_results = old_searcher
+        .search(&DenseVectorQuery::new(embedding, vec![0.25; 8]), 5)
         .await
-        .expect_err("retraining must reject an existing IVF generation")
-        .to_string();
-    assert!(
-        error.contains("already contains an IVF/ScaNN index"),
-        "{error}"
-    );
-    assert!(
-        writer
-            .segment_manager
-            .read_metadata(|metadata| metadata.is_field_built(embedding.0))
-            .await
-    );
-    assert_eq!(
-        writer.segment_manager.trained().unwrap().centroids[&embedding.0].version,
-        old_version,
-        "a rejected rebuild must leave the published generation untouched"
-    );
+        .expect("an old reader must remain paired with generation 1");
+    assert!(!old_results.is_empty());
 
-    // Simulate metadata left Flat by a crash-interrupted rebuild from an older
-    // Hermes release. The ordinary build entry point must inspect the segment
-    // generation too; trusting metadata alone would silently replace artifacts
-    // still required by the committed IVF segment.
-    writer
-        .segment_manager
-        .update_metadata(|metadata| {
-            let field = metadata.vector_fields.get_mut(&embedding.0).unwrap();
-            field.state = crate::index::VectorIndexState::Flat;
-            field.centroids_file = None;
-            field.codebook_file = None;
-            metadata.refresh_total_vectors();
+    let artifacts = dir
+        .list_files(std::path::Path::new(""))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("vector_artifact_"))
         })
-        .await
-        .unwrap();
-    let error = writer
-        .build_vector_index()
-        .await
-        .expect_err("ordinary training must reject a stale Flat metadata state")
-        .to_string();
-    assert!(
-        error.contains("already contains an IVF/ScaNN index"),
-        "{error}"
-    );
-    assert!(
-        !writer
-            .segment_manager
-            .read_metadata(|metadata| metadata.is_field_built(embedding.0))
-            .await,
-        "a rejected recovery build must not mutate metadata"
-    );
+        .count();
     assert_eq!(
-        writer.segment_manager.trained().unwrap().centroids[&embedding.0].version,
-        old_version,
-        "a rejected recovery build must not replace the published generation"
+        artifacts, 2,
+        "only the published centroid/codebook pair remains"
     );
 }
 
@@ -424,11 +431,10 @@ async fn test_needle_dense_vector_flat() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -786,11 +792,10 @@ async fn test_needle_combined_all_modalities() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -944,11 +949,10 @@ async fn search_fused_hybrid_union_impl() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
-            build_threshold: None,
             unit_norm: false,
             soar: None,
-            rabitq_bits: None,
         },
     );
     let schema = sb.build();
@@ -1192,8 +1196,7 @@ async fn test_binary_ivf_end_to_end() {
     let byte_len = dim_bits / 8;
 
     let mut sb = SchemaBuilder::default();
-    let mut cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
-    cfg.build_threshold = Some(100); // build IVF once we have 100+ vectors
+    let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
     let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg.clone());
     assert_eq!(cfg.index_type, BinaryIndexType::Ivf);
     let schema = sb.build();
@@ -1219,6 +1222,43 @@ async fn test_binary_ivf_end_to_end() {
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let built_segments = index.segment_readers().await.unwrap();
+    assert_eq!(built_segments.len(), 1);
+    assert!(matches!(
+        built_segments[0].get_vector_index(bvec),
+        Some(crate::segment::VectorIndex::BinaryIvf(_))
+    ));
+    drop(index);
+    let first_quantizer =
+        writer.segment_manager.trained().unwrap().binary_quantizers[&bvec.0].version;
+
+    // Expand the corpus with the complementary bit distribution, then verify
+    // that explicit retraining rebuilds every binary segment against the new
+    // global quantizer before an ordinary force merge.
+    for i in 0..200u16 {
+        let mut doc = Document::new();
+        let mut vector = vec![0xAA; byte_len];
+        vector[(i as usize) % byte_len] ^= (i as u8).rotate_left((i % 8) as u32);
+        doc.add_binary_dense_vector(bvec, vector);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.retrain_vector_index().await.unwrap();
+    let second_quantizer =
+        writer.segment_manager.trained().unwrap().binary_quantizers[&bvec.0].version;
+    assert_ne!(first_quantizer, second_quantizer);
+    let retrained = Index::open(dir.clone(), config.clone()).await.unwrap();
+    for segment in retrained.segment_readers().await.unwrap() {
+        let Some(crate::segment::VectorIndex::BinaryIvf(lazy)) = segment.get_vector_index(bvec)
+        else {
+            panic!("every retrained binary segment must contain IVF");
+        };
+        assert_eq!(lazy.get().header().quantizer_version, second_quantizer);
+    }
+    drop(retrained);
+    writer.force_merge().await.unwrap();
 
     let index = Index::open(dir, config).await.unwrap();
     let segments = index.segment_readers().await.unwrap();
@@ -1260,8 +1300,7 @@ async fn binary_ivf_multi_value_exact_scores() {
 
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
-    let mut cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(4), 4); // full probe
-    cfg.build_threshold = Some(50);
+    let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(4), 4); // full probe
     let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
     sb.set_multi(bvec, true);
     let schema = sb.build();
@@ -1302,6 +1341,13 @@ async fn binary_ivf_multi_value_exact_scores() {
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let mut merge_trigger = Document::new();
+    merge_trigger.add_text(title, "merge trigger");
+    merge_trigger.add_binary_dense_vector(bvec, vec![0; byte_len]);
+    writer.add_document(merge_trigger).unwrap();
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
 
     let index = Index::open(dir, config).await.unwrap();
     let segments = index.segment_readers().await.unwrap();

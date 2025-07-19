@@ -130,6 +130,8 @@ impl IndexService for IndexServiceImpl {
         // Index documents individually to collect per-document errors (e.g. duplicate PK)
         let mut indexed_count = 0u32;
         let mut doc_errors = Vec::new();
+        let mut loggable_doc_errors = 0u32;
+        let mut first_loggable_error: Option<String> = None;
         let total_docs = documents.len();
         {
             let w = writer.read().await;
@@ -148,19 +150,25 @@ impl IndexService for IndexServiceImpl {
                             "Indexing backpressure during batch_index: index={}, indexed {}/{} docs, {} skipped",
                             req.index_name, indexed_count, total_docs, skipped
                         );
+                        let error = format!(
+                            "Indexing backpressure — {} remaining documents skipped",
+                            skipped
+                        );
+                        loggable_doc_errors += 1;
+                        first_loggable_error.get_or_insert_with(|| error.clone());
                         doc_errors.push(DocumentError {
                             index: i as u32,
-                            error: format!(
-                                "Indexing backpressure — {} remaining documents skipped",
-                                skipped
-                            ),
+                            error,
                         });
                         break;
                     }
                     Err(e) => {
+                        let error = e.to_string();
+                        loggable_doc_errors += 1;
+                        first_loggable_error.get_or_insert_with(|| error.clone());
                         doc_errors.push(DocumentError {
                             index: i as u32,
-                            error: e.to_string(),
+                            error,
                         });
                     }
                 }
@@ -168,28 +176,31 @@ impl IndexService for IndexServiceImpl {
         }
 
         let error_count = conversion_errors + doc_errors.len() as u32;
+        let loggable_error_count = conversion_errors + loggable_doc_errors;
 
         // Fail loud: a failed batch must not hide at DEBUG (a wedged writer
         // once rejected 100% of documents and it was only visible there).
-        if error_count > 0 {
-            let sample = doc_errors
-                .first()
-                .map(|e| e.error.as_str())
+        // Duplicate primary keys are an expected idempotency conflict: return
+        // them to the caller, but never emit a server log for a duplicate-only
+        // batch or let one hide the first actionable error.
+        if loggable_error_count > 0 {
+            let sample = first_loggable_error
+                .as_deref()
                 .unwrap_or("document conversion failed");
             if indexed_count == 0 {
                 log::error!(
                     "Batch indexing failed completely: index={}, indexed=0, errors={} (first error: {})",
                     req.index_name,
-                    error_count,
+                    loggable_error_count,
                     sample
                 );
             } else {
                 warn!(
                     "Batch indexed with errors: index={}, indexed={}, errors={} (first error: {})",
-                    req.index_name, indexed_count, error_count, sample
+                    req.index_name, indexed_count, loggable_error_count, sample
                 );
             }
-        } else {
+        } else if error_count == 0 {
             debug!(
                 "Batch indexed documents: index={}, indexed={}, errors={}",
                 req.index_name, indexed_count, error_count
@@ -443,13 +454,23 @@ impl IndexService for IndexServiceImpl {
         request: Request<RetrainVectorIndexRequest>,
     ) -> Result<Response<RetrainVectorIndexResponse>, Status> {
         let req = request.into_inner();
-        let _index = self.registry.get_or_open_index(&req.index_name).await?;
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
             .write()
             .await
-            .rebuild_vector_index()
+            .retrain_vector_index()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+
+        // New requests must immediately see the atomically published
+        // segment/codebook generation. In-flight searchers retain the old pair.
+        index
+            .reader()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?
+            .reload()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
 

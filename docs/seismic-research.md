@@ -56,10 +56,10 @@ Most building blocks already exist:
 | top-λ list pruning              | `pruning` (per-list fraction) — needs absolute-λ variant  |
 | α-mass summaries                | `doc_mass` logic (same cropping, applied to a max-vector) |
 | u8 quantization                 | `WeightQuantization::UInt8` + max_weight scale            |
-| shallow k-means                 | kentro (used by IVF/ScaNN training)                       |
+| shallow k-means                 | shared deterministic k-means++/Lloyd trainer             |
 | forward index for exact scoring | BMP block data is already a forward index                 |
 | heap_factor pruning             | same knob/semantics as BMP/MaxScore                       |
-| kNN graph (Wave)                | could reuse dense vectors' IVF/RaBitQ neighbors           |
+| kNN graph (Wave)                | could reuse the global dense IVF HNSW topology            |
 
 Sketch: a third `SparseFormat::Seismic` with per-list blocked-cluster layout
 

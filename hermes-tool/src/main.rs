@@ -320,7 +320,7 @@ enum Commands {
     },
 
     // === Vector Index Commands ===
-    /// Train coarse centroids for IVF-RaBitQ from sample vectors
+    /// Train a global IVF coarse codebook from sample vectors
     #[command(name = "train-centroids")]
     TrainCentroids {
         /// Path to input file with vectors (JSONL with field containing float arrays)

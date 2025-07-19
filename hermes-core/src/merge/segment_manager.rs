@@ -47,7 +47,7 @@ use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwapOption;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::directories::DirectoryWriter;
@@ -81,6 +81,10 @@ struct ActiveOperationState {
     indexing_tokens: HashSet<u64>,
     next_operation_token: u64,
     accepting: bool,
+    /// Retraining stages a complete replacement segment generation. Ordinary
+    /// merge/reorder work is paused so its source set cannot change midway;
+    /// indexing producers remain allowed and deliberately emit flat vectors.
+    non_indexing_paused: bool,
 }
 
 struct ActiveSegmentOperations {
@@ -98,6 +102,7 @@ impl ActiveSegmentOperations {
                 indexing_tokens: HashSet::new(),
                 next_operation_token: 0,
                 accepting: true,
+                non_indexing_paused: false,
             }),
             idle: Notify::new(),
             shutdown: Notify::new(),
@@ -108,7 +113,7 @@ impl ActiveSegmentOperations {
     /// reorder, cleanup). Returns a guard on success, `None` if any requested
     /// ID is already owned by another active operation.
     fn try_register(self: &Arc<Self>, segment_ids: Vec<String>) -> Option<SegmentOperationGuard> {
-        self.try_register_kind(segment_ids, false)
+        self.try_register_kind(segment_ids, false, false)
     }
 
     /// Try to claim IDs for an indexing producer whose guard is held until
@@ -117,17 +122,31 @@ impl ActiveSegmentOperations {
         self: &Arc<Self>,
         segment_ids: Vec<String>,
     ) -> Option<SegmentOperationGuard> {
-        self.try_register_kind(segment_ids, true)
+        self.try_register_kind(segment_ids, true, false)
+    }
+
+    /// Claim source/output IDs for the exclusive vector-generation updater,
+    /// which is the only non-indexing producer allowed through its own pause.
+    fn try_register_vector_update(
+        self: &Arc<Self>,
+        segment_ids: Vec<String>,
+    ) -> Option<SegmentOperationGuard> {
+        self.try_register_kind(segment_ids, false, true)
     }
 
     fn try_register_kind(
         self: &Arc<Self>,
         segment_ids: Vec<String>,
         indexing: bool,
+        vector_update: bool,
     ) -> Option<SegmentOperationGuard> {
         let mut inner = self.inner.lock();
         if !inner.accepting {
             log::debug!("[segment_lifecycle] rejected operation during shutdown");
+            return None;
+        }
+        if !indexing && !vector_update && inner.non_indexing_paused {
+            log::debug!("[segment_lifecycle] deferred operation during vector retraining");
             return None;
         }
         // Check for overlap with any active lifecycle operation.
@@ -197,6 +216,15 @@ impl ActiveSegmentOperations {
         if inner.segment_ids.is_empty() {
             self.idle.notify_waiters();
         }
+    }
+
+    fn pause_non_indexing(&self) {
+        self.inner.lock().non_indexing_paused = true;
+    }
+
+    fn resume_non_indexing(&self) {
+        self.inner.lock().non_indexing_paused = false;
+        self.idle.notify_waiters();
     }
 
     fn is_accepting(&self) -> bool {
@@ -270,15 +298,16 @@ impl Drop for SegmentOperationGuard {
 /// Segment producers consult this gate before capturing the current trained
 /// structures. Once the gate is raised, new producers deliberately emit flat
 /// vector data; waiting for already-active producers to drain then guarantees
-/// that no segment using the previous generation can appear after a rebuild
-/// safety check.
+/// that the committed source set stays stable while replacements are staged.
 struct VectorArtifactUpdateLease {
     updating: Arc<AtomicBool>,
+    active_operations: Arc<ActiveSegmentOperations>,
 }
 
 impl Drop for VectorArtifactUpdateLease {
     fn drop(&mut self) {
         self.updating.store(false, Ordering::Release);
+        self.active_operations.resume_non_indexing();
     }
 }
 
@@ -465,6 +494,36 @@ fn classify_source_error(segment_id: String, error: Error) -> MergeTaskError {
 
 #[cfg(feature = "native")]
 type MergeTaskResult<T> = std::result::Result<T, MergeTaskError>;
+
+#[derive(Clone, Copy)]
+enum ReplacementLayout {
+    Recomputed {
+        reordered: bool,
+        bp_converged: bool,
+    },
+    /// A vector-only rewrite leaves document order and sparse layout exactly
+    /// unchanged, so its persisted BP progress must not be reset or advanced.
+    PreserveSingleSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VectorSegmentRewriteOutcome {
+    Rewritten,
+    AlreadyCurrent,
+    SourceGone,
+    Conflict,
+    Deferred,
+}
+
+/// Complete but unpublished vector-only replacement. Its lifecycle claim and
+/// cleanup guard stay armed until the whole codebook generation commits.
+pub(crate) struct StagedVectorSegment {
+    source_id: String,
+    output_id: SegmentId,
+    doc_count: u32,
+    _operation: SegmentOperationGuard,
+    cleanup: OutputCleanupGuard,
+}
 
 /// Segment manager — coordinates segment commit, background merging, and trained structures.
 ///
@@ -665,9 +724,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Bounded rayon pool for background CPU (merge-time BP, manual reorder).
-    /// Query scoring uses the global rayon pool; keeping background BP off it
-    /// prevents a large merge from queueing every search behind gain passes.
+    /// Bounded rayon pool for background CPU (merge-time BP, manual reorder,
+    /// and global vector-codebook training).
+    /// Query scoring uses a dedicated search pool; keeping background work on
+    /// this separate bounded pool prevents a merge or retrain from queueing
+    /// every search behind its CPU passes.
     pub fn background_cpu_pool(&self) -> Arc<rayon::ThreadPool> {
         if let Some(pool) = &self.background_reorder_pool {
             return Arc::clone(pool);
@@ -1039,50 +1100,45 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ///
     /// New segment operations may continue while this waits, but they observe
     /// the gate through `trained_for_segment_build` and therefore emit flat
-    /// vector data. The guard is cancellation-safe: dropping the requesting
-    /// future reopens ANN production without leaving the manager wedged.
+    /// vector data until the replacement generation is published. The guard
+    /// is cancellation-safe: dropping the requesting future reopens ANN
+    /// production without leaving the manager wedged.
     ///
-    /// Indexing tokens are NOT waited on: their guards are parked inside
+    /// Indexing tokens cannot be waited on: their guards are parked inside
     /// built-but-uncommitted `PreparedSegment`s and are released only by a
     /// later commit. That commit typically needs the writer this update's
     /// caller already holds (server write lock / embedded `&mut self`), so
-    /// waiting on them would permanently wedge build/rebuild_vector_index.
-    /// Segments those tokens own were built against the previous generation
-    /// and surface to the rebuild safety check once committed.
+    /// waiting would permanently wedge vector-index finalization. They also
+    /// cannot be ignored: such a segment may already contain ANN data bound to
+    /// the previous artifact generation and could otherwise be committed after
+    /// the new generation is published. Reject promptly and let the caller
+    /// commit or abort the pending generation before retrying.
     pub(crate) async fn begin_vector_artifact_update(&self) -> Result<VectorArtifactUpdateGuard> {
         self.vector_artifact_update
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
                 Error::Internal("a trained-vector artifact update is already in progress".into())
             })?;
+        self.active_operations.pause_non_indexing();
         let guard = VectorArtifactUpdateGuard {
             _lease: Arc::new(VectorArtifactUpdateLease {
                 updating: Arc::clone(&self.vector_artifact_update),
+                active_operations: Arc::clone(&self.active_operations),
             }),
         };
         let (preexisting, parked_indexing) =
             self.active_operations.draining_operation_tokens_snapshot();
         if parked_indexing > 0 {
-            log::warn!(
-                "[trained] artifact update proceeding past {} in-flight/uncommitted indexing \
-                 segment(s); segments built before this update keep the previous artifact \
-                 generation and become visible to rebuild safety checks once committed",
-                parked_indexing,
-            );
+            return Err(Error::Internal(format!(
+                "cannot update trained-vector artifacts while {parked_indexing} indexing \
+                 segment(s) are built but uncommitted; commit or abort the pending \
+                 generation and retry"
+            )));
         }
         self.active_operations
             .wait_until_operations_finish(&preexisting)
             .await;
         Ok(guard)
-    }
-
-    /// Compatibility entry point: load the complete trained set or clear the
-    /// published generation and log the validation failure.
-    pub async fn load_and_publish_trained(&self) {
-        if let Err(error) = self.try_load_and_publish_trained().await {
-            self.trained.store(None);
-            log::error!("[trained] refusing to publish trained artifacts: {error}");
-        }
     }
 
     /// Load trained structures from disk and publish to ArcSwap.
@@ -1108,34 +1164,59 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok(())
     }
 
-    /// Persist vector metadata and publish its fully validated artifact set as
-    /// one cancellation-safe lifecycle transaction.
+    /// Atomically publish a fully staged vector generation.
     ///
-    /// Validation happens before the durable metadata commit. Once the rename
-    /// commits, both in-memory metadata and ArcSwap publication are completed by
-    /// the tracked transaction even if the requesting RPC is cancelled.
-    pub(crate) async fn update_vector_metadata_and_publish<F>(
+    /// Every replacement segment and its global codebook is complete before
+    /// this transaction starts. Metadata, tracker ownership, and the lock-free
+    /// trained pointer advance under the same state lock; snapshots therefore
+    /// observe either the complete old generation or the complete new one.
+    pub(crate) async fn publish_vector_generation(
         self: &Arc<Self>,
         artifact_update: &VectorArtifactUpdateGuard,
-        update: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(&mut IndexMetadata),
-    {
+        vector_fields: HashMap<u32, crate::index::FieldVectorMeta>,
+        next_trained: Arc<TrainedVectorStructures>,
+        mut staged: Vec<StagedVectorSegment>,
+    ) -> Result<()> {
+        if !self.vector_artifact_update.load(Ordering::Acquire) {
+            return Err(Error::Internal(
+                "vector generation publication lost its exclusive update lease".into(),
+            ));
+        }
+
+        for replacement in &staged {
+            self.validate_completed_segment(&replacement.output_id.to_hex(), replacement.doc_count)
+                .await?;
+        }
+
         let mut st = Arc::clone(&self.state).lock_owned().await;
         let mut next = st.metadata.clone();
-        update(&mut next);
+        next.vector_fields = vector_fields;
+        next.refresh_total_vectors();
 
-        let next_trained = IndexMetadata::try_load_trained_from_fields(
-            &next.vector_fields,
-            self.schema.as_ref(),
-            self.directory.as_ref(),
-        )
-        .await?
-        .map(Arc::new);
+        for replacement in &staged {
+            let source_info = next
+                .segment_metas
+                .remove(&replacement.source_id)
+                .ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "vector generation source {} disappeared before publication",
+                        replacement.source_id,
+                    ))
+                })?;
+            let output_hex = replacement.output_id.to_hex();
+            if next.segment_metas.contains_key(&output_hex) {
+                return Err(Error::Corruption(format!(
+                    "vector generation output {output_hex} is already metadata-live"
+                )));
+            }
+            // A vector-only rewrite changes neither document order nor merge
+            // lineage, so preserve the complete lifecycle record verbatim.
+            next.add_segment_meta(output_hex, source_info);
+        }
 
         let directory = Arc::clone(&self.directory);
         let trained = Arc::clone(&self.trained);
+        let tracker = Arc::clone(&self.tracker);
         // Keep the producer gate raised if the requesting future is cancelled
         // after the metadata transaction has been detached. The last guard
         // clone drops only after durable metadata and ArcSwap state agree.
@@ -1143,8 +1224,36 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.run_lifecycle_transaction(async move {
             let _artifact_update = artifact_update;
             next.save(directory.as_ref()).await?;
+
+            for replacement in &staged {
+                tracker.register(&replacement.output_id.to_hex());
+            }
             st.metadata = next;
-            trained.store(next_trained);
+            trained.store(Some(next_trained));
+
+            // Outputs are now durably live. Disarm unwind cleanup before
+            // retiring the old generation and releasing operation ownership.
+            for replacement in &mut staged {
+                replacement.cleanup.disarm();
+            }
+            let retired = staged
+                .iter()
+                .map(|replacement| replacement.source_id.clone())
+                .collect::<Vec<_>>();
+            let ready_to_delete = tracker.mark_for_deletion(&retired);
+            drop(st);
+            for &segment_id in &ready_to_delete {
+                if let Err(error) =
+                    crate::segment::delete_segment(directory.as_ref(), segment_id).await
+                {
+                    log::warn!(
+                        "[segment_cleanup] immediate vector-generation delete failed for {}: {}",
+                        segment_id.to_hex(),
+                        error,
+                    );
+                }
+            }
+            tracker.complete_deletion(&ready_to_delete);
             Ok(())
         })
         .await
@@ -1179,15 +1288,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Acquire a snapshot of current segments for reading.
     /// The snapshot holds references — segments won't be deleted while snapshot exists.
     pub async fn acquire_snapshot(&self) -> SegmentSnapshot {
-        let acquired = {
+        let (acquired, trained) = {
             let st = self.state.lock().await;
             let segment_ids = st.metadata.segment_ids();
-            self.tracker.acquire(&segment_ids)
+            (self.tracker.acquire(&segment_ids), self.trained.load_full())
         };
 
-        SegmentSnapshot::with_delete_fn(
+        SegmentSnapshot::with_generation(
             Arc::clone(&self.tracker),
             acquired,
+            trained,
             Arc::clone(&self.delete_fn),
         )
     }
@@ -1418,8 +1528,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                             &ids,
                             new_id,
                             doc_count,
-                            sm.reorder_on_merge,
-                            bp_converged,
+                            ReplacementLayout::Recomputed {
+                                reordered: sm.reorder_on_merge,
+                                bp_converged,
+                            },
                         )
                         .await
                     {
@@ -1513,8 +1625,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         old_ids: &[String],
         new_id: String,
         doc_count: u32,
-        reordered: bool,
-        bp_converged: bool,
+        layout: ReplacementLayout,
     ) -> Result<()> {
         // The operation guard owns the output during validation. Publication
         // below replaces that ownership with metadata + tracker atomically.
@@ -1562,41 +1673,65 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )));
         }
 
-        let parent_generation = old_ids
-            .iter()
-            .filter_map(|id| st.metadata.segment_metas.get(id))
-            .map(|info| info.generation)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Error::Corruption("merge generation exceeds u32::MAX".into()))?;
-        let parent_unconverged_passes = old_ids
-            .iter()
-            .filter_map(|id| st.metadata.segment_metas.get(id))
-            .map(|info| info.bp_unconverged_passes)
-            .max()
-            .unwrap_or(0);
-        let bp_unconverged_passes = if reordered && !bp_converged {
-            parent_unconverged_passes.saturating_add(1)
-        } else {
-            0
+        let replacement_info = match layout {
+            ReplacementLayout::Recomputed {
+                reordered,
+                bp_converged,
+            } => {
+                let generation = old_ids
+                    .iter()
+                    .filter_map(|id| st.metadata.segment_metas.get(id))
+                    .map(|info| info.generation)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Corruption("merge generation exceeds u32::MAX".into()))?;
+                let parent_unconverged_passes = old_ids
+                    .iter()
+                    .filter_map(|id| st.metadata.segment_metas.get(id))
+                    .map(|info| info.bp_unconverged_passes)
+                    .max()
+                    .unwrap_or(0);
+                let passes = if reordered && !bp_converged {
+                    parent_unconverged_passes.saturating_add(1)
+                } else {
+                    0
+                };
+                SegmentMetaInfo {
+                    num_docs: doc_count,
+                    ancestors: old_ids.to_vec(),
+                    generation,
+                    reordered,
+                    bp_converged,
+                    bp_unconverged_passes: passes,
+                }
+            }
+            ReplacementLayout::PreserveSingleSource => {
+                let [source_id] = old_ids else {
+                    return Err(Error::Internal(
+                        "layout-preserving replacement requires exactly one source".into(),
+                    ));
+                };
+                let mut source = st
+                    .metadata
+                    .segment_metas
+                    .get(source_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "layout-preserving replacement source {source_id} disappeared"
+                        ))
+                    })?;
+                source.num_docs = doc_count;
+                source
+            }
         };
         let retired_ids = old_ids.to_vec();
         let mut next = st.metadata.clone();
         for id in old_ids {
             next.remove_segment(id);
         }
-        next.add_segment_meta(
-            new_id.clone(),
-            SegmentMetaInfo {
-                num_docs: doc_count,
-                ancestors: retired_ids.clone(),
-                generation: parent_generation,
-                reordered,
-                bp_converged,
-                bp_unconverged_passes,
-            },
-        );
+        next.add_segment_meta(new_id.clone(), replacement_info);
 
         let directory = Arc::clone(&self.directory);
         let tracker = Arc::clone(&self.tracker);
@@ -2100,8 +2235,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     &batch,
                     new_segment_id,
                     total_docs,
-                    self.reorder_on_merge,
-                    bp_converged,
+                    ReplacementLayout::Recomputed {
+                        reordered: self.reorder_on_merge,
+                        bp_converged,
+                    },
                 )
                 .await
             {
@@ -2113,6 +2250,404 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             output_cleanup.disarm();
 
             // _guard drops here, releasing operation ownership.
+        }
+    }
+
+    fn segment_needs_vector_rewrite(
+        &self,
+        reader: &SegmentReader,
+        field_ids: &[u32],
+        rewrite_existing: bool,
+    ) -> Result<bool> {
+        for &field_id in field_ids {
+            let flat = reader.flat_vectors().get(&field_id);
+            let ann = reader.vector_indexes().get(&field_id);
+            if ann.is_some() && flat.is_none() {
+                return Err(Error::Corruption(format!(
+                    "segment {:032x} field {field_id} has ANN data without the required flat vectors",
+                    reader.meta().id,
+                )));
+            }
+
+            let Some(flat) = flat else {
+                continue;
+            };
+            if flat.num_vectors == 0 {
+                continue;
+            }
+            if rewrite_existing {
+                return Ok(true);
+            }
+            let field = crate::dsl::Field(field_id);
+            let entry = self.schema.get_field_entry(field).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "segment {:032x} references unknown vector field {field_id}",
+                    reader.meta().id,
+                ))
+            })?;
+            let current = match entry.field_type {
+                crate::dsl::FieldType::DenseVector => {
+                    matches!(ann, Some(crate::segment::VectorIndex::IvfPq(_)))
+                }
+                crate::dsl::FieldType::BinaryDenseVector => {
+                    matches!(ann, Some(crate::segment::VectorIndex::BinaryIvf(_)))
+                }
+                _ => false,
+            };
+            if !current {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn acquire_vector_rewrite_capacity(
+        &self,
+    ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let global = tokio::select! {
+            biased;
+            () = self.active_operations.wait_for_shutdown() => {
+                return Err(Error::IndexClosed);
+            }
+            permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
+                permit.map_err(|_| Error::Internal(
+                    "global background merge scheduler is closed".into()
+                ))?
+            }
+        };
+        let local = tokio::select! {
+            biased;
+            () = self.active_operations.wait_for_shutdown() => {
+                return Err(Error::IndexClosed);
+            }
+            permit = Arc::clone(&self.merge_permits).acquire_owned() => {
+                permit.map_err(|_| Error::Internal(
+                    "background merge scheduler is closed".into()
+                ))?
+            }
+        };
+        Ok((global, local))
+    }
+
+    async fn build_vector_replacement(
+        self: &Arc<Self>,
+        segment_id: &str,
+        source_id: SegmentId,
+        output_id: SegmentId,
+        trained: &TrainedVectorStructures,
+        failure_context: &'static str,
+    ) -> Result<(String, u32, OutputCleanupGuard)> {
+        let mut cleanup = self.output_cleanup_guard(output_id);
+        match crate::segment::reorder::rewrite_vector_segment(
+            self.directory.as_ref(),
+            &self.schema,
+            source_id,
+            output_id,
+            self.term_cache_blocks,
+            trained,
+            Some(self.background_cpu_pool()),
+        )
+        .await
+        {
+            Ok((new_id, doc_count)) => {
+                self.validate_completed_segment(&new_id, doc_count).await?;
+                Ok((new_id, doc_count, cleanup))
+            }
+            Err(error) => {
+                self.delete_output_if_unregistered(output_id, failure_context)
+                    .await;
+                cleanup.disarm();
+                if is_deterministic_source_error(&error) {
+                    self.quarantine_segment(segment_id, &error);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Build every required replacement segment without exposing any of them.
+    /// The returned guards keep both source and output generations alive until
+    /// [`Self::publish_vector_generation`] commits the complete set.
+    pub(crate) async fn stage_vector_generation(
+        self: &Arc<Self>,
+        _artifact_update: &VectorArtifactUpdateGuard,
+        segment_ids: &[String],
+        field_ids: &[u32],
+        trained: Arc<TrainedVectorStructures>,
+        rewrite_existing: bool,
+    ) -> Result<Vec<StagedVectorSegment>> {
+        if !self.vector_artifact_update.load(Ordering::Acquire) {
+            return Err(Error::Internal(
+                "cannot stage a vector generation without an exclusive update lease".into(),
+            ));
+        }
+
+        let mut staged = Vec::new();
+        for segment_id in segment_ids {
+            if self.quarantined_segments.lock().contains(segment_id) {
+                return Err(Error::Corruption(format!(
+                    "segment {segment_id} is quarantined after a deterministic source failure"
+                )));
+            }
+            let source_id = SegmentId::from_hex(segment_id).ok_or_else(|| {
+                Error::Corruption(format!("invalid vector rewrite segment ID: {segment_id}"))
+            })?;
+
+            // A single rewrite may hold several gigabytes while assigning all
+            // vectors. Reuse the ordinary local and process-wide merge bounds.
+            let _capacity = self.acquire_vector_rewrite_capacity().await?;
+
+            let output_id = SegmentId::new();
+            let output_hex = output_id.to_hex();
+            let operation = {
+                let st = self.state.lock().await;
+                if !st.metadata.has_segment(segment_id) {
+                    return Err(Error::Corruption(format!(
+                        "vector generation source {segment_id} disappeared while lifecycle work was paused"
+                    )));
+                }
+                self.active_operations
+                    .try_register_vector_update(vec![segment_id.clone(), output_hex.clone()])
+            }
+            .ok_or_else(|| {
+                if self.active_operations.is_accepting() {
+                    Error::Internal(format!(
+                        "vector generation could not claim stable source {segment_id}"
+                    ))
+                } else {
+                    Error::IndexClosed
+                }
+            })?;
+
+            let reader = SegmentReader::open(
+                self.directory.as_ref(),
+                source_id,
+                Arc::clone(&self.schema),
+                self.term_cache_blocks,
+            )
+            .await?;
+            if !self.segment_needs_vector_rewrite(&reader, field_ids, rewrite_existing)? {
+                continue;
+            }
+            drop(reader);
+
+            let (new_id, doc_count, cleanup) = self
+                .build_vector_replacement(
+                    segment_id,
+                    source_id,
+                    output_id,
+                    trained.as_ref(),
+                    "vector generation staging failure",
+                )
+                .await?;
+            debug_assert_eq!(new_id, output_hex);
+            let output_reader = SegmentReader::open(
+                self.directory.as_ref(),
+                output_id,
+                Arc::clone(&self.schema),
+                self.term_cache_blocks,
+            )
+            .await?;
+            if self.segment_needs_vector_rewrite(&output_reader, field_ids, false)? {
+                return Err(Error::Corruption(format!(
+                    "staged vector segment {new_id} does not match its candidate codebook generation"
+                )));
+            }
+
+            staged.push(StagedVectorSegment {
+                source_id: segment_id.clone(),
+                output_id,
+                doc_count,
+                _operation: operation,
+                cleanup,
+            });
+        }
+        Ok(staged)
+    }
+
+    async fn rewrite_vector_segment_once(
+        self: &Arc<Self>,
+        segment_id: &str,
+        field_ids: &[u32],
+    ) -> Result<VectorSegmentRewriteOutcome> {
+        if self.quarantined_segments.lock().contains(segment_id) {
+            return Err(Error::Corruption(format!(
+                "segment {segment_id} is quarantined after a deterministic source failure; repair it before ANN finalization"
+            )));
+        }
+        let source_id = SegmentId::from_hex(segment_id).ok_or_else(|| {
+            Error::Corruption(format!("invalid vector rewrite segment ID: {segment_id}"))
+        })?;
+
+        // Match ordinary merge lock ordering: capacity before lifecycle
+        // ownership. A vector rewrite can hold several gigabytes while it
+        // assigns vectors, so it participates in both local and process-wide
+        // merge limits.
+        let _capacity = self.acquire_vector_rewrite_capacity().await?;
+
+        let output_id = SegmentId::new();
+        let output_hex = output_id.to_hex();
+        let all_ids = vec![segment_id.to_owned(), output_hex];
+        let operation = {
+            let st = self.state.lock().await;
+            if !st.metadata.has_segment(segment_id) {
+                return Ok(VectorSegmentRewriteOutcome::SourceGone);
+            }
+            self.active_operations.try_register(all_ids)
+        };
+        let _operation = match operation {
+            Some(operation) => operation,
+            None if !self.active_operations.is_accepting() => return Err(Error::IndexClosed),
+            None => return Ok(VectorSegmentRewriteOutcome::Conflict),
+        };
+
+        let Some(trained) = self.trained_for_segment_build() else {
+            return Ok(VectorSegmentRewriteOutcome::Deferred);
+        };
+
+        let reader = SegmentReader::open(
+            self.directory.as_ref(),
+            source_id,
+            Arc::clone(&self.schema),
+            self.term_cache_blocks,
+        )
+        .await?;
+        if !self.segment_needs_vector_rewrite(&reader, field_ids, false)? {
+            return Ok(VectorSegmentRewriteOutcome::AlreadyCurrent);
+        }
+        drop(reader);
+
+        let (new_id, doc_count, mut output_cleanup) = self
+            .build_vector_replacement(
+                segment_id,
+                source_id,
+                output_id,
+                trained.as_ref(),
+                "vector rewrite failure",
+            )
+            .await?;
+
+        if let Err(error) = self
+            .replace_segments(
+                &[segment_id.to_owned()],
+                new_id,
+                doc_count,
+                ReplacementLayout::PreserveSingleSource,
+            )
+            .await
+        {
+            self.delete_output_if_unregistered(output_id, "vector replacement failure")
+                .await;
+            output_cleanup.disarm();
+            return Err(error);
+        }
+        output_cleanup.disarm();
+        Ok(VectorSegmentRewriteOutcome::Rewritten)
+    }
+
+    /// Finalize every committed flat vector segment against the published
+    /// global ANN generation.
+    /// Unlike force-merge this handles one segment and segments already at the
+    /// merge policy's maximum size.
+    pub(crate) async fn rewrite_vector_segments(
+        self: &Arc<Self>,
+        field_ids: &[u32],
+    ) -> Result<usize> {
+        if field_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut rewritten = 0usize;
+        loop {
+            let segment_ids = self.get_segment_ids().await;
+            let mut conflicted = false;
+            let mut changed = false;
+            for segment_id in segment_ids {
+                match self
+                    .rewrite_vector_segment_once(&segment_id, field_ids)
+                    .await?
+                {
+                    VectorSegmentRewriteOutcome::Rewritten => {
+                        rewritten += 1;
+                        changed = true;
+                    }
+                    VectorSegmentRewriteOutcome::Conflict => conflicted = true,
+                    VectorSegmentRewriteOutcome::Deferred => {
+                        return Err(Error::Internal(
+                            "ANN finalization lost the published trained generation".into(),
+                        ));
+                    }
+                    VectorSegmentRewriteOutcome::AlreadyCurrent
+                    | VectorSegmentRewriteOutcome::SourceGone => {}
+                }
+            }
+            if !conflicted && !changed {
+                log::info!(
+                    "[vector_rewrite] ANN finalization complete ({} segment(s) rewritten)",
+                    rewritten,
+                );
+                return Ok(rewritten);
+            }
+            tokio::select! {
+                biased;
+                () = self.active_operations.wait_for_shutdown() => {
+                    return Err(Error::IndexClosed);
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+    }
+
+    /// A producer that started in the force-flat phase can commit after the
+    /// main finalization snapshot. Upgrade exactly those new segments in a
+    /// tracked background task; ordinary producers already using the current
+    /// generation are detected and skipped without rewriting.
+    pub(crate) fn schedule_vector_segment_upgrades(self: &Arc<Self>, segment_ids: Vec<String>) {
+        if segment_ids.is_empty() || self.trained_for_segment_build().is_none() {
+            return;
+        }
+        let manager = Arc::clone(self);
+        let future = async move {
+            let field_ids = manager
+                .read_metadata(|metadata| {
+                    metadata
+                        .vector_fields
+                        .keys()
+                        .filter(|field_id| metadata.is_field_built(**field_id))
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            for segment_id in segment_ids {
+                loop {
+                    match manager
+                        .rewrite_vector_segment_once(&segment_id, &field_ids)
+                        .await
+                    {
+                        Ok(VectorSegmentRewriteOutcome::Conflict) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Ok(VectorSegmentRewriteOutcome::Deferred) => break,
+                        Ok(_) => break,
+                        Err(error) => {
+                            log::error!(
+                                "[vector_rewrite] failed to upgrade newly committed segment {}: {}",
+                                segment_id,
+                                error,
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                "[vector_rewrite] runtime unavailable; newly committed flat segment upgrade deferred"
+            );
+            return;
+        };
+        if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
+            log::warn!("[vector_rewrite] runtime rejected newly committed flat segment upgrade");
         }
     }
 
@@ -2368,8 +2903,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 &[seg_id.to_string()],
                 new_id,
                 total_docs,
-                true,
-                ladder_converged,
+                ReplacementLayout::Recomputed {
+                    reordered: true,
+                    bp_converged: ladder_converged,
+                },
             )
             .await
         {
@@ -2609,7 +3146,9 @@ mod tests {
             .trained
             .store(Some(Arc::new(TrainedVectorStructures {
                 centroids: rustc_hash::FxHashMap::default(),
+                binary_quantizers: rustc_hash::FxHashMap::default(),
                 codebooks: rustc_hash::FxHashMap::default(),
+                ..Default::default()
             })));
 
         let guard = manager.begin_vector_artifact_update().await.unwrap();
@@ -2630,6 +3169,33 @@ mod tests {
         );
         drop(detached_transaction_guard);
         assert!(manager.trained_for_segment_build().is_some());
+    }
+
+    #[tokio::test]
+    async fn artifact_update_pauses_lifecycle_rewrites_but_allows_flat_indexing() {
+        let manager = lifecycle_test_manager();
+        let guard = manager.begin_vector_artifact_update().await.unwrap();
+        assert!(
+            manager
+                .active_operations
+                .try_register(vec!["merge".into()])
+                .is_none(),
+            "ordinary merge/reorder work must not change staged sources"
+        );
+        let indexing = manager
+            .active_operations
+            .try_register_indexing(vec!["fresh".into()])
+            .expect("indexing remains available in flat mode");
+        drop(indexing);
+
+        drop(guard);
+        assert!(!manager.vector_artifact_update.load(Ordering::Acquire));
+        assert!(
+            manager
+                .active_operations
+                .try_register(vec!["merge".into()])
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2866,7 +3432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_update_does_not_wait_for_built_uncommitted_indexing_segments() {
+    async fn artifact_update_rejects_built_uncommitted_indexing_segments() {
         let manager = lifecycle_test_manager();
         // Simulates a memory-budget mid-cycle segment build whose guard is
         // parked inside a PreparedSegment: only a later commit releases this
@@ -2876,16 +3442,28 @@ mod tests {
             .protect_new_segment("00000000000000000000000000000abc".into())
             .unwrap();
 
-        let guard = tokio::time::timeout(
+        let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             manager.begin_vector_artifact_update(),
         )
         .await
         .expect("begin_vector_artifact_update deadlocked on a built-but-uncommitted segment")
-        .unwrap();
+        .err()
+        .expect("an old-generation prepared segment must block artifact replacement")
+        .to_string();
+        assert!(error.contains("built but uncommitted"), "{error}");
+        assert!(
+            !manager.vector_artifact_update.load(Ordering::Acquire),
+            "a rejected update must release the producer gate"
+        );
 
-        drop(guard);
         drop(parked_indexing);
+
+        let guard = manager
+            .begin_vector_artifact_update()
+            .await
+            .expect("artifact update should succeed after the pending generation is resolved");
+        drop(guard);
     }
 
     #[tokio::test]

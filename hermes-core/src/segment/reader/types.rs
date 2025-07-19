@@ -1,192 +1,60 @@
 //! Types for segment reader
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::DocId;
 use crate::directories::{FileHandle, OwnedBytes};
-use crate::structures::{
-    BlockSparsePostingList, IVFPQIndex, IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex,
-    SparseBlock, SparseSkipEntry,
-};
+use crate::structures::{BlockSparsePostingList, SparseBlock, SparseSkipEntry};
 
-/// Vector index type - RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
+/// Production ANN payloads for float IVF-PQ and packed-binary IVF.
 ///
 /// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
 /// via mmap for reranking and merge. This enum only holds ANN indexes.
 ///
-/// All variants are **lazy**: `OwnedBytes` (zero-copy mmap ref) are stored on
-/// construction, deserialization is deferred to first search access via `OnceLock`.
-/// No heap copies during segment load.
+/// Both variants use the same validated mmap-backed run format. Corpus-sized
+/// columns stay in the file mapping; only the compact run directory is parsed.
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
-    /// RaBitQ - lazy JSON deserialization on first access
-    RaBitQ(Arc<LazyRaBitQ>),
-    /// IVF-RaBitQ - lazy deserialization on first access
-    IVF(Arc<LazyIVF>),
-    /// ScaNN (IVF-PQ) - lazy deserialization on first access
-    ScaNN(Arc<LazyScaNN>),
-    /// Binary IVF (Hamming) - lazy deserialization on first access
-    BinaryIvf(Arc<LazyBinaryIvf>),
+    /// Float IVF-PQ payload.
+    IvfPq(Arc<MmapAnnIndex>),
+    /// Binary IVF (Hamming) payload.
+    BinaryIvf(Arc<MmapAnnIndex>),
 }
 
-/// Lazy binary IVF index — defers bincode deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyBinaryIvf {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<Arc<crate::structures::BinaryIvfIndex>>>,
+/// Thin public wrapper around the shared mmap ANN representation. Its internals
+/// remain crate-private so the segment format is not exposed as a library API.
+pub struct MmapAnnIndex {
+    index: crate::segment::ann_disk::AnnDiskIndex,
 }
 
-impl LazyBinaryIvf {
-    pub fn new(raw: OwnedBytes) -> Self {
-        Self {
-            raw,
-            resolved: OnceLock::new(),
-        }
-    }
-
-    pub fn get(&self) -> Option<&Arc<crate::structures::BinaryIvfIndex>> {
-        self.resolved
-            .get_or_init(|| {
-                match crate::structures::BinaryIvfIndex::from_bytes(self.raw.as_slice()) {
-                    Ok(idx) => Some(Arc::new(idx)),
-                    Err(e) => {
-                        log::warn!("[lazy_binary_ivf] deserialization failed: {}", e);
-                        None
-                    }
-                }
-            })
-            .as_ref()
+impl MmapAnnIndex {
+    pub(crate) fn open(
+        raw: OwnedBytes,
+        kind: crate::segment::ann_disk::AnnKind,
+        total_docs: u32,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            index: crate::segment::ann_disk::AnnDiskIndex::open(raw, kind, total_docs)?,
+        })
     }
 
     pub fn estimated_memory_bytes(&self) -> usize {
-        match self.resolved.get() {
-            Some(Some(idx)) => idx.estimated_memory_bytes(),
-            _ => self.raw.len(),
-        }
-    }
-}
-
-/// Lazy RaBitQ index — defers serde_json deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyRaBitQ {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<Arc<RaBitQIndex>>>,
-}
-
-impl LazyRaBitQ {
-    pub fn new(raw: OwnedBytes) -> Self {
-        Self {
-            raw,
-            resolved: OnceLock::new(),
-        }
+        self.index.estimated_memory_bytes()
     }
 
-    pub fn get(&self) -> Option<&Arc<RaBitQIndex>> {
-        self.resolved
-            .get_or_init(|| match RaBitQIndex::from_bytes(self.raw.as_slice()) {
-                Ok(idx) => Some(Arc::new(idx)),
-                Err(e) => {
-                    log::warn!("[lazy_rabitq] deserialization failed: {}", e);
-                    None
-                }
-            })
-            .as_ref()
+    pub(crate) fn get(&self) -> &crate::segment::ann_disk::AnnDiskIndex {
+        &self.index
     }
 
-    pub fn estimated_memory_bytes(&self) -> usize {
-        match self.resolved.get() {
-            Some(Some(idx)) => idx.estimated_memory_bytes(),
-            _ => self.raw.len(),
-        }
-    }
-}
-
-/// Lazy IVF-RaBitQ index — defers bincode deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyIVF {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<(Arc<IVFRaBitQIndex>, Arc<RaBitQCodebook>)>>,
-}
-
-impl LazyIVF {
-    pub fn new(raw: OwnedBytes) -> Self {
-        Self {
-            raw,
-            resolved: OnceLock::new(),
-        }
-    }
-
-    pub fn get(&self) -> Option<(&Arc<IVFRaBitQIndex>, &Arc<RaBitQCodebook>)> {
-        self.resolved
-            .get_or_init(|| {
-                match super::super::vector_data::IVFRaBitQIndexData::from_bytes(&self.raw) {
-                    Ok(data) => Some((Arc::new(data.index), Arc::new(data.codebook))),
-                    Err(e) => {
-                        log::warn!("[lazy_ivf] deserialization failed: {}", e);
-                        None
-                    }
-                }
-            })
-            .as_ref()
-            .map(|(i, c)| (i, c))
-    }
-
-    pub fn estimated_memory_bytes(&self) -> usize {
-        match self.resolved.get() {
-            Some(Some((index, codebook))) => {
-                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
-            }
-            _ => self.raw.len(),
-        }
-    }
-}
-
-/// Lazy ScaNN (IVF-PQ) index — defers bincode deserialization to first access
-///
-/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
-/// The mmap pages are only paged into physical RAM when deserialization happens.
-pub struct LazyScaNN {
-    raw: OwnedBytes,
-    resolved: OnceLock<Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)>>,
-}
-
-impl LazyScaNN {
-    pub fn new(raw: OwnedBytes) -> Self {
-        Self {
-            raw,
-            resolved: OnceLock::new(),
-        }
-    }
-
-    pub fn get(&self) -> Option<(&Arc<IVFPQIndex>, &Arc<PQCodebook>)> {
-        self.resolved
-            .get_or_init(|| {
-                match super::super::vector_data::ScaNNIndexData::from_bytes(&self.raw) {
-                    Ok(data) => Some((Arc::new(data.index), Arc::new(data.codebook))),
-                    Err(e) => {
-                        log::warn!("[lazy_scann] deserialization failed: {}", e);
-                        None
-                    }
-                }
-            })
-            .as_ref()
-            .map(|(i, c)| (i, c))
-    }
-
-    pub fn estimated_memory_bytes(&self) -> usize {
-        match self.resolved.get() {
-            Some(Some((index, codebook))) => {
-                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
-            }
-            _ => self.raw.len(),
-        }
+    #[cfg(feature = "native")]
+    fn pin_lookup_directory(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        self.index.pin_lookup_directory(mode, remaining, report);
     }
 }
 
@@ -194,10 +62,25 @@ impl VectorIndex {
     /// Estimate memory usage of this vector index
     pub fn estimated_memory_bytes(&self) -> usize {
         match self {
-            VectorIndex::RaBitQ(lazy) => lazy.estimated_memory_bytes(),
-            VectorIndex::IVF(lazy) => lazy.estimated_memory_bytes(),
-            VectorIndex::ScaNN(lazy) => lazy.estimated_memory_bytes(),
+            VectorIndex::IvfPq(lazy) => lazy.estimated_memory_bytes(),
             VectorIndex::BinaryIvf(lazy) => lazy.estimated_memory_bytes(),
+        }
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_lookup_directory(
+        &mut self,
+        mode: crate::segment::pin::PinMode,
+        remaining: &mut u64,
+        report: &mut crate::segment::pin::PinReport,
+    ) {
+        let index = match self {
+            Self::IvfPq(index) | Self::BinaryIvf(index) => index,
+        };
+        if let Some(index) = Arc::get_mut(index) {
+            index.pin_lookup_directory(mode, remaining, report);
+        } else {
+            log::warn!("[pin] ANN lookup directory was shared before segment pinning");
         }
     }
 }

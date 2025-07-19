@@ -3,20 +3,15 @@
 //! Provides k-means clustering for the first level of IVF indexing.
 //! Trained once, shared across all segments for O(1) merge compatibility.
 
-use std::io::{self, Cursor, Read, Write};
-use std::path::Path;
-
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-#[cfg(not(feature = "native"))]
-use rand::SeedableRng;
-#[cfg(not(feature = "native"))]
-use rand::prelude::SliceRandom;
 use serde::{Deserialize, Serialize};
 
+use super::routing::{
+    HNSW_AUTO_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
+    allocate_child_clusters, effective_routing_mode, float_probe_fingerprint, parent_probe_count,
+    routing_parent_count, select_best, select_best_candidates,
+};
 use super::soar::{MultiAssignment, SoarConfig};
-
-/// Magic number for coarse centroids file
-const CENTROIDS_MAGIC: u32 = 0x48435643; // "CVCH" - Coarse Vector Centroids Hermes
+use crate::dsl::IvfRoutingMode;
 
 /// Configuration for coarse quantizer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +26,8 @@ pub struct CoarseConfig {
     pub seed: u64,
     /// SOAR configuration (optional)
     pub soar: Option<SoarConfig>,
+    /// Flat, two-level, or HNSW routing. Auto chooses from the final leaf count.
+    pub routing: IvfRoutingMode,
 }
 
 impl CoarseConfig {
@@ -41,6 +38,7 @@ impl CoarseConfig {
             max_iters: 25,
             seed: 42,
             soar: None,
+            routing: IvfRoutingMode::Auto,
         }
     }
 
@@ -58,6 +56,11 @@ impl CoarseConfig {
         self.max_iters = iters;
         self
     }
+
+    pub fn with_routing(mut self, routing: IvfRoutingMode) -> Self {
+        self.routing = routing;
+        self
+    }
 }
 
 /// Coarse centroids for IVF - trained once, shared across all segments
@@ -73,119 +76,139 @@ pub struct CoarseCentroids {
     pub version: u64,
     /// SOAR configuration (if enabled)
     pub soar_config: Option<SoarConfig>,
+    /// Persisted parent centroids and topology for sublinear leaf routing.
+    pub(crate) routing_index: Option<FloatCentroidRouter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum FloatCentroidRouter {
+    TwoLevel {
+        parent_centroids: Vec<f32>,
+        topology: IvfRoutingTopology,
+    },
+    Hnsw(HnswRoutingGraph),
 }
 
 impl CoarseCentroids {
     /// Train coarse centroids using k-means algorithm
     ///
-    /// Uses kentro crate for clustering (native feature).
-    #[cfg(feature = "native")]
+    /// Uses deterministic k-means++ seeding and Lloyd refinement.
     pub fn train(config: &CoarseConfig, vectors: &[Vec<f32>]) -> Self {
-        use kentro::KMeans;
-        use ndarray::Array2;
-
         assert!(!vectors.is_empty(), "Cannot train on empty vector set");
         assert!(config.num_clusters > 0, "Need at least 1 cluster");
+        assert!(vectors.iter().all(|vector| vector.len() == config.dim));
 
         let actual_clusters = config.num_clusters.min(vectors.len());
-        let dim = config.dim;
-
-        // Convert to ndarray format
-        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
-        let data = Array2::from_shape_vec((vectors.len(), dim), flat)
-            .expect("Failed to create ndarray from vectors");
-
-        // Run k-means with euclidean distance
-        let mut kmeans = KMeans::new(actual_clusters)
-            .with_euclidean(true)
-            .with_iterations(config.max_iters);
-        let _ = kmeans
-            .train(data.view(), None)
-            .expect("K-means training failed");
-
-        // Extract centroids
-        let centroids: Vec<f32> = kmeans
-            .centroids()
-            .expect("No centroids after training")
-            .iter()
-            .copied()
-            .collect();
+        let (centroids, routing_index) =
+            match effective_routing_mode(config.routing, actual_clusters) {
+                IvfRoutingMode::TwoLevel => {
+                    let (leaves, router) =
+                        Self::train_hierarchical(config, vectors, actual_clusters);
+                    (leaves, Some(router))
+                }
+                IvfRoutingMode::Hnsw => {
+                    let leaves = if actual_clusters >= HNSW_AUTO_THRESHOLD {
+                        Self::train_hierarchical(config, vectors, actual_clusters).0
+                    } else {
+                        Self::train_flat(config, vectors, actual_clusters).0
+                    };
+                    let graph = HnswRoutingGraph::build(
+                        actual_clusters,
+                        |left, right| {
+                            let left = left as usize * config.dim;
+                            let right = right as usize * config.dim;
+                            squared_l2(
+                                &leaves[left..left + config.dim],
+                                &leaves[right..right + config.dim],
+                            )
+                        },
+                        config.seed,
+                    );
+                    (leaves, Some(FloatCentroidRouter::Hnsw(graph)))
+                }
+                IvfRoutingMode::Flat | IvfRoutingMode::Auto => {
+                    (Self::train_flat(config, vectors, actual_clusters).0, None)
+                }
+            };
 
         let version = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_nanos() as u64;
 
         Self {
             num_clusters: actual_clusters as u32,
-            dim,
+            dim: config.dim,
             centroids,
             version,
             soar_config: config.soar.clone(),
+            routing_index,
         }
     }
 
-    /// Fallback k-means for non-native builds (WASM)
-    #[cfg(not(feature = "native"))]
-    pub fn train(config: &CoarseConfig, vectors: &[Vec<f32>]) -> Self {
-        assert!(!vectors.is_empty(), "Cannot train on empty vector set");
-        assert!(config.num_clusters > 0, "Need at least 1 cluster");
-
-        let actual_clusters = config.num_clusters.min(vectors.len());
+    fn train_flat(
+        config: &CoarseConfig,
+        vectors: &[Vec<f32>],
+        clusters: usize,
+    ) -> (Vec<f32>, Vec<Vec<usize>>) {
         let dim = config.dim;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
-
-        // Simple random initialization
-        let mut indices: Vec<usize> = (0..vectors.len()).collect();
-        indices.shuffle(&mut rng);
-
-        let mut centroids: Vec<f32> = indices[..actual_clusters]
-            .iter()
-            .flat_map(|&i| vectors[i].iter().copied())
-            .collect();
-
-        // K-means iterations
-        for _ in 0..config.max_iters {
-            let assignments: Vec<usize> = vectors
-                .iter()
-                .map(|v| Self::find_nearest_idx_static(v, &centroids, dim))
-                .collect();
-
-            let mut new_centroids = vec![0.0f32; actual_clusters * dim];
-            let mut counts = vec![0usize; actual_clusters];
-
-            for (vec_idx, &cluster_id) in assignments.iter().enumerate() {
-                counts[cluster_id] += 1;
-                let offset = cluster_id * dim;
-                for (i, &val) in vectors[vec_idx].iter().enumerate() {
-                    new_centroids[offset + i] += val;
-                }
-            }
-
-            for (cluster_id, &count) in counts.iter().enumerate().take(actual_clusters) {
-                if count > 0 {
-                    let offset = cluster_id * dim;
-                    for i in 0..dim {
-                        new_centroids[offset + i] /= count as f32;
-                    }
-                }
-            }
-
-            centroids = new_centroids;
-        }
-
-        let version = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        Self {
-            num_clusters: actual_clusters as u32,
+        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        let trained = crate::structures::vector::kmeans::train_euclidean_kmeans(
+            &flat,
+            vectors.len(),
             dim,
-            centroids,
-            version,
-            soar_config: config.soar.clone(),
+            clusters,
+            config.max_iters,
+            config.seed,
+        );
+        let mut groups = vec![Vec::new(); clusters];
+        for (point, cluster) in trained.assignments.into_iter().enumerate() {
+            groups[cluster].push(point);
         }
+        (trained.centroids, groups)
+    }
+
+    fn train_hierarchical(
+        config: &CoarseConfig,
+        vectors: &[Vec<f32>],
+        leaf_count: usize,
+    ) -> (Vec<f32>, FloatCentroidRouter) {
+        let parent_count = routing_parent_count(leaf_count).min(vectors.len());
+        let mut parent_config = config.clone();
+        parent_config.routing = IvfRoutingMode::Flat;
+        parent_config.num_clusters = parent_count;
+        let (parent_centroids, groups) = Self::train_flat(&parent_config, vectors, parent_count);
+        let group_sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+        let child_counts = allocate_child_clusters(&group_sizes, leaf_count);
+        let mut leaves = Vec::with_capacity(leaf_count.saturating_mul(config.dim));
+        let mut children = vec![Vec::new(); parent_count];
+
+        for (parent, (indices, &child_count)) in groups.iter().zip(&child_counts).enumerate() {
+            if child_count == 0 {
+                continue;
+            }
+            let group_vectors: Vec<Vec<f32>> = indices
+                .iter()
+                .map(|&index| vectors[index].clone())
+                .collect();
+            let mut child_config = config.clone();
+            child_config.routing = IvfRoutingMode::Flat;
+            child_config.num_clusters = child_count;
+            child_config.seed = config.seed ^ (parent as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let first_leaf = leaves.len() / config.dim;
+            leaves
+                .extend_from_slice(&Self::train_flat(&child_config, &group_vectors, child_count).0);
+            children[parent].extend((first_leaf..first_leaf + child_count).map(|leaf| leaf as u32));
+        }
+        debug_assert_eq!(leaves.len(), leaf_count * config.dim);
+
+        (
+            leaves,
+            FloatCentroidRouter::TwoLevel {
+                parent_centroids,
+                topology: IvfRoutingTopology::from_children(&children),
+            },
+        )
     }
 
     /// Find nearest centroid index for a vector (static helper)
@@ -239,6 +262,110 @@ impl CoarseCentroids {
         distances.into_iter().map(|(c, _)| c).collect()
     }
 
+    /// Build a versioned probe plan using flat or two-level routing.
+    ///
+    /// The returned leaf IDs are independent of segment contents and can be
+    /// reused across every segment built from this global codebook.
+    pub fn probe(&self, vector: &[f32], k: usize, mode: IvfRoutingMode) -> IvfProbePlan {
+        let take = k.clamp(1, self.num_clusters as usize);
+        let clusters = match effective_routing_mode(mode, self.num_clusters as usize) {
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_k_nearest(vector, take),
+            IvfRoutingMode::TwoLevel => self.find_k_nearest_two_level(vector, take),
+            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(vector, take),
+        };
+        IvfProbePlan::new(
+            self.version,
+            float_probe_fingerprint(vector, take, mode),
+            clusters,
+        )
+    }
+
+    pub fn validate_routing(&self, mode: IvfRoutingMode) -> Result<(), String> {
+        match effective_routing_mode(mode, self.num_clusters as usize) {
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => Ok(()),
+            IvfRoutingMode::TwoLevel => {
+                let Some(FloatCentroidRouter::TwoLevel {
+                    parent_centroids,
+                    topology,
+                }) = self.routing_index.as_ref()
+                else {
+                    return Err(
+                        "two-level IVF routing was requested but the global codebook has no matching router"
+                            .to_string(),
+                    );
+                };
+                let parent_count = topology.parent_count();
+                if parent_count == 0
+                    || parent_centroids.len() != parent_count.saturating_mul(self.dim)
+                    || !topology.validate(self.num_clusters as usize)
+                    || parent_centroids.iter().any(|value| !value.is_finite())
+                {
+                    return Err("invalid float two-level IVF routing index".to_string());
+                }
+                Ok(())
+            }
+            IvfRoutingMode::Hnsw => {
+                let Some(FloatCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
+                    return Err(
+                        "HNSW IVF routing was requested but the global codebook has no HNSW graph"
+                            .to_string(),
+                    );
+                };
+                if !graph.validate(self.num_clusters as usize) {
+                    return Err("invalid float HNSW routing graph".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn find_k_nearest_two_level(&self, vector: &[f32], k: usize) -> Vec<u32> {
+        let Some(FloatCentroidRouter::TwoLevel {
+            parent_centroids,
+            topology,
+        }) = self.routing_index.as_ref()
+        else {
+            return self.find_k_nearest(vector, k);
+        };
+        if topology.parent_count() <= 1 {
+            return self.find_k_nearest(vector, k);
+        }
+
+        let mut parent_scores = vec![0.0; topology.parent_count()];
+        for (parent_id, score) in parent_scores.iter_mut().enumerate() {
+            let offset = parent_id * self.dim;
+            *score = squared_l2(vector, &parent_centroids[offset..offset + self.dim]);
+        }
+        let parent_take =
+            parent_probe_count(k, self.num_clusters as usize, topology.parent_count());
+        let parents = select_best::<false>(&parent_scores, parent_take);
+        let candidate_capacity = parents
+            .iter()
+            .map(|&parent| topology.children(parent as usize).len())
+            .sum();
+        let mut candidates = Vec::with_capacity(candidate_capacity);
+        for parent in parents {
+            for &leaf in topology.children(parent as usize) {
+                candidates.push((leaf, squared_l2(vector, self.get_centroid(leaf))));
+            }
+        }
+        select_best_candidates::<false>(&mut candidates, k)
+    }
+
+    fn find_k_nearest_hnsw(&self, vector: &[f32], k: usize) -> Vec<u32> {
+        let Some(FloatCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
+            return self.find_k_nearest(vector, k);
+        };
+        graph.search(|leaf| squared_l2(vector, self.get_centroid(leaf)), k)
+    }
+
+    fn find_nearest_hnsw(&self, vector: &[f32]) -> u32 {
+        let Some(FloatCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
+            return self.find_nearest(vector);
+        };
+        graph.search_one(|leaf| squared_l2(vector, self.get_centroid(leaf)))
+    }
+
     /// Find k nearest clusters with their distances
     pub fn find_k_nearest_with_distances(&self, vector: &[f32], k: usize) -> Vec<(u32, f32)> {
         let mut distances: Vec<(u32, f32)> = (0..self.num_clusters)
@@ -264,11 +391,24 @@ impl CoarseCentroids {
 
     /// Assign vector with SOAR (if configured) or standard assignment
     pub fn assign(&self, vector: &[f32]) -> MultiAssignment {
+        self.assign_with_routing(vector, IvfRoutingMode::Flat)
+    }
+
+    /// Assign during segment construction through the same persisted router
+    /// used at query time. Large codebooks therefore avoid an O(K) scan for
+    /// every indexed vector.
+    pub fn assign_with_routing(&self, vector: &[f32], routing: IvfRoutingMode) -> MultiAssignment {
         if let Some(ref soar_config) = self.soar_config {
-            self.assign_with_soar(vector, soar_config)
+            self.assign_with_soar_and_routing(vector, soar_config, routing)
         } else {
+            let primary_cluster = match effective_routing_mode(routing, self.num_clusters as usize)
+            {
+                IvfRoutingMode::Hnsw => self.find_nearest_hnsw(vector),
+                IvfRoutingMode::TwoLevel => self.find_k_nearest_two_level(vector, 1)[0],
+                IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_nearest(vector),
+            };
             MultiAssignment {
-                primary_cluster: self.find_nearest(vector),
+                primary_cluster,
                 secondary_clusters: Vec::new(),
             }
         }
@@ -276,8 +416,37 @@ impl CoarseCentroids {
 
     /// SOAR-style assignment: find secondary clusters with orthogonal residuals
     pub fn assign_with_soar(&self, vector: &[f32], config: &SoarConfig) -> MultiAssignment {
-        // 1. Find primary cluster (nearest centroid)
-        let primary = self.find_nearest(vector);
+        self.assign_with_soar_and_routing(vector, config, IvfRoutingMode::Flat)
+    }
+
+    fn assign_with_soar_and_routing(
+        &self,
+        vector: &[f32],
+        config: &SoarConfig,
+        routing: IvfRoutingMode,
+    ) -> MultiAssignment {
+        let leaf_ids: Vec<u32> = match effective_routing_mode(routing, self.num_clusters as usize) {
+            IvfRoutingMode::TwoLevel => {
+                self.two_level_candidate_leaves(vector, config.num_secondary + 1)
+            }
+            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(
+                vector,
+                (config.num_secondary + 1)
+                    .saturating_mul(16)
+                    .max(32)
+                    .min(self.num_clusters as usize),
+            ),
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => (0..self.num_clusters).collect(),
+        };
+        let primary = leaf_ids
+            .iter()
+            .copied()
+            .min_by(|&left, &right| {
+                squared_l2(vector, self.get_centroid(left))
+                    .total_cmp(&squared_l2(vector, self.get_centroid(right)))
+                    .then_with(|| left.cmp(&right))
+            })
+            .unwrap_or(0);
         let primary_centroid = self.get_centroid(primary);
 
         // 2. Compute primary residual r = x - c
@@ -298,7 +467,8 @@ impl CoarseCentroids {
         }
 
         // 4. Find secondary clusters that MINIMIZE |⟨r, r'⟩| (orthogonal residuals)
-        let mut candidates: Vec<(u32, f32)> = (0..self.num_clusters)
+        let mut candidates: Vec<(u32, f32)> = leaf_ids
+            .into_iter()
             .filter(|&c| c != primary)
             .map(|c| {
                 let centroid = self.get_centroid(c);
@@ -331,6 +501,34 @@ impl CoarseCentroids {
         }
     }
 
+    fn two_level_candidate_leaves(&self, vector: &[f32], k: usize) -> Vec<u32> {
+        let Some(FloatCentroidRouter::TwoLevel {
+            parent_centroids,
+            topology,
+        }) = self.routing_index.as_ref()
+        else {
+            return (0..self.num_clusters).collect();
+        };
+        let mut parent_scores = vec![0.0; topology.parent_count()];
+        for (parent_id, score) in parent_scores.iter_mut().enumerate() {
+            let offset = parent_id * self.dim;
+            *score = squared_l2(vector, &parent_centroids[offset..offset + self.dim]);
+        }
+        let parents = select_best::<false>(
+            &parent_scores,
+            parent_probe_count(k, self.num_clusters as usize, topology.parent_count()),
+        );
+        let capacity = parents
+            .iter()
+            .map(|&parent| topology.children(parent as usize).len())
+            .sum();
+        let mut leaves = Vec::with_capacity(capacity);
+        for parent in parents {
+            leaves.extend_from_slice(topology.children(parent as usize));
+        }
+        leaves
+    }
+
     /// Get centroid for a cluster
     pub fn get_centroid(&self, cluster_id: u32) -> &[f32] {
         let offset = cluster_id as usize * self.dim;
@@ -343,107 +541,70 @@ impl CoarseCentroids {
         vector.iter().zip(centroid).map(|(&v, &c)| v - c).collect()
     }
 
-    /// Save to binary file
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let mut file = std::fs::File::create(path)?;
-        self.write_to(&mut file)
-    }
-
-    /// Write to any writer
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_u32::<LittleEndian>(CENTROIDS_MAGIC)?;
-        writer.write_u32::<LittleEndian>(2)?; // version 2 with SOAR support
-        writer.write_u64::<LittleEndian>(self.version)?;
-        writer.write_u32::<LittleEndian>(self.num_clusters)?;
-        writer.write_u32::<LittleEndian>(self.dim as u32)?;
-
-        // Write SOAR config
-        if let Some(ref soar) = self.soar_config {
-            writer.write_u8(1)?;
-            writer.write_u32::<LittleEndian>(soar.num_secondary as u32)?;
-            writer.write_u8(if soar.selective { 1 } else { 0 })?;
-            writer.write_f32::<LittleEndian>(soar.spill_threshold)?;
-        } else {
-            writer.write_u8(0)?;
-        }
-
-        for &val in &self.centroids {
-            writer.write_f32::<LittleEndian>(val)?;
-        }
-
-        Ok(())
-    }
-
-    /// Load from binary file
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let data = std::fs::read(path)?;
-        Self::read_from(&mut Cursor::new(data))
-    }
-
-    /// Read from any reader
-    pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let magic = reader.read_u32::<LittleEndian>()?;
-        if magic != CENTROIDS_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid centroids file magic",
-            ));
-        }
-
-        let file_version = reader.read_u32::<LittleEndian>()?;
-        let version = reader.read_u64::<LittleEndian>()?;
-        let num_clusters = reader.read_u32::<LittleEndian>()?;
-        let dim = reader.read_u32::<LittleEndian>()? as usize;
-
-        // Read SOAR config (version 2+)
-        let soar_config = if file_version >= 2 {
-            let has_soar = reader.read_u8()? != 0;
-            if has_soar {
-                let num_secondary = reader.read_u32::<LittleEndian>()? as usize;
-                let selective = reader.read_u8()? != 0;
-                let spill_threshold = reader.read_f32::<LittleEndian>()?;
-                Some(SoarConfig {
-                    num_secondary,
-                    selective,
-                    spill_threshold,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut centroids = vec![0.0f32; num_clusters as usize * dim];
-        for val in &mut centroids {
-            *val = reader.read_f32::<LittleEndian>()?;
-        }
-
-        Ok(Self {
-            num_clusters,
-            dim,
-            centroids,
-            version,
-            soar_config,
-        })
-    }
-
-    /// Serialize to bytes
-    pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.write_to(&mut buf)?;
-        Ok(buf)
-    }
-
-    /// Deserialize from bytes
-    pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
-        Self::read_from(&mut Cursor::new(data))
-    }
-
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
-        self.centroids.len() * 4 + 64 // centroids + overhead
+        let routing_bytes = self
+            .routing_index
+            .as_ref()
+            .map_or(0, |router| match router {
+                FloatCentroidRouter::TwoLevel {
+                    parent_centroids,
+                    topology,
+                } => {
+                    parent_centroids.len() * size_of::<f32>()
+                        + topology.parent_count() * size_of::<u32>()
+                        + self.num_clusters as usize * size_of::<u32>()
+                }
+                FloatCentroidRouter::Hnsw(graph) => graph.size_bytes(),
+            });
+        self.centroids.len() * size_of::<f32>() + routing_bytes + 64
     }
+
+    /// Visit compact routing topology and parent arrays before the potentially
+    /// much larger leaf centroid matrix.
+    #[cfg(feature = "native")]
+    pub(crate) fn visit_routing_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        if let Some(router) = &self.routing_index {
+            match router {
+                FloatCentroidRouter::TwoLevel {
+                    parent_centroids,
+                    topology,
+                } => {
+                    topology.visit_resident_regions(visit);
+                    visit(
+                        "float parent centroids",
+                        super::routing::bytes_of_slice(parent_centroids),
+                    );
+                }
+                FloatCentroidRouter::Hnsw(graph) => graph.visit_resident_regions(visit),
+            }
+        }
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn visit_leaf_centroid_region(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        visit(
+            "float leaf centroids",
+            super::routing::bytes_of_slice(&self.centroids),
+        );
+    }
+
+    /// Encode the current index-level centroid artifact format.
+    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+
+#[inline]
+fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(&a, &b)| {
+            let delta = a - b;
+            delta * delta
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -535,11 +696,42 @@ mod tests {
         let centroids = CoarseCentroids::train(&config, &vectors);
 
         // Serialize and deserialize
-        let bytes = centroids.to_bytes().unwrap();
-        let loaded = CoarseCentroids::from_bytes(&bytes).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&centroids, bincode::config::standard()).unwrap();
+        let (loaded, consumed): (CoarseCentroids, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, bytes.len());
 
         assert_eq!(loaded.num_clusters, centroids.num_clusters);
         assert_eq!(loaded.dim, centroids.dim);
         assert_eq!(loaded.centroids.len(), centroids.centroids.len());
+    }
+
+    #[test]
+    fn persisted_hnsw_and_two_level_routers_are_valid() {
+        let dim = 4;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(991);
+        let vectors: Vec<Vec<f32>> = (0..256)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>()).collect())
+            .collect();
+
+        for routing in [IvfRoutingMode::Hnsw, IvfRoutingMode::TwoLevel] {
+            let trained =
+                CoarseCentroids::train(&CoarseConfig::new(dim, 16).with_routing(routing), &vectors);
+            trained.validate_routing(routing).unwrap();
+            let plan = trained.probe(&vectors[0], 8, routing);
+            assert_eq!(plan.cluster_ids.len(), 8);
+            assert!(
+                plan.cluster_ids
+                    .iter()
+                    .all(|&cluster| cluster < trained.num_clusters)
+            );
+
+            let bytes =
+                bincode::serde::encode_to_vec(&trained, bincode::config::standard()).unwrap();
+            let (loaded, consumed): (CoarseCentroids, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, bytes.len());
+            loaded.validate_routing(routing).unwrap();
+        }
     }
 }

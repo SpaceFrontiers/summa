@@ -21,7 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Format/wire compatibility is designed, not accidental.** New serialized
   fields use `#[serde(default)]` (+ `skip_serializing_if` for emitters); formats
   carry version gates that loudly refuse data too new to read; incompatible
-  builds must fail merge via version checks (see RaBitQ codebook `version`).
+  builds must fail merge via global quantizer/codebook version checks.
   When a change claims "no behavioral change," verify byte-identical output.
 - **Hot-path allocation hygiene.** Per-query buffers come from reusable /
   thread-local scratch (see `BmpScratch`), `Vec::with_capacity` over realloc
@@ -90,7 +90,7 @@ The index is the central abstraction. Documents are stored in **segments** (writ
 Key modules:
 
 - `index/` - Main `Index` struct with async operations (search, write, merge)
-- `segment/` - Segment building, reading, merging; document storage; vector indexes (flat, IVF-RaBitQ, ScaNN)
+- `segment/` - Segment building, reading, merging; document storage; vector indexes (flat, global IVF-PQ and binary IVF)
 - `query/` - Query execution with BM25 ranking, WAND/MaxScore optimizations
 - `directories/` - Storage abstraction layer (filesystem, HTTP, RAM, memory-mapped, caching)
 - `dsl/` - Schema Definition Language parser (pest-based)

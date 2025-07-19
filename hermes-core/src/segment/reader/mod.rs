@@ -14,10 +14,10 @@ pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
 /// or a more selective prefix when they are exceeded.
 const MAX_PREFIX_TERMS: usize = 1_024;
 const MAX_PREFIX_POSTINGS: u64 = 5_000_000;
-/// Bound ANN result/resolution vectors per segment. Exact vector bytes are
-/// scored in smaller batches below, so peak rerank scratch stays predictable.
-const MAX_DENSE_CANDIDATES_PER_SEGMENT: usize = 200_000;
-const MAX_ANN_ORDINAL_OVERFETCH: usize = 32;
+/// Hard guard for explicitly requested dense candidate documents. Values of
+/// those documents are exact-scored through bounded streaming batches, so a
+/// valid multi-valued document is not rejected merely for owning many values.
+const MAX_DENSE_CANDIDATES_PER_SEGMENT: usize = 20_000;
 /// Preferred vector count; wide vectors reduce it to stay under the byte cap.
 const DENSE_SCORE_BATCH: usize = 4_096;
 const BINARY_SCORE_BATCH: usize = 8_192;
@@ -69,8 +69,7 @@ use crate::directories::{Directory, FileHandle};
 use crate::dsl::{DenseVectorQuantization, Document, Field, Schema};
 use crate::query::{MAX_DENSE_NPROBE, MAX_DENSE_RERANK_FACTOR};
 use crate::structures::{
-    AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFPQIndex, IVFRaBitQIndex, PQCodebook,
-    RaBitQIndex, SSTableStats, TermInfo,
+    AsyncSSTableReader, BlockPostingList, CoarseCentroids, SSTableStats, TermInfo,
 };
 use crate::{DocId, Error, Result};
 
@@ -293,138 +292,6 @@ fn checked_dense_fetch_k(k: usize, rerank_factor: f32) -> Result<usize> {
     Ok(fetch.ceil() as usize)
 }
 
-fn ann_ordinal_fetch_k(fetch_k: usize, num_vectors: usize, num_docs: usize) -> usize {
-    if num_vectors == 0 || num_docs == 0 {
-        return 0;
-    }
-    let average_values_per_doc = num_vectors
-        .div_ceil(num_docs)
-        .clamp(1, MAX_ANN_ORDINAL_OVERFETCH);
-    fetch_k
-        .saturating_mul(average_values_per_doc)
-        .min(MAX_DENSE_CANDIDATES_PER_SEGMENT)
-        .min(num_vectors)
-}
-
-/// Search vector-level ANN progressively until it yields enough distinct
-/// documents, or until the probed candidate population / safety cap is
-/// exhausted. A fixed average-values overfetch is insufficient for skewed
-/// fields where one document owns most of the best vectors.
-fn progressive_ann_search<F>(
-    target_docs: usize,
-    initial_fetch: usize,
-    max_vectors: usize,
-    mut search: F,
-) -> Result<Vec<RawVectorCandidate>>
-where
-    F: FnMut(usize) -> Vec<RawVectorCandidate>,
-{
-    let max_fetch = max_vectors.min(MAX_DENSE_CANDIDATES_PER_SEGMENT);
-    if target_docs == 0 || max_fetch == 0 {
-        return Ok(Vec::new());
-    }
-
-    let target_docs = target_docs.min(max_fetch);
-    let mut fetch = initial_fetch.max(target_docs).min(max_fetch);
-    loop {
-        let results = search(fetch);
-        let mut docs = rustc_hash::FxHashSet::with_capacity_and_hasher(
-            target_docs.min(results.len()),
-            Default::default(),
-        );
-        for &(doc_id, _, _) in &results {
-            docs.insert(doc_id);
-            if docs.len() >= target_docs {
-                return Ok(results);
-            }
-        }
-        if results.len() < fetch || fetch == max_vectors {
-            return Ok(results);
-        }
-        if fetch == max_fetch {
-            return Err(Error::Query(format!(
-                "ANN search reached the per-segment candidate limit of \
-                 {MAX_DENSE_CANDIDATES_PER_SEGMENT} with only {} of {target_docs} requested \
-                 documents; reduce k or the number of vector values per document",
-                docs.len()
-            )));
-        }
-
-        let next_fetch = fetch.saturating_mul(2).min(max_fetch);
-        if next_fetch == fetch {
-            return Ok(results);
-        }
-        fetch = next_fetch;
-    }
-}
-
-/// Single-scan variant of [`progressive_ann_search`] for indexes whose
-/// `search(k)` cost does not depend on `k`.
-///
-/// Binary IVF scans every vector of every probed cluster regardless of the
-/// collector size, so each doubling retry of [`progressive_ann_search`]
-/// repeated the identical full scan (~nprobe/num_clusters of the segment's
-/// codes) just to grow the collector. Here the closure runs ONCE at the
-/// fetch cap and the doubling schedule is replayed over prefixes of the
-/// single ranked list, returning exactly what the retry loop would have
-/// returned (a `search(f)` that returns the top-`f` of a fixed ranking makes
-/// the two observationally identical, including the candidate-limit error).
-fn single_scan_ann_search<F>(
-    target_docs: usize,
-    initial_fetch: usize,
-    max_vectors: usize,
-    search: F,
-) -> Result<Vec<RawVectorCandidate>>
-where
-    F: FnOnce(usize) -> Vec<RawVectorCandidate>,
-{
-    let max_fetch = max_vectors.min(MAX_DENSE_CANDIDATES_PER_SEGMENT);
-    if target_docs == 0 || max_fetch == 0 {
-        return Ok(Vec::new());
-    }
-    let target_docs = target_docs.min(max_fetch);
-
-    let mut results = search(max_fetch);
-    results.truncate(max_fetch);
-
-    // Ranked-list length at which `target_docs` distinct documents are first
-    // covered (None if the whole list falls short).
-    let mut docs = rustc_hash::FxHashSet::with_capacity_and_hasher(target_docs, Default::default());
-    let mut satisfied_len = None;
-    for (i, &(doc_id, _, _)) in results.iter().enumerate() {
-        docs.insert(doc_id);
-        if docs.len() >= target_docs {
-            satisfied_len = Some(i + 1);
-            break;
-        }
-    }
-
-    let mut fetch = initial_fetch.max(target_docs).min(max_fetch);
-    loop {
-        let round_len = fetch.min(results.len());
-        if satisfied_len.is_some_and(|len| len <= round_len) {
-            results.truncate(round_len);
-            return Ok(results);
-        }
-        if results.len() < fetch || fetch == max_vectors {
-            return Ok(results);
-        }
-        if fetch == max_fetch {
-            return Err(Error::Query(format!(
-                "ANN search reached the per-segment candidate limit of \
-                 {MAX_DENSE_CANDIDATES_PER_SEGMENT} with only {} of {target_docs} requested \
-                 documents; reduce k or the number of vector values per document",
-                docs.len()
-            )));
-        }
-        let next_fetch = fetch.saturating_mul(2).min(max_fetch);
-        if next_fetch == fetch {
-            return Ok(results);
-        }
-        fetch = next_fetch;
-    }
-}
-
 #[inline]
 fn bounded_vector_score_batch(vector_byte_size: usize, preferred: usize) -> usize {
     preferred.min((MAX_VECTOR_SCORE_BATCH_BYTES / vector_byte_size.max(1)).max(1))
@@ -448,21 +315,38 @@ fn checked_file_range(
 }
 
 type RawVectorCandidate = (u32, u16, f32);
-type ResolvedVectorCandidate = (usize, usize); // (result index, flat-vector index)
+type CandidateVectorRef = (DocId, u16, usize); // (doc ID, ordinal, flat-vector index)
 
-/// ANN operates on individual vectors, but document combiners require every
-/// stored value for a candidate document. Expand the deduplicated ANN document
-/// union before exact reranking, with a hard per-segment vector budget.
-fn expand_ann_candidate_documents(
+#[derive(Clone, Copy)]
+struct CandidateDocumentRange {
+    doc_id: DocId,
+    start: usize,
+    end: usize,
+}
+
+struct AnnCandidateDocuments {
+    ranges: Vec<CandidateDocumentRange>,
+    vector_count: usize,
+}
+
+/// Resolve the document union returned by ANN to compact flat-vector ranges.
+///
+/// The number of selected documents remains bounded by `fetch_k`, while the
+/// number of values those documents own is intentionally not capped. A valid
+/// multi-valued document may have many ordinals; materializing one result and
+/// one flat-index entry per ordinal used to turn that into a spurious query
+/// error at 20,000 vectors. Callers stream these ranges through a fixed-size
+/// score buffer instead.
+fn ann_candidate_document_ranges(
     ann_results: &[RawVectorCandidate],
     flat: &LazyFlatVectorData,
-) -> Result<(Vec<RawVectorCandidate>, Vec<ResolvedVectorCandidate>)> {
+) -> Result<AnnCandidateDocuments> {
     let mut candidate_docs: Vec<DocId> = ann_results.iter().map(|candidate| candidate.0).collect();
     candidate_docs.sort_unstable();
     candidate_docs.dedup();
 
-    let mut expanded = Vec::new();
-    let mut resolved = Vec::new();
+    let mut ranges = Vec::with_capacity(candidate_docs.len());
+    let mut vector_count = 0usize;
     for doc_id in candidate_docs {
         let (start, count) = flat.flat_indexes_for_doc_range(doc_id);
         if count == 0 {
@@ -470,67 +354,286 @@ fn expand_ann_candidate_documents(
                 "ANN candidate document {doc_id} is missing from flat vector storage"
             )));
         }
-        let next_len = expanded
-            .len()
+        vector_count = vector_count
             .checked_add(count)
             .ok_or_else(|| Error::Query("ANN candidate vector expansion overflow".to_string()))?;
-        if next_len > MAX_DENSE_CANDIDATES_PER_SEGMENT {
-            return Err(Error::Query(format!(
-                "ANN candidate documents expand to more than \
-                 {MAX_DENSE_CANDIDATES_PER_SEGMENT} vectors in one segment"
-            )));
-        }
-        expanded.reserve(count);
-        resolved.reserve(count);
         let end = start
             .checked_add(count)
             .ok_or_else(|| Error::Corruption("flat vector range overflow".to_string()))?;
-        for flat_index in start..end {
-            let (stored_doc_id, ordinal) = flat.get_doc_id(flat_index);
-            if stored_doc_id != doc_id {
-                return Err(Error::Corruption(format!(
-                    "flat vector doc map is not contiguous for document {doc_id}"
-                )));
-            }
-            let result_index = expanded.len();
-            expanded.push((doc_id, ordinal, 0.0));
-            resolved.push((result_index, flat_index));
+        if end > flat.num_vectors {
+            return Err(Error::Corruption(format!(
+                "flat vector range {start}..{end} for document {doc_id} exceeds {} vectors",
+                flat.num_vectors
+            )));
         }
+        ranges.push(CandidateDocumentRange { doc_id, start, end });
     }
-    Ok((expanded, resolved))
+    Ok(AnnCandidateDocuments {
+        ranges,
+        vector_count,
+    })
 }
 
-/// Reuse the probe's scores for (doc, ordinal) pairs it already returned.
-///
-/// Binary IVF clusters store the same packed codes as flat storage and score
-/// them with the same exact SIMD Hamming kernel, so re-reading those vectors
-/// from flat storage recomputes an identical score at the cost of one random
-/// read (and potential page fault on cold mmap) per candidate. Only the
-/// candidate documents' remaining ordinals still need flat reads. The
-/// per-query map is justified by removing one flat read per reused entry.
-fn fill_probe_scores_and_prune_resolved(
-    ann_results: &[RawVectorCandidate],
-    expanded: &mut [RawVectorCandidate],
-    resolved: Vec<ResolvedVectorCandidate>,
-) -> Vec<ResolvedVectorCandidate> {
-    let mut probe_scores: FxHashMap<(DocId, u16), f32> =
-        FxHashMap::with_capacity_and_hasher(ann_results.len(), Default::default());
-    for &(doc_id, ordinal, score) in ann_results {
-        probe_scores.insert((doc_id, ordinal), score);
+struct CandidateVectorCursor<'a> {
+    ranges: &'a [CandidateDocumentRange],
+    range_index: usize,
+    flat_index: usize,
+}
+
+impl<'a> CandidateVectorCursor<'a> {
+    fn new(ranges: &'a [CandidateDocumentRange]) -> Self {
+        Self {
+            ranges,
+            range_index: 0,
+            flat_index: ranges.first().map_or(0, |range| range.start),
+        }
     }
-    resolved
-        .into_iter()
-        .filter(|&(result_index, _)| {
-            let (doc_id, ordinal, _) = expanded[result_index];
-            match probe_scores.get(&(doc_id, ordinal)) {
-                Some(&score) => {
-                    expanded[result_index].2 = score;
-                    false
+
+    /// Fill `batch` in `(doc_id, ordinal)` order. The cursor validates the
+    /// contiguity promise made by the flat doc map while it streams, avoiding
+    /// an O(all candidate ordinals) validation allocation.
+    fn fill_batch(
+        &mut self,
+        flat: &LazyFlatVectorData,
+        batch: &mut Vec<CandidateVectorRef>,
+        limit: usize,
+    ) -> Result<bool> {
+        batch.clear();
+        while batch.len() < limit && self.range_index < self.ranges.len() {
+            let range = self.ranges[self.range_index];
+            if self.flat_index == range.end {
+                self.range_index += 1;
+                if let Some(next) = self.ranges.get(self.range_index) {
+                    self.flat_index = next.start;
                 }
-                None => true,
+                continue;
             }
-        })
-        .collect()
+            let (stored_doc_id, ordinal) = flat.get_doc_id(self.flat_index);
+            if stored_doc_id != range.doc_id {
+                return Err(Error::Corruption(format!(
+                    "flat vector doc map is not contiguous for document {}",
+                    range.doc_id
+                )));
+            }
+            batch.push((range.doc_id, ordinal, self.flat_index));
+            self.flat_index += 1;
+        }
+        Ok(!batch.is_empty())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VectorReadRun {
+    buffer_start: usize,
+    flat_start: usize,
+    count: usize,
+}
+
+/// Coalesce an ordered set of selected flat indexes into contiguous reads.
+/// Multi-valued document bodies are stored consecutively, so this turns the
+/// common case from one range lookup per value into one lookup per bounded
+/// run while retaining a packed score buffer.
+fn plan_vector_read_runs(indexes: &[usize], runs: &mut Vec<VectorReadRun>) -> Result<()> {
+    runs.clear();
+    for (buffer_index, &flat_index) in indexes.iter().enumerate() {
+        if let Some(run) = runs.last_mut()
+            && run
+                .flat_start
+                .checked_add(run.count)
+                .is_some_and(|next| next == flat_index)
+        {
+            run.count += 1;
+            continue;
+        }
+        if buffer_index > 0 && flat_index <= indexes[buffer_index - 1] {
+            return Err(Error::Corruption(
+                "candidate flat-vector indexes are not strictly ordered".into(),
+            ));
+        }
+        runs.push(VectorReadRun {
+            buffer_start: buffer_index,
+            flat_start: flat_index,
+            count: 1,
+        });
+    }
+    Ok(())
+}
+
+async fn read_vector_runs(
+    flat: &LazyFlatVectorData,
+    indexes: &[usize],
+    runs: &mut Vec<VectorReadRun>,
+    output: &mut [u8],
+) -> Result<()> {
+    plan_vector_read_runs(indexes, runs)?;
+    let vector_byte_size = flat.vector_byte_size();
+    for run in runs {
+        let bytes = flat
+            .read_vectors_batch(run.flat_start, run.count)
+            .await
+            .map_err(Error::Io)?;
+        let start = run
+            .buffer_start
+            .checked_mul(vector_byte_size)
+            .ok_or_else(|| Error::Query("dense rerank buffer offset overflow".into()))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::Query("dense rerank buffer range overflow".into()))?;
+        let destination = output
+            .get_mut(start..end)
+            .ok_or_else(|| Error::Corruption("dense rerank buffer is too short".into()))?;
+        destination.copy_from_slice(bytes.as_slice());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sync")]
+fn read_vector_runs_sync(
+    flat: &LazyFlatVectorData,
+    indexes: &[usize],
+    runs: &mut Vec<VectorReadRun>,
+    output: &mut [u8],
+) -> Result<()> {
+    plan_vector_read_runs(indexes, runs)?;
+    let vector_byte_size = flat.vector_byte_size();
+    for run in runs {
+        let bytes = flat
+            .read_vectors_batch_sync(run.flat_start, run.count)
+            .map_err(Error::Io)?;
+        let start = run
+            .buffer_start
+            .checked_mul(vector_byte_size)
+            .ok_or_else(|| Error::Query("dense rerank buffer offset overflow".into()))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::Query("dense rerank buffer range overflow".into()))?;
+        let destination = output
+            .get_mut(start..end)
+            .ok_or_else(|| Error::Corruption("dense rerank buffer is too short".into()))?;
+        destination.copy_from_slice(bytes.as_slice());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct DenseRerankStats {
+    vector_count: usize,
+    resolve_elapsed: std::time::Duration,
+    read_elapsed: std::time::Duration,
+    score_elapsed: std::time::Duration,
+}
+
+async fn exact_score_dense_candidate_documents(
+    ann_results: &[RawVectorCandidate],
+    flat: &LazyFlatVectorData,
+    query: &[f32],
+    unit_norm: bool,
+    combiner: crate::query::MultiValueCombiner,
+    limit: usize,
+) -> Result<(Vec<VectorSearchResult>, DenseRerankStats)> {
+    let resolve_started = std::time::Instant::now();
+    let documents = ann_candidate_document_ranges(ann_results, flat)?;
+    let mut stats = DenseRerankStats {
+        vector_count: documents.vector_count,
+        resolve_elapsed: resolve_started.elapsed(),
+        ..Default::default()
+    };
+    let vector_byte_size = flat.vector_byte_size();
+    let batch_len = bounded_vector_score_batch(vector_byte_size, DENSE_SCORE_BATCH);
+    let raw_capacity = batch_len
+        .checked_mul(vector_byte_size)
+        .ok_or_else(|| Error::Query("dense rerank buffer size overflow".to_string()))?;
+    let mut raw = vec![0u8; raw_capacity];
+    let mut scores = vec![0.0f32; batch_len];
+    let mut batch = Vec::with_capacity(batch_len);
+    let mut flat_indexes = Vec::with_capacity(batch_len);
+    let mut read_runs = Vec::new();
+    let mut cursor = CandidateVectorCursor::new(&documents.ranges);
+    let mut collector = FlatDocumentCollector::new(limit, combiner);
+    let mut scored = 0usize;
+
+    while cursor.fill_batch(flat, &mut batch, batch_len)? {
+        flat_indexes.clear();
+        flat_indexes.extend(batch.iter().map(|&(_, _, flat_index)| flat_index));
+        #[cfg(feature = "native")]
+        flat.prefetch_vectors(flat_indexes.iter().copied());
+        let raw_len = batch
+            .len()
+            .checked_mul(vector_byte_size)
+            .ok_or_else(|| Error::Query("dense rerank buffer size overflow".to_string()))?;
+        let raw = &mut raw[..raw_len];
+
+        let read_started = std::time::Instant::now();
+        read_vector_runs(flat, &flat_indexes, &mut read_runs, raw).await?;
+        stats.read_elapsed += read_started.elapsed();
+
+        let score_started = std::time::Instant::now();
+        SegmentReader::score_quantized_batch(
+            query,
+            raw,
+            flat.quantization,
+            flat.dim,
+            &mut scores[..batch.len()],
+            unit_norm,
+        )?;
+        stats.score_elapsed += score_started.elapsed();
+        for (buffer_index, &(doc_id, ordinal, _)) in batch.iter().enumerate() {
+            collector.push(doc_id, ordinal, scores[buffer_index]);
+        }
+        scored += batch.len();
+    }
+    debug_assert_eq!(scored, documents.vector_count);
+    Ok((collector.into_results(), stats))
+}
+
+#[cfg(feature = "sync")]
+fn exact_score_dense_candidate_documents_sync(
+    ann_results: &[RawVectorCandidate],
+    flat: &LazyFlatVectorData,
+    query: &[f32],
+    unit_norm: bool,
+    combiner: crate::query::MultiValueCombiner,
+    limit: usize,
+) -> Result<Vec<VectorSearchResult>> {
+    let documents = ann_candidate_document_ranges(ann_results, flat)?;
+    let vector_byte_size = flat.vector_byte_size();
+    let batch_len = bounded_vector_score_batch(vector_byte_size, DENSE_SCORE_BATCH);
+    let raw_capacity = batch_len
+        .checked_mul(vector_byte_size)
+        .ok_or_else(|| Error::Query("dense rerank buffer size overflow".to_string()))?;
+    let mut raw = vec![0u8; raw_capacity];
+    let mut scores = vec![0.0f32; batch_len];
+    let mut batch = Vec::with_capacity(batch_len);
+    let mut flat_indexes = Vec::with_capacity(batch_len);
+    let mut read_runs = Vec::new();
+    let mut cursor = CandidateVectorCursor::new(&documents.ranges);
+    let mut collector = FlatDocumentCollector::new(limit, combiner);
+    let mut scored = 0usize;
+
+    while cursor.fill_batch(flat, &mut batch, batch_len)? {
+        flat_indexes.clear();
+        flat_indexes.extend(batch.iter().map(|&(_, _, flat_index)| flat_index));
+        let raw_len = batch
+            .len()
+            .checked_mul(vector_byte_size)
+            .ok_or_else(|| Error::Query("dense rerank buffer size overflow".to_string()))?;
+        let raw = &mut raw[..raw_len];
+        read_vector_runs_sync(flat, &flat_indexes, &mut read_runs, raw)?;
+        SegmentReader::score_quantized_batch(
+            query,
+            raw,
+            flat.quantization,
+            flat.dim,
+            &mut scores[..batch.len()],
+            unit_norm,
+        )?;
+        for (buffer_index, &(doc_id, ordinal, _)) in batch.iter().enumerate() {
+            collector.push(doc_id, ordinal, scores[buffer_index]);
+        }
+        scored += batch.len();
+    }
+    debug_assert_eq!(scored, documents.vector_count);
+    Ok(collector.into_results())
 }
 
 async fn exact_score_binary_candidate_documents(
@@ -538,9 +641,14 @@ async fn exact_score_binary_candidate_documents(
     flat: &LazyFlatVectorData,
     query: &[u8],
     dim_bits: usize,
-) -> Result<Vec<RawVectorCandidate>> {
-    let (mut expanded, resolved) = expand_ann_candidate_documents(ann_results, flat)?;
-    let resolved = fill_probe_scores_and_prune_resolved(ann_results, &mut expanded, resolved);
+    combiner: crate::query::MultiValueCombiner,
+    limit: usize,
+) -> Result<Vec<VectorSearchResult>> {
+    let documents = ann_candidate_document_ranges(ann_results, flat)?;
+    let probe_scores: FxHashMap<(DocId, u16), f32> = ann_results
+        .iter()
+        .map(|&(doc_id, ordinal, score)| ((doc_id, ordinal), score))
+        .collect();
     let vector_byte_size = flat.vector_byte_size();
     let batch_len = bounded_vector_score_batch(vector_byte_size, BINARY_SCORE_BATCH);
     let raw_capacity = batch_len
@@ -548,35 +656,51 @@ async fn exact_score_binary_candidate_documents(
         .ok_or_else(|| Error::Query("binary candidate buffer size overflow".to_string()))?;
     let mut raw = vec![0u8; raw_capacity];
     let mut scores = vec![0.0f32; batch_len];
+    let mut batch_scores = vec![0.0f32; batch_len];
+    let mut batch = Vec::with_capacity(batch_len);
+    let mut unresolved = Vec::with_capacity(batch_len);
+    let mut unresolved_flat_indexes = Vec::with_capacity(batch_len);
+    let mut read_runs = Vec::new();
+    let mut cursor = CandidateVectorCursor::new(&documents.ranges);
+    let mut collector = FlatDocumentCollector::new(limit, combiner);
+    let mut scored = 0usize;
 
-    for chunk in resolved.chunks(batch_len) {
+    while cursor.fill_batch(flat, &mut batch, batch_len)? {
+        unresolved.clear();
+        for (batch_index, &(doc_id, ordinal, flat_index)) in batch.iter().enumerate() {
+            if let Some(&score) = probe_scores.get(&(doc_id, ordinal)) {
+                batch_scores[batch_index] = score;
+            } else {
+                unresolved.push((batch_index, flat_index));
+            }
+        }
+        unresolved_flat_indexes.clear();
+        unresolved_flat_indexes.extend(unresolved.iter().map(|&(_, flat_index)| flat_index));
         #[cfg(feature = "native")]
-        flat.prefetch_vectors(chunk.iter().map(|&(_, flat_index)| flat_index));
-        let raw_len = chunk
+        flat.prefetch_vectors(unresolved_flat_indexes.iter().copied());
+        let raw_len = unresolved
             .len()
             .checked_mul(vector_byte_size)
             .ok_or_else(|| Error::Query("binary candidate buffer size overflow".to_string()))?;
         let raw = &mut raw[..raw_len];
-        for (buffer_index, &(_, flat_index)) in chunk.iter().enumerate() {
-            flat.read_vector_raw_into(
-                flat_index,
-                &mut raw[buffer_index * vector_byte_size..(buffer_index + 1) * vector_byte_size],
-            )
-            .await
-            .map_err(Error::Io)?;
-        }
+        read_vector_runs(flat, &unresolved_flat_indexes, &mut read_runs, raw).await?;
         crate::structures::simd::batch_hamming_scores(
             query,
             raw,
             vector_byte_size,
             dim_bits,
-            &mut scores[..chunk.len()],
+            &mut scores[..unresolved.len()],
         );
-        for (buffer_index, &(result_index, _)) in chunk.iter().enumerate() {
-            expanded[result_index].2 = scores[buffer_index];
+        for (buffer_index, &(batch_index, _)) in unresolved.iter().enumerate() {
+            batch_scores[batch_index] = scores[buffer_index];
         }
+        for (batch_index, &(doc_id, ordinal, _)) in batch.iter().enumerate() {
+            collector.push(doc_id, ordinal, batch_scores[batch_index]);
+        }
+        scored += batch.len();
     }
-    Ok(expanded)
+    debug_assert_eq!(scored, documents.vector_count);
+    Ok(collector.into_results())
 }
 
 #[cfg(feature = "sync")]
@@ -585,9 +709,14 @@ fn exact_score_binary_candidate_documents_sync(
     flat: &LazyFlatVectorData,
     query: &[u8],
     dim_bits: usize,
-) -> Result<Vec<RawVectorCandidate>> {
-    let (mut expanded, resolved) = expand_ann_candidate_documents(ann_results, flat)?;
-    let resolved = fill_probe_scores_and_prune_resolved(ann_results, &mut expanded, resolved);
+    combiner: crate::query::MultiValueCombiner,
+    limit: usize,
+) -> Result<Vec<VectorSearchResult>> {
+    let documents = ann_candidate_document_ranges(ann_results, flat)?;
+    let probe_scores: FxHashMap<(DocId, u16), f32> = ann_results
+        .iter()
+        .map(|&(doc_id, ordinal, score)| ((doc_id, ordinal), score))
+        .collect();
     let vector_byte_size = flat.vector_byte_size();
     let batch_len = bounded_vector_score_batch(vector_byte_size, BINARY_SCORE_BATCH);
     let raw_capacity = batch_len
@@ -595,32 +724,49 @@ fn exact_score_binary_candidate_documents_sync(
         .ok_or_else(|| Error::Query("binary candidate buffer size overflow".to_string()))?;
     let mut raw = vec![0u8; raw_capacity];
     let mut scores = vec![0.0f32; batch_len];
+    let mut batch_scores = vec![0.0f32; batch_len];
+    let mut batch = Vec::with_capacity(batch_len);
+    let mut unresolved = Vec::with_capacity(batch_len);
+    let mut unresolved_flat_indexes = Vec::with_capacity(batch_len);
+    let mut read_runs = Vec::new();
+    let mut cursor = CandidateVectorCursor::new(&documents.ranges);
+    let mut collector = FlatDocumentCollector::new(limit, combiner);
+    let mut scored = 0usize;
 
-    for chunk in resolved.chunks(batch_len) {
-        let raw_len = chunk
+    while cursor.fill_batch(flat, &mut batch, batch_len)? {
+        unresolved.clear();
+        for (batch_index, &(doc_id, ordinal, flat_index)) in batch.iter().enumerate() {
+            if let Some(&score) = probe_scores.get(&(doc_id, ordinal)) {
+                batch_scores[batch_index] = score;
+            } else {
+                unresolved.push((batch_index, flat_index));
+            }
+        }
+        unresolved_flat_indexes.clear();
+        unresolved_flat_indexes.extend(unresolved.iter().map(|&(_, flat_index)| flat_index));
+        let raw_len = unresolved
             .len()
             .checked_mul(vector_byte_size)
             .ok_or_else(|| Error::Query("binary candidate buffer size overflow".to_string()))?;
         let raw = &mut raw[..raw_len];
-        for (buffer_index, &(_, flat_index)) in chunk.iter().enumerate() {
-            flat.read_vector_raw_into_sync(
-                flat_index,
-                &mut raw[buffer_index * vector_byte_size..(buffer_index + 1) * vector_byte_size],
-            )
-            .map_err(Error::Io)?;
-        }
+        read_vector_runs_sync(flat, &unresolved_flat_indexes, &mut read_runs, raw)?;
         crate::structures::simd::batch_hamming_scores(
             query,
             raw,
             vector_byte_size,
             dim_bits,
-            &mut scores[..chunk.len()],
+            &mut scores[..unresolved.len()],
         );
-        for (buffer_index, &(result_index, _)) in chunk.iter().enumerate() {
-            expanded[result_index].2 = scores[buffer_index];
+        for (buffer_index, &(batch_index, _)) in unresolved.iter().enumerate() {
+            batch_scores[batch_index] = scores[buffer_index];
         }
+        for (batch_index, &(doc_id, ordinal, _)) in batch.iter().enumerate() {
+            collector.push(doc_id, ordinal, batch_scores[batch_index]);
+        }
+        scored += batch.len();
     }
-    Ok(expanded)
+    debug_assert_eq!(scored, documents.vector_count);
+    Ok(collector.into_results())
 }
 
 fn validate_coarse_centroids(centroids: &CoarseCentroids, dim: usize) -> Result<()> {
@@ -642,6 +788,134 @@ fn validate_coarse_centroids(centroids: &CoarseCentroids, dim: usize) -> Result<
     Ok(())
 }
 
+fn validate_ivf_pq_ann(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    centroids: &CoarseCentroids,
+    codebook: &crate::structures::PQCodebook,
+    dim: usize,
+    routing: crate::dsl::IvfRoutingMode,
+) -> Result<()> {
+    let header = index.header();
+    if header.dim != dim
+        || codebook.config.dim != dim
+        || header.code_size != codebook.config.num_subspaces
+        || header.num_clusters != centroids.num_clusters
+        || header.quantizer_version != centroids.version
+        || header.codebook_version != codebook.version
+        || header.routing != routing
+    {
+        return Err(Error::Corruption(format!(
+            "IVF-PQ payload/codebook/centroid metadata does not match schema dimension {dim}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_binary_ann(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    quantizer: &crate::structures::BinaryCoarseQuantizer,
+    config: &crate::dsl::BinaryDenseVectorConfig,
+    dim: usize,
+    field: Field,
+) -> Result<()> {
+    let header = index.header();
+    if header.dim != dim
+        || header.code_size != config.byte_len()
+        || header.num_clusters != quantizer.num_clusters
+        || header.quantizer_version != quantizer.version
+        || header.codebook_version != 0
+        || header.routing != config.ivf_routing
+        || quantizer.dim_bits != dim
+    {
+        return Err(Error::Corruption(format!(
+            "binary IVF field {} does not match its quantizer/schema generation",
+            field.0,
+        )));
+    }
+    Ok(())
+}
+
+fn float_query_plan(
+    centroids: &CoarseCentroids,
+    codebook: &crate::structures::PQCodebook,
+    query: &[f32],
+    nprobe: usize,
+    routing: crate::dsl::IvfRoutingMode,
+    cache: Option<&std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>>,
+) -> Result<std::sync::Arc<crate::structures::IvfPqQueryPlan>> {
+    let effective_nprobe = nprobe.clamp(1, centroids.num_clusters as usize);
+    let request_fingerprint = crate::structures::vector::ivf::routing::float_probe_fingerprint(
+        query,
+        effective_nprobe,
+        routing,
+    );
+    if let Some(cache) = cache {
+        let mut cached = cache
+            .lock()
+            .map_err(|_| Error::Internal("dense IVF probe cache is poisoned".into()))?;
+        if let Some(plan) = cached.as_ref()
+            && plan.quantizer_version == centroids.version
+            && plan.codebook_version == codebook.version
+            && plan.request_fingerprint == request_fingerprint
+            && plan.cluster_ids.len() == effective_nprobe
+        {
+            return Ok(std::sync::Arc::clone(plan));
+        }
+        let plan = std::sync::Arc::new(crate::structures::IvfPqQueryPlan::build(
+            centroids,
+            codebook,
+            query,
+            effective_nprobe,
+            routing,
+        ));
+        *cached = Some(std::sync::Arc::clone(&plan));
+        return Ok(plan);
+    }
+    Ok(std::sync::Arc::new(
+        crate::structures::IvfPqQueryPlan::build(
+            centroids,
+            codebook,
+            query,
+            effective_nprobe,
+            routing,
+        ),
+    ))
+}
+
+fn binary_probe_clusters(
+    quantizer: &crate::structures::BinaryCoarseQuantizer,
+    query: &[u8],
+    nprobe: usize,
+    routing: crate::dsl::IvfRoutingMode,
+    cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
+) -> Result<std::sync::Arc<[u32]>> {
+    let effective_nprobe = nprobe.clamp(1, quantizer.num_clusters as usize);
+    let request_fingerprint = crate::structures::vector::ivf::routing::binary_probe_fingerprint(
+        query,
+        effective_nprobe,
+        routing,
+    );
+    if let Some(cache) = cache {
+        let mut cached = cache
+            .lock()
+            .map_err(|_| Error::Internal("binary IVF probe cache is poisoned".into()))?;
+        if let Some(plan) = cached.as_ref()
+            && plan.quantizer_version == quantizer.version
+            && plan.request_fingerprint == request_fingerprint
+            && plan.cluster_ids.len() == effective_nprobe
+        {
+            return Ok(std::sync::Arc::clone(&plan.cluster_ids));
+        }
+        let plan = quantizer.probe(query, effective_nprobe, routing);
+        let clusters = std::sync::Arc::clone(&plan.cluster_ids);
+        *cached = Some(plan);
+        return Ok(clusters);
+    }
+    Ok(quantizer
+        .probe(query, effective_nprobe, routing)
+        .cluster_ids)
+}
+
 /// Async segment reader with lazy loading
 ///
 /// - Term dictionary: only index loaded, blocks loaded on-demand
@@ -656,12 +930,12 @@ pub struct SegmentReader {
     /// Document store with lazy block loading
     store: Arc<AsyncStoreReader>,
     schema: Arc<Schema>,
-    /// Dense vector indexes per field (RaBitQ or IVF-RaBitQ) — for search
+    /// Per-segment ANN payloads.
     vector_indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — for reranking and merge (doc_ids in memory, vectors via mmap)
     flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
-    /// Per-field coarse centroids for IVF/ScaNN search
-    coarse_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+    /// One immutable generation of all index-global ANN artifacts.
+    trained_vectors: Arc<crate::segment::TrainedVectorStructures>,
     /// Sparse vector indexes per field (MaxScore format)
     sparse_indexes: FxHashMap<u32, SparseIndex>,
     /// BMP sparse vector indexes per field (BMP format)
@@ -791,7 +1065,7 @@ impl SegmentReader {
             schema,
             vector_indexes,
             flat_vectors,
-            coarse_centroids: FxHashMap::default(),
+            trained_vectors: Arc::new(crate::segment::TrainedVectorStructures::default()),
             sparse_indexes,
             bmp_indexes,
             positions_handle,
@@ -810,9 +1084,10 @@ impl SegmentReader {
     /// Pin per-query-mandatory metadata sections in priority order until the
     /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
     ///
-    /// Priority: BMP block-offset tables → sparse skip sections → doc-id maps
-    /// → BMP superblock grids. Bulk data (4-bit grid, block data, raw vectors)
-    /// is never pinned. Fail-loud: budget exhaustion and mlock failures are
+    /// Priority: ANN run directories → BMP block-offset tables → sparse skip
+    /// sections → doc-id maps → BMP superblock grids. Bulk data (ANN codes,
+    /// 4-bit grids, block data, raw vectors) is never pinned. Fail-loud: budget
+    /// exhaustion and mlock failures are
     /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
     /// pinned_metadata_bytes}`.
     #[cfg(feature = "native")]
@@ -825,22 +1100,26 @@ impl SegmentReader {
         let mut remaining = policy.budget_bytes;
         let mut report = PinReport::default();
 
-        // Priority 1: BMP block-offset tables
+        // Priority 1: compact ANN lookup directories
+        for index in self.vector_indexes.values_mut() {
+            index.pin_lookup_directory(policy.mode, &mut remaining, &mut report);
+        }
+        // Priority 2: BMP block-offset tables
         for bmp in self.bmp_indexes.values_mut() {
             bmp.pin_block_starts(policy.mode, &mut remaining, &mut report);
         }
-        // Priority 2: sparse skip sections
+        // Priority 3: sparse skip sections
         for sparse in self.sparse_indexes.values_mut() {
             sparse.pin_skip_section(policy.mode, &mut remaining, &mut report);
         }
-        // Priority 3: doc-id maps
+        // Priority 4: doc-id maps
         for flat in self.flat_vectors.values_mut() {
             flat.pin_doc_ids(policy.mode, &mut remaining, &mut report);
         }
         for bmp in self.bmp_indexes.values_mut() {
             bmp.pin_doc_maps(policy.mode, &mut remaining, &mut report);
         }
-        // Priority 4: BMP superblock grids
+        // Priority 5: BMP superblock grids
         for bmp in self.bmp_indexes.values_mut() {
             bmp.pin_sb_grid(policy.mode, &mut remaining, &mut report);
         }
@@ -957,8 +1236,8 @@ impl SegmentReader {
                 .map(|b| b.estimated_memory_bytes())
                 .sum::<usize>();
 
-        // Dense index: vectors are memory-mapped, but we track index structures
-        // RaBitQ/IVF indexes have cluster assignments in memory
+        // Dense corpus columns are memory-mapped; only compact ANN run
+        // directories and other lookup structures count as heap memory here.
         let dense_index_bytes: usize = self
             .vector_indexes
             .values()
@@ -1487,7 +1766,7 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Search dense vectors using RaBitQ
+    /// Search dense vectors through the production IVF-PQ index.
     ///
     /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
     /// Doc IDs are segment-local.
@@ -1501,6 +1780,46 @@ impl SegmentReader {
         rerank_factor: f32,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
+        self.search_dense_vector_impl(field, query, k, nprobe, rerank_factor, combiner, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn search_dense_vector_with_probe_cache(
+        &self,
+        field: Field,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_factor: f32,
+        combiner: crate::query::MultiValueCombiner,
+        probe_cache: &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.search_dense_vector_impl(
+            field,
+            query,
+            k,
+            nprobe,
+            rerank_factor,
+            combiner,
+            Some(probe_cache),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_dense_vector_impl(
+        &self,
+        field: Field,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_factor: f32,
+        combiner: crate::query::MultiValueCombiner,
+        probe_cache: Option<
+            &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+        >,
+    ) -> Result<Vec<VectorSearchResult>> {
         let params =
             self.validate_dense_search_request(field, query, nprobe, rerank_factor, combiner)?;
         let fetch_k = checked_dense_fetch_k(k, rerank_factor)?;
@@ -1510,10 +1829,6 @@ impl SegmentReader {
 
         let ann_index = self.vector_indexes.get(&field.0);
         let lazy_flat = self.flat_vectors.get(&field.0);
-        let ann_fetch_k = lazy_flat.map_or(fetch_k, |flat| {
-            ann_ordinal_fetch_k(fetch_k, flat.num_vectors, flat.num_docs_with_vectors())
-        });
-
         // No vectors at all for this field
         if ann_index.is_none() && lazy_flat.is_none() {
             return Ok(Vec::new());
@@ -1538,130 +1853,63 @@ impl SegmentReader {
         // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
         let t0 = std::time::Instant::now();
         let mut flat_results = None;
-        let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
-            // ANN search (RaBitQ, IVF, ScaNN)
+        let results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
+            // ANN search through the segment's IVF-PQ payload.
             match index {
-                VectorIndex::RaBitQ(lazy) => {
-                    let rabitq = lazy.get().ok_or_else(|| {
-                        Error::Schema("RaBitQ index deserialization failed".to_string())
-                    })?;
-                    if rabitq.codebook.config.dim != params.dim {
-                        return Err(Error::Corruption(format!(
-                            "RaBitQ index dimension {} does not match schema dimension {}",
-                            rabitq.codebook.config.dim, params.dim
-                        )));
-                    }
-                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    progressive_ann_search(
-                        fetch_k.min(flat.num_docs_with_vectors()),
-                        ann_fetch_k,
-                        rabitq.len().min(flat.num_vectors),
-                        |candidate_k| {
-                            rabitq
-                                .search(query, candidate_k)
-                                .into_iter()
-                                .map(|(doc_id, ordinal, dist)| {
-                                    (doc_id, ordinal, 1.0 / (1.0 + dist))
-                                })
-                                .collect()
-                        },
-                    )?
-                }
-                VectorIndex::IVF(lazy) => {
-                    let (index, codebook) = lazy.get().ok_or_else(|| {
-                        Error::Schema("IVF index deserialization failed".to_string())
-                    })?;
-                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
-                        Error::Schema(format!(
-                            "IVF index requires coarse centroids for field {}",
-                            field.0
-                        ))
-                    })?;
+                VectorIndex::IvfPq(lazy) => {
+                    let index = lazy.get();
+                    let codebook =
+                        self.trained_vectors
+                            .codebooks
+                            .get(&field.0)
+                            .ok_or_else(|| {
+                                Error::Schema(format!(
+                                    "IVF-PQ index requires a global codebook for field {}",
+                                    field.0
+                                ))
+                            })?;
+                    let centroids =
+                        self.trained_vectors
+                            .centroids
+                            .get(&field.0)
+                            .ok_or_else(|| {
+                                Error::Schema(format!(
+                                    "IVF-PQ index requires coarse centroids for field {}",
+                                    field.0
+                                ))
+                            })?;
                     validate_coarse_centroids(centroids, params.dim)?;
-                    if index.config.dim != params.dim
-                        || codebook.config.dim != params.dim
-                        || index.centroids_version != centroids.version
-                        || index.codebook_version != codebook.version
-                        || index
-                            .clusters
-                            .iter()
-                            .any(|(cluster_id, _)| cluster_id >= centroids.num_clusters)
-                    {
-                        return Err(Error::Corruption(format!(
-                            "IVF index/codebook/centroid metadata does not match schema dimension {}",
-                            params.dim
-                        )));
-                    }
-                    let effective_nprobe = params.nprobe.min(centroids.num_clusters as usize);
+                    let routing = self
+                        .schema
+                        .get_field_entry(field)
+                        .and_then(|entry| entry.dense_vector_config.as_ref())
+                        .map_or(crate::dsl::IvfRoutingMode::Auto, |config| {
+                            config.ivf_routing
+                        });
+                    validate_ivf_pq_ann(index, centroids, codebook, params.dim, routing)?;
+                    let query_plan = float_query_plan(
+                        centroids,
+                        codebook,
+                        query,
+                        params.nprobe,
+                        routing,
+                        probe_cache,
+                    )?;
                     let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    progressive_ann_search(
-                        fetch_k.min(flat.num_docs_with_vectors()),
-                        ann_fetch_k,
-                        index.len().min(flat.num_vectors),
-                        |candidate_k| {
-                            index
-                                .search(
-                                    centroids,
-                                    codebook,
-                                    query,
-                                    candidate_k,
-                                    Some(effective_nprobe),
-                                )
-                                .into_iter()
-                                .map(|(doc_id, ordinal, dist)| {
-                                    (doc_id, ordinal, 1.0 / (1.0 + dist))
-                                })
-                                .collect()
-                        },
-                    )?
-                }
-                VectorIndex::ScaNN(lazy) => {
-                    let (index, codebook) = lazy.get().ok_or_else(|| {
-                        Error::Schema("ScaNN index deserialization failed".to_string())
-                    })?;
-                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
-                        Error::Schema(format!(
-                            "ScaNN index requires coarse centroids for field {}",
-                            field.0
-                        ))
-                    })?;
-                    validate_coarse_centroids(centroids, params.dim)?;
-                    if index.config.dim != params.dim
-                        || codebook.config.dim != params.dim
-                        || index.centroids_version != centroids.version
-                        || index.codebook_version != codebook.version
-                        || index
-                            .clusters
-                            .iter()
-                            .any(|(cluster_id, _)| cluster_id >= centroids.num_clusters)
-                    {
-                        return Err(Error::Corruption(format!(
-                            "ScaNN index/codebook/centroid metadata does not match schema dimension {}",
-                            params.dim
-                        )));
-                    }
-                    let effective_nprobe = params.nprobe.min(centroids.num_clusters as usize);
-                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    progressive_ann_search(
-                        fetch_k.min(flat.num_docs_with_vectors()),
-                        ann_fetch_k,
-                        index.len().min(flat.num_vectors),
-                        |candidate_k| {
-                            index
-                                .search(
-                                    centroids,
-                                    codebook,
-                                    query,
-                                    candidate_k,
-                                    Some(effective_nprobe),
-                                )
-                                .into_iter()
-                                .map(|(doc_id, ordinal, dist)| {
-                                    (doc_id, ordinal, 1.0 / (1.0 + dist))
-                                })
-                                .collect()
-                        },
-                    )?
+                    index
+                        .search_ivf_pq_distinct(
+                            fetch_k.min(flat.num_docs_with_vectors()),
+                            &query_plan,
+                        )
+                        .map_err(|error| {
+                            Error::Corruption(format!(
+                                "invalid IVF-PQ payload for field {}: {error}",
+                                field.0,
+                            ))
+                        })?
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
                 }
                 VectorIndex::BinaryIvf(_) => {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
@@ -1718,9 +1966,7 @@ impl SegmentReader {
         let l1_elapsed = t0.elapsed();
         {
             let kind = match ann_index {
-                Some(VectorIndex::RaBitQ(_)) => "rabitq",
-                Some(VectorIndex::IVF(_)) => "ivf_rabitq",
-                Some(VectorIndex::ScaNN(_)) => "scann",
+                Some(VectorIndex::IvfPq(_)) => "ivf_pq",
                 Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
                 None => "flat",
             };
@@ -1750,123 +1996,59 @@ impl SegmentReader {
             && let Some(lazy_flat) = lazy_flat
         {
             let t_rerank = std::time::Instant::now();
-            let dim = lazy_flat.dim;
-            let quant = lazy_flat.quantization;
             let vbs = lazy_flat.vector_byte_size();
+            let (reranked, stats) = exact_score_dense_candidate_documents(
+                &results,
+                lazy_flat,
+                query,
+                params.unit_norm,
+                combiner,
+                k,
+            )
+            .await?;
 
-            // Deduplicate ANN hits by document, then exact-score every value
-            // of each candidate document so the configured combiner sees a
-            // complete value set.
-            let (expanded, mut resolved) = expand_ann_candidate_documents(&results, lazy_flat)?;
-            results = expanded;
-
-            let t_resolve = t_rerank.elapsed();
-            if !resolved.is_empty() {
-                // Sort by flat_idx for sequential mmap access (better page locality)
-                resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
-
-                // Read and score bounded chunks. A legal high-recall request
-                // can resolve hundreds of thousands of candidates; allocating
-                // all raw vectors at once used to require gigabytes per segment.
-                let batch_len = bounded_vector_score_batch(vbs, DENSE_SCORE_BATCH);
-                let max_batch = batch_len.min(resolved.len());
-                let max_raw_len = max_batch
-                    .checked_mul(vbs)
-                    .ok_or_else(|| Error::Query("dense rerank buffer size overflow".into()))?;
-                let mut raw_buf = vec![0u8; max_raw_len];
-                let mut scores = vec![0f32; max_batch];
-                let mut read_elapsed = std::time::Duration::ZERO;
-                let mut score_elapsed = std::time::Duration::ZERO;
-
-                for chunk in resolved.chunks(batch_len) {
-                    // Advise only the bounded chunk about to be consumed. A
-                    // whole-candidate MADV_WILLNEED can evict the rest of the
-                    // working set long before those pages are read.
-                    #[cfg(feature = "native")]
-                    lazy_flat.prefetch_vectors(chunk.iter().map(|&(_, flat_idx)| flat_idx));
-                    let raw_len = chunk
-                        .len()
-                        .checked_mul(vbs)
-                        .ok_or_else(|| Error::Query("dense rerank buffer size overflow".into()))?;
-                    let raw = &mut raw_buf[..raw_len];
-
-                    let t_read = std::time::Instant::now();
-                    for (buf_idx, &(_, flat_idx)) in chunk.iter().enumerate() {
-                        lazy_flat
-                            .read_vector_raw_into(
-                                flat_idx,
-                                &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
-                            )
-                            .await
-                            .map_err(crate::Error::Io)?;
-                    }
-                    read_elapsed += t_read.elapsed();
-
-                    let t_score = std::time::Instant::now();
-                    Self::score_quantized_batch(
-                        query,
-                        raw,
-                        quant,
-                        dim,
-                        &mut scores[..chunk.len()],
-                        params.unit_norm,
-                    )?;
-                    score_elapsed += t_score.elapsed();
-
-                    for (buf_idx, &(ri, _)) in chunk.iter().enumerate() {
-                        results[ri].2 = scores[buf_idx];
-                    }
-                }
-
-                crate::observe::dense_rerank(
-                    self.schema.index_label(),
-                    self.schema.get_field_name(field).unwrap_or("?"),
-                    t_rerank.elapsed().as_secs_f64(),
-                    t_resolve.as_secs_f64(),
-                    read_elapsed.as_secs_f64(),
-                    resolved.len(),
-                );
-                log::debug!(
-                    "[search_dense] field {}: rerank {} vectors (dim={}, quant={:?}, {}B/vec): resolve={:.1}ms read={:.1}ms score={:.1}ms",
-                    field.0,
-                    resolved.len(),
-                    dim,
-                    quant,
-                    vbs,
-                    t_resolve.as_secs_f64() * 1000.0,
-                    read_elapsed.as_secs_f64() * 1000.0,
-                    score_elapsed.as_secs_f64() * 1000.0,
-                );
-            }
+            crate::observe::dense_rerank(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                t_rerank.elapsed().as_secs_f64(),
+                stats.resolve_elapsed.as_secs_f64(),
+                stats.read_elapsed.as_secs_f64(),
+                stats.vector_count,
+            );
+            log::debug!(
+                "[search_dense] field {}: rerank {} vectors (dim={}, quant={:?}, {}B/vec): resolve={:.1}ms read={:.1}ms score={:.1}ms",
+                field.0,
+                stats.vector_count,
+                lazy_flat.dim,
+                lazy_flat.quantization,
+                vbs,
+                stats.resolve_elapsed.as_secs_f64() * 1000.0,
+                stats.read_elapsed.as_secs_f64() * 1000.0,
+                stats.score_elapsed.as_secs_f64() * 1000.0,
+            );
 
             log::debug!(
                 "[search_dense] field {}: rerank total={:.1}ms",
                 field.0,
                 t_rerank.elapsed().as_secs_f64() * 1000.0
             );
+            return Ok(reranked);
         }
 
         Ok(combine_grouped_ordinal_results(results, combiner, k))
     }
 
-    /// Query-time nprobe for a binary field from its schema config (None = index default).
-    fn binary_ivf_nprobe(&self, field: Field) -> Option<usize> {
-        self.schema
-            .get_field_entry(field)
-            .and_then(|e| e.binary_dense_vector_config.as_ref())
-            .map(|c| c.nprobe)
-            .filter(|&n| n > 0)
-    }
-
-    /// Search binary dense vectors using brute-force Hamming distance.
+    /// Search binary dense vectors using IVF when available, otherwise
+    /// brute-force Hamming distance.
     ///
-    /// Always flat brute-force (no ANN). Returns VectorSearchResult with ordinal tracking.
-    pub async fn search_binary_dense_vector(
+    /// Returns VectorSearchResult with ordinal tracking.
+    async fn search_binary_dense_vector_impl(
         &self,
         field: Field,
         query: &[u8],
         k: usize,
         combiner: crate::query::MultiValueCombiner,
+        probe_cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
     ) -> Result<Vec<VectorSearchResult>> {
         let schema_dim = self.validate_binary_search_request(field, query)?;
         combiner.validate().map_err(Error::Query)?;
@@ -1874,57 +2056,73 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
         let t0 = crate::observe::Timer::start();
-        // Binary IVF finds candidate documents. Expand each candidate to all
-        // of its stored values and exact-score them before applying the
-        // document combiner.
-        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
-            && let Some(ivf) = lazy.get()
-        {
-            if ivf.config.dim_bits != schema_dim {
-                return Err(Error::Corruption(format!(
-                    "binary IVF field {} has schema dimension {} but index dimension {}",
-                    field.0, schema_dim, ivf.config.dim_bits
-                )));
-            }
+        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0) {
+            let ivf = lazy.get();
+            let config = self
+                .schema
+                .get_field_entry(field)
+                .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "binary IVF field {} has no schema configuration",
+                        field.0
+                    ))
+                })?;
+            let quantizer = self
+                .trained_vectors
+                .binary_quantizers
+                .get(&field.0)
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "global binary IVF field {} has no loaded quantizer",
+                        field.0
+                    ))
+                })?;
+            validate_binary_ann(ivf, quantizer, config, schema_dim, field)?;
             let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
                 Error::Corruption(format!(
-                    "binary IVF field {} is missing flat vector storage",
+                    "global binary IVF field {} is missing flat vector storage",
                     field.0
                 ))
             })?;
-            if flat.dim != schema_dim
-                || flat.quantization != crate::dsl::DenseVectorQuantization::Binary
-            {
-                return Err(Error::Corruption(format!(
-                    "binary IVF field {} has inconsistent flat vector metadata",
-                    field.0
-                )));
-            }
-            let nprobe = self.binary_ivf_nprobe(field);
-            let initial_fetch =
-                ann_ordinal_fetch_k(k, flat.num_vectors, flat.num_docs_with_vectors());
-            // Single scan: BinaryIvfIndex::search scans all probed clusters
-            // regardless of candidate_k, so progressive doubling would repeat
-            // the identical scan on every retry.
-            let ann_results = single_scan_ann_search(
-                k.min(flat.num_docs_with_vectors()),
-                initial_fetch,
-                ivf.len().min(flat.num_vectors),
-                |candidate_k| ivf.search(query, candidate_k, nprobe),
+            let clusters = binary_probe_clusters(
+                quantizer,
+                query,
+                config.nprobe,
+                config.ivf_routing,
+                probe_cache,
             )?;
-            let results =
-                exact_score_binary_candidate_documents(&ann_results, flat, query, schema_dim)
-                    .await?;
+            let single_valued = flat.num_vectors == flat.num_docs_with_vectors();
+            let candidate_docs = k.min(flat.num_docs_with_vectors());
+            let ann_results = if single_valued {
+                ivf.search_binary_clusters::<false>(query, candidate_docs, &clusters)
+            } else {
+                ivf.search_binary_clusters::<true>(query, candidate_docs, &clusters)
+            }
+            .map_err(|error| {
+                Error::Corruption(format!(
+                    "invalid binary IVF payload for field {}: {error}",
+                    field.0,
+                ))
+            })?;
+            let results = exact_score_binary_candidate_documents(
+                &ann_results,
+                flat,
+                query,
+                schema_dim,
+                combiner,
+                k,
+            )
+            .await?;
             crate::observe::dense_l1(
                 self.schema.index_label(),
                 self.schema.get_field_name(field).unwrap_or("?"),
-                "binary_ivf",
+                "global_binary_ivf",
                 t0.secs(),
                 results.len(),
             );
-            return Ok(combine_grouped_ordinal_results(results, combiner, k));
+            return Ok(results);
         }
-
         let lazy_flat = match self.flat_vectors.get(&field.0) {
             Some(f) => f,
             None => return Ok(Vec::new()),
@@ -1987,49 +2185,39 @@ impl SegmentReader {
         Ok(results)
     }
 
-    /// Check if this segment has dense vectors for the given field
-    pub fn has_dense_vector_index(&self, field: Field) -> bool {
-        self.vector_indexes.contains_key(&field.0) || self.flat_vectors.contains_key(&field.0)
-    }
-
-    /// Get the dense vector index for a field (if available)
-    pub fn get_dense_vector_index(&self, field: Field) -> Option<Arc<RaBitQIndex>> {
-        match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::RaBitQ(lazy)) => lazy.get().cloned(),
-            _ => None,
-        }
-    }
-
-    /// Get the IVF vector index for a field (if available)
-    pub fn get_ivf_vector_index(
+    pub async fn search_binary_dense_vector(
         &self,
         field: Field,
-    ) -> Option<(Arc<IVFRaBitQIndex>, Arc<crate::structures::RaBitQCodebook>)> {
-        match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::IVF(lazy)) => lazy.get().map(|(i, c)| (i.clone(), c.clone())),
-            _ => None,
-        }
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.search_binary_dense_vector_impl(field, query, k, combiner, None)
+            .await
     }
 
-    /// Get coarse centroids for a field
+    pub(crate) async fn search_binary_dense_vector_with_probe_cache(
+        &self,
+        field: Field,
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+        probe_cache: &std::sync::Mutex<Option<crate::structures::IvfProbePlan>>,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.search_binary_dense_vector_impl(field, query, k, combiner, Some(probe_cache))
+            .await
+    }
+
+    /// Get coarse centroids for a field.
     pub fn coarse_centroids(&self, field_id: u32) -> Option<&Arc<CoarseCentroids>> {
-        self.coarse_centroids.get(&field_id)
+        self.trained_vectors.centroids.get(&field_id)
     }
 
-    /// Set per-field coarse centroids from index-level trained structures
-    pub fn set_coarse_centroids(&mut self, centroids: FxHashMap<u32, Arc<CoarseCentroids>>) {
-        self.coarse_centroids = centroids;
-    }
-
-    /// Get the ScaNN vector index for a field (if available)
-    pub fn get_scann_vector_index(
-        &self,
-        field: Field,
-    ) -> Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)> {
-        match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::ScaNN(lazy)) => lazy.get().map(|(i, c)| (i.clone(), c.clone())),
-            _ => None,
-        }
+    pub fn set_trained_vectors(
+        &mut self,
+        trained_vectors: Arc<crate::segment::TrainedVectorStructures>,
+    ) {
+        self.trained_vectors = trained_vectors;
     }
 
     /// Get the vector index type for a field
@@ -2236,6 +2424,46 @@ impl SegmentReader {
         rerank_factor: f32,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
+        self.search_dense_vector_sync_impl(field, query, k, nprobe, rerank_factor, combiner, None)
+    }
+
+    #[cfg(feature = "sync")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_dense_vector_sync_with_probe_cache(
+        &self,
+        field: Field,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_factor: f32,
+        combiner: crate::query::MultiValueCombiner,
+        probe_cache: &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.search_dense_vector_sync_impl(
+            field,
+            query,
+            k,
+            nprobe,
+            rerank_factor,
+            combiner,
+            Some(probe_cache),
+        )
+    }
+
+    #[cfg(feature = "sync")]
+    #[allow(clippy::too_many_arguments)]
+    fn search_dense_vector_sync_impl(
+        &self,
+        field: Field,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_factor: f32,
+        combiner: crate::query::MultiValueCombiner,
+        probe_cache: Option<
+            &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+        >,
+    ) -> Result<Vec<VectorSearchResult>> {
         let params =
             self.validate_dense_search_request(field, query, nprobe, rerank_factor, combiner)?;
         let fetch_k = checked_dense_fetch_k(k, rerank_factor)?;
@@ -2245,10 +2473,6 @@ impl SegmentReader {
 
         let ann_index = self.vector_indexes.get(&field.0);
         let lazy_flat = self.flat_vectors.get(&field.0);
-        let ann_fetch_k = lazy_flat.map_or(fetch_k, |flat| {
-            ann_ordinal_fetch_k(fetch_k, flat.num_vectors, flat.num_docs_with_vectors())
-        });
-
         if ann_index.is_none() && lazy_flat.is_none() {
             return Ok(Vec::new());
         }
@@ -2269,130 +2493,63 @@ impl SegmentReader {
             )));
         }
 
-        let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
+        let results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
             // ANN search (already sync)
             match index {
-                VectorIndex::RaBitQ(lazy) => {
-                    let rabitq = lazy.get().ok_or_else(|| {
-                        Error::Schema("RaBitQ index deserialization failed".to_string())
-                    })?;
-                    if rabitq.codebook.config.dim != params.dim {
-                        return Err(Error::Corruption(format!(
-                            "RaBitQ index dimension {} does not match schema dimension {}",
-                            rabitq.codebook.config.dim, params.dim
-                        )));
-                    }
-                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    progressive_ann_search(
-                        fetch_k.min(flat.num_docs_with_vectors()),
-                        ann_fetch_k,
-                        rabitq.len().min(flat.num_vectors),
-                        |candidate_k| {
-                            rabitq
-                                .search(query, candidate_k)
-                                .into_iter()
-                                .map(|(doc_id, ordinal, dist)| {
-                                    (doc_id, ordinal, 1.0 / (1.0 + dist))
-                                })
-                                .collect()
-                        },
-                    )?
-                }
-                VectorIndex::IVF(lazy) => {
-                    let (index, codebook) = lazy.get().ok_or_else(|| {
-                        Error::Schema("IVF index deserialization failed".to_string())
-                    })?;
-                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
-                        Error::Schema(format!(
-                            "IVF index requires coarse centroids for field {}",
-                            field.0
-                        ))
-                    })?;
+                VectorIndex::IvfPq(lazy) => {
+                    let index = lazy.get();
+                    let codebook =
+                        self.trained_vectors
+                            .codebooks
+                            .get(&field.0)
+                            .ok_or_else(|| {
+                                Error::Schema(format!(
+                                    "IVF-PQ index requires a global codebook for field {}",
+                                    field.0
+                                ))
+                            })?;
+                    let centroids =
+                        self.trained_vectors
+                            .centroids
+                            .get(&field.0)
+                            .ok_or_else(|| {
+                                Error::Schema(format!(
+                                    "IVF-PQ index requires coarse centroids for field {}",
+                                    field.0
+                                ))
+                            })?;
                     validate_coarse_centroids(centroids, params.dim)?;
-                    if index.config.dim != params.dim
-                        || codebook.config.dim != params.dim
-                        || index.centroids_version != centroids.version
-                        || index.codebook_version != codebook.version
-                        || index
-                            .clusters
-                            .iter()
-                            .any(|(cluster_id, _)| cluster_id >= centroids.num_clusters)
-                    {
-                        return Err(Error::Corruption(format!(
-                            "IVF index/codebook/centroid metadata does not match schema dimension {}",
-                            params.dim
-                        )));
-                    }
-                    let effective_nprobe = params.nprobe.min(centroids.num_clusters as usize);
+                    let routing = self
+                        .schema
+                        .get_field_entry(field)
+                        .and_then(|entry| entry.dense_vector_config.as_ref())
+                        .map_or(crate::dsl::IvfRoutingMode::Auto, |config| {
+                            config.ivf_routing
+                        });
+                    validate_ivf_pq_ann(index, centroids, codebook, params.dim, routing)?;
+                    let query_plan = float_query_plan(
+                        centroids,
+                        codebook,
+                        query,
+                        params.nprobe,
+                        routing,
+                        probe_cache,
+                    )?;
                     let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    progressive_ann_search(
-                        fetch_k.min(flat.num_docs_with_vectors()),
-                        ann_fetch_k,
-                        index.len().min(flat.num_vectors),
-                        |candidate_k| {
-                            index
-                                .search(
-                                    centroids,
-                                    codebook,
-                                    query,
-                                    candidate_k,
-                                    Some(effective_nprobe),
-                                )
-                                .into_iter()
-                                .map(|(doc_id, ordinal, dist)| {
-                                    (doc_id, ordinal, 1.0 / (1.0 + dist))
-                                })
-                                .collect()
-                        },
-                    )?
-                }
-                VectorIndex::ScaNN(lazy) => {
-                    let (index, codebook) = lazy.get().ok_or_else(|| {
-                        Error::Schema("ScaNN index deserialization failed".to_string())
-                    })?;
-                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
-                        Error::Schema(format!(
-                            "ScaNN index requires coarse centroids for field {}",
-                            field.0
-                        ))
-                    })?;
-                    validate_coarse_centroids(centroids, params.dim)?;
-                    if index.config.dim != params.dim
-                        || codebook.config.dim != params.dim
-                        || index.centroids_version != centroids.version
-                        || index.codebook_version != codebook.version
-                        || index
-                            .clusters
-                            .iter()
-                            .any(|(cluster_id, _)| cluster_id >= centroids.num_clusters)
-                    {
-                        return Err(Error::Corruption(format!(
-                            "ScaNN index/codebook/centroid metadata does not match schema dimension {}",
-                            params.dim
-                        )));
-                    }
-                    let effective_nprobe = params.nprobe.min(centroids.num_clusters as usize);
-                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    progressive_ann_search(
-                        fetch_k.min(flat.num_docs_with_vectors()),
-                        ann_fetch_k,
-                        index.len().min(flat.num_vectors),
-                        |candidate_k| {
-                            index
-                                .search(
-                                    centroids,
-                                    codebook,
-                                    query,
-                                    candidate_k,
-                                    Some(effective_nprobe),
-                                )
-                                .into_iter()
-                                .map(|(doc_id, ordinal, dist)| {
-                                    (doc_id, ordinal, 1.0 / (1.0 + dist))
-                                })
-                                .collect()
-                        },
-                    )?
+                    index
+                        .search_ivf_pq_distinct(
+                            fetch_k.min(flat.num_docs_with_vectors()),
+                            &query_plan,
+                        )
+                        .map_err(|error| {
+                            Error::Corruption(format!(
+                                "invalid IVF-PQ payload for field {}: {error}",
+                                field.0,
+                            ))
+                        })?
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
                 }
                 VectorIndex::BinaryIvf(_) => {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
@@ -2441,52 +2598,14 @@ impl SegmentReader {
             && !results.is_empty()
             && let Some(lazy_flat) = lazy_flat
         {
-            let dim = lazy_flat.dim;
-            let quant = lazy_flat.quantization;
-            let vbs = lazy_flat.vector_byte_size();
-
-            let (expanded, mut resolved) = expand_ann_candidate_documents(&results, lazy_flat)?;
-            results = expanded;
-
-            if !resolved.is_empty() {
-                resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
-                let batch_len = bounded_vector_score_batch(vbs, DENSE_SCORE_BATCH);
-                let max_batch = batch_len.min(resolved.len());
-                let max_raw_len = max_batch
-                    .checked_mul(vbs)
-                    .ok_or_else(|| Error::Query("dense rerank buffer size overflow".into()))?;
-                let mut raw_buf = vec![0u8; max_raw_len];
-                let mut scores = vec![0f32; max_batch];
-
-                for chunk in resolved.chunks(batch_len) {
-                    let raw_len = chunk
-                        .len()
-                        .checked_mul(vbs)
-                        .ok_or_else(|| Error::Query("dense rerank buffer size overflow".into()))?;
-                    let raw = &mut raw_buf[..raw_len];
-                    for (buf_idx, &(_, flat_idx)) in chunk.iter().enumerate() {
-                        lazy_flat
-                            .read_vector_raw_into_sync(
-                                flat_idx,
-                                &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
-                            )
-                            .map_err(crate::Error::Io)?;
-                    }
-
-                    Self::score_quantized_batch(
-                        query,
-                        raw,
-                        quant,
-                        dim,
-                        &mut scores[..chunk.len()],
-                        params.unit_norm,
-                    )?;
-
-                    for (buf_idx, &(ri, _)) in chunk.iter().enumerate() {
-                        results[ri].2 = scores[buf_idx];
-                    }
-                }
-            }
+            return exact_score_dense_candidate_documents_sync(
+                &results,
+                lazy_flat,
+                query,
+                params.unit_norm,
+                combiner,
+                k,
+            );
         }
 
         Ok(combine_grouped_ordinal_results(results, combiner, k))
@@ -2497,12 +2616,13 @@ impl SegmentReader {
     /// Mirrors [`Self::search_binary_dense_vector`] for the rayon-parallel
     /// sync scorer path used by multi-threaded runtimes.
     #[cfg(feature = "sync")]
-    pub fn search_binary_dense_vector_sync(
+    fn search_binary_dense_vector_sync_impl(
         &self,
         field: Field,
         query: &[u8],
         k: usize,
         combiner: crate::query::MultiValueCombiner,
+        probe_cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
     ) -> Result<Vec<VectorSearchResult>> {
         let schema_dim = self.validate_binary_search_request(field, query)?;
         combiner.validate().map_err(Error::Query)?;
@@ -2510,54 +2630,71 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
         let t0 = crate::observe::Timer::start();
-        // Binary IVF candidate union followed by complete document scoring.
-        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0)
-            && let Some(ivf) = lazy.get()
-        {
-            if ivf.config.dim_bits != schema_dim {
-                return Err(Error::Corruption(format!(
-                    "binary IVF field {} has schema dimension {} but index dimension {}",
-                    field.0, schema_dim, ivf.config.dim_bits
-                )));
-            }
+        if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0) {
+            let ivf = lazy.get();
+            let config = self
+                .schema
+                .get_field_entry(field)
+                .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "binary IVF field {} has no schema configuration",
+                        field.0
+                    ))
+                })?;
+            let quantizer = self
+                .trained_vectors
+                .binary_quantizers
+                .get(&field.0)
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "global binary IVF field {} has no loaded quantizer",
+                        field.0
+                    ))
+                })?;
+            validate_binary_ann(ivf, quantizer, config, schema_dim, field)?;
             let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
                 Error::Corruption(format!(
-                    "binary IVF field {} is missing flat vector storage",
+                    "global binary IVF field {} is missing flat vector storage",
                     field.0
                 ))
             })?;
-            if flat.dim != schema_dim
-                || flat.quantization != crate::dsl::DenseVectorQuantization::Binary
-            {
-                return Err(Error::Corruption(format!(
-                    "binary IVF field {} has inconsistent flat vector metadata",
-                    field.0
-                )));
-            }
-            let nprobe = self.binary_ivf_nprobe(field);
-            let initial_fetch =
-                ann_ordinal_fetch_k(k, flat.num_vectors, flat.num_docs_with_vectors());
-            // Single scan: BinaryIvfIndex::search scans all probed clusters
-            // regardless of candidate_k, so progressive doubling would repeat
-            // the identical scan on every retry.
-            let ann_results = single_scan_ann_search(
-                k.min(flat.num_docs_with_vectors()),
-                initial_fetch,
-                ivf.len().min(flat.num_vectors),
-                |candidate_k| ivf.search(query, candidate_k, nprobe),
+            let clusters = binary_probe_clusters(
+                quantizer,
+                query,
+                config.nprobe,
+                config.ivf_routing,
+                probe_cache,
             )?;
-            let results =
-                exact_score_binary_candidate_documents_sync(&ann_results, flat, query, schema_dim)?;
+            let candidate_docs = k.min(flat.num_docs_with_vectors());
+            let ann_results = if flat.num_vectors == flat.num_docs_with_vectors() {
+                ivf.search_binary_clusters::<false>(query, candidate_docs, &clusters)
+            } else {
+                ivf.search_binary_clusters::<true>(query, candidate_docs, &clusters)
+            }
+            .map_err(|error| {
+                Error::Corruption(format!(
+                    "invalid binary IVF payload for field {}: {error}",
+                    field.0,
+                ))
+            })?;
+            let results = exact_score_binary_candidate_documents_sync(
+                &ann_results,
+                flat,
+                query,
+                schema_dim,
+                combiner,
+                k,
+            )?;
             crate::observe::dense_l1(
                 self.schema.index_label(),
                 self.schema.get_field_name(field).unwrap_or("?"),
-                "binary_ivf",
+                "global_binary_ivf",
                 t0.secs(),
                 results.len(),
             );
-            return Ok(combine_grouped_ordinal_results(results, combiner, k));
+            return Ok(results);
         }
-
         let lazy_flat = match self.flat_vectors.get(&field.0) {
             Some(f) => f,
             None => return Ok(Vec::new()),
@@ -2617,6 +2754,29 @@ impl SegmentReader {
             results.len(),
         );
         Ok(results)
+    }
+
+    #[cfg(feature = "sync")]
+    pub fn search_binary_dense_vector_sync(
+        &self,
+        field: Field,
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.search_binary_dense_vector_sync_impl(field, query, k, combiner, None)
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn search_binary_dense_vector_sync_with_probe_cache(
+        &self,
+        field: Field,
+        query: &[u8],
+        k: usize,
+        combiner: crate::query::MultiValueCombiner,
+        probe_cache: &std::sync::Mutex<Option<crate::structures::IvfProbePlan>>,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.search_binary_dense_vector_sync_impl(field, query, k, combiner, Some(probe_cache))
     }
 }
 
@@ -2684,56 +2844,9 @@ mod dense_search_safety_tests {
     #[test]
     fn dense_fetch_count_rounds_up_and_detects_overflow() {
         assert_eq!(checked_dense_fetch_k(3, 1.5).unwrap(), 5);
-        assert_eq!(checked_dense_fetch_k(50_000, 3.0).unwrap(), 150_000);
-        assert!(checked_dense_fetch_k(50_000, 32.0).is_err());
+        assert_eq!(checked_dense_fetch_k(5_000, 3.0).unwrap(), 15_000);
+        assert!(checked_dense_fetch_k(50_000, 3.0).is_err());
         assert!(checked_dense_fetch_k(usize::MAX, 2.0).is_err());
-    }
-
-    #[test]
-    fn ann_fetch_depth_accounts_for_multivalue_density_and_stays_bounded() {
-        assert_eq!(ann_ordinal_fetch_k(100, 1_000, 100), 1_000);
-        assert_eq!(
-            ann_ordinal_fetch_k(100_000, usize::MAX, 1),
-            MAX_DENSE_CANDIDATES_PER_SEGMENT
-        );
-        assert_eq!(ann_ordinal_fetch_k(100, 0, 10), 0);
-    }
-
-    #[test]
-    fn ann_search_deepens_until_skewed_results_contain_enough_documents() {
-        let ranked = [
-            (1, 0, 1.0),
-            (1, 1, 0.99),
-            (1, 2, 0.98),
-            (1, 3, 0.97),
-            (1, 4, 0.96),
-            (1, 5, 0.95),
-            (2, 0, 0.9),
-            (3, 0, 0.8),
-        ];
-        let mut fetches = Vec::new();
-        let results = progressive_ann_search(2, 2, ranked.len(), |fetch| {
-            fetches.push(fetch);
-            ranked.iter().copied().take(fetch).collect()
-        })
-        .unwrap();
-
-        assert_eq!(fetches, vec![2, 4, 8]);
-        assert!(results.iter().any(|&(doc_id, _, _)| doc_id == 2));
-    }
-
-    #[test]
-    fn ann_search_stops_when_probed_population_is_exhausted() {
-        let ranked = [(1, 0, 1.0), (1, 1, 0.9)];
-        let mut calls = 0;
-        let results = progressive_ann_search(3, 4, 100, |fetch| {
-            calls += 1;
-            ranked.iter().copied().take(fetch).collect()
-        })
-        .unwrap();
-
-        assert_eq!(calls, 1);
-        assert_eq!(results.len(), 2);
     }
 
     #[test]
@@ -2743,72 +2856,71 @@ mod dense_search_safety_tests {
         assert!(checked_file_range(5, 3, 7, "test").is_err());
     }
 
-    /// The single-scan replay must return exactly what the doubling retry
-    /// loop returns for any (target, initial fetch, population) combination
-    /// when `search(f)` yields the top-`f` prefix of one fixed ranking —
-    /// while invoking the search closure exactly once.
     #[test]
-    fn single_scan_ann_search_matches_progressive_with_one_search_call() {
-        // Skewed ranking: doc 1 owns the best six vectors, then a sparse tail.
-        let ranked: Vec<RawVectorCandidate> = vec![
-            (1, 0, 1.0),
-            (1, 1, 0.99),
-            (1, 2, 0.98),
-            (1, 3, 0.97),
-            (1, 4, 0.96),
-            (1, 5, 0.95),
-            (2, 0, 0.9),
-            (3, 0, 0.8),
-            (2, 1, 0.7),
-            (4, 0, 0.6),
-            (5, 0, 0.5),
-        ];
-
-        for target_docs in 0..=6 {
-            for initial_fetch in [0, 1, 2, 3, 8, 16, 64] {
-                for max_vectors in [0, 1, 2, 8, ranked.len(), 100] {
-                    let progressive =
-                        progressive_ann_search(target_docs, initial_fetch, max_vectors, |fetch| {
-                            ranked.iter().copied().take(fetch).collect()
-                        });
-                    let mut calls = 0;
-                    let single =
-                        single_scan_ann_search(target_docs, initial_fetch, max_vectors, |fetch| {
-                            calls += 1;
-                            ranked.iter().copied().take(fetch).collect()
-                        });
-                    let case =
-                        format!("target={target_docs} initial={initial_fetch} max={max_vectors}");
-                    match (progressive, single) {
-                        (Ok(a), Ok(b)) => assert_eq!(a, b, "{case}"),
-                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{case}"),
-                        (a, b) => panic!("verdict mismatch for {case}: {a:?} vs {b:?}"),
-                    }
-                    assert!(calls <= 1, "{case}: search must run at most once");
-                }
-            }
-        }
+    fn candidate_vector_reads_coalesce_contiguous_values() {
+        let mut runs = Vec::new();
+        plan_vector_read_runs(&[3, 4, 5, 9, 12, 13], &mut runs).unwrap();
+        assert_eq!(runs.len(), 3);
+        assert!(matches!(
+            runs.as_slice(),
+            [
+                VectorReadRun {
+                    buffer_start: 0,
+                    flat_start: 3,
+                    count: 3,
+                },
+                VectorReadRun {
+                    buffer_start: 3,
+                    flat_start: 9,
+                    count: 1,
+                },
+                VectorReadRun {
+                    buffer_start: 4,
+                    flat_start: 12,
+                    count: 2,
+                },
+            ]
+        ));
+        assert!(plan_vector_read_runs(&[3, 3], &mut runs).is_err());
     }
 
-    /// Probe-returned (doc, ordinal) pairs keep their probe scores and are
-    /// pruned from the flat-read list; only the candidate documents'
-    /// remaining ordinals still need reads.
-    #[test]
-    fn probe_scored_candidates_skip_flat_rereads() {
-        let ann_results: Vec<RawVectorCandidate> = vec![(7, 0, 0.75), (9, 2, 0.5)];
-        // Expansion of docs 7 and 9 to all their ordinals (scores unfilled).
-        let mut expanded: Vec<RawVectorCandidate> =
-            vec![(7, 0, 0.0), (7, 1, 0.0), (9, 0, 0.0), (9, 2, 0.0)];
-        let resolved: Vec<ResolvedVectorCandidate> = vec![(0, 10), (1, 11), (2, 20), (3, 22)];
+    #[tokio::test]
+    async fn multivalue_ann_rerank_streams_past_document_candidate_cap() {
+        use crate::directories::{FileHandle, OwnedBytes};
+        use crate::segment::FlatVectorData;
 
-        let remaining = fill_probe_scores_and_prune_resolved(&ann_results, &mut expanded, resolved);
+        const VALUES: usize = MAX_DENSE_CANDIDATES_PER_SEGMENT + 1;
+        let mut encoded = Vec::new();
+        let vectors = vec![1.0f32; VALUES];
+        let doc_ids: Vec<_> = (0..VALUES).map(|ordinal| (0, ordinal as u16)).collect();
+        FlatVectorData::serialize_binary_from_flat_streaming(
+            1,
+            &vectors,
+            &doc_ids,
+            DenseVectorQuantization::F32,
+            &mut encoded,
+        )
+        .unwrap();
+        let flat = LazyFlatVectorData::open_with_doc_limit(
+            FileHandle::from_bytes(OwnedBytes::new(encoded)),
+            Some(1),
+        )
+        .await
+        .unwrap();
 
-        // Probe-scored pairs (7,0) and (9,2) are filled and pruned.
-        assert_eq!(expanded[0].2, 0.75);
-        assert_eq!(expanded[3].2, 0.5);
-        // Unseen ordinals (7,1) and (9,0) still need flat reads.
-        assert_eq!(remaining, vec![(1, 11), (2, 20)]);
-        assert_eq!(expanded[1].2, 0.0);
-        assert_eq!(expanded[2].2, 0.0);
+        let (results, stats) = exact_score_dense_candidate_documents(
+            &[(0, 0, 0.0)],
+            &flat,
+            &[1.0],
+            false,
+            crate::query::MultiValueCombiner::Max,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.vector_count, VALUES);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ordinals.len(), VALUES);
+        assert!((results[0].score - 1.0).abs() < 1e-5);
     }
 }

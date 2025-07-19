@@ -252,6 +252,7 @@ struct PreparedSegment<D: DirectoryWriter + 'static> {
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     operation: Option<crate::merge::SegmentOperationGuard>,
     runtime: tokio::runtime::Handle,
+    needs_vector_upgrade: bool,
     published: bool,
 }
 
@@ -1031,6 +1032,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_manager: Arc::clone(&state.segment_manager),
             operation: Some(operation),
             runtime: handle.clone(),
+            needs_vector_upgrade: trained.is_none(),
             published: false,
         };
 
@@ -1370,6 +1372,16 @@ impl<D: DirectoryWriter + 'static> PreparedSegmentsGuard<D> {
     fn take_published(&mut self) -> Vec<PreparedSegment<D>> {
         self.segments.take().unwrap_or_default()
     }
+
+    fn vector_upgrade_segment_ids(&self) -> Vec<String> {
+        self.segments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|segment| segment.needs_vector_upgrade)
+            .map(|segment| segment.id.clone())
+            .collect()
+    }
 }
 
 impl<D: DirectoryWriter + 'static> Drop for PreparedSegmentsGuard<D> {
@@ -1479,6 +1491,7 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     mut commit: OwnedCommitFinalization<D>,
 ) -> Result<bool> {
     let metadata_entries = commit.prepared.metadata_entries();
+    let published_segment_ids = commit.prepared.vector_upgrade_segment_ids();
 
     // This entire future is owned by a Tokio task. Cancelling the RPC only
     // drops its JoinHandle; it cannot split durable metadata publication from
@@ -1491,6 +1504,9 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
         segment.mark_published();
     }
     drop(published);
+    commit
+        .segment_manager
+        .schedule_vector_segment_upgrades(published_segment_ids);
     // Publication is irreversible. From here onward every exit path, including
     // panic unwind, must make the writer available again while PK reservations
     // remain fail-closed until refresh succeeds.

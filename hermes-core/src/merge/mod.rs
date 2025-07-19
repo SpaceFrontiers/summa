@@ -10,7 +10,7 @@ mod segment_manager;
 #[cfg(feature = "native")]
 pub use segment_manager::SegmentManager;
 #[cfg(feature = "native")]
-pub(crate) use segment_manager::{SegmentOperationGuard, VectorArtifactUpdateGuard};
+pub(crate) use segment_manager::SegmentOperationGuard;
 
 /// Information about a segment for merge decisions
 #[derive(Debug, Clone)]

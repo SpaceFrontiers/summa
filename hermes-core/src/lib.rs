@@ -25,7 +25,8 @@ pub mod tokenizer;
 // Re-exports from dsl
 pub use dsl::{
     BinaryDenseVectorConfig, Document, Field, FieldDef, FieldEntry, FieldType, FieldValue,
-    IndexDef, QueryLanguageParser, Schema, SchemaBuilder, SdlParser, parse_sdl, parse_single_index,
+    IndexDef, IvfRoutingMode, QueryLanguageParser, Schema, SchemaBuilder, SdlParser, parse_sdl,
+    parse_single_index,
 };
 
 // Re-exports from structures
