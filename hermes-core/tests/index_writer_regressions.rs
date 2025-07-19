@@ -367,3 +367,48 @@ async fn test_retried_prepare_commit_survives_cancelled_commit_waiter() {
     assert!(prepared.commit().await.unwrap());
     opener.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Writer-lock recovery: a deferred conflict must not outlive the conflict
+// ---------------------------------------------------------------------------
+
+/// Prod regression (k8s rolling update): the new pod's `Index::writer()` hit
+/// the old pod's live advisory lock and cached `Unavailable`; the old pod
+/// exited seconds later (the kernel released its lock), but the new writer
+/// kept rejecting every batch forever. An `Unavailable` writer must re-attempt
+/// acquisition on its next mutating operation instead of caching the conflict
+/// for its lifetime.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_writer_lock_reacquired_after_holder_releases() {
+    let (schema, title) = title_schema();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = IndexConfig::default();
+
+    let index = Index::create(MmapDirectory::new(tmp.path()), schema, config.clone())
+        .await
+        .unwrap();
+    let writer_a = index.writer();
+    let mut writer_b = index.writer();
+
+    // While A is alive, B must keep failing loudly.
+    writer_b
+        .add_document(title_doc(title, "must be rejected"))
+        .expect_err("second writer's mutations must fail while the lock is held");
+
+    // A exits (pod terminated); the kernel releases its advisory lock.
+    drop(writer_a);
+
+    // B's next mutation must acquire the now-free lock and succeed.
+    writer_b
+        .add_document(title_doc(title, "accepted after holder exit"))
+        .expect("writer must recover once the previous holder released the lock");
+    writer_b.commit().await.unwrap();
+
+    // And the recovered writer really owns the lock: an external open is
+    // rejected again.
+    let err = IndexWriter::open(MmapDirectory::new(tmp.path()), config)
+        .await
+        .err()
+        .expect("recovered writer must hold the single-writer lock");
+    assert!(err.to_string().contains("single-writer lock"));
+}

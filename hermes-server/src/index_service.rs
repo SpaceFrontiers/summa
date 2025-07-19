@@ -169,10 +169,32 @@ impl IndexService for IndexServiceImpl {
 
         let error_count = conversion_errors + doc_errors.len() as u32;
 
-        debug!(
-            "Batch indexed documents: index={}, indexed={}, errors={}",
-            req.index_name, indexed_count, error_count
-        );
+        // Fail loud: a failed batch must not hide at DEBUG (a wedged writer
+        // once rejected 100% of documents and it was only visible there).
+        if error_count > 0 {
+            let sample = doc_errors
+                .first()
+                .map(|e| e.error.as_str())
+                .unwrap_or("document conversion failed");
+            if indexed_count == 0 {
+                log::error!(
+                    "Batch indexing failed completely: index={}, indexed=0, errors={} (first error: {})",
+                    req.index_name,
+                    error_count,
+                    sample
+                );
+            } else {
+                warn!(
+                    "Batch indexed with errors: index={}, indexed={}, errors={} (first error: {})",
+                    req.index_name, indexed_count, error_count, sample
+                );
+            }
+        } else {
+            debug!(
+                "Batch indexed documents: index={}, indexed={}, errors={}",
+                req.index_name, indexed_count, error_count
+            );
+        }
 
         Ok(Response::new(BatchIndexDocumentsResponse {
             indexed_count,

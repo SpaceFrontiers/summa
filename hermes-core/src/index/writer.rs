@@ -162,7 +162,10 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     /// the reservations or duplicate primary keys could be admitted.
     pk_reservations_retained: Arc<AtomicBool>,
     /// Advisory single-writer lock, held for the writer's lifetime.
-    writer_lock: WriterLock,
+    /// `Unavailable` is retryable: the conflicting holder may exit at any
+    /// time (the kernel then releases its lock), so `ensure_writer_lock`
+    /// re-attempts acquisition instead of caching the conflict forever.
+    writer_lock: parking_lot::RwLock<WriterLock>,
 }
 
 #[derive(Default)]
@@ -505,16 +508,43 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             primary_key_index: Arc::new(parking_lot::RwLock::new(None)),
             commit_finalization: Arc::new(CommitFinalizationState::default()),
             pk_reservations_retained: Arc::new(AtomicBool::new(false)),
-            writer_lock,
+            writer_lock: parking_lot::RwLock::new(writer_lock),
         }
     }
 
     /// Fail loudly when another writer owns the single-writer lock.
+    ///
+    /// A deferred conflict (`from_index` during a writer handover, e.g. a
+    /// rolling pod restart) is not permanent: the holder exits and the kernel
+    /// releases its advisory lock. Re-attempt acquisition on every call in
+    /// the `Unavailable` state so the writer recovers as soon as the lock
+    /// frees, instead of rejecting all writes for its lifetime.
     fn ensure_writer_lock(&self) -> Result<()> {
-        if let WriterLock::Unavailable { reason } = &self.writer_lock {
-            return Err(Error::Internal(reason.clone()));
+        // Fast path: uncontended read on the healthy states.
+        if !matches!(&*self.writer_lock.read(), WriterLock::Unavailable { .. }) {
+            return Ok(());
         }
-        Ok(())
+
+        let mut lock = self.writer_lock.write();
+        // Another thread may have recovered while we waited for the write lock.
+        if !matches!(&*lock, WriterLock::Unavailable { .. }) {
+            return Ok(());
+        }
+        match try_acquire_writer_lock(self.directory.as_ref())? {
+            acquired @ (WriterLock::Held { .. } | WriterLock::NotApplicable) => {
+                log::info!(
+                    "[writer_lock] single-writer lock acquired after retry; \
+                     the previous holder has released it — resuming writes"
+                );
+                *lock = acquired;
+                Ok(())
+            }
+            WriterLock::Unavailable { reason } => {
+                let err = Error::Internal(reason.clone());
+                *lock = WriterLock::Unavailable { reason };
+                Err(err)
+            }
+        }
     }
 
     /// Clear primary-key reservations after an aborted or failed generation.
