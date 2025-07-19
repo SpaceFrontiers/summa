@@ -3177,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.73"
+version = "1.8.78"
 dependencies = [
  "ahash",
  "aho-corasick",
