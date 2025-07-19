@@ -1,0 +1,89 @@
+# ~201M-total / ~116M-active hybrid MoE retriever.
+#
+# This keeps the proven retriever-100m backbone geometry and active FFN width:
+# - 24 x 512, with the same 2:1 Mamba:global-attention ratio
+# - 12 dense SwiGLU FFNs of width 1536
+# - 12 dropless token-choice MoE FFNs with 8 experts, top-2 routing, and
+#   width 768 per expert; two active experts equal one dense width-1536 FFN
+# - no shared expert, following OLMoE's controlled ablation
+#
+# Exact MAL estimate: 200,795,648 stored parameters. The parameters touched by
+# one token are approximately 115,860,992, including every router.
+
+attention retr_attn {
+    num_heads: 8
+    num_kv_heads: 4
+    bias: false
+    qk_norm: true
+    position_encoding: rope { theta: 100000.0 }
+}
+
+ssm retr_ssm {
+    state_dim: 16
+    conv_kernel: 4
+    expand: 2
+}
+
+ffn retr_dense_ffn {
+    hidden_dim: 1536
+    activation: swiglu
+    bias: false
+}
+
+ffn retr_moe_ffn {
+    hidden_dim: 768
+    activation: swiglu
+    bias: false
+    moe {
+        experts: 8
+        top_k: 2
+        shared_experts: 0
+        load_balance_loss_weight: 0.01
+        router_z_loss_weight: 0.001
+    }
+}
+
+block attn_dense_block {
+    attention: retr_attn
+    ffn: retr_dense_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+block attn_moe_block {
+    attention: retr_attn
+    ffn: retr_moe_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+block mamba_dense_block {
+    ssm: retr_ssm
+    ffn: retr_dense_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+block mamba_moe_block {
+    ssm: retr_ssm
+    ffn: retr_moe_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+model retriever-200m-moe {
+    description: "Hybrid Mamba+attention MoE retriever, ~201M total / ~116M active parameters"
+    vocab_size: 50277
+    max_seq_len: 8192
+    hidden_size: 512
+    num_layers: 24
+    block: attn_dense_block
+    pattern: [mamba_dense_block, mamba_moe_block, attn_dense_block, mamba_moe_block, mamba_dense_block, attn_moe_block]
+    embeddings {
+        tie_weights: true
+    }
+}

@@ -27,12 +27,22 @@ mod cube_attention;
 mod cube_tensor;
 mod ffn;
 mod fused_attention;
+#[cfg(feature = "cuda")]
+mod fused_swiglu;
 #[cfg(feature = "training-fusion")]
 mod fusion;
+#[cfg(feature = "cuda")]
+mod grouped_linear;
 mod linear_cross_entropy;
 mod mamba;
 mod matmul;
+#[cfg(feature = "cuda")]
+mod moe_dispatch;
+#[cfg(feature = "cuda")]
+mod moe_route;
+mod moe_topk;
 mod norm;
+mod row_permute;
 mod scan;
 mod transformer;
 mod weights;

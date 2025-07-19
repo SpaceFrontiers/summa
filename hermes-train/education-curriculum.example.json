@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "search_api": {
+    "url": "http://search-api/internal/v2/search/",
+    "index": "documents",
+    "mode": "hybrid",
+    "page_size": 250,
+    "limit_per_search": 2000,
+    "deduplicate": true,
+    "timeout_seconds": 60,
+    "max_retries": 6,
+    "retry_initial_seconds": 1,
+    "retry_max_seconds": 15
+  },
+  "alloydb": {
+    "batch_size": 500,
+    "connections": 4,
+    "timeout_seconds": 120
+  },
+  "output": {
+    "compression": "zstd",
+    "seed": 17,
+    "validation_fraction": 0.02,
+    "max_chunk_chars": 24000,
+    "min_chunk_chars": 300,
+    "max_chunks_per_document": 256,
+    "hard_negatives": 2
+  },
+  "stages": [
+    {
+      "name": "language-foundations",
+      "languages": ["en", "ru"],
+      "allow_unknown_language": false,
+      "document_types": ["book", "wiki"],
+      "min_content_chars": 500,
+      "max_content_chars": 3000000,
+      "max_duplicate_line_fraction": 0.35,
+      "max_documents": 8000,
+      "max_documents_per_language": 6000,
+      "min_documents": 2,
+      "title_allow_patterns": [
+        "\\b(alphabet|abc|primer|phonics|spelling|grammar|reader|reading|language arts)\\b",
+        "(буквар|азбук|грамматик|чтени|русский язык)"
+      ],
+      "title_deny_patterns": [
+        "proceedings",
+        "journal",
+        "conference",
+        "dissertation"
+      ],
+      "searches": [
+        {
+          "name": "english-alphabet-and-phonics",
+          "language": "en",
+          "query": "beginner English alphabet and phonics book"
+        },
+        {
+          "name": "english-grammar-foundations",
+          "language": "en",
+          "query": "basic English grammar and sentence structure textbook"
+        },
+        {
+          "name": "russian-alphabet-and-reading",
+          "language": "ru",
+          "query": "букварь азбука обучение чтению"
+        },
+        {
+          "name": "russian-basic-grammar",
+          "language": "ru",
+          "query": "основы грамматики русского языка для детей"
+        }
+      ],
+      "training": {
+        "causal": {
+          "sequence_length": 512,
+          "batch_size": 8,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 65536,
+          "learning_rate_scale": 1.0
+        },
+        "retrieval": {
+          "sequence_length": 512,
+          "batch_size": 8,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 16384,
+          "learning_rate_scale": 0.25,
+          "temperature": 0.05,
+          "layer": 24
+        }
+      }
+    },
+    {
+      "name": "school-fundamentals",
+      "languages": ["en", "ru"],
+      "allow_unknown_language": false,
+      "document_types": ["book", "wiki", "report"],
+      "min_content_chars": 1000,
+      "max_content_chars": 4000000,
+      "max_duplicate_line_fraction": 0.35,
+      "max_documents": 16000,
+      "max_documents_per_language": 12000,
+      "min_documents": 2,
+      "title_allow_patterns": [
+        "\\b(grade|school|elementary|middle school|arithmetic|science|history|geography|algebra|geometry|textbook|workbook)\\b",
+        "(школ|учебник|арифметик|естествозн|истори|географ|алгебр|геометр)"
+      ],
+      "replay": {
+        "language-foundations": 0.2
+      },
+      "searches": [
+        {
+          "name": "english-school-math-reasoning",
+          "language": "en",
+          "query": "school mathematics and reasoning textbook"
+        },
+        {
+          "name": "english-school-science-and-facts",
+          "language": "en",
+          "query": "school science history and geography textbook"
+        },
+        {
+          "name": "russian-school-math",
+          "language": "ru",
+          "query": "школьный учебник математики с задачами"
+        },
+        {
+          "name": "russian-school-science",
+          "language": "ru",
+          "query": "школьный учебник естествознания истории и географии"
+        }
+      ],
+      "training": {
+        "causal": {
+          "sequence_length": 1024,
+          "batch_size": 4,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 65536,
+          "learning_rate_scale": 0.8
+        },
+        "retrieval": {
+          "sequence_length": 512,
+          "batch_size": 8,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 16384,
+          "learning_rate_scale": 0.2,
+          "temperature": 0.05,
+          "layer": 24
+        }
+      }
+    },
+    {
+      "name": "university-core",
+      "languages": ["en", "ru"],
+      "allow_unknown_language": false,
+      "document_types": ["book", "wiki", "report"],
+      "min_content_chars": 1500,
+      "max_content_chars": 5000000,
+      "max_duplicate_line_fraction": 0.35,
+      "max_documents": 20000,
+      "max_documents_per_language": 15000,
+      "min_documents": 2,
+      "title_allow_patterns": [
+        "\\b(university|college|undergraduate|textbook|handbook|lecture notes|calculus|linear algebra|computer science)\\b",
+        "(университет|учебник|курс лекц|высшая математик|линейная алгебр)"
+      ],
+      "replay": {
+        "language-foundations": 0.1,
+        "school-fundamentals": 0.2
+      },
+      "searches": [
+        {
+          "name": "english-university-stem",
+          "language": "en",
+          "query": "undergraduate STEM textbook with worked examples"
+        },
+        {
+          "name": "english-university-computing-and-humanities",
+          "language": "en",
+          "query": "university computer science social science and humanities textbook"
+        },
+        {
+          "name": "russian-university-textbooks",
+          "language": "ru",
+          "query": "университетский учебник с примерами и упражнениями"
+        }
+      ],
+      "training": {
+        "causal": {
+          "sequence_length": 2048,
+          "batch_size": 2,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 65536,
+          "learning_rate_scale": 0.6
+        },
+        "retrieval": {
+          "sequence_length": 768,
+          "batch_size": 8,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 16384,
+          "learning_rate_scale": 0.15,
+          "temperature": 0.05,
+          "layer": 24
+        }
+      }
+    },
+    {
+      "name": "advanced-scholarship",
+      "languages": ["en", "ru"],
+      "allow_unknown_language": false,
+      "document_types": ["journal-article", "book", "report"],
+      "min_content_chars": 1500,
+      "max_content_chars": 5000000,
+      "max_duplicate_line_fraction": 0.35,
+      "max_documents": 30000,
+      "max_documents_per_language": 24000,
+      "min_documents": 2,
+      "title_allow_patterns": [
+        "\\b(advanced|graduate|monograph|handbook|review|proceedings|journal|thesis|dissertation|analysis|theory)\\b",
+        "(монограф|диссертац|научн|теори|анализ|аспирант)"
+      ],
+      "replay": {
+        "language-foundations": 0.05,
+        "school-fundamentals": 0.15,
+        "university-core": 0.25
+      },
+      "searches": [
+        {
+          "name": "english-advanced-textbooks-and-monographs",
+          "language": "en",
+          "query": "advanced graduate textbook handbook or research monograph"
+        },
+        {
+          "name": "english-scholarly-papers",
+          "language": "en",
+          "query": "scholarly review paper with methods results and references"
+        },
+        {
+          "name": "russian-advanced-scholarship",
+          "language": "ru",
+          "query": "научная монография диссертация или обзорная статья"
+        }
+      ],
+      "training": {
+        "causal": {
+          "sequence_length": 4096,
+          "batch_size": 1,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 65536,
+          "learning_rate_scale": 0.4
+        },
+        "retrieval": {
+          "sequence_length": 1024,
+          "batch_size": 4,
+          "gradient_accumulation": 8,
+          "epochs": 1,
+          "shuffle_buffer": 16384,
+          "learning_rate_scale": 0.1,
+          "temperature": 0.05,
+          "layer": 24
+        }
+      }
+    }
+  ]
+}

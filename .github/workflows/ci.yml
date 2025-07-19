@@ -61,7 +61,11 @@ jobs:
       - name: Check and test relaunch supervisor
         run: |
           shellcheck -x hermes-train/scripts/relaunch.sh hermes-train/scripts/relaunch_test.sh
-          python3 -m py_compile hermes-train/scripts/wandb_tail.py
+          python3 -m py_compile \
+            hermes-train/scripts/wandb_tail.py \
+            hermes-train/scripts/education_curriculum.py \
+            hermes-train/scripts/build_education_curriculum.py
+          python3 hermes-train/scripts/test_education_curriculum.py
           hermes-train/scripts/relaunch_test.sh
 
   # Security audit - check for known vulnerabilities

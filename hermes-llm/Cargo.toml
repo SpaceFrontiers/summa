@@ -25,7 +25,7 @@ burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23
 burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std"] }
 burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std"] }
 burn-ir = { git = "https://github.com/tracel-ai/burn.git", rev = "bd6e8fa2f23c2ecea1044af149bdc9e698a0848d", optional = true, default-features = false, features = ["std"] }
-cubecl = { git = "https://github.com/ppodolsky/cubecl.git", rev = "bda6a68d86df41f468cac78d713f1563869daa8e", optional = true, default-features = false, features = ["std"] }
+cubecl = { git = "https://github.com/ppodolsky/cubecl.git", rev = "dd61293f47c4202ca1db3e702cfedbb9c775b7de", optional = true, default-features = false, features = ["std"] }
 cubek = { git = "https://github.com/ppodolsky/cubek", rev = "b4fe9788a774c0f5e5af26122776b5bf4c8ee94d", optional = true, default-features = false, features = ["attention", "stdlib"] }
 half = { version = "2", optional = true, default-features = false }
 

@@ -81,6 +81,35 @@ pub(super) fn linear_low_precision<const D: usize>(layer: &Linear, input: Tensor
     linear(layer, input)
 }
 
+/// Apply a batch of independent linear projections with one weight matrix per
+/// batch item. This is the batched-GEMM counterpart of
+/// [`linear_low_precision`] used by balanced MoE expert groups.
+pub(super) fn batched_linear_low_precision(
+    input: Tensor<3>,
+    weight: Tensor<3>,
+    bias: Option<Tensor<2>>,
+) -> Tensor<3> {
+    #[cfg(feature = "cuda")]
+    {
+        if matmul_dtype(&input.device()).is_some() {
+            let mut output = matmul_input(input).matmul(matmul_input(weight));
+            if let Some(bias) = bias {
+                output = output + matmul_input(bias).unsqueeze_dim::<3>(1);
+            }
+            #[cfg(feature = "training-fusion")]
+            return output;
+            #[cfg(not(feature = "training-fusion"))]
+            return output.cast(FloatDType::F32);
+        }
+    }
+
+    let mut output = input.matmul(weight);
+    if let Some(bias) = bias {
+        output = output + bias.unsqueeze_dim::<3>(1);
+    }
+    output
+}
+
 /// Cast an activation onto the training residual-stream dtype.
 ///
 /// Under CUDA training-fusion the whole residual stream runs in BF16 — the

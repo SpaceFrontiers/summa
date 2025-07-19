@@ -1,10 +1,23 @@
 # Configurable MoE design
 
-Hermes supports mixture-of-experts as an opt-in FFN property. An FFN without a
-`moe` block is the existing dense implementation with the same parameter names,
-count, execution path, and checkpoint layout. In particular,
+The model stack supports mixture-of-experts as an opt-in FFN property. An FFN
+without a `moe` block is the existing dense implementation with the same
+parameter names, count, execution path, and checkpoint layout. In particular,
 `retriever_100m.mal` remains dense; enabling MoE is a new-model or explicit
 upcycling decision, never an implicit migration.
+
+`well-known/retriever_200m_moe.mal` is the first sized MoE retriever. It keeps
+the 24x512 hybrid backbone and changes exactly 12 of 24 FFNs to 8-expert,
+top-2 MoE layers. Each expert has width 768, so the two routed experts have the
+same aggregate width as a dense width-1536 FFN. MAL estimates 200,795,648
+stored parameters and approximately 115,860,992 parameters touched per token
+(including routers). MoE placement is balanced across Mamba and attention
+blocks, and layer 24 remains a global-attention retrieval layer.
+
+The model deliberately has no shared expert. OLMoE's controlled comparison
+found a small regression from forcing one always-active expert at fixed total
+and active budgets. Its load-balancing and router z-loss weights follow the
+same study's stable dropless token-choice recipe.
 
 ```mal
 ffn retrieval_moe {
@@ -25,15 +38,19 @@ The router is an unbiased FP32 linear projection. It selects the top-k routed
 experts per token, renormalizes their probabilities, and never drops tokens.
 Optional shared experts are always active. Routed and shared experts retain the
 configured dense FFN activation, width, gate, bias, and dropout. Router weights
-use AdamW; expert matrices retain Muon. The trainer adds and separately reports
-`router_aux_loss`, while `loss` remains the task loss and `optimized_loss`
-includes both.
+and the rank-3 routed-expert banks use AdamW; ordinary 2-D hidden matrices retain
+Muon. The trainer adds and separately reports `router_aux_loss`, while `loss`
+remains the task loss and `optimized_loss` includes both.
 
-The portable Burn dispatch currently evaluates static expert shapes and masks
-inactive routes. This gives deterministic semantics, autodiff, checkpointing,
-and CPU/Metal/CUDA portability, but does not yet reduce expert FLOPs. Production
-MoE throughput requires replacing that internal dispatch with a grouped
-block-sparse CubeCL kernel; the MAL and checkpoint schema do not need to change.
+The Burn dispatch groups routes by expert and restores token order with an
+inverse permutation. Inference evaluates compact expert batches without
+padding. Training keeps expert weights in their batched execution layout and,
+when the largest expert batch keeps total padded work at or below 1.5x useful
+routes, executes two batched GEMMs; more skewed routing falls back to compact
+expert batches. The permutation has a matching inverse-permutation backward,
+so it avoids the generic scatter-add path. A small CubeCL kernel handles top-2
+selection on GPU; other top-k values retain the portable implementation. The
+measured A100 comparison is in [MoE performance](moe-performance.md).
 
 ## Research conclusions
 
@@ -50,8 +67,8 @@ block-sparse CubeCL kernel; the MAL and checkpoint schema do not need to change.
   later A/B, not a silent default change.
 - Shared experts are configurable but default off. DeepSeekMoE motivates shared
   expert isolation, while OLMoE's matched-compute experiment did not improve
-  with a shared expert. It should therefore be measured on Hermes data.
-- Soft MoE is not the first choice for autoregressive Hermes serving: its soft
+  with a shared expert. It should therefore be measured on the target corpus.
+- Soft MoE is not the first choice for autoregressive serving: its soft
   token-slot mixing is less natural for causal one-token decoding than token
   choice and complicates an efficient KV-aware decode path.
 - Sparse upcycling can initialize experts from a trained dense FFN and is the
@@ -69,14 +86,3 @@ Primary sources:
 - [Auxiliary-Loss-Free Load Balancing](https://arxiv.org/abs/2408.15664)
 - [DeepSeek-V3](https://arxiv.org/abs/2412.19437)
 - [From Sparse to Soft Mixtures of Experts](https://proceedings.iclr.cc/paper_files/paper/2024/file/79fea214543ba263952ac3f4e5452b14-Paper-Conference.pdf)
-
-## First Hermes experiment (not applied to the current model)
-
-For a controlled small-model A/B, retain the current 24-layer mixer order and
-replace only four FFNs (layers 6, 12, 18, and 24) with 8 routed experts,
-top-2, width 768, and no shared expert. Two active width-768 experts match the
-active FFN matmul size of one width-1536 dense FFN. The resulting model is
-approximately 144.14M total parameters versus 115.81M today, while active FFN
-compute in converted layers is approximately unchanged. Compare task loss per
-token, wall-clock convergence, router entropy/load skew, retrieval quality,
-and decode latency before expanding MoE to more layers.
