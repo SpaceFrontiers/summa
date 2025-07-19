@@ -406,6 +406,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
             std::slice::from_ref(&reader),
             &dst_files,
             Some(trained),
+            super::merger::AnnWriteMode::Rebuild,
         )
         .await?;
     if vector_bytes == 0 {

@@ -75,6 +75,12 @@ pub struct IndexConfig {
     pub store_cache_blocks: usize,
     /// Max memory (bytes) across all builders before auto-commit (global limit)
     pub max_indexing_memory_bytes: usize,
+    /// Maximum vectors retained for one field's global ANN training sample.
+    /// The byte budget below is applied at the same time; the smaller bound
+    /// wins. Fields are sampled and trained serially.
+    pub vector_training_max_samples: usize,
+    /// Maximum raw vector bytes retained for one field's ANN training sample.
+    pub vector_training_memory_bytes: usize,
     /// Merge policy for background segment merging
     pub merge_policy: Box<dyn crate::merge::MergePolicy>,
     /// Index optimization mode (adaptive, size-optimized, performance-optimized)
@@ -177,6 +183,11 @@ impl Default for IndexConfig {
             term_cache_blocks: 256,
             store_cache_blocks: 32,
             max_indexing_memory_bytes: 256 * 1024 * 1024, // 256 MB default
+            vector_training_max_samples: 10_000_000,
+            #[cfg(target_pointer_width = "64")]
+            vector_training_memory_bytes: 4 * 1024 * 1024 * 1024,
+            #[cfg(not(target_pointer_width = "64"))]
+            vector_training_memory_bytes: usize::MAX,
             // large_scale: wide fan-in + budget/scored selection. Safe for
             // small indexes too (tier floors only shape *when* segments
             // merge); merge-time BP is wall-clock budgeted, so giant merges

@@ -203,6 +203,27 @@ impl BinaryCoarseQuantizer {
         self.validate()
     }
 
+    /// Visit compact routing topology and parent arrays before the potentially
+    /// much larger leaf centroid matrix.
+    pub(crate) fn visit_routing_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        if let Some(router) = &self.routing_index {
+            match router {
+                BinaryCentroidRouter::TwoLevel {
+                    parent_centroids,
+                    topology,
+                } => {
+                    topology.visit_resident_regions(visit);
+                    visit("binary parent centroids", parent_centroids);
+                }
+                BinaryCentroidRouter::Hnsw(graph) => graph.visit_resident_regions(visit),
+            }
+        }
+    }
+
+    pub(crate) fn visit_leaf_centroid_region(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        visit("binary leaf centroids", &self.centroids);
+    }
+
     pub fn probe(&self, query: &[u8], k: usize, mode: IvfRoutingMode) -> IvfProbePlan {
         let take = k.clamp(1, self.num_clusters as usize);
         let cluster_ids = match effective_routing_mode(mode, self.num_clusters as usize) {
@@ -387,12 +408,12 @@ impl BinaryIvfConfig {
 }
 
 /// One cluster: SoA layout with contiguous packed codes for SIMD scanning.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct BinaryCluster {
-    doc_ids: Vec<u32>,
-    ordinals: Vec<u16>,
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BinaryCluster {
+    pub(crate) doc_ids: Vec<u32>,
+    pub(crate) ordinals: Vec<u16>,
     /// Packed codes, `byte_len` bytes per entry, contiguous
-    codes: Vec<u8>,
+    pub(crate) codes: Vec<u8>,
 }
 
 fn visit_binary_cluster(
@@ -425,7 +446,7 @@ fn visit_binary_cluster(
 /// Centroid-free binary IVF payload for one segment. The global quantizer is
 /// loaded once at index scope; segments only retain exact codes partitioned by
 /// leaf ID, making compatible merges O(number of non-empty clusters).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct BinaryIvfIndex {
     pub dim_bits: usize,
     pub quantizer_version: u64,
@@ -433,8 +454,108 @@ pub struct BinaryIvfIndex {
     /// Sorted non-empty `(leaf_id, payload)` pairs. Empty cells cost no
     /// per-segment heap memory even when the global codebook has millions of
     /// leaves.
-    clusters: Vec<(u32, BinaryCluster)>,
+    pub(crate) clusters: Vec<(u32, BinaryCluster)>,
     len: usize,
+}
+
+/// Streaming build state used by vector-generation rewrites. Only the exact
+/// compressed output plus one bounded assignment batch is resident; source
+/// flat vectors are never accumulated in memory.
+pub(crate) struct BinaryIvfBuilder {
+    dim_bits: usize,
+    quantizer_version: u64,
+    num_clusters: u32,
+    routing: IvfRoutingMode,
+    clusters: rustc_hash::FxHashMap<u32, BinaryCluster>,
+    len: usize,
+}
+
+impl BinaryIvfBuilder {
+    pub(crate) fn new(
+        quantizer: &BinaryCoarseQuantizer,
+        routing: IvfRoutingMode,
+    ) -> io::Result<Self> {
+        quantizer
+            .validate_routing(routing)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            dim_bits: quantizer.dim_bits,
+            quantizer_version: quantizer.version,
+            num_clusters: quantizer.num_clusters,
+            routing,
+            clusters: rustc_hash::FxHashMap::default(),
+            len: 0,
+        })
+    }
+
+    pub(crate) fn add_batch(
+        &mut self,
+        quantizer: &BinaryCoarseQuantizer,
+        codes: &[u8],
+        doc_id_ordinals: &[(u32, u16)],
+    ) -> io::Result<()> {
+        if quantizer.dim_bits != self.dim_bits
+            || quantizer.version != self.quantizer_version
+            || quantizer.num_clusters != self.num_clusters
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary IVF build batch uses a different quantizer generation",
+            ));
+        }
+        let byte_len = quantizer.byte_len();
+        let expected = doc_id_ordinals.len().checked_mul(byte_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "binary IVF batch overflows")
+        })?;
+        if codes.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary IVF code/label batch is inconsistent",
+            ));
+        }
+        #[cfg(feature = "native")]
+        let assignments: Vec<u32> = {
+            use rayon::prelude::*;
+            codes
+                .par_chunks_exact(byte_len)
+                .map(|code| quantizer.assign(code, self.routing))
+                .collect()
+        };
+        #[cfg(not(feature = "native"))]
+        let assignments: Vec<u32> = codes
+            .chunks_exact(byte_len)
+            .map(|code| quantizer.assign(code, self.routing))
+            .collect();
+
+        for (index, &(doc_id, ordinal)) in doc_id_ordinals.iter().enumerate() {
+            let cluster = self.clusters.entry(assignments[index]).or_default();
+            cluster.doc_ids.push(doc_id);
+            cluster.ordinals.push(ordinal);
+            cluster
+                .codes
+                .extend_from_slice(&codes[index * byte_len..(index + 1) * byte_len]);
+        }
+        self.len = self.len.checked_add(doc_id_ordinals.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "binary IVF count overflows")
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> io::Result<BinaryIvfIndex> {
+        let mut clusters: Vec<_> = self.clusters.into_iter().collect();
+        clusters.sort_unstable_by_key(|(cluster_id, _)| *cluster_id);
+        let index = BinaryIvfIndex {
+            dim_bits: self.dim_bits,
+            quantizer_version: self.quantizer_version,
+            num_clusters: self.num_clusters,
+            clusters,
+            len: self.len,
+        };
+        index
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(index)
+    }
 }
 
 impl BinaryIvfIndex {
@@ -444,52 +565,9 @@ impl BinaryIvfIndex {
         codes: &[u8],
         doc_id_ordinals: &[(u32, u16)],
     ) -> io::Result<Self> {
-        quantizer
-            .validate()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let byte_len = quantizer.byte_len();
-        let expected = doc_id_ordinals.len().checked_mul(byte_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "binary IVF code size overflow")
-        })?;
-        if codes.len() != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "binary IVF code/label matrix is inconsistent",
-            ));
-        }
-        let n = doc_id_ordinals.len();
-        #[cfg(feature = "native")]
-        let assignments: Vec<u32> = {
-            use rayon::prelude::*;
-            (0..n)
-                .into_par_iter()
-                .map(|i| quantizer.assign(&codes[i * byte_len..(i + 1) * byte_len], routing))
-                .collect()
-        };
-        #[cfg(not(feature = "native"))]
-        let assignments: Vec<u32> = (0..n)
-            .map(|i| quantizer.assign(&codes[i * byte_len..(i + 1) * byte_len], routing))
-            .collect();
-
-        let mut by_cluster: rustc_hash::FxHashMap<u32, BinaryCluster> =
-            rustc_hash::FxHashMap::default();
-        for (i, &(doc_id, ordinal)) in doc_id_ordinals.iter().enumerate() {
-            let cluster = by_cluster.entry(assignments[i]).or_default();
-            cluster.doc_ids.push(doc_id);
-            cluster.ordinals.push(ordinal);
-            cluster
-                .codes
-                .extend_from_slice(&codes[i * byte_len..(i + 1) * byte_len]);
-        }
-        let mut clusters: Vec<_> = by_cluster.into_iter().collect();
-        clusters.sort_unstable_by_key(|(cluster_id, _)| *cluster_id);
-        Ok(Self {
-            dim_bits: quantizer.dim_bits,
-            quantizer_version: quantizer.version,
-            num_clusters: quantizer.num_clusters,
-            clusters,
-            len: n,
-        })
+        let mut builder = BinaryIvfBuilder::new(quantizer, routing)?;
+        builder.add_batch(quantizer, codes, doc_id_ordinals)?;
+        builder.finish()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -565,64 +643,12 @@ impl BinaryIvfIndex {
         collector.into_sorted_results()
     }
 
-    pub fn merge_into(&mut self, other: &Self, doc_id_offset: u32) -> Result<(), &'static str> {
-        if self.quantizer_version != other.quantizer_version
-            || self.dim_bits != other.dim_bits
-            || self.num_clusters != other.num_clusters
-        {
-            return Err("cannot merge binary IVF payloads from different quantizers");
-        }
-        for (cluster_id, source) in &other.clusters {
-            let position = match self
-                .clusters
-                .binary_search_by_key(cluster_id, |(id, _)| *id)
-            {
-                Ok(position) => position,
-                Err(position) => {
-                    self.clusters
-                        .insert(position, (*cluster_id, BinaryCluster::default()));
-                    position
-                }
-            };
-            let target = &mut self.clusters[position].1;
-            target.doc_ids.reserve(source.doc_ids.len());
-            target.ordinals.reserve(source.ordinals.len());
-            target.codes.reserve(source.codes.len());
-            target
-                .doc_ids
-                .extend(source.doc_ids.iter().map(|doc_id| doc_id + doc_id_offset));
-            target.ordinals.extend_from_slice(&source.ordinals);
-            target.codes.extend_from_slice(&source.codes);
-        }
-        self.len += other.len;
-        Ok(())
-    }
-
     pub fn len(&self) -> usize {
         self.len
     }
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    pub fn write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<usize> {
-        bincode::serde::encode_into_std_write(self, writer, bincode::config::standard())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        let index: Self =
-            crate::structures::vector::decode_ann_bincode_exact(data, "global binary IVF")?;
-        index
-            .validate()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        Ok(index)
     }
 
     pub fn estimated_memory_bytes(&self) -> usize {
@@ -991,38 +1017,34 @@ mod tests {
     }
 
     #[test]
-    fn payload_merge_is_lossless_and_generation_checked() {
+    fn streaming_builder_appends_batches_without_retaining_inputs() {
         let codes = [0x00, 0x01, 0x02, 0xf0, 0xf1, 0xf2];
-        let labels = [(0, 0), (1, 0), (2, 0), (0, 0), (1, 0), (2, 0)];
+        let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
         let config = BinaryIvfConfig::new(8, 2);
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, codes.len()).unwrap();
-        let mut left =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes[..3], &labels[..3])
-                .unwrap();
-        let right =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes[3..], &labels[3..])
-                .unwrap();
-        left.merge_into(&right, 3).unwrap();
-        assert_eq!(left.len(), 6);
+        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat).unwrap();
+        builder
+            .add_batch(&quantizer, &codes[..3], &labels[..3])
+            .unwrap();
+        builder
+            .add_batch(&quantizer, &codes[3..], &labels[3..])
+            .unwrap();
+        let index = builder.finish().unwrap();
+        assert_eq!(index.len(), 6);
         let plan = quantizer.probe(&[0xf0], 2, IvfRoutingMode::Flat);
         assert_eq!(
-            left.search_in_clusters(&[0xf0], 1, &plan.cluster_ids)[0].0,
+            index.search_in_clusters(&[0xf0], 1, &plan.cluster_ids)[0].0,
             3
         );
     }
 
     #[test]
-    fn sparse_payload_and_serialization_do_not_allocate_empty_leaf_columns() {
+    fn sparse_payload_does_not_allocate_empty_leaf_columns() {
         let codes = [0x00, 0xff];
         let labels = [(0, 0), (1, 0)];
         let (quantizer, index) = trained_index(8, 2, &codes, &labels);
         assert!(index.clusters.len() <= 2);
-        let bytes = index.to_bytes().unwrap();
-        let decoded = BinaryIvfIndex::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.quantizer_version, quantizer.version);
-        let mut trailing = bytes;
-        trailing.push(0);
-        assert!(BinaryIvfIndex::from_bytes(&trailing).is_err());
+        assert_eq!(index.quantizer_version, quantizer.version);
     }
 
     #[test]

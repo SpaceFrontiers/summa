@@ -560,6 +560,33 @@ impl CoarseCentroids {
         self.centroids.len() * size_of::<f32>() + routing_bytes + 64
     }
 
+    /// Visit compact routing topology and parent arrays before the potentially
+    /// much larger leaf centroid matrix.
+    pub(crate) fn visit_routing_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        if let Some(router) = &self.routing_index {
+            match router {
+                FloatCentroidRouter::TwoLevel {
+                    parent_centroids,
+                    topology,
+                } => {
+                    topology.visit_resident_regions(visit);
+                    visit(
+                        "float parent centroids",
+                        super::routing::bytes_of_slice(parent_centroids),
+                    );
+                }
+                FloatCentroidRouter::Hnsw(graph) => graph.visit_resident_regions(visit),
+            }
+        }
+    }
+
+    pub(crate) fn visit_leaf_centroid_region(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        visit(
+            "float leaf centroids",
+            super::routing::bytes_of_slice(&self.centroids),
+        );
+    }
+
     /// Encode the current index-level centroid artifact format.
     pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
         bincode::serde::encode_to_vec(self, bincode::config::standard())

@@ -207,12 +207,14 @@ async fn test_vector_retrain_atomically_replaces_the_complete_generation() {
     );
     let current_index = Index::open(dir.clone(), config).await.unwrap();
     for segment in current_index.segment_readers().await.unwrap() {
-        let index = segment
-            .get_ivf_pq_vector_index(embedding)
-            .expect("every current segment must contain IVF-PQ");
-        assert_eq!(index.codebook_version, second_version);
+        let Some(crate::segment::VectorIndex::IvfPq(index)) = segment.get_vector_index(embedding)
+        else {
+            panic!("every current segment must contain IVF-PQ");
+        };
+        let header = index.get().header();
+        assert_eq!(header.codebook_version, second_version);
         assert_eq!(
-            index.centroids_version,
+            header.quantizer_version,
             trained.centroids[&embedding.0].version
         );
     }
@@ -1253,7 +1255,7 @@ async fn test_binary_ivf_end_to_end() {
         else {
             panic!("every retrained binary segment must contain IVF");
         };
-        assert_eq!(lazy.get().unwrap().quantizer_version, second_quantizer);
+        assert_eq!(lazy.get().header().quantizer_version, second_quantizer);
     }
     drop(retrained);
     writer.force_merge().await.unwrap();

@@ -414,8 +414,8 @@ pub struct LazyFlatVectorData {
 impl LazyFlatVectorData {
     /// Open from a lazy file slice pointing to the flat binary data region.
     ///
-    /// Reads header (16 bytes) + doc_ids (~6 bytes/vector) into memory.
-    /// Vector data stays lazy on disk.
+    /// Reads and validates the header and zero-copy document map. Vector data
+    /// stays lazy on disk.
     pub async fn open(handle: FileHandle) -> io::Result<Self> {
         Self::open_with_doc_limit(handle, None).await
     }
@@ -428,6 +428,23 @@ impl LazyFlatVectorData {
     pub(crate) async fn open_with_doc_limit(
         handle: FileHandle,
         total_docs: Option<u32>,
+    ) -> io::Result<Self> {
+        Self::open_impl(handle, total_docs, true).await
+    }
+
+    /// Open only the raw-vector region needed by global ANN training.
+    ///
+    /// The complete serialized shape is still checked, but the corpus-sized
+    /// document map is neither faulted in nor scanned: sampling addresses
+    /// vectors by global vector ordinal and never resolves document IDs.
+    pub(crate) async fn open_for_training(handle: FileHandle) -> io::Result<Self> {
+        Self::open_impl(handle, None, false).await
+    }
+
+    async fn open_impl(
+        handle: FileHandle,
+        total_docs: Option<u32>,
+        load_doc_map: bool,
     ) -> io::Result<Self> {
         let header_len = u64::try_from(FLAT_BINARY_HEADER_SIZE).map_err(|_| {
             io::Error::new(
@@ -552,16 +569,21 @@ impl LazyFlatVectorData {
             )
         })?;
 
-        let doc_ids_bytes = handle.read_bytes_range(doc_ids_start..doc_ids_end).await?;
-        if doc_ids_bytes.len() != doc_ids_byte_len_usize {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "flat vector doc-map read returned {} bytes, expected {doc_ids_byte_len_usize}",
-                    doc_ids_bytes.len()
-                ),
-            ));
-        }
+        let doc_ids_bytes = if load_doc_map {
+            let bytes = handle.read_bytes_range(doc_ids_start..doc_ids_end).await?;
+            if bytes.len() != doc_ids_byte_len_usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "flat vector doc-map read returned {} bytes, expected {doc_ids_byte_len_usize}",
+                        bytes.len()
+                    ),
+                ));
+            }
+            bytes
+        } else {
+            OwnedBytes::empty()
+        };
 
         let mut previous = None;
         let mut num_docs_with_vectors = 0usize;
@@ -992,6 +1014,11 @@ impl LazyFlatVectorData {
     /// Read doc_id at index from raw bytes (no ordinal).
     #[inline]
     fn doc_id_at(&self, idx: usize) -> u32 {
+        assert_eq!(
+            self.doc_ids_bytes.len(),
+            self.num_vectors * DOC_ID_ENTRY_SIZE,
+            "document IDs are unavailable on a training-only flat-vector reader",
+        );
         let off = idx * DOC_ID_ENTRY_SIZE;
         let d = &self.doc_ids_bytes[off..];
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
@@ -1000,6 +1027,11 @@ impl LazyFlatVectorData {
     /// Get doc_id and ordinal at index (parsed from zero-copy mmap bytes).
     #[inline]
     pub fn get_doc_id(&self, idx: usize) -> (u32, u16) {
+        assert_eq!(
+            self.doc_ids_bytes.len(),
+            self.num_vectors * DOC_ID_ENTRY_SIZE,
+            "document IDs are unavailable on a training-only flat-vector reader",
+        );
         let off = idx * DOC_ID_ENTRY_SIZE;
         let d = &self.doc_ids_bytes[off..];
         let doc_id = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);

@@ -30,7 +30,7 @@ const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 /// drops fields it does not know about, so loading newer metadata would
 /// misread index state and the next save would destructively rewrite the
 /// unknown fields away.
-pub const INDEX_META_FORMAT_VERSION: u32 = 3;
+pub const INDEX_META_FORMAT_VERSION: u32 = 4;
 
 /// Index-level centroids/codebooks are deliberately bounded before they are
 /// read or decoded. Besides limiting ordinary corruption damage, the matching
@@ -584,11 +584,15 @@ impl IndexMetadata {
         if centroids.is_empty() && binary_quantizers.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(crate::segment::TrainedVectorStructures {
+            let mut trained = crate::segment::TrainedVectorStructures {
                 centroids,
                 binary_quantizers,
                 codebooks,
-            }))
+                ..Default::default()
+            };
+            #[cfg(feature = "native")]
+            trained.pin_ann_structures(crate::segment::pin::pin_policy());
+            Ok(Some(trained))
         }
     }
 }

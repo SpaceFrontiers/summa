@@ -490,10 +490,11 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             if let Some(n) = p.into_inner().next() {
                 config.bmp_block_size = Some(n.as_str().parse().unwrap_or_else(|_| {
                     log::warn!(
-                        "Invalid bmp_block_size value '{}', using default 64",
-                        n.as_str()
+                        "Invalid bmp_block_size value '{}', using default {}",
+                        n.as_str(),
+                        SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE,
                     );
-                    64
+                    SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE
                 }));
             }
         }
@@ -1605,9 +1606,12 @@ mod tests {
         assert_eq!(config1.format, SparseFormat::Bmp);
         assert_eq!(config1.bmp_block_size, 256);
 
-        // Default block size stays 64
+        // Default block size stays 32.
         let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
-        assert_eq!(config2.bmp_block_size, 64);
+        assert_eq!(
+            config2.bmp_block_size,
+            SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE
+        );
     }
 
     /// Regression: `bmp_grid_bits` parsed but was never applied to the field

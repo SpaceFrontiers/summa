@@ -26,10 +26,11 @@ pub fn new_ivf_pq(
     IVFPQIndex::new(config, centroids.version, codebook.version)
 }
 
-/// Serialize a populated IVF-PQ index to bytes.
+/// Encode a populated IVF-PQ build into the merge-native segment format.
 #[cfg(feature = "native")]
-pub fn serialize_ivf_pq(index: IVFPQIndex) -> crate::Result<Vec<u8>> {
-    index
-        .to_bytes()
-        .map_err(|e| crate::Error::Serialization(e.to_string()))
+pub fn serialize_ivf_pq(index: IVFPQIndex, num_clusters: u32) -> crate::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    crate::segment::ann_disk::write_built_ivf_pq(&index, num_clusters, &mut bytes)
+        .map_err(crate::Error::Io)?;
+    Ok(bytes)
 }

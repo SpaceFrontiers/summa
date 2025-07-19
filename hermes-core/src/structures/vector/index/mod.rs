@@ -6,6 +6,7 @@
 mod binary_ivf;
 mod ivf_pq;
 
+pub(crate) use binary_ivf::BinaryIvfBuilder;
 pub use binary_ivf::{BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex};
 pub use ivf_pq::{IVFPQConfig, IVFPQIndex, IvfPqQueryPlan};
 

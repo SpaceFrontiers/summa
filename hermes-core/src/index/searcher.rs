@@ -368,8 +368,6 @@ impl<D: Directory + 'static> Searcher<D> {
                 Ok(mut reader) => {
                     // Inject the single immutable index-level artifact generation.
                     reader.set_trained_vectors(Arc::clone(trained_vectors));
-                    #[cfg(feature = "native")]
-                    crate::segment::block_in_place_if_multithread(|| reader.warm_ann_indexes())?;
                     loaded.push((idx, Arc::new(reader)));
                 }
                 Err(e) => {

@@ -17,12 +17,123 @@ use crate::dsl::Field;
 /// Defined here (not in merger) so it's available on all platforms including WASM.
 #[derive(Clone, Default)]
 pub struct TrainedVectorStructures {
+    /// Must be declared before artifact `Arc`s so locks are released while all
+    /// referenced allocations are still alive (Rust drops fields in order).
+    #[cfg(feature = "native")]
+    pub(crate) _ann_pins: Arc<crate::segment::pin::HeapPinSet>,
     /// Trained centroids per field_id
     pub centroids: FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
     /// Global Hamming coarse quantizers per binary dense field.
     pub binary_quantizers: FxHashMap<u32, Arc<crate::structures::BinaryCoarseQuantizer>>,
     /// Index-global PQ codebooks per field ID.
     pub codebooks: FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
+}
+
+impl TrainedVectorStructures {
+    /// Lock the immutable index-global structures touched by ANN routing once
+    /// per artifact generation. Segment payloads (PQ/exact codes, doc IDs) and
+    /// raw rerank vectors are deliberately excluded: those scale with the
+    /// corpus and are data, not lightweight routing metadata.
+    #[cfg(feature = "native")]
+    pub(crate) fn pin_ann_structures(&mut self, policy: &crate::segment::pin::PinPolicy) {
+        if !policy.is_enabled() {
+            return;
+        }
+        let mut pins = crate::segment::pin::HeapPinSet::default();
+        let mut remaining = policy.budget_bytes;
+
+        let mut float_fields: Vec<_> = self.centroids.keys().copied().collect();
+        float_fields.sort_unstable();
+        let mut binary_fields: Vec<_> = self.binary_quantizers.keys().copied().collect();
+        binary_fields.sort_unstable();
+        let mut codebook_fields: Vec<_> = self.codebooks.keys().copied().collect();
+        codebook_fields.sort_unstable();
+
+        // Priority 1: graph/topology and two-level parent data for every field.
+        for field_id in &float_fields {
+            pins.retain_owner(Arc::clone(&self.centroids[field_id]));
+            self.centroids[field_id].visit_routing_regions(&mut |label, bytes| {
+                pins.pin_slice(
+                    bytes,
+                    &format!("field {field_id} {label}"),
+                    policy.mode,
+                    &mut remaining,
+                );
+            });
+        }
+        for field_id in &binary_fields {
+            pins.retain_owner(Arc::clone(&self.binary_quantizers[field_id]));
+            self.binary_quantizers[field_id].visit_routing_regions(&mut |label, bytes| {
+                pins.pin_slice(
+                    bytes,
+                    &format!("field {field_id} {label}"),
+                    policy.mode,
+                    &mut remaining,
+                );
+            });
+        }
+
+        // Priority 2: PQ/OPQ tables used for every float query plan.
+        for field_id in &codebook_fields {
+            pins.retain_owner(Arc::clone(&self.codebooks[field_id]));
+            self.codebooks[field_id].visit_resident_regions(&mut |label, bytes| {
+                pins.pin_slice(
+                    bytes,
+                    &format!("field {field_id} {label}"),
+                    policy.mode,
+                    &mut remaining,
+                );
+            });
+        }
+
+        // Priority 3: leaf centroids. These can be much larger at billion
+        // scale, so they consume the budget only after all control structures.
+        for field_id in &float_fields {
+            self.centroids[field_id].visit_leaf_centroid_region(&mut |label, bytes| {
+                pins.pin_slice(
+                    bytes,
+                    &format!("field {field_id} {label}"),
+                    policy.mode,
+                    &mut remaining,
+                );
+            });
+        }
+        for field_id in &binary_fields {
+            self.binary_quantizers[field_id].visit_leaf_centroid_region(&mut |label, bytes| {
+                pins.pin_slice(
+                    bytes,
+                    &format!("field {field_id} {label}"),
+                    policy.mode,
+                    &mut remaining,
+                );
+            });
+        }
+
+        let report = pins.report();
+        if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
+            log::warn!(
+                "[pin] ANN generation: resident {}/{} bytes ({:?}); budget skipped {}, mlock failed {}",
+                report.pinned_bytes,
+                report.intended_bytes,
+                policy.mode,
+                report.skipped_budget_bytes,
+                report.failed_bytes,
+            );
+        } else if report.pinned_bytes > 0 {
+            log::info!(
+                "[pin] ANN generation: pinned {} bytes of routing structures ({:?})",
+                report.pinned_bytes,
+                policy.mode,
+            );
+        }
+        self._ann_pins = Arc::new(pins);
+    }
+
+    #[cfg(feature = "native")]
+    #[cfg(test)]
+    pub(crate) fn ann_pin_report(&self) -> crate::segment::pin::PinReport {
+        self._ann_pins.report()
+    }
 }
 
 /// Unique segment identifier (UUID7-like: 48-bit timestamp + 80-bit random)
@@ -229,5 +340,51 @@ impl SegmentFiles {
             self.positions.clone(),
             self.fast.clone(),
         ]
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod ann_pin_tests {
+    use super::*;
+    use crate::dsl::IvfRoutingMode;
+    use crate::segment::pin::{PinMode, PinPolicy};
+    use crate::structures::{CoarseCentroids, CoarseConfig};
+
+    fn trained_float_artifacts() -> TrainedVectorStructures {
+        let vectors = vec![vec![0.0, 0.0], vec![1.0, 1.0]];
+        let centroids = CoarseCentroids::train(
+            &CoarseConfig::new(2, 2).with_routing(IvfRoutingMode::Flat),
+            &vectors,
+        );
+        let mut trained = TrainedVectorStructures::default();
+        trained.centroids.insert(7, Arc::new(centroids));
+        trained
+    }
+
+    #[test]
+    fn ann_heap_pinning_accounts_for_global_routing_arrays() {
+        let mut trained = trained_float_artifacts();
+        trained.pin_ann_structures(&PinPolicy {
+            budget_bytes: 1 << 20,
+            mode: PinMode::Copy,
+        });
+        let report = trained.ann_pin_report();
+        assert!(report.intended_bytes > 0);
+        assert_eq!(report.pinned_bytes, report.intended_bytes);
+        assert_eq!(report.skipped_budget_bytes, 0);
+        assert_eq!(report.failed_bytes, 0);
+    }
+
+    #[test]
+    fn ann_heap_pinning_honors_generation_budget() {
+        let mut trained = trained_float_artifacts();
+        trained.pin_ann_structures(&PinPolicy {
+            budget_bytes: 1,
+            mode: PinMode::Copy,
+        });
+        let report = trained.ann_pin_report();
+        assert!(report.intended_bytes > 0);
+        assert_eq!(report.pinned_bytes, 0);
+        assert_eq!(report.skipped_budget_bytes, report.intended_bytes);
     }
 }

@@ -244,7 +244,10 @@ pub(super) fn build_vectors_streaming(
                                     "parallel IVF-PQ build failed for field {field_id}: {error}"
                                 ))
                             })?;
-                        super::super::ann_build::serialize_ivf_pq(index)
+                        super::super::ann_build::serialize_ivf_pq(
+                            index,
+                            centroids.num_clusters,
+                        )
                             .map(|b| (super::super::ann_build::IVF_PQ_TYPE, b))
                     }
                     _ => return Ok(None),
@@ -388,10 +391,12 @@ pub(super) fn build_vectors_streaming(
                 .map_err(crate::Error::Io)?;
                 let blob_offset = current_offset;
                 let mut output = &mut *writer;
-                let blob_len = u64::try_from(
-                    index.write_to(&mut output).map_err(crate::Error::Io)?,
+                let blob_len = crate::segment::ann_disk::write_built_binary_ivf(
+                    &index,
+                    cfg.ivf_routing,
+                    &mut output,
                 )
-                .map_err(|_| crate::Error::Internal("binary IVF blob size exceeds u64".into()))?;
+                .map_err(crate::Error::Io)?;
                 current_offset = current_offset.checked_add(blob_len).ok_or_else(|| {
                     crate::Error::Internal("binary IVF output offset exceeds u64".into())
                 })?;

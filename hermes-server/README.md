@@ -231,6 +231,12 @@ Train new global IVF-PQ or binary-IVF codebooks from the current corpus and
 rebuild every ANN segment. The complete segment/codebook generation is
 published atomically; existing readers keep the previous generation.
 
+Training reads a deterministic corpus-wide sample for one field at a time.
+`--vector-training-max-samples` (default 10,000,000) and
+`--vector-training-memory-mb` (default 4096) are simultaneous per-field
+bounds; the smaller limit wins. Unselected corpus vectors are never loaded
+into the training sample.
+
 ```protobuf
 rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
 ```

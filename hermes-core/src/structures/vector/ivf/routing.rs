@@ -367,6 +367,15 @@ impl HnswRoutingGraph {
             + self.neighbors.len() * size_of::<u32>()
             + 32
     }
+
+    /// Visit the compact, immutable arrays touched by every HNSW route.
+    /// Query scratch is thread-local and intentionally excluded.
+    pub(crate) fn visit_resident_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        visit("HNSW node levels", bytes_of_slice(&self.node_levels));
+        visit("HNSW node offsets", bytes_of_slice(&self.node_offsets));
+        visit("HNSW level offsets", bytes_of_slice(&self.level_offsets));
+        visit("HNSW neighbors", bytes_of_slice(&self.neighbors));
+    }
 }
 
 fn greedy_search_level(
@@ -612,6 +621,26 @@ impl IvfRoutingTopology {
                 leaves.iter().copied().eq(0..num_leaves as u32)
             }
     }
+
+    pub(crate) fn visit_resident_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        visit(
+            "two-level child offsets",
+            bytes_of_slice(&self.child_offsets),
+        );
+        visit("two-level leaf IDs", bytes_of_slice(&self.leaf_ids));
+    }
+}
+
+/// View an initialized plain-data slice as bytes for residency operations.
+/// The returned slice cannot outlive the source and is never mutated.
+pub(crate) fn bytes_of_slice<T>(slice: &[T]) -> &[u8] {
+    let byte_len = std::mem::size_of_val(slice);
+    if byte_len == 0 {
+        return &[];
+    }
+    // SAFETY: every byte in an initialized `T` allocation may be read as u8;
+    // the lifetime remains tied to `slice`, and callers receive no mutation.
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), byte_len) }
 }
 
 pub fn routing_parent_count(num_leaves: usize) -> usize {

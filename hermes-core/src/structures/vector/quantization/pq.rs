@@ -471,6 +471,21 @@ impl PQCodebook {
             .unwrap_or(0);
         centroids_size + rotation_size + 64
     }
+
+    /// Visit the small, index-global tables required to build every IVF-PQ
+    /// query plan and distance table.
+    pub(crate) fn visit_resident_regions(&self, visit: &mut dyn FnMut(&'static str, &[u8])) {
+        if let Some(rotation) = &self.rotation_matrix {
+            visit(
+                "PQ rotation matrix",
+                crate::structures::vector::ivf::routing::bytes_of_slice(rotation),
+            );
+        }
+        visit(
+            "PQ centroid table",
+            crate::structures::vector::ivf::routing::bytes_of_slice(&self.centroids),
+        );
+    }
 }
 
 /// Precomputed distance table for fast asymmetric distance computation

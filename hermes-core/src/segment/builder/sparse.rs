@@ -109,7 +109,9 @@ pub(super) fn build_sparse_streaming(
 
         match format {
             SparseFormat::Bmp => {
-                let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
+                let bmp_block_size = sparse_config
+                    .map(|config| config.bmp_block_size)
+                    .unwrap_or(crate::structures::SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE);
                 let grid_bits = sparse_config.map(|c| c.bmp_grid_bits).unwrap_or(4);
                 let dims = sparse_config.and_then(|c| c.dims).unwrap_or(105879); // default SPLADE vocab
                 let max_weight = sparse_config.and_then(|c| c.max_weight).unwrap_or(5.0); // default SPLADE max

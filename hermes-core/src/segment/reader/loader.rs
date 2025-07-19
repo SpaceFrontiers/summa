@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::Cursor;
 
 use super::super::types::SegmentFiles;
@@ -28,6 +28,9 @@ pub struct VectorsFileData {
     pub indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — doc_ids in memory, vectors via mmap for reranking/merge
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
+    /// ANN field IDs declared by the validated TOC. Training-only callers use
+    /// this without opening corpus-sized ANN payloads.
+    pub ann_fields: Vec<u32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,11 +265,36 @@ pub async fn load_vectors_file<D: Directory>(
     schema: &Schema,
     total_docs: u32,
 ) -> Result<VectorsFileData> {
+    load_vectors_file_impl(dir, files, schema, total_docs, true, None).await
+}
+
+/// Open only selected flat-vector fields for training. The TOC and flat
+/// payloads receive the same validation as search loading, but ANN run columns
+/// are not mapped or parsed.
+pub(crate) async fn load_flat_vectors_file<D: Directory>(
+    dir: &D,
+    files: &SegmentFiles,
+    schema: &Schema,
+    total_docs: u32,
+    field_ids: &[u32],
+) -> Result<VectorsFileData> {
+    load_vectors_file_impl(dir, files, schema, total_docs, false, Some(field_ids)).await
+}
+
+async fn load_vectors_file_impl<D: Directory>(
+    dir: &D,
+    files: &SegmentFiles,
+    schema: &Schema,
+    total_docs: u32,
+    load_ann: bool,
+    flat_field_filter: Option<&[u32]>,
+) -> Result<VectorsFileData> {
     let mut indexes = FxHashMap::default();
     let mut flat_vectors = FxHashMap::default();
     let empty = || VectorsFileData {
         indexes: FxHashMap::default(),
         flat_vectors: FxHashMap::default(),
+        ann_fields: Vec::new(),
     };
 
     // Skip loading vectors file if schema has no dense/binary dense vector fields
@@ -328,8 +356,38 @@ pub async fn load_vectors_file<D: Directory>(
     }
     validate_vector_toc_ranges(&entries, data_start, data_end)?;
 
-    // Load each entry — a field can have both Flat (lazy) and ANN (in-memory)
+    // Validate field-level TOC structure before opening any payload. ANN
+    // always depends on the same field's exact flat data, and duplicate
+    // entries are corruption regardless of which load mode the caller uses.
     use crate::segment::ann_build;
+    let mut flat_toc_fields = FxHashSet::default();
+    let mut ann_toc_fields = FxHashSet::default();
+    for entry in &entries {
+        let inserted = match entry.index_type {
+            ann_build::FLAT_TYPE => flat_toc_fields.insert(entry.field_id),
+            ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE => {
+                ann_toc_fields.insert(entry.field_id)
+            }
+            _ => continue,
+        };
+        if !inserted {
+            return Err(crate::Error::Corruption(format!(
+                "duplicate vector entry type {} for field {}",
+                entry.index_type, entry.field_id,
+            )));
+        }
+    }
+    for &field_id in &ann_toc_fields {
+        if !flat_toc_fields.contains(&field_id) {
+            return Err(crate::Error::Corruption(format!(
+                "ANN vectors for field {field_id} are missing matching flat vector storage",
+            )));
+        }
+    }
+    let mut ann_fields: Vec<_> = ann_toc_fields.into_iter().collect();
+    ann_fields.sort_unstable();
+
+    // Load each entry — a field can have both flat and mmap-backed ANN data.
     for DenseVectorTocEntry {
         field_id,
         index_type,
@@ -341,20 +399,27 @@ pub async fn load_vectors_file<D: Directory>(
         let end = offset + length;
         match index_type {
             ann_build::FLAT_TYPE => {
-                // Flat binary — load lazily (only doc_ids in memory, vectors via mmap)
+                // Search readers validate the zero-copy document map. Training
+                // readers need only the header and sampled raw-vector ranges.
                 let field = schema.get_field_entry(Field(field_id)).ok_or_else(|| {
                     crate::Error::Corruption(format!(
                         "flat vectors reference unknown schema field {field_id}"
                     ))
                 })?;
+                if flat_field_filter.is_some_and(|filter| !filter.contains(&field_id)) {
+                    continue;
+                }
                 let slice = handle.slice(offset..end);
-                let lazy_flat = LazyFlatVectorData::open_with_doc_limit(slice, Some(total_docs))
-                    .await
-                    .map_err(|error| {
-                        crate::Error::Corruption(format!(
-                            "invalid flat vectors for field {field_id}: {error}"
-                        ))
-                    })?;
+                let lazy_flat = if load_ann {
+                    LazyFlatVectorData::open_with_doc_limit(slice, Some(total_docs)).await
+                } else {
+                    LazyFlatVectorData::open_for_training(slice).await
+                }
+                .map_err(|error| {
+                    crate::Error::Corruption(format!(
+                        "invalid flat vectors for field {field_id}: {error}"
+                    ))
+                })?;
                 match lazy_flat.quantization {
                     DenseVectorQuantization::Binary => {
                         let config = field
@@ -400,16 +465,37 @@ pub async fn load_vectors_file<D: Directory>(
             }
             ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE => {
                 validate_ann_schema(schema, field_id, index_type)?;
-                // ANN payloads stay lazy and zero-copy; only their validated
-                // byte range is retained until first search.
+                if !load_ann {
+                    continue;
+                }
+                // ANN corpus columns stay mmap-backed. Opening validates the
+                // compact header/run directory without decoding payloads.
                 let data = handle.read_bytes_range(offset..end).await?;
                 let index = match index_type {
-                    ann_build::IVF_PQ_TYPE => {
-                        VectorIndex::IvfPq(Arc::new(super::types::LazyIvfPq::new(data)))
-                    }
-                    ann_build::BINARY_IVF_TYPE => {
-                        VectorIndex::BinaryIvf(Arc::new(super::types::LazyBinaryIvf::new(data)))
-                    }
+                    ann_build::IVF_PQ_TYPE => VectorIndex::IvfPq(Arc::new(
+                        super::types::MmapAnnIndex::open(
+                            data,
+                            crate::segment::ann_disk::AnnKind::IvfPq,
+                            total_docs,
+                        )
+                        .map_err(|error| {
+                            crate::Error::Corruption(format!(
+                                "invalid IVF-PQ payload for field {field_id}: {error}"
+                            ))
+                        })?,
+                    )),
+                    ann_build::BINARY_IVF_TYPE => VectorIndex::BinaryIvf(Arc::new(
+                        super::types::MmapAnnIndex::open(
+                            data,
+                            crate::segment::ann_disk::AnnKind::BinaryIvf,
+                            total_docs,
+                        )
+                        .map_err(|error| {
+                            crate::Error::Corruption(format!(
+                                "invalid binary IVF payload for field {field_id}: {error}"
+                            ))
+                        })?,
+                    )),
                     _ => {
                         return Err(crate::Error::Corruption(format!(
                             "unknown vector index type {index_type} for field {field_id}"
@@ -430,23 +516,10 @@ pub async fn load_vectors_file<D: Directory>(
         }
     }
 
-    // Every ANN implementation relies on the exact flat payload for reranking,
-    // multi-value expansion, merge streaming, and corruption checks. Flat-only
-    // fields remain valid while a segment is below its ANN build threshold, but
-    // an ANN-only field would silently change query semantics.
-    let mut ann_fields: Vec<u32> = indexes.keys().copied().collect();
-    ann_fields.sort_unstable();
-    for field_id in ann_fields {
-        if !flat_vectors.contains_key(&field_id) {
-            return Err(crate::Error::Corruption(format!(
-                "ANN vectors for field {field_id} are missing matching flat vector storage"
-            )));
-        }
-    }
-
     Ok(VectorsFileData {
         indexes,
         flat_vectors,
+        ann_fields,
     })
 }
 
@@ -867,7 +940,8 @@ mod tests {
     use crate::structures::{SparseSkipEntry, SparseVectorConfig};
 
     use super::{
-        SegmentFiles, load_sparse_file, load_vectors_file, validate_sparse_dimension_skip_entries,
+        SegmentFiles, load_flat_vectors_file, load_sparse_file, load_vectors_file,
+        validate_sparse_dimension_skip_entries,
     };
 
     fn encoded_skip_entries(entries: &[SparseSkipEntry]) -> Vec<u8> {
@@ -1055,6 +1129,28 @@ mod tests {
         };
         assert!(message.contains("field 1"));
         assert!(message.contains("missing matching flat"));
+    }
+
+    #[tokio::test]
+    async fn training_loads_flat_samples_without_opening_ann_columns() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(120);
+        let dir = RamDirectory::new();
+        let bytes = vectors_file_with_payloads(vec![
+            (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
+            (0, ann_build::IVF_PQ_TYPE, vec![0]),
+        ]);
+        dir.write(&files.vectors, &bytes).await.unwrap();
+
+        let training = load_flat_vectors_file(&dir, &files, &schema, 1, &[0])
+            .await
+            .unwrap();
+        assert_eq!(training.ann_fields, [0]);
+        assert_eq!(training.flat_vectors[&0].num_vectors, 1);
+        assert_eq!(training.flat_vectors[&0].num_docs_with_vectors(), 0);
+        assert!(load_vectors_file(&dir, &files, &schema, 1).await.is_err());
     }
 
     #[tokio::test]

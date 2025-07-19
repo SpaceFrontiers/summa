@@ -3148,6 +3148,7 @@ mod tests {
                 centroids: rustc_hash::FxHashMap::default(),
                 binary_quantizers: rustc_hash::FxHashMap::default(),
                 codebooks: rustc_hash::FxHashMap::default(),
+                ..Default::default()
             })));
 
         let guard = manager.begin_vector_artifact_update().await.unwrap();

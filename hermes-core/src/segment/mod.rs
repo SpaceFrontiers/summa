@@ -1,4 +1,5 @@
 pub(crate) mod ann_build;
+mod ann_disk;
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod builder;
 pub(crate) mod format;

@@ -14,7 +14,7 @@ use crate::dsl::{
     BinaryDenseVectorConfig, BinaryIndexType, DenseVectorConfig, Field, FieldType, VectorIndexType,
 };
 use crate::error::{Error, Result};
-use crate::segment::{SegmentId, SegmentReader};
+use crate::segment::{SegmentFiles, SegmentId, SegmentMeta};
 
 use super::IndexWriter;
 
@@ -24,6 +24,10 @@ const MAX_IVF_CLUSTERS: usize = 1_048_576;
 /// Faiss-style clustering quality floor: fewer points per centroid generally
 /// overfits the training sample and leaves unstable/empty cells.
 const MIN_TRAINING_POINTS_PER_CENTROID: usize = 39;
+/// Bound transient I/O/dequantization buffers independently of the configured
+/// total training sample budget.
+const MAX_SAMPLE_READ_BYTES: usize = 64 * 1024 * 1024;
+const SAMPLE_BLOCK: usize = 256;
 /// Generation-qualified filenames make retraining crash-safe: the currently
 /// published metadata never points at a file being overwritten in place.
 const VECTOR_ARTIFACT_PREFIX: &str = "vector_artifact_";
@@ -203,6 +207,26 @@ fn effective_field_num_clusters(
     Ok(requested.min(quality_limit).min(artifact_limit))
 }
 
+fn training_sample_limit(
+    max_samples: usize,
+    max_bytes: usize,
+    bytes_per_sample: usize,
+) -> Result<usize> {
+    if max_samples == 0 || max_bytes == 0 || bytes_per_sample == 0 {
+        return Err(Error::Schema(
+            "vector training sample count, memory budget, and vector size must be greater than zero"
+                .into(),
+        ));
+    }
+    let memory_limited = max_bytes / bytes_per_sample;
+    if memory_limited == 0 {
+        return Err(Error::Schema(format!(
+            "vector training memory budget ({max_bytes} bytes) cannot hold one {bytes_per_sample}-byte sample"
+        )));
+    }
+    Ok(max_samples.min(memory_limited))
+}
+
 /// Validate the configured centroid count and cap it to the training sample.
 ///
 /// Corpus size drives the automatic heuristic, but training cannot produce
@@ -279,8 +303,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         let mut candidate_metadata = self.segment_manager.read_metadata(Clone::clone).await;
         if !fields_to_train.is_empty() {
-            let (all_vectors, total_vectors) = self
-                .collect_vectors_for_training(
+            let total_vectors = self
+                .count_vectors_for_training(
                     snapshot.segment_ids(),
                     &fields_to_train,
                     mode == VectorGenerationMode::BuildMissing,
@@ -289,8 +313,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             let artifact_generation = SegmentId::new().to_hex();
             let updates = self
                 .train_fields(
+                    snapshot.segment_ids(),
                     &fields_to_train,
-                    &all_vectors,
                     &total_vectors,
                     &artifact_generation,
                 )
@@ -370,8 +394,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     async fn train_fields(
         &self,
+        segment_ids: &[String],
         fields: &[(Field, IvfFieldConfig)],
-        all_vectors: &FxHashMap<u32, TrainingSample>,
         total_vectors: &FxHashMap<u32, usize>,
         artifact_generation: &str,
     ) -> Result<Vec<TrainedFieldUpdate>> {
@@ -379,25 +403,32 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let mut missing = Vec::new();
         let mut updates = Vec::with_capacity(fields.len());
         for (field, config) in fields {
-            // Field working sets are intentionally serialized. Each field can
-            // still use every thread in the bounded background Rayon pool,
-            // but its sample, centroids, and clustering scratch cannot overlap
-            // another field's multi-gigabyte training allocations.
+            // Sample collection and training are both field-serial. At most
+            // one bounded sample, one field's clustering scratch, and one
+            // generated artifact set can coexist.
+            let corpus_count = total_vectors.get(&field.0).copied().unwrap_or(0);
+            let Some(sample) = self
+                .collect_training_sample(segment_ids, *field, config, corpus_count)
+                .await?
+            else {
+                missing.push(field.0);
+                continue;
+            };
             let model = crate::segment::block_in_place_if_multithread(|| {
                 training_pool.install(|| {
                     Self::train_field_model(
                         *field,
                         config,
-                        all_vectors,
-                        total_vectors,
+                        &sample,
+                        corpus_count,
                         artifact_generation,
                     )
                 })
             })?;
-            match model {
-                Some(model) => updates.push(self.save_trained_field(model).await?),
-                None => missing.push(field.0),
-            }
+            // Training artifacts own everything needed for persistence. Drop
+            // the potentially multi-gigabyte sample before async file I/O.
+            drop(sample);
+            updates.push(self.save_trained_field(model).await?);
         }
         if updates.is_empty() && !fields.is_empty() {
             return Err(Error::Schema(format!(
@@ -461,13 +492,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     // Helper methods
     // ========================================================================
 
-    fn reject_ann_in_reader(reader: &SegmentReader, id_str: &str, field_ids: &[u32]) -> Result<()> {
+    fn reject_ann_fields(ann_fields: &[u32], id_str: &str, field_ids: &[u32]) -> Result<()> {
         for &field_id in field_ids {
-            if matches!(
-                reader.vector_indexes().get(&field_id),
-                Some(crate::segment::VectorIndex::IvfPq(_))
-                    | Some(crate::segment::VectorIndex::BinaryIvf(_))
-            ) {
+            if ann_fields.binary_search(&field_id).is_ok() {
                 return Err(Error::Schema(format!(
                     "metadata-flat field {field_id} already has ANN data in segment {id_str}; \
                      recreate the index instead of mixing vector generations"
@@ -475,6 +502,39 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             }
         }
         Ok(())
+    }
+
+    /// Open only selected flat-vector fields plus the tiny segment metadata.
+    /// Training does not need term dictionaries, stores, sparse structures, or
+    /// corpus-sized ANN run columns, and must not pin those transient readers.
+    async fn load_training_vectors(
+        &self,
+        segment_id: SegmentId,
+        field_ids: &[u32],
+    ) -> Result<crate::segment::reader::loader::VectorsFileData> {
+        let files = SegmentFiles::new(segment_id.0);
+        let meta_bytes = self
+            .directory
+            .open_read(&files.meta)
+            .await?
+            .read_bytes()
+            .await?;
+        let meta = SegmentMeta::deserialize(meta_bytes.as_slice())?;
+        if meta.id != segment_id.0 {
+            return Err(Error::Corruption(format!(
+                "segment metadata ID {:032x} does not match file ID {}",
+                meta.id,
+                segment_id.to_hex(),
+            )));
+        }
+        crate::segment::reader::loader::load_flat_vectors_file(
+            self.directory.as_ref(),
+            &files,
+            self.schema.as_ref(),
+            meta.num_docs,
+            field_ids,
+        )
+        .await
     }
 
     /// Get all dense vector fields that need ANN indexes
@@ -526,207 +586,188 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .collect()
     }
 
-    /// Collect a deterministic uniform sample over the complete committed
-    /// corpus. Counting first prevents early segments from monopolizing the
-    /// training budget when an index has many generations of segments.
-    async fn collect_vectors_for_training(
+    /// Count every configured field without reading any vector payload bytes.
+    async fn count_vectors_for_training(
         &self,
         segment_ids: &[String],
         fields_to_build: &[(Field, IvfFieldConfig)],
         require_flat_generation: bool,
-    ) -> Result<(FxHashMap<u32, TrainingSample>, FxHashMap<u32, usize>)> {
-        // At the one-billion-vector default, two million training points allow
-        // about 51K stable cells at the 39-points-per-centroid quality floor.
-        // The byte bound keeps high-dimensional float training below 6 GiB;
-        // k-means' contiguous work matrix can temporarily double that amount.
-        const MAX_TRAINING_VECTORS: usize = 2_000_000;
-        const MAX_TRAINING_SAMPLE_BYTES: usize = 6usize.saturating_mul(1024 * 1024 * 1024);
-
+    ) -> Result<FxHashMap<u32, usize>> {
         let mut total_vectors: FxHashMap<u32, usize> = FxHashMap::default();
         let field_ids: Vec<u32> = fields_to_build.iter().map(|(field, _)| field.0).collect();
 
-        // First pass counts every field globally. Initial construction rejects
+        // Initial construction rejects
         // ANN payloads for metadata-flat fields; an explicit retrain reads the
         // exact flat vectors retained beside the current ANN generation.
         for id_str in segment_ids {
             let segment_id = SegmentId::from_hex(id_str)
                 .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open_with_cache_blocks(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                self.config.term_cache_blocks,
-                self.config.store_cache_blocks,
-            )
-            .await?;
+            let vectors = self.load_training_vectors(segment_id, &field_ids).await?;
 
             if require_flat_generation {
-                Self::reject_ann_in_reader(&reader, id_str, &field_ids)?;
+                Self::reject_ann_fields(&vectors.ann_fields, id_str, &field_ids)?;
             }
 
             for (field, _) in fields_to_build {
-                if let Some(flat) = reader.flat_vectors().get(&field.0) {
+                if let Some(flat) = vectors.flat_vectors.get(&field.0) {
                     let total = total_vectors.entry(field.0).or_default();
-                    *total = total.saturating_add(flat.num_vectors);
+                    *total = total.checked_add(flat.num_vectors).ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "vector count overflows usize for field {}",
+                            field.0,
+                        ))
+                    })?;
                 }
             }
         }
+        Ok(total_vectors)
+    }
 
-        // Draw sorted global vector ordinals independently per field. Mapping
-        // them back onto segment-local indexes preserves uniform probability
-        // without reading vectors that were not selected.
-        let mut selected_ordinals: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
-        for (field, config) in fields_to_build {
-            let total = total_vectors.get(&field.0).copied().unwrap_or(0);
-            if total == 0 {
-                continue;
+    /// Fetch one deterministic, uniform field sample from the pinned segment
+    /// snapshot. Only selected ranges are read; all other corpus vectors stay
+    /// on disk. The caller trains and drops this sample before moving to the
+    /// next field.
+    async fn collect_training_sample(
+        &self,
+        segment_ids: &[String],
+        field: Field,
+        config: &IvfFieldConfig,
+        total: usize,
+    ) -> Result<Option<TrainingSample>> {
+        if total == 0 {
+            return Ok(None);
+        }
+        let bytes_per_sample = match config {
+            IvfFieldConfig::Float(config) => config
+                .dim
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| Error::Schema("float training vector size overflows".into()))?,
+            IvfFieldConfig::Binary(config) => config.dim.div_ceil(8),
+        };
+        let limit = training_sample_limit(
+            self.config.vector_training_max_samples,
+            self.config.vector_training_memory_bytes,
+            bytes_per_sample,
+        )?;
+        let take = total.min(limit);
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
+            0x4845_524d_4553_4956 ^ field.0 as u64 ^ total as u64,
+        );
+        let mut ordinals = Vec::with_capacity(take);
+        if take == total {
+            ordinals.extend(0..total);
+        } else {
+            let blocks = take.div_ceil(SAMPLE_BLOCK);
+            for block in 0..blocks {
+                let block_len = SAMPLE_BLOCK.min(take - ordinals.len());
+                let stratum_start = block.saturating_mul(total) / blocks;
+                let stratum_end = (block + 1).saturating_mul(total) / blocks;
+                let latest_start = stratum_end.saturating_sub(block_len);
+                let start = if latest_start > stratum_start {
+                    rand::Rng::random_range(&mut rng, stratum_start..=latest_start)
+                } else {
+                    stratum_start
+                };
+                ordinals.extend(start..start + block_len);
             }
-            let bytes_per_sample = match config {
-                IvfFieldConfig::Float(config) => config.dim.saturating_mul(size_of::<f32>()),
-                IvfFieldConfig::Binary(config) => config.dim.div_ceil(8),
-            };
-            let limit = MAX_TRAINING_VECTORS.min(
-                MAX_TRAINING_SAMPLE_BYTES
-                    .checked_div(bytes_per_sample.max(1))
-                    .unwrap_or(0)
-                    .max(1),
-            );
-            let take = total.min(limit);
-            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
-                0x4845_524d_4553_4956 ^ field.0 as u64 ^ total as u64,
-            );
-            const SAMPLE_BLOCK: usize = 256;
-            let mut ordinals = Vec::with_capacity(take);
-            if take == total {
-                ordinals.extend(0..total);
-            } else {
-                let blocks = take.div_ceil(SAMPLE_BLOCK);
-                for block in 0..blocks {
-                    let block_len = SAMPLE_BLOCK.min(take - ordinals.len());
-                    let stratum_start = block.saturating_mul(total) / blocks;
-                    let stratum_end = (block + 1).saturating_mul(total) / blocks;
-                    let latest_start = stratum_end.saturating_sub(block_len);
-                    let start = if latest_start > stratum_start {
-                        rand::Rng::random_range(&mut rng, stratum_start..=latest_start)
-                    } else {
-                        stratum_start
-                    };
-                    ordinals.extend(start..start + block_len);
-                }
-            }
-            selected_ordinals.insert(field.0, ordinals);
         }
 
-        let mut all_vectors: FxHashMap<u32, TrainingSample> = FxHashMap::default();
-        let mut global_offsets: FxHashMap<u32, usize> = FxHashMap::default();
-        let mut sample_cursors: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut sample = match config {
+            IvfFieldConfig::Float(_) => TrainingSample::Float(Vec::with_capacity(take)),
+            IvfFieldConfig::Binary(_) => TrainingSample::Binary(Vec::with_capacity(
+                take.checked_mul(bytes_per_sample)
+                    .ok_or_else(|| Error::Schema("binary training sample size overflows".into()))?,
+            )),
+        };
+        let max_read_vectors = (MAX_SAMPLE_READ_BYTES / bytes_per_sample.max(1)).max(1);
+        let mut global_offset = 0usize;
+        let mut cursor = 0usize;
+        let field_ids = [field.0];
 
-        // Second pass: fetch only selected vector ordinals.
         for id_str in segment_ids {
             let segment_id = SegmentId::from_hex(id_str)
                 .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {id_str}")))?;
-            let reader = SegmentReader::open_with_cache_blocks(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                self.config.term_cache_blocks,
-                self.config.store_cache_blocks,
-            )
-            .await?;
+            let vectors = self.load_training_vectors(segment_id, &field_ids).await?;
 
-            for (field, config) in fields_to_build {
-                let Some(lazy_flat) = reader.flat_vectors().get(&field.0) else {
-                    continue;
-                };
-                let base = *global_offsets.entry(field.0).or_default();
-                let end = base.saturating_add(lazy_flat.num_vectors);
-                *global_offsets.get_mut(&field.0).unwrap() = end;
-                let Some(ordinals) = selected_ordinals.get(&field.0) else {
-                    continue;
-                };
-                let cursor = sample_cursors.entry(field.0).or_default();
-                let first = *cursor;
-                while *cursor < ordinals.len() && ordinals[*cursor] < end {
-                    *cursor += 1;
+            let Some(lazy_flat) = vectors.flat_vectors.get(&field.0) else {
+                continue;
+            };
+            let base = global_offset;
+            let end = base.checked_add(lazy_flat.num_vectors).ok_or_else(|| {
+                Error::Corruption(format!("vector offset overflows for field {}", field.0))
+            })?;
+            global_offset = end;
+            let first = cursor;
+            while cursor < ordinals.len() && ordinals[cursor] < end {
+                cursor += 1;
+            }
+            let selected = &ordinals[first..cursor];
+            let mut run_start = 0;
+            while run_start < selected.len() {
+                let mut run_end = run_start + 1;
+                while run_end < selected.len()
+                    && run_end - run_start < max_read_vectors
+                    && selected[run_end] == selected[run_end - 1] + 1
+                {
+                    run_end += 1;
                 }
-                let indices: Vec<usize> = ordinals[first..*cursor]
-                    .iter()
-                    .map(|ordinal| ordinal - base)
-                    .collect();
-                if indices.is_empty() {
-                    continue;
-                }
-
-                let entry = all_vectors.entry(field.0).or_insert_with(|| match config {
-                    IvfFieldConfig::Float(_) => TrainingSample::Float(Vec::new()),
-                    IvfFieldConfig::Binary(_) => TrainingSample::Binary(Vec::new()),
-                });
-                if let TrainingSample::Binary(codes) = entry {
-                    let byte_len = config.dim().div_ceil(8);
-                    let mut run_start = 0;
-                    while run_start < indices.len() {
-                        let mut run_end = run_start + 1;
-                        while run_end < indices.len()
-                            && indices[run_end] == indices[run_end - 1] + 1
-                        {
-                            run_end += 1;
-                        }
-                        let bytes = lazy_flat
-                            .read_vectors_batch(indices[run_start], run_end - run_start)
-                            .await
-                            .map_err(crate::Error::Io)?;
-                        codes.extend_from_slice(bytes.as_slice());
-                        debug_assert_eq!(
-                            bytes.len(),
-                            (run_end - run_start).saturating_mul(byte_len)
-                        );
-                        run_start = run_end;
-                    }
-                    continue;
-                }
-
-                let TrainingSample::Float(vectors) = entry else {
-                    unreachable!()
-                };
-                let dim = lazy_flat.dim;
-                let mut run_start = 0;
-                while run_start < indices.len() {
-                    let mut run_end = run_start + 1;
-                    while run_end < indices.len() && indices[run_end] == indices[run_end - 1] + 1 {
-                        run_end += 1;
-                    }
-                    let run_len = run_end - run_start;
-                    let bytes = lazy_flat
-                        .read_vectors_batch(indices[run_start], run_len)
-                        .await
-                        .map_err(crate::Error::Io)?;
-                    let mut decoded = vec![0.0; run_len.saturating_mul(dim)];
-                    crate::segment::dequantize_raw(
-                        bytes.as_slice(),
-                        lazy_flat.quantization,
-                        decoded.len(),
-                        &mut decoded,
-                    )
+                let local_start = selected[run_start] - base;
+                let run_len = run_end - run_start;
+                let bytes = lazy_flat
+                    .read_vectors_batch(local_start, run_len)
+                    .await
                     .map_err(crate::Error::Io)?;
-                    vectors.extend(decoded.chunks_exact(dim).map(<[f32]>::to_vec));
-                    run_start = run_end;
+                match &mut sample {
+                    TrainingSample::Binary(codes) => {
+                        let expected = run_len.checked_mul(bytes_per_sample).ok_or_else(|| {
+                            Error::Corruption("binary sample read size overflows".into())
+                        })?;
+                        if bytes.len() != expected {
+                            return Err(Error::Corruption(format!(
+                                "binary sample read returned {} bytes, expected {expected}",
+                                bytes.len(),
+                            )));
+                        }
+                        codes.extend_from_slice(bytes.as_slice());
+                    }
+                    TrainingSample::Float(vectors) => {
+                        let dim = lazy_flat.dim;
+                        let float_count = run_len.checked_mul(dim).ok_or_else(|| {
+                            Error::Corruption("float sample read size overflows".into())
+                        })?;
+                        let mut decoded = vec![0.0; float_count];
+                        crate::segment::dequantize_raw(
+                            bytes.as_slice(),
+                            lazy_flat.quantization,
+                            decoded.len(),
+                            &mut decoded,
+                        )
+                        .map_err(crate::Error::Io)?;
+                        vectors.extend(decoded.chunks_exact(dim).map(<[f32]>::to_vec));
+                    }
                 }
+                run_start = run_end;
             }
         }
 
-        let total: usize = total_vectors.values().sum();
-        let collected: usize = selected_ordinals.values().map(Vec::len).sum();
+        let collected = sample.len(config.dim());
+        if global_offset != total || cursor != take || collected != take {
+            return Err(Error::Corruption(format!(
+                "training sample coverage mismatch for field {}: counted={total}, traversed={global_offset}, selected={cursor}, collected={collected}",
+                field.0,
+            )));
+        }
         if collected < total {
             log::info!(
-                "Sampled {} vectors for training (skipped {}, max {} vectors / {} bytes per field)",
+                "Sampled {} / {} vectors for field {} (max {} vectors / {} bytes resident)",
                 collected,
-                total - collected,
-                MAX_TRAINING_VECTORS,
-                MAX_TRAINING_SAMPLE_BYTES,
+                total,
+                field.0,
+                self.config.vector_training_max_samples,
+                self.config.vector_training_memory_bytes,
             );
         }
-
-        Ok((all_vectors, total_vectors))
+        Ok(Some(sample))
     }
 
     /// Train one field. Called from the shared bounded Rayon pool, so fields
@@ -734,22 +775,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     fn train_field_model(
         field: Field,
         config: &IvfFieldConfig,
-        all_vectors: &FxHashMap<u32, TrainingSample>,
-        total_vectors: &FxHashMap<u32, usize>,
+        sample: &TrainingSample,
+        corpus_count: usize,
         artifact_generation: &str,
-    ) -> Result<Option<TrainedFieldModel>> {
+    ) -> Result<TrainedFieldModel> {
         let field_id = field.0;
-        let sample = match all_vectors.get(&field_id) {
-            Some(sample) if sample.len(config.dim()) > 0 => sample,
-            _ => return Ok(None),
-        };
-
         let dim = config.dim();
         let sample_count = sample.len(dim);
-        let corpus_count = total_vectors
-            .get(&field_id)
-            .copied()
-            .unwrap_or(sample_count);
+        if sample_count == 0 || corpus_count == 0 {
+            return Err(Error::Internal(format!(
+                "empty training sample for non-empty field {field_id}"
+            )));
+        }
         let num_clusters = effective_field_num_clusters(config, corpus_count, sample_count)?;
 
         log::info!(
@@ -809,7 +846,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             TrainedFieldArtifacts::Float { centroids, .. } => centroids.num_clusters as usize,
             TrainedFieldArtifacts::Binary(quantizer) => quantizer.num_clusters as usize,
         };
-        Ok(Some(TrainedFieldModel {
+        Ok(TrainedFieldModel {
             update: TrainedFieldUpdate {
                 field_id,
                 index_type: config.index_type(),
@@ -819,7 +856,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 codebook_file: codebook_filename,
             },
             artifacts,
-        }))
+        })
     }
 
     async fn save_trained_field(&self, model: TrainedFieldModel) -> Result<TrainedFieldUpdate> {
@@ -1001,6 +1038,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("without sample vectors"));
+    }
+
+    #[test]
+    fn training_sample_limit_honors_both_cli_bounds() {
+        assert_eq!(training_sample_limit(10_000_000, 4_096, 4).unwrap(), 1_024);
+        assert_eq!(training_sample_limit(100, 4_096, 4).unwrap(), 100);
+        let error = training_sample_limit(100, 3, 4).unwrap_err().to_string();
+        assert!(error.contains("cannot hold one"), "{error}");
     }
 
     #[test]

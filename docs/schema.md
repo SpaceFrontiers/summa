@@ -270,8 +270,10 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4�
 
 Float fields have one production ANN format: corpus-trained global IVF-PQ.
 Every segment shares the index's centroid router and residual-PQ codebook;
-segments store only compact assignments and PQ codes. `flat` remains available
-for exact brute-force search and as the accumulation format before ANN build.
+segments store only mmap-backed cluster runs and PQ codes. Ordinary segment
+merges copy those immutable run columns byte-for-byte and rewrite only their
+compact document-base directory. `flat` remains available for exact
+brute-force search and as the accumulation format before ANN build.
 
 ```
 field e: dense_vector<768, f16> [indexed]                                      # global IVF-PQ
@@ -286,7 +288,8 @@ can be `auto`, `flat`, `two_level`, or `hnsw`; `auto` uses flat centroid scoring
 below 4,096 leaves and HNSW above it. HNSW is a global coarse-quantizer index,
 so its work is done once per query rather than once per segment. The default
 `nprobe` is 64. Candidate collection keeps distinct documents, is bounded to
-3×k, and exact reranking reads at most that bounded set across all segments.
+3×k per segment, and exact reranking streams every value of those candidate
+documents through fixed-size buffers.
 
 ### SOAR (higher recall for IVF indexes)
 
