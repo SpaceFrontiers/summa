@@ -1,0 +1,30 @@
+[package]
+name = "hermes-tokenizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Stable-Rust byte-level BPE tokenization for Hermes"
+keywords = ["tokenizer", "bpe", "llm", "nlp"]
+categories = ["text-processing"]
+
+[dependencies]
+aho-corasick = "1.1"
+anyhow = { workspace = true }
+icu_normalizer = { version = "2.2", features = ["compiled_data"] }
+icu_properties = { version = "2.2", features = ["compiled_data"] }
+memchr = "2.8"
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ahash = "0.8"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }

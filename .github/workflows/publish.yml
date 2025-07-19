@@ -94,6 +94,8 @@ jobs:
           sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
           # Update hermes-core dependency version in workspace
           sed -i 's/hermes-core = { version = "[^"]*"/hermes-core = { version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
+          # Update hermes-tokenizer dependency version in workspace
+          sed -i 's/hermes-tokenizer = { version = "[^"]*"/hermes-tokenizer = { version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
           echo "Updated Cargo.toml to version ${{ steps.bump.outputs.new_version }}"
 
       - name: Update pyproject.toml versions
@@ -152,6 +154,13 @@ jobs:
 
       - name: Publish hermes-mal
         run: cargo publish -p hermes-mal --no-verify
+        continue-on-error: true
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish hermes-tokenizer
+        run: cargo publish -p hermes-tokenizer --no-verify
         continue-on-error: true
 
       - name: Wait for crates.io index

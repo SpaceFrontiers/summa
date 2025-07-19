@@ -4,6 +4,7 @@ members = [
     "hermes-llm",
     "hermes-mal",
     "hermes-mal-python",
+    "hermes-tokenizer",
     "hermes-train",
     "hermes-server",
     "hermes-tool",
@@ -30,6 +31,7 @@ categories = ["database", "text-processing"]
 hermes-core = { version = "1.8.73", path = "hermes-core", default-features = false }
 hermes-mal = { version = "1.8.57", path = "hermes-mal" }
 hermes-llm = { version = "1.8.57", path = "hermes-llm", default-features = false }
+hermes-tokenizer = { version = "1.8.73", path = "hermes-tokenizer" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
