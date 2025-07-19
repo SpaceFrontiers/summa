@@ -425,6 +425,40 @@ where
     }
 }
 
+/// Search binary ANN candidates once, avoiding multi-value over-fetch for
+/// segments that store at most one vector per document.
+///
+/// Binary IVF scans the same probed clusters regardless of collector size. A
+/// multi-valued field therefore collects the capped ranked list once so the
+/// distinct-document deepening schedule can be replayed without rescanning.
+/// For a physically single-valued segment every vector represents a distinct
+/// document, so collecting more than `target_docs` only adds heap and sorting
+/// work without changing the result.
+fn binary_ann_search<F>(
+    single_valued: bool,
+    target_docs: usize,
+    initial_fetch: usize,
+    max_vectors: usize,
+    search: F,
+) -> Result<Vec<RawVectorCandidate>>
+where
+    F: FnOnce(usize) -> Vec<RawVectorCandidate>,
+{
+    if !single_valued {
+        return single_scan_ann_search(target_docs, initial_fetch, max_vectors, search);
+    }
+
+    let fetch = target_docs
+        .min(max_vectors)
+        .min(MAX_DENSE_CANDIDATES_PER_SEGMENT);
+    if fetch == 0 {
+        return Ok(Vec::new());
+    }
+    let mut results = search(fetch);
+    results.truncate(fetch);
+    Ok(results)
+}
+
 #[inline]
 fn bounded_vector_score_batch(vector_byte_size: usize, preferred: usize) -> usize {
     preferred.min((MAX_VECTOR_SCORE_BATCH_BYTES / vector_byte_size.max(1)).max(1))
@@ -1858,9 +1892,10 @@ impl SegmentReader {
             .filter(|&n| n > 0)
     }
 
-    /// Search binary dense vectors using brute-force Hamming distance.
+    /// Search binary dense vectors using IVF when available, otherwise
+    /// brute-force Hamming distance.
     ///
-    /// Always flat brute-force (no ANN). Returns VectorSearchResult with ordinal tracking.
+    /// Returns VectorSearchResult with ordinal tracking.
     pub async fn search_binary_dense_vector(
         &self,
         field: Field,
@@ -1903,10 +1938,12 @@ impl SegmentReader {
             let nprobe = self.binary_ivf_nprobe(field);
             let initial_fetch =
                 ann_ordinal_fetch_k(k, flat.num_vectors, flat.num_docs_with_vectors());
-            // Single scan: BinaryIvfIndex::search scans all probed clusters
-            // regardless of candidate_k, so progressive doubling would repeat
-            // the identical scan on every retry.
-            let ann_results = single_scan_ann_search(
+            let single_valued = flat.num_vectors == flat.num_docs_with_vectors();
+            // Physically single-valued segments collect exactly k candidates.
+            // Multi-valued segments collect the capped ranking once so
+            // distinct-document deepening does not repeat the identical scan.
+            let ann_results = binary_ann_search(
+                single_valued,
                 k.min(flat.num_docs_with_vectors()),
                 initial_fetch,
                 ivf.len().min(flat.num_vectors),
@@ -2537,10 +2574,12 @@ impl SegmentReader {
             let nprobe = self.binary_ivf_nprobe(field);
             let initial_fetch =
                 ann_ordinal_fetch_k(k, flat.num_vectors, flat.num_docs_with_vectors());
-            // Single scan: BinaryIvfIndex::search scans all probed clusters
-            // regardless of candidate_k, so progressive doubling would repeat
-            // the identical scan on every retry.
-            let ann_results = single_scan_ann_search(
+            let single_valued = flat.num_vectors == flat.num_docs_with_vectors();
+            // Physically single-valued segments collect exactly k candidates.
+            // Multi-valued segments collect the capped ranking once so
+            // distinct-document deepening does not repeat the identical scan.
+            let ann_results = binary_ann_search(
+                single_valued,
                 k.min(flat.num_docs_with_vectors()),
                 initial_fetch,
                 ivf.len().min(flat.num_vectors),
@@ -2788,6 +2827,33 @@ mod dense_search_safety_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn binary_ann_search_does_not_overcollect_single_valued_candidates() {
+        let ranked: Vec<RawVectorCandidate> = (0..64)
+            .map(|doc_id| (doc_id, 0, 1.0 - doc_id as f32 / 100.0))
+            .collect();
+
+        let mut single_fetch = None;
+        let single = binary_ann_search(true, 3, 3, ranked.len(), |fetch| {
+            single_fetch = Some(fetch);
+            ranked.iter().copied().take(fetch).collect()
+        })
+        .unwrap();
+        assert_eq!(single_fetch, Some(3));
+        assert_eq!(single, ranked[..3]);
+
+        // Multi-valued fields retain the existing one-scan replay: collect the
+        // full probed population once, then replay the distinct-doc schedule.
+        let mut multi_fetch = None;
+        let multi = binary_ann_search(false, 3, 3, ranked.len(), |fetch| {
+            multi_fetch = Some(fetch);
+            ranked.iter().copied().take(fetch).collect()
+        })
+        .unwrap();
+        assert_eq!(multi_fetch, Some(ranked.len()));
+        assert_eq!(multi, ranked[..3]);
     }
 
     /// Probe-returned (doc, ordinal) pairs keep their probe scores and are
