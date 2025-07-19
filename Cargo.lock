@@ -1395,9 +1395,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a394189d59f9befacce833f337f7b1eca5e9a91221bcdd4d28e0114d96e597b3"
+checksum = "e2e30e509674ef0ec91e21a7735766db37d163d46151b6a361d8b83dd79116bd"
 dependencies = [
  "link-section",
  "linktime-proc-macro",
@@ -3065,7 +3065,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "anyhow",
  "axum",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "anyhow",
  "pest",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "anyhow",
  "clap",
@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.74"
+version = "1.8.75"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -3965,9 +3965,9 @@ dependencies = [
 
 [[package]]
 name = "link-section"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e333fe507b738576d6da5bb3f1a7d7a1c80307ed9ef31624c057d844c19c93e9"
+checksum = "8dc98458dfe90986c5e2f6ddcf68360c7e5c4252600153e06aa4ee8176c0f8d1"
 
 [[package]]
 name = "linktime-proc-macro"
