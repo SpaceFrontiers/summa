@@ -3,8 +3,9 @@
 use std::sync::LazyLock;
 
 use hermes_core::query::{
-    BinaryDenseVectorQuery, DenseVectorQuery, LazyGlobalStats, MAX_DENSE_NPROBE,
-    MAX_DENSE_RERANK_FACTOR, MultiValueCombiner, RerankerConfig, SparseVectorQuery,
+    BinaryDenseVectorQuery, DEFAULT_DENSE_RERANK_FACTOR, DenseVectorQuery, LazyGlobalStats,
+    MAX_DENSE_NPROBE, MAX_DENSE_RERANK_FACTOR, MultiValueCombiner, RerankerConfig,
+    SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
@@ -466,7 +467,7 @@ pub fn convert_query(
             }
 
             let rerank_factor = if dv_query.rerank_factor == 0.0 {
-                3.0
+                DEFAULT_DENSE_RERANK_FACTOR
             } else {
                 dv_query.rerank_factor
             };
@@ -1255,6 +1256,7 @@ mod tests {
             f32::INFINITY,
             f32::NEG_INFINITY,
             -1.0,
+            2.01,
             MAX_DENSE_RERANK_FACTOR + 1.0,
         ] {
             let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);

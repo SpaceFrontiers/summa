@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hermes-mal"
-version = "1.8.78"
+version = "1.8.80"
 description = "Python bindings for the Hermes MAL parser (single source of truth, backed by Rust)"
 readme = "README.md"
 license = "MIT"

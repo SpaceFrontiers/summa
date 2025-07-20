@@ -7,7 +7,9 @@ mod sparse;
 
 pub use binary_dense::BinaryDenseVectorQuery;
 pub use combiner::MultiValueCombiner;
-pub use dense::{DenseVectorQuery, MAX_DENSE_NPROBE, MAX_DENSE_RERANK_FACTOR};
+pub use dense::{
+    DEFAULT_DENSE_RERANK_FACTOR, DenseVectorQuery, MAX_DENSE_NPROBE, MAX_DENSE_RERANK_FACTOR,
+};
 pub use sparse::{SparseTermQuery, SparseVectorQuery};
 
 use crate::segment::VectorSearchResult;

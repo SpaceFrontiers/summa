@@ -515,7 +515,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                 // Matryoshka pre-filter
                 if let Some(mdims) = config.matryoshka_dims
                     && mdims < query_dim
-                    && n > final_limit.saturating_mul(2)
+                    && n > crate::query::max_candidate_limit(final_limit)
                 {
                     let trunc_dim = mdims;
                     let trunc_pq = PrecompQuery {
@@ -590,7 +590,8 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                         });
                     });
                     let approximate_docs = ranked.len();
-                    let survivor_doc_limit = final_limit.saturating_mul(2).min(approximate_docs);
+                    let survivor_doc_limit =
+                        crate::query::max_candidate_limit(final_limit).min(approximate_docs);
                     let survivor_docs: FxHashSet<usize> = ranked
                         .into_iter()
                         .take(survivor_doc_limit)
@@ -716,7 +717,11 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     // Sort flat buffer by candidate_idx so contiguous runs belong to the same doc
     all_scores.sort_unstable_by_key(|&(ci, _, _)| ci);
 
-    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len().min(final_limit * 2));
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(
+        candidates
+            .len()
+            .min(crate::query::max_candidate_limit(final_limit)),
+    );
     let mut ordinal_pairs: Vec<(u32, f32)> = Vec::new();
     let mut i = 0;
     while i < all_scores.len() {

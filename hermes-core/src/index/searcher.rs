@@ -775,9 +775,9 @@ impl<D: Directory + 'static> Searcher<D> {
     /// carry per-chunk `positions`.
     ///
     /// Each query is paired with a weight scaling its contribution.
-    /// `fetch_limit` is the per-query candidate depth. The server defaults to
-    /// `4 * limit` (min 50) without reranking, but uses the already
-    /// oversubscribed rerank pool directly when one is configured.
+    /// `fetch_limit` is the per-query candidate depth. Request-facing adapters
+    /// default to at most [`crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION`] times
+    /// the result window and never multiply an existing rerank pool again.
     pub async fn search_fused(
         &self,
         queries: &[(&dyn crate::query::Query, f32)],

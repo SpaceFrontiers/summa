@@ -8,6 +8,8 @@ use super::combiner::MultiValueCombiner;
 use crate::query::ScoredPosition;
 use crate::query::traits::{CountFuture, MatchedPositions, Query, Scorer, ScorerFuture};
 
+const DEFAULT_SPARSE_OVER_FETCH_FACTOR: f32 = crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32;
+
 /// Sparse vector query for similarity search
 #[derive(Debug, Clone)]
 pub struct SparseVectorQuery {
@@ -73,7 +75,7 @@ impl SparseVectorQuery {
             max_query_dims: Some(crate::query::MAX_QUERY_TERMS),
             pruning: None,
             min_query_dims: 4,
-            over_fetch_factor: 2.0,
+            over_fetch_factor: DEFAULT_SPARSE_OVER_FETCH_FACTOR,
             max_superblocks: 0,
             pruned: None,
         };
@@ -114,9 +116,11 @@ impl SparseVectorQuery {
                 self.heap_factor
             )));
         }
-        if !self.over_fetch_factor.is_finite() || self.over_fetch_factor < 1.0 {
+        if !self.over_fetch_factor.is_finite()
+            || !(1.0..=DEFAULT_SPARSE_OVER_FETCH_FACTOR).contains(&self.over_fetch_factor)
+        {
             return Err(crate::Error::Query(format!(
-                "sparse over_fetch_factor must be finite and at least 1, got {}",
+                "sparse over_fetch_factor must be finite and in [1, {DEFAULT_SPARSE_OVER_FETCH_FACTOR}], got {}",
                 self.over_fetch_factor
             )));
         }
@@ -134,7 +138,7 @@ impl SparseVectorQuery {
     /// this multiplier compensates by fetching more from the executor.
     /// (1.0 = no over-fetch, 2.0 = fetch 2x then combine down)
     pub fn with_over_fetch_factor(mut self, factor: f32) -> Self {
-        self.over_fetch_factor = factor.max(1.0);
+        self.over_fetch_factor = factor.clamp(1.0, DEFAULT_SPARSE_OVER_FETCH_FACTOR);
         self
     }
 
@@ -586,7 +590,7 @@ impl SparseTermQuery {
             weight,
             heap_factor: 1.0,
             combiner: MultiValueCombiner::default(),
-            over_fetch_factor: 2.0,
+            over_fetch_factor: DEFAULT_SPARSE_OVER_FETCH_FACTOR,
         }
     }
 
@@ -601,7 +605,7 @@ impl SparseTermQuery {
     }
 
     pub fn with_over_fetch_factor(mut self, factor: f32) -> Self {
-        self.over_fetch_factor = factor.max(1.0);
+        self.over_fetch_factor = factor.clamp(1.0, DEFAULT_SPARSE_OVER_FETCH_FACTOR);
         self
     }
 
@@ -627,9 +631,11 @@ impl SparseTermQuery {
                 self.heap_factor
             )));
         }
-        if !self.over_fetch_factor.is_finite() || self.over_fetch_factor < 1.0 {
+        if !self.over_fetch_factor.is_finite()
+            || !(1.0..=DEFAULT_SPARSE_OVER_FETCH_FACTOR).contains(&self.over_fetch_factor)
+        {
             return Err(crate::Error::Query(format!(
-                "sparse over_fetch_factor must be finite and at least 1, got {}",
+                "sparse over_fetch_factor must be finite and in [1, {DEFAULT_SPARSE_OVER_FETCH_FACTOR}], got {}",
                 self.over_fetch_factor
             )));
         }
@@ -855,5 +861,20 @@ mod tests {
         assert_eq!(query.pruned_dims().len(), crate::query::MAX_QUERY_TERMS);
         // Pruning retains the dimensions with the largest absolute weights.
         assert!(query.pruned_dims().iter().all(|(dim, _)| *dim >= 36));
+    }
+
+    #[test]
+    fn sparse_over_fetch_factor_uses_shared_candidate_bound() {
+        let query = SparseVectorQuery::new(Field(0), vec![]).with_over_fetch_factor(99.0);
+        let term = SparseTermQuery::new(Field(0), 1, 1.0).with_over_fetch_factor(99.0);
+
+        assert_eq!(
+            query.over_fetch_factor,
+            crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32
+        );
+        assert_eq!(
+            term.over_fetch_factor,
+            crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32
+        );
     }
 }

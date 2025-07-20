@@ -60,7 +60,7 @@ jobs:
         id: current
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Current version: $VERSION"
 
       - name: Calculate new version
@@ -85,7 +85,7 @@ jobs:
           esac
 
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "New version: $NEW_VERSION"
 
       - name: Update Cargo.toml versions
@@ -147,46 +147,27 @@ jobs:
 
       - name: Publish hermes-core
         run: cargo publish -p hermes-core --no-verify
-        continue-on-error: true
 
       - name: Wait for crates.io index
         run: sleep 30
 
       - name: Publish hermes-mal
         run: cargo publish -p hermes-mal --no-verify
-        continue-on-error: true
 
       - name: Wait for crates.io index
         run: sleep 30
 
       - name: Publish hermes-tokenizer
         run: cargo publish -p hermes-tokenizer --no-verify
-        continue-on-error: true
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish hermes-llm
-        run: cargo publish -p hermes-llm --no-verify
-        continue-on-error: true
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish hermes-train
-        run: cargo publish -p hermes-train --no-verify
-        continue-on-error: true
 
       - name: Wait for crates.io index
         run: sleep 30
 
       - name: Publish hermes-server
         run: cargo publish -p hermes-server --no-verify
-        continue-on-error: true
 
       - name: Publish hermes-tool
         run: cargo publish -p hermes-tool --no-verify
-        continue-on-error: true
 
   publish-npm:
     name: Publish to NPM

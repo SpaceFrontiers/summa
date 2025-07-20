@@ -284,7 +284,6 @@ macro_rules! boolean_plan {
         if !scorer_options.collect_positions
             && !should.is_empty()
             && !must.is_empty()
-            && limit < usize::MAX / 4
         {
             // Pre-check: is SHOULD all-sparse? This determines whether we can
             // use bitset fallback for MUST clauses that lack fast-field predicates.
@@ -417,11 +416,16 @@ macro_rules! boolean_plan {
                 }
             }
 
-            // 3c. PredicatedScorer fallback (over-fetch 4x when any filter is present)
+            // 3c. PredicatedScorer fallback. Filters can discard candidates,
+            // so use the same bounded candidate budget as other query paths.
             let has_filters = !predicates.is_empty()
                 || !must_verifiers.is_empty()
                 || !must_not_verifiers.is_empty();
-            let should_limit = if has_filters { limit * 4 } else { limit };
+            let should_limit = if has_filters {
+                super::max_candidate_limit(limit)
+            } else {
+                limit
+            };
             let should_scorer = if should.len() == 1 {
                 should[0].$scorer_fn(
                     reader, should_limit, scorer_options.without_threshold()

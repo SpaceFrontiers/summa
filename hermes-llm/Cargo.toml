@@ -9,6 +9,7 @@ authors.workspace = true
 description = "LLM inference and model definition; training lives in hermes-train"
 keywords = ["llm", "transformer", "deep-learning", "gpt", "inference"]
 categories = ["science"]
+publish = false
 
 [dependencies]
 # Burn is the sole inference runtime. CPU uses ndarray; GPU backends and the

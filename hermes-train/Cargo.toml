@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Training for MAL-defined Hermes language models"
+publish = false
 
 [dependencies]
 anyhow.workspace = true

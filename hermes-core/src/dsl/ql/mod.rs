@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use super::query_field_router::{QueryFieldRouter, RoutingMode};
 use super::schema::{Field, Schema};
-use crate::query::{BooleanQuery, PrefixQuery, Query, TermQuery};
+use crate::query::{BooleanQuery, DEFAULT_DENSE_RERANK_FACTOR, PrefixQuery, Query, TermQuery};
 use crate::tokenizer::{BoxedTokenizer, TokenizerRegistry};
 
 #[derive(Parser)]
@@ -351,12 +351,12 @@ impl QueryLanguageParser {
         Ok(ParsedQuery::Phrase { field, phrase })
     }
 
-    /// Parse an ANN query: field:ann([1.0, 2.0, 3.0], nprobe=32, rerank=3)
+    /// Parse an ANN query: field:ann([1.0, 2.0, 3.0], nprobe=32, rerank=2)
     fn parse_ann_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
         let mut field = String::new();
         let mut vector = Vec::new();
         let mut nprobe = 32usize;
-        let mut rerank = 3.0f32;
+        let mut rerank = DEFAULT_DENSE_RERANK_FACTOR;
 
         for inner in pair.into_inner() {
             match inner.as_rule() {
@@ -849,7 +849,7 @@ mod tests {
             assert_eq!(field, "embedding");
             assert_eq!(vector, vec![1.0, 2.0, 3.0]);
             assert_eq!(nprobe, 32);
-            assert_eq!(rerank, 3.0); // default
+            assert_eq!(rerank, 2.0); // default
         } else {
             panic!("Expected Ann query, got: {:?}", result);
         }

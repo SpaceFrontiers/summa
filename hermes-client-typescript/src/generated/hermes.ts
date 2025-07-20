@@ -141,7 +141,7 @@ export interface FusionQuery {
   method: FusionMethod;
   /** RRF rank constant; 0 = default 60 */
   rrfK: number;
-  /** Per-sub-query candidate depth; 0 = max(4x limit, 50) */
+  /** Per-sub-query candidate depth; 0 = shared 2x result-window budget */
   fetchLimit: number;
   /**
    * Combiner for fused per-chunk (ordinal) scores into a document score.
@@ -272,7 +272,7 @@ export interface Reranker {
   field: string;
   /** Query vector (f32, for dense fields) */
   vector: number[];
-  /** L1 candidate count (0 = 10x final limit) */
+  /** L1 candidate count (0 = 2x result window, maximum: 2x) */
   limit: number;
   combiner: MultiValueCombiner;
   combinerTemperature: number;
