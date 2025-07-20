@@ -91,9 +91,14 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V14 blob footer ("BMP4" in LE)
+/// Magic number for the current BMP V15 blob footer ("BMP5" in LE).
 ///
-/// V14 changes from V13:
+/// V15 changes from V14:
+/// - **u64 total_terms and total_postings** footer statistics (were u32 and
+///   saturated on billion-scale indexes).
+/// - **72-byte footer** (was 64) to accommodate the wider statistics.
+///
+/// V14 changed from V13:
 /// - **u32 num_terms and u32 posting prefix sums** per block (were u16):
 ///   blocks with >65,535 postings (bmp_block_size 256 × ~300-dim docs)
 ///   silently wrapped the u16 prefix sums, corrupting the block and
@@ -103,11 +108,13 @@ pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 /// V13 changes from V12:
 /// - **Recursive Graph Bisection (BP)** replaces SimHash for document ordering
 /// - **Section H removed**: no per-block SimHash (BP needs no stored metadata)
-/// - **64-byte footer** (was 72): `block_simhash_offset` field removed
-pub const BMP_BLOB_MAGIC_V14: u32 = 0x34504D42;
+/// - **64-byte footer** (was 72): `block_simhash_offset` field removed.
+///
+/// Only V15 is accepted; older indexes must be rebuilt.
+pub const BMP_BLOB_MAGIC: u32 = 0x35504D42;
 
-/// BMP V14 blob footer size: 64 bytes (unchanged from V13)
-pub const BMP_BLOB_FOOTER_SIZE_V14: usize = 64;
+/// Current BMP V15 blob footer size.
+pub const BMP_BLOB_FOOTER_SIZE: usize = 72;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

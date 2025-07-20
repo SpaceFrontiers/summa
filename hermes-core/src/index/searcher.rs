@@ -846,30 +846,26 @@ impl<D: Directory + 'static> Searcher<D> {
         }
         combiner.validate().map_err(crate::Error::Query)?;
 
-        // Sub-queries are independent — fan them out on rayon under a single
-        // block_in_place (each also par_iters its segments; rayon
-        // work-stealing composes the two levels). Sequential fallback for
-        // current_thread runtimes / non-sync builds.
+        // Each sub-query already fans out across every segment. Keep fusion
+        // sequential at the outer level so queries do not contend for the
+        // same rayon pool, mmap pages, and memory bandwidth, and so each
+        // query's shared threshold converges as early as possible.
         #[cfg(feature = "sync")]
         if !self.segments.is_empty()
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
-            use rayon::prelude::*;
-            let lists: Vec<Result<(Vec<crate::query::SearchResult>, f32, u32)>> =
+            let lists: Vec<(Vec<crate::query::SearchResult>, f32, u32)> =
                 tokio::task::block_in_place(|| {
-                    self.search_pool.install(|| {
-                        queries
-                            .par_iter()
-                            .map(|&(query, weight)| {
-                                let (results, seen) =
-                                    self.search_internal_sync(query, fetch_limit, 0, true)?;
-                                Ok((results, weight, seen))
-                            })
-                            .collect()
-                    })
-                });
-            let lists = lists.into_iter().collect::<Result<Vec<_>>>()?;
+                    queries
+                        .iter()
+                        .map(|&(query, weight)| {
+                            let (results, seen) =
+                                self.search_internal_sync(query, fetch_limit, 0, true)?;
+                            Ok((results, weight, seen))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?;
             let mut total_seen = 0u32;
             let ranked_lists = lists
                 .into_iter()
@@ -884,19 +880,13 @@ impl<D: Directory + 'static> Searcher<D> {
             return Ok((fused, total_seen));
         }
 
-        // Async/current-thread fallback retains bounded I/O concurrency and
-        // preserves input list order for deterministic rank ties.
-        const MAX_ASYNC_FUSION_SEARCHES: usize = 4;
-        use futures::{StreamExt, TryStreamExt};
-        let mut pending = Vec::with_capacity(queries.len());
+        // Async/current-thread fallback uses the same outer execution shape
+        // and preserves input list order for deterministic rank ties.
+        let mut lists = Vec::with_capacity(queries.len());
         for &(query, weight) in queries {
-            pending.push(async move {
-                let (results, seen) = self.search_with_positions(query, fetch_limit).await?;
-                Ok::<_, crate::Error>((results, weight, seen))
-            });
+            let (results, seen) = self.search_with_positions(query, fetch_limit).await?;
+            lists.push((results, weight, seen));
         }
-        let searches = futures::stream::iter(pending).buffered(MAX_ASYNC_FUSION_SEARCHES);
-        let lists: Vec<_> = searches.try_collect().await?;
         let mut total_seen = 0u32;
         let ranked_lists = lists
             .into_iter()
@@ -1195,6 +1185,28 @@ mod search_window_tests {
         assert_eq!(
             page.iter().map(|result| result.doc_id).collect::<Vec<_>>(),
             vec![2, 3, 4]
+        );
+    }
+}
+
+#[cfg(test)]
+mod fusion_parallelism_tests {
+    #[test]
+    fn fusion_keeps_parallelism_at_the_segment_level() {
+        let source = include_str!("searcher.rs");
+        let body = source
+            .split("pub async fn search_fused_with_count")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Two-stage search").next())
+            .expect("bounded fusion search implementation");
+
+        assert!(
+            !body.contains(".par_iter()"),
+            "sub-query parallelism nests over segment parallelism"
+        );
+        assert!(
+            !body.contains(".buffered("),
+            "async fusion fallback must preserve the same bounded execution shape"
         );
     }
 }

@@ -264,6 +264,8 @@ message SearchRequest {
   uint32 limit = 3;
   uint32 offset = 4;
   repeated string fields_to_load = 5;
+  Reranker reranker = 6;
+  uint32 candidate_limit = 7;
 }
 ```
 

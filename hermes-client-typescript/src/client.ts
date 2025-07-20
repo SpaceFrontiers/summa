@@ -253,7 +253,9 @@ export class HermesClient {
    * // Dense vector query
    * await client.search("docs", {
    *   query: { denseVector: { field: "embedding", vector: [0.1, 0.2, ...], nprobe: 10 } },
-   *   reranker: { field: "embedding", vector: [0.1, 0.2, ...], limit: 100 },
+   *   reranker: { field: "embedding", vector: [0.1, 0.2, ...] },
+   *   limit: 50,
+   *   candidateLimit: 100,
    * });
    *
    * // Boolean query
@@ -278,6 +280,7 @@ export class HermesClient {
         offset: request.offset ?? 0,
         fieldsToLoad: request.fieldsToLoad ?? [],
         reranker,
+        candidateLimit: request.candidateLimit ?? 0,
       },
       this.callOptions(timeoutMs)
     );
@@ -401,7 +404,6 @@ function buildQuery(q: Query): PbQuery {
         field: dv.field,
         vector: dv.vector,
         nprobe: dv.nprobe ?? 0,
-        rerankFactor: dv.rerankFactor ?? 0,
         combiner: combinerToProto(dv.combiner),
         combinerTemperature: dv.combinerTemperature ?? 0,
         combinerTopK: dv.combinerTopK ?? 0,
@@ -458,7 +460,6 @@ function buildQuery(q: Query): PbQuery {
             ? PbFusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
             : PbFusionMethod.FUSION_RRF,
         rrfK: f.rrfK ?? 0,
-        fetchLimit: f.fetchLimit ?? 0,
         combiner: combinerToProto(f.combiner),
       },
     };
@@ -474,7 +475,6 @@ function buildReranker(r: Reranker): any {
   return {
     field: r.field,
     vector: r.vector ?? [],
-    limit: r.limit ?? 0,
     combiner: combinerToProto(r.combiner),
     combinerTemperature: r.combinerTemperature ?? 0,
     combinerTopK: r.combinerTopK ?? 0,

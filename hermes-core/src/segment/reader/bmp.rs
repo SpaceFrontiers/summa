@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V14 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V15 zero-copy**.
 //!
-//! V14 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! V15 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -72,9 +72,9 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V14 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V15 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V14 format with Recursive Graph Bisection (BP) document ordering.
+/// V15 format with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -99,8 +99,8 @@ pub struct BmpIndex {
     // ── Section metadata ──────────────────────────────────────────────
     /// Fixed vocabulary size — grid has `dims` rows
     dims: u32,
-    total_terms: u32,
-    total_postings: u32,
+    total_terms: u64,
+    total_postings: u64,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
     packed_row_size: u32,
     /// Bits per block-grid cell (4 or 2); dequant scale is 17 or 85.
@@ -146,12 +146,12 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V14 blob from the given file handle.
+    /// Parse a BMP V15 blob from the given file handle.
     ///
-    /// Reads the 64-byte footer, then acquires the entire blob as a single
+    /// Reads the footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V14 data-first layout: Section B (per-block interleaved data) first,
+    /// V15 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
     pub fn parse(
         handle: FileHandle,
@@ -160,49 +160,47 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V14, BMP_BLOB_MAGIC_V14};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V14 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V14 footer".into(),
+                "BMP blob too small for V15 footer".into(),
             ));
         }
 
-        // Read the footer (last 64 bytes of the blob)
+        // Read the footer.
         let blob_end = blob_offset
             .checked_add(blob_len)
             .ok_or_else(|| crate::Error::Corruption("BMP blob range overflows u64".into()))?;
-        let footer_start = blob_end - BMP_BLOB_FOOTER_SIZE_V14 as u64;
+        let footer_start = blob_end - BMP_BLOB_FOOTER_SIZE as u64;
         let footer_bytes = handle
             .read_bytes_range_sync(footer_start..blob_end)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
-        let total_terms = u32::from_le_bytes(fb[0..4].try_into().unwrap());
-        let total_postings = u32::from_le_bytes(fb[4..8].try_into().unwrap());
-        let grid_offset = u64::from_le_bytes(fb[8..16].try_into().unwrap());
-        let sb_grid_offset = u64::from_le_bytes(fb[16..24].try_into().unwrap());
-        let num_blocks = u32::from_le_bytes(fb[24..28].try_into().unwrap());
-        let dims = u32::from_le_bytes(fb[28..32].try_into().unwrap());
-        let bmp_block_size = u32::from_le_bytes(fb[32..36].try_into().unwrap());
-        let num_virtual_docs = u32::from_le_bytes(fb[36..40].try_into().unwrap());
-        let max_weight_scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
-        let doc_map_offset = u64::from_le_bytes(fb[44..52].try_into().unwrap());
-        let num_real_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
-        // fb[56..60]: grid cell width in bits (0 = legacy 4-bit)
-        let grid_bits_raw = u32::from_le_bytes(fb[56..60].try_into().unwrap());
-        let magic = u32::from_le_bytes(fb[60..64].try_into().unwrap());
+        let total_terms = u64::from_le_bytes(fb[0..8].try_into().unwrap());
+        let total_postings = u64::from_le_bytes(fb[8..16].try_into().unwrap());
+        let grid_offset = u64::from_le_bytes(fb[16..24].try_into().unwrap());
+        let sb_grid_offset = u64::from_le_bytes(fb[24..32].try_into().unwrap());
+        let num_blocks = u32::from_le_bytes(fb[32..36].try_into().unwrap());
+        let dims = u32::from_le_bytes(fb[36..40].try_into().unwrap());
+        let bmp_block_size = u32::from_le_bytes(fb[40..44].try_into().unwrap());
+        let num_virtual_docs = u32::from_le_bytes(fb[44..48].try_into().unwrap());
+        let max_weight_scale = f32::from_le_bytes(fb[48..52].try_into().unwrap());
+        let doc_map_offset = u64::from_le_bytes(fb[52..60].try_into().unwrap());
+        let num_real_docs = u32::from_le_bytes(fb[60..64].try_into().unwrap());
+        let grid_bits_raw = u32::from_le_bytes(fb[64..68].try_into().unwrap());
+        let magic = u32::from_le_bytes(fb[68..72].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V14 {
+        if magic != BMP_BLOB_MAGIC {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP4 {:#x}). V13 and \
-                 older segments use u16 posting prefix sums that overflow on \
-                 large blocks — rebuild the index with this version.",
-                magic, BMP_BLOB_MAGIC_V14
+                "Invalid BMP blob magic: {:#x} (expected BMP5 {:#x}); rebuild \
+                 the index with this version.",
+                magic, BMP_BLOB_MAGIC
             )));
         }
         let grid_bits: u8 = match grid_bits_raw {
-            0 | 4 => 4, // 0 = blobs written before the field existed
+            4 => 4,
             2 => 2,
             other => {
                 return Err(crate::Error::Corruption(format!(
@@ -273,7 +271,7 @@ impl BmpIndex {
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V14 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE as u64;
         let data_len_usize = usize::try_from(data_len).map_err(|_| {
             crate::Error::Corruption("BMP blob is too large for this platform".into())
         })?;
@@ -425,7 +423,7 @@ impl BmpIndex {
         }
 
         log::debug!(
-            "BMP V14 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
+            "BMP V15 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
              packed_row_size={}, single_valued={}, block_data={}B, doc_map={}B",
             num_blocks,
@@ -468,7 +466,7 @@ impl BmpIndex {
         })
     }
 
-    /// Read the entire raw V14 blob (including footer) from the source file.
+    /// Read the entire raw V15 blob (including footer) from the source file.
     ///
     /// Used by reorder paths (native-only) to copy a field byte-identically
     /// when its `reorder` schema attribute is unset.
@@ -713,12 +711,12 @@ impl BmpIndex {
 
     /// Total number of terms (unique dim×block pairs) stored in the index.
     pub fn total_terms(&self) -> u64 {
-        self.total_terms as u64
+        self.total_terms
     }
 
     /// Total number of postings stored in the index.
     pub fn total_postings(&self) -> u64 {
-        self.total_postings as u64
+        self.total_postings
     }
 
     /// Actual vector count before block-alignment padding.
@@ -1789,6 +1787,7 @@ unsafe fn compute_block_masks_range_sse41(
 mod safety_tests {
     use super::BmpIndex;
     use crate::directories::{FileHandle, OwnedBytes};
+    use crate::segment::format::BMP_BLOB_FOOTER_SIZE;
     use rustc_hash::FxHashMap;
 
     fn test_blob() -> Vec<u8> {
@@ -1810,19 +1809,19 @@ mod safety_tests {
     #[test]
     fn parse_rejects_footer_section_underflow_without_panicking() {
         let mut blob = test_blob();
-        let footer = blob.len() - 64;
-        blob[footer + 8..footer + 16].copy_from_slice(&0u64.to_le_bytes());
+        let footer = blob.len() - BMP_BLOB_FOOTER_SIZE;
+        blob[footer + 16..footer + 24].copy_from_slice(&0u64.to_le_bytes());
         assert!(matches!(parse(blob), Err(crate::Error::Corruption(_))));
     }
 
     #[test]
     fn parse_rejects_nonzero_first_block_offset() {
         let mut blob = test_blob();
-        let footer = blob.len() - 64;
+        let footer = blob.len() - BMP_BLOB_FOOTER_SIZE;
         let grid_offset =
-            u64::from_le_bytes(blob[footer + 8..footer + 16].try_into().unwrap()) as usize;
+            u64::from_le_bytes(blob[footer + 16..footer + 24].try_into().unwrap()) as usize;
         let num_blocks =
-            u32::from_le_bytes(blob[footer + 24..footer + 28].try_into().unwrap()) as usize;
+            u32::from_le_bytes(blob[footer + 32..footer + 36].try_into().unwrap()) as usize;
         let starts = grid_offset - (num_blocks + 1) * 8;
         blob[starts..starts + 8].copy_from_slice(&1u64.to_le_bytes());
         assert!(matches!(parse(blob), Err(crate::Error::Corruption(_))));

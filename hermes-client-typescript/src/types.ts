@@ -123,8 +123,6 @@ export interface DenseVectorQuery {
   vector: number[];
   /** Number of clusters to probe (for IVF indexes) */
   nprobe?: number;
-  /** Exact-rerank factor multiplied by k (default and maximum: 2) */
-  rerankFactor?: number;
   combiner?: Combiner;
   /** Temperature for LogSumExp combiner (default: 1.5) */
   combinerTemperature?: number;
@@ -180,8 +178,6 @@ export interface FusionQuery {
   method?: "rrf" | "normalized_weighted_sum";
   /** RRF rank constant (default: 60) */
   rrfK?: number;
-  /** Per-sub-query candidate depth (default and maximum: 2x result window) */
-  fetchLimit?: number;
   /**
    * Combiner for fused per-chunk (ordinal) scores into a document score.
    * Fusion runs at chunk granularity: same-chunk hits across sub-queries
@@ -212,8 +208,6 @@ export interface Reranker {
   field: string;
   /** Query vector (f32, for dense fields) */
   vector?: number[];
-  /** L1 candidate count (0 = 2x result window, maximum: 2x) */
-  limit?: number;
   combiner?: Combiner;
   combinerTemperature?: number;
   combinerTopK?: number;
@@ -236,4 +230,6 @@ export interface SearchRequest {
   offset?: number;
   fieldsToLoad?: string[];
   reranker?: Reranker;
+  /** Shared first-stage candidate pool (0 = result window, maximum: 2x). */
+  candidateLimit?: number;
 }

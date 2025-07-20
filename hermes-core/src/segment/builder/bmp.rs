@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V14 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V15 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -25,7 +25,7 @@
 //! - **64-byte footer** (was 72): `block_simhash_offset` field removed
 //! - V12 segments are incompatible — must rebuild
 //!
-//! ## BMP V14 Blob Layout (data-first, block-interleaved)
+//! ## BMP V15 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -42,20 +42,20 @@
 //!   posting_starts: [u32-LE × (num_terms + 1)]        relative cumulative counts
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP V14 Footer (64 bytes):
-//!   total_terms: u32              //  0- 3  (stats only)
-//!   total_postings: u32           //  4- 7  (stats only)
-//!   grid_offset: u64              //  8-15  (byte offset of Section D)
-//!   sb_grid_offset: u64           // 16-23  (byte offset of Section E)
-//!   num_blocks: u32               // 24-27
-//!   dims: u32                     // 28-31  (fixed vocabulary size)
-//!   bmp_block_size: u32           // 32-35
-//!   num_virtual_docs: u32         // 36-39  (= num_blocks × bmp_block_size, padded)
-//!   max_weight_scale: f32         // 40-43
-//!   doc_map_offset: u64           // 44-51  (byte offset of Section F)
-//!   num_real_docs: u32            // 52-55  (actual vector count before padding)
-//!   reserved: u32                 // 56-59
-//!   magic: u32                    // 60-63  (BMP3 = 0x33504D42)
+//! BMP V15 Footer (72 bytes):
+//!   total_terms: u64              //  0- 7  (stats only)
+//!   total_postings: u64           //  8-15  (stats only)
+//!   grid_offset: u64              // 16-23  (byte offset of Section D)
+//!   sb_grid_offset: u64           // 24-31  (byte offset of Section E)
+//!   num_blocks: u32               // 32-35
+//!   dims: u32                     // 36-39  (fixed vocabulary size)
+//!   bmp_block_size: u32           // 40-43
+//!   num_virtual_docs: u32         // 44-47  (= num_blocks × bmp_block_size, padded)
+//!   max_weight_scale: f32         // 48-51
+//!   doc_map_offset: u64           // 52-59  (byte offset of Section F)
+//!   num_real_docs: u32            // 60-63  (actual vector count before padding)
+//!   grid_bits: u32                // 64-67  (2 or 4)
+//!   magic: u32                    // 68-71  (BMP5 = 0x35504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -93,10 +93,10 @@ impl VidLookup {
 }
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V14;
+use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V14 blob from per-dimension postings.
+/// Build a BMP V15 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -196,7 +196,7 @@ pub(crate) fn build_bmp_blob(
     if num_real_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP real document count exceeds the V14 u32 format limit",
+            "BMP real document count exceeds the V15 u32 format limit",
         ));
     }
 
@@ -219,7 +219,7 @@ pub(crate) fn build_bmp_blob(
     if num_virtual_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP padded document count exceeds the V14 u32 format limit",
+            "BMP padded document count exceeds the V15 u32 format limit",
         ));
     }
     let num_blocks = num_virtual_docs / effective_block_size as usize;
@@ -419,7 +419,7 @@ pub(crate) fn build_bmp_blob(
             let nt_u32 = u32::try_from(nt).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "BMP block term count exceeds the V14 u32 format limit",
+                    "BMP block term count exceeds the V15 u32 format limit",
                 )
             })?;
             blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
@@ -463,7 +463,7 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V14 vectors={} padded={} blocks={} dims={} \
+        "[bmp_build] V15 vectors={} padded={} blocks={} dims={} \
          terms={} postings={} grid_entries={}",
         num_real_docs,
         num_virtual_docs,
@@ -526,7 +526,7 @@ pub(crate) fn build_bmp_blob(
 
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V14 Footer (64 bytes)
+    // BMP V15 footer.
     write_bmp_footer(
         writer,
         total_terms,
@@ -542,12 +542,12 @@ pub(crate) fn build_bmp_blob(
         num_real_docs as u32,
         grid_bits,
     )?;
-    bytes_written += 64;
+    bytes_written += BMP_BLOB_FOOTER_SIZE as u64;
 
     Ok(bytes_written)
 }
 
-/// Write the BMP V14 footer (64 bytes).
+/// Write the BMP V15 footer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
@@ -564,29 +564,19 @@ pub(crate) fn write_bmp_footer(
     num_real_docs: u32,
     grid_bits: u8,
 ) -> std::io::Result<()> {
-    // These two fields are diagnostics only; structural navigation uses the
-    // section offsets. Saturate instead of wrapping a valid large V14 index.
-    if total_terms > u32::MAX as u64 || total_postings > u32::MAX as u64 {
-        log::warn!(
-            "[bmp] footer statistics exceed u32 and will be saturated: terms={}, postings={}",
-            total_terms,
-            total_postings,
-        );
-    }
-    writer.write_u32::<LittleEndian>(total_terms.min(u32::MAX as u64) as u32)?; //  0- 3
-    writer.write_u32::<LittleEndian>(total_postings.min(u32::MAX as u64) as u32)?; //  4- 7
-    writer.write_u64::<LittleEndian>(grid_offset)?; //  8-15
-    writer.write_u64::<LittleEndian>(sb_grid_offset)?; // 16-23
-    writer.write_u32::<LittleEndian>(num_blocks)?; // 24-27
-    writer.write_u32::<LittleEndian>(dims)?; // 28-31
-    writer.write_u32::<LittleEndian>(bmp_block_size)?; // 32-35
-    writer.write_u32::<LittleEndian>(num_virtual_docs)?; // 36-39
-    writer.write_f32::<LittleEndian>(max_weight_scale)?; // 40-43
-    writer.write_u64::<LittleEndian>(doc_map_offset)?; // 44-51
-    writer.write_u32::<LittleEndian>(num_real_docs)?; // 52-55
-    // 56-59: grid cell width in bits (0 = legacy 4-bit; else 2 or 4)
-    writer.write_u32::<LittleEndian>(grid_bits as u32)?;
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V14)?; // 60-63
+    writer.write_u64::<LittleEndian>(total_terms)?; //  0- 7
+    writer.write_u64::<LittleEndian>(total_postings)?; //  8-15
+    writer.write_u64::<LittleEndian>(grid_offset)?; // 16-23
+    writer.write_u64::<LittleEndian>(sb_grid_offset)?; // 24-31
+    writer.write_u32::<LittleEndian>(num_blocks)?; // 32-35
+    writer.write_u32::<LittleEndian>(dims)?; // 36-39
+    writer.write_u32::<LittleEndian>(bmp_block_size)?; // 40-43
+    writer.write_u32::<LittleEndian>(num_virtual_docs)?; // 44-47
+    writer.write_f32::<LittleEndian>(max_weight_scale)?; // 48-51
+    writer.write_u64::<LittleEndian>(doc_map_offset)?; // 52-59
+    writer.write_u32::<LittleEndian>(num_real_docs)?; // 60-63
+    writer.write_u32::<LittleEndian>(grid_bits as u32)?; // 64-67
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC)?; // 68-71
     Ok(())
 }
 
@@ -929,6 +919,40 @@ mod tests {
     }
 
     #[test]
+    fn bmp_footer_preserves_u64_statistics() {
+        let total_terms = u32::MAX as u64 + 17;
+        let total_postings = u32::MAX as u64 + 29;
+        let mut footer = Vec::new();
+
+        write_bmp_footer(
+            &mut footer,
+            total_terms,
+            total_postings,
+            11,
+            22,
+            33,
+            44,
+            32,
+            55,
+            6.0,
+            66,
+            77,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(footer.len(), 72);
+        assert_eq!(
+            u64::from_le_bytes(footer[0..8].try_into().unwrap()),
+            total_terms
+        );
+        assert_eq!(
+            u64::from_le_bytes(footer[8..16].try_into().unwrap()),
+            total_postings
+        );
+    }
+
+    #[test]
     fn test_build_bmp_blob_empty() {
         let postings = FxHashMap::default();
         let mut buf = Vec::new();
@@ -950,10 +974,10 @@ mod tests {
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
-        // Verify V14 footer magic (last 4 bytes of 64-byte footer)
+        // Verify the current footer magic.
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V14);
+        assert_eq!(magic, BMP_BLOB_MAGIC);
     }
 
     #[test]
@@ -985,15 +1009,15 @@ mod tests {
         let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify V14 footer: num_virtual_docs should be 64 (padded to block_size)
+        // num_virtual_docs should be 64 (padded to block_size)
         // 3 real docs padded to 64
-        let footer_start = buf.len() - 64;
+        let footer_start = buf.len() - BMP_BLOB_FOOTER_SIZE;
         let fb = &buf[footer_start..];
-        let num_virtual_docs = u32::from_le_bytes(fb[36..40].try_into().unwrap());
+        let num_virtual_docs = u32::from_le_bytes(fb[44..48].try_into().unwrap());
         assert_eq!(num_virtual_docs, 64); // padded to block_size
 
         // num_real_docs should be 3
-        let num_real_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
+        let num_real_docs = u32::from_le_bytes(fb[60..64].try_into().unwrap());
         assert_eq!(num_real_docs, 3);
     }
 
@@ -1010,10 +1034,10 @@ mod tests {
         let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify max_weight_scale in V14 footer (bytes 40-43)
-        let footer_start = buf.len() - 64;
+        // Verify max_weight_scale in the footer.
+        let footer_start = buf.len() - BMP_BLOB_FOOTER_SIZE;
         let fb = &buf[footer_start..];
-        let scale = f32::from_le_bytes(fb[40..44].try_into().unwrap());
+        let scale = f32::from_le_bytes(fb[48..52].try_into().unwrap());
         assert!((scale - 5.0).abs() < 0.001, "scale={}, expected 5.0", scale);
     }
 
@@ -1033,19 +1057,13 @@ mod tests {
         // Fixed max_weight=5.0: same scale
         let mut buf_a = Vec::new();
         build_bmp_blob(postings_a, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
-        let scale_a = f32::from_le_bytes(
-            buf_a[buf_a.len() - 64 + 40..buf_a.len() - 64 + 44]
-                .try_into()
-                .unwrap(),
-        );
+        let footer_a = buf_a.len() - BMP_BLOB_FOOTER_SIZE;
+        let scale_a = f32::from_le_bytes(buf_a[footer_a + 48..footer_a + 52].try_into().unwrap());
 
         let mut buf_b = Vec::new();
         build_bmp_blob(postings_b, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
-        let scale_b = f32::from_le_bytes(
-            buf_b[buf_b.len() - 64 + 40..buf_b.len() - 64 + 44]
-                .try_into()
-                .unwrap(),
-        );
+        let footer_b = buf_b.len() - BMP_BLOB_FOOTER_SIZE;
+        let scale_b = f32::from_le_bytes(buf_b[footer_b + 48..footer_b + 52].try_into().unwrap());
         assert_eq!(
             scale_a, scale_b,
             "Fixed max_weight scales must be identical"

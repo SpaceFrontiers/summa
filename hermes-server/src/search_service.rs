@@ -458,8 +458,8 @@ struct SearchBudget {
     offset: usize,
     /// Number of ranked results required before applying the offset.
     search_limit: usize,
-    rerank_l1_limit: Option<usize>,
-    fusion_fetch_limit: Option<usize>,
+    /// Single first-stage pool used by every collector and retrieval mode.
+    candidate_limit: usize,
 }
 
 fn bounded_limit(name: &str, value: u32, default: usize, max: usize) -> Result<usize, Status> {
@@ -504,29 +504,19 @@ fn validate_search_budget(req: &SearchRequest) -> Result<SearchBudget, Status> {
     }
     let max_candidate_limit =
         hermes_core::query::max_candidate_limit(search_limit).min(MAX_CANDIDATE_LIMIT);
-
-    let rerank_l1_limit = match &req.reranker {
-        Some(reranker) if reranker.limit > 0 => Some(bounded_limit(
-            "Reranker.limit",
-            reranker.limit,
-            search_limit,
-            max_candidate_limit,
-        )?),
-        Some(_) => Some(max_candidate_limit),
-        None => None,
-    };
-    if req
-        .reranker
-        .as_ref()
-        .is_some_and(|reranker| reranker.limit > 0)
-        && rerank_l1_limit.is_some_and(|l1_limit| l1_limit < search_limit)
-    {
+    let candidate_limit = bounded_limit(
+        "SearchRequest.candidate_limit",
+        req.candidate_limit,
+        search_limit,
+        max_candidate_limit,
+    )?;
+    if candidate_limit < search_limit {
         return Err(Status::invalid_argument(format!(
-            "Reranker.limit must be at least offset + limit ({search_limit})"
+            "SearchRequest.candidate_limit must be at least offset + limit ({search_limit})"
         )));
     }
 
-    let fusion_fetch_limit = if let Some(query::Query::Fusion(fusion)) = &query.query {
+    if let Some(query::Query::Fusion(fusion)) = &query.query {
         if fusion.queries.is_empty() {
             return Err(Status::invalid_argument(
                 "FusionQuery requires at least one sub-query",
@@ -554,47 +544,23 @@ fn validate_search_budget(req: &SearchRequest) -> Result<SearchBudget, Status> {
             }
         }
 
-        let fused_limit = rerank_l1_limit.unwrap_or(search_limit);
-        let fetch_limit = if fusion.fetch_limit > 0 {
-            bounded_limit(
-                "FusionQuery.fetch_limit",
-                fusion.fetch_limit,
-                fused_limit,
-                max_candidate_limit,
-            )?
-        } else if rerank_l1_limit.is_some() {
-            // The rerank pool is already the shared candidate budget.
-            fused_limit
-        } else {
-            max_candidate_limit
-        };
-        if fetch_limit < fused_limit {
-            return Err(Status::invalid_argument(format!(
-                "FusionQuery.fetch_limit must be at least the fused result window ({fused_limit})"
-            )));
-        }
-
-        let candidate_slots = fetch_limit
+        let candidate_slots = candidate_limit
             .checked_mul(fusion.queries.len())
             .ok_or_else(|| Status::invalid_argument("Fusion candidate budget is too large"))?;
         if candidate_slots > MAX_FUSION_CANDIDATE_SLOTS {
             return Err(Status::invalid_argument(format!(
                 "FusionQuery candidate budget must not exceed {MAX_FUSION_CANDIDATE_SLOTS} \
-                 (fetch_limit {fetch_limit} x {} sub-queries = {candidate_slots})",
+                 (candidate_limit {candidate_limit} x {} sub-queries = {candidate_slots})",
                 fusion.queries.len()
             )));
         }
-        Some(fetch_limit)
-    } else {
-        None
-    };
+    }
 
     Ok(SearchBudget {
         final_limit,
         offset,
         search_limit,
-        rerank_l1_limit,
-        fusion_fetch_limit,
+        candidate_limit,
     })
 }
 
@@ -662,20 +628,18 @@ impl SearchService for SearchServiceImpl {
         // Rank enough results to cover the requested page, then apply the
         // offset only after fusion/reranking so pagination preserves ranking.
         let limit = budget.search_limit;
+        let candidate_limit = budget.candidate_limit;
 
         // Optional L2 reranker config; the L1 pool it consumes is either a
         // single query's results or the fused union of sub-query results.
-        let rerank_setup = match &req.reranker {
-            Some(reranker) => {
-                let config = convert_reranker(reranker, reader.schema())
-                    .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))?;
-                let l1_limit = budget
-                    .rerank_l1_limit
-                    .ok_or_else(|| Status::internal("Missing validated reranker budget"))?;
-                Some((config, l1_limit))
-            }
-            None => None,
-        };
+        let rerank_setup = req
+            .reranker
+            .as_ref()
+            .map(|reranker| {
+                convert_reranker(reranker, reader.schema())
+                    .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))
+            })
+            .transpose()?;
 
         // ── Phase 1: L1 search ──────────────────────────────────────────────
         let start = Instant::now();
@@ -724,10 +688,11 @@ impl SearchService for SearchServiceImpl {
                 };
 
                 // With a reranker, the fused list is the L1 candidate pool.
-                let fused_limit = rerank_setup.as_ref().map_or(limit, |&(_, l1)| l1);
-                let fetch_limit = budget
-                    .fusion_fetch_limit
-                    .ok_or_else(|| Status::internal("Missing validated fusion budget"))?;
+                let fused_limit = if rerank_setup.is_some() {
+                    candidate_limit
+                } else {
+                    limit
+                };
 
                 // Chunk combiner for fused per-ordinal scores. Unset (0) maps
                 // to Max — LogSumExp is unsuitable at RRF score magnitudes.
@@ -740,12 +705,13 @@ impl SearchService for SearchServiceImpl {
                     "fusion of {} sub-queries (method={:?}, fetch={})",
                     sub_queries.len(),
                     method,
-                    fetch_limit
+                    candidate_limit
                 );
                 log::info!(
-                    "search: index={}, limit={}, query={}",
+                    "search: index={}, limit={}, candidates={}, query={}",
                     req.index_name,
                     req.limit,
+                    candidate_limit,
                     query_desc
                 );
 
@@ -756,14 +722,14 @@ impl SearchService for SearchServiceImpl {
                 let (fused, seen) = searcher
                     .search_fused_with_count(
                         &query_refs,
-                        fetch_limit,
+                        candidate_limit,
                         fused_limit,
                         method,
                         combiner,
                     )
                     .await
                     .map_err(crate::error::hermes_error_to_status)?;
-                let rerank_config = rerank_setup.map(|(config, _)| (config, limit));
+                let rerank_config = rerank_setup.map(|config| (config, limit));
                 (fused, seen, rerank_config)
             } else {
                 let core_query = convert_query(
@@ -776,21 +742,22 @@ impl SearchService for SearchServiceImpl {
 
                 query_desc = core_query.to_string();
                 log::info!(
-                    "search: index={}, limit={}, query={}",
+                    "search: index={}, limit={}, candidates={}, query={}",
                     req.index_name,
                     req.limit,
+                    candidate_limit,
                     query_desc
                 );
 
-                if let Some((config, l1_limit)) = rerank_setup {
+                if let Some(config) = rerank_setup {
                     let (candidates, seen) = searcher
-                        .search_with_count(core_query.as_ref(), l1_limit)
+                        .search_with_count(core_query.as_ref(), candidate_limit)
                         .await
                         .map_err(crate::error::hermes_error_to_status)?;
                     (candidates, seen, Some((config, limit)))
                 } else {
                     let (results, seen) = searcher
-                        .search_with_positions(core_query.as_ref(), limit)
+                        .search_with_positions(core_query.as_ref(), candidate_limit)
                         .await
                         .map_err(crate::error::hermes_error_to_status)?;
                     (results, seen, None)
@@ -1154,9 +1121,10 @@ mod tests {
         }
     }
 
-    fn fusion_request(sub_queries: usize, fetch_limit: u32) -> SearchRequest {
+    fn fusion_request(sub_queries: usize, candidate_limit: u32) -> SearchRequest {
         SearchRequest {
             index_name: "test-index".to_string(),
+            candidate_limit,
             query: Some(Query {
                 query: Some(query::Query::Fusion(FusionQuery {
                     queries: (0..sub_queries)
@@ -1165,7 +1133,6 @@ mod tests {
                             weight: 1.0,
                         })
                         .collect(),
-                    fetch_limit,
                     ..Default::default()
                 })),
             }),
@@ -1180,8 +1147,7 @@ mod tests {
         assert_eq!(budget.final_limit, DEFAULT_SEARCH_LIMIT);
         assert_eq!(budget.offset, 0);
         assert_eq!(budget.search_limit, DEFAULT_SEARCH_LIMIT);
-        assert_eq!(budget.rerank_l1_limit, None);
-        assert_eq!(budget.fusion_fetch_limit, None);
+        assert_eq!(budget.candidate_limit, DEFAULT_SEARCH_LIMIT);
     }
 
     #[test]
@@ -1229,45 +1195,47 @@ mod tests {
     }
 
     #[test]
-    fn search_budget_caps_rerank_depth_at_two_x_the_result_window() {
+    fn search_budget_caps_candidate_depth_at_two_x_the_result_window() {
         let mut ordinary_default = ordinary_request();
         ordinary_default.limit = 300;
-        ordinary_default.reranker = Some(Reranker::default());
         assert_eq!(
             validate_search_budget(&ordinary_default)
                 .unwrap()
-                .rerank_l1_limit,
-            Some(600)
+                .candidate_limit,
+            300
         );
 
         let mut default_req = ordinary_request();
         default_req.limit = MAX_SEARCH_LIMIT as u32;
-        default_req.reranker = Some(Reranker::default());
         assert_eq!(
             validate_search_budget(&default_req)
                 .unwrap()
-                .rerank_l1_limit,
-            Some(MAX_SEARCH_LIMIT * 2)
+                .candidate_limit,
+            MAX_SEARCH_LIMIT
         );
 
         let mut excessive_req = ordinary_request();
         excessive_req.limit = 100;
-        excessive_req.reranker = Some(Reranker {
-            limit: 201,
-            ..Default::default()
-        });
+        excessive_req.candidate_limit = 201;
         let err = validate_search_budget(&excessive_req).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
 
         let mut impossible_page = ordinary_request();
         impossible_page.limit = 10;
         impossible_page.offset = 1_000;
-        impossible_page.reranker = Some(Reranker {
-            limit: 100,
-            ..Default::default()
-        });
+        impossible_page.candidate_limit = 100;
         let err = validate_search_budget(&impossible_page).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn explicit_candidate_budget_is_not_expanded_again() {
+        let mut request = ordinary_request();
+        request.limit = 100;
+        request.candidate_limit = 100;
+        let budget = validate_search_budget(&request).unwrap();
+        assert_eq!(budget.search_limit, 100);
+        assert_eq!(budget.candidate_limit, 100);
     }
 
     #[test]
@@ -1292,14 +1260,13 @@ mod tests {
     }
 
     #[test]
-    fn fusion_default_does_not_multiply_an_existing_rerank_pool() {
+    fn fusion_and_reranker_share_one_candidate_pool() {
         let mut req = fusion_request(2, 0);
         req.limit = 100;
         req.reranker = Some(Reranker::default());
 
         let budget = validate_search_budget(&req).unwrap();
-        assert_eq!(budget.rerank_l1_limit, Some(200));
-        assert_eq!(budget.fusion_fetch_limit, Some(200));
+        assert_eq!(budget.candidate_limit, 100);
     }
 
     #[test]
@@ -1330,14 +1297,13 @@ mod tests {
     }
 
     #[test]
-    fn fusion_default_fetch_is_checked_and_capped() {
+    fn fusion_default_candidate_pool_is_checked_and_capped() {
         let mut req = fusion_request(2, 0);
         req.limit = MAX_SEARCH_LIMIT as u32;
         req.reranker = Some(Reranker::default());
 
         let budget = validate_search_budget(&req).unwrap();
-        assert_eq!(budget.rerank_l1_limit, Some(MAX_SEARCH_LIMIT * 2));
-        assert_eq!(budget.fusion_fetch_limit, Some(MAX_SEARCH_LIMIT * 2));
+        assert_eq!(budget.candidate_limit, MAX_SEARCH_LIMIT);
     }
 
     #[test]
