@@ -108,9 +108,9 @@ struct Args {
     #[arg(long, default_value = "600")]
     optimizer_time_budget_secs: u64,
 
-    /// Depth cap for large-segment BP: stop at partitions of this many docs
-    /// (4096 = superblock granularity, keeps most of the pruning win)
-    #[arg(long, default_value = "4096")]
+    /// Depth cap for large-segment BP: stop at partitions of this many vectors
+    /// (256 = one default 32-vector × 8-block LSP superblock)
+    #[arg(long, default_value = "256")]
     optimizer_partial_min_partition_docs: usize,
 
     /// Cooldown in seconds between deepening passes on budget-truncated segments

@@ -1,253 +1,260 @@
-# BMP Grid Memory: Compression Research & Roadmap
+# BMP LSP/0 and Maximum-Grid Compression
 
-## Memory anatomy of a BMP segment (V15)
+Status: implemented in the BMP V17 format (2026-07-23).
 
-Everything is mmap-backed (page cache, not heap), but resident-set pressure
-is real on memory-bound deployments. Counts below are per field and use the
-current production settings: 105,879 dimensions, 32 vectors per block, a
-64-block superblock, and a dense 4-bit block grid. The cardinality is sparse
-**vectors/ordinals**, not logical documents; a multi-valued field can therefore
-be many times larger than its document count.
-
-`num_blocks = ceil(num_vectors / 32)`. Sizes are decimal GB/TB, matching disk
-tools; binary sizes are included where useful.
-
-| section          | exact V15 bytes | 18M vectors | 100M vectors | 1B vectors |
-| ---------------- | ---------------: | ----------: | -----------: | ---------: |
-| block grid (D)   | `dims × ceil(num_blocks / 2)` | 29.78 GB (27.73 GiB) | 165.44 GB (154.07 GiB) | **1.654 TB (1.504 TiB)** |
-| sb_grid (E)      | `dims × ceil(num_blocks / 64)` | 0.931 GB (0.867 GiB) | 5.170 GB (4.815 GiB) | 51.70 GB (48.15 GiB) |
-| doc maps (F+G)   | `6 × num_virtual_docs` | 0.108 GB | 0.600 GB | 6.000 GB |
-| block starts (A) | `8 × (num_blocks + 1)` | 4.50 MB | 25.00 MB | 250.00 MB |
-| block data (B)   | `2P + 8T + 8N` | workload-dependent | workload-dependent | workload-dependent |
-
-Thus a single 1B-vector BMP field needs about **1.706 TB** for the two grids
-alone at block size 32/4-bit, before postings, document maps, segment metadata,
-temporary merge output, or a second BMP field. Segment boundaries add a small
-amount of row-padding overhead. Two 1B-vector fields need about **3.412 TB**
-for Sections D and E alone.
-
-In the block-data formula, `P` is the posting count, `T` is the number of
-non-zero `(block, dimension)` pairs, and `N` is the number of non-empty blocks.
-The blob also has at most seven alignment bytes and a 72-byte footer. These
-small fixed sections do not change the conclusion: the block grid dominates.
-
-The **dense block grid dominates**: every one of `dims` vocabulary rows gets
-a 4-bit cell in _every_ block, even though a typical SPLADE block touches
-only a small fraction of the vocabulary. The exact non-zero density is
-`total_terms / (dims × num_blocks)` using the V15 footer counters. Smaller
-blocks reduce that density while increasing the number of dense cells.
-
-## Shipped controls: block size, grid width, and paging
-
-Grid bytes scale approximately as `1/block_size`. Moving a field from the
-current block size 32 to 256 would:
-
-- At 18M vectors: grid 29.78 GB → **3.72 GB** and sb_grid
-  0.931 GB → **0.116 GB** (8×).
-- At 1B vectors: grid 1.654 TB → **206.8 GB** and sb_grid
-  51.70 GB → **6.46 GB** (8×).
-- Pruning granularity would coarsen by the same factor: a block would contain
-  256 vectors and a 64-block superblock 16,384 vectors. This is not a free
-  compression knob. The production choice remains **32** until representative
-  relevance and tail-latency tests justify a larger value.
-- Block size is per field and uniform across all segments. There is deliberately
-  no auto-escalation or mixed-block-size support: block-copy merge and blockwise
-  reorder move blocks verbatim and validate uniformity.
-- The block grid is now `MADV_RANDOM`: queries at production scale read 32
-  bytes per (query dim, surviving superblock) at effectively random offsets,
-  and default kernel readahead amplified each probe into 128 KB of page
-  cache (~4000×) — marching the entire data-sized grid into memory and
-  OOMing cgroup-limited deployments. With MADV_RANDOM only the touched 4 KB
-  pages fault in, and they stay cleanly reclaimable.
-
-SDL:
+The production field shape is:
 
 ```sdl
-field embedding: sparse_vector<u32> [indexed<format: bmp, dims: 105879,
-    max_weight: 5.0, bmp_block_size: 32, bmp_grid_bits: 4>]
+field embedding: sparse_vector<u32> [indexed<
+    format: bmp,
+    dims: 105879,
+    max_weight: 5.0,
+    bmp_block_size: 32,
+    bmp_grid_bits: 4,
+    query<pruning: 0.33>
+>]
 ```
 
-## What “compression” means in the original BMP paper
+V17 is the only supported BMP representation. There is no compatibility
+reader or migration path; rebuild the index after upgrading.
 
-The [SIGIR 2024 BMP paper](https://arxiv.org/pdf/2405.01117) evaluates two
-representations of each dimension's block-max row:
+## Space anatomy
 
-- **BMP-Dense** stores every 8-bit maximum, including zeros.
-- **BMP-Sparse**, called “compressed” in Table 1, zero-suppresses each row:
-  only non-zero `(offset, maximum)` pairs are kept. The
-  [reference implementation](https://github.com/pisa-engine/BMP) partitions a
-  row into groups of 256 blocks and stores those pairs inside each group.
-  Query evaluation scans the pairs and scatters them into a dense accumulator.
+Let `n` be stored vectors/ordinals, `d` the vocabulary size, `b = 32` vectors
+per block, and `c = 8` blocks per superblock. Multi-valued fields count every
+ordinal, not only logical documents.
 
-This is not entropy compression of the whole index, posting compression, or
-Hermes's 4-bit packing. On MS MARCO with block size 8, the paper reports the
-block-max structure shrinking from 30 GB dense to 5.5 GB compressed; at block
-size 256 it reports 0.9 GB dense versus 1.2 GB compressed, so sparse storage
-can even lose once rows become sufficiently dense.
+Before local bit packing, the two maximum grids would occupy:
 
-Hermes does **not** store BMP-Sparse in production. It currently has:
+```text
+blocks      = ceil(n / b)
+superblocks = ceil(blocks / c)
+D bytes     = d × ceil(blocks / 2)       # ceil-u4 block maxima
+E bytes     = d × ceil(superblocks / 2)  # ceil-u4 superblock maxima
+```
 
-- a dense block grid with independently addressable 4-bit cells (or optional
-  2-bit cells), using ceil quantization so the bounds remain rank-safe;
-- an exact dense 8-bit superblock grid;
-- BP document ordering, which improves bound tightness and zero density;
-- two-level superblock pruning and `MADV_RANDOM` on the block grid.
+For `d = 105,879`:
 
-## Why the original sparse grid is wrong for the current executor
+| vectors | blocks | superblocks | dense D | dense E | dense D + E |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 18M | 562,500 | 70,313 | 29.78 GB | 3.72 GB | **33.50 GB** |
+| 100M | 3,125,000 | 390,625 | 165.44 GB | 20.68 GB | **186.12 GB** |
+| 1B | 31,250,000 | 3,906,250 | 1.654 TB | 206.79 GB | **1.861 TB** |
 
-The [2025 SP paper](https://arxiv.org/html/2504.17045) introduced two-level
-superblock traversal but left both grids uncompressed. Its
-[2026 LSP follow-up](https://arxiv.org/html/2602.02883) directly tests
-compression with this access pattern. It finds the original BMP-Sparse up to
-**76× slower** because surviving superblocks cause random block-group access,
-rather than BMP's original sequential full-row scan.
+Those are dense-reference sizes, not the V17 on-disk sizes. V17 omits
+all-zero payload groups and uses each group’s actual local width. The encoded
+size depends on term density and BP ordering, so projections captured for the
+old 64-block/exact-u8 hierarchy are not valid for V17. The segment load log’s
+separate D/E byte counts are authoritative after a rebuild.
 
-Correctness is cross-checked entry-exact between layouts:
+The other persistent sections are:
 
-| config    | density | grid memory: dense → CSR | block-UB compute: dense → CSR | probes hitting |
-| --------- | ------- | ------------------------ | ----------------------------- | -------------- |
-| block 64  | 3.5%    | 1562 → 227 MB (**6.9×**) | 12 → 59 ns/probe (**5.1×**)   | 94%            |
-| block 256 | 10.4%   | 391 → 137 MB (**2.9×**)  | 11 → 72 ns/probe (**6.3×**)   | 99%            |
+```text
+T = total non-empty (block, dimension) pairs
+P = total document-term postings
+B = total blocks
+N = padded vector/ordinal count
 
-Two hypotheses failed:
+Section B, Flat-Inv payload = 8 × non-empty_blocks + 9T + 2P
+Section A, block offsets    = 8 × (B + 1)
+Sections F+G, document map  = 6N
+```
 
-1. **"Sparse rows skip absent dims"** — real query dims are Zipf-head dims,
-   present in nearly every superblock (94-99% probe hit rate). The skip
-   advantage barely exists; every hit pays a binary search plus a scalar
-   scatter instead of one 32-byte SIMD sweep.
-2. **The memory win shrinks exactly where large fields are going**: at
-   block 256 density triples, so CSR yields only 2.9× — for a 6.3×
-   hot-loop regression.
+The `9T` term-header component is four bytes for the dimension, four bytes for
+its posting start, and one byte for its exact block maximum. The final posting
+start contributes the other four bytes per non-empty block. Retaining the
+exact maximum costs `T` bytes, but lets a D2 BP/reorder regenerate a tight
+ceil-u4 E grid without rereading `2P` posting bytes. Empty blocks have no
+Section B payload.
 
-Note also that the dense grid is mmap-backed: rows of dims that queries
-never touch are never faulted in, so the _resident_ dense grid is already
-concentrated on head-dim rows — the same rows CSR must keep hot.
+## V17 grid representation
 
-## Best next grid experiment: SIMDBP-256*
+D and E are independent dimension-major grids partitioned into 256-cell
+groups. Each exact block-header maximum is ceiling-quantized before projection:
 
-The 2026 LSP follow-up proposes a better representation for exactly this access
-pattern:
+```text
+u4 = ceil(exact_u8 / 17)
+u2 = ceil(exact_u8 / 85)  # D only, when bmp_grid_bits = 2
+```
 
-1. Partition each dimension's block and superblock maxima into independently
-   decodable groups of 256 integers.
-2. Bit-pack each group at its local maximum width, so an all-zero group needs
-   no payload bits and low-valued groups use fewer bits.
-3. Put the group-width selectors at the front of each row so a randomly chosen
-   group can be located and decoded without walking earlier payload groups.
-4. Decode 256 values into `u16` lanes, allowing twice as many values per SIMD
-   instruction as the conventional `u32` SIMDBP decoder.
+E always uses ceil-u4. Taking the maximum of ceiling-quantized block values is
+equivalent to ceiling-quantizing their exact maximum. Query-time multiplication
+by 17 (or 85 for u2 D) makes every decoded cell an upper bound, never a rounded
+down estimate.
 
-The paper reports that `SIMDBP-256*` is up to 1.5× faster than conventional
-SIMDBP-256 for random group access. On MS MARCO at block size 32, its Table 7
-reports 8.0 GB for dense 8-bit block/superblock maxima, 4.2 GB for BMP-Sparse,
-3.7 GB for 8-bit SIMDBP-256*, and **1.5 GB for SIMDBP-256* with 4-bit
-maxima**. Unlike BMP-Sparse, its safe-search latency stays near the dense
-representation.
+A 256-cell group is encoded at its smallest sufficient bit width:
 
-Those ratios cannot be applied directly to Hermes: its block grid is already
-4-bit, its superblock grid is 8-bit, and its BP ordering and density differ.
-The remaining opportunity is the zero/low-width compression inside each
-256-cell group, plus converting the superblock grid to ceil-quantized 4-bit.
-The latter alone halves Section E but saves only about 3% of current total grid
-bytes because a superblock spans 64 blocks.
+- D has local width `0..=bmp_grid_bits`.
+- E has local width `0..=4`.
+- An all-zero group has width zero and no payload.
+- A group payload is exactly `width × 32` bytes.
 
-A Hermes prototype must retain the current rank-safe semantics: calculate the
-exact u8 maximum, ceil it to the stored lattice, and losslessly bit-pack that
-ceiling. It must be evaluated on production-shaped, x86 data for:
+Rows use checkpointed selectors:
 
-- bytes per block and superblock maximum, including selectors/offsets;
-- hot and cold p50/p99 latency, page faults, and decoded groups;
-- exact top-k parity with the current 4-bit dense grid;
-- build/reorder/streaming-merge throughput and peak memory.
+```text
+row_offsets: u64[dims + 1]
 
-This is a higher-priority experiment than increasing `bmp_block_size`: it can
-remove zero and low-width storage without coarsening the 32-vector pruning
-unit. It is not implemented yet.
+for each row:
+    repeated every 32 groups:
+        payload_checkpoint: u32  # offset in 32-byte units
+        widths: packed-u4[1..=32]
+    group payloads
+```
 
-## Existing dense-grid option: 2-bit block maxima
+The final selector record stores only live nibbles. One checkpoint plus at
+most 31 width additions locates any group without walking the row. For
+`C` cells and `G = ceil(C / 256)` groups:
 
-Halve the dense grid (dims × blocks / 4) by quantizing block UBs to 2 bits
-(ceil-quantized, recall-safe like `quantize_u8_to_u4_ceil`). Same layout and
-probe pattern, with no format fork beyond a footer flag.
+```text
+row_header  = ceil(G / 2) + 4 × ceil(G / 32)
+row_payload = 32 × sum(local_group_widths)
+section     = 8 × (dims + 1) + sum(row_header + row_payload)
+```
 
-| grid            | topical queries (blocks/q) | background-only queries (blocks/q) |
-| --------------- | -------------------------- | ---------------------------------- |
-| 4-bit (shipped) | 25.7                       | 6057                               |
-| 3-bit (9 lvl)   | 25.8 (+0.4%)               | 6122 (+1.1%)                       |
-| 2-bit (4 lvl)   | 25.8 (+0.4%)               | 6188 (+2.2%)                       |
+Codec groups do not pad the logical BMP block or superblock counts.
 
-Why so cheap: the exact u8 `sb_grid` prunes first and shields the block
-grid — coarse block bounds only act inside surviving superblocks. **2-bit
-grid ≈ free** in this experiment. At the current block size 32, it changes the
-100M-vector grid from 165.44 GB to 82.72 GB, and the 1B-vector grid from
-1.654 TB to 827.18 GB.
+## LSP/0 execution
 
-**Implemented**: SDL `indexed<bmp_grid_bits: 2>` (default 4; per field,
-uniform across segments — merge/blockwise validate loudly). The V15 blob
-footer carries the cell width (2 or 4); older segments must be rebuilt.
-2-bit currently uses an unrolled scalar
-accumulate/mask kernel (4 cells/byte); SIMD u2 variants are a follow-up if
-profiling asks for them — the block grid is probed only inside surviving
-superblocks. Exactness is pinned by
-`test_bmp_grid_bits_2_exact_parity_and_roundtrip` (identical top-k vs a
-4-bit index over the same corpus, through block-copy merge and BP reorder).
+V17 implements LSP/0 as a query-level operation:
 
-## Exact integer bounds (implemented 2026-07-15)
+1. Keep the strongest query dimensions for candidate generation
+   (`beta = 0.33` by default for BMP).
+2. Sweep E for those dimensions and compute SBMax for every physical segment.
+3. Select one global top-`gamma` set across the entire index, then partition
+   the selected superblock IDs back to their segments.
+4. Visit selected superblocks in non-increasing SBMax order while
+   `SBMax >= theta`.
+5. Within a selected superblock, decode D once per candidate dimension, order
+   its eight blocks by BlockMax, and apply `heap_factor` only at this level.
+6. Score documents in visited blocks with the bounded full query, including
+   dimensions removed from candidate generation.
 
-## 4-bit posting weights: measured and rejected
+The global selection is important: 50 immutable segments still visit at most
+`gamma` superblocks in total, not `50 × gamma`.
 
-Snapping posting impacts to the u4 lattice (u8 multiples of 17; emulated at
-build time so quantization applies to both scores and grid maxes) costs
-real quality: **recall@10 vs the 8-bit index = 95.1%** on the same corpus,
-matching the classical 3-5% loss for sub-8-bit impact quantization
-(Anh & Moffat lineage). The saving is only ~25% of the postings section —
-NOT 50%, because a BMP posting is 2 bytes `(local_slot: u8, impact: u8)`
-and only the impact half shrinks: packed, 2 B → 1.5 B per posting. Bad
-trade — weights stay 8-bit.
+Automatic gamma follows the paper’s zero-shot depths:
 
-## Dropping rare-dimension rows: assessed and rejected
+| requested candidate depth | gamma |
+| ---: | ---: |
+| `1..=10` | 250 |
+| `11..=100` | 500 |
+| `101..=1000` | 1,000 |
+| `> 1000` | `max(2000, depth)` |
 
-Term-centric static pruning (Carmel et al., SIGIR 2001 lineage) suggests
-dropping upper-bound rows for rare dims and treating their UB
-conservatively (global max weight for all blocks). But a conservative UB
-inflates every block bound for queries containing rare dims — exactly the
-discriminative dims BMP prunes best with — and with CSR rejected the
-"row costs bf_t entries" argument is moot: under the dense grid rare-dim
-rows are mmap pages that queries rarely fault in anyway.
+Set query `lsp_gamma: 0` for exhaustive traversal, or a positive value for an
+explicit cap. `heap_factor: 1.0` and ceiling bounds are rank-safe when query
+pruning is disabled; finite gamma and beta below 1.0 are intentional
+candidate-generation approximations. Full-query scoring preserves relevance
+within the visited candidate set.
 
-## Orthogonal follow-ups
+Candidate bounds and their corresponding score contributions share the same
+integer arithmetic: query-u16 times ceiling maximum accumulates in u32 and is
+converted to f32 once with the document scorer’s dequantizer. This prevents a
+floating-point rounding difference from lowering an unpruned bound.
 
-The 2026 paper
-[Forward Index Compression for Learned Sparse Retrieval](https://arxiv.org/html/2602.05445)
-introduces DotVByte, which fuses component-gap decoding, query-value gathers,
-and dot-product accumulation. This targets a document-oriented forward index,
-not the block/superblock maximum grids. Hermes V15 instead stores a block-local
-inverted Section B, so DotVByte is not a drop-in grid fix. Its fused-decode
-approach is worth revisiting only if Section B becomes the measured bottleneck
-after the grids are addressed.
+## Build, merge, and BP reorder
 
-[Seismic](https://arxiv.org/abs/2404.18812) and
-[SeismicWave](https://arxiv.org/abs/2408.04443) avoid an exhaustive BMP grid
-through statically pruned inverted lists, compact block summaries, and (for
-SeismicWave) a proximity graph. They are approximate retrieval designs with
-different build, update, and quality trade-offs, not lossless compression for
-the current BMP executor. They should be compared as separate algorithms
-rather than mixed into the V15 format.
+Initial build and BP/reorder write grids from sorted
+`(dimension, block, exact_u8_maximum)` entries. Exact maxima are retained in
+each block header, so both D and E can be regenerated without scanning or
+reserializing postings.
 
-## SSD-friendliness / paging behavior
+Ordinary merge remains a streaming block-copy operation:
 
-The grid is mmap-backed; "SSD-friendly" means the resident set stays
-bounded and misses are served as clean 4 KB NVMe refaults:
+- Section B block payloads are copied byte-for-byte.
+- Aligned D groups are copied byte-for-byte.
+- A shifted D boundary is decoded/repacked with one bounded 256-cell buffer.
+- E values are remapped to destination superblocks. If a source superblock
+  straddles a destination boundary, its ceiling bound is max-propagated to
+  both destinations. The bound may be temporarily loose but cannot be unsafe.
+- Document maps are chunked copies with document-ID offset patching.
 
-- **MADV_RANDOM on the grid** (shipped): kills readahead amplification —
-  per query the grid working set is `query_dims × surviving_superblocks ×
-4 KB` instead of ×128 KB. Pages are clean and reclaimable; under memory
-  pressure the kernel evicts them and cold queries pay ~20-50 µs NVMe
-  refaults per page instead of the pod OOMing.
-- **sb_grid stays readahead-friendly and pinnable** (priority 4 in the pin
-  budget): it is swept contiguously per query dim and is 64× smaller than
-  the grid — keeping it resident preserves superblock pruning, which is
-  what keeps the number of grid probes small in the first place.
-- The block grid is deliberately never pinned (data-sized).
+A later BP pass rebuilds tight E values from exact block headers. Reordering
+changes block coordinates first and then projects exact maxima into
+`floor(new_block / 8)`, so ceil quantization composes correctly with any
+permutation.
 
-## Recommendation
+## CPU and paging behavior
+
+The production codec and hot loops are Rust:
+
+- x86_64 uses BMI2 for variable-width unpacking and SSE4.1 for u4/u8 bound
+  accumulation, including the eight-block LSP unit;
+- AArch64 uses bounded unpacking and NEON for the same D/E accumulation paths;
+- other targets use a result-identical scalar fallback.
+
+All large sections remain mmap-backed. E and the compact offset/selector
+structures are eligible for priority pinning because every BMP query uses
+them. D payload and block payload remain pageable. D receives random-access
+advice; E receives sequential advice.
+
+## Match to the LSP paper
+
+V17 follows the core design in
+[Carlson et al., “Efficiency Optimizations for Superblock-based Sparse Retrieval”](https://arxiv.org/html/2602.02883v1):
+
+- 256 independently decodable maximum cells per compressed group;
+- random group access rather than BMP-Sparse’s binary-search/scatter path;
+- four-bit ceiling maxima at both hierarchy levels;
+- a superblock footprint no larger than 256 vectors (`b = 32`, `c = 8`);
+- beta query pruning, strict SBMax top-gamma selection, safe
+  `SBMax >= theta`, block-level eta/`heap_factor`, and full-query scoring of
+  visited candidates.
+
+Hermes’s codec is equivalent in access granularity and bounds but is not the
+paper implementation’s wire format. Its selector checkpoints are interleaved
+every 32 groups rather than stored as one long selector prefix, which bounds
+random lookup work on very long 1B-scale rows.
+
+The paper reports its best latency around block sizes 4–16. Hermes keeps the
+requested block size 32 and compensates with eight-block superblocks; this
+satisfies the paper’s `b × c <= 256` recommendation but is a deliberate
+space/build-time tradeoff rather than a claim that 32 is the paper optimum.
+
+## Flat-Inv versus the paper’s Fwd layout
+
+Hermes does **not** use the paper’s document-major Fwd payload for persistent
+BMP scoring. Section B is a block-local Flat-Inv layout:
+
+```text
+sorted term IDs
+term offsets
+(local_slot: u8, impact: u8) postings
+```
+
+The paper finds Fwd faster for small blocks, including `b = 32`, but its
+Compact-Inv format explicitly assumes a vocabulary that fits two-byte term
+IDs. Hermes production fields use roughly 105,879 dimensions, so a direct
+Hermes Fwd layout requires four-byte IDs. At minimum, separate u32 term IDs
+and u8 weights cost `5P` bytes plus document offsets, while current Section B
+costs `2P + 9T + block headers`. Which representation is smaller therefore
+depends on the measured `T/P` ratio; vocabulary size alone does not settle it.
+Ignoring the small offset/header terms, Fwd becomes smaller only when
+`T/P > 1/3`; repeated dimensions within a 32-vector block push that ratio
+down and favor Flat-Inv.
+Flat-Inv also lets the scorer fetch only postings for query-present terms,
+whereas Fwd streams every term in every candidate document.
+
+“Forward indexes” elsewhere in Hermes are temporary BP/reorder structures
+used to compute a document or block permutation. They are memory-budgeted,
+discarded after the pass, and are not the on-disk query payload discussed by
+the paper.
+
+## Validation
+
+The test suite pins:
+
+- every local width round trip and malformed metadata rejection;
+- SSE4.1/NEON/scalar-equivalent u4 and u8 accumulation tails;
+- exact BMP-versus-MaxScore top-k parity in exhaustive mode;
+- u2-versus-u4 rank-safe parity;
+- a single global gamma across multiple segments;
+- non-aligned D merge and overlapping E-bound propagation;
+- record and blockwise BP reorder;
+- E regeneration from exact block-header maxima;
+- bounded external-run construction.
+
+After a production rebuild, record D/E encoded bytes, hot and cold
+p50/p95/p99, page faults, global selected/visited superblocks, blocks visited,
+and recall against `lsp_gamma: 0`. The new hierarchy should be judged from
+those measurements rather than the obsolete V16 projections.

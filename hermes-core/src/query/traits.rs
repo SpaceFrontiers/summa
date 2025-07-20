@@ -47,6 +47,8 @@ pub struct ScorerOptions {
     /// it during traversal so concurrently searched segments benefit as soon
     /// as another segment establishes a stronger global floor.
     pub shared_threshold: Option<super::scoring::SharedThreshold>,
+    /// Query-global LSP/0 selection projected onto this segment.
+    pub(crate) lsp_plan: Option<std::sync::Arc<super::bmp::LspSegmentPlan>>,
 }
 
 impl ScorerOptions {
@@ -55,6 +57,7 @@ impl ScorerOptions {
             collect_positions: true,
             initial_threshold: 0.0,
             shared_threshold: None,
+            lsp_plan: None,
         }
     }
 
@@ -66,6 +69,7 @@ impl ScorerOptions {
             collect_positions: self.collect_positions,
             initial_threshold: 0.0,
             shared_threshold: None,
+            lsp_plan: None,
         }
     }
 }
@@ -195,6 +199,10 @@ pub struct SparseTermQueryInfo {
     pub dim_id: u32,
     /// Query weight for this dimension
     pub weight: f32,
+    /// Whether this term participates in candidate generation. BMP/LSP uses
+    /// the pruned subset for maximum-grid traversal, then scores candidates
+    /// with every term retained in this decomposition.
+    pub candidate: bool,
     /// MaxScore heap factor (1.0 = exact, lower = approximate)
     pub heap_factor: f32,
     /// Multi-value combiner for ordinal deduplication
@@ -202,8 +210,8 @@ pub struct SparseTermQueryInfo {
     /// Multiplier on executor limit to compensate for ordinal deduplication
     /// (1.0 = exact, 2.0 = fetch 2x then combine down)
     pub over_fetch_factor: f32,
-    /// Maximum superblocks to visit (LSP/0 gamma cap). 0 = unlimited.
-    pub max_superblocks: usize,
+    /// LSP/0 γ. None is depth-derived; Some(0) is exhaustive.
+    pub lsp_gamma: Option<usize>,
 }
 
 /// Decomposition of a query for MaxScore optimization.

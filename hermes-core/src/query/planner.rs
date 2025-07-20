@@ -241,7 +241,7 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
     let si = reader.sparse_index(field)?;
     let query_terms: Vec<(u32, f32)> = infos
         .iter()
-        .filter(|info| si.has_dimension(info.dim_id))
+        .filter(|info| info.candidate && si.has_dimension(info.dim_id))
         .map(|info| (info.dim_id, info.weight))
         .collect();
     if query_terms.is_empty() {
@@ -275,34 +275,7 @@ pub(crate) fn build_sparse_bmp_results(
     limit: usize,
     options: &super::ScorerOptions,
 ) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
-    let field = infos[0].field;
-    let bmp = reader.bmp_index(field)?;
-    let query_terms: Vec<(u32, f32)> = infos
-        .iter()
-        .map(|info| (info.dim_id, info.weight))
-        .collect();
-    if query_terms.is_empty() {
-        return None;
-    }
-    let executor_limit = bmp_executor_limit(limit, infos[0].over_fetch_factor, bmp);
-    let max_sb = infos[0].max_superblocks;
-    let field_label = reader.schema().get_field_name(field).unwrap_or("?");
-    match super::bmp::execute_bmp_with_threshold(
-        bmp,
-        reader.schema().index_label(),
-        field_label,
-        &query_terms,
-        executor_limit,
-        infos[0].heap_factor,
-        max_sb,
-        bmp_threshold(options, infos[0].combiner, bmp.is_single_valued()),
-    ) {
-        Ok(results) => Some((results, infos[0])),
-        Err(e) => {
-            log::warn!("BMP execution failed for field {}: {}", field.0, e);
-            None
-        }
-    }
+    build_sparse_bmp_results_inner(infos, reader, limit, None, options)
 }
 
 /// Build a sparse BMP executor with a document predicate filter.
@@ -316,32 +289,69 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     predicate: &dyn Fn(crate::DocId) -> bool,
     options: &super::ScorerOptions,
 ) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
-    let field = infos[0].field;
+    build_sparse_bmp_results_inner(infos, reader, limit, Some(predicate), options)
+}
+
+fn build_sparse_bmp_results_inner(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    predicate: Option<&dyn Fn(crate::DocId) -> bool>,
+    options: &super::ScorerOptions,
+) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
+    let info = *infos.first()?;
+    let field = info.field;
     let bmp = reader.bmp_index(field)?;
-    let query_terms: Vec<(u32, f32)> = infos
+    let candidate_terms: Vec<(u32, f32)> = infos
+        .iter()
+        .filter(|info| info.candidate)
+        .map(|info| (info.dim_id, info.weight))
+        .collect();
+    if candidate_terms.is_empty() {
+        return None;
+    }
+    let scoring_terms: Vec<(u32, f32)> = infos
         .iter()
         .map(|info| (info.dim_id, info.weight))
         .collect();
-    if query_terms.is_empty() {
-        return None;
-    }
-    let executor_limit = bmp_executor_limit(limit, infos[0].over_fetch_factor, bmp);
-    let max_sb = infos[0].max_superblocks;
+    let executor_limit = bmp_executor_limit(limit, info.over_fetch_factor, bmp);
+    let lsp_gamma = info
+        .lsp_gamma
+        .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit));
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
-    match super::bmp::execute_bmp_filtered_with_threshold(
-        bmp,
-        reader.schema().index_label(),
-        field_label,
-        &query_terms,
-        executor_limit,
-        infos[0].heap_factor,
-        max_sb,
-        predicate,
-        bmp_threshold(options, infos[0].combiner, bmp.is_single_valued()),
-    ) {
-        Ok(results) => Some((results, infos[0])),
+    let threshold = bmp_threshold(options, info.combiner, bmp.is_single_valued());
+    let result = if let Some(predicate) = predicate {
+        super::bmp::execute_bmp_filtered_with_threshold(
+            bmp,
+            reader.schema().index_label(),
+            field_label,
+            &candidate_terms,
+            &scoring_terms,
+            executor_limit,
+            info.heap_factor,
+            lsp_gamma,
+            options.lsp_plan.as_deref(),
+            predicate,
+            threshold,
+        )
+    } else {
+        super::bmp::execute_bmp_with_threshold(
+            bmp,
+            reader.schema().index_label(),
+            field_label,
+            &candidate_terms,
+            &scoring_terms,
+            executor_limit,
+            info.heap_factor,
+            lsp_gamma,
+            options.lsp_plan.as_deref(),
+            threshold,
+        )
+    };
+    match result {
+        Ok(results) => Some((results, info)),
         Err(e) => {
-            log::warn!("BMP filtered execution failed for field {}: {}", field.0, e);
+            log::warn!("BMP execution failed for field {}: {}", field.0, e);
             None
         }
     }
@@ -668,6 +678,7 @@ mod tests {
             collect_positions: false,
             initial_threshold: 5.0,
             shared_threshold: Some(shared),
+            lsp_plan: None,
         };
 
         let single_sum = bmp_threshold(&options, MultiValueCombiner::Sum, true);

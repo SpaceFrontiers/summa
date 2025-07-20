@@ -167,8 +167,10 @@ pub struct SparseQueryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_query_dims: Option<usize>,
     /// Fraction of query dimensions to keep (0.0-1.0), same semantics as
-    /// indexing-time `pruning`: sort by abs(weight) descending,
-    /// keep top fraction. None or 1.0 = no pruning.
+    /// indexing-time `pruning`: sort by abs(weight) descending and keep the
+    /// top fraction. BMP uses this subset for candidate generation and the
+    /// bounded full query for final scoring; MaxScore uses the subset for both.
+    /// None or 1.0 = no pruning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruning: Option<f32>,
     /// Minimum number of query dimensions before pruning and weight_threshold
@@ -177,10 +179,10 @@ pub struct SparseQueryConfig {
     /// Default: 4. Set to 0 to always apply pruning/filtering.
     #[serde(default = "default_min_terms")]
     pub min_query_dims: usize,
-    /// Maximum number of superblocks to visit (LSP/0 gamma cap).
-    /// 0 = unlimited (default). Only applies to BMP format.
-    #[serde(default)]
-    pub max_superblocks: usize,
+    /// LSP/0 top-superblock guarantee γ. `None` selects the paper-derived
+    /// schedule from retrieval depth; `Some(0)` requests exhaustive traversal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_gamma: Option<usize>,
 }
 
 fn default_heap_factor() -> f32 {
@@ -197,7 +199,7 @@ impl Default for SparseQueryConfig {
             max_query_dims: None,
             pruning: None,
             min_query_dims: 4,
-            max_superblocks: 0,
+            lsp_gamma: None,
         }
     }
 }
@@ -247,28 +249,21 @@ pub struct SparseVectorConfig {
     /// BMP block size: number of consecutive doc_ids per block (must be power
     /// of 2, max 256). Only used when format = Bmp. Uniform across every
     /// segment of the field — set per field in SDL (`bmp_block_size: N`).
-    /// Smaller = better pruning granularity; larger = smaller grid — the
-    /// dense 4-bit grid is `dims × num_blocks / 2` bytes, so grid memory
-    /// scales as 1/block_size. Default 32 favors pruning granularity; increase
-    /// it explicitly only when the block-grid memory tradeoff requires it
+    /// Smaller = better pruning granularity; larger means fewer locally
+    /// bit-packed maximum cells. Default 32 favors pruning granularity;
+    /// increase it only after representative tail-latency testing
     /// (docs/bmp-grid-compression.md).
     #[serde(default = "default_bmp_block_size")]
     pub bmp_block_size: u32,
-    /// Bits per BMP block-grid cell: 4 (default) or 2. The grid is
-    /// `dims × num_blocks × bits/8` bytes, so 2 halves grid memory; measured
-    /// pruning cost is ~free (+0.4-2.2% blocks scored — the exact u8 sb_grid
-    /// prunes first and shields the block grid; docs/bmp-grid-compression.md).
+    /// Bits per BMP block-grid cell: 4 (default) or 2. Two caps compressed D
+    /// payload groups at two bits; the exact space reduction depends on local
+    /// group widths. Measured pruning cost is small (+0.4-2.2% blocks scored;
+    /// the ceil-u4 superblock grid prunes first).
     /// Grid bounds are ceil-quantized, so exact top-k results are unchanged
     /// at any width. Uniform per field across all segments — set in SDL
     /// (`bmp_grid_bits: 2`) at index creation.
     #[serde(default = "default_bmp_grid_bits")]
     pub bmp_grid_bits: u8,
-    /// BMP superblock size: number of consecutive blocks grouped for hierarchical
-    /// pruning (Carlson et al., SIGIR 2025). Must be power of 2.
-    /// Default 64. Set to 0 to disable superblock pruning (flat BMP scoring).
-    /// Only used when format = Bmp.
-    #[serde(default = "default_bmp_superblock_size")]
-    pub bmp_superblock_size: u32,
     /// Static pruning: fraction of postings to keep per inverted list (SEISMIC-style)
     /// Lists are sorted by weight descending and truncated to top fraction.
     ///
@@ -296,7 +291,7 @@ pub struct SparseVectorConfig {
     /// - uniCOIL: 30522
     /// - Custom models: set to vocabulary size
     ///
-    /// If None, BMP builder derives dims from observed data (V10 behavior).
+    /// If None, the BMP builder derives dims from observed data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dims: Option<u32>,
     /// Fixed max weight scale for BMP format.
@@ -305,7 +300,7 @@ pub struct SparseVectorConfig {
     /// (`max_weight_scale = max_weight`), eliminating rescaling during merge.
     ///
     /// For SPLADE models: 5.0 (covers typical weight range 0-5).
-    /// If None, BMP builder derives scale from data (V10 behavior).
+    /// If None, the BMP builder derives scale from data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_weight: Option<f32>,
     /// Minimum number of postings in a dimension before pruning and
@@ -326,11 +321,7 @@ fn default_bmp_block_size() -> u32 {
 }
 
 fn default_bmp_grid_bits() -> u8 {
-    4
-}
-
-fn default_bmp_superblock_size() -> u32 {
-    64
+    SparseVectorConfig::DEFAULT_BMP_GRID_BITS
 }
 
 fn default_min_terms() -> usize {
@@ -347,8 +338,7 @@ impl Default for SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: None,
             query_config: None,
 
@@ -361,6 +351,7 @@ impl Default for SparseVectorConfig {
 
 impl SparseVectorConfig {
     pub const DEFAULT_BMP_BLOCK_SIZE: u32 = 32;
+    pub const DEFAULT_BMP_GRID_BITS: u8 = 4;
 
     /// SPLADE-optimized config with research-validated defaults
     ///
@@ -386,8 +377,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: Some(0.1), // Keep top 10% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -397,7 +387,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(20), // Process top 20 query dimensions
                 pruning: Some(0.1),       // Keep top 10% of query dims
                 min_query_dims: 4,
-                max_superblocks: 0,
+                lsp_gamma: None,
             }),
 
             dims: None,
@@ -421,18 +411,17 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: Some(0.1),
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
                 weighting: QueryWeighting::One,
-                heap_factor: 0.8,
+                heap_factor: 1.0,
                 weight_threshold: 0.01,
-                max_query_dims: Some(20),
-                pruning: Some(0.1),
+                max_query_dims: None,
+                pruning: Some(0.33),
                 min_query_dims: 4,
-                max_superblocks: 0,
+                lsp_gamma: None,
             }),
 
             dims: Some(105879),
@@ -458,8 +447,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -469,7 +457,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(15), // Fewer query dimensions
                 pruning: Some(0.15),      // Keep top 15% of query dims
                 min_query_dims: 4,
-                max_superblocks: 0,
+                lsp_gamma: None,
             }),
 
             dims: None,
@@ -490,8 +478,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: None,
             query_config: None,
 
@@ -519,8 +506,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -530,7 +516,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(50), // Process more dimensions
                 pruning: None,            // No fraction-based pruning
                 min_query_dims: 4,
-                max_superblocks: 0,
+                lsp_gamma: None,
             }),
 
             dims: None,
@@ -596,8 +582,7 @@ impl SparseVectorConfig {
             doc_mass: None,
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
-            bmp_grid_bits: 4,
-            bmp_superblock_size: 64,
+            bmp_grid_bits: default_bmp_grid_bits(),
             pruning: None,
             query_config: None,
 

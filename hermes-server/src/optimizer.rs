@@ -33,8 +33,7 @@ pub struct OptimizerConfig {
     /// Wall-clock budget per BP pass on large segments.
     pub time_budget: Duration,
     /// Depth cap for large segments: stop bisection at partitions of this
-    /// many docs. 4096 = superblock granularity (64 blocks × 64 docs), which
-    /// keeps most of the superblock-pruning win at ~⅓ less depth.
+    /// many vectors. 256 is one default LSP superblock (8 × 32 vectors).
     pub partial_min_partition_docs: usize,
     /// Minimum wait between follow-up passes on a segment whose previous
     /// pass hit its wall-clock budget (`bp_converged == false`). Each

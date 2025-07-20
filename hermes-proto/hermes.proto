@@ -113,6 +113,7 @@ message SparseVectorQuery {
   float weight_threshold = 10;      // Min abs(weight) for query dims (0 = no filtering)
   uint32 max_query_dims = 11;       // Max query dimensions to process (0 = all)
   float pruning = 12;               // Fraction of query dims to keep (0 = no pruning, 0.1 = top 10%)
+  optional uint32 lsp_gamma = 13;   // LSP/0 gamma (unset = depth-derived, 0 = exhaustive)
 }
 
 // Dense vector query for similarity search

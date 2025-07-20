@@ -363,19 +363,30 @@ The BMP (block-max pruning) format takes additional `indexed<...>` options:
 
 ```
 field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.0,
-    bmp_block_size: 32, bmp_grid_bits: 4>, reorder]
+    bmp_block_size: 32, bmp_grid_bits: 4,
+    query<pruning: 0.33, lsp_gamma: 1000>>, reorder]
 ```
 
 - `bmp_block_size` (power of two, max 256; default 32) — vectors per BMP
-  block, uniform across every segment of the field. The dense 4-bit grid
-  is `dims × num_blocks / 2` bytes, so grid memory scales as
-  1/block_size; smaller blocks give finer pruning granularity. Multi-valued
-  fields count each ordinal as a vector. Do not increase the block size solely
+  block, uniform across every segment of the field. Larger blocks reduce the
+  number of locally bit-packed maximum cells but also coarsen pruning.
+  Multi-valued fields count each ordinal as a vector. Do not increase the block
 - `bmp_grid_bits` (2 or 4; default 4) — bits per block-grid upper bound.
-  Two-bit bounds are ceil-quantized and remain rank-safe, but are looser.
+  Two-bit bounds are ceil-quantized and remain rank-safe, but are looser. They
+  cap compressed D payload widths at two bits; the exact saving is
+  workload-dependent.
+- `query<pruning: 0.33>` — retain the highest-weight third of query
+  dimensions for BMP candidate generation, matching the LSP/0 zero-shot beta.
+  Visited documents are still scored with the bounded full query. The BMP
+  preset and server fallback use 0.33; use 1.0 for unpruned candidate
+  generation.
+- `query<lsp_gamma: N>` — cap traversal to the global top-N superblocks across
+  all physical segments. When omitted, Hermes derives gamma from candidate
+  depth (250/500/1000 for depths 10/100/1000). Set zero for exhaustive
+  traversal.
 
-See `docs/bmp-grid-compression.md` for exact current sizes and compression
-research.
+See `docs/bmp-grid-compression.md` for current size formulas, LSP/0 behavior,
+merge/reorder invariants, and the Flat-Inv versus Fwd design choice.
 
 ### Quantization and Pruning
 
