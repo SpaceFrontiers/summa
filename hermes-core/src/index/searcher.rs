@@ -598,13 +598,33 @@ impl<D: Directory + 'static> Searcher<D> {
         {
             return Ok(empty());
         }
+        let field = first.field;
+        let (total_superblocks, planning_depth) = self
+            .segments
+            .iter()
+            .filter_map(|segment| segment.bmp_index(field))
+            .fold((0usize, retrieval_depth), |(total, depth), bmp| {
+                (
+                    total.saturating_add(bmp.num_superblocks as usize),
+                    depth.max(crate::query::bmp_executor_limit(
+                        retrieval_depth,
+                        first.over_fetch_factor,
+                        bmp,
+                    )),
+                )
+            });
         let gamma = first
             .lsp_gamma
-            .unwrap_or_else(|| crate::query::bmp::recommended_lsp_gamma(retrieval_depth));
+            .unwrap_or_else(|| crate::query::bmp::recommended_lsp_gamma(planning_depth));
         if gamma == 0 {
             return Ok(empty());
         }
-        let field = first.field;
+        if total_superblocks == 0 || gamma >= total_superblocks {
+            // A cap covering the whole index is exhaustive. Let each segment
+            // compute and traverse its local order once instead of building a
+            // query-global heap and retaining an all-superblock plan.
+            return Ok(empty());
+        }
         let candidate_terms: Vec<(u32, f32)> = infos
             .iter()
             .filter(|info| info.candidate)
@@ -667,9 +687,13 @@ impl<D: Directory + 'static> Searcher<D> {
                     .total_cmp(&segment_bounds[left as usize])
                     .then_with(|| left.cmp(&right))
             });
+            let selected_bounds = selected[segment]
+                .iter()
+                .map(|&superblock| segment_bounds[superblock as usize])
+                .collect();
             plans.push(Some(std::sync::Arc::new(
                 crate::query::bmp::LspSegmentPlan {
-                    sb_ubs: segment_bounds,
+                    sb_ubs: selected_bounds,
                     sb_order: std::mem::take(&mut selected[segment]),
                 },
             )));

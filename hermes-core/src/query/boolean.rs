@@ -226,7 +226,7 @@ macro_rules! boolean_plan {
             // Auto-detect: BMP executor if field has BMP index, else MaxScore
             if let Some(infos) = extract_all_sparse_infos(should) {
                 if let Some((raw, info)) =
-                    build_sparse_bmp_results(&infos, reader, limit, &scorer_options)
+                    build_sparse_bmp_results(&infos, reader, limit, &scorer_options)?
                 {
                     return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
                 }
@@ -358,7 +358,7 @@ macro_rules! boolean_plan {
                         if let Some((raw, info)) =
                             build_sparse_bmp_results_filtered(
                                 &infos, reader, limit, &bitset_pred, &scorer_options
-                            )
+                            )?
                         {
                             log::debug!(
                                 "BooleanQuery planner: bitset-aware sparse BMP, {} dims, {} matching docs",
@@ -374,7 +374,7 @@ macro_rules! boolean_plan {
                     if let Some((raw, info)) =
                         build_sparse_bmp_results_filtered(
                             &infos, reader, limit, &*combined, &scorer_options
-                        )
+                        )?
                     {
                         log::debug!(
                             "BooleanQuery planner: predicate-aware sparse BMP, {} dims",

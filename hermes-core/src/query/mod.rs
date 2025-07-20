@@ -27,6 +27,7 @@ mod fusion;
 mod global_stats;
 mod phrase;
 mod planner;
+pub(crate) use planner::bmp_executor_limit;
 mod prefix;
 mod range;
 mod reranker;

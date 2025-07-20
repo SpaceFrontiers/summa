@@ -184,7 +184,7 @@ pub(super) fn bounded_sparse_executor_limit(limit: usize, over_fetch_factor: f32
 /// hit is already a distinct final document. Genuine multi-value segments
 /// retain the configured budget because aggregation can collapse many raw
 /// ordinals into one document.
-fn bmp_executor_limit(
+pub(crate) fn bmp_executor_limit(
     limit: usize,
     over_fetch_factor: f32,
     bmp: &crate::segment::reader::bmp::BmpIndex,
@@ -194,7 +194,6 @@ fn bmp_executor_limit(
         over_fetch_factor,
         bmp.is_single_valued(),
         bmp.num_real_docs() as usize,
-        bmp.num_virtual_docs as usize,
     )
 }
 
@@ -203,12 +202,11 @@ fn bmp_executor_limit_for_counts(
     over_fetch_factor: f32,
     single_valued: bool,
     num_real_docs: usize,
-    num_virtual_docs: usize,
 ) -> usize {
     if single_valued {
         limit.min(num_real_docs)
     } else {
-        bounded_sparse_executor_limit(limit, over_fetch_factor).min(num_virtual_docs)
+        bounded_sparse_executor_limit(limit, over_fetch_factor).min(num_real_docs)
     }
 }
 
@@ -274,7 +272,7 @@ pub(crate) fn build_sparse_bmp_results(
     reader: &SegmentReader,
     limit: usize,
     options: &super::ScorerOptions,
-) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
+) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
     build_sparse_bmp_results_inner(infos, reader, limit, None, options)
 }
 
@@ -288,7 +286,7 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     limit: usize,
     predicate: &dyn Fn(crate::DocId) -> bool,
     options: &super::ScorerOptions,
-) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
+) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
     build_sparse_bmp_results_inner(infos, reader, limit, Some(predicate), options)
 }
 
@@ -298,17 +296,21 @@ fn build_sparse_bmp_results_inner(
     limit: usize,
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
     options: &super::ScorerOptions,
-) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
-    let info = *infos.first()?;
+) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
+    let Some(&info) = infos.first() else {
+        return Ok(None);
+    };
     let field = info.field;
-    let bmp = reader.bmp_index(field)?;
+    let Some(bmp) = reader.bmp_index(field) else {
+        return Ok(None);
+    };
     let candidate_terms: Vec<(u32, f32)> = infos
         .iter()
         .filter(|info| info.candidate)
         .map(|info| (info.dim_id, info.weight))
         .collect();
     if candidate_terms.is_empty() {
-        return None;
+        return Ok(None);
     }
     let scoring_terms: Vec<(u32, f32)> = infos
         .iter()
@@ -320,7 +322,7 @@ fn build_sparse_bmp_results_inner(
         .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit));
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     let threshold = bmp_threshold(options, info.combiner, bmp.is_single_valued());
-    let result = if let Some(predicate) = predicate {
+    let results = if let Some(predicate) = predicate {
         super::bmp::execute_bmp_filtered_with_threshold(
             bmp,
             reader.schema().index_label(),
@@ -347,14 +349,8 @@ fn build_sparse_bmp_results_inner(
             options.lsp_plan.as_deref(),
             threshold,
         )
-    };
-    match result {
-        Ok(results) => Some((results, info)),
-        Err(e) => {
-            log::warn!("BMP execution failed for field {}: {}", field.0, e);
-            None
-        }
-    }
+    }?;
+    Ok(Some((results, info)))
 }
 
 /// Combine raw MaxScore results with ordinal deduplication into a scorer.
@@ -660,14 +656,8 @@ mod tests {
     #[test]
     fn bmp_single_value_limit_does_not_overfetch() {
         assert_eq!(bounded_sparse_executor_limit(320, 99.0), 640);
-        assert_eq!(
-            bmp_executor_limit_for_counts(320, 2.0, true, 10_000, 10_048),
-            320
-        );
-        assert_eq!(
-            bmp_executor_limit_for_counts(320, 2.0, false, 10_000, 10_048),
-            640
-        );
+        assert_eq!(bmp_executor_limit_for_counts(320, 2.0, true, 10_000), 320);
+        assert_eq!(bmp_executor_limit_for_counts(320, 2.0, false, 10_000), 640);
     }
 
     #[test]
