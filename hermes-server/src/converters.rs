@@ -3,9 +3,8 @@
 use std::sync::LazyLock;
 
 use hermes_core::query::{
-    BinaryDenseVectorQuery, DEFAULT_DENSE_RERANK_FACTOR, DenseVectorQuery, LazyGlobalStats,
-    MAX_DENSE_NPROBE, MAX_DENSE_RERANK_FACTOR, MultiValueCombiner, RerankerConfig,
-    SparseVectorQuery,
+    BinaryDenseVectorQuery, DenseVectorQuery, LazyGlobalStats, MAX_DENSE_NPROBE,
+    MultiValueCombiner, RerankerConfig, SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
@@ -371,7 +370,11 @@ pub fn convert_query(
                 sv_query.combiner_top_k,
                 sv_query.combiner_decay,
             );
-            let mut query = SparseVectorQuery::new(field, vector).with_combiner(combiner);
+            // SearchRequest.candidate_limit is the single candidate budget.
+            // Query collectors must not multiply it independently.
+            let mut query = SparseVectorQuery::new(field, vector)
+                .with_combiner(combiner)
+                .with_over_fetch_factor(1.0);
 
             // Apply SDL query_config defaults, then override with per-request values
             let schema_qc = schema
@@ -466,22 +469,9 @@ pub fn convert_query(
                 ));
             }
 
-            let rerank_factor = if dv_query.rerank_factor == 0.0 {
-                DEFAULT_DENSE_RERANK_FACTOR
-            } else {
-                dv_query.rerank_factor
-            };
-            if !rerank_factor.is_finite()
-                || !(1.0..=MAX_DENSE_RERANK_FACTOR).contains(&rerank_factor)
-            {
-                return Err(format!(
-                    "Dense query rerank_factor must be finite and in [1, {MAX_DENSE_RERANK_FACTOR}], got {rerank_factor}"
-                ));
-            }
-
             let mut query = DenseVectorQuery::new(field, dv_query.vector.clone())
                 .with_nprobe(nprobe)
-                .with_rerank_factor(rerank_factor);
+                .with_rerank_factor(1.0);
             let combiner = convert_combiner(
                 dv_query.combiner,
                 dv_query.combiner_temperature,
@@ -1224,6 +1214,15 @@ mod tests {
     }
 
     #[test]
+    fn server_conversion_uses_the_shared_candidate_budget() {
+        let schema = dense_test_schema(17);
+        let query =
+            convert_query(&dense_proto_query(vec![1.0, 2.0, 3.0]), &schema, None, None).unwrap();
+
+        assert!(query.to_string().contains("rerank=1"));
+    }
+
+    #[test]
     fn dense_query_rejects_invalid_dimensions_and_values() {
         let schema = dense_test_schema(17);
         for vector in [
@@ -1250,25 +1249,6 @@ mod tests {
         };
         query.field = "title".to_string();
         assert!(convert_query(&wrong_field, &schema, None, None).is_err());
-
-        for rerank_factor in [
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            -1.0,
-            2.01,
-            MAX_DENSE_RERANK_FACTOR + 1.0,
-        ] {
-            let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);
-            let Some(ProtoQueryType::DenseVector(query)) = proto.query.as_mut() else {
-                unreachable!()
-            };
-            query.rerank_factor = rerank_factor;
-            assert!(
-                convert_query(&proto, &schema, None, None).is_err(),
-                "rerank_factor {rerank_factor} should be rejected"
-            );
-        }
 
         let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);
         let Some(ProtoQueryType::DenseVector(query)) = proto.query.as_mut() else {

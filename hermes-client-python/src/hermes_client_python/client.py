@@ -384,6 +384,7 @@ class HermesClient:
         offset: int = 0,
         fields_to_load: list[str] | None = None,
         reranker: dict[str, Any] | None = None,
+        candidate_limit: int = 0,
         timeout: float | None = None,
     ) -> SearchResponse:
         """Search for documents.
@@ -398,11 +399,13 @@ class HermesClient:
                 Fusion (hybrid union of sub-queries, top-level only):
                 {"fusion": {"queries": [{"query": {...}, "weight": 1.0}, ...],
                 "method": "rrf" | "normalized_weighted_sum",
-                "rrf_k": 60, "fetch_limit": 100}}
+                "rrf_k": 60}}
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
             reranker: Reranker dict matching proto Reranker message
+            candidate_limit: Shared first-stage candidate pool. Zero uses the
+                result window; explicit values are capped at 2x that window.
 
         Returns:
             SearchResponse with hits
@@ -450,8 +453,9 @@ class HermesClient:
                 reranker={
                     "field": "embedding",
                     "vector": [0.1, 0.2, 0.3],
-                    "limit": 100,
                 },
+                limit=50,
+                candidate_limit=100,
                 fields_to_load=["title"])
 
         """
@@ -467,6 +471,7 @@ class HermesClient:
             offset=offset,
             fields_to_load=fields_to_load or [],
             reranker=pb_reranker,
+            candidate_limit=candidate_limit,
         )
 
         response = await self._search_stub.Search(
@@ -783,7 +788,6 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
                 field=dv["field"],
                 vector=dv["vector"],
                 nprobe=dv.get("nprobe", 0),
-                rerank_factor=dv.get("rerank_factor", 0),
                 combiner=_combiner_to_proto(dv.get("combiner")),
                 combiner_temperature=dv.get("combiner_temperature", 0),
                 combiner_top_k=dv.get("combiner_top_k", 0),
@@ -860,7 +864,6 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
                 ],
                 method=pb_method,
                 rrf_k=f.get("rrf_k", 0),
-                fetch_limit=f.get("fetch_limit", 0),
                 # Chunk combiner; unset -> MAX server-side (chunk-level fusion)
                 combiner=_combiner_to_proto(f.get("combiner")),
             )
@@ -891,7 +894,6 @@ def _build_reranker(r: dict[str, Any]) -> pb.Reranker:
     return pb.Reranker(
         field=r["field"],
         vector=r.get("vector", []),
-        limit=r.get("limit", 0),
         combiner=_combiner_to_proto(r.get("combiner")),
         combiner_temperature=r.get("combiner_temperature", 0),
         combiner_top_k=r.get("combiner_top_k", 0),

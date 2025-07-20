@@ -756,7 +756,7 @@ fn reorder_bmp_field_blockwise(
     }
     if num_blocks_total > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V14 u32 format limit".into(),
+            "reordered BMP block count exceeds the V15 u32 format limit".into(),
         ));
     }
     let num_virtual_docs = num_blocks_total
@@ -764,7 +764,7 @@ fn reorder_bmp_field_blockwise(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V14 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the V15 u32 format limit".into(),
             )
         })?;
 
@@ -955,7 +955,7 @@ fn reorder_bmp_field_blockwise(
             .checked_add(b.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "reordered BMP real-document count exceeds the V14 u32 format limit".into(),
+                    "reordered BMP real-document count exceeds the V15 u32 format limit".into(),
                 )
             })?;
     }
@@ -1351,7 +1351,7 @@ pub(crate) fn reorder_bmp_field(
     }
     if num_real_docs > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP real-document count exceeds the V14 u32 format limit".into(),
+            "reordered BMP real-document count exceeds the V15 u32 format limit".into(),
         ));
     }
 
@@ -1464,7 +1464,7 @@ pub(crate) fn reorder_bmp_field(
     let new_num_blocks = num_real_docs.div_ceil(effective_block_size);
     if new_num_blocks > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V14 u32 format limit".into(),
+            "reordered BMP block count exceeds the V15 u32 format limit".into(),
         ));
     }
     let new_num_virtual_docs = new_num_blocks
@@ -1472,7 +1472,7 @@ pub(crate) fn reorder_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V14 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the V15 u32 format limit".into(),
             )
         })?;
 
@@ -1517,7 +1517,7 @@ pub(crate) fn reorder_bmp_field(
     let mut run_files = GridRunFiles::new(field_id);
 
     // Encode one output block: gather its records from source blocks and
-    // serialize the V14 block layout. Pure function of `perm` + read-only
+    // serialize the V15 block layout. Pure function of `perm` + read-only
     // sources — output blocks encode independently.
     //
     // Global real ids resolve to a source via `real_base`, then to a
@@ -1823,7 +1823,7 @@ pub(crate) fn reorder_bmp_field(
             .map_err(crate::Error::Io)?;
     }
 
-    // V14 footer (64 bytes)
+    // V15 footer.
     write_bmp_footer(
         &mut writer,
         total_terms,

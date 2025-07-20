@@ -82,9 +82,6 @@ message FusionQuery {
   repeated WeightedQuery queries = 1;
   FusionMethod method = 2;
   float rrf_k = 3;         // RRF rank constant; 0 = default 60
-  // Per-sub-query candidate depth. 0 uses the shared 2x result-window budget;
-  // explicit values must be between the result window and that 2x ceiling.
-  uint32 fetch_limit = 4;
   // Combiner for fused per-chunk (ordinal) scores into a document score.
   // Fusion runs at chunk granularity: same-chunk hits across sub-queries
   // compound, and results carry per-chunk ordinal_scores.
@@ -123,7 +120,6 @@ message DenseVectorQuery {
   string field = 1;
   repeated float vector = 2;
   uint32 nprobe = 3;           // Number of clusters to probe (for IVF indexes)
-  float rerank_factor = 4;     // Exact-rerank factor multiplied by k (0 = 2x default, max 2x)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
   float combiner_temperature = 6;   // Temperature for LogSumExp (default: 1.5)
   uint32 combiner_top_k = 7;        // K for WeightedTopK (default: 5)
@@ -189,7 +185,6 @@ message PrefixQuery {
 message Reranker {
   string field = 1;                    // Vector field (dense or binary dense)
   repeated float vector = 2;           // Query vector (f32, for dense fields)
-  uint32 limit = 3;                    // L1 candidates (0 = 2x result window, max 2x)
   MultiValueCombiner combiner = 4;
   float combiner_temperature = 5;
   uint32 combiner_top_k = 6;
@@ -207,6 +202,9 @@ message SearchRequest {
   uint32 offset = 4;
   repeated string fields_to_load = 5;
   Reranker reranker = 6;               // Optional L2 reranker
+  // First-stage candidate pool. 0 uses offset + limit; explicit values must
+  // be between offset + limit and the 2x ceiling.
+  uint32 candidate_limit = 7;
 }
 
 // Unique document address: segment + local doc_id

@@ -2775,8 +2775,8 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
 /// posting prefix sums at build time (bmp_block_size=256 × ~300-dim docs
 /// hits this in production), silently corrupting the block; the reader's
 /// `end - start` then underflowed into a wild posting slice — SIGSEGV in
-/// the BP forward-index build (optimizer-bp threads). V14 stores num_terms
-/// and prefix sums as u32.
+/// the BP forward-index build (optimizer-bp threads). V14 and later store
+/// num_terms and prefix sums as u32.
 #[tokio::test]
 async fn test_bmp_block_posting_overflow_256() {
     // 256 docs × 301 dims each → 77,056 postings in block 0 (> u16::MAX).

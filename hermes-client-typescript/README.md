@@ -96,8 +96,9 @@ await client.search("docs", {
   fieldsToLoad: ["title", "body"],
   combiner: "sum", // "sum" | "max" | "avg"
 
-  // L2 reranker: [field, queryVector, l1Limit]
-  reranker: ["embedding", [0.1, 0.2], 100],
+  // L2 reranker; candidateLimit is the shared first-stage pool.
+  reranker: ["embedding", [0.1, 0.2]],
+  candidateLimit: 20,
 });
 ```
 

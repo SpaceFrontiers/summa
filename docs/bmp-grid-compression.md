@@ -1,6 +1,6 @@
 # BMP Grid Memory: Compression Research & Roadmap
 
-## Memory anatomy of a BMP segment (V13/V14)
+## Memory anatomy of a BMP segment (V15)
 
 Everything is mmap-backed (page cache, not heap), but resident-set pressure
 is real on memory-bound deployments. Per field, per segment:
@@ -67,9 +67,9 @@ grid ≈ free** (grid 10 GB → 5 GB at 50M docs / block 64; combine with
 `bmp_block_size: 256` for 2.5 GB).
 
 **Implemented**: SDL `indexed<bmp_grid_bits: 2>` (default 4; per field,
-uniform across segments — merge/blockwise validate loudly). The V14 blob
-footer's reserved field carries the cell width (0 = legacy 4-bit), so
-existing segments stay readable. 2-bit currently uses an unrolled scalar
+uniform across segments — merge/blockwise validate loudly). The V15 blob
+footer carries the cell width (2 or 4); older segments must be rebuilt.
+2-bit currently uses an unrolled scalar
 accumulate/mask kernel (4 cells/byte); SIMD u2 variants are a follow-up if
 profiling asks for them — the block grid is probed only inside surviving
 superblocks. Exactness is pinned by

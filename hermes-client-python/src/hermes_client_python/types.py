@@ -62,7 +62,6 @@ class DenseVectorQuery(TypedDict, total=False):
     field: str  # required but total=False for optional fields
     vector: list[float]
     nprobe: int
-    rerank_factor: float
     combiner: Combiner
     combiner_temperature: float
     combiner_top_k: int
@@ -100,7 +99,6 @@ Query = dict[str, Any]
 class Reranker(TypedDict, total=False):
     field: str
     vector: list[float]
-    limit: int
     combiner: Combiner
     combiner_temperature: float
     combiner_top_k: int

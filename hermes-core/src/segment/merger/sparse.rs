@@ -98,7 +98,7 @@ impl SegmentMerger {
                         .try_fold(0u32, |total, vectors| total.checked_add(vectors))
                         .ok_or_else(|| {
                             crate::Error::Internal(
-                                "merged BMP vector count exceeds the V14 u32 format limit".into(),
+                                "merged BMP vector count exceeds the V15 u32 format limit".into(),
                             )
                         })?;
                     let bmp_block_size = sparse_config
@@ -572,9 +572,9 @@ fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawDa
     Ok(())
 }
 
-/// Merge BMP fields with **streaming block-copy V14 format**.
+/// Merge BMP fields with **streaming block-copy V15 format**.
 ///
-/// V14 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
+/// V15 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
 /// and `max_weight_scale`, so blocks are self-contained and can be copied directly.
 ///
 /// Phases:
@@ -583,7 +583,7 @@ fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawDa
 /// 3. Stream Section D (packed_grid) — one row at a time
 /// 4. Write Section E (sb_grid) — one row at a time
 /// 5. Stream Section F+G (doc_map) — bulk copy with offset patching
-/// 6. Write V14 footer (64 bytes)
+/// 6. Write the V15 footer
 ///
 /// Peak memory: row_buf (~4 MB) + sb_row (~120 KB) + id_buf (256 KB) + tiny Vecs.
 #[allow(clippy::too_many_arguments)]
@@ -652,14 +652,14 @@ fn merge_bmp_field(
             .checked_add(bmp.num_blocks)
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "merged BMP block count exceeds the V14 u32 format limit".into(),
+                    "merged BMP block count exceeds the V15 u32 format limit".into(),
                 )
             })?;
         num_real_docs_total = num_real_docs_total
             .checked_add(bmp.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "merged BMP real-document count exceeds the V14 u32 format limit".into(),
+                    "merged BMP real-document count exceeds the V15 u32 format limit".into(),
                 )
             })?;
     }
@@ -674,7 +674,7 @@ fn merge_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "merged BMP virtual-document count exceeds the V14 u32 format limit".into(),
+                "merged BMP virtual-document count exceeds the V15 u32 format limit".into(),
             )
         })?;
     let packed_row_size = crate::segment::builder::bmp::grid_packed_row_size(num_blocks, grid_bits);
@@ -881,7 +881,7 @@ fn merge_bmp_field(
         }
     }
 
-    // ── Phase 6: Write V14 footer (64 bytes) ────────────────────────────
+    // ── Phase 6: Write V15 footer ───────────────────────────────────────
     write_bmp_footer(
         writer,
         total_terms,
