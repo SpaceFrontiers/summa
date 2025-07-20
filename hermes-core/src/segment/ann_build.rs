@@ -8,6 +8,8 @@ pub const IVF_PQ_TYPE: u8 = 2;
 pub const FLAT_TYPE: u8 = 4;
 /// Binary IVF payload backed by an index-level global quantizer.
 pub const BINARY_IVF_TYPE: u8 = 6;
+/// TurboQuant flat payload; training-free, no global artifacts.
+pub const TQ_FLAT_TYPE: u8 = 7;
 
 // --- Native-only builder/serialization functions ---
 
@@ -31,6 +33,25 @@ pub fn new_ivf_pq(
 pub fn serialize_ivf_pq(index: IVFPQIndex, num_clusters: u32) -> crate::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     crate::segment::ann_disk::write_built_ivf_pq(&index, num_clusters, &mut bytes)
+        .map_err(crate::Error::Io)?;
+    Ok(bytes)
+}
+
+/// Encode one segment's vectors with the training-free TurboQuant codec.
+#[cfg(feature = "native")]
+pub fn build_tq_flat(
+    dim: usize,
+    doc_id_ordinals: &[(u32, u16)],
+    vectors: &[f32],
+) -> crate::Result<Vec<u8>> {
+    let codec = std::sync::Arc::new(crate::structures::TqCodec::new(dim));
+    let mut builder = crate::structures::TqFlatBuilder::new(codec);
+    builder
+        .add_batch(doc_id_ordinals, vectors)
+        .map_err(|error| crate::Error::Internal(format!("TQ encode failed: {error}")))?;
+    builder.finish();
+    let mut bytes = Vec::new();
+    crate::segment::ann_disk::write_built_tq_flat(&builder, &mut bytes)
         .map_err(crate::Error::Io)?;
     Ok(bytes)
 }

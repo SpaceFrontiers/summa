@@ -31,7 +31,7 @@ pub(crate) use reader::bmp::{block_term_postings, find_dim_in_block_data};
 pub(crate) use reader::combine_ordinal_results;
 #[cfg(feature = "native")]
 pub mod pin;
-pub use reader::{SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
+pub use reader::{DensePlanCache, SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{SegmentSnapshot, SegmentTracker};

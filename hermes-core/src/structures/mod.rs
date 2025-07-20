@@ -120,6 +120,8 @@ pub use postings::{
 };
 
 // Re-export vector
+#[cfg(feature = "native")]
+pub use vector::TqFlatBuilder;
 pub use vector::{
     BinaryCoarseQuantizer,
     BinaryIvfConfig,
@@ -138,6 +140,8 @@ pub use vector::{
     PQCodebook,
     PQConfig,
     SoarConfig,
+    TqCodec,
+    TqQueryPlan,
 };
 
 // Re-export simd
