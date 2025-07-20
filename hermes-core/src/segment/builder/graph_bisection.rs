@@ -336,7 +336,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         let bmp = bmps[job.src as usize];
         let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+        for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
             let mut n = 0usize;
             for p in postings {
                 let vid = job.block_id as usize * block_size + p.local_slot as usize;
@@ -488,7 +488,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         let bmp = bmps[job.src as usize];
         let (v2r, _) = &vid_maps[job.src as usize];
         let block_size = bmp.bmp_block_size as usize;
-        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+        for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
             if term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX) == u32::MAX {
                 continue;
             }
@@ -535,7 +535,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         assert!(job.real_len as usize <= 256, "BMP block exceeds 256 docs");
         let mut cursor = [0u32; 256];
         let base = offsets[global_real_start] as usize;
-        for (dim_id, postings) in bmp.iter_block_terms(job.block_id) {
+        for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
             let compact = term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX);
             if compact == u32::MAX {
                 continue;
@@ -643,7 +643,7 @@ pub(crate) fn build_forward_index_from_blocks(
         .map(|_| std::sync::atomic::AtomicU32::new(0))
         .collect();
     let count_block_bf = |&(src, block_id): &(u32, u32)| {
-        for (dim_id, _) in bmps[src as usize].iter_block_terms(block_id) {
+        for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
             if let Some(count) = dim_bf.get(dim_id as usize) {
                 count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -757,7 +757,7 @@ pub(crate) fn build_forward_index_from_blocks(
     let count_remapped = |&(src, block_id): &(u32, u32)| -> u32 {
         bmps[src as usize]
             .iter_block_terms(block_id)
-            .filter(|(dim_id, _)| {
+            .filter(|(dim_id, _, _)| {
                 term_remap
                     .get(*dim_id as usize)
                     .copied()
@@ -778,7 +778,7 @@ pub(crate) fn build_forward_index_from_blocks(
     let mut terms = vec![0u32; total];
     let fill_block = |&(src, block_id): &(u32, u32), out: &mut [u32]| {
         let mut n = 0usize;
-        for (dim_id, _) in bmps[src as usize].iter_block_terms(block_id) {
+        for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
             let compact = term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX);
             if compact != u32::MAX {
                 out[n] = compact;

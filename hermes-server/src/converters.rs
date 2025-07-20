@@ -377,10 +377,12 @@ pub fn convert_query(
                 .with_over_fetch_factor(1.0);
 
             // Apply SDL query_config defaults, then override with per-request values
-            let schema_qc = schema
+            let sparse_config = schema
                 .get_field_entry(field)
-                .and_then(|e| e.sparse_vector_config.as_ref())
-                .and_then(|c| c.query_config.as_ref());
+                .and_then(|entry| entry.sparse_vector_config.as_ref());
+            let schema_qc = sparse_config.and_then(|config| config.query_config.as_ref());
+            let is_bmp = sparse_config
+                .is_some_and(|config| config.format == hermes_core::structures::SparseFormat::Bmp);
 
             // heap_factor: per-request > schema default > 1.0
             if sv_query.heap_factor > 0.0 {
@@ -408,11 +410,22 @@ pub fn convert_query(
                 query = query.with_pruning(sv_query.pruning);
             } else if let Some(Some(p)) = schema_qc.map(|qc| qc.pruning) {
                 query = query.with_pruning(p);
+            } else if is_bmp {
+                // LSP/0's robust zero-shot configuration keeps the top third
+                // of query terms by absolute weight.
+                query = query.with_pruning(0.33);
             }
 
             // min_query_dims: schema default (no per-request override)
             if let Some(qc) = schema_qc {
                 query = query.with_min_query_dims(qc.min_query_dims);
+            }
+
+            // LSP/0 gamma: per-request > schema default > depth-derived.
+            if let Some(gamma) = sv_query.lsp_gamma {
+                query = query.with_lsp_gamma(gamma as usize);
+            } else if let Some(gamma) = schema_qc.and_then(|config| config.lsp_gamma) {
+                query = query.with_lsp_gamma(gamma);
             }
 
             Ok(Box::new(query))
@@ -816,6 +829,9 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     }
                     if qc.min_query_dims != 4 {
                         qparams.push(format!("min_query_dims: {}", qc.min_query_dims));
+                    }
+                    if let Some(gamma) = qc.lsp_gamma {
+                        qparams.push(format!("lsp_gamma: {gamma}"));
                     }
                     if !qparams.is_empty() {
                         idx_params.push(format!("query<{}>", qparams.join(", ")));

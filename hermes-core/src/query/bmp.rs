@@ -14,7 +14,7 @@
 //!
 //! ## Three-level pruning hierarchy
 //!
-//! 1. **LSP/0 gamma cap**: Hard limit on superblock visits (prevents tail waste)
+//! 1. **LSP/0 top-γ**: Visit only the highest-SBMax superblocks
 //! 2. **Superblock UBs** (~1.2K entries at 1M×5): cheap to compute, prune 25-75%
 //! 3. **Block UBs** (only for surviving superblocks): L1-cache friendly per-SB
 //!
@@ -24,10 +24,10 @@
 //! only flat contiguous arrays — no file I/O, no parsing, no heap allocation
 //! in the hot path.
 //!
-//! - **LSP/0 gamma cap**: Hard limit on superblock visits for predictable latency
+//! - **LSP/0 top-γ**: strict SBMax order with safe superblock-level pruning
 //! - **Integer scoring**: u32 accumulators with u16 quantized query weights (~20% faster)
 //! - **Superblock pruning**: Skip entire groups of blocks via coarse UBs
-//! - **L1 cache locality**: SaaT loop keeps c=64 blocks' grid data in L1
+//! - **L1 cache locality**: SaaT loop keeps eight blocks' grid data in registers/L1
 //! - **Integer-consistent UBs**: bounds and document scores share exact accumulator units
 //! - **Pre-scaled weights**: `weight * scale` computed once, not per-block
 //! - **Bitmask skip**: Register-level mask check replaces grid DRAM lookups
@@ -38,10 +38,11 @@
 //! - **Early termination**: stop when superblock/block UB < top-k threshold
 
 use super::scoring::{ScoreCollector, ScoredDoc, SharedThreshold};
-use crate::segment::{
-    BMP_SUPERBLOCK_SIZE, BmpIndex, accumulate_grid_u32, block_term_postings, compute_block_masks,
-    find_dim_in_block_data,
+use crate::segment::bmp_grid::{
+    CompressedGrid, GRID_GROUP_CELLS, LSP_SUPERBLOCK_GRID_BITS, accumulate_packed_u4,
+    accumulate_u8, block_grid_scale,
 };
+use crate::segment::{BMP_SUPERBLOCK_SIZE, BmpIndex, block_term_postings, find_dim_in_block_data};
 
 // dim_id is used directly as grid row index. No dim_idx indirection.
 
@@ -81,29 +82,27 @@ fn prefetch_read<T>(ptr: *const T) {
 ///
 /// Two-level hierarchy:
 /// - **Superblock-level**: sized to num_superblocks, for SB ordering + early termination
-/// - **Local block-level**: sized to BMP_SUPERBLOCK_SIZE (64), for per-SB block computation
+/// - **Local block-level**: sized to BMP_SUPERBLOCK_SIZE (8), for per-SB block computation
 /// - **Accumulator**: u32 sized to bmp_block_size, reused per block (integer scoring)
 #[derive(Default)]
 struct BmpScratch {
     // Superblock-level (reused across queries, sized to num_superblocks)
     sb_ubs: Vec<f32>,
+    sb_ub_units: Vec<u32>,
     sb_order: Vec<u32>,
-    sb_priorities: Vec<f32>,
-    sb_suffix_max: Vec<f32>,
     // Block-level (reused per superblock, sized to BMP_SUPERBLOCK_SIZE)
     local_block_ubs: Vec<f32>,
     local_block_ub_units: Vec<u32>,
-    local_block_masks: Vec<u64>,
+    query_presence: Vec<u64>,
     local_block_order: Vec<u32>,
     // Two-phase block scoring: phase1 block UBs (sized to BMP_SUPERBLOCK_SIZE)
     phase1_local_block_ubs: Vec<f32>,
     phase1_local_block_ub_units: Vec<u32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
-    // Compact grid buffers: query-relevant dim rows copied contiguously for L1 locality.
-    // Resized per query to num_query_dims × row_size. Typical: 20 dims → ~16KB total.
-    compact_sb_grid: Vec<u8>,
-    compact_grid: Vec<u8>,
+    // One decoded random-access group. D uses at most eight values per visit; E
+    // uses the full 256-cell group.
+    decoded_grid_group: Vec<u8>,
 }
 
 impl BmpScratch {
@@ -112,24 +111,17 @@ impl BmpScratch {
         if self.sb_ubs.len() < num_superblocks {
             self.sb_ubs.resize(num_superblocks, 0.0);
         }
+        if self.sb_ub_units.len() < num_superblocks {
+            self.sb_ub_units.resize(num_superblocks, 0);
+        }
         if self.sb_order.capacity() < num_superblocks {
             self.sb_order.reserve(num_superblocks - self.sb_order.len());
-        }
-        if self.sb_priorities.len() < num_superblocks {
-            self.sb_priorities.resize(num_superblocks, 0.0);
-        }
-        // suffix_max needs num_superblocks + 1 for sentinel
-        if self.sb_suffix_max.len() < num_superblocks + 1 {
-            self.sb_suffix_max.resize(num_superblocks + 1, 0.0);
         }
         if self.local_block_ubs.len() < sb_size {
             self.local_block_ubs.resize(sb_size, 0.0);
         }
         if self.local_block_ub_units.len() < sb_size {
             self.local_block_ub_units.resize(sb_size, 0);
-        }
-        if self.local_block_masks.len() < sb_size {
-            self.local_block_masks.resize(sb_size, 0u64);
         }
         if self.local_block_order.len() < sb_size {
             self.local_block_order.resize(sb_size, 0);
@@ -146,6 +138,9 @@ impl BmpScratch {
         let safe_acc_size = block_size.max(256);
         if self.acc.len() < safe_acc_size {
             self.acc.resize(safe_acc_size, 0);
+        }
+        if self.decoded_grid_group.len() < GRID_GROUP_CELLS {
+            self.decoded_grid_group.resize(GRID_GROUP_CELLS, 0);
         }
     }
 }
@@ -167,6 +162,170 @@ pub(crate) struct BmpThreshold<'a> {
     pub publish: bool,
 }
 
+struct BmpQueryWeights {
+    query_by_dim_u16: Vec<(u32, u16)>,
+    candidate_grid_weights: Vec<BmpGridWeight>,
+    candidate_mask: u64,
+    dequant: f32,
+}
+
+#[derive(Clone, Copy)]
+struct BmpGridWeight {
+    dimension: usize,
+    weight: u16,
+    query_index: usize,
+}
+
+/// Globally selected LSP/0 superblocks for one segment.
+///
+/// The multi-segment searcher computes all segment SBMax values first and
+/// partitions the single query-level top-γ set into these segment plans. This
+/// prevents a 50-segment index from silently turning γ into `50 × γ`.
+#[derive(Debug)]
+pub(crate) struct LspSegmentPlan {
+    pub(crate) sb_ubs: Vec<f32>,
+    pub(crate) sb_order: Vec<u32>,
+}
+
+/// Robust zero-shot γ schedule reported for LSP/0.
+///
+/// The paper evaluates 250 for k=10, 500 for k=100, and 1000 for k=1000.
+/// Beyond the evaluated range we avoid inventing a sublinear cap: γ grows
+/// with the requested depth and is never smaller than 2000.
+pub(crate) const fn recommended_lsp_gamma(retrieval_depth: usize) -> usize {
+    match retrieval_depth {
+        0..=10 => 250,
+        11..=100 => 500,
+        101..=1000 => 1000,
+        _ => {
+            if retrieval_depth < 2000 {
+                2000
+            } else {
+                retrieval_depth
+            }
+        }
+    }
+}
+
+fn prepare_bmp_query(
+    index: &BmpIndex,
+    candidate_terms: &[(u32, f32)],
+    scoring_terms: &[(u32, f32)],
+) -> crate::Result<Option<BmpQueryWeights>> {
+    let dims = index.dims();
+    let mut query_info: Vec<(u32, f32)> = scoring_terms
+        .iter()
+        .filter_map(|&(dimension, weight)| {
+            (dimension < dims && weight.is_finite() && weight != 0.0)
+                .then_some((dimension, weight.abs()))
+        })
+        .collect();
+    if query_info.is_empty() {
+        return Ok(None);
+    }
+    if query_info.len() > crate::query::MAX_QUERY_TERMS {
+        return Err(crate::Error::Query(format!(
+            "BMP query has {} resolved dimensions; maximum is {}",
+            query_info.len(),
+            crate::query::MAX_QUERY_TERMS
+        )));
+    }
+    query_info.sort_unstable_by_key(|&(dimension, _)| dimension);
+
+    let max_query_weight = query_info
+        .iter()
+        .map(|&(_, weight)| weight)
+        .fold(0.0f32, f32::max);
+    let accumulator_denominator = 255u64.saturating_mul(query_info.len() as u64);
+    let max_quantized_weight = ((u32::MAX as u64) / accumulator_denominator).min(16_383);
+    if max_quantized_weight == 0 {
+        return Err(crate::Error::Query(format!(
+            "BMP query has too many resolved dimensions ({})",
+            query_info.len()
+        )));
+    }
+    let quant_scale = max_quantized_weight as f32 / max_query_weight;
+    let dequant =
+        (max_query_weight / max_quantized_weight as f32) * (index.max_weight_scale / 255.0);
+    if !dequant.is_finite() {
+        return Err(crate::Error::Query(
+            "BMP query score scale exceeds the finite f32 range".into(),
+        ));
+    }
+
+    let query_by_dim_u16: Vec<(u32, u16)> = query_info
+        .iter()
+        .map(|&(dimension, weight)| {
+            (
+                dimension,
+                (weight * quant_scale)
+                    .round()
+                    .clamp(0.0, max_quantized_weight as f32) as u16,
+            )
+        })
+        .collect();
+    let mut candidate_dimensions: Vec<u32> = candidate_terms
+        .iter()
+        .filter_map(|&(dimension, weight)| {
+            (dimension < dims && weight.is_finite() && weight != 0.0).then_some(dimension)
+        })
+        .collect();
+    candidate_dimensions.sort_unstable();
+    candidate_dimensions.dedup();
+    let mut candidate_mask = 0u64;
+    let mut candidate_grid_weights = Vec::with_capacity(candidate_dimensions.len());
+    let mut candidate_index = 0usize;
+    for (query_index, &(dimension, weight)) in query_by_dim_u16.iter().enumerate() {
+        while candidate_dimensions
+            .get(candidate_index)
+            .is_some_and(|&candidate| candidate < dimension)
+        {
+            candidate_index += 1;
+        }
+        if candidate_dimensions.get(candidate_index) == Some(&dimension) {
+            candidate_mask |= 1u64 << query_index;
+            candidate_grid_weights.push(BmpGridWeight {
+                dimension: dimension as usize,
+                weight,
+                query_index,
+            });
+        }
+    }
+    if candidate_grid_weights.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(BmpQueryWeights {
+        query_by_dim_u16,
+        candidate_grid_weights,
+        candidate_mask,
+        dequant,
+    }))
+}
+
+/// Compute one segment's SBMax vector for the global LSP/0 selection pass.
+pub(crate) fn prepare_lsp_superblock_ubs(
+    index: &BmpIndex,
+    candidate_terms: &[(u32, f32)],
+    scoring_terms: &[(u32, f32)],
+) -> crate::Result<Vec<f32>> {
+    let Some(weights) = prepare_bmp_query(index, candidate_terms, scoring_terms)? else {
+        return Ok(vec![0.0; index.num_superblocks as usize]);
+    };
+    let count = index.num_superblocks as usize;
+    let mut units = vec![0u32; count];
+    let mut bounds = vec![0.0f32; count];
+    let mut decoded = [0u8; GRID_GROUP_CELLS];
+    compute_sb_ubs_int(
+        index.superblock_grid(),
+        &weights.candidate_grid_weights,
+        weights.dequant,
+        &mut units,
+        &mut bounds,
+        &mut decoded,
+    )?;
+    Ok(bounds)
+}
+
 /// Execute a BMP query against the given index.
 ///
 /// Returns top-k results sorted by score descending.
@@ -174,7 +333,7 @@ pub(crate) struct BmpThreshold<'a> {
 /// (doc_id, ordinal) pairs at collection time. The caller's `combine_ordinal_results`
 /// handles multi-ordinal grouping via the configured combiner.
 ///
-/// Uses superblock pruning: computes coarse UBs over groups of 64 blocks,
+/// Uses LSP/0 pruning: computes coarse UBs over groups of eight blocks,
 /// prunes entire superblocks, then scores only surviving blocks.
 ///
 /// `heap_factor` controls approximate retrieval (BMP alpha parameter):
@@ -182,9 +341,9 @@ pub(crate) struct BmpThreshold<'a> {
 /// - **0.8**: prune when `UB * 0.8 < threshold` → ~20% more aggressive
 /// - **0.6**: prune when `UB * 0.6 < threshold` → ~40% more aggressive
 ///
-/// `max_superblocks` (LSP/0 gamma cap): hard limit on superblock visits.
-/// - **0**: unlimited (default, existing behavior)
-/// - **>0**: stop after visiting this many superblocks
+/// `lsp_gamma` is the paper's γ: the maximum number of highest-SBMax
+/// superblocks selected for block traversal. Zero means exhaustive top-down
+/// traversal while retaining the same safe superblock stopping condition.
 ///
 /// Based on Mallia et al. (SIGIR 2024) and Carlson et al. (arXiv 2602.02883).
 #[allow(dead_code)]
@@ -195,16 +354,18 @@ pub fn execute_bmp(
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
-    max_superblocks: usize,
+    lsp_gamma: usize,
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
         index,
         index_label,
         field_label,
         query_terms,
+        query_terms,
         k,
         heap_factor,
-        max_superblocks,
+        lsp_gamma,
+        None,
         None,
         BmpThreshold::default(),
     )
@@ -216,20 +377,24 @@ pub(crate) fn execute_bmp_with_threshold(
     index: &BmpIndex,
     index_label: &str,
     field_label: &str,
-    query_terms: &[(u32, f32)],
+    candidate_terms: &[(u32, f32)],
+    scoring_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
-    max_superblocks: usize,
+    lsp_gamma: usize,
+    lsp_plan: Option<&LspSegmentPlan>,
     threshold: BmpThreshold<'_>,
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
         index,
         index_label,
         field_label,
-        query_terms,
+        candidate_terms,
+        scoring_terms,
         k,
         heap_factor,
-        max_superblocks,
+        lsp_gamma,
+        lsp_plan,
         None,
         threshold,
     )
@@ -249,7 +414,7 @@ pub fn execute_bmp_filtered(
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
-    max_superblocks: usize,
+    lsp_gamma: usize,
     predicate: &dyn Fn(crate::DocId) -> bool,
 ) -> crate::Result<Vec<ScoredDoc>> {
     execute_bmp_inner(
@@ -257,9 +422,11 @@ pub fn execute_bmp_filtered(
         index_label,
         field_label,
         query_terms,
+        query_terms,
         k,
         heap_factor,
-        max_superblocks,
+        lsp_gamma,
+        None,
         Some(predicate),
         BmpThreshold::default(),
     )
@@ -271,10 +438,12 @@ pub(crate) fn execute_bmp_filtered_with_threshold(
     index: &BmpIndex,
     index_label: &str,
     field_label: &str,
-    query_terms: &[(u32, f32)],
+    candidate_terms: &[(u32, f32)],
+    scoring_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
-    max_superblocks: usize,
+    lsp_gamma: usize,
+    lsp_plan: Option<&LspSegmentPlan>,
     predicate: &dyn Fn(crate::DocId) -> bool,
     threshold: BmpThreshold<'_>,
 ) -> crate::Result<Vec<ScoredDoc>> {
@@ -282,10 +451,12 @@ pub(crate) fn execute_bmp_filtered_with_threshold(
         index,
         index_label,
         field_label,
-        query_terms,
+        candidate_terms,
+        scoring_terms,
         k,
         heap_factor,
-        max_superblocks,
+        lsp_gamma,
+        lsp_plan,
         Some(predicate),
         threshold,
     )
@@ -296,14 +467,16 @@ fn execute_bmp_inner(
     index: &BmpIndex,
     index_label: &str,
     field_label: &str,
-    query_terms: &[(u32, f32)],
+    candidate_terms: &[(u32, f32)],
+    scoring_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
-    max_superblocks: usize,
+    lsp_gamma: usize,
+    lsp_plan: Option<&LspSegmentPlan>,
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
     threshold_source: BmpThreshold<'_>,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    if query_terms.is_empty() || index.num_blocks == 0 || k == 0 {
+    if candidate_terms.is_empty() || scoring_terms.is_empty() || index.num_blocks == 0 || k == 0 {
         return Ok(Vec::new());
     }
 
@@ -311,95 +484,20 @@ fn execute_bmp_inner(
     // UB * alpha < threshold → prune when UB < threshold / alpha
     // alpha < 1.0 means more aggressive pruning (approximate but faster)
     let alpha = heap_factor.clamp(0.01, 1.0);
-    let scale = index.max_weight_scale / 255.0;
     let num_blocks = index.num_blocks as usize;
     let block_size = index.bmp_block_size as usize;
     let num_superblocks_total = index.num_superblocks as usize;
 
     // ── Phase 1: Resolve query dimensions and quantize weights ────────
-    // dim_id is used directly as grid row index (no dim_idx indirection).
-    // Build combined info, sort by dim_id, then split into resolved + query_by_dim_u16.
-    // Both arrays MUST have the same ordering so mask bit `q` corresponds to the
-    // same dimension in both compute_block_masks (uses resolved) and
-    // score_block_bsearch_int (uses query_by_dim_u16).
-    let dims = index.dims();
-    let mut query_info: Vec<(u32, usize, f32)> = Vec::with_capacity(query_terms.len());
-
-    for &(dim_id, weight) in query_terms {
-        // dim_id IS the grid row index — just check bounds
-        if dim_id < dims && weight.is_finite() && weight != 0.0 {
-            // BMP stores absolute document impacts. Upper bounds and integer
-            // scoring must use the same absolute query weight; keeping the
-            // sign only in the grid path could under-estimate a block and
-            // prune a result that the scorer later treated as positive.
-            query_info.push((dim_id, dim_id as usize, weight.abs()));
-        }
-    }
-
-    if query_info.is_empty() {
+    let Some(prepared_query) = prepare_bmp_query(index, candidate_terms, scoring_terms)? else {
         return Ok(Vec::new());
-    }
-
-    // Block masks and the two-phase scorer use one u64 bit per query term.
-    // SparseVectorQuery enforces this already; reject oversized direct calls
-    // rather than silently producing an incomplete mask.
-    if query_info.len() > crate::query::MAX_QUERY_TERMS {
-        return Err(crate::Error::Query(format!(
-            "BMP query has {} resolved dimensions; maximum is {}",
-            query_info.len(),
-            crate::query::MAX_QUERY_TERMS
-        )));
-    }
-
-    // Sort by dim_id for binary search within blocks (blocks store dim_id directly).
-    query_info.sort_unstable_by_key(|&(dim_id, _, _)| dim_id);
-
-    // Integer scoring: adapt the quantizer to query width so the documented
-    // u32 accumulator bound remains true for queries wider than 1024 dims.
-    let max_query_weight = query_info.iter().map(|q| q.2).fold(0.0f32, f32::max);
-    let accumulator_denominator = 255u64.saturating_mul(query_info.len() as u64);
-    let max_quantized_weight = ((u32::MAX as u64) / accumulator_denominator).min(16_383);
-    if max_quantized_weight == 0 {
-        return Err(crate::Error::Query(format!(
-            "BMP query has too many resolved dimensions ({})",
-            query_info.len()
-        )));
-    }
-    let (quant_scale, dequant) = if max_query_weight > 0.0 {
-        (
-            max_quantized_weight as f32 / max_query_weight,
-            (max_query_weight / max_quantized_weight as f32) * scale,
-        )
-    } else {
-        (0.0, 0.0)
     };
-    // query_by_dim_u16 stores (dim_id, weight) — matches per-block dim_ids
-    let query_by_dim_u16: Vec<(u32, u16)> = query_info
-        .iter()
-        .map(|&(dim_id, _, w)| {
-            (
-                dim_id,
-                (w.abs() * quant_scale)
-                    .round()
-                    .clamp(0.0, max_quantized_weight as f32) as u16,
-            )
-        })
-        .collect();
-    if !dequant.is_finite() {
-        return Err(crate::Error::Query(
-            "BMP query score scale exceeds the finite f32 range".into(),
-        ));
-    }
-
-    // Block and superblock bounds use the exact integer-scoring weight
-    // (quantized query × common dequantizer), not the original f32 weight.
-    // Otherwise rounding a query weight upward could make a scored document
-    // slightly exceed its block bound and be pruned incorrectly.
-    let resolved: Vec<(usize, f32)> = query_info
-        .iter()
-        .zip(&query_by_dim_u16)
-        .map(|(&(.., grid_index, _), &(_, weight))| (grid_index, weight as f32 * dequant))
-        .collect();
+    let BmpQueryWeights {
+        query_by_dim_u16,
+        candidate_grid_weights,
+        candidate_mask,
+        dequant,
+    } = prepared_query;
 
     // ── Two-phase lazy block scoring setup ────────────────────────────
     // For queries with >5 dims, score only the top-3 heaviest dims first (phase1).
@@ -407,7 +505,8 @@ fn execute_bmp_inner(
     // For ≤5 dims: full scoring directly (zero overhead).
     const PHASE1_DIMS: usize = 3;
     const MIN_DIMS_FOR_TWO_PHASE: usize = 6;
-    let two_phase_active = (MIN_DIMS_FOR_TWO_PHASE..=64).contains(&query_by_dim_u16.len());
+    let two_phase_active = candidate_mask.count_ones() as usize == query_by_dim_u16.len()
+        && (MIN_DIMS_FOR_TWO_PHASE..=64).contains(&query_by_dim_u16.len());
     // phase1_mask: bitmask of which query dim indices are in phase1
     let phase1_mask: u64 = if two_phase_active {
         let mut weight_indices: Vec<(u16, usize)> = query_by_dim_u16
@@ -422,15 +521,6 @@ fn execute_bmp_inner(
     } else {
         u64::MAX
     };
-    // phase1 grid dims for UB computation (indices into grid_dims/resolved)
-    let phase1_grid_indices: Vec<usize> = if two_phase_active {
-        (0..query_by_dim_u16.len())
-            .filter(|&i| phase1_mask & (1u64 << i) != 0)
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     // The planner has already applied the configured ordinal over-fetch factor
     // to `k`.  Do not derive another factor from num_virtual_docs: that ratio
     // includes block-alignment padding and used to multiply the heap depth a
@@ -439,7 +529,7 @@ fn execute_bmp_inner(
 
     let t_start = std::time::Instant::now();
 
-    let result = BMP_SCRATCH.with(|cell| {
+    let result = BMP_SCRATCH.with(|cell| -> crate::Result<Vec<ScoredDoc>> {
         let scratch = &mut *cell.borrow_mut();
 
         // ── Superblock-at-a-time scoring ─────────────────────────────
@@ -449,114 +539,61 @@ fn execute_bmp_inner(
             block_size,
         );
 
-        let prs = index.packed_row_size();
-
-        // ── Grid access strategy ─────────────────────────────────────
-        // For small segments: copy query-relevant grid rows into compact
-        // buffers that fit L1 cache (~16KB for 20 dims × 750 blocks).
-        // For large segments: use mmap-backed grid directly (zero alloc)
-        // to avoid multi-MB thread-local scratch that never shrinks.
-        const COMPACT_GRID_MAX: usize = 128 * 1024; // 128KB — fits L2 comfortably
-        let compact_sb_size = resolved.len().saturating_mul(num_superblocks_total);
-        let compact_grid_size = resolved.len().saturating_mul(prs);
-        let use_compact = compact_sb_size.saturating_add(compact_grid_size) <= COMPACT_GRID_MAX;
-
-        // grid_dims: (dim_index_into_grid, weight) — local for compact, global for direct
-        let grid_dims: Vec<(usize, f32)>;
-        // sb_int_weights: (dim_index_into_sb_grid, u16_weight) — for integer-consistent SB UBs
-        let sb_int_weights: Vec<(usize, u16)>;
-        let sb_grid_slice: &[u8];
-        let grid_slice: &[u8];
-
-        if use_compact {
-            let dim_indices: Vec<usize> = resolved.iter().map(|&(idx, _)| idx).collect();
-            index.extract_compact_grids(
-                &dim_indices,
-                &mut scratch.compact_sb_grid,
-                &mut scratch.compact_grid,
-            );
-            grid_dims = (0..resolved.len()).map(|i| (i, resolved[i].1)).collect();
-            sb_int_weights = (0..resolved.len())
-                .map(|i| (i, query_by_dim_u16[i].1))
-                .collect();
-            sb_grid_slice = &scratch.compact_sb_grid;
-            grid_slice = &scratch.compact_grid;
-        } else {
-            // Direct mmap access — zero allocation. Grid layout uses global dim indices.
-            grid_dims = resolved.clone();
-            sb_int_weights = resolved
-                .iter()
-                .enumerate()
-                .map(|(i, &(idx, _))| (idx, query_by_dim_u16[i].1))
-                .collect();
-            sb_grid_slice = index.sb_grid_slice();
-            grid_slice = index.grid_slice();
-            // Shrink oversized compact buffers from previous queries
-            if scratch.compact_grid.capacity() > COMPACT_GRID_MAX {
-                scratch.compact_sb_grid = Vec::new();
-                scratch.compact_grid = Vec::new();
+        let (sb_ubs, sb_order, superblock_visit_limit) = if let Some(plan) = lsp_plan {
+            if plan.sb_ubs.len() != num_superblocks_total {
+                return Err(crate::Error::Internal(format!(
+                    "global LSP/0 plan has {} bounds for {} superblocks",
+                    plan.sb_ubs.len(),
+                    num_superblocks_total
+                )));
             }
-        }
-
-        let phase1_int_weights: Vec<(usize, u16)> = if two_phase_active {
-            phase1_grid_indices
+            if plan
+                .sb_order
                 .iter()
-                .map(|&index| sb_int_weights[index])
-                .collect()
+                .any(|&superblock| superblock as usize >= num_superblocks_total)
+            {
+                return Err(crate::Error::Internal(
+                    "global LSP/0 plan contains an invalid superblock id".into(),
+                ));
+            }
+            (
+                plan.sb_ubs.as_slice(),
+                plan.sb_order.as_slice(),
+                plan.sb_order.len(),
+            )
         } else {
-            Vec::new()
+            // Single-segment/direct execution computes its own SBMax order.
+            compute_sb_ubs_int(
+                index.superblock_grid(),
+                &candidate_grid_weights,
+                dequant,
+                &mut scratch.sb_ub_units,
+                &mut scratch.sb_ubs,
+                &mut scratch.decoded_grid_group,
+            )?;
+            // LSP/0 requires strict non-increasing SBMax order. A secondary
+            // coverage heuristic would change membership in top-γ.
+            sort_sb_desc_into(
+                &scratch.sb_ubs[..num_superblocks_total],
+                &mut scratch.sb_order,
+            );
+            let visit_limit = if lsp_gamma == 0 {
+                scratch.sb_order.len()
+            } else {
+                lsp_gamma.min(scratch.sb_order.len())
+            };
+            (
+                &scratch.sb_ubs[..num_superblocks_total],
+                scratch.sb_order.as_slice(),
+                visit_limit,
+            )
         };
 
-        // Phase 2: Compute SUPERBLOCK UBs using integer weights (matching scoring path)
-        compute_sb_ubs_int(
-            sb_grid_slice,
-            num_superblocks_total,
-            &sb_int_weights,
-            dequant,
-            &mut scratch.sb_ubs,
-        );
-
-        // Coverage-biased SB ordering: boost SBs with higher query-dim coverage.
-        // Count how many query dims are active in each SB (non-zero sb_grid value).
-        let nqd = sb_int_weights.len();
-        for sb in 0..num_superblocks_total {
-            let base_ub = scratch.sb_ubs[sb];
-            if base_ub == 0.0 {
-                scratch.sb_priorities[sb] = 0.0;
-                continue;
-            }
-            let mut coverage = 0u32;
-            for &(local_idx, _) in &sb_int_weights {
-                if sb_grid_slice[local_idx * num_superblocks_total + sb] > 0 {
-                    coverage += 1;
-                }
-            }
-            // Boost: high-coverage SBs get +5% priority boost (breaks ties, doesn't
-            // significantly reorder SBs with very different UBs).
-            let cf = coverage as f32 / nqd as f32;
-            scratch.sb_priorities[sb] = base_ub * (1.0 + cf * 0.05);
+        if sb_order.is_empty() {
+            return Ok(Vec::new());
         }
 
-        sort_sb_desc_into(
-            &scratch.sb_priorities[..num_superblocks_total],
-            &mut scratch.sb_order,
-        );
-
-        if scratch.sb_order.is_empty() {
-            return Vec::new();
-        }
-
-        // Pre-compute suffix-max of ACTUAL UBs for safe early termination.
-        // Because coverage-biased ordering is non-monotonic in UB, we can't `break`
-        // on a single low-UB SB. Instead we `break` when the max UB of ALL remaining
-        // SBs < threshold — guaranteed correct while retaining canonical ties.
-        compute_suffix_max_ubs(
-            &scratch.sb_ubs,
-            &scratch.sb_order,
-            &mut scratch.sb_suffix_max,
-        );
-
-        // Phase 3: Score superblocks in priority-descending order
+        // Phase 3: score the selected superblocks in SBMax-descending order.
         let mut blocks_scored = 0u32;
         let mut docmap_lookups = 0u32;
         let mut sbs_scored = 0u32;
@@ -568,33 +605,27 @@ fn execute_bmp_inner(
             .max(threshold_source.initial);
         collector.seed_threshold(initial_threshold);
 
-        for (idx, &sb_id) in scratch.sb_order.iter().enumerate() {
+        for (idx, &sb_id) in sb_order.iter().take(superblock_visit_limit).enumerate() {
             if let Some(shared) = threshold_source.shared {
                 collector.seed_threshold(shared.get());
             }
-            // LSP/0: hard cap on superblock visits
-            if max_superblocks > 0 && idx >= max_superblocks {
-                break;
-            }
+            let sb_ub = sb_ubs[sb_id as usize];
 
-            // Safe early termination: max UB of ALL remaining SBs < threshold
-            if collector.len() >= collector_k
-                && scratch.sb_suffix_max[idx] * alpha < collector.threshold()
-            {
+            // LSP/0's superblock condition is SBMax >= theta. Eta/alpha is
+            // deliberately NOT applied here; it belongs only to block
+            // pruning. With an unpruned query this is rank-safe; candidate
+            // query pruning is the paper's intentional approximation while
+            // final document scores still use the full query.
+            let threshold = collector.threshold();
+            if threshold > 0.0 && sb_ub < threshold {
                 break;
-            }
-
-            // Individual SB skip (continue, not break — ordering is non-monotonic in UB)
-            let sb_ub = scratch.sb_ubs[sb_id as usize];
-            if collector.len() >= collector_k && sb_ub * alpha < collector.threshold() {
-                continue;
             }
 
             let block_start = sb_id as usize * BMP_SUPERBLOCK_SIZE as usize;
             let block_end = (block_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
             let count = block_end - block_start;
 
-            // Level 1: Warm block_data_starts for this superblock (~520 bytes, 8-9 cache lines).
+            // Warm one cache line of block offsets for this eight-block superblock.
             // Ensures block_data_ptr() never stalls on offset lookups during scoring.
             // Range includes the sentinel at block_end (needed by block_data_range).
             {
@@ -605,42 +636,28 @@ fn execute_bmp_inner(
                 }
             }
 
-            // Compute block UBs + masks from grid
-            compute_block_ubs_int(
-                grid_slice,
+            // Decode every candidate-generation dimension once for this
+            // eight-block range. The same pass accumulates full/phase-one
+            // candidate bounds and produces a block-presence bitset. Final
+            // payload scoring below still evaluates all bounded query terms.
+            let blocks_with_query_terms = compute_block_ubs_and_presence(
+                index.block_grid(),
                 index.grid_bits(),
-                prs,
-                &sb_int_weights,
+                &candidate_grid_weights,
+                query_by_dim_u16.len(),
+                phase1_mask,
                 block_start,
-                block_end,
-                dequant,
+                count,
                 &mut scratch.local_block_ub_units,
+                &mut scratch.phase1_local_block_ub_units,
                 &mut scratch.local_block_ubs,
-            );
-            compute_block_masks(
-                grid_slice,
-                index.grid_bits(),
-                prs,
-                &grid_dims,
-                block_start,
-                block_end - block_start,
-                &mut scratch.local_block_masks,
-            );
-
-            // Two-phase: compute phase1 block UBs (only top-3 dims)
-            if two_phase_active {
-                compute_block_ubs_int(
-                    grid_slice,
-                    index.grid_bits(),
-                    prs,
-                    &phase1_int_weights,
-                    block_start,
-                    block_end,
-                    dequant,
-                    &mut scratch.phase1_local_block_ub_units,
-                    &mut scratch.phase1_local_block_ubs,
-                );
-            }
+                &mut scratch.phase1_local_block_ubs,
+                &mut scratch.query_presence,
+                &mut scratch.decoded_grid_group,
+                dequant,
+            )?;
+            #[cfg(not(feature = "native"))]
+            let _ = blocks_with_query_terms;
 
             sort_local_blocks_desc(
                 &scratch.local_block_ubs[..count],
@@ -667,7 +684,7 @@ fn execute_bmp_inner(
                     if heap_full && scratch.local_block_ubs[li] * alpha < thr {
                         break;
                     }
-                    if scratch.local_block_masks[li] == 0 {
+                    if blocks_with_query_terms & (1u64 << li) == 0 {
                         continue;
                     }
                     let (s, e) = index.block_data_range((block_start + li) as u32);
@@ -685,8 +702,9 @@ fn execute_bmp_inner(
                 count,
                 &scratch.local_block_order,
                 &scratch.local_block_ubs,
-                &scratch.local_block_masks,
+                &scratch.query_presence,
                 &query_by_dim_u16,
+                candidate_mask,
                 dequant,
                 alpha,
                 collector_k,
@@ -713,7 +731,9 @@ fn execute_bmp_inner(
             // Cross-superblock lookahead: prefetch next superblock's block_data_starts.
             // Gives offsets time to arrive during pruning check + UB/mask computation.
             // Range includes the sentinel at next_end (needed by block_data_range).
-            if let Some(&next_sb) = scratch.sb_order.get(idx + 1) {
+            if idx + 1 < superblock_visit_limit
+                && let Some(&next_sb) = sb_order.get(idx + 1)
+            {
                 let next_start = next_sb as usize * BMP_SUPERBLOCK_SIZE as usize;
                 let next_end = (next_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
                 let bds_base = index.block_data_starts_ptr(0);
@@ -740,12 +760,15 @@ fn execute_bmp_inner(
         );
         if elapsed_ms > 500.0 {
             log::warn!(
-                "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, k={}, returned={}, seed={:.4}, threshold={:.4}, alpha={:.2}",
+                "slow BMP: {:.1}ms, sbs={}/{}, gamma={}, blocks={}/{}, dims={}/{}, k={}, returned={}, seed={:.4}, threshold={:.4}, eta={:.2}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
+                superblock_visit_limit,
                 blocks_scored,
                 num_blocks,
+                candidate_mask.count_ones(),
+                query_by_dim_u16.len(),
                 collector_k,
                 returned,
                 initial_threshold,
@@ -754,12 +777,15 @@ fn execute_bmp_inner(
             );
         } else {
             log::debug!(
-                "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, k={}, returned={}, seed={:.4}, threshold={:.4}, alpha={:.2}",
+                "BMP execute: {:.1}ms, sbs={}/{}, gamma={}, blocks={}/{}, dims={}/{}, k={}, returned={}, seed={:.4}, threshold={:.4}, eta={:.2}",
                 elapsed_ms,
                 sbs_scored,
                 num_superblocks_total,
+                superblock_visit_limit,
                 blocks_scored,
                 num_blocks,
+                candidate_mask.count_ones(),
+                query_by_dim_u16.len(),
                 collector_k,
                 returned,
                 initial_threshold,
@@ -768,8 +794,8 @@ fn execute_bmp_inner(
             );
         }
 
-        collector_to_results(collector)
-    });
+        Ok(collector_to_results(collector))
+    })?;
 
     Ok(result)
 }
@@ -810,7 +836,7 @@ fn zero_touched_acc(acc: &mut [u32], touched: &[u64; 4]) {
 
 /// Score a block using integer arithmetic (u32 accumulators, u16 weights).
 ///
-/// Uses **bitmask skip**: checks `block_mask & (1 << q) != 0` before binary search.
+/// Uses one per-query-dimension block-presence bitset before binary search.
 /// Accumulates `w_u16 * impact_u8` into u32 — eliminates u8→f32 conversion per posting.
 ///
 /// Blocks store u32 dim_id directly. Binary search on dim_id (always 4 bytes).
@@ -831,15 +857,22 @@ fn score_block_bsearch_int(
     ps_ptr: *const u8,
     post_ptr: *const u8,
     query_by_dim_u16: &[(u32, u16)],
-    block_mask: u64,
+    query_mask: u64,
+    candidate_mask: u64,
+    query_presence: &[u64],
+    local_block: usize,
     acc: &mut [u32],
     touched: &mut [u64; 4],
     block_size: usize,
     total_block_postings: u32,
 ) {
     for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
-        // Bitmask skip: if this query dim has zero max in this block, skip
-        if q < 64 && block_mask & (1u64 << q) == 0 {
+        // The fused grid decoder produces one block-presence bitset per query
+        // dimension. Avoid transposing those bits into 64 per-block masks.
+        let query_bit = 1u64 << q;
+        if query_mask & query_bit == 0
+            || candidate_mask & query_bit != 0 && query_presence[q] & (1u64 << local_block) == 0
+        {
             continue;
         }
         // find_dim_in_block_data always uses u32 dim_ids
@@ -865,7 +898,8 @@ fn score_block_bsearch_int(
 /// Score blocks within a single superblock using integer scoring.
 ///
 /// `block_start` is the global block ID of the first block in this superblock.
-/// `local_order`, `local_ubs`, `local_masks` are indexed by local offset (0..count).
+/// `local_order` and `local_ubs` are indexed by local offset (0..count);
+/// `query_presence` stores one local-block bitset per query dimension.
 ///
 /// **Two-phase lazy scoring**: When `phase1_mask != u64::MAX` and `phase1_local_ubs`
 /// is `Some`, scores only phase1 dims first. If the best possible score from phase1 +
@@ -880,8 +914,9 @@ fn score_superblock_blocks(
     count: usize,
     local_order: &[u32],
     local_ubs: &[f32],
-    local_masks: &[u64],
+    query_presence: &[u64],
     query_by_dim_u16: &[(u32, u16)],
+    candidate_mask: u64,
     dequant: f32,
     alpha: f32,
     k: usize,
@@ -935,9 +970,8 @@ fn score_superblock_blocks(
             }
         }
 
-        let (num_terms, dim_ptr, ps_ptr, post_ptr, total_block_postings) =
+        let (num_terms, dim_ptr, ps_ptr, _, post_ptr, total_block_postings) =
             index.parse_block(block_id);
-        let mask = local_masks[local_idx as usize];
         let mut touched = [0u64; 4];
         if num_terms > 0 {
             if two_phase && collector.len() >= k {
@@ -948,7 +982,10 @@ fn score_superblock_blocks(
                     ps_ptr,
                     post_ptr,
                     query_by_dim_u16,
-                    mask & phase1_mask,
+                    phase1_mask,
+                    candidate_mask,
+                    query_presence,
+                    local_idx as usize,
                     acc,
                     &mut touched,
                     block_size,
@@ -975,7 +1012,10 @@ fn score_superblock_blocks(
                     ps_ptr,
                     post_ptr,
                     query_by_dim_u16,
-                    mask & !phase1_mask,
+                    !phase1_mask,
+                    candidate_mask,
+                    query_presence,
+                    local_idx as usize,
                     acc,
                     &mut touched,
                     block_size,
@@ -989,7 +1029,10 @@ fn score_superblock_blocks(
                     ps_ptr,
                     post_ptr,
                     query_by_dim_u16,
-                    mask,
+                    u64::MAX,
+                    candidate_mask,
+                    query_presence,
+                    local_idx as usize,
                     acc,
                     &mut touched,
                     block_size,
@@ -1056,7 +1099,7 @@ fn score_superblock_blocks(
 
 /// Sort local block indices by their UBs in descending order.
 ///
-/// For c=64 blocks, a simple sort on non-zero UB indices is optimal.
+/// For eight blocks, a simple sort on non-zero UB indices is optimal.
 /// Reuses `out` Vec to avoid allocation.
 fn sort_local_blocks_desc(local_ubs: &[f32], out: &mut Vec<u32>) {
     out.clear();
@@ -1067,12 +1110,12 @@ fn sort_local_blocks_desc(local_ubs: &[f32], out: &mut Vec<u32>) {
     }
     out.sort_unstable_by(|&a, &b| {
         local_ubs[b as usize]
-            .partial_cmp(&local_ubs[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&local_ubs[a as usize])
+            .then_with(|| a.cmp(&b))
     });
 }
 
-/// Sort superblock IDs by values (priorities or UBs) in descending order, into `out`.
+/// Sort superblock IDs by SBMax in descending order, into `out`.
 ///
 /// For ~2K superblocks, comparison sort takes ~30μs — negligible vs BMP query time.
 /// Reuses `out` Vec to avoid allocation.
@@ -1085,26 +1128,9 @@ fn sort_sb_desc_into(values: &[f32], out: &mut Vec<u32>) {
     }
     out.sort_unstable_by(|&a, &b| {
         values[b as usize]
-            .partial_cmp(&values[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&values[a as usize])
+            .then_with(|| a.cmp(&b))
     });
-}
-
-/// Pre-compute suffix-max of actual UBs over the sorted SB order.
-///
-/// `suffix_max[i]` = max UB among all SBs at positions `i..order.len()`.
-/// This enables safe early termination with non-monotonic ordering:
-/// if `suffix_max[i] * alpha < threshold`, ALL remaining SBs can be skipped.
-///
-/// O(num_superblocks) pre-computation, then O(1) check per SB in the loop.
-fn compute_suffix_max_ubs(sb_ubs: &[f32], order: &[u32], out: &mut [f32]) {
-    let n = order.len();
-    // Sentinel: suffix_max[n] = 0.0 (no remaining SBs)
-    out[n] = 0.0;
-    for i in (0..n).rev() {
-        let ub = sb_ubs[order[i] as usize];
-        out[i] = ub.max(out[i + 1]);
-    }
 }
 
 fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
@@ -1119,10 +1145,6 @@ fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
         .collect()
 }
 
-// ============================================================================
-// Compact grid helpers: operate on query-local contiguous grid buffers
-// ============================================================================
-
 /// Compute superblock UBs using integer weights for consistency with integer scoring.
 ///
 /// Uses the same u16 query weights and dequantization factor as `score_block_bsearch_int`,
@@ -1130,71 +1152,180 @@ fn collector_to_results(collector: ScoreCollector) -> Vec<ScoredDoc> {
 /// a subtle correctness issue where f32-weighted UBs can be slightly LOWER than
 /// integer-scored thresholds due to u16 quantization rounding.
 ///
-/// `compact_sb_grid` layout: `compact_sb_grid[local_dim * nsb + sb_id]`
-/// `int_weights[i] = (local_dim_index, u16_weight)` — parallel to `compact_dims`.
 #[inline]
 fn compute_sb_ubs_int(
-    compact_sb_grid: &[u8],
-    nsb: usize,
-    int_weights: &[(usize, u16)],
-    dequant: f32,
-    out: &mut [f32],
-) {
-    debug_assert!(out.len() >= nsb);
-    // Accumulate as u32 to match integer scoring path exactly
-    for sb in 0..nsb {
-        let mut acc: u32 = 0;
-        for &(local_idx, w) in int_weights {
-            let val = compact_sb_grid[local_idx * nsb + sb];
-            acc += w as u32 * val as u32;
-        }
-        out[sb] = acc as f32 * dequant;
-    }
-}
-
-/// Compute block UBs in the same integer units as document scoring.
-///
-/// Grid cells are ceiling-quantized upper bounds. Accumulating `u16 × u8` in
-/// `u32`, then applying the common dequantizer once, preserves the monotonic
-/// relationship `block_ub >= document_score` under f32 conversion. Summing
-/// already-dequantized f32 terms can round downward (measurably even at 64
-/// dimensions) and made exact-mode pruning unsafe near the heap threshold.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn compute_block_ubs_int(
-    compact_grid: &[u8],
-    grid_bits: u8,
-    prs: usize,
-    int_weights: &[(usize, u16)],
-    block_start: usize,
-    block_end: usize,
+    grid: &CompressedGrid,
+    int_weights: &[BmpGridWeight],
     dequant: f32,
     units: &mut [u32],
     out: &mut [f32],
-) {
-    let count = block_end - block_start;
+    decoded: &mut [u8],
+) -> crate::Result<()> {
+    let nsb = grid.cells();
+    debug_assert!(out.len() >= nsb);
+    debug_assert!(units.len() >= nsb);
+    debug_assert!(decoded.len() >= GRID_GROUP_CELLS);
+    units[..nsb].fill(0);
+
+    // E is always consumed as a complete row. Walk its selectors and payload
+    // once without allocating descriptors or paying a checkpoint-prefix
+    // lookup for every group.
+    let cell_scale = block_grid_scale(LSP_SUPERBLOCK_GRID_BITS);
+    for &BmpGridWeight {
+        dimension, weight, ..
+    } in int_weights
+    {
+        grid.try_for_each_row_group(dimension, |group_id, group| {
+            let start = group_id * GRID_GROUP_CELLS;
+            let count = GRID_GROUP_CELLS.min(nsb - start);
+            if group.width() == 0 {
+                return Ok(());
+            }
+            group.decode(0, count, decoded);
+            accumulate_u8(
+                decoded,
+                count,
+                cell_scale * u32::from(weight),
+                &mut units[start..start + count],
+            );
+            Ok(())
+        })?;
+    }
+    for (bound, &integer_units) in out[..nsb].iter_mut().zip(&units[..nsb]) {
+        *bound = integer_units as f32 * dequant;
+    }
+    Ok(())
+}
+
+/// Decode one eight-block superblock and compute every grid-derived value in one
+/// pass: full bounds, phase-one bounds, and per-query-dimension presence.
+///
+/// Grid cells are ceiling-quantized upper bounds. Accumulating `u16 × u8` in
+/// `u32`, then applying the common dequantizer once, preserves
+/// `block_ub >= candidate-query document score` under f32 conversion.
+/// Summing already-dequantized terms can round downward and made unpruned
+/// exact-mode pruning unsafe near the heap threshold.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn compute_block_ubs_and_presence(
+    grid: &CompressedGrid,
+    grid_bits: u8,
+    int_weights: &[BmpGridWeight],
+    query_term_count: usize,
+    phase1_mask: u64,
+    block_start: usize,
+    count: usize,
+    units: &mut [u32],
+    phase1_units: &mut [u32],
+    out: &mut [f32],
+    phase1_out: &mut [f32],
+    query_presence: &mut Vec<u64>,
+    decoded: &mut [u8],
+    dequant: f32,
+) -> crate::Result<u64> {
     debug_assert!(units.len() >= count);
+    debug_assert!(phase1_units.len() >= count);
     debug_assert!(out.len() >= count);
+    debug_assert!(phase1_out.len() >= count);
+    debug_assert!(decoded.len() >= count);
+    debug_assert!(count <= BMP_SUPERBLOCK_SIZE as usize);
+    let group_id = block_start / GRID_GROUP_CELLS;
+    let within = block_start % GRID_GROUP_CELLS;
+    if within + count > GRID_GROUP_CELLS {
+        return Err(crate::Error::Corruption(
+            "BMP superblock crosses a compressed-grid group boundary".into(),
+        ));
+    }
+
     units[..count].fill(0);
-    for &(local_idx, weight) in int_weights {
-        let row = &compact_grid[local_idx * prs..(local_idx + 1) * prs];
-        accumulate_grid_u32(
-            row,
-            grid_bits,
-            block_start,
+    phase1_units[..count].fill(0);
+    if query_presence.len() < query_term_count {
+        query_presence.resize(query_term_count, 0);
+    }
+    query_presence[..query_term_count].fill(0);
+
+    let cell_scale = crate::segment::bmp_grid::block_grid_scale(grid_bits);
+    let use_phase1 = phase1_mask != u64::MAX;
+    let mut blocks_with_query_terms = 0u64;
+    for &BmpGridWeight {
+        dimension,
+        weight,
+        query_index,
+    } in int_weights
+    {
+        let group = grid.group(dimension, group_id)?;
+        if group.width() == 0 {
+            continue;
+        }
+        group.decode_u4_packed(within, count, decoded);
+        let multiplier = cell_scale * u32::from(weight);
+        let phase1 = (use_phase1 && phase1_mask & (1u64 << query_index) != 0)
+            .then_some(&mut phase1_units[..count]);
+        let presence = accumulate_packed_u4(
+            &decoded[..count.div_ceil(2)],
             count,
-            u32::from(weight),
+            multiplier,
             &mut units[..count],
+            phase1,
         );
+        query_presence[query_index] = presence;
+        blocks_with_query_terms |= presence;
     }
     for (bound, &integer_units) in out[..count].iter_mut().zip(&units[..count]) {
         *bound = integer_units as f32 * dequant;
     }
+    if use_phase1 {
+        for (bound, &integer_units) in phase1_out[..count].iter_mut().zip(&phase1_units[..count]) {
+            *bound = integer_units as f32 * dequant;
+        }
+    }
+    Ok(blocks_with_query_terms)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compute_block_ubs_int;
+    use std::io::Write;
+
+    use super::{
+        BmpGridWeight, compute_block_ubs_and_presence, recommended_lsp_gamma, sort_sb_desc_into,
+    };
+    use crate::directories::OwnedBytes;
+    use crate::segment::BMP_SUPERBLOCK_SIZE;
+    use crate::segment::bmp_grid::{
+        CompressedGrid, CompressedGridLayout, GRID_GROUP_CELLS, bit_width, pack_group,
+    };
+
+    fn test_grid(rows: &[Vec<u8>], cells: usize) -> CompressedGrid {
+        let layout = CompressedGridLayout::new(rows.len(), cells);
+        let widths_by_row: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| {
+                row.chunks(GRID_GROUP_CELLS)
+                    .map(|group| bit_width(group.iter().copied().max().unwrap_or(0)))
+                    .collect()
+            })
+            .collect();
+        let row_sizes: Vec<u64> = widths_by_row
+            .iter()
+            .map(|widths| layout.row_bytes(widths).unwrap())
+            .collect();
+        let mut bytes = Vec::new();
+        layout.write_row_offsets(&row_sizes, &mut bytes).unwrap();
+        let mut values = [0u8; GRID_GROUP_CELLS];
+        let mut packed = [0u8; GRID_GROUP_CELLS];
+        for (row, widths) in rows.iter().zip(&widths_by_row) {
+            layout.write_row_header(widths, 4, &mut bytes).unwrap();
+            for (group, &width) in widths.iter().enumerate() {
+                values.fill(0);
+                let start = group * GRID_GROUP_CELLS;
+                let count = GRID_GROUP_CELLS.min(cells - start);
+                values[..count].copy_from_slice(&row[start..start + count]);
+                let len = pack_group(&values, width, &mut packed).unwrap();
+                bytes.write_all(&packed[..len]).unwrap();
+            }
+        }
+        CompressedGrid::parse(OwnedBytes::new(bytes), rows.len(), cells, 4, "test grid").unwrap()
+    }
 
     #[test]
     fn integer_block_bound_cannot_round_below_integer_score() {
@@ -1202,24 +1333,40 @@ mod tests {
         // common targets. The block bound and document score now convert the
         // same integer units exactly once.
         let dimensions = 64usize;
-        let grid = vec![0x0f; dimensions]; // one 4-bit cell (= 255) per row
-        let weights: Vec<(usize, u16)> =
-            (0..dimensions).map(|dimension| (dimension, 160)).collect();
+        let rows = vec![vec![15]; dimensions]; // one 4-bit cell (= 255) per row
+        let grid = test_grid(&rows, 1);
+        let weights: Vec<BmpGridWeight> = (0..dimensions)
+            .map(|dimension| BmpGridWeight {
+                dimension,
+                weight: 160,
+                query_index: dimension,
+            })
+            .collect();
         let dequant = 0.123_456_7f32;
         let mut units = [0u32; 1];
         let mut bounds = [0.0f32; 1];
 
-        compute_block_ubs_int(
+        let mut phase1_units = [0u32; 1];
+        let mut phase1_bounds = [0.0f32; 1];
+        let mut presence = Vec::new();
+        let mut decoded = [0u8; GRID_GROUP_CELLS];
+        compute_block_ubs_and_presence(
             &grid,
             4,
-            1,
             &weights,
+            dimensions,
+            u64::MAX,
             0,
             1,
-            dequant,
             &mut units,
+            &mut phase1_units,
             &mut bounds,
-        );
+            &mut phase1_bounds,
+            &mut presence,
+            &mut decoded,
+            dequant,
+        )
+        .unwrap();
 
         let score_units = 160u32 * 255 * dimensions as u32;
         let score = score_units as f32 * dequant;
@@ -1230,31 +1377,65 @@ mod tests {
     #[test]
     fn packed_integer_bound_kernel_matches_every_4bit_cell() {
         let blocks = 64usize;
-        let grid: Vec<u8> = (0..blocks / 2)
-            .map(|pair| {
-                let low = (pair * 2 % 16) as u8;
-                let high = ((pair * 2 + 1) % 16) as u8;
-                low | (high << 4)
-            })
-            .collect();
-        let mut units = [0u32; 64];
-        let mut bounds = [0.0f32; 64];
-
-        compute_block_ubs_int(
-            &grid,
-            4,
-            grid.len(),
-            &[(0, 123)],
-            0,
+        let grid = test_grid(
+            &[(0..blocks).map(|block| (block % 16) as u8).collect()],
             blocks,
-            1.0,
-            &mut units,
-            &mut bounds,
         );
+        for block_start in (0..blocks).step_by(BMP_SUPERBLOCK_SIZE as usize) {
+            let mut units = [0u32; BMP_SUPERBLOCK_SIZE as usize];
+            let mut phase1_units = [0u32; BMP_SUPERBLOCK_SIZE as usize];
+            let mut bounds = [0.0f32; BMP_SUPERBLOCK_SIZE as usize];
+            let mut phase1_bounds = [0.0f32; BMP_SUPERBLOCK_SIZE as usize];
+            let mut presence = Vec::new();
+            let mut decoded = [0u8; GRID_GROUP_CELLS];
 
-        for block in 0..blocks {
-            assert_eq!(units[block], (block % 16) as u32 * 17 * 123);
-            assert_eq!(bounds[block], units[block] as f32);
+            compute_block_ubs_and_presence(
+                &grid,
+                4,
+                &[BmpGridWeight {
+                    dimension: 0,
+                    weight: 123,
+                    query_index: 0,
+                }],
+                1,
+                u64::MAX,
+                block_start,
+                BMP_SUPERBLOCK_SIZE as usize,
+                &mut units,
+                &mut phase1_units,
+                &mut bounds,
+                &mut phase1_bounds,
+                &mut presence,
+                &mut decoded,
+                1.0,
+            )
+            .unwrap();
+
+            for local in 0..BMP_SUPERBLOCK_SIZE as usize {
+                let block = block_start + local;
+                assert_eq!(units[local], (block % 16) as u32 * 17 * 123);
+                assert_eq!(bounds[local], units[local] as f32);
+            }
         }
+    }
+
+    #[test]
+    fn lsp_zero_shot_gamma_schedule_is_depth_aware() {
+        assert_eq!(recommended_lsp_gamma(0), 250);
+        assert_eq!(recommended_lsp_gamma(10), 250);
+        assert_eq!(recommended_lsp_gamma(11), 500);
+        assert_eq!(recommended_lsp_gamma(100), 500);
+        assert_eq!(recommended_lsp_gamma(101), 1000);
+        assert_eq!(recommended_lsp_gamma(1000), 1000);
+        assert_eq!(recommended_lsp_gamma(1001), 2000);
+        assert_eq!(recommended_lsp_gamma(4800), 4800);
+    }
+
+    #[test]
+    fn lsp_orders_strictly_by_superblock_maximum() {
+        let bounds = [4.0, 9.0, 9.0, 1.0, 7.0];
+        let mut order = Vec::new();
+        sort_sb_desc_into(&bounds, &mut order);
+        assert_eq!(order, vec![1, 2, 4, 0, 3]);
     }
 }

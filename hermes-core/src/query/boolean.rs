@@ -426,10 +426,17 @@ macro_rules! boolean_plan {
             } else {
                 limit
             };
+            let mut should_options = scorer_options.without_threshold();
+            if should_is_sparse {
+                // The outer decomposition built this plan from the complete
+                // sparse SHOULD expression. Filters cannot increase scores,
+                // so retain global γ even when a verifier prevents predicate
+                // push-down. Thresholds still belong to the outer score space
+                // and remain cleared.
+                should_options.lsp_plan = scorer_options.lsp_plan.clone();
+            }
             let should_scorer = if should.len() == 1 {
-                should[0].$scorer_fn(
-                    reader, should_limit, scorer_options.without_threshold()
-                ) $(. $aw)* ?
+                should[0].$scorer_fn(reader, should_limit, should_options) $(. $aw)* ?
             } else {
                 let sub = BooleanQuery {
                     must: Vec::new(),
@@ -437,9 +444,7 @@ macro_rules! boolean_plan {
                     must_not: Vec::new(),
                     global_stats: global_stats.cloned(),
                 };
-                sub.$scorer_fn(
-                    reader, should_limit, scorer_options.without_threshold()
-                ) $(. $aw)* ?
+                sub.$scorer_fn(reader, should_limit, should_options) $(. $aw)* ?
             };
 
             let use_predicated =
@@ -564,6 +569,20 @@ impl Query for BooleanQuery {
             get_postings_sync,
             execute_sync
         )
+    }
+
+    fn decompose(&self) -> super::QueryDecomposition {
+        // LSP/0 selection depends only on the sparse scoring clauses. Pure
+        // filters may remove documents but cannot increase their score, so a
+        // query-global superblock plan remains valid and must be shared across
+        // segments for filtered sparse queries too. A scoring MUST clause can
+        // change final ordering, therefore keep that shape opaque.
+        if self.should.is_empty() || self.must.iter().any(|query| !query.is_filter()) {
+            return super::QueryDecomposition::Opaque;
+        }
+        extract_all_sparse_infos(&self.should)
+            .map(super::QueryDecomposition::SparseTerms)
+            .unwrap_or(super::QueryDecomposition::Opaque)
     }
 
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {

@@ -98,14 +98,17 @@ impl SegmentMerger {
                         .try_fold(0u32, |total, vectors| total.checked_add(vectors))
                         .ok_or_else(|| {
                             crate::Error::Internal(
-                                "merged BMP vector count exceeds the V15 u32 format limit".into(),
+                                "merged BMP vector count exceeds the V17 u32 format limit".into(),
                             )
                         })?;
                     let bmp_block_size = sparse_config
                         .as_ref()
                         .map(|c| c.bmp_block_size)
-                        .unwrap_or(64);
-                    let grid_bits = sparse_config.as_ref().map(|c| c.bmp_grid_bits).unwrap_or(4);
+                        .unwrap_or(crate::structures::SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE);
+                    let grid_bits = sparse_config
+                        .as_ref()
+                        .map(|c| c.bmp_grid_bits)
+                        .unwrap_or(crate::structures::SparseVectorConfig::DEFAULT_BMP_GRID_BITS);
                     let dims = sparse_config
                         .as_ref()
                         .and_then(|c| c.dims)
@@ -572,20 +575,23 @@ fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawDa
     Ok(())
 }
 
-/// Merge BMP fields with **streaming block-copy V15 format**.
+/// Merge BMP fields with **streaming block-copy V17 format**.
 ///
-/// V15 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
+/// V17 block-copy merge: all segments share the same `dims`, `bmp_block_size`,
 /// and `max_weight_scale`, so blocks are self-contained and can be copied directly.
 ///
 /// Phases:
 /// 1. Stream Section B (block data) — sequential chunked copy
 /// 2. Write padding + Section A (block_data_starts) — recomputed on-the-fly
-/// 3. Stream Section D (packed_grid) — one row at a time
-/// 4. Write Section E (sb_grid) — one row at a time
+/// 3. Stream Section D — payload groups already aligned in output coordinates
+///    are copied byte-for-byte; shifted groups use a bounded decode/repack
+/// 4. Stream Section E — ceil-u4 values decoded/repacked into the output
+///    superblock coordinate system
 /// 5. Stream Section F+G (doc_map) — bulk copy with offset patching
-/// 6. Write the V15 footer
+/// 6. Write the V17 footer
 ///
-/// Peak memory: row_buf (~4 MB) + sb_row (~120 KB) + id_buf (256 KB) + tiny Vecs.
+/// Peak memory is one row's group descriptors/selectors, one superblock row,
+/// and fixed-size copy/decode buffers; it does not scale with postings.
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
@@ -601,8 +607,6 @@ fn merge_bmp_field(
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
     use crate::segment::builder::bmp::write_bmp_footer;
-    use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
-
     let effective_block_size = bmp_block_size.clamp(1, 256);
 
     // Pre-build source list: (&BmpIndex, doc_offset). Filters out None segments.
@@ -652,14 +656,14 @@ fn merge_bmp_field(
             .checked_add(bmp.num_blocks)
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "merged BMP block count exceeds the V15 u32 format limit".into(),
+                    "merged BMP block count exceeds the V17 u32 format limit".into(),
                 )
             })?;
         num_real_docs_total = num_real_docs_total
             .checked_add(bmp.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "merged BMP real-document count exceeds the V15 u32 format limit".into(),
+                    "merged BMP real-document count exceeds the V17 u32 format limit".into(),
                 )
             })?;
     }
@@ -674,12 +678,9 @@ fn merge_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "merged BMP virtual-document count exceeds the V15 u32 format limit".into(),
+                "merged BMP virtual-document count exceeds the V17 u32 format limit".into(),
             )
         })?;
-    let packed_row_size = crate::segment::builder::bmp::grid_packed_row_size(num_blocks, grid_bits);
-    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
-
     // Pre-compute aggregate stats (needed for footer, independent of block order)
     let mut total_terms: u64 = 0;
     let mut total_postings: u64 = 0;
@@ -687,20 +688,8 @@ fn merge_bmp_field(
         total_terms = total_terms.saturating_add(bmp.total_terms());
         total_postings = total_postings.saturating_add(bmp.total_postings());
     }
-    // Pre-compute per-source block offsets (first global block id for each source)
-    let mut block_offsets: Vec<u32> = Vec::with_capacity(sources.len());
-    {
-        let mut cumulative: u32 = 0;
-        for &(bmp, _) in &sources {
-            block_offsets.push(cumulative);
-            cumulative = cumulative.checked_add(bmp.num_blocks).ok_or_else(|| {
-                crate::Error::Internal("merged BMP block offset exceeds u32::MAX".into())
-            })?;
-        }
-    }
-
     log::debug!(
-        "[merge_bmp_v14] field {}: dims={}, {} sources, {} total_blocks, \
+        "[merge_bmp_v17] field {}: dims={}, {} sources, {} total_blocks, \
          block_size={}, max_weight_scale={:.4}",
         field_id,
         dims,
@@ -765,66 +754,19 @@ fn merge_bmp_field(
         .write_all(&cumulative_bytes.to_le_bytes())
         .map_err(crate::Error::Io)?;
 
-    // ── Phase 3: Stream Section D (packed_grid) — one row at a time
+    // ── Phase 3: Stream Section D. Groups already aligned in output
+    // coordinates are copied byte-for-byte; shifted output groups use a
+    // bounded 256-cell decode/repack.
     let grid_offset = writer.offset() - blob_start;
-    let mut row_buf = vec![0u8; packed_row_size];
+    let block_grid_bytes =
+        write_merged_block_grid(&sources, dims as usize, num_blocks, grid_bits, writer)?;
 
-    for dim_id in 0..dims {
-        row_buf.fill(0);
-        for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
-            let col_offset = block_offsets[src_idx] as usize;
-            let src_prs = bmp.packed_row_size();
-            let src_num_blocks = bmp.num_blocks as usize;
-            let src_row_start = dim_id as usize * src_prs;
-            let src_row_end = src_row_start + src_prs;
-            let src_grid = bmp.grid_slice();
-            if src_row_end > src_grid.len() {
-                continue;
-            }
-            let src_row = &src_grid[src_row_start..src_row_end];
-            copy_cells(src_row, src_num_blocks, &mut row_buf, col_offset, grid_bits);
-        }
-        writer.write_all(&row_buf).map_err(crate::Error::Io)?;
-    }
-    drop(row_buf);
-
-    // ── Phase 4: Stream Section E (sb_grid) — one row at a time ─
+    // ── Phase 4: Stream Section E. Source superblock coordinates restart at
+    // every segment, so this ceil-u4 section is remapped by
+    // source block offsets and repacked.
     let sb_grid_offset = writer.offset() - blob_start;
-    let mut sb_row = vec![0u8; num_superblocks];
-    let sb_size = BMP_SUPERBLOCK_SIZE as usize;
-
-    for dim_id in 0..dims {
-        sb_row.fill(0);
-        for (src_idx, &(bmp, _)) in sources.iter().enumerate() {
-            let col_offset = block_offsets[src_idx] as usize;
-            let src_num_blocks = bmp.num_blocks as usize;
-            let src_num_sbs = bmp.num_superblocks as usize;
-            let src_sb_grid = bmp.sb_grid_slice();
-            let src_sb_row_start = dim_id as usize * src_num_sbs;
-            let src_sb_row_end = src_sb_row_start + src_num_sbs;
-            if src_sb_row_end > src_sb_grid.len() {
-                continue;
-            }
-            let src_sb_row = &src_sb_grid[src_sb_row_start..src_sb_row_end];
-
-            for (sb_src, &val) in src_sb_row.iter().enumerate() {
-                if val == 0 {
-                    continue;
-                }
-                let first_block = col_offset + sb_src * sb_size;
-                let last_block = (first_block + sb_size).min(col_offset + src_num_blocks) - 1;
-                let first_out_sb = first_block / sb_size;
-                let last_out_sb = last_block / sb_size;
-                for slot in &mut sb_row[first_out_sb..=last_out_sb] {
-                    if val > *slot {
-                        *slot = val;
-                    }
-                }
-            }
-        }
-        writer.write_all(&sb_row).map_err(crate::Error::Io)?;
-    }
-    drop(sb_row);
+    debug_assert_eq!(sb_grid_offset, grid_offset + block_grid_bytes);
+    write_merged_superblock_grid(&sources, dims as usize, num_blocks, writer)?;
 
     // Release grid pages
     #[cfg(feature = "native")]
@@ -881,7 +823,7 @@ fn merge_bmp_field(
         }
     }
 
-    // ── Phase 6: Write V15 footer ───────────────────────────────────────
+    // ── Phase 6: Write V17 footer ───────────────────────────────────────
     write_bmp_footer(
         writer,
         total_terms,
@@ -984,20 +926,355 @@ fn push_bmp_field_toc(
     });
 }
 
-/// Copy 4-bit nibbles from a source grid row to a destination row at a column offset.
-///
-/// Hot inner loop for grid merge (~8 KB per row).
-/// Source nibbles are packed: low nibble = even block, high nibble = odd block.
-#[inline]
-fn copy_cells(src_row: &[u8], src_blocks: usize, dst_row: &mut [u8], offset: usize, grid_bits: u8) {
-    use crate::segment::builder::bmp::{grid_get_cell, grid_set_cell};
-    for b in 0..src_blocks {
-        let val = grid_get_cell(src_row, b, grid_bits);
-        if val == 0 {
-            continue;
-        }
-        grid_set_cell(dst_row, offset + b, val, grid_bits);
+enum MergedBlockGroup<'a> {
+    Borrowed(crate::segment::bmp_grid::PackedGridGroup<'a>),
+    Repacked { width: u8 },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_merged_block_group<'a>(
+    output_group: usize,
+    num_blocks: usize,
+    source_bases: &[usize],
+    source_group_bases: &[usize],
+    row_groups: &[crate::segment::bmp_grid::PackedGridGroup<'a>],
+    source_cursor: &mut usize,
+    values: &mut [u8; crate::segment::bmp_grid::GRID_GROUP_CELLS],
+) -> Result<MergedBlockGroup<'a>> {
+    use crate::segment::bmp_grid::{GRID_GROUP_CELLS, bit_width};
+
+    let output_start = output_group * GRID_GROUP_CELLS;
+    let output_end = (output_start + GRID_GROUP_CELLS).min(num_blocks);
+    while source_bases
+        .get(*source_cursor + 1)
+        .is_some_and(|&end| end <= output_start)
+    {
+        *source_cursor += 1;
     }
+    let source_end = source_bases.get(*source_cursor + 1).ok_or_else(|| {
+        crate::Error::Corruption("BMP merge block-grid source range is incomplete".into())
+    })?;
+    let local_start = output_start
+        .checked_sub(source_bases[*source_cursor])
+        .ok_or_else(|| {
+            crate::Error::Corruption("BMP merge block-grid source ranges overlap".into())
+        })?;
+
+    // The common large-segment case: this output group is exactly one
+    // complete source group. Preserve its payload byte-for-byte.
+    if output_end - output_start == GRID_GROUP_CELLS
+        && output_end <= *source_end
+        && local_start.is_multiple_of(GRID_GROUP_CELLS)
+    {
+        let group_index = source_group_bases[*source_cursor] + local_start / GRID_GROUP_CELLS;
+        let group = row_groups.get(group_index).copied().ok_or_else(|| {
+            crate::Error::Corruption("BMP merge block-grid group is missing".into())
+        })?;
+        return Ok(MergedBlockGroup::Borrowed(group));
+    }
+
+    values.fill(0);
+    let mut global = output_start;
+    let mut current_source = *source_cursor;
+    while global < output_end {
+        while source_bases
+            .get(current_source + 1)
+            .is_some_and(|&end| end <= global)
+        {
+            current_source += 1;
+        }
+        let current_end = *source_bases.get(current_source + 1).ok_or_else(|| {
+            crate::Error::Corruption("BMP merge block-grid source range is incomplete".into())
+        })?;
+        let local = global
+            .checked_sub(source_bases[current_source])
+            .ok_or_else(|| {
+                crate::Error::Corruption("BMP merge block-grid source ranges overlap".into())
+            })?;
+        let source_group = local / GRID_GROUP_CELLS;
+        let within = local % GRID_GROUP_CELLS;
+        let count = (GRID_GROUP_CELLS - within)
+            .min(output_end - global)
+            .min(current_end - global);
+        let destination = global - output_start;
+        let group_index = source_group_bases[current_source] + source_group;
+        row_groups
+            .get(group_index)
+            .copied()
+            .ok_or_else(|| {
+                crate::Error::Corruption("BMP merge block-grid group is missing".into())
+            })?
+            .decode(within, count, &mut values[destination..destination + count]);
+        global += count;
+    }
+    Ok(MergedBlockGroup::Repacked {
+        width: bit_width(values.iter().copied().max().unwrap_or(0)),
+    })
+}
+
+fn write_merged_block_grid<'a>(
+    sources: &[(&'a BmpIndex, u32)],
+    dims: usize,
+    num_blocks: usize,
+    grid_bits: u8,
+    writer: &mut dyn Write,
+) -> Result<u64> {
+    use crate::segment::bmp_grid::{CompressedGridLayout, GRID_GROUP_CELLS, pack_group};
+
+    let layout = CompressedGridLayout::new(dims, num_blocks);
+    let mut source_bases = Vec::with_capacity(sources.len() + 1);
+    let mut source_group_bases = Vec::with_capacity(sources.len() + 1);
+    source_bases.push(0usize);
+    source_group_bases.push(0usize);
+    for &(bmp, _) in sources {
+        let next = source_bases
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(bmp.num_blocks as usize)
+            .ok_or_else(|| {
+                crate::Error::Internal("merged BMP block-grid offset overflows usize".into())
+            })?;
+        source_bases.push(next);
+        source_group_bases.push(
+            source_group_bases
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .checked_add(bmp.block_grid().groups())
+                .ok_or_else(|| {
+                    crate::Error::Internal(
+                        "merged BMP block-grid group offset overflows usize".into(),
+                    )
+                })?,
+        );
+    }
+    if source_bases.last().copied() != Some(num_blocks) {
+        return Err(crate::Error::Internal(
+            "merged BMP block-grid source lengths disagree with output".into(),
+        ));
+    }
+
+    let mut widths = vec![0u8; layout.groups()];
+    let mut row_sizes = Vec::with_capacity(dims);
+    let mut row_groups: Vec<crate::segment::bmp_grid::PackedGridGroup<'a>> =
+        Vec::with_capacity(*source_group_bases.last().unwrap_or(&0));
+
+    let load_row = |dimension: usize,
+                    groups: &mut Vec<crate::segment::bmp_grid::PackedGridGroup<'a>>|
+     -> Result<()> {
+        groups.clear();
+        for &(bmp, _) in sources {
+            let grid = bmp.block_grid();
+            if grid.dims() != dims || grid.max_width() != grid_bits {
+                return Err(crate::Error::Corruption(
+                    "BMP merge block-grid metadata disagrees with the field schema".into(),
+                ));
+            }
+            grid.append_row_groups(dimension, groups)?;
+        }
+        if groups.len() != *source_group_bases.last().unwrap_or(&0) {
+            return Err(crate::Error::Corruption(
+                "BMP merge block-grid row has an inconsistent group count".into(),
+            ));
+        }
+        Ok(())
+    };
+    let mut group_values = [0u8; GRID_GROUP_CELLS];
+    let collect_widths = |widths: &mut [u8],
+                          groups: &[crate::segment::bmp_grid::PackedGridGroup<'a>],
+                          values: &mut [u8; GRID_GROUP_CELLS]|
+     -> Result<()> {
+        widths.fill(0);
+        let mut source = 0usize;
+        for (output_group, output_width) in widths.iter_mut().enumerate() {
+            *output_width = match prepare_merged_block_group(
+                output_group,
+                num_blocks,
+                &source_bases,
+                &source_group_bases,
+                groups,
+                &mut source,
+                values,
+            )? {
+                MergedBlockGroup::Borrowed(group) => group.width(),
+                MergedBlockGroup::Repacked { width } => width,
+            };
+        }
+        Ok(())
+    };
+
+    for dimension in 0..dims {
+        load_row(dimension, &mut row_groups)?;
+        collect_widths(&mut widths, &row_groups, &mut group_values)?;
+        row_sizes.push(layout.row_bytes(&widths)?);
+    }
+    let table_bytes = layout
+        .write_row_offsets(&row_sizes, writer)
+        .map_err(crate::Error::Io)?;
+
+    for dimension in 0..dims {
+        load_row(dimension, &mut row_groups)?;
+        collect_widths(&mut widths, &row_groups, &mut group_values)?;
+        layout
+            .write_row_header(&widths, grid_bits, writer)
+            .map_err(crate::Error::Io)?;
+
+        let mut packed = [0u8; GRID_GROUP_CELLS];
+        let mut source = 0usize;
+        for (output_group, &width) in widths.iter().enumerate() {
+            match prepare_merged_block_group(
+                output_group,
+                num_blocks,
+                &source_bases,
+                &source_group_bases,
+                &row_groups,
+                &mut source,
+                &mut group_values,
+            )? {
+                MergedBlockGroup::Borrowed(group) => {
+                    if group.width() != width {
+                        return Err(crate::Error::Corruption(
+                            "BMP merge block-grid sizing changed during encoding".into(),
+                        ));
+                    }
+                    writer.write_all(group.bytes()).map_err(crate::Error::Io)?;
+                }
+                MergedBlockGroup::Repacked {
+                    width: actual_width,
+                } => {
+                    if actual_width != width {
+                        return Err(crate::Error::Corruption(
+                            "BMP merge block-grid sizing changed during encoding".into(),
+                        ));
+                    }
+                    let payload_len = pack_group(&group_values, width, &mut packed)?;
+                    writer
+                        .write_all(&packed[..payload_len])
+                        .map_err(crate::Error::Io)?;
+                }
+            }
+        }
+    }
+    Ok(table_bytes + row_sizes.into_iter().sum::<u64>())
+}
+
+fn write_merged_superblock_grid<'a>(
+    sources: &[(&'a BmpIndex, u32)],
+    dims: usize,
+    num_blocks: usize,
+    writer: &mut dyn Write,
+) -> Result<u64> {
+    use crate::segment::bmp_grid::{CompressedGridLayout, GRID_GROUP_CELLS, pack_group};
+
+    let mut source_block_bases = Vec::with_capacity(sources.len() + 1);
+    source_block_bases.push(0usize);
+    for &(bmp, _) in sources {
+        let next = source_block_bases
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(bmp.num_blocks as usize)
+            .ok_or_else(|| {
+                crate::Error::Internal("merged BMP superblock block offset overflows usize".into())
+            })?;
+        source_block_bases.push(next);
+    }
+    if source_block_bases.last().copied() != Some(num_blocks) {
+        return Err(crate::Error::Internal(
+            "merged BMP superblock source lengths disagree with output".into(),
+        ));
+    }
+    let cells = num_blocks.div_ceil(crate::segment::BMP_SUPERBLOCK_SIZE as usize);
+    let layout = CompressedGridLayout::new(dims, cells);
+    let mut widths = vec![0u8; layout.groups()];
+    let mut row_sizes = Vec::with_capacity(dims);
+    let mut row = vec![0u8; cells];
+    let mut decoded = [0u8; GRID_GROUP_CELLS];
+    let mut source_groups: Vec<crate::segment::bmp_grid::PackedGridGroup<'a>> = Vec::new();
+
+    let fill_row = |dimension: usize,
+                    row: &mut [u8],
+                    decoded: &mut [u8; GRID_GROUP_CELLS],
+                    source_groups: &mut Vec<crate::segment::bmp_grid::PackedGridGroup<'a>>|
+     -> Result<()> {
+        const SB: usize = crate::segment::BMP_SUPERBLOCK_SIZE as usize;
+        row.fill(0);
+        for (source, &(bmp, _)) in sources.iter().enumerate() {
+            let grid = bmp.superblock_grid();
+            let source_blocks = bmp.num_blocks as usize;
+            source_groups.clear();
+            grid.append_row_groups(dimension, source_groups)?;
+            for (source_group, group) in source_groups.iter().copied().enumerate() {
+                let source_cell_start = source_group * GRID_GROUP_CELLS;
+                let count = GRID_GROUP_CELLS.min(grid.cells() - source_cell_start);
+                if group.width() == 0 {
+                    continue;
+                }
+                group.decode(0, count, decoded);
+                for (within, &value) in decoded[..count].iter().enumerate() {
+                    if value == 0 {
+                        continue;
+                    }
+                    let source_sb = source_cell_start + within;
+                    let local_block_start = source_sb * SB;
+                    if local_block_start >= source_blocks {
+                        break;
+                    }
+                    let local_block_end = (local_block_start + SB).min(source_blocks);
+                    let global_block_start = source_block_bases[source] + local_block_start;
+                    let global_block_end = source_block_bases[source] + local_block_end;
+                    let first_output_sb = global_block_start / SB;
+                    let last_output_sb = (global_block_end - 1) / SB;
+                    for slot in &mut row[first_output_sb..=last_output_sb] {
+                        *slot = (*slot).max(value);
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    let collect_widths = |row: &[u8], widths: &mut [u8]| {
+        widths.fill(0);
+        for (group, values) in row.chunks(GRID_GROUP_CELLS).enumerate() {
+            widths[group] =
+                crate::segment::bmp_grid::bit_width(values.iter().copied().max().unwrap_or(0));
+        }
+    };
+
+    for dimension in 0..dims {
+        fill_row(dimension, &mut row, &mut decoded, &mut source_groups)?;
+        collect_widths(&row, &mut widths);
+        row_sizes.push(layout.row_bytes(&widths)?);
+    }
+    let table_bytes = layout
+        .write_row_offsets(&row_sizes, writer)
+        .map_err(crate::Error::Io)?;
+
+    let mut values = [0u8; GRID_GROUP_CELLS];
+    let mut packed = [0u8; GRID_GROUP_CELLS];
+    for dimension in 0..dims {
+        fill_row(dimension, &mut row, &mut decoded, &mut source_groups)?;
+        collect_widths(&row, &mut widths);
+        layout
+            .write_row_header(
+                &widths,
+                crate::segment::bmp_grid::LSP_SUPERBLOCK_GRID_BITS,
+                writer,
+            )
+            .map_err(crate::Error::Io)?;
+        for (output_group, &width) in widths.iter().enumerate() {
+            values.fill(0);
+            let start = output_group * GRID_GROUP_CELLS;
+            let count = GRID_GROUP_CELLS.min(cells - start);
+            values[..count].copy_from_slice(&row[start..start + count]);
+            let payload_len = pack_group(&values, width, &mut packed)?;
+            writer
+                .write_all(&packed[..payload_len])
+                .map_err(crate::Error::Io)?;
+        }
+    }
+    Ok(table_bytes + row_sizes.into_iter().sum::<u64>())
 }
 
 #[cfg(test)]

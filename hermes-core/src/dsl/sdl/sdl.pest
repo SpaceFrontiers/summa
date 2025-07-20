@@ -159,11 +159,11 @@ weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
 block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
 block_size_spec = @{ ASCII_DIGIT+ }
 // BMP block size (vectors per block, power of two, max 256; default 32).
-// Uniform across all segments of the field. Grid memory scales as
-// 1/bmp_block_size; larger values coarsen pruning (docs/bmp-grid-compression.md).
+// Uniform across all segments of the field. Larger values reduce compressed
+// grid cells but coarsen pruning (docs/bmp-grid-compression.md).
 bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
-// Bits per BMP block-grid cell: 4 (default) or 2. 2 halves grid memory at
-// ~zero pruning cost (bounds are ceil-quantized — exactness is unchanged).
+// Bits per BMP block-grid cell: 4 (default) or 2. Two caps local D payload
+// widths at two bits (bounds are ceil-quantized — exactness is unchanged).
 bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }
 pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
 pruning_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
@@ -193,7 +193,7 @@ path_chars = @{ (!("\"" ) ~ ANY)* }
 // Example: query<tokenizer: "model/name", weighting: idf>
 query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
 query_config_params = { query_config_param ~ ("," ~ query_config_param)* }
-query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg | query_min_query_dims_kwarg }
+query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg | query_min_query_dims_kwarg | query_lsp_gamma_kwarg }
 query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
 query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
 tokenizer_path = { "\"" ~ path_chars ~ "\"" }
@@ -202,6 +202,8 @@ query_weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spe
 query_max_dims_kwarg = { "max_dims" ~ ":" ~ nprobe_spec }
 query_pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
 query_min_query_dims_kwarg = { "min_query_dims" ~ ":" ~ min_terms_spec }
+// LSP/0 top-superblock guarantee. 0 means exhaustive SBMax traversal.
+query_lsp_gamma_kwarg = { "lsp_gamma" ~ ":" ~ nprobe_spec }
 
 // Identifier (field names, index names, tokenizer names)
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

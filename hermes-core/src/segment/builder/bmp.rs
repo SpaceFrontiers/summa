@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V15 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V17 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -18,21 +18,14 @@
 //!
 //! Peak memory: `input + grid_entries + O(num_blocks) block_data_starts`.
 //!
-//! ## V13 changes from V12
-//!
-//! - **Recursive Graph Bisection (BP)** replaces SimHash for document ordering
-//! - **Section H removed**: no per-block SimHash (BP needs no stored metadata)
-//! - **64-byte footer** (was 72): `block_simhash_offset` field removed
-//! - V12 segments are incompatible — must rebuild
-//!
-//! ## BMP V15 Blob Layout (data-first, block-interleaved)
+//! ## BMP V17 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
 //!             padding            [0-7 bytes to 8-byte boundary]
 //! Section A:  block_data_starts  [u64-LE × (num_blocks + 1)]   byte offsets into Section B
-//! Section D:  grid_packed4       [u8 × (dims × packed_row_size)]  ← indexed by dim_id directly
-//! Section E:  sb_grid            [u8 × (dims × num_superblocks)]  ← indexed by dim_id directly
+//! Section D:  compressed block grid       [random-access 256-cell groups]
+//! Section E:  compressed superblock grid  [ceil-u4, random-access 256-cell groups]
 //! Section F:  doc_map_ids        [u32-LE × num_virtual_docs]
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
 //!
@@ -40,9 +33,10 @@
 //!   num_terms: u32                                    offset 0
 //!   term_dim_ids: [u32-LE × num_terms]                offset 4
 //!   posting_starts: [u32-LE × (num_terms + 1)]        relative cumulative counts
+//!   term_max_impacts: [u8 × num_terms]                exact per-block maxima
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP V15 Footer (72 bytes):
+//! BMP V17 Footer (72 bytes):
 //!   total_terms: u64              //  0- 7  (stats only)
 //!   total_postings: u64           //  8-15  (stats only)
 //!   grid_offset: u64              // 16-23  (byte offset of Section D)
@@ -55,7 +49,7 @@
 //!   doc_map_offset: u64           // 52-59  (byte offset of Section F)
 //!   num_real_docs: u32            // 60-63  (actual vector count before padding)
 //!   grid_bits: u32                // 64-67  (2 or 4)
-//!   magic: u32                    // 68-71  (BMP5 = 0x35504D42)
+//!   magic: u32                    // 68-71  (BMP7 = 0x37504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -93,10 +87,14 @@ impl VidLookup {
 }
 
 use crate::DocId;
+use crate::segment::bmp_grid::{
+    CompressedGridLayout, GRID_GROUP_CELLS, LSP_SUPERBLOCK_GRID_BITS, bit_width, pack_group,
+    quantize_block_maximum,
+};
 use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V15 blob from per-dimension postings.
+/// Build a BMP V17 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -196,7 +194,7 @@ pub(crate) fn build_bmp_blob(
     if num_real_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP real document count exceeds the V15 u32 format limit",
+            "BMP real document count exceeds the V17 u32 format limit",
         ));
     }
 
@@ -206,9 +204,11 @@ pub(crate) fn build_bmp_blob(
     // Safety: local_slot is u8, so block_size must not exceed 256
     let effective_block_size = bmp_block_size.clamp(1, 256);
 
-    // Pad num_virtual_docs to block_size alignment
-    let num_virtual_docs = num_real_docs
-        .div_ceil(effective_block_size as usize)
+    // Pad only the final document block. Compressed-grid groups are
+    // independently decodable, so merge can repack the at-most-two groups
+    // crossing each source boundary while copying aligned interiors verbatim.
+    let num_blocks = num_real_docs.div_ceil(effective_block_size as usize);
+    let num_virtual_docs = num_blocks
         .checked_mul(effective_block_size as usize)
         .ok_or_else(|| {
             std::io::Error::new(
@@ -219,10 +219,9 @@ pub(crate) fn build_bmp_blob(
     if num_virtual_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP padded document count exceeds the V15 u32 format limit",
+            "BMP padded document count exceeds the V17 u32 format limit",
         ));
     }
-    let num_blocks = num_virtual_docs / effective_block_size as usize;
 
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
     dim_ids.sort_unstable();
@@ -313,6 +312,7 @@ pub(crate) fn build_bmp_blob(
     let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut blk_dim_ids: Vec<u32> = Vec::new();
     let mut blk_posting_counts: Vec<u32> = Vec::new();
+    let mut blk_max_impacts: Vec<u8> = Vec::new();
     let mut blk_postings: Vec<u8> = Vec::new();
 
     while let Some(&Reverse((block_id, _, _))) = heap.peek() {
@@ -327,6 +327,7 @@ pub(crate) fn build_bmp_blob(
         // Clear per-block scratch
         blk_dim_ids.clear();
         blk_posting_counts.clear();
+        blk_max_impacts.clear();
         blk_postings.clear();
 
         // Process all dims with postings in this block
@@ -380,6 +381,7 @@ pub(crate) fn build_bmp_blob(
             }
 
             blk_posting_counts.push(term_posting_count);
+            blk_max_impacts.push(max_impact);
             total_postings = total_postings.saturating_add(u64::from(term_posting_count));
             total_terms = total_terms.saturating_add(1);
 
@@ -419,7 +421,7 @@ pub(crate) fn build_bmp_blob(
             let nt_u32 = u32::try_from(nt).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "BMP block term count exceeds the V15 u32 format limit",
+                    "BMP block term count exceeds the V17 u32 format limit",
                 )
             })?;
             blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
@@ -430,8 +432,8 @@ pub(crate) fn build_bmp_blob(
             }
 
             // posting_starts [u32 × (nt + 1)] — relative cumulative.
-            // u32, not u16: a 256-doc block of ~300-dim docs exceeds 65,535
-            // postings, and the old u16 sums wrapped silently (V13 → V14).
+            // A 256-vector block with hundreds of dimensions can exceed
+            // 65,535 postings, so both counts and prefixes are u32.
             let mut cum: u32 = 0;
             for &count in &blk_posting_counts {
                 blk_buf.extend_from_slice(&cum.to_le_bytes());
@@ -443,6 +445,11 @@ pub(crate) fn build_bmp_blob(
                 })?;
             }
             blk_buf.extend_from_slice(&cum.to_le_bytes());
+
+            // Exact per-term block maxima. The compressed D grid keeps its
+            // existing ceil-u4 semantics; these exact values let reorder
+            // rebuild tight ceil-u4 superblock maxima without rescanning postings.
+            blk_buf.extend_from_slice(&blk_max_impacts);
 
             // postings [(u8, u8) × total_block_postings]
             blk_buf.extend_from_slice(&blk_postings);
@@ -463,7 +470,7 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V15 vectors={} padded={} blocks={} dims={} \
+        "[bmp_build] V17 vectors={} padded={} blocks={} dims={} \
          terms={} postings={} grid_entries={}",
         num_real_docs,
         num_virtual_docs,
@@ -526,7 +533,7 @@ pub(crate) fn build_bmp_blob(
 
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V15 footer.
+    // BMP V17 footer.
     write_bmp_footer(
         writer,
         total_terms,
@@ -547,7 +554,7 @@ pub(crate) fn build_bmp_blob(
     Ok(bytes_written)
 }
 
-/// Write the BMP V15 footer.
+/// Write the BMP V17 footer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
@@ -604,76 +611,164 @@ pub(crate) fn write_u64_slice_le(writer: &mut dyn Write, data: &[u64]) -> std::i
     Ok(data.len() as u64 * 8)
 }
 
-/// Bytes per grid row for `num_blocks` cells at `bits` per cell (2 or 4).
-#[inline]
-pub(crate) fn grid_packed_row_size(num_blocks: usize, grid_bits: u8) -> usize {
-    match grid_bits {
-        2 => num_blocks.div_ceil(4),
-        _ => num_blocks.div_ceil(2),
-    }
+#[derive(Clone, Copy)]
+enum GridProjection {
+    Block { bits: u8 },
+    Superblock,
 }
 
-/// Dequantization multiplier for a grid cell: `cell × scale` recovers a safe
-/// (ceil-quantized) u8 upper bound. 4-bit → 17 (15×17=255); 2-bit → 85.
-#[inline]
-pub(crate) fn grid_dequant_scale(grid_bits: u8) -> u32 {
-    match grid_bits {
-        2 => 85,
-        _ => 17,
+impl GridProjection {
+    #[inline]
+    fn cells(self, num_blocks: usize) -> usize {
+        match self {
+            Self::Block { .. } => num_blocks,
+            Self::Superblock => num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize),
+        }
     }
-}
 
-/// Ceiling quantize u8 to a `bits`-wide grid cell. Guarantees
-/// `cell × grid_dequant_scale(bits) >= original` (bounds never underestimate).
-#[inline]
-pub(crate) fn grid_quantize_ceil(val: u8, grid_bits: u8) -> u8 {
-    if val == 0 {
-        return 0;
+    #[inline]
+    fn max_width(self) -> u8 {
+        match self {
+            Self::Block { bits } => bits,
+            Self::Superblock => LSP_SUPERBLOCK_GRID_BITS,
+        }
     }
-    match grid_bits {
-        2 => (val as u16 * 3).div_ceil(255) as u8,
-        _ => (val as u16 * 15).div_ceil(255) as u8,
-    }
-}
 
-/// OR a quantized cell into a packed grid row at cell index `idx`.
-#[inline]
-pub(crate) fn grid_set_cell(row: &mut [u8], idx: usize, cell: u8, grid_bits: u8) {
-    match grid_bits {
-        2 => row[idx / 4] |= cell << ((idx % 4) * 2),
-        _ => {
-            if idx.is_multiple_of(2) {
-                row[idx / 2] |= cell;
-            } else {
-                row[idx / 2] |= cell << 4;
-            }
+    #[inline]
+    fn project(self, block: u32, impact: u8) -> (usize, u8) {
+        match self {
+            Self::Block { bits } => (block as usize, quantize_block_maximum(impact, bits)),
+            Self::Superblock => (
+                block as usize / BMP_SUPERBLOCK_SIZE as usize,
+                quantize_block_maximum(impact, LSP_SUPERBLOCK_GRID_BITS),
+            ),
         }
     }
 }
 
-/// Read a cell from a packed grid row at cell index `idx`.
-#[inline]
-pub(crate) fn grid_get_cell(row: &[u8], idx: usize, grid_bits: u8) -> u8 {
-    match grid_bits {
-        2 => (row[idx / 4] >> ((idx % 4) * 2)) & 0x03,
-        _ => {
-            if idx.is_multiple_of(2) {
-                row[idx / 2] & 0x0F
-            } else {
-                row[idx / 2] >> 4
-            }
+fn fill_row_widths(
+    entries: &[(u32, u32, u8)],
+    projection: GridProjection,
+    widths: &mut [u8],
+    cells: usize,
+) -> std::io::Result<()> {
+    widths.fill(0);
+    for &(_, block, impact) in entries {
+        let (cell, value) = projection.project(block, impact);
+        if cell >= cells {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("BMP grid cell {cell} exceeds configured cell count {cells}"),
+            ));
         }
+        let group = cell / GRID_GROUP_CELLS;
+        widths[group] = widths[group].max(bit_width(value));
     }
+    Ok(())
 }
 
-/// Stream-write 4-bit packed grid (Section D) and 8-bit superblock grid (Section E).
+fn write_compressed_row_payload(
+    entries: &[(u32, u32, u8)],
+    projection: GridProjection,
+    widths: &[u8],
+    cells: usize,
+    writer: &mut dyn Write,
+) -> std::io::Result<()> {
+    let mut values = [0u8; GRID_GROUP_CELLS];
+    let mut packed = [0u8; GRID_GROUP_CELLS];
+    let mut entry = 0usize;
+    for (group, &width) in widths.iter().enumerate() {
+        values.fill(0);
+        while entry < entries.len() {
+            let (_, block, impact) = entries[entry];
+            let (cell, value) = projection.project(block, impact);
+            let entry_group = cell / GRID_GROUP_CELLS;
+            if entry_group > group {
+                break;
+            }
+            if entry_group < group || cell >= cells {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP grid entries are not sorted by block within a dimension",
+                ));
+            }
+            let slot = &mut values[cell % GRID_GROUP_CELLS];
+            *slot = (*slot).max(value);
+            entry += 1;
+        }
+        let payload_len = pack_group(&values, width, &mut packed)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        writer.write_all(&packed[..payload_len])?;
+    }
+    if entry != entries.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BMP grid row contains entries beyond the final group",
+        ));
+    }
+    Ok(())
+}
+
+fn write_compressed_grid_section(
+    grid_entries: &[(u32, u32, u8)],
+    num_dims: usize,
+    num_blocks: usize,
+    projection: GridProjection,
+    writer: &mut dyn Write,
+) -> std::io::Result<u64> {
+    let cells = projection.cells(num_blocks);
+    let layout = CompressedGridLayout::new(num_dims, cells);
+    let mut widths = vec![0u8; layout.groups()];
+    let mut row_sizes = Vec::with_capacity(num_dims);
+
+    let mut entry = 0usize;
+    for dim in 0..num_dims as u32 {
+        let start = entry;
+        while entry < grid_entries.len() && grid_entries[entry].0 == dim {
+            entry += 1;
+        }
+        fill_row_widths(&grid_entries[start..entry], projection, &mut widths, cells)?;
+        row_sizes.push(
+            layout
+                .row_bytes(&widths)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        );
+    }
+    if entry != grid_entries.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "BMP grid entry dim_id {} exceeds configured dims={num_dims}",
+                grid_entries[entry].0
+            ),
+        ));
+    }
+
+    let table_bytes = layout.write_row_offsets(&row_sizes, writer)?;
+    entry = 0;
+    for dim in 0..num_dims as u32 {
+        let start = entry;
+        while entry < grid_entries.len() && grid_entries[entry].0 == dim {
+            entry += 1;
+        }
+        let row_entries = &grid_entries[start..entry];
+        fill_row_widths(row_entries, projection, &mut widths, cells)?;
+        layout.write_row_header(&widths, projection.max_width(), writer)?;
+        write_compressed_row_payload(row_entries, projection, &widths, cells, writer)?;
+    }
+    Ok(table_bytes + row_sizes.into_iter().sum::<u64>())
+}
+
+/// Stream-write compressed ceil-quantized block (D) and LSP/0 superblock (E)
+/// grids. Both levels use four bits by default; an explicitly configured
+/// two-bit block grid does not reduce the four-bit superblock grid.
 ///
 /// `grid_entries` sorted by `(dim_id, block_id)`. `num_dims` is the fixed
 /// vocabulary size (dims), so the grid has `num_dims` rows.
 /// Each entry is `(dim_id, block_id, max_impact_u8)`.
 ///
-/// Memory: O(packed_row_size + num_superblocks) — one row buffer each.
-/// Returns `(packed_grid_bytes, sb_grid_bytes)`.
+/// Memory is bounded by one selector row plus two 256-byte group buffers.
+/// Returns `(block_grid_bytes, superblock_grid_bytes)`.
 pub(crate) fn stream_write_grids(
     grid_entries: &[(u32, u32, u8)],
     num_dims: usize,
@@ -681,58 +776,21 @@ pub(crate) fn stream_write_grids(
     grid_bits: u8,
     writer: &mut dyn Write,
 ) -> std::io::Result<(u64, u64)> {
-    let packed_row_size = grid_packed_row_size(num_blocks, grid_bits);
-    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
-
-    let mut row_buf = vec![0u8; packed_row_size];
-    let mut sb_row = vec![0u8; num_superblocks];
-
-    // Section D: packed 4-bit grid, one dim row at a time
-    let mut gi = 0;
-    for dim_id in 0..num_dims as u32 {
-        row_buf.fill(0);
-        while gi < grid_entries.len() && grid_entries[gi].0 == dim_id {
-            let b = grid_entries[gi].1 as usize;
-            let cell = grid_quantize_ceil(grid_entries[gi].2, grid_bits);
-            grid_set_cell(&mut row_buf, b, cell, grid_bits);
-            gi += 1;
-        }
-        writer.write_all(&row_buf)?;
-    }
-    let packed_bytes = (num_dims * packed_row_size) as u64;
-
-    // Entries with dim_id >= num_dims sort past the cursor and have no grid
-    // row: they would be dropped silently, leaving those dimensions
-    // unsearchable. The segment builder rejects them at add/build time, so
-    // leftovers here mean a legacy blob or a caller bug — say so loudly.
-    if gi < grid_entries.len() {
-        log::warn!(
-            "[bmp] {} grid entries with dim_id >= dims={} dropped from the block-max grid \
-             (first dim_id={}); these dimensions are unsearchable — raise `dims` in the \
-             field's sparse_vector config and rebuild",
-            grid_entries.len() - gi,
-            num_dims,
-            grid_entries[gi].0,
-        );
-    }
-
-    // Section E: 8-bit superblock grid, one dim row at a time
-    gi = 0;
-    for dim_id in 0..num_dims as u32 {
-        sb_row.fill(0);
-        while gi < grid_entries.len() && grid_entries[gi].0 == dim_id {
-            let b = grid_entries[gi].1 as usize;
-            let sb = b / BMP_SUPERBLOCK_SIZE as usize;
-            if grid_entries[gi].2 > sb_row[sb] {
-                sb_row[sb] = grid_entries[gi].2;
-            }
-            gi += 1;
-        }
-        writer.write_all(&sb_row)?;
-    }
-    let sb_bytes = (num_dims * num_superblocks) as u64;
-
-    Ok((packed_bytes, sb_bytes))
+    let block_bytes = write_compressed_grid_section(
+        grid_entries,
+        num_dims,
+        num_blocks,
+        GridProjection::Block { bits: grid_bits },
+        writer,
+    )?;
+    let superblock_bytes = write_compressed_grid_section(
+        grid_entries,
+        num_dims,
+        num_blocks,
+        GridProjection::Superblock,
+        writer,
+    )?;
+    Ok((block_bytes, superblock_bytes))
 }
 
 /// Size of a single grid entry on disk: dim_id(4) + block_id(4) + impact(1) = 9 bytes.
@@ -765,16 +823,16 @@ impl GridRunReader {
     ) -> std::io::Result<Option<(u32, u32, u8)>> {
         use std::io::Read;
         let mut buf = [0u8; GRID_ENTRY_DISK_SIZE];
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {
-                let dim_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-                let block_id = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                let impact = buf[8];
-                Ok(Some((dim_id, block_id, impact)))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-            Err(e) => Err(e),
+        // EOF is valid only between complete records. `read_exact` alone
+        // cannot distinguish an empty read from a truncated 1..8-byte tail.
+        if reader.read(&mut buf[..1])? == 0 {
+            return Ok(None);
         }
+        reader.read_exact(&mut buf[1..])?;
+        let dim_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let block_id = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let impact = buf[8];
+        Ok(Some((dim_id, block_id, impact)))
     }
 
     /// Advance to the next entry.
@@ -814,15 +872,196 @@ pub(crate) fn write_grid_run(
     Ok(())
 }
 
-/// Stream-write grids from multiple sorted run files (external merge sort).
+#[cfg(feature = "native")]
+fn visit_merged_dimension(
+    run_readers: &mut [GridRunReader],
+    dimension: u32,
+    mut visitor: impl FnMut(u32, u8) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut heap: BinaryHeap<Reverse<(u32, u8, usize)>> =
+        BinaryHeap::with_capacity(run_readers.len());
+    for (run, reader) in run_readers.iter().enumerate() {
+        if let Some((dim, block, impact)) = reader.current
+            && dim == dimension
+        {
+            heap.push(Reverse((block, impact, run)));
+        }
+    }
+    while let Some(Reverse((block, impact, run))) = heap.pop() {
+        visitor(block, impact)?;
+        let reader = &mut run_readers[run];
+        reader.advance()?;
+        if let Some((dim, next_block, next_impact)) = reader.current
+            && dim == dimension
+        {
+            heap.push(Reverse((next_block, next_impact, run)));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+struct ProjectedRowEncoder {
+    projection: GridProjection,
+    cells: usize,
+    widths: Vec<u8>,
+    payload: Vec<u8>,
+    values: [u8; GRID_GROUP_CELLS],
+    packed: [u8; GRID_GROUP_CELLS],
+    current_group: Option<usize>,
+    previous_cell: Option<usize>,
+}
+
+#[cfg(feature = "native")]
+impl ProjectedRowEncoder {
+    fn new(
+        projection: GridProjection,
+        cells: usize,
+        groups: usize,
+        payload_capacity: usize,
+    ) -> Self {
+        Self {
+            projection,
+            cells,
+            widths: vec![0; groups],
+            payload: Vec::with_capacity(payload_capacity),
+            values: [0; GRID_GROUP_CELLS],
+            packed: [0; GRID_GROUP_CELLS],
+            current_group: None,
+            previous_cell: None,
+        }
+    }
+
+    fn push(&mut self, block: u32, impact: u8) -> std::io::Result<()> {
+        let (cell, value) = self.projection.project(block, impact);
+        if cell >= self.cells {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "BMP grid cell {cell} exceeds configured cell count {}",
+                    self.cells
+                ),
+            ));
+        }
+        if self.previous_cell.is_some_and(|previous| cell < previous) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP external grid runs are not sorted by block",
+            ));
+        }
+        let group = cell / GRID_GROUP_CELLS;
+        if self.current_group != Some(group) {
+            self.finish_current_group()?;
+            self.values.fill(0);
+            self.current_group = Some(group);
+        }
+        let slot = &mut self.values[cell % GRID_GROUP_CELLS];
+        *slot = (*slot).max(value);
+        self.previous_cell = Some(cell);
+        Ok(())
+    }
+
+    fn finish_current_group(&mut self) -> std::io::Result<()> {
+        let Some(group) = self.current_group else {
+            return Ok(());
+        };
+        let maximum = self.values.iter().copied().max().unwrap_or(0);
+        let width = bit_width(maximum);
+        self.widths[group] = width;
+        let payload_len = pack_group(&self.values, width, &mut self.packed)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.payload.extend_from_slice(&self.packed[..payload_len]);
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        self.finish_current_group()?;
+        Ok((self.widths, self.payload))
+    }
+}
+
+#[cfg(feature = "native")]
+fn write_compressed_grid_section_merged(
+    run_readers: &mut [GridRunReader],
+    num_dims: usize,
+    num_blocks: usize,
+    projection: GridProjection,
+    writer: &mut dyn Write,
+) -> std::io::Result<u64> {
+    let cells = projection.cells(num_blocks);
+    let layout = CompressedGridLayout::new(num_dims, cells);
+    let mut widths = vec![0u8; layout.groups()];
+    let mut row_sizes = Vec::with_capacity(num_dims);
+
+    for dim in 0..num_dims as u32 {
+        widths.fill(0);
+        visit_merged_dimension(run_readers, dim, |block, impact| {
+            let (cell, value) = projection.project(block, impact);
+            if cell >= cells {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("BMP grid cell {cell} exceeds configured cell count {cells}"),
+                ));
+            }
+            let group = cell / GRID_GROUP_CELLS;
+            widths[group] = widths[group].max(bit_width(value));
+            Ok(())
+        })?;
+        row_sizes.push(
+            layout
+                .row_bytes(&widths)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        );
+    }
+    for reader in run_readers.iter() {
+        if let Some((dimension, _, _)) = reader.current {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("BMP grid run dimension {dimension} exceeds configured dims={num_dims}"),
+            ));
+        }
+    }
+
+    for reader in run_readers.iter_mut() {
+        reader.reset()?;
+    }
+    let table_bytes = layout.write_row_offsets(&row_sizes, writer)?;
+    for (dim, &expected_row_size) in (0..num_dims as u32).zip(&row_sizes) {
+        let expected_row_size = usize::try_from(expected_row_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP compressed-grid row exceeds addressable memory",
+            )
+        })?;
+        let payload_capacity = expected_row_size
+            .checked_sub(layout.row_header_bytes())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP compressed-grid row is shorter than its header",
+                )
+            })?;
+        let mut row =
+            ProjectedRowEncoder::new(projection, cells, layout.groups(), payload_capacity);
+        visit_merged_dimension(run_readers, dim, |block, impact| row.push(block, impact))?;
+        let (widths, payload) = row.finish()?;
+        if payload.len() != payload_capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP compressed-grid row size changed between sizing and encoding",
+            ));
+        }
+        layout.write_row_header(&widths, projection.max_width(), writer)?;
+        writer.write_all(&payload)?;
+    }
+    Ok(table_bytes + row_sizes.into_iter().sum::<u64>())
+}
+
+/// Stream-write compressed grids from multiple sorted run files.
 ///
-/// Two-pass approach: first pass writes Section D (packed 4-bit grid),
-/// then resets all readers and second pass writes Section E (superblock grid).
-///
-/// Within each run, entries are sorted by `(dim_id, block_id)`, so for each dim
-/// we drain matching entries from all readers. No heap needed.
-///
-/// Returns `(packed_grid_bytes, sb_grid_bytes)`.
+/// Each section uses one sizing pass and one encoding pass. Encoding buffers at
+/// most one already-compressed row, so peak memory is bounded even when a head
+/// dimension occurs in every block.
 #[cfg(feature = "native")]
 pub(crate) fn stream_write_grids_merged(
     run_readers: &mut [GridRunReader],
@@ -831,69 +1070,24 @@ pub(crate) fn stream_write_grids_merged(
     grid_bits: u8,
     writer: &mut dyn Write,
 ) -> std::io::Result<(u64, u64)> {
-    let packed_row_size = grid_packed_row_size(num_blocks, grid_bits);
-    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
-
-    let mut row_buf = vec![0u8; packed_row_size];
-    let mut sb_row = vec![0u8; num_superblocks];
-
-    // Pass 1: Section D — packed 4-bit grid, one dim row at a time
-    for dim_id in 0..num_dims as u32 {
-        row_buf.fill(0);
-        for reader in run_readers.iter_mut() {
-            while let Some((d, block_id, impact)) = reader.current {
-                if d != dim_id {
-                    break;
-                }
-                let b = block_id as usize;
-                let cell = grid_quantize_ceil(impact, grid_bits);
-                grid_set_cell(&mut row_buf, b, cell, grid_bits);
-                reader.advance()?;
-            }
-        }
-        writer.write_all(&row_buf)?;
-    }
-    let packed_bytes = (num_dims * packed_row_size) as u64;
-
-    // Same silent-drop hazard as `stream_write_grids`: any entry still
-    // pending after the dim sweep has dim_id >= dims and no grid row.
-    for reader in run_readers.iter() {
-        if let Some((dim_id, _, _)) = reader.current {
-            log::warn!(
-                "[bmp] grid run contains entries with dim_id >= dims={num_dims} \
-                 (first dim_id={dim_id}) that were dropped from the block-max grid; \
-                 these dimensions are unsearchable — raise `dims` in the field's \
-                 sparse_vector config and rebuild",
-            );
-            break;
-        }
-    }
-
-    // Reset all readers for pass 2
+    let block_bytes = write_compressed_grid_section_merged(
+        run_readers,
+        num_dims,
+        num_blocks,
+        GridProjection::Block { bits: grid_bits },
+        writer,
+    )?;
     for reader in run_readers.iter_mut() {
         reader.reset()?;
     }
-
-    // Pass 2: Section E — 8-bit superblock grid, one dim row at a time
-    for dim_id in 0..num_dims as u32 {
-        sb_row.fill(0);
-        for reader in run_readers.iter_mut() {
-            while let Some((d, block_id, impact)) = reader.current {
-                if d != dim_id {
-                    break;
-                }
-                let sb = block_id as usize / BMP_SUPERBLOCK_SIZE as usize;
-                if impact > sb_row[sb] {
-                    sb_row[sb] = impact;
-                }
-                reader.advance()?;
-            }
-        }
-        writer.write_all(&sb_row)?;
-    }
-    let sb_bytes = (num_dims * num_superblocks) as u64;
-
-    Ok((packed_bytes, sb_bytes))
+    let superblock_bytes = write_compressed_grid_section_merged(
+        run_readers,
+        num_dims,
+        num_blocks,
+        GridProjection::Superblock,
+        writer,
+    )?;
+    Ok((block_bytes, superblock_bytes))
 }
 
 /// Quantize a weight to u8 (0-255) given the global max scale.
@@ -1039,6 +1233,20 @@ mod tests {
         let fb = &buf[footer_start..];
         let scale = f32::from_le_bytes(fb[48..52].try_into().unwrap());
         assert!((scale - 5.0).abs() < 0.001, "scale={}, expected 5.0", scale);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn grid_run_reader_rejects_a_truncated_final_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("grid-run");
+        std::fs::write(&path, [0u8; GRID_ENTRY_DISK_SIZE + 1]).unwrap();
+
+        let mut reader = GridRunReader::open(&path).unwrap();
+        let error = reader
+            .advance()
+            .expect_err("a partial grid record must not be treated as clean EOF");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

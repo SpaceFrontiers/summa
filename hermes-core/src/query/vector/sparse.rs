@@ -23,14 +23,17 @@ pub struct SparseVectorQuery {
     /// Controls MaxScore pruning aggressiveness in block-max scoring
     pub heap_factor: f32,
     /// Minimum abs(weight) for query dimensions (0.0 = no filtering)
-    /// Dimensions below this threshold are dropped before search.
+    /// Dimensions below this threshold are dropped from candidate generation.
+    /// BMP still uses the bounded full query when scoring visited candidates.
     pub weight_threshold: f32,
-    /// Maximum number of query dimensions to process (None = all)
-    /// Keeps only the top-k dimensions by abs(weight).
+    /// Maximum candidate-generation dimensions (None = implementation cap).
+    /// Keeps only the top-k dimensions by abs(weight); BMP final scoring uses
+    /// up to `MAX_QUERY_TERMS` dimensions from the full query.
     pub max_query_dims: Option<usize>,
     /// Fraction of query dimensions to keep (0.0-1.0), same semantics as
     /// indexing-time `pruning`: sort by abs(weight) descending,
-    /// keep top fraction. None or 1.0 = no pruning.
+    /// keep top fraction. BMP applies it to candidate generation and scores
+    /// visited candidates with the bounded full query. None or 1.0 = no pruning.
     pub pruning: Option<f32>,
     /// Minimum number of query dimensions before pruning and weight_threshold
     /// filtering are applied. Protects short queries from losing signal.
@@ -38,8 +41,8 @@ pub struct SparseVectorQuery {
     pub min_query_dims: usize,
     /// Multiplier on executor limit for ordinal deduplication (1.0 = no over-fetch)
     pub over_fetch_factor: f32,
-    /// Maximum superblocks to visit (LSP/0 gamma cap). 0 = unlimited.
-    pub max_superblocks: usize,
+    /// LSP/0 γ. None is depth-derived; Some(0) is exhaustive.
+    pub lsp_gamma: Option<usize>,
     /// Cached pruned vector; None = use `vector` as-is (no pruning applied)
     pruned: Option<Vec<(u32, f32)>>,
 }
@@ -76,7 +79,7 @@ impl SparseVectorQuery {
             pruning: None,
             min_query_dims: 4,
             over_fetch_factor: DEFAULT_SPARSE_OVER_FETCH_FACTOR,
-            max_superblocks: 0,
+            lsp_gamma: None,
             pruned: None,
         };
         q.pruned = Some(q.compute_pruned_vector());
@@ -186,6 +189,13 @@ impl SparseVectorQuery {
         self
     }
 
+    /// Select at most the top-γ superblocks by SBMax using LSP/0.
+    /// Zero retains exhaustive SBMax-ordered traversal.
+    pub fn with_lsp_gamma(mut self, gamma: usize) -> Self {
+        self.lsp_gamma = Some(gamma);
+        self
+    }
+
     /// Apply weight_threshold, pruning, and max_query_dims, returning the pruned vector.
     fn compute_pruned_vector(&self) -> Vec<(u32, f32)> {
         let original_len = self.vector.len();
@@ -211,11 +221,7 @@ impl SparseVectorQuery {
             && fraction < 1.0
             && v.len() > self.min_query_dims
         {
-            v.sort_unstable_by(|a, b| {
-                b.1.abs()
-                    .partial_cmp(&a.1.abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            v.sort_unstable_by(|a, b| b.1.abs().total_cmp(&a.1.abs()).then_with(|| a.0.cmp(&b.0)));
             sorted_by_weight = true;
             let keep = ((v.len() as f64 * fraction as f64).ceil() as usize).max(1);
             v.truncate(keep);
@@ -232,9 +238,7 @@ impl SparseVectorQuery {
         if v.len() > max_dims {
             if !sorted_by_weight {
                 v.sort_unstable_by(|a, b| {
-                    b.1.abs()
-                        .partial_cmp(&a.1.abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    b.1.abs().total_cmp(&a.1.abs()).then_with(|| a.0.cmp(&b.0))
                 });
             }
             v.truncate(max_dims);
@@ -422,18 +426,37 @@ impl SparseVectorQuery {
 }
 
 impl SparseVectorQuery {
-    /// Build SparseTermQueryInfo decomposition for MaxScore execution.
+    /// Build a bounded full-query decomposition and mark the pruned terms used
+    /// for candidate generation. LSP/BMP scores visited documents with the
+    /// full list; MaxScore continues to consume only marked candidate terms.
     fn sparse_infos(&self) -> Vec<crate::query::SparseTermQueryInfo> {
-        self.pruned_dims()
+        let candidate_dims: rustc_hash::FxHashSet<u32> = self
+            .pruned_dims()
             .iter()
-            .map(|&(dim_id, weight)| crate::query::SparseTermQueryInfo {
+            .map(|&(dimension, _)| dimension)
+            .collect();
+        let mut scoring_dims = self.vector.clone();
+        if scoring_dims.len() > crate::query::MAX_QUERY_TERMS {
+            scoring_dims.sort_unstable_by(|left, right| {
+                right
+                    .1
+                    .abs()
+                    .total_cmp(&left.1.abs())
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            scoring_dims.truncate(crate::query::MAX_QUERY_TERMS);
+        }
+        scoring_dims
+            .into_iter()
+            .map(|(dim_id, weight)| crate::query::SparseTermQueryInfo {
                 field: self.field,
                 dim_id,
                 weight,
+                candidate: candidate_dims.contains(&dim_id),
                 heap_factor: self.heap_factor,
                 combiner: self.combiner,
                 over_fetch_factor: self.over_fetch_factor,
-                max_superblocks: self.max_superblocks,
+                lsp_gamma: self.lsp_gamma,
             })
             .collect()
     }
@@ -653,10 +676,11 @@ impl SparseTermQuery {
             field: self.field,
             dim_id: self.dim_id,
             weight: self.weight,
+            candidate: true,
             heap_factor: self.heap_factor,
             combiner: self.combiner,
             over_fetch_factor: self.over_fetch_factor,
-            max_superblocks: 0,
+            lsp_gamma: None,
         }];
         if let Some((raw, info)) =
             crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, options)
@@ -769,10 +793,11 @@ impl Query for SparseTermQuery {
             field: self.field,
             dim_id: self.dim_id,
             weight: self.weight,
+            candidate: true,
             heap_factor: self.heap_factor,
             combiner: self.combiner,
             over_fetch_factor: self.over_fetch_factor,
-            max_superblocks: 0,
+            lsp_gamma: None,
         }])
     }
 }
@@ -861,6 +886,31 @@ mod tests {
         assert_eq!(query.pruned_dims().len(), crate::query::MAX_QUERY_TERMS);
         // Pruning retains the dimensions with the largest absolute weights.
         assert!(query.pruned_dims().iter().all(|(dim, _)| *dim >= 36));
+    }
+
+    #[test]
+    fn decomposition_keeps_full_scores_and_marks_pruned_candidates() {
+        let query = SparseVectorQuery::new(Field(0), vec![(3, 1.0), (7, 0.8), (11, 0.2)])
+            .with_min_query_dims(0)
+            .with_pruning(0.34);
+        let infos = query.sparse_infos();
+
+        assert_eq!(infos.len(), 3);
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| info.candidate)
+                .map(|info| info.dim_id)
+                .collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert_eq!(
+            infos
+                .iter()
+                .map(|info| (info.dim_id, info.weight))
+                .collect::<Vec<_>>(),
+            vec![(3, 1.0), (7, 0.8), (11, 0.2)]
+        );
     }
 
     #[test]

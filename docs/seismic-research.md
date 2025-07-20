@@ -38,14 +38,16 @@ An _approximate_ sparse index that abandons the document-space grid entirely:
 
 ## Why this matters for Hermes at 1B scale
 
-BMP's grid is O(dims × docs / 2b) — the structure that forces block-size
-compromises and dominates memory (~15 GB per 18M-doc segment today, ~410 GB
-at 1B even with b=64). Seismic's memory is O(kept postings): λ caps every
-list, so the index grows with _vocabulary_, not corpus × dims. That is the
-structurally right shape for 1B vectors. The trade: approximate-only (no
-rank-safe mode), parameter-sensitive, and per-list clustering makes
-incremental merging awkward (blocks must be re-clustered per list — a
-rebuild-style operation like our reorder, not a byte-stack merge).
+BMP's maximum grids are O(dims × vectors / block_size) before V17's local
+bit packing. At 1B vectors, `dims=105879`, `b=32`, and eight blocks per
+superblock, the dense D+E reference is 1.861 TB; actual V17 size is
+data-dependent because zero groups disappear and every 256-cell group uses
+its local width. Seismic's memory is O(kept postings): λ caps every list, so
+the index grows with _vocabulary_, not corpus × dims. That is a structurally
+attractive shape for 1B vectors. The trade: approximate-only (no rank-safe
+mode), parameter-sensitive, and per-list clustering makes incremental
+merging awkward (blocks must be re-clustered per list — a rebuild-style
+operation like our reorder, not a byte-stack merge).
 
 ## Fit with existing Hermes machinery
 
@@ -57,7 +59,7 @@ Most building blocks already exist:
 | α-mass summaries                | `doc_mass` logic (same cropping, applied to a max-vector) |
 | u8 quantization                 | `WeightQuantization::UInt8` + max_weight scale            |
 | shallow k-means                 | shared deterministic k-means++/Lloyd trainer             |
-| forward index for exact scoring | BMP block data is already a forward index                 |
+| forward index for exact scoring | BMP has the same values in block-local Flat-Inv form; a Seismic scorer would need a persistent document-major Fwd layout or an equivalent exact-vector store |
 | heap_factor pruning             | same knob/semantics as BMP/MaxScore                       |
 | kNN graph (Wave)                | could reuse the global dense IVF HNSW topology            |
 
@@ -65,16 +67,17 @@ Sketch: a third `SparseFormat::Seismic` with per-list blocked-cluster layout
 
 - summary section; merge = concat lists then recluster (or block-stack with
   summary rebuild as the cheap path); query executor mirrors the paper's
-  coordinate-at-a-time loop. Estimated scope: comparable to the BMP V13
+  coordinate-at-a-time loop. Estimated scope: comparable to the BMP
   implementation (format + builder + merger + executor + tests).
 
 ## Recommendation
 
-Not a replacement for BMP today — BMP + superblocks + BP reorder is
-rank-safe, merge-friendly, and now well-instrumented. Seismic becomes the
-right tool when (a) corpus per segment pushes the grid past what block-size
-inflation can absorb (≳100M docs/segment territory), or (b) strictly
-approximate retrieval with sub-ms budgets is acceptable product-wide.
+Not a replacement for BMP today — BMP + superblocks + BP reorder supports an
+exhaustive rank-safe mode, remains merge-friendly, and is well-instrumented.
+Seismic becomes the right tool when (a) corpus per segment pushes the grid
+past what local compression and the chosen block size can absorb, or (b)
+strictly approximate retrieval with sub-ms budgets is acceptable
+product-wide.
 Suggested path: prototype behind `format: seismic` on one production-shaped
 segment, compare against BMP at equal recall using the new
 `hermes_bmp_*`/latency metrics before committing to the format.

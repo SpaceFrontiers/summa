@@ -277,6 +277,7 @@ struct IndexConfig {
     query_max_dims: Option<usize>,
     query_pruning: Option<f32>,
     query_min_query_dims: Option<usize>,
+    query_lsp_gamma: Option<usize>,
     // BMP fixed dims (vocabulary size) and max weight scale
     dims: Option<u32>,
     max_weight: Option<f32>,
@@ -478,10 +479,11 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             if let Some(n) = p.into_inner().next() {
                 config.bmp_grid_bits = Some(n.as_str().parse().unwrap_or_else(|_| {
                     log::warn!(
-                        "Invalid bmp_grid_bits value '{}', using default 4",
-                        n.as_str()
+                        "Invalid bmp_grid_bits value '{}', using default {}",
+                        n.as_str(),
+                        SparseVectorConfig::DEFAULT_BMP_GRID_BITS,
                     );
-                    4
+                    SparseVectorConfig::DEFAULT_BMP_GRID_BITS
                 }));
             }
         }
@@ -642,6 +644,18 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                                 t.as_str()
                                             );
                                             4
+                                        }));
+                                }
+                            }
+                            Rule::query_lsp_gamma_kwarg => {
+                                if let Some(value) = p.into_inner().next() {
+                                    config.query_lsp_gamma =
+                                        Some(value.as_str().parse().unwrap_or_else(|_| {
+                                            log::warn!(
+                                                "Invalid query lsp_gamma '{}', using 0",
+                                                value.as_str()
+                                            );
+                                            0
                                         }));
                                 }
                             }
@@ -896,10 +910,11 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
             config.bmp_grid_bits = bits;
         } else {
             log::warn!(
-                "bmp_grid_bits {} unsupported (must be 2 or 4), using 4",
-                bits
+                "bmp_grid_bits {} unsupported (must be 2 or 4), using {}",
+                bits,
+                SparseVectorConfig::DEFAULT_BMP_GRID_BITS,
             );
-            config.bmp_grid_bits = 4;
+            config.bmp_grid_bits = SparseVectorConfig::DEFAULT_BMP_GRID_BITS;
         }
     }
     if let Some(p) = idx_cfg.pruning {
@@ -940,6 +955,7 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         || idx_cfg.query_max_dims.is_some()
         || idx_cfg.query_pruning.is_some()
         || idx_cfg.query_min_query_dims.is_some()
+        || idx_cfg.query_lsp_gamma.is_some()
     {
         let query_config = config
             .query_config
@@ -961,6 +977,9 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         if let Some(m) = idx_cfg.query_min_query_dims {
             query_config.min_query_dims = m;
+        }
+        if let Some(gamma) = idx_cfg.query_lsp_gamma {
+            query_config.lsp_gamma = Some(gamma);
         }
     }
 }
@@ -1631,10 +1650,16 @@ mod tests {
         assert_eq!(config1.bmp_grid_bits, 2);
         // Default stays 4
         let config2 = indexes[0].fields[1].sparse_vector_config.as_ref().unwrap();
-        assert_eq!(config2.bmp_grid_bits, 4);
+        assert_eq!(
+            config2.bmp_grid_bits,
+            SparseVectorConfig::DEFAULT_BMP_GRID_BITS
+        );
         // Unsupported width falls back to 4 with a warning
         let config3 = indexes[0].fields[2].sparse_vector_config.as_ref().unwrap();
-        assert_eq!(config3.bmp_grid_bits, 4);
+        assert_eq!(
+            config3.bmp_grid_bits,
+            SparseVectorConfig::DEFAULT_BMP_GRID_BITS
+        );
     }
 
     #[test]
@@ -2249,7 +2274,7 @@ mod tests {
     fn test_sparse_vector_query_config_pruning_params() {
         let sdl = r#"
             index documents {
-                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<weighting: idf, weight_threshold: 0.03, max_dims: 25, pruning: 0.2>>]
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<weighting: idf, weight_threshold: 0.03, max_dims: 25, pruning: 0.2, lsp_gamma: 500>>]
             }
         "#;
 
@@ -2261,6 +2286,7 @@ mod tests {
         assert!((qc.weight_threshold - 0.03).abs() < 0.001);
         assert_eq!(qc.max_query_dims, Some(25));
         assert!((qc.pruning.unwrap() - 0.2).abs() < 0.001);
+        assert_eq!(qc.lsp_gamma, Some(500));
 
         // Verify schema roundtrip
         let schema = indexes[0].to_schema();
@@ -2271,6 +2297,7 @@ mod tests {
         assert!((rqc.weight_threshold - 0.03).abs() < 0.001);
         assert_eq!(rqc.max_query_dims, Some(25));
         assert!((rqc.pruning.unwrap() - 0.2).abs() < 0.001);
+        assert_eq!(rqc.lsp_gamma, Some(500));
     }
 
     #[test]

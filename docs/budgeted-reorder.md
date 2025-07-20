@@ -20,10 +20,12 @@ converge to full-BP quality.
 `BpBudget` (threaded through every reorder path):
 
 - `min_partition_docs: Option<usize>` — depth cap; stop bisection at
-  partitions of this size. **4096 (= superblock 64 blocks × 64 docs) keeps
-  nearly all of the superblock-pruning win at ~⅓ less depth** — the
-  remaining levels only sharpen intra-superblock block ordering. A depth cap
-  is a chosen target: the pass reports `converged = true`.
+  partitions of this size. **256 (= the default LSP superblock, 8 blocks ×
+  32 vectors) reaches the hierarchy's coarse-pruning unit**; remaining
+  levels only sharpen intra-superblock block ordering. The graph routine
+  completes that chosen target normally; segment metadata deliberately
+  records a depth-capped optimizer pass as `bp_converged = false` so the
+  deepening ladder can later reach full block depth.
 - `time_budget: Option<Duration>` — wall-clock deadline, checked between
   refinement passes and before each recursion (atomic flag across the rayon
   fan-out). Hitting it ends the pass cleanly with `converged = false`.
@@ -39,7 +41,7 @@ cold-IO writer, so at least they no longer evict the cache.
 
 - Segments `< --optimizer-large-segment-docs` (default 5M): full-depth BP.
 - Larger: budgeted pass — depth capped at
-  `--optimizer-partial-min-partition-docs` (default 4096) and wall-clock
+  `--optimizer-partial-min-partition-docs` (default 256) and wall-clock
   capped at `--optimizer-time-budget-secs` (default 600).
 - Unconverged segments (deadline fired) are revisited alongside fresh work,
   with at most one deepening pass active globally. After it completes, the

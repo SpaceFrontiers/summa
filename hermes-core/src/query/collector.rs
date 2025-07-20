@@ -586,6 +586,7 @@ pub async fn collect_segment_with_limit_seeded<C: Collector>(
         collect_positions: collector.needs_positions(),
         initial_threshold,
         shared_threshold: None,
+        lsp_plan: None,
     };
     let mut scorer = query.scorer_with_options(reader, limit, options).await?;
     drive_scorer(scorer.as_mut(), collector);
@@ -661,6 +662,7 @@ pub fn collect_segment_with_limit_seeded_sync<C: Collector>(
         collect_positions: collector.needs_positions(),
         initial_threshold,
         shared_threshold: None,
+        lsp_plan: None,
     };
     let mut scorer = query.scorer_sync_with_options(reader, limit, options)?;
     drive_scorer(scorer.as_mut(), collector);
@@ -706,6 +708,26 @@ pub fn search_segment_shared_sync(
     collect_positions: bool,
     shared_threshold: super::SharedThreshold,
 ) -> Result<(Vec<SearchResult>, u32)> {
+    search_segment_shared_sync_planned(
+        reader,
+        query,
+        limit,
+        collect_positions,
+        shared_threshold,
+        None,
+    )
+}
+
+/// Per-segment search with a live threshold and a query-global LSP/0 plan.
+#[cfg(feature = "sync")]
+pub(crate) fn search_segment_shared_sync_planned(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+    shared_threshold: super::SharedThreshold,
+    lsp_plan: Option<std::sync::Arc<super::bmp::LspSegmentPlan>>,
+) -> Result<(Vec<SearchResult>, u32)> {
     let segment_limit = limit.min(reader.num_docs() as usize);
     let mut collector = if collect_positions {
         TopKCollector::with_positions(segment_limit)
@@ -716,6 +738,7 @@ pub fn search_segment_shared_sync(
         collect_positions,
         initial_threshold: shared_threshold.get(),
         shared_threshold: Some(shared_threshold),
+        lsp_plan,
     };
     let mut scorer = query.scorer_sync_with_options(reader, segment_limit, options)?;
     drive_scorer(scorer.as_mut(), &mut collector);
@@ -755,6 +778,26 @@ pub async fn search_segment_shared(
     collect_positions: bool,
     shared_threshold: super::SharedThreshold,
 ) -> Result<(Vec<SearchResult>, u32)> {
+    search_segment_shared_planned(
+        reader,
+        query,
+        limit,
+        collect_positions,
+        shared_threshold,
+        None,
+    )
+    .await
+}
+
+/// Async per-segment search with a query-global LSP/0 plan.
+pub(crate) async fn search_segment_shared_planned(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+    shared_threshold: super::SharedThreshold,
+    lsp_plan: Option<std::sync::Arc<super::bmp::LspSegmentPlan>>,
+) -> Result<(Vec<SearchResult>, u32)> {
     let segment_limit = limit.min(reader.num_docs() as usize);
     let mut collector = if collect_positions {
         TopKCollector::with_positions(segment_limit)
@@ -765,6 +808,7 @@ pub async fn search_segment_shared(
         collect_positions,
         initial_threshold: shared_threshold.get(),
         shared_threshold: Some(shared_threshold),
+        lsp_plan,
     };
     let mut scorer = query
         .scorer_with_options(reader, segment_limit, options)

@@ -406,8 +406,6 @@ pub async fn heatmap_bmp_grid(
 
     let dims = bmp.dims() as usize;
     let num_blocks = bmp.num_blocks as usize;
-    let packed_row_size = bmp.packed_row_size();
-    let grid = bmp.grid_slice();
 
     // Get terminal size
     let (term_cols, term_rows) = terminal_size();
@@ -427,17 +425,20 @@ pub async fn heatmap_bmp_grid(
 
     for d in 0..dims {
         let row = (d / dim_bin_size).min(actual_rows - 1);
-        let row_base = d * packed_row_size;
-        for b in 0..num_blocks {
-            let col = (b / block_bin_size).min(actual_cols - 1);
-            let byte = grid[row_base + b / 2];
-            let val = if b % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-            if val > 0 {
-                nonzero_cells += 1;
+        bmp.for_each_block_grid_chunk(d as u32, |start, count, values| {
+            total_cells += count as u64;
+            let Some(values) = values else {
+                return;
+            };
+            for (within, &value) in values.iter().enumerate() {
+                let block = start + within;
+                let col = (block / block_bin_size).min(actual_cols - 1);
+                if value > 0 {
+                    nonzero_cells += 1;
+                }
+                heatmap[row][col] = heatmap[row][col].max(value);
             }
-            total_cells += 1;
-            heatmap[row][col] = heatmap[row][col].max(val);
-        }
+        })?;
     }
 
     let sparsity = if total_cells > 0 {

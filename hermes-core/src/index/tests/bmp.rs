@@ -116,6 +116,67 @@ async fn test_bmp_needle_in_haystack() {
     assert_eq!(results.len(), 0);
 }
 
+/// LSP follows the paper's query-pruning split: the pruned terms select
+/// superblocks/blocks, but every visited document is scored with the bounded
+/// full query. Otherwise candidate pruning silently changes final scores and
+/// can reverse the ranking even inside the same selected block.
+#[tokio::test]
+async fn test_bmp_pruned_candidate_query_scores_with_full_query() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let sparse = schema_builder.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        true,
+        SparseVectorConfig {
+            format: SparseFormat::Bmp,
+            weight_quantization: WeightQuantization::UInt8,
+            bmp_block_size: 32,
+            dims: Some(2),
+            max_weight: Some(5.0),
+            ..SparseVectorConfig::default()
+        },
+    );
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    let mut candidate_winner = Document::new();
+    candidate_winner.add_text(title, "candidate-only winner");
+    candidate_winner.add_sparse_vector(sparse, vec![(0, 1.0)]);
+    writer.add_document(candidate_winner).unwrap();
+
+    let mut full_query_winner = Document::new();
+    full_query_winner.add_text(title, "full-query winner");
+    full_query_winner.add_sparse_vector(sparse, vec![(0, 0.9), (1, 5.0)]);
+    writer.add_document(full_query_winner).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let query = SparseVectorQuery::new(sparse, vec![(0, 1.0), (1, 0.9)])
+        .with_min_query_dims(0)
+        .with_pruning(0.5)
+        .with_lsp_gamma(0);
+    assert_eq!(query.pruned_dims(), &[(0, 1.0)]);
+
+    let results = searcher.search(&query, 1).await.unwrap();
+    assert_eq!(results.len(), 1);
+    let document = searcher
+        .doc(results[0].segment_id, results[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        document.get_first(title).unwrap().as_text(),
+        Some("full-query winner")
+    );
+}
+
 /// A live global BMP floor may change traversal work, never the exact top-k.
 /// This also exercises physical single-value detection on many small segments:
 /// each segment should collect `k`, not the sparse query's default `2k`.
@@ -892,6 +953,12 @@ async fn test_bmp_merge_correctness() {
         segments.len() >= 5,
         "Should have >= 5 segments before merge"
     );
+    assert!(
+        segments
+            .iter()
+            .all(|segment| segment.bmp_indexes()[&sparse.0].num_blocks == 2),
+        "100 vectors at block size 64 must use two blocks, without codec-group padding"
+    );
 
     // Force merge
     let mut writer = IndexWriter::open(dir.clone(), config.clone())
@@ -900,7 +967,11 @@ async fn test_bmp_merge_correctness() {
     writer.force_merge().await.unwrap();
 
     let index = Index::open(dir.clone(), config.clone()).await.unwrap();
-    assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+    let merged_segments = index.segment_readers().await.unwrap();
+    assert_eq!(merged_segments.len(), 1);
+    let merged_bmp = &merged_segments[0].bmp_indexes()[&sparse.0];
+    assert_eq!(merged_bmp.num_blocks, (NUM_SEGS * 2) as u32);
+    assert_eq!(merged_bmp.num_virtual_docs, (NUM_SEGS * 2 * 64) as u32);
     assert_eq!(
         index.num_docs().await.unwrap() as usize,
         DOCS_PER_SEG * NUM_SEGS
@@ -956,6 +1027,76 @@ async fn test_bmp_merge_correctness() {
         DOCS_PER_SEG * NUM_SEGS,
         results.len()
     );
+}
+
+/// A source-row group can straddle two output groups when segment block
+/// counts are not 256-aligned. The shifted output group must use the width of
+/// the cells it actually receives, not the maximum width of the whole source
+/// group; otherwise repeated block-copy merges gradually inflate Section D.
+#[tokio::test]
+async fn test_bmp_merge_repacked_group_uses_exact_local_width() {
+    let mut schema_builder = SchemaBuilder::default();
+    let sparse = schema_builder.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        true,
+        SparseVectorConfig {
+            bmp_block_size: 1,
+            dims: Some(2),
+            max_weight: Some(5.0),
+            ..bmp_config()
+        },
+    );
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // One block shifts the following 256-block source by one output cell.
+    let mut prefix = Document::new();
+    prefix.add_sparse_vector(sparse, vec![(1, 1.0)]);
+    writer.add_document(prefix).unwrap();
+    writer.commit().await.unwrap();
+
+    // The source group needs width four because of local block zero, but its
+    // final cell needs only width one.
+    for block in 0..256 {
+        let mut document = Document::new();
+        document.add_sparse_vector(sparse, vec![(0, if block == 0 { 5.0 } else { 0.1 })]);
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert_eq!(segments.len(), 1);
+    let bmp = &segments[0].bmp_indexes()[&sparse.0];
+    assert_eq!(bmp.num_blocks, 257);
+    let grid = bmp.block_grid();
+    assert_eq!(grid.groups(), 2);
+    assert_eq!(grid.group(0, 0).unwrap().width(), 4);
+    assert_eq!(grid.group(0, 1).unwrap().width(), 1);
+
+    let mut decoded = [0u8; crate::segment::bmp_grid::GRID_GROUP_CELLS];
+    grid.group(0, 1).unwrap().decode(0, 1, &mut decoded);
+    assert_eq!(decoded[0], 1);
+
+    // Source 2 starts at output block 1. Its first source superblock therefore
+    // overlaps output superblocks 0 and 1. The pure-copy merge must propagate
+    // its ceil-u4 maximum to both destinations; recomputing only from source
+    // superblock IDs would underestimate output SB 1 and make LSP pruning
+    // unsafe.
+    let superblock_grid = bmp.superblock_grid();
+    assert_eq!(superblock_grid.max_width(), 4);
+    superblock_grid
+        .group(0, 0)
+        .unwrap()
+        .decode(0, 2, &mut decoded);
+    assert_eq!(&decoded[..2], &[15, 15]);
 }
 
 /// BMP merge large: stress test with many blocks and multi-segment merge.
@@ -2173,8 +2314,8 @@ fn bmp_schema_with_config(
     (sb.build(), title, sparse)
 }
 
-/// Block size 256 (the default) must work end-to-end: build, block-copy
-/// merge, BP reorder, and exact search.
+/// The maximum block size 256 must work end-to-end: build, block-copy merge,
+/// BP reorder, and exact search.
 #[tokio::test]
 async fn test_bmp_block_size_256_build_merge_reorder_search() {
     let (schema, _title, sparse) = bmp_schema_with_config(SparseVectorConfig {
@@ -2411,7 +2552,7 @@ async fn test_deepening_pass_on_unconverged_segment_forces_record_level() {
 
 /// Alignment of the depth budget with blockwise BP: `min_partition_docs` is
 /// in DOC units, but blockwise BP entities are BLOCKS — the cap must be
-/// converted (4096 docs = 64 blocks = exactly superblock depth), or the
+/// converted (4096 docs = 64 blocks for this test's 64-vector blocks), or the
 /// optimizer's large-segment cap silently stops blockwise BP above
 /// superblock granularity and the pass becomes an identity no-op.
 #[tokio::test]
@@ -2464,7 +2605,7 @@ async fn test_blockwise_budget_depth_cap_scales_to_block_units() {
     );
     assert_ne!(
         ids_before, ids_after,
-        "a 4096-doc depth cap = superblock depth for blockwise BP — the pass must actually permute blocks"
+        "a document-unit depth cap must be converted to blocks, so the pass actually permutes blocks"
     );
     // Ladder semantics: a pass with a depth floor above block granularity is
     // recorded UNCONVERGED so the optimizer's deepening ladder revisits it
@@ -2690,7 +2831,7 @@ async fn test_bmp_grid_bits_2_exact_parity_and_roundtrip() {
         assert_eq!(readers.len(), 1);
         let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
         assert_eq!(bmp.grid_bits(), grid_bits, "footer must carry grid_bits");
-        grid_sizes.push(bmp.packed_row_size());
+        grid_sizes.push(bmp.block_grid().encoded_bytes());
 
         let reader = index.reader().await.unwrap();
         let searcher = reader.searcher().await.unwrap();
@@ -2722,16 +2863,15 @@ async fn test_bmp_grid_bits_2_exact_parity_and_roundtrip() {
             assert!((a - b).abs() < 1e-3, "score mismatch {a} vs {b}");
         }
     }
-    // 2-bit grid rows are half the 4-bit rows
-    assert_eq!(grid_sizes[1], grid_sizes[0].div_ceil(2));
+    // Selector/checkpoint metadata is shared, so the complete compressed
+    // section is not exactly half-sized; the narrower payload must still win.
+    assert!(grid_sizes[1] < grid_sizes[0]);
 }
 
-/// Regression: blockwise reorder used to write the superblock grid in
-/// GRID-CELL scale (0-15) instead of u8 impact scale (0-255), deflating
-/// superblock UBs ~17× — unsafe pruning (silent recall loss) once the heap
-/// fills. Pin the structural invariant directly: the sb_grid's maximum
-/// value must survive a blockwise pass (builder writes u8 impacts; the
-/// needle dims here have impact ≈51, which the bug collapses to cell 3).
+/// Regression: the superblock grid is ceiling-quantized directly from exact
+/// block-header impacts. A BP/reorder pass must reproduce that same scale,
+/// neither omitting the query-time ×17 multiplier nor quantizing an already
+/// quantized cell a second time.
 #[tokio::test]
 async fn test_blockwise_reorder_preserves_sb_grid_scale() {
     let (schema, _title, sparse) = bmp_schema();
@@ -2748,13 +2888,25 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
         let index = Index::open(dir, config).await.unwrap();
         let readers = index.segment_readers().await.unwrap();
         let bmp = readers[0].bmp_indexes().get(&sparse.0).unwrap();
-        bmp.sb_grid_slice().iter().copied().max().unwrap_or(0)
+        let grid = bmp.superblock_grid();
+        let mut decoded = [0u8; crate::segment::bmp_grid::GRID_GROUP_CELLS];
+        let mut maximum = 0u8;
+        for dimension in 0..grid.dims() {
+            for group_id in 0..grid.groups() {
+                let group = grid.group(dimension, group_id).unwrap();
+                if group.width() == 0 {
+                    continue;
+                }
+                let start = group_id * crate::segment::bmp_grid::GRID_GROUP_CELLS;
+                let count = crate::segment::bmp_grid::GRID_GROUP_CELLS.min(grid.cells() - start);
+                group.decode(0, count, &mut decoded);
+                maximum = maximum.max(decoded[..count].iter().copied().max().unwrap_or(0));
+            }
+        }
+        maximum
     };
     let before = sb_max(dir.clone(), config.clone()).await;
-    assert!(
-        before > 15,
-        "test setup: builder sb_grid must carry u8 impacts (got max {before})"
-    );
+    assert_eq!(before, 3, "test setup: ceil(impact 51 / 17)");
 
     // Blockwise pass (Auto picks Blocks for this corpus — pinned elsewhere)
     let mut writer = IndexWriter::open(dir.clone(), config.clone())
@@ -2766,8 +2918,7 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
     let after = sb_max(dir.clone(), config.clone()).await;
     assert_eq!(
         after, before,
-        "blockwise reorder must preserve sb_grid impact scale (0-255) — \
-         cell-scale values (≤15) deflate superblock UBs ~17× (unsafe pruning)"
+        "blockwise reorder must rebuild the same ceil-u4 bound from exact block headers"
     );
 }
 
@@ -2775,7 +2926,7 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
 /// posting prefix sums at build time (bmp_block_size=256 × ~300-dim docs
 /// hits this in production), silently corrupting the block; the reader's
 /// `end - start` then underflowed into a wild posting slice — SIGSEGV in
-/// the BP forward-index build (optimizer-bp threads). V14 and later store
+/// the BP forward-index build (optimizer-bp threads). The current format stores
 /// num_terms and prefix sums as u32.
 #[tokio::test]
 async fn test_bmp_block_posting_overflow_256() {

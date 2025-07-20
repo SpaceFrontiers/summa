@@ -17,16 +17,16 @@ all.
 Treat each existing block as one entity whose "terms" are its header dim
 list (no posting decode needed):
 
-- BP over `num_blocks` entities (~64× fewer than records) down to
-  `min_partition = superblock_size` — within a superblock, block order is
-  irrelevant to pruning (the executor sorts local blocks by UB at query
-  time), so only superblock _assignment_ matters.
+- BP over `num_blocks` entities (~32× fewer than vectors with the production
+  block size) down to `min_partition = superblock_size` — within a
+  superblock, block order is irrelevant to pruning (the executor sorts local
+  blocks by UB at query time), so only superblock _assignment_ matters.
 - The rewrite is a **permuted block copy**: block bytes verbatim in the new
-  order, `block_data_starts` recomputed, grid rows re-permuted nibble-wise
-  (row-at-a-time streaming, same cost class as the merge's grid pass),
-  `sb_grid` recomputed in the same pass, doc maps copied per 64-entry block
-  chunk (doc-id offsets patched for multi-source). No record unpacking, no
-  per-block hashmaps, no padding changes.
+  order, `block_data_starts` recomputed, compressed grid groups regenerated
+  from exact maxima retained in block headers, `sb_grid` recomputed in the
+  same bounded pass, and document maps copied per block chunk (doc-id offsets
+  patched for multi-source). No record unpacking, no per-block hashmaps, no
+  padding changes.
 
 The row-major grid rewrite is bounded independently of field size: each row
 is spilled and consumed in order instead of retaining `dimensions ×
@@ -81,10 +81,10 @@ Two estimator details:
   ordering signal — and on id-heavy corpora (a unique dim per record) they
   compress the bounds enough to fake "no headroom" and mask real headroom
   in the informative dims.
-- **Large segments are stride-sampled** (cap: 8192 blocks ≈ 512k docs at
-  block_size 64). All aggregates come from the sampled sub-population, so
-  the estimator stays consistent at both extremes; the decision log reports
-  scanned/total blocks.
+- **Large segments are stride-sampled** (cap: 8192 blocks ≈ 262k vectors at
+  the production block size 32). All aggregates come from the sampled
+  sub-population, so the estimator stays consistent at both extremes; the
+  decision log reports scanned/total blocks.
 
 Threshold: `BLOCKWISE_NORM_COHERENCE_THRESHOLD = 0.5`. Every `Auto`
 decision logs `norm`, `d`, `d_rand`, `d_max`, blocks scanned, scan time,
@@ -107,9 +107,10 @@ rules keep them consistent:
   resolves `Records` whenever any source is unconverged.
 - **Depth caps are converted to block units for blockwise BP.**
   `BpBudget::min_partition_docs` is in docs; blockwise BP entities are
-  blocks. Unconverted, the optimizer's large-segment cap (4096 docs) reads
-  as 4096 _blocks_ and stops blockwise BP above superblock depth as a
-  silent no-op. 4096 docs / 64 = 64 blocks = exactly the superblock target.
+  blocks. Unconverted, the optimizer's default large-segment cap (256
+  vectors) would read as 256 _blocks_ and stop blockwise BP above the desired
+  depth as a silent no-op. With the production defaults, 256 / 32 = 8 blocks,
+  exactly one LSP superblock.
 - **Partial record-level output legitimately reads `norm ≈ 0`.** Budgeted
   passes (`min_partition_docs` above block size) leave intra-block order
   random, so Auto keeps routing such segments to record-level until a
@@ -134,8 +135,8 @@ Where Auto applies:
 
 |                  | record-level                    | block-level                           |
 | ---------------- | ------------------------------- | ------------------------------------- |
-| BP entities      | num_records                     | num_blocks (÷64)                      |
-| BP depth target  | block (64 docs)                 | superblock (64 blocks)                |
+| BP entities      | num_records                     | num_blocks (÷32 by default)           |
+| BP depth target  | block (32 vectors by default)   | LSP superblock (8 blocks)             |
 | rewrite          | scatter every record            | permuted memcpy + grid nibble permute |
 | improves         | block UBs + superblock locality | superblock locality only              |
 | interior padding | compacted                       | preserved                             |
