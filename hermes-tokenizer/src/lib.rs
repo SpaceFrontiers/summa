@@ -13,7 +13,7 @@ mod token;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, ensure};
 use parking_lot::Mutex;
@@ -29,7 +29,7 @@ pub const UPSTREAM_GIGATOKEN_REVISION: &str = "542367a3efed134883fb4f1140b49c04e
 /// caches. Token IDs remain those of the source `tokenizer.json`.
 pub struct Tokenizer {
     primary: Mutex<BpeEngine>,
-    workers: Vec<Mutex<BpeEngine>>,
+    workers: OnceLock<Vec<Mutex<BpeEngine>>>,
     pieces: Arc<[Option<String>]>,
     token_to_id: Arc<HashMap<String, u32>>,
     special_ids: Arc<HashSet<u32>>,
@@ -50,13 +50,9 @@ impl Tokenizer {
 
     fn from_loaded(loaded: hf::LoadedTokenizer) -> Result<Self> {
         ensure!(!loaded.pieces.is_empty(), "tokenizer vocabulary is empty");
-        let worker_count = rayon::current_num_threads().max(1);
-        let workers = (0..worker_count)
-            .map(|_| Mutex::new(loaded.engine.fork()))
-            .collect();
         Ok(Self {
             primary: Mutex::new(loaded.engine),
-            workers,
+            workers: OnceLock::new(),
             pieces: loaded.pieces.into(),
             token_to_id: Arc::new(loaded.token_to_id),
             special_ids: Arc::new(loaded.special_ids),
@@ -89,7 +85,7 @@ impl Tokenizer {
             return Ok(Vec::new());
         }
         let total_bytes = texts.iter().map(String::len).sum::<usize>();
-        if self.workers.len() == 1 || total_bytes < 1 << 20 {
+        if rayon::current_num_threads() == 1 || total_bytes < 1 << 20 {
             let mut engine = self.primary.lock();
             return Ok(texts
                 .iter()
@@ -105,13 +101,14 @@ impl Tokenizer {
                 .collect());
         }
 
-        let task_count = self.workers.len() * 4;
+        let workers = self.worker_engines();
+        let task_count = workers.len() * 4;
         let chunk_size = texts.len().div_ceil(task_count).max(1);
         let chunks: Vec<Vec<Vec<u32>>> = texts
             .par_chunks(chunk_size)
             .map(|chunk| {
-                let worker = rayon::current_thread_index().unwrap_or(0) % self.workers.len();
-                let mut engine = self.workers[worker].lock();
+                let worker = rayon::current_thread_index().unwrap_or(0) % workers.len();
+                let mut engine = workers[worker].lock();
                 chunk
                     .iter()
                     .map(|text| {
@@ -127,6 +124,15 @@ impl Tokenizer {
             })
             .collect();
         Ok(chunks.into_iter().flatten().collect())
+    }
+
+    fn worker_engines(&self) -> &[Mutex<BpeEngine>] {
+        self.workers.get_or_init(|| {
+            let engine = self.primary.lock();
+            (0..rayon::current_num_threads().max(1))
+                .map(|_| Mutex::new(engine.fork()))
+                .collect()
+        })
     }
 
     /// Decode IDs through the byte-level vocabulary. Invalid UTF-8 fragments
