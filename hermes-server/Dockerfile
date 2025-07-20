@@ -22,6 +22,7 @@ COPY hermes-core ./hermes-core
 COPY hermes-llm ./hermes-llm
 COPY hermes-mal ./hermes-mal
 COPY hermes-mal-python ./hermes-mal-python
+COPY hermes-tokenizer ./hermes-tokenizer
 COPY hermes-train ./hermes-train
 COPY hermes-server ./hermes-server
 COPY hermes-tool ./hermes-tool
