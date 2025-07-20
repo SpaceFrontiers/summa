@@ -4,6 +4,19 @@
 /// Queries exceeding this limit are trimmed to the top-weighted terms.
 pub const MAX_QUERY_TERMS: usize = 64;
 
+/// Maximum candidate depth relative to the result window.
+///
+/// This is the single query-level oversubscription policy used by fusion,
+/// vector reranking, and request-facing adapters. A caller that already asks
+/// for an expanded result window may explicitly use that window as its
+/// candidate depth; no layer multiplies an explicit depth again.
+pub const MAX_CANDIDATE_OVERSUBSCRIPTION: usize = 2;
+
+/// Largest default candidate pool for a requested result window.
+pub const fn max_candidate_limit(result_window: usize) -> usize {
+    result_window.saturating_mul(MAX_CANDIDATE_OVERSUBSCRIPTION)
+}
+
 mod bm25;
 pub(crate) mod bmp;
 mod boolean;

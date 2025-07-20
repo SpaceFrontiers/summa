@@ -15,10 +15,10 @@ use crate::query::traits::{CountFuture, Query, Scorer, ScorerFuture};
 pub const MAX_DENSE_NPROBE: usize = 65_536;
 
 /// Maximum exact-rerank candidate multiplier accepted by dense search.
-///
-/// Normal deployments use 2-5x. 32x leaves ample room for recall tuning while
-/// bounding the heap and raw-vector buffers derived from the requested top-k.
-pub const MAX_DENSE_RERANK_FACTOR: f32 = 32.0;
+pub const MAX_DENSE_RERANK_FACTOR: f32 = crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32;
+
+/// Default exact-rerank candidate multiplier for dense search.
+pub const DEFAULT_DENSE_RERANK_FACTOR: f32 = MAX_DENSE_RERANK_FACTOR;
 
 /// Dense vector query for similarity search
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub struct DenseVectorQuery {
     pub vector: Vec<f32>,
     /// Number of clusters to probe (for IVF indexes)
     pub nprobe: usize,
-    /// Re-ranking factor (multiplied by k for candidate selection, e.g. 3.0)
+    /// Re-ranking factor multiplied by k for candidate selection (1x to 2x)
     pub rerank_factor: f32,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
@@ -59,7 +59,7 @@ impl DenseVectorQuery {
             field,
             vector,
             nprobe: 64,
-            rerank_factor: 3.0,
+            rerank_factor: DEFAULT_DENSE_RERANK_FACTOR,
             combiner: MultiValueCombiner::Max,
             probe_cache: Arc::new(Mutex::new(None)),
         }
@@ -74,7 +74,7 @@ impl DenseVectorQuery {
         self
     }
 
-    /// Set the re-ranking factor (e.g. 3.0 = fetch 3x candidates for reranking)
+    /// Set the re-ranking factor (e.g. 2.0 = fetch 2x candidates for reranking)
     ///
     /// Values are validated when the query is executed. See
     /// [`MAX_DENSE_RERANK_FACTOR`].
@@ -144,13 +144,11 @@ mod tests {
 
     #[test]
     fn test_dense_vector_query_builder() {
-        let query = DenseVectorQuery::new(Field(0), vec![1.0, 2.0, 3.0])
-            .with_nprobe(64)
-            .with_rerank_factor(5.0);
+        let query = DenseVectorQuery::new(Field(0), vec![1.0, 2.0, 3.0]).with_nprobe(64);
 
         assert_eq!(query.field, Field(0));
         assert_eq!(query.vector.len(), 3);
         assert_eq!(query.nprobe, 64);
-        assert_eq!(query.rerank_factor, 5.0);
+        assert_eq!(query.rerank_factor, 2.0);
     }
 }

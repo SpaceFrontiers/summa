@@ -136,10 +136,7 @@ pub(super) fn prepare_per_field_grouping(
         return None;
     }
 
-    let num_groups = field_groups.len() + non_term_indices.len();
-    let per_field_limit = limit
-        .saturating_mul(num_groups)
-        .min(reader.num_docs() as usize);
+    let per_field_limit = super::max_candidate_limit(limit).min(reader.num_docs() as usize);
     let num_docs = reader.num_docs() as f32;
 
     let mut multi_term_groups = Vec::new();
@@ -172,7 +169,7 @@ const MAX_SPARSE_EXECUTOR_RESULTS: usize = 200_000;
 
 pub(super) fn bounded_sparse_executor_limit(limit: usize, over_fetch_factor: f32) -> usize {
     let factor = if over_fetch_factor.is_finite() && over_fetch_factor >= 1.0 {
-        over_fetch_factor as f64
+        over_fetch_factor.min(super::MAX_CANDIDATE_OVERSUBSCRIPTION as f32) as f64
     } else {
         1.0
     };
@@ -652,6 +649,7 @@ mod tests {
 
     #[test]
     fn bmp_single_value_limit_does_not_overfetch() {
+        assert_eq!(bounded_sparse_executor_limit(320, 99.0), 640);
         assert_eq!(
             bmp_executor_limit_for_counts(320, 2.0, true, 10_000, 10_048),
             320

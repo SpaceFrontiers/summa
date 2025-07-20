@@ -2792,6 +2792,7 @@ mod dense_search_safety_tests {
             f32::NEG_INFINITY,
             0.0,
             0.5,
+            2.01,
             MAX_DENSE_RERANK_FACTOR + 1.0,
         ] {
             assert!(
@@ -2844,8 +2845,8 @@ mod dense_search_safety_tests {
     #[test]
     fn dense_fetch_count_rounds_up_and_detects_overflow() {
         assert_eq!(checked_dense_fetch_k(3, 1.5).unwrap(), 5);
-        assert_eq!(checked_dense_fetch_k(5_000, 3.0).unwrap(), 15_000);
-        assert!(checked_dense_fetch_k(50_000, 3.0).is_err());
+        assert_eq!(checked_dense_fetch_k(10_000, 2.0).unwrap(), 20_000);
+        assert!(checked_dense_fetch_k(10_001, 2.0).is_err());
         assert!(checked_dense_fetch_k(usize::MAX, 2.0).is_err());
     }
 

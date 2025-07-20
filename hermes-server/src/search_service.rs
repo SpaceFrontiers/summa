@@ -17,10 +17,7 @@ use crate::registry::IndexRegistry;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 10_000;
 const MAX_SEARCH_WINDOW: usize = 50_000;
-const MAX_RERANK_CANDIDATES: usize = 50_000;
-const MAX_FUSION_FETCH_LIMIT: usize = 50_000;
-const DEFAULT_RERANK_OVERSUBSCRIPTION: usize = 5;
-const DEFAULT_FUSION_OVERSUBSCRIPTION: usize = 4;
+const MAX_CANDIDATE_LIMIT: usize = 50_000;
 const MAX_FUSION_SUB_QUERIES: usize = hermes_core::query::MAX_FUSION_SUB_QUERIES;
 const MAX_FUSION_CANDIDATE_SLOTS: usize = hermes_core::query::MAX_FUSION_CANDIDATE_SLOTS;
 
@@ -505,20 +502,17 @@ fn validate_search_budget(req: &SearchRequest) -> Result<SearchBudget, Status> {
              (got {offset} + {final_limit} = {search_limit})"
         )));
     }
+    let max_candidate_limit =
+        hermes_core::query::max_candidate_limit(search_limit).min(MAX_CANDIDATE_LIMIT);
 
     let rerank_l1_limit = match &req.reranker {
         Some(reranker) if reranker.limit > 0 => Some(bounded_limit(
             "Reranker.limit",
             reranker.limit,
             search_limit,
-            MAX_RERANK_CANDIDATES,
+            max_candidate_limit,
         )?),
-        Some(_) => Some(
-            search_limit
-                .checked_mul(DEFAULT_RERANK_OVERSUBSCRIPTION)
-                .ok_or_else(|| Status::invalid_argument("Reranker limit is too large"))?
-                .min(MAX_RERANK_CANDIDATES),
-        ),
+        Some(_) => Some(max_candidate_limit),
         None => None,
     };
     if req
@@ -566,19 +560,19 @@ fn validate_search_budget(req: &SearchRequest) -> Result<SearchBudget, Status> {
                 "FusionQuery.fetch_limit",
                 fusion.fetch_limit,
                 fused_limit,
-                MAX_FUSION_FETCH_LIMIT,
+                max_candidate_limit,
             )?
         } else if rerank_l1_limit.is_some() {
-            // The rerank pool is already an oversubscribed candidate budget.
-            // Multiplying it again made a 4× rerank pool become 16× per
-            // fusion branch (and 32× inside multi-value sparse execution).
-            fused_limit.min(MAX_FUSION_FETCH_LIMIT)
+            // The rerank pool is already the shared candidate budget.
+            fused_limit
         } else {
-            search_limit
-                .checked_mul(DEFAULT_FUSION_OVERSUBSCRIPTION)
-                .ok_or_else(|| Status::invalid_argument("Fusion fetch limit is too large"))?
-                .clamp(50, MAX_FUSION_FETCH_LIMIT)
+            max_candidate_limit
         };
+        if fetch_limit < fused_limit {
+            return Err(Status::invalid_argument(format!(
+                "FusionQuery.fetch_limit must be at least the fused result window ({fused_limit})"
+            )));
+        }
 
         let candidate_slots = fetch_limit
             .checked_mul(fusion.queries.len())
@@ -1235,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn search_budget_bounds_default_and_explicit_rerank_depths() {
+    fn search_budget_caps_rerank_depth_at_two_x_the_result_window() {
         let mut ordinary_default = ordinary_request();
         ordinary_default.limit = 300;
         ordinary_default.reranker = Some(Reranker::default());
@@ -1243,7 +1237,7 @@ mod tests {
             validate_search_budget(&ordinary_default)
                 .unwrap()
                 .rerank_l1_limit,
-            Some(1_500)
+            Some(600)
         );
 
         let mut default_req = ordinary_request();
@@ -1253,12 +1247,13 @@ mod tests {
             validate_search_budget(&default_req)
                 .unwrap()
                 .rerank_l1_limit,
-            Some(MAX_RERANK_CANDIDATES)
+            Some(MAX_SEARCH_LIMIT * 2)
         );
 
         let mut excessive_req = ordinary_request();
+        excessive_req.limit = 100;
         excessive_req.reranker = Some(Reranker {
-            limit: (MAX_RERANK_CANDIDATES + 1) as u32,
+            limit: 201,
             ..Default::default()
         });
         let err = validate_search_budget(&excessive_req).unwrap_err();
@@ -1288,27 +1283,23 @@ mod tests {
     }
 
     #[test]
-    fn fusion_budget_accepts_existing_fetch_depth() {
-        let req = fusion_request(2, 4_800);
+    fn fusion_budget_rejects_more_than_two_x_the_result_window() {
+        let mut req = fusion_request(2, 201);
+        req.limit = 100;
 
-        assert_eq!(
-            validate_search_budget(&req).unwrap().fusion_fetch_limit,
-            Some(4_800)
-        );
+        let err = validate_search_budget(&req).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[test]
     fn fusion_default_does_not_multiply_an_existing_rerank_pool() {
         let mut req = fusion_request(2, 0);
-        req.limit = 300;
-        req.reranker = Some(Reranker {
-            limit: 1_200,
-            ..Default::default()
-        });
+        req.limit = 100;
+        req.reranker = Some(Reranker::default());
 
         let budget = validate_search_budget(&req).unwrap();
-        assert_eq!(budget.rerank_l1_limit, Some(1_200));
-        assert_eq!(budget.fusion_fetch_limit, Some(1_200));
+        assert_eq!(budget.rerank_l1_limit, Some(200));
+        assert_eq!(budget.fusion_fetch_limit, Some(200));
     }
 
     #[test]
@@ -1321,13 +1312,15 @@ mod tests {
 
     #[test]
     fn fusion_budget_rejects_excessive_fetch_and_aggregate_work() {
-        let excessive_fetch = fusion_request(2, (MAX_FUSION_FETCH_LIMIT + 1) as u32);
+        let excessive_fetch = fusion_request(2, (MAX_CANDIDATE_LIMIT + 1) as u32);
         assert_eq!(
             validate_search_budget(&excessive_fetch).unwrap_err().code(),
             Code::InvalidArgument
         );
 
-        let excessive_aggregate = fusion_request(5, MAX_FUSION_FETCH_LIMIT as u32);
+        let mut excessive_aggregate = fusion_request(5, MAX_CANDIDATE_LIMIT as u32);
+        excessive_aggregate.limit = MAX_SEARCH_LIMIT as u32;
+        excessive_aggregate.offset = (MAX_SEARCH_WINDOW - MAX_SEARCH_LIMIT) as u32;
         assert_eq!(
             validate_search_budget(&excessive_aggregate)
                 .unwrap_err()
@@ -1343,8 +1336,8 @@ mod tests {
         req.reranker = Some(Reranker::default());
 
         let budget = validate_search_budget(&req).unwrap();
-        assert_eq!(budget.rerank_l1_limit, Some(MAX_RERANK_CANDIDATES));
-        assert_eq!(budget.fusion_fetch_limit, Some(MAX_FUSION_FETCH_LIMIT));
+        assert_eq!(budget.rerank_l1_limit, Some(MAX_SEARCH_LIMIT * 2));
+        assert_eq!(budget.fusion_fetch_limit, Some(MAX_SEARCH_LIMIT * 2));
     }
 
     #[test]

@@ -211,8 +211,14 @@ pub(crate) async fn execute_structured_search<D: Directory>(
             }
         };
 
-        let fused_limit = req.limit + req.offset;
-        let fetch_limit = fusion.fetch_limit.unwrap_or((fused_limit * 4).max(50));
+        let fused_limit = req.limit.saturating_add(req.offset);
+        let max_fetch_limit = hermes_core::query::max_candidate_limit(fused_limit);
+        let fetch_limit = fusion.fetch_limit.unwrap_or(max_fetch_limit);
+        if !(fused_limit..=max_fetch_limit).contains(&fetch_limit) {
+            return Err(JsValue::from_str(&format!(
+                "fusion fetchLimit must be between {fused_limit} and {max_fetch_limit}"
+            )));
+        }
         let refs: Vec<(&dyn Query, f32)> =
             sub_queries.iter().map(|(q, w)| (q.as_ref(), *w)).collect();
         let mut fused = searcher
