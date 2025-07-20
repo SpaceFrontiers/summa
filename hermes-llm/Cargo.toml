@@ -30,8 +30,8 @@ cubecl = { git = "https://github.com/ppodolsky/cubecl.git", rev = "dd61293f47c42
 cubek = { git = "https://github.com/ppodolsky/cubek", rev = "b4fe9788a774c0f5e5af26122776b5bf4c8ee94d", optional = true, default-features = false, features = ["attention", "stdlib"] }
 half = { version = "2", optional = true, default-features = false }
 
-# Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
-tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "fancy-regex"] }
+# Stable-Rust byte-level BPE shared by training and inference.
+hermes-tokenizer = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

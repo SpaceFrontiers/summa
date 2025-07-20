@@ -1,6 +1,6 @@
 use anyhow::Result;
+use hermes_tokenizer::Tokenizer as CoreTokenizer;
 use std::path::Path;
-use tokenizers::Tokenizer as HfTokenizer;
 
 // Training and inference resolve EOS through the same tokenizer wrapper, so
 // the stop/sequence-boundary token cannot drift between executables.
@@ -13,14 +13,14 @@ const EOS_NAMES: &[&str] = &[
 ];
 
 pub struct Tokenizer {
-    inner: HfTokenizer,
+    inner: CoreTokenizer,
     eos_token_id: u32,
 }
 
 impl Tokenizer {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let inner = HfTokenizer::from_file(path).map_err(|e| anyhow::anyhow!("{}", e))?;
-        let vocab_size = inner.get_vocab_size(true);
+        let inner = CoreTokenizer::from_file(path).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        let vocab_size = inner.vocab_size();
         anyhow::ensure!(vocab_size > 0, "tokenizer has an empty vocabulary");
         let resolve = |names: &[&str]| names.iter().find_map(|n| inner.token_to_id(n));
         let eos_token_id = resolve(EOS_NAMES).ok_or_else(|| {
@@ -36,11 +36,9 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
-        let encoding = self
-            .inner
+        self.inner
             .encode(text, add_special_tokens)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        Ok(encoding.get_ids().to_vec())
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
     pub fn encode_batch(
@@ -48,20 +46,15 @@ impl Tokenizer {
         texts: Vec<String>,
         add_special_tokens: bool,
     ) -> Result<Vec<Vec<u32>>> {
-        let encodings = self
-            .inner
+        self.inner
             .encode_batch(texts, add_special_tokens)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        Ok(encodings
-            .into_iter()
-            .map(|encoding| encoding.get_ids().to_vec())
-            .collect())
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.inner
             .decode(ids, skip_special_tokens)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
     /// Vocabulary piece for one token ID, without decoder cleanup. This is
@@ -88,47 +81,10 @@ impl Tokenizer {
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.inner.get_vocab_size(true)
+        self.inner.vocab_size()
     }
 
     pub fn eos_token_id(&self) -> u32 {
         self.eos_token_id
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::byte_level::ByteLevel};
-
-    #[test]
-    fn display_piece_uses_the_configured_byte_level_decoder() {
-        let vocab = [
-            ("<unk>".to_owned(), 0),
-            ("<eos>".to_owned(), 1),
-            ("âĢĻ".to_owned(), 2),
-            ("ĠâĢĶ".to_owned(), 3),
-            ("âĢ¦".to_owned(), 4),
-            ("Ċ".to_owned(), 5),
-        ]
-        .into_iter()
-        .collect();
-        let model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("<unk>".to_owned())
-            .build()
-            .unwrap();
-        let mut inner = HfTokenizer::new(model);
-        inner.with_decoder(Some(ByteLevel::default()));
-        let tokenizer = Tokenizer {
-            inner,
-            eos_token_id: 1,
-        };
-
-        assert_eq!(tokenizer.display_piece(2).unwrap(), "’");
-        assert_eq!(tokenizer.display_piece(3).unwrap(), " —");
-        assert_eq!(tokenizer.display_piece(4).unwrap(), "…");
-        assert_eq!(tokenizer.display_piece(5).unwrap(), "\n");
-        assert_eq!(tokenizer.token_piece(2).unwrap(), "âĢĻ");
     }
 }
