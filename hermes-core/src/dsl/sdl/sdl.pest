@@ -158,9 +158,9 @@ quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
 weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
 block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
 block_size_spec = @{ ASCII_DIGIT+ }
-// BMP block size (docs per block, power of two, max 256; default 64).
+// BMP block size (vectors per block, power of two, max 256; default 32).
 // Uniform across all segments of the field. Grid memory scales as
-// 1/bmp_block_size — large corpora should set 256 (docs/bmp-grid-compression.md).
+// 1/bmp_block_size; larger values coarsen pruning (docs/bmp-grid-compression.md).
 bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
 // Bits per BMP block-grid cell: 4 (default) or 2. 2 halves grid memory at
 // ~zero pruning cost (bounds are ceil-quantized — exactness is unchanged).

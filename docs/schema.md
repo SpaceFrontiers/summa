@@ -363,16 +363,19 @@ The BMP (block-max pruning) format takes additional `indexed<...>` options:
 
 ```
 field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.0,
-    bmp_block_size: 256>, reorder]
+    bmp_block_size: 32, bmp_grid_bits: 4>, reorder]
 ```
 
-- `bmp_block_size` (power of two, max 256; default 64) — docs per BMP
+- `bmp_block_size` (power of two, max 256; default 32) — vectors per BMP
   block, uniform across every segment of the field. The dense 4-bit grid
   is `dims × num_blocks / 2` bytes, so grid memory scales as
-  1/block_size; smaller blocks give finer pruning granularity. Large
-  corpora (10M+ docs at 100k-dim vocabularies) should set 256 — at 50M
-  docs the grid is ~41 GB at block 64 vs ~10 GB at 256. See
-  `docs/bmp-grid-compression.md`.
+  1/block_size; smaller blocks give finer pruning granularity. Multi-valued
+  fields count each ordinal as a vector. Do not increase the block size solely
+- `bmp_grid_bits` (2 or 4; default 4) — bits per block-grid upper bound.
+  Two-bit bounds are ceil-quantized and remain rank-safe, but are looser.
+
+See `docs/bmp-grid-compression.md` for exact current sizes and compression
+research.
 
 ### Quantization and Pruning
 
