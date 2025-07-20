@@ -93,6 +93,29 @@ pub type DocId = u32;
 pub type TermFreq = u32;
 pub type Score = f32;
 
+/// Format a byte count with IEC binary units.
+///
+/// All Hermes user-facing size logs use this formatter so a `MiB` always
+/// means 1,048,576 bytes and the precision is consistent across subsystems.
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Default number of indexing threads (cpu / 4, minimum 1).
 /// Centralized so all configs share one definition.
 #[cfg(feature = "native")]
@@ -111,4 +134,20 @@ pub fn default_search_threads() -> usize {
 #[cfg(feature = "native")]
 pub fn default_compression_threads() -> usize {
     (num_cpus::get() / 4).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn format_bytes_uses_iec_units() {
+        assert_eq!(super::format_bytes(0), "0 B");
+        assert_eq!(super::format_bytes(1023), "1023 B");
+        assert_eq!(super::format_bytes(1024), "1.00 KiB");
+        assert_eq!(super::format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(super::format_bytes(3 * 1024 * 1024 * 1024), "3.00 GiB");
+        assert_eq!(
+            super::format_bytes(2 * 1024 * 1024 * 1024 * 1024),
+            "2.00 TiB"
+        );
+    }
 }

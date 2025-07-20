@@ -416,7 +416,7 @@ impl BmpIndex {
         log::debug!(
             "BMP V17 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
-             block_grid={}B, superblock_grid={}B, single_valued={}, block_data={}B, doc_map={}B",
+             block_grid={}, superblock_grid={}, single_valued={}, block_data={}, doc_map={}",
             num_blocks,
             num_superblocks,
             dims,
@@ -425,11 +425,11 @@ impl BmpIndex {
             num_real_docs,
             max_weight_scale,
             total_postings,
-            block_grid.encoded_bytes(),
-            superblock_grid.encoded_bytes(),
+            crate::format_bytes(block_grid.encoded_bytes() as u64),
+            crate::format_bytes(superblock_grid.encoded_bytes() as u64),
             single_valued,
-            bds_start,
-            num_virtual_docs as usize * 6,
+            crate::format_bytes(bds_start as u64),
+            crate::format_bytes(u64::from(num_virtual_docs) * 6),
         );
 
         Ok(Self {

@@ -112,17 +112,17 @@ impl TrainedVectorStructures {
         let report = pins.report();
         if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
             log::warn!(
-                "[pin] ANN generation: resident {}/{} bytes ({:?}); budget skipped {}, mlock failed {}",
-                report.pinned_bytes,
-                report.intended_bytes,
+                "[pin] ANN generation: resident {}/{} ({:?}); budget skipped {}, mlock failed {}",
+                crate::format_bytes(report.pinned_bytes),
+                crate::format_bytes(report.intended_bytes),
                 policy.mode,
-                report.skipped_budget_bytes,
-                report.failed_bytes,
+                crate::format_bytes(report.skipped_budget_bytes),
+                crate::format_bytes(report.failed_bytes),
             );
         } else if report.pinned_bytes > 0 {
             log::info!(
-                "[pin] ANN generation: pinned {} bytes of routing structures ({:?})",
-                report.pinned_bytes,
+                "[pin] ANN generation: pinned {} of routing structures ({:?})",
+                crate::format_bytes(report.pinned_bytes),
                 policy.mode,
             );
         }

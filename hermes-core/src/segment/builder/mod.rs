@@ -1425,14 +1425,14 @@ impl SegmentBuilder {
         drop(sparse_vectors);
 
         log::info!(
-            "[segment_build] {} docs: term_dict={}, postings={}, store={}, vectors={}, sparse={}, fast={}",
+            "[segment_build] docs={}: term_dict={}, postings={}, store={}, dense_vectors={}, sparse_vectors={}, fast_fields={}",
             num_docs,
-            super::format_bytes(term_dict_bytes),
-            super::format_bytes(postings_bytes),
-            super::format_bytes(store_bytes),
-            super::format_bytes(vectors_bytes),
-            super::format_bytes(sparse_bytes),
-            super::format_bytes(fast_bytes),
+            crate::format_bytes(term_dict_bytes as u64),
+            crate::format_bytes(postings_bytes as u64),
+            crate::format_bytes(store_bytes as u64),
+            crate::format_bytes(vectors_bytes as u64),
+            crate::format_bytes(sparse_bytes as u64),
+            crate::format_bytes(fast_bytes as u64),
         );
 
         let meta = SegmentMeta {

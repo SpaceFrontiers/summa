@@ -184,8 +184,8 @@ impl StreamingWriter for ColdStreamingWriter {
         self.maybe_drop(true);
         crate::observe::cold_write(&self.label, self.written as usize);
         log::debug!(
-            "[cold_io] wrote {:.1} MB with page cache dropped behind the cursor",
-            self.written as f64 / (1024.0 * 1024.0)
+            "[cold_io] wrote {} with page cache dropped behind the cursor",
+            crate::format_bytes(self.written)
         );
         Ok(())
     }

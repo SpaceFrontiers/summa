@@ -901,10 +901,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
                     if b.num_docs() & 0x3FFF == 0 {
                         log::debug!(
-                            "[indexing] docs={}, memory={:.2} MB, budget={:.2} MB",
+                            "[indexing] docs={}, memory={}, budget={}",
                             b.num_docs(),
-                            builder_memory as f64 / (1024.0 * 1024.0),
-                            state.memory_budget_per_worker as f64 / (1024.0 * 1024.0)
+                            crate::format_bytes(builder_memory as u64),
+                            crate::format_bytes(state.memory_budget_per_worker as u64)
                         );
                     }
 
@@ -919,10 +919,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     if builder_memory >= effective_budget && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH {
                         log::info!(
                             "[indexing] memory budget reached, building segment: \
-                             docs={}, memory={:.2} MB, budget={:.2} MB",
+                             docs={}, memory={}, budget={}",
                             b.num_docs(),
-                            builder_memory as f64 / (1024.0 * 1024.0),
-                            state.memory_budget_per_worker as f64 / (1024.0 * 1024.0),
+                            crate::format_bytes(builder_memory as u64),
+                            crate::format_bytes(state.memory_budget_per_worker as u64),
                         );
                         let full_builder = builder.take().unwrap();
                         Self::build_segment_inline(&state, full_builder, &handle);

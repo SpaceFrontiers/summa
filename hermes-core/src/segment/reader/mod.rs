@@ -1029,17 +1029,17 @@ impl SegmentReader {
             )];
             if !vector_indexes.is_empty() || !flat_vectors.is_empty() {
                 parts.push(format!(
-                    "dense: {} ann + {} flat fields",
+                    "dense vectors: {} ANN + {} flat fields",
                     vector_indexes.len(),
                     flat_vectors.len()
                 ));
             }
             for (field_id, idx) in &sparse_indexes {
                 parts.push(format!(
-                    "sparse field {}: {} dims, ~{:.1} KB",
+                    "sparse vector field {}: {} dims, ~{}",
                     field_id,
                     idx.num_dimensions(),
-                    idx.num_dimensions() as f64 * 24.0 / 1024.0
+                    crate::format_bytes(idx.num_dimensions() as u64 * 24)
                 ));
             }
             for (field_id, idx) in &bmp_indexes {
@@ -1126,18 +1126,19 @@ impl SegmentReader {
 
         if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
             log::warn!(
-                "[pin] segment {:016x}: pinned {}/{} bytes (budget skipped {}, mlock failed {}) —                  raise HERMES_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
+                "[pin] segment {:016x}: pinned {}/{} (budget skipped {}, mlock failed {}) — \
+                 raise HERMES_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
                 self.meta.id,
-                report.pinned_bytes,
-                report.intended_bytes,
-                report.skipped_budget_bytes,
-                report.failed_bytes,
+                crate::format_bytes(report.pinned_bytes),
+                crate::format_bytes(report.intended_bytes),
+                crate::format_bytes(report.skipped_budget_bytes),
+                crate::format_bytes(report.failed_bytes),
             );
         } else if report.pinned_bytes > 0 {
             log::info!(
-                "[pin] segment {:016x}: pinned {} bytes of hot metadata ({:?})",
+                "[pin] segment {:016x}: pinned {} of hot metadata ({:?})",
                 self.meta.id,
-                report.pinned_bytes,
+                crate::format_bytes(report.pinned_bytes),
                 policy.mode,
             );
         }
@@ -1438,7 +1439,11 @@ impl SegmentReader {
                             doc.add_binary_dense_vector(Field(field_id), raw);
                         }
                         Err(e) => {
-                            log::warn!("Failed to hydrate binary vector field {}: {}", field_id, e);
+                            log::warn!(
+                                "Failed to hydrate binary dense vector field {}: {}",
+                                field_id,
+                                e
+                            );
                         }
                     }
                 } else {
@@ -1447,7 +1452,7 @@ impl SegmentReader {
                             doc.add_dense_vector(Field(field_id), vec);
                         }
                         Err(e) => {
-                            log::warn!("Failed to hydrate vector field {}: {}", field_id, e);
+                            log::warn!("Failed to hydrate dense vector field {}: {}", field_id, e);
                         }
                     }
                 }
@@ -1921,7 +1926,7 @@ impl SegmentReader {
             // Combine every value of a document before document-level top-k;
             // vector-level top-k loses documents on multi-valued fields.
             log::debug!(
-                "[search_dense] field {}: brute-force on {} vectors (dim={}, quant={:?})",
+                "[dense_vector_search] field {}: brute-force on {} vectors (dim={}, quant={:?})",
                 field.0,
                 lazy_flat.num_vectors,
                 lazy_flat.dim,
@@ -1979,7 +1984,7 @@ impl SegmentReader {
             );
         }
         log::debug!(
-            "[search_dense] field {}: L1 returned {} candidates in {:.1}ms",
+            "[dense_vector_search] field {}: L1 returned {} candidates in {:.1}ms",
             field.0,
             flat_results.as_ref().map_or(results.len(), Vec::len),
             l1_elapsed.as_secs_f64() * 1000.0
@@ -2016,7 +2021,7 @@ impl SegmentReader {
                 stats.vector_count,
             );
             log::debug!(
-                "[search_dense] field {}: rerank {} vectors (dim={}, quant={:?}, {}B/vec): resolve={:.1}ms read={:.1}ms score={:.1}ms",
+                "[dense_vector_search] field {}: rerank {} vectors (dim={}, quant={:?}, bytes_per_vector={}): resolve={:.1}ms read={:.1}ms score={:.1}ms",
                 field.0,
                 stats.vector_count,
                 lazy_flat.dim,
@@ -2028,7 +2033,7 @@ impl SegmentReader {
             );
 
             log::debug!(
-                "[search_dense] field {}: rerank total={:.1}ms",
+                "[dense_vector_search] field {}: rerank total={:.1}ms",
                 field.0,
                 t_rerank.elapsed().as_secs_f64() * 1000.0
             );

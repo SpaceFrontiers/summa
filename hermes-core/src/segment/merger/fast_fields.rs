@@ -145,7 +145,7 @@ impl SegmentMerger {
             "[merge] fast-fields: {} columns, {} docs, {} (raw block stacking)",
             toc_entries.len(),
             total_docs,
-            super::format_bytes(total_bytes)
+            crate::format_bytes(total_bytes as u64)
         );
 
         Ok(total_bytes)

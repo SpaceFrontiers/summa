@@ -124,8 +124,8 @@ impl Drop for HeapPinGuard {
     fn drop(&mut self) {
         if unsafe { libc::munlock(self.page_start, self.page_len) } != 0 {
             log::warn!(
-                "[pin] munlock failed for {} ANN heap bytes: {}",
-                self.page_len,
+                "[pin] munlock failed for {} of ANN heap: {}",
+                crate::format_bytes(self.page_len as u64),
                 std::io::Error::last_os_error()
             );
         }
@@ -177,10 +177,10 @@ impl HeapPinSet {
             self.report.skipped_budget_bytes =
                 self.report.skipped_budget_bytes.saturating_add(len_u64);
             log::debug!(
-                "[pin] ANN budget exhausted: skipping {} ({} bytes, {} remaining)",
+                "[pin] ANN budget exhausted: skipping {} ({}, {} remaining)",
                 label,
-                len_u64,
-                *remaining
+                crate::format_bytes(len_u64),
+                crate::format_bytes(*remaining)
             );
             return;
         }
@@ -225,9 +225,9 @@ impl HeapPinSet {
         } else {
             self.report.failed_bytes = self.report.failed_bytes.saturating_add(len_u64);
             log::warn!(
-                "[pin] mlock failed for ANN {} ({} bytes): {} — check RLIMIT_MEMLOCK/CAP_IPC_LOCK; continuing unpinned",
+                "[pin] mlock failed for ANN {} ({}): {} — check RLIMIT_MEMLOCK/CAP_IPC_LOCK; continuing unpinned",
                 label,
-                len_u64,
+                crate::format_bytes(len_u64),
                 std::io::Error::last_os_error()
             );
         }
@@ -256,10 +256,10 @@ pub(crate) fn pin_section(
     if len > *remaining {
         report.skipped_budget_bytes += len;
         log::debug!(
-            "[pin] budget exhausted: skipping {} ({} bytes, {} remaining)",
+            "[pin] budget exhausted: skipping {} ({}, {} remaining)",
             label,
-            len,
-            *remaining
+            crate::format_bytes(len),
+            crate::format_bytes(*remaining)
         );
         return;
     }
@@ -272,10 +272,10 @@ pub(crate) fn pin_section(
             } else {
                 report.failed_bytes += len;
                 log::warn!(
-                    "[pin] mlock failed for {} ({} bytes) — check RLIMIT_MEMLOCK; \
+                    "[pin] mlock failed for {} ({}) — check RLIMIT_MEMLOCK; \
                      continuing unpinned",
                     label,
-                    len
+                    crate::format_bytes(len)
                 );
             }
         }

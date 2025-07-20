@@ -392,26 +392,26 @@ impl<D: Directory + 'static> Searcher<D> {
             let seg_total = stats.total_bytes();
             total_mem += seg_total;
             log::info!(
-                "[searcher] segment {:016x}: docs={}, mem={:.2} MB \
-                 (term_dict={:.2} MB, store={:.2} MB, sparse={:.2} MB, dense={:.2} MB, bloom={:.2} MB)",
+                "[searcher] segment {:016x}: docs={}, estimated_memory={} \
+                 (term_dict={}, store={}, sparse_vectors={}, dense_vectors={}, bloom={})",
                 stats.segment_id,
                 stats.num_docs,
-                seg_total as f64 / (1024.0 * 1024.0),
-                stats.term_dict_cache_bytes as f64 / (1024.0 * 1024.0),
-                stats.store_cache_bytes as f64 / (1024.0 * 1024.0),
-                stats.sparse_index_bytes as f64 / (1024.0 * 1024.0),
-                stats.dense_index_bytes as f64 / (1024.0 * 1024.0),
-                stats.bloom_filter_bytes as f64 / (1024.0 * 1024.0),
+                crate::format_bytes(seg_total as u64),
+                crate::format_bytes(stats.term_dict_cache_bytes as u64),
+                crate::format_bytes(stats.store_cache_bytes as u64),
+                crate::format_bytes(stats.sparse_index_bytes as u64),
+                crate::format_bytes(stats.dense_index_bytes as u64),
+                crate::format_bytes(stats.bloom_filter_bytes as u64),
             );
         }
         // Log process RSS if available (helps diagnose OOM)
-        let rss_mb = process_rss_mb();
+        let rss_bytes = process_rss_bytes();
         log::info!(
-            "[searcher] loaded {} segments: total_docs={}, estimated_mem={:.2} MB, process_rss={:.1} MB",
+            "[searcher] loaded {} segments: total_docs={}, estimated_memory={}, process_rss={}",
             segments.len(),
             total_docs,
-            total_mem as f64 / (1024.0 * 1024.0),
-            rss_mb,
+            crate::format_bytes(total_mem as u64),
+            crate::format_bytes(rss_bytes),
         );
 
         Ok(segments)
@@ -1232,25 +1232,25 @@ fn checked_search_window(limit: usize, offset: usize) -> Result<usize> {
         .ok_or_else(|| crate::Error::Query("search offset + limit overflow".into()))
 }
 
-/// Get current process RSS in MB (best-effort, returns 0.0 on failure)
-fn process_rss_mb() -> f64 {
+/// Get current process RSS in bytes (best-effort, returns zero on failure).
+fn process_rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         // Read from /proc/self/status — VmRSS line
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    let kb: f64 = rest
+                    let kib: u64 = rest
                         .trim()
                         .trim_end_matches("kB")
                         .trim()
                         .parse()
-                        .unwrap_or(0.0);
-                    return kb / 1024.0;
+                        .unwrap_or(0);
+                    return kib.saturating_mul(1024);
                 }
             }
         }
-        0.0
+        0
     }
     #[cfg(target_os = "macos")]
     {
@@ -1281,15 +1281,11 @@ fn process_rss_mb() -> f64 {
                 &mut count,
             )
         };
-        if ret == 0 {
-            info.resident_size as f64 / (1024.0 * 1024.0)
-        } else {
-            0.0
-        }
+        if ret == 0 { info.resident_size } else { 0 }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        0.0
+        0
     }
 }
 

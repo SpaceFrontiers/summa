@@ -261,14 +261,14 @@ impl RemoteIndex {
             if let Some(directory) = &self.directory {
                 let stats = directory.inner().http_stats();
                 log::debug!(
-                    "=== SEARCH END: {} requests, {} bytes ===",
+                    "=== SEARCH END: {} requests, {} ===",
                     stats.total_requests,
-                    stats.total_bytes
+                    hermes_core::format_bytes(stats.total_bytes)
                 );
                 for op in &stats.operations {
                     log::debug!(
-                        "  HTTP: {} bytes, {}ms, range={:?}, url={}",
-                        op.bytes,
+                        "  HTTP: {}, {}ms, range={:?}, url={}",
+                        hermes_core::format_bytes(op.bytes),
                         op.duration_ms,
                         op.range,
                         op.url

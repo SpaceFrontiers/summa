@@ -565,8 +565,8 @@ pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> 
     use hermes_core::{DirectoryWriter, SLICE_CACHE_FILENAME, SliceCachingDirectory};
 
     info!(
-        "Opening index with slice caching (max {} bytes)...",
-        cache_size
+        "Opening index with slice caching (max {})...",
+        hermes_core::format_bytes(cache_size as u64)
     );
 
     let dir = FsDirectory::new(&index_path);
@@ -583,8 +583,10 @@ pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> 
 
     let stats = index.directory().stats();
     info!(
-        "Cache populated: {} bytes in {} slices across {} files",
-        stats.total_bytes, stats.total_slices, stats.files_cached
+        "Cache populated: {} in {} slices across {} files",
+        hermes_core::format_bytes(stats.total_bytes as u64),
+        stats.total_slices,
+        stats.files_cached
     );
 
     // Serialize cache data
@@ -595,8 +597,9 @@ pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> 
     let cache_file_size = std::fs::metadata(&cache_file).map(|m| m.len()).unwrap_or(0);
 
     info!(
-        "Slice cache saved to {:?} ({} bytes)",
-        cache_file, cache_file_size
+        "Slice cache saved to {:?} ({})",
+        cache_file,
+        hermes_core::format_bytes(cache_file_size)
     );
 
     Ok(())

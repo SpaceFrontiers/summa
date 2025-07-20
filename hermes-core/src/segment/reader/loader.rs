@@ -614,8 +614,8 @@ pub async fn load_sparse_file<D: Directory>(
     }
 
     log::debug!(
-        "Loading sparse: size={} bytes, num_fields={}, skip_offset={}, toc_offset={}",
-        file_size,
+        "Loading sparse vectors: size={}, num_fields={}, skip_offset={}, toc_offset={}",
+        crate::format_bytes(file_size),
         num_fields,
         skip_offset,
         toc_offset,
@@ -722,7 +722,7 @@ pub async fn load_sparse_file<D: Directory>(
             ) {
                 Ok(idx) => {
                     log::debug!(
-                        "Loaded BMP index for field {}: dims={}, num_blocks={}, total_vectors={}",
+                        "Loaded BMP sparse vector index for field {}: dims={}, num_blocks={}, total_vectors={}",
                         field_id,
                         idx.dims(),
                         idx.num_blocks,
@@ -797,11 +797,11 @@ pub async fn load_sparse_file<D: Directory>(
             }
 
             log::debug!(
-                "Loaded sparse index for field {}: num_dims={}, total_vectors={}, skip_bytes={}",
+                "Loaded sparse vector index for field {}: num_dims={}, total_vectors={}, skip={}",
                 field_id,
                 dims.len(),
                 total_vectors,
-                skip_section.len(),
+                crate::format_bytes(skip_section.len() as u64),
             );
 
             maxscore_indexes.insert(

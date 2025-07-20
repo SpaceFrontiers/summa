@@ -292,7 +292,7 @@ impl SegmentMerger {
                 })?;
 
             log::debug!(
-                "[merge] sparse field {}: {} unique dims across {} segments, total_vectors={}",
+                "[sparse_vector_merge] field {}: {} unique dims across {} segments, total_vectors={}",
                 field.0,
                 all_dims.len(),
                 segments.len(),
@@ -500,8 +500,8 @@ impl SegmentMerger {
 
         let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
         log::info!(
-            "[merge_sparse] file written: {:.2} MB ({} fields, {} dims, {} skip entries)",
-            output_size as f64 / (1024.0 * 1024.0),
+            "[sparse_vector_merge] file written: {} ({} fields, {} dims, {} skip entries)",
+            crate::format_bytes(output_size as u64),
             field_tocs.len(),
             total_dims,
             skip_count,

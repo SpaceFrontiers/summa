@@ -314,9 +314,9 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         max_dims.saturating_mul(std::mem::size_of::<std::sync::atomic::AtomicU32>());
     if frequency_bytes > memory_budget_bytes.saturating_sub(jobs_bytes) {
         log::warn!(
-            "[reorder] memory budget {:.0} MB cannot hold the {:.0} MB dimension-frequency table; using identity order",
-            memory_budget_bytes as f64 / (1024.0 * 1024.0),
-            frequency_bytes as f64 / (1024.0 * 1024.0),
+            "[reorder] memory budget {} cannot hold the {} dimension-frequency table; using identity order",
+            crate::format_bytes(memory_budget_bytes as u64),
+            crate::format_bytes(frequency_bytes as u64),
         );
         return (
             ForwardIndex {
@@ -443,9 +443,9 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         budget_limited |= dropped > 0;
 
         log::warn!(
-            "[reorder] memory budget {:.0} MB: estimated {:.0} MB, dropped {} highest-df dims, keeping {} ({} postings)",
-            memory_budget_bytes as f64 / (1024.0 * 1024.0),
-            estimated_bytes as f64 / (1024.0 * 1024.0),
+            "[reorder] memory budget {}: estimated {}, dropped {} highest-df dims, keeping {} ({} postings)",
+            crate::format_bytes(memory_budget_bytes as u64),
+            crate::format_bytes(estimated_bytes as u64),
             dropped,
             keep_count,
             cum,
