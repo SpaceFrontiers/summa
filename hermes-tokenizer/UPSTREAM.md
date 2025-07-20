@@ -7,7 +7,7 @@ pretokenizers under `src/bpe/` and `src/pretokenize/` were extracted from
 
 The extraction removes the Python bindings, CLI, file/data-source layer,
 tokenizer trainer, reference pretokenizers, network loading, and SentencePiece
-engine. The latter is the only extracted source path that required nightly
+engine. SentencePiece is the only upstream path that required nightly
 `portable_simd`; the retained byte-level BPE path builds on Hermes' stable Rust
 toolchain. `src/hf.rs`, the public wrapper in `src/lib.rs`, and the differential
 tests are Hermes integration code.
