@@ -921,8 +921,8 @@ unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
             let e = &BIT_POS[b];
             let base = rel.wrapping_add(8 * j as u16);
             // Fixed 8-lane copy: autovectorizes to one 16-byte store.
-            for t in 0..8 {
-                out.add(w + t).write(e[t].wrapping_add(base));
+            for (t, &offset) in e.iter().enumerate() {
+                out.add(w + t).write(offset.wrapping_add(base));
             }
         }
     }
