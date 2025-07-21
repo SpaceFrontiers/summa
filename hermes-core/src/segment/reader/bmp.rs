@@ -831,6 +831,7 @@ impl BmpIndex {
     /// The footer is the source of truth for reading this blob. Rewriting with
     /// a different block width, grid width, vocabulary, or impact scale would
     /// otherwise make block slicing or copied upper bounds invalid.
+    #[cfg(any(feature = "native", test))]
     pub(crate) fn validate_rewrite_layout(
         &self,
         context: &str,
@@ -922,6 +923,7 @@ impl BmpIndex {
     /// iterators. Query parsing deliberately degrades malformed blocks to
     /// empty for availability; a rewrite must instead fail loudly so it never
     /// publishes silent data loss or indexes an invalid local slot.
+    #[cfg(any(feature = "native", test))]
     pub(crate) fn validate_block_for_rewrite(&self, block_id: u32) -> crate::Result<()> {
         if block_id >= self.num_blocks {
             return Err(crate::Error::Corruption(format!(

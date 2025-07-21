@@ -36,11 +36,21 @@ fn term_degree_bytes(num_terms: usize) -> usize {
 /// for every posting. Workers own private tables, and the number of tables is
 /// capped by the caller's remaining memory budget. A single plain table is
 /// used when the budget cannot afford useful parallelism.
-fn count_frequencies_bounded<T: Sync>(
+#[cfg(feature = "native")]
+trait FrequencyParallelSafe: Sync {}
+#[cfg(feature = "native")]
+impl<T: Sync + ?Sized> FrequencyParallelSafe for T {}
+
+#[cfg(not(feature = "native"))]
+trait FrequencyParallelSafe {}
+#[cfg(not(feature = "native"))]
+impl<T: ?Sized> FrequencyParallelSafe for T {}
+
+fn count_frequencies_bounded<T: FrequencyParallelSafe>(
     items: &[T],
     num_terms: usize,
     available_bytes: usize,
-    count_item: impl Fn(&T, &mut [u32]) + Sync,
+    count_item: impl Fn(&T, &mut [u32]) + FrequencyParallelSafe,
 ) -> Option<Vec<u32>> {
     if num_terms == 0 {
         return Some(Vec::new());
@@ -1199,7 +1209,7 @@ fn partition_by_gain(
     ranked_scratch: &mut [usize],
 ) -> PartitionOutcome {
     #[cfg(not(feature = "native"))]
-    let _ = &movement_workspaces;
+    let _ = (fwd, &movement_workspaces);
 
     #[cfg(feature = "native")]
     if !movement_workspaces.is_empty() && docs.len() >= PARALLEL_BP_MIN_ENTITIES {
