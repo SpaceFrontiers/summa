@@ -44,6 +44,7 @@ pub const BLOOM_BITS_PER_KEY: usize = 10;
 
 /// Bloom filter hash count (optimal for 10 bits/key)
 pub const BLOOM_HASH_COUNT: usize = 7;
+const BLOOM_FILTER_HEADER_SIZE: usize = 16;
 
 const MAX_SSTABLE_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SSTABLE_DICTIONARY_BYTES: u64 = 16 * 1024 * 1024;
@@ -114,9 +115,38 @@ impl BloomBits {
             BloomBits::Bytes(b) => b.len(),
         }
     }
+
+    fn write_to(&self, writer: &mut (impl Write + ?Sized)) -> io::Result<()> {
+        match self {
+            BloomBits::Vec(words) => {
+                #[cfg(target_endian = "little")]
+                {
+                    // SAFETY: u64 has no padding and the native byte order is
+                    // the on-disk little-endian order.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            words.as_ptr().cast::<u8>(),
+                            words.len().saturating_mul(8),
+                        )
+                    };
+                    writer.write_all(bytes)
+                }
+                #[cfg(target_endian = "big")]
+                {
+                    for &word in words {
+                        writer.write_u64::<LittleEndian>(word)?;
+                    }
+                    Ok(())
+                }
+            }
+            BloomBits::Bytes(bytes) => writer.write_all(bytes.as_slice()),
+        }
+    }
 }
 
 impl BloomFilter {
+    pub(crate) const SERIALIZED_HEADER_SIZE: usize = BLOOM_FILTER_HEADER_SIZE;
+
     /// Create a new bloom filter sized for expected number of keys
     pub fn new(expected_keys: usize, bits_per_key: usize) -> Self {
         let num_bits = expected_keys.saturating_mul(bits_per_key).max(64);
@@ -132,18 +162,24 @@ impl BloomFilter {
     /// Unlike `from_owned_bytes`, this copies data into a `Vec<u64>` so that
     /// `insert()` works. Used by the primary-key bloom cache.
     pub fn from_bytes_mutable(data: &[u8]) -> io::Result<Self> {
-        if data.len() < 12 {
+        if data.len() < BLOOM_FILTER_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Bloom filter data too short",
             ));
         }
-        let num_bits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let num_hashes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-        let num_words = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let num_bits = usize::try_from(u64::from_le_bytes(data[0..8].try_into().unwrap()))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Bloom filter bit count exceeds addressable memory",
+                )
+            })?;
+        let num_hashes = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let num_words = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
 
         validate_bloom_header(data.len(), num_bits, num_hashes, num_words)?;
-        let expected_len = 12 + num_words * 8;
+        let expected_len = BLOOM_FILTER_HEADER_SIZE + num_words * 8;
         if data.len() != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -153,7 +189,7 @@ impl BloomFilter {
 
         let mut vec = vec![0u64; num_words];
         for (i, v) in vec.iter_mut().enumerate() {
-            let off = 12 + i * 8;
+            let off = BLOOM_FILTER_HEADER_SIZE + i * 8;
             *v = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
         }
 
@@ -166,19 +202,25 @@ impl BloomFilter {
 
     /// Create from serialized OwnedBytes (zero-copy for mmap)
     pub fn from_owned_bytes(data: OwnedBytes) -> io::Result<Self> {
-        if data.len() < 12 {
+        if data.len() < BLOOM_FILTER_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Bloom filter data too short",
             ));
         }
         let d = data.as_slice();
-        let num_bits = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize;
-        let num_hashes = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
-        let num_words = u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
+        let num_bits =
+            usize::try_from(u64::from_le_bytes(d[0..8].try_into().unwrap())).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Bloom filter bit count exceeds addressable memory",
+                )
+            })?;
+        let num_hashes = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
+        let num_words = u32::from_le_bytes(d[12..16].try_into().unwrap()) as usize;
 
         validate_bloom_header(d.len(), num_bits, num_hashes, num_words)?;
-        let expected_len = 12 + num_words * 8;
+        let expected_len = BLOOM_FILTER_HEADER_SIZE + num_words * 8;
         if d.len() != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -186,8 +228,9 @@ impl BloomFilter {
             ));
         }
 
-        // Slice past the 12-byte header to get raw u64 LE words (zero-copy)
-        let bits_bytes = data.slice(12..12 + num_words * 8);
+        // Slice past the header to get raw u64 LE words (zero-copy).
+        let bits_bytes =
+            data.slice(BLOOM_FILTER_HEADER_SIZE..BLOOM_FILTER_HEADER_SIZE + num_words * 8);
 
         Ok(Self {
             bits: BloomBits::Bytes(bits_bytes),
@@ -196,18 +239,23 @@ impl BloomFilter {
         })
     }
 
-    /// Serialize to bytes
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// Serialized header + word bytes.
+    pub fn serialized_len(&self) -> usize {
+        BLOOM_FILTER_HEADER_SIZE + self.bits.len() * 8
+    }
+
+    /// Stream the serialized representation without an intermediate buffer.
+    pub fn write_to(&self, writer: &mut (impl Write + ?Sized)) -> io::Result<()> {
         let num_words = self.bits.len();
-        let mut data = Vec::with_capacity(12 + num_words * 8);
-        data.write_u32::<LittleEndian>(self.num_bits as u32)
-            .unwrap();
-        data.write_u32::<LittleEndian>(self.num_hashes as u32)
-            .unwrap();
-        data.write_u32::<LittleEndian>(num_words as u32).unwrap();
-        for i in 0..num_words {
-            data.write_u64::<LittleEndian>(self.bits.get(i)).unwrap();
-        }
+        write_bloom_header(writer, self.num_bits, self.num_hashes, num_words)?;
+        self.bits.write_to(writer)
+    }
+
+    /// Serialize to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(self.serialized_len());
+        self.write_to(&mut data)
+            .expect("writing a bloom filter to Vec cannot fail");
         data
     }
 
@@ -241,7 +289,7 @@ impl BloomFilter {
 
     /// Size in bytes
     pub fn size_bytes(&self) -> usize {
-        12 + self.bits.size_bytes()
+        BLOOM_FILTER_HEADER_SIZE + self.bits.size_bytes()
     }
 
     /// Insert a pre-computed hash pair into the filter
@@ -277,6 +325,33 @@ impl BloomFilter {
     }
 }
 
+fn write_bloom_header(
+    writer: &mut (impl Write + ?Sized),
+    num_bits: usize,
+    num_hashes: usize,
+    num_words: usize,
+) -> io::Result<()> {
+    writer.write_u64::<LittleEndian>(u64::try_from(num_bits).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bloom filter bit count exceeds u64",
+        )
+    })?)?;
+    writer.write_u32::<LittleEndian>(u32::try_from(num_hashes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bloom filter hash count exceeds u32",
+        )
+    })?)?;
+    writer.write_u32::<LittleEndian>(u32::try_from(num_words).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bloom filter word count exceeds u32",
+        )
+    })?)?;
+    Ok(())
+}
+
 fn validate_bloom_header(
     data_len: usize,
     num_bits: usize,
@@ -292,7 +367,7 @@ fn validate_bloom_header(
     let word_bytes = num_words
         .checked_mul(8)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow"))?;
-    let expected_len = 12usize
+    let expected_len = BLOOM_FILTER_HEADER_SIZE
         .checked_add(word_bytes)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow"))?;
     let capacity_bits = num_words
@@ -1008,10 +1083,9 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
 
         // Write bloom filter if present
         let bloom_offset = if let Some(ref bloom) = bloom_filter {
-            let bloom_data = bloom.to_bytes();
             let offset = self.current_offset;
-            self.writer.write_all(&bloom_data)?;
-            self.current_offset += bloom_data.len() as u64;
+            bloom.write_to(&mut self.writer)?;
+            self.current_offset += bloom.serialized_len() as u64;
             offset
         } else {
             0
@@ -1257,8 +1331,9 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             } else {
                 footer_start
             };
-            // Read bloom filter size first (12 bytes header)
-            let bloom_header_end = bloom_start.checked_add(12).ok_or_else(|| {
+            // Read the canonical header first to determine the payload size.
+            let header_size = BloomFilter::SERIALIZED_HEADER_SIZE as u64;
+            let bloom_header_end = bloom_start.checked_add(header_size).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "bloom filter range overflow")
             })?;
             if bloom_header_end > bloom_end {
@@ -1271,14 +1346,14 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 .read_bytes_range(bloom_start..bloom_header_end)
                 .await?;
             let num_words = u32::from_le_bytes([
-                bloom_header[8],
-                bloom_header[9],
-                bloom_header[10],
-                bloom_header[11],
+                bloom_header[12],
+                bloom_header[13],
+                bloom_header[14],
+                bloom_header[15],
             ]) as u64;
             let bloom_size = num_words
                 .checked_mul(8)
-                .and_then(|bytes| bytes.checked_add(12))
+                .and_then(|bytes| bytes.checked_add(header_size))
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "bloom filter size overflow")
                 })?;
@@ -1985,6 +2060,18 @@ mod tests {
         assert!(restored.may_contain(b"key1"));
         assert!(restored.may_contain(b"key2"));
         assert!(!restored.may_contain(b"key3"));
+    }
+
+    #[test]
+    fn bloom_header_preserves_bit_counts_above_u32() {
+        let num_bits = u32::MAX as usize + 1;
+        let mut header = Vec::new();
+        write_bloom_header(&mut header, num_bits, BLOOM_HASH_COUNT, 1).unwrap();
+        assert_eq!(header.len(), BLOOM_FILTER_HEADER_SIZE);
+        assert_eq!(
+            u64::from_le_bytes(header[0..8].try_into().unwrap()),
+            num_bits as u64
+        );
     }
 
     #[test]

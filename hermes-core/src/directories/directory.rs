@@ -526,6 +526,16 @@ pub trait Directory: Send + Sync + 'static {
     /// forward to their inner directory. Default: no-op (directories that
     /// emit no Directory-layer metrics, e.g. RamDirectory).
     fn set_index_label(&self, _label: &str) {}
+
+    /// Resolve a directory-relative file to a native filesystem path.
+    ///
+    /// Local backends expose this so large, short-lived merge scratch files
+    /// can live beside the index instead of silently spilling to the
+    /// container's root filesystem. Remote and in-memory backends return
+    /// `None`.
+    fn local_path(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Async directory trait for reading index files (WASM version - no Send requirement)
@@ -553,6 +563,11 @@ pub trait Directory: 'static {
     /// Attach the owning index's name for Directory-layer metric labels.
     /// No-op default; metrics are native-only but the label is harmless.
     fn set_index_label(&self, _label: &str) {}
+
+    /// WASM backends do not expose a native filesystem path.
+    fn local_path(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A writer for incrementally writing data to a directory file.
@@ -969,6 +984,10 @@ impl Directory for FsDirectory {
     fn set_index_label(&self, label: &str) {
         self.label.set(label);
     }
+
+    fn local_path(&self, path: &Path) -> Option<PathBuf> {
+        Some(self.resolve(path))
+    }
 }
 
 #[cfg(feature = "native")]
@@ -1121,6 +1140,10 @@ impl<D: Directory> Directory for CachingDirectory<D> {
 
     fn set_index_label(&self, label: &str) {
         self.inner.set_index_label(label);
+    }
+
+    fn local_path(&self, path: &Path) -> Option<PathBuf> {
+        self.inner.local_path(path)
     }
 }
 

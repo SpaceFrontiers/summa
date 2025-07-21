@@ -530,6 +530,21 @@ impl SparseIndex {
         self.dims.dim_ids.iter().copied()
     }
 
+    /// Iterate dimension counts already resident in the compact SoA table.
+    ///
+    /// Merge admission uses this to aggregate format capacities without
+    /// binary-searching the same dimension back into this table.
+    #[cfg(feature = "native")]
+    pub(crate) fn dimension_counts(&self) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+        self.dims
+            .dim_ids
+            .iter()
+            .copied()
+            .zip(self.dims.doc_counts.iter().copied())
+            .zip(self.dims.skip_counts.iter().copied())
+            .map(|((dimension, docs), blocks)| (dimension, docs, blocks))
+    }
+
     /// Get doc count for dimension (from SoA table, no I/O)
     pub fn doc_count(&self, dim_id: u32) -> u32 {
         self.dims

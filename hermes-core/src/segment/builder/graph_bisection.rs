@@ -22,12 +22,169 @@ const MIN_OBJECTIVE_ITERATIONS: usize = 4;
 const OBJECTIVE_STALL_ITERATIONS: usize = 2;
 
 fn term_degree_bytes(num_terms: usize) -> usize {
+    let bitmap_words = num_terms.div_ceil(64);
     num_terms
         .saturating_mul(TERM_DEGREE_VALUE_BYTES)
-        .saturating_add(num_terms.div_ceil(64).saturating_mul(8))
+        .saturating_add(bitmap_words.saturating_mul(std::mem::size_of::<u64>()))
+        // A reusable lane remembers only bitmap words touched by its previous
+        // partition, so reset is proportional to active terms rather than the
+        // complete vocabulary.
+        .saturating_add(bitmap_words.saturating_mul(std::mem::size_of::<u32>()))
 }
 
-fn parallel_bisect_depth(
+/// Count a dense vocabulary without a cache-line-contended atomic increment
+/// for every posting. Workers own private tables, and the number of tables is
+/// capped by the caller's remaining memory budget. A single plain table is
+/// used when the budget cannot afford useful parallelism.
+fn count_frequencies_bounded<T: Sync>(
+    items: &[T],
+    num_terms: usize,
+    available_bytes: usize,
+    count_item: impl Fn(&T, &mut [u32]) + Sync,
+) -> Option<Vec<u32>> {
+    if num_terms == 0 {
+        return Some(Vec::new());
+    }
+    let table_bytes = num_terms
+        .checked_mul(std::mem::size_of::<u32>())?
+        .checked_add(std::mem::size_of::<Vec<u32>>())?;
+    let affordable_tables = available_bytes.checked_div(table_bytes)?;
+    if affordable_tables == 0 {
+        return None;
+    }
+
+    #[cfg(feature = "native")]
+    {
+        let lanes = affordable_tables
+            .min(rayon::current_num_threads().max(1))
+            .min(items.len().max(1));
+        if lanes > 1 {
+            let chunk_len = items.len().div_ceil(lanes);
+            return items
+                .par_chunks(chunk_len)
+                .map(|chunk| {
+                    let mut counts = vec![0u32; num_terms];
+                    for item in chunk {
+                        count_item(item, &mut counts);
+                    }
+                    counts
+                })
+                .reduce_with(|mut left, right| {
+                    for (total, count) in left.iter_mut().zip(right) {
+                        *total = total.saturating_add(count);
+                    }
+                    left
+                });
+        }
+    }
+
+    let mut counts = vec![0u32; num_terms];
+    for item in items {
+        count_item(item, &mut counts);
+    }
+    Some(counts)
+}
+
+/// Retain the lowest-frequency eligible dimensions while the frequency table
+/// is live. Both record- and block-level builders use the same bounded policy.
+fn select_frequency_candidates(
+    frequencies: &[u32],
+    min_frequency: usize,
+    max_frequency: usize,
+    candidate_budget_bytes: usize,
+) -> (Vec<(u32, usize)>, bool) {
+    let eligible_count = frequencies
+        .iter()
+        .filter(|&&frequency| {
+            let frequency = frequency as usize;
+            frequency >= min_frequency && frequency <= max_frequency
+        })
+        .count();
+    let capacity = candidate_budget_bytes
+        .checked_div(CANDIDATE_ENTRY_BYTES)
+        .unwrap_or(0)
+        .min(eligible_count);
+    let mut candidates = std::collections::BinaryHeap::with_capacity(capacity);
+    for (term_id, &frequency) in frequencies.iter().enumerate() {
+        let frequency = frequency as usize;
+        if frequency < min_frequency || frequency > max_frequency {
+            continue;
+        }
+        let candidate = (frequency, term_id as u32);
+        if candidates.len() < capacity {
+            candidates.push(candidate);
+        } else if capacity > 0 && candidate < *candidates.peek().unwrap() {
+            candidates.pop();
+            candidates.push(candidate);
+        }
+    }
+    let selected = candidates
+        .into_vec()
+        .into_iter()
+        .map(|(frequency, term_id)| (term_id, frequency))
+        .collect();
+    (selected, capacity < eligible_count)
+}
+
+struct CandidateFit {
+    estimated_bytes: usize,
+    retained_postings: usize,
+    dropped: usize,
+}
+
+/// Apply the shared forward-index memory model, preferring low-frequency
+/// dimensions because they add the least CSR storage and the strongest
+/// clustering signal.
+fn fit_candidates_to_budget(
+    candidates: &mut Vec<(u32, usize)>,
+    fixed_bytes: usize,
+    memory_budget_bytes: usize,
+) -> CandidateFit {
+    let total_postings = candidates.iter().fold(0usize, |total, (_, frequency)| {
+        total.saturating_add(*frequency)
+    });
+    let estimated_bytes = total_postings
+        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_add(fixed_bytes)
+        .saturating_add(candidates.len().saturating_mul(CANDIDATE_ENTRY_BYTES))
+        .saturating_add(term_degree_bytes(candidates.len()));
+    if estimated_bytes <= memory_budget_bytes || candidates.is_empty() {
+        return CandidateFit {
+            estimated_bytes,
+            retained_postings: total_postings,
+            dropped: 0,
+        };
+    }
+
+    candidates.sort_by_key(|&(_, frequency)| frequency);
+    let mut used_bytes = fixed_bytes;
+    let mut retained_postings = 0usize;
+    let mut keep = 0usize;
+    for &(_, frequency) in candidates.iter() {
+        let term_bytes = frequency
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(TERM_DEGREE_VALUE_BYTES + 1)
+            .saturating_add(CANDIDATE_ENTRY_BYTES);
+        if term_bytes > memory_budget_bytes.saturating_sub(used_bytes) {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(term_bytes);
+        retained_postings = retained_postings.saturating_add(frequency);
+        keep += 1;
+    }
+    let dropped = candidates.len() - keep;
+    candidates.truncate(keep);
+    // BinaryHeap::into_vec retains its original capacity. Release dropped
+    // candidates before allocating the remap, CSR, and graph scratch.
+    candidates.shrink_to_fit();
+    CandidateFit {
+        estimated_bytes,
+        retained_postings,
+        dropped,
+    }
+}
+
+fn parallel_bisect_lanes(
     memory_budget_bytes: usize,
     non_degree_bytes: usize,
     num_terms: usize,
@@ -42,7 +199,7 @@ fn parallel_bisect_depth(
     let worker_limit = rayon::current_num_threads().max(1);
     #[cfg(not(feature = "native"))]
     let worker_limit = 1usize;
-    affordable_nodes.min(worker_limit).ilog2() as usize
+    affordable_nodes.min(worker_limit)
 }
 
 /// Per-partition left/right term degrees with direct compact-term indexing.
@@ -55,16 +212,31 @@ fn parallel_bisect_depth(
 struct TermDegrees {
     values: Vec<std::mem::MaybeUninit<[u32; 2]>>,
     initialized: Vec<u64>,
+    touched_words: Vec<u32>,
 }
 
 impl TermDegrees {
     fn new(num_terms: usize) -> Self {
+        let bitmap_words = num_terms.div_ceil(64);
         let mut values = Vec::with_capacity(num_terms);
         values.resize_with(num_terms, std::mem::MaybeUninit::uninit);
         Self {
             values,
-            initialized: vec![0; num_terms.div_ceil(64)],
+            initialized: vec![0; bitmap_words],
+            touched_words: Vec::with_capacity(bitmap_words),
         }
+    }
+
+    /// Reuse this vocabulary-sized lane for another partition without
+    /// clearing the complete initialization bitmap.
+    fn reset(&mut self) {
+        for word in self.touched_words.drain(..) {
+            self.initialized[word as usize] = 0;
+        }
+    }
+
+    fn sort_touched_words(&mut self) {
+        self.touched_words.sort_unstable();
     }
 
     #[inline]
@@ -72,6 +244,9 @@ impl TermDegrees {
         let word = term / 64;
         let mask = 1u64 << (term % 64);
         if self.initialized[word] & mask == 0 {
+            if self.initialized[word] == 0 {
+                self.touched_words.push(word as u32);
+            }
             self.values[term].write([0, 0]);
             self.initialized[word] |= mask;
         }
@@ -92,8 +267,9 @@ impl TermDegrees {
     }
 
     fn merge_from(&mut self, other: &Self) {
-        for (word_idx, &initialized) in other.initialized.iter().enumerate() {
-            let mut pending = initialized;
+        for &word_idx in &other.touched_words {
+            let word_idx = word_idx as usize;
+            let mut pending = other.initialized[word_idx];
             while pending != 0 {
                 let bit = pending.trailing_zeros() as usize;
                 let term = word_idx * 64 + bit;
@@ -102,6 +278,40 @@ impl TermDegrees {
                 let entry = self.entry_mut(term);
                 entry[0] += left;
                 entry[1] += right;
+                pending &= pending - 1;
+            }
+        }
+    }
+
+    /// Apply directional movement counts accumulated in a reusable lane.
+    ///
+    /// Each entry is `[right_to_left, left_to_right]`. Keeping two unsigned
+    /// counters lets partition workers reuse the exact same storage as degree
+    /// construction instead of allocating a separate signed delta table.
+    fn apply_moves_to(&self, degrees: &mut Self) {
+        for &word_idx in &self.touched_words {
+            let word_idx = word_idx as usize;
+            let mut pending = self.initialized[word_idx];
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                // SAFETY: `pending` is derived from the initialized bitmap.
+                let [right_to_left, left_to_right] =
+                    unsafe { *self.values[term].assume_init_ref() };
+                debug_assert!(
+                    degrees.initialized[word_idx] & (1u64 << bit) != 0,
+                    "a moved term must already exist in the partition degrees"
+                );
+                let degree = degrees.entry_mut(term);
+                let new_left =
+                    i64::from(degree[0]) + i64::from(right_to_left) - i64::from(left_to_right);
+                let new_right =
+                    i64::from(degree[1]) + i64::from(left_to_right) - i64::from(right_to_left);
+                debug_assert!(new_left >= 0 && new_right >= 0);
+                debug_assert!(new_left <= i64::from(u32::MAX));
+                debug_assert!(new_right <= i64::from(u32::MAX));
+                degree[0] = new_left as u32;
+                degree[1] = new_right as u32;
                 pending &= pending - 1;
             }
         }
@@ -119,8 +329,9 @@ impl TermDegrees {
             fast_log2_lookup(left_size, log_table) as f64,
             fast_log2_lookup(right_size, log_table) as f64,
         ];
-        for (word_idx, &initialized) in self.initialized.iter().enumerate() {
-            let mut pending = initialized;
+        for &word_idx in &self.touched_words {
+            let word_idx = word_idx as usize;
+            let mut pending = self.initialized[word_idx];
             while pending != 0 {
                 let bit = pending.trailing_zeros() as usize;
                 let term = word_idx * 64 + bit;
@@ -140,75 +351,6 @@ impl TermDegrees {
     }
 }
 
-/// Per-term change to the left degree. The right change is its negation
-/// because every moved document leaves one side and enters the other.
-///
-/// This uses the same lazy dense representation as [`TermDegrees`]. Parallel
-/// partition workers therefore pay one vocabulary-sized allocation each, but
-/// the number of workers is carved from the existing degree-array memory
-/// allowance rather than multiplying the configured BP budget.
-struct TermDeltas {
-    values: Vec<std::mem::MaybeUninit<i64>>,
-    initialized: Vec<u64>,
-}
-
-impl TermDeltas {
-    fn new(num_terms: usize) -> Self {
-        let mut values = Vec::with_capacity(num_terms);
-        values.resize_with(num_terms, std::mem::MaybeUninit::uninit);
-        Self {
-            values,
-            initialized: vec![0; num_terms.div_ceil(64)],
-        }
-    }
-
-    #[inline]
-    fn entry_mut(&mut self, term: usize) -> &mut i64 {
-        let word = term / 64;
-        let mask = 1u64 << (term % 64);
-        if self.initialized[word] & mask == 0 {
-            self.values[term].write(0);
-            self.initialized[word] |= mask;
-        }
-        // SAFETY: the bit above is set only after writing this exact slot.
-        unsafe { self.values[term].assume_init_mut() }
-    }
-
-    fn merge_from(&mut self, other: &Self) {
-        for (word_idx, &initialized) in other.initialized.iter().enumerate() {
-            let mut pending = initialized;
-            while pending != 0 {
-                let bit = pending.trailing_zeros() as usize;
-                let term = word_idx * 64 + bit;
-                // SAFETY: `pending` is derived from the initialized bitmap.
-                let delta = unsafe { *other.values[term].assume_init_ref() };
-                *self.entry_mut(term) += delta;
-                pending &= pending - 1;
-            }
-        }
-    }
-
-    fn apply_to(&self, degrees: &mut TermDegrees) {
-        for (word_idx, &initialized) in self.initialized.iter().enumerate() {
-            let mut pending = initialized;
-            while pending != 0 {
-                let bit = pending.trailing_zeros() as usize;
-                let term = word_idx * 64 + bit;
-                // SAFETY: `pending` is derived from the initialized bitmap.
-                let delta = unsafe { *self.values[term].assume_init_ref() };
-                let degree = degrees.entry_mut(term);
-                let new_left = degree[0] as i64 + delta;
-                let new_right = degree[1] as i64 - delta;
-                debug_assert!(new_left >= 0 && new_right >= 0);
-                debug_assert!(new_left <= u32::MAX as i64 && new_right <= u32::MAX as i64);
-                degree[0] = new_left as u32;
-                degree[1] = new_right as u32;
-                pending &= pending - 1;
-            }
-        }
-    }
-}
-
 // ── Forward index (CSR) ──────────────────────────────────────────────────
 
 /// Forward index in CSR format: doc `d`'s terms are `terms[offsets[d]..offsets[d+1]]`.
@@ -222,10 +364,10 @@ pub(crate) struct ForwardIndex {
     /// by dropping dims below the u32 limit.
     offsets: Vec<u64>,
     pub num_terms: usize,
-    /// Maximum recursion depth at which both children may own a vocabulary-
-    /// sized degree array concurrently. Deeper partitions still use Rayon for
-    /// gain computation, but recurse serially to honor the memory budget.
-    parallel_bisect_depth: usize,
+    /// Exact number of simultaneous vocabulary-sized degree-array lanes
+    /// allowed by the memory budget. Recursion divides this allowance between
+    /// children without rounding non-power-of-two worker pools down.
+    parallel_bisect_lanes: usize,
     /// True when the configured memory limit forced graph signal to be
     /// discarded. Callers must not report the resulting order as fully
     /// converged: a later pass with a larger budget may still improve it.
@@ -288,28 +430,11 @@ pub(crate) fn build_vid_maps(
     let expected_real = bmp.num_real_docs() as usize;
     let mut virtual_to_real = vec![u32::MAX; num_virtual];
     let mut real_to_virtual = Vec::with_capacity(expected_real);
-    for (vid, (slot, chunk)) in virtual_to_real
-        .iter_mut()
-        .zip(ids.as_chunks::<4>().0)
-        .enumerate()
-    {
-        let doc_id = u32::from_le_bytes(*chunk);
-        if doc_id != u32::MAX {
-            if real_to_virtual.len() == expected_real {
-                return Err(crate::Error::Corruption(format!(
-                    "BMP document map contains more than the footer's {expected_real} real slots"
-                )));
-            }
-            *slot = real_to_virtual.len() as u32;
-            real_to_virtual.push(vid as u32);
-        }
-    }
-    if real_to_virtual.len() != expected_real {
-        return Err(crate::Error::Corruption(format!(
-            "BMP document map has {} real slots but footer declares {expected_real}",
-            real_to_virtual.len(),
-        )));
-    }
+    debug_assert_eq!(ids.len(), virtual_to_real.len() * 4);
+    bmp.visit_real_slots_for_rewrite(|vid| {
+        virtual_to_real[vid] = real_to_virtual.len() as u32;
+        real_to_virtual.push(vid as u32);
+    })?;
     Ok((virtual_to_real, real_to_virtual))
 }
 
@@ -362,7 +487,7 @@ fn build_block_jobs(
 /// Documents are identified by dense *real* indices assigned sequentially
 /// across sources: source 0 gets 0..n0, source 1 gets n0..n0+n1, etc., where
 /// each n is the source's real (non-padding) doc count derived from its doc
-/// map via [`build_vid_maps`]. Returns `(forward_index, per_source_real_doc_counts)`.
+/// map via [`build_vid_maps`].
 ///
 /// Filters dims with doc_freq outside `[min_doc_freq, max_doc_freq]`.
 /// If the estimated forward index memory exceeds `memory_budget_bytes`, the
@@ -376,7 +501,7 @@ pub(crate) fn build_forward_index_from_bmps(
     min_doc_freq: usize,
     max_doc_freq: usize,
     memory_budget_bytes: usize,
-) -> crate::Result<(ForwardIndex, Vec<usize>)> {
+) -> crate::Result<ForwardIndex> {
     let vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmps
         .iter()
         .map(|bmp| build_vid_maps(bmp))
@@ -399,22 +524,18 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     min_doc_freq: usize,
     max_doc_freq: usize,
     memory_budget_bytes: usize,
-) -> (ForwardIndex, Vec<usize>) {
+) -> ForwardIndex {
     debug_assert_eq!(bmps.len(), vid_maps.len());
-    let source_doc_counts: Vec<usize> = vid_maps.iter().map(|(_, r2v)| r2v.len()).collect();
-    let total_docs: usize = source_doc_counts.iter().sum();
+    let total_docs: usize = vid_maps.iter().map(|(_, r2v)| r2v.len()).sum();
 
     if total_docs == 0 {
-        return (
-            ForwardIndex {
-                terms: Vec::new(),
-                offsets: Vec::new(),
-                num_terms: 0,
-                parallel_bisect_depth: 0,
-                budget_limited: false,
-            },
-            source_doc_counts,
-        );
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+            parallel_bisect_lanes: 1,
+            budget_limited: false,
+        };
     }
 
     // Job list: one entry per (source, block). Real ids are assigned in
@@ -423,9 +544,9 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     // parallel, writing disjoint slices.
     let jobs = build_block_jobs(bmps, vid_maps);
 
-    // Phase 1: count doc frequency in one dense atomic table. The previous
-    // Rayon fold built a vocabulary-sized hash map per worker before the
-    // budget check, multiplying peak memory by the CPU count.
+    // Phase 1: count document frequencies in bounded worker-local tables.
+    // Shared atomics made popular dimensions a cache-coherence bottleneck;
+    // private dense tables avoid that while retaining an exact memory cap.
     let max_dims = bmps
         .iter()
         .map(|bmp| bmp.dims() as usize)
@@ -434,145 +555,89 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     let jobs_bytes = jobs
         .len()
         .saturating_mul(std::mem::size_of::<BlockJob>().saturating_add(40));
-    let frequency_bytes =
-        max_dims.saturating_mul(std::mem::size_of::<std::sync::atomic::AtomicU32>());
+    let frequency_bytes = max_dims.saturating_mul(std::mem::size_of::<u32>());
     if frequency_bytes > memory_budget_bytes.saturating_sub(jobs_bytes) {
         log::warn!(
             "[reorder] memory budget {} cannot hold the {} dimension-frequency table; using identity order",
             crate::format_bytes(memory_budget_bytes as u64),
             crate::format_bytes(frequency_bytes as u64),
         );
-        return (
-            ForwardIndex {
-                terms: Vec::new(),
-                offsets: Vec::new(),
-                num_terms: 0,
-                parallel_bisect_depth: 0,
-                budget_limited: true,
-            },
-            source_doc_counts,
-        );
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+            parallel_bisect_lanes: 1,
+            budget_limited: true,
+        };
     }
-    let dim_df: Vec<std::sync::atomic::AtomicU32> = (0..max_dims)
-        .map(|_| std::sync::atomic::AtomicU32::new(0))
-        .collect();
-    let count_block_df = |job: &BlockJob| {
-        let bmp = bmps[job.src as usize];
-        let (v2r, _) = &vid_maps[job.src as usize];
-        let block_size = bmp.bmp_block_size as usize;
-        for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
-            let mut n = 0usize;
-            for p in postings {
-                let vid = job.block_id as usize * block_size + p.local_slot as usize;
-                if v2r[vid] != u32::MAX && p.impact > 0 {
-                    n += 1;
+    let Some(dim_df) = count_frequencies_bounded(
+        &jobs,
+        max_dims,
+        memory_budget_bytes.saturating_sub(jobs_bytes),
+        |job, counts| {
+            let bmp = bmps[job.src as usize];
+            let (v2r, _) = &vid_maps[job.src as usize];
+            let block_size = bmp.bmp_block_size as usize;
+            for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
+                let mut frequency = 0u32;
+                for posting in postings {
+                    let vid = job.block_id as usize * block_size + posting.local_slot as usize;
+                    if v2r.get(vid).is_some_and(|&real| real != u32::MAX) && posting.impact > 0 {
+                        frequency = frequency.saturating_add(1);
+                    }
+                }
+                if frequency > 0
+                    && let Some(total) = counts.get_mut(dim_id as usize)
+                {
+                    *total = total.saturating_add(frequency);
                 }
             }
-            if n > 0
-                && let Some(count) = dim_df.get(dim_id as usize)
-            {
-                count.fetch_add(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        },
+    ) else {
+        log::warn!(
+            "[reorder] memory budget {} cannot hold a bounded dimension-frequency table; using identity order",
+            crate::format_bytes(memory_budget_bytes as u64),
+        );
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+            parallel_bisect_lanes: 1,
+            budget_limited: true,
+        };
     };
-    #[cfg(feature = "native")]
-    jobs.par_iter().for_each(count_block_df);
-    #[cfg(not(feature = "native"))]
-    jobs.iter().for_each(count_block_df);
 
     // Retain the lowest-frequency candidates in a bounded heap while the
     // frequency table is live. This makes candidate discovery itself obey the
     // configured limit even for extremely large vocabularies.
-    let eligible_candidate_count = dim_df
-        .iter()
-        .filter(|df| {
-            let df = df.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            df >= min_doc_freq && df <= max_doc_freq
-        })
-        .count();
-    let candidate_capacity = memory_budget_bytes
-        .saturating_sub(jobs_bytes)
-        .saturating_sub(frequency_bytes)
-        .checked_div(std::mem::size_of::<(usize, u32)>())
-        .unwrap_or(0)
-        .min(eligible_candidate_count);
-    let mut candidate_heap = std::collections::BinaryHeap::with_capacity(candidate_capacity);
-    for (dim_id, df) in dim_df.iter().enumerate() {
-        let df = df.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        if df < min_doc_freq || df > max_doc_freq {
-            continue;
-        }
-        let candidate = (df, dim_id as u32);
-        if candidate_heap.len() < candidate_capacity {
-            candidate_heap.push(candidate);
-        } else if candidate_capacity > 0 && candidate < *candidate_heap.peek().unwrap() {
-            candidate_heap.pop();
-            candidate_heap.push(candidate);
-        }
-    }
+    let (mut eligible, mut budget_limited) = select_frequency_candidates(
+        &dim_df,
+        min_doc_freq,
+        max_doc_freq,
+        memory_budget_bytes
+            .saturating_sub(jobs_bytes)
+            .saturating_sub(frequency_bytes),
+    );
     drop(dim_df);
-    let mut eligible: Vec<(u32, usize)> = candidate_heap
-        .into_vec()
-        .into_iter()
-        .map(|(df, dim_id)| (dim_id, df))
-        .collect();
-    let mut budget_limited = eligible.len() < eligible_candidate_count;
 
     // Memory budget: estimate forward index + bisection scratch.
     // Includes jobs/slice descriptors, dense remap, all per-document scratch,
     // and at least one exact TermDegrees allocation.
-    let total_postings_est = eligible
-        .iter()
-        .fold(0usize, |total, (_, df)| total.saturating_add(*df));
     let entity_scratch_bytes = total_docs.saturating_mul(32);
     let remap_bytes = max_dims.saturating_mul(4);
     let fixed_bytes = entity_scratch_bytes
         .saturating_add(remap_bytes)
         .saturating_add(jobs_bytes);
-    let estimated_bytes = total_postings_est
-        .saturating_mul(4)
-        .saturating_add(fixed_bytes)
-        // Candidate metadata coexists with the dense remap until construction
-        // starts; omitting it let a huge rare-term vocabulary exceed the cap.
-        .saturating_add(eligible.len().saturating_mul(CANDIDATE_ENTRY_BYTES))
-        .saturating_add(term_degree_bytes(eligible.len()));
-
-    if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
-        // Sort by df ascending — keep discriminative low-df dims first,
-        // drop highest-df dims which contribute the most postings.
-        eligible.sort_by_key(|&(_, df)| df);
-
-        // Account for each retained term together with its postings. The old
-        // calculation charged the eight-byte degree slot for every candidate
-        // before deciding how many to retain; a large rare-term vocabulary
-        // could therefore make the target zero even when a useful subset fit.
-        let mut used_bytes = fixed_bytes;
-        let mut cum = 0usize;
-        let mut keep_count = 0;
-        for &(_, df) in &eligible {
-            let term_bytes = df
-                .saturating_mul(4)
-                .saturating_add(TERM_DEGREE_VALUE_BYTES + 1)
-                .saturating_add(CANDIDATE_ENTRY_BYTES);
-            if term_bytes > memory_budget_bytes.saturating_sub(used_bytes) {
-                break;
-            }
-            used_bytes = used_bytes.saturating_add(term_bytes);
-            cum = cum.saturating_add(df);
-            keep_count += 1;
-        }
-
-        let dropped = eligible.len() - keep_count;
-        eligible.truncate(keep_count);
-        budget_limited |= dropped > 0;
-
+    let fit = fit_candidates_to_budget(&mut eligible, fixed_bytes, memory_budget_bytes);
+    if fit.dropped > 0 {
+        budget_limited = true;
         log::warn!(
             "[reorder] memory budget {}: estimated {}, dropped {} highest-df dims, keeping {} ({} postings)",
             crate::format_bytes(memory_budget_bytes as u64),
-            crate::format_bytes(estimated_bytes as u64),
-            dropped,
-            keep_count,
-            cum,
+            crate::format_bytes(fit.estimated_bytes as u64),
+            fit.dropped,
+            eligible.len(),
+            fit.retained_postings,
         );
     }
 
@@ -581,16 +646,13 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         // signal. Avoid allocating per-document counts and u64 offsets only
         // to discover that the terms array is empty, especially when the
         // configured budget is below the fixed document scratch cost.
-        return (
-            ForwardIndex {
-                terms: Vec::new(),
-                offsets: Vec::new(),
-                num_terms: 0,
-                parallel_bisect_depth: 0,
-                budget_limited,
-            },
-            source_doc_counts,
-        );
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+            parallel_bisect_lanes: 1,
+            budget_limited,
+        };
     }
 
     let mut term_remap = vec![u32::MAX; max_dims];
@@ -598,12 +660,16 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         term_remap[dim_id as usize] = compact_id as u32;
     }
     let num_active_terms = eligible.len();
-    let retained_postings = eligible
-        .iter()
-        .fold(0usize, |total, (_, df)| total.saturating_add(*df));
-    let non_degree_bytes = fixed_bytes.saturating_add(retained_postings.saturating_mul(4));
-    let parallel_bisect_depth =
-        parallel_bisect_depth(memory_budget_bytes, non_degree_bytes, num_active_terms);
+    // Jobs, candidate metadata, and the dense remap are construction scratch
+    // and are gone before graph recursion. Admit lanes against graph-resident
+    // CSR/entity scratch so non-power-of-two pools are not needlessly rounded
+    // down under a tight budget.
+    let non_degree_bytes = entity_scratch_bytes.saturating_add(
+        fit.retained_postings
+            .saturating_mul(std::mem::size_of::<u32>()),
+    );
+    let parallel_bisect_lanes =
+        parallel_bisect_lanes(memory_budget_bytes, non_degree_bytes, num_active_terms);
     drop(eligible);
 
     // Phase 2: count terms per doc (filtered) — per-block disjoint slices
@@ -618,7 +684,9 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             }
             for p in postings {
                 let vid = job.block_id as usize * block_size + p.local_slot as usize;
-                let real = v2r[vid];
+                let Some(&real) = v2r.get(vid) else {
+                    continue;
+                };
                 if real != u32::MAX && p.impact > 0 {
                     out[(real - job.real_start) as usize] += 1;
                 }
@@ -666,7 +734,9 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             }
             for p in postings {
                 let vid = job.block_id as usize * block_size + p.local_slot as usize;
-                let real = v2r[vid];
+                let Some(&real) = v2r.get(vid) else {
+                    continue;
+                };
                 if real != u32::MAX && p.impact > 0 {
                     let local = (real - job.real_start) as usize;
                     let pos =
@@ -699,16 +769,13 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         }
     }
 
-    (
-        ForwardIndex {
-            terms,
-            offsets,
-            num_terms: num_active_terms,
-            parallel_bisect_depth,
-            budget_limited,
-        },
-        source_doc_counts,
-    )
+    ForwardIndex {
+        terms,
+        offsets,
+        num_terms: num_active_terms,
+        parallel_bisect_lanes,
+        budget_limited,
+    }
 }
 
 /// Build a forward index over BLOCKS (one entity per block, its terms = the
@@ -728,7 +795,7 @@ pub(crate) fn build_forward_index_from_blocks(
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
-            parallel_bisect_depth: 0,
+            parallel_bisect_lanes: 1,
             budget_limited: false,
         };
     }
@@ -740,7 +807,8 @@ pub(crate) fn build_forward_index_from_blocks(
         .flat_map(|(src, bmp)| (0..bmp.num_blocks).map(move |b| (src as u32, b)))
         .collect();
 
-    // Phase 1: one bounded dense frequency table, shared by every worker.
+    // Phase 1: bounded worker-local frequency tables. This is the same policy
+    // as record-level BP and avoids hot atomic increments on common terms.
     let max_dims = bmps
         .iter()
         .map(|bmp| bmp.dims() as usize)
@@ -749,8 +817,7 @@ pub(crate) fn build_forward_index_from_blocks(
     let blocks_bytes = blocks
         .len()
         .saturating_mul(std::mem::size_of::<(u32, u32)>().saturating_add(32));
-    let frequency_bytes =
-        max_dims.saturating_mul(std::mem::size_of::<std::sync::atomic::AtomicU32>());
+    let frequency_bytes = max_dims.saturating_mul(std::mem::size_of::<u32>());
     if frequency_bytes > memory_budget_bytes.saturating_sub(blocks_bytes) {
         log::warn!(
             "[reorder] block-level frequency table exceeds memory budget; using identity order"
@@ -759,98 +826,57 @@ pub(crate) fn build_forward_index_from_blocks(
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
-            parallel_bisect_depth: 0,
+            parallel_bisect_lanes: 1,
             budget_limited: true,
         };
     }
-    let dim_bf: Vec<std::sync::atomic::AtomicU32> = (0..max_dims)
-        .map(|_| std::sync::atomic::AtomicU32::new(0))
-        .collect();
-    let count_block_bf = |&(src, block_id): &(u32, u32)| {
-        for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
-            if let Some(count) = dim_bf.get(dim_id as usize) {
-                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(dim_bf) = count_frequencies_bounded(
+        &blocks,
+        max_dims,
+        memory_budget_bytes.saturating_sub(blocks_bytes),
+        |&(src, block_id), counts| {
+            for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
+                if let Some(count) = counts.get_mut(dim_id as usize) {
+                    *count = count.saturating_add(1);
+                }
             }
-        }
+        },
+    ) else {
+        log::warn!(
+            "[reorder] block-level frequency table cannot fit its bounded allocation; using identity order"
+        );
+        return ForwardIndex {
+            terms: Vec::new(),
+            offsets: Vec::new(),
+            num_terms: 0,
+            parallel_bisect_lanes: 1,
+            budget_limited: true,
+        };
     };
-    #[cfg(feature = "native")]
-    blocks.par_iter().for_each(count_block_bf);
-    #[cfg(not(feature = "native"))]
-    blocks.iter().for_each(count_block_bf);
 
     let max_bf = (total_blocks as f64 * 0.9) as usize;
-    let eligible_candidate_count = dim_bf
-        .iter()
-        .filter(|bf| {
-            let bf = bf.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            bf >= 2 && bf <= max_bf.max(2)
-        })
-        .count();
-    let candidate_capacity = memory_budget_bytes
-        .saturating_sub(blocks_bytes)
-        .saturating_sub(frequency_bytes)
-        .checked_div(std::mem::size_of::<(usize, u32)>())
-        .unwrap_or(0)
-        .min(eligible_candidate_count);
-    let mut candidate_heap = std::collections::BinaryHeap::with_capacity(candidate_capacity);
-    for (dim_id, bf) in dim_bf.iter().enumerate() {
-        let bf = bf.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        if bf < 2 || bf > max_bf.max(2) {
-            continue;
-        }
-        let candidate = (bf, dim_id as u32);
-        if candidate_heap.len() < candidate_capacity {
-            candidate_heap.push(candidate);
-        } else if candidate_capacity > 0 && candidate < *candidate_heap.peek().unwrap() {
-            candidate_heap.pop();
-            candidate_heap.push(candidate);
-        }
-    }
+    let (mut eligible, mut budget_limited) = select_frequency_candidates(
+        &dim_bf,
+        2,
+        max_bf.max(2),
+        memory_budget_bytes
+            .saturating_sub(blocks_bytes)
+            .saturating_sub(frequency_bytes),
+    );
     drop(dim_bf);
-    let mut eligible: Vec<(u32, usize)> = candidate_heap
-        .into_vec()
-        .into_iter()
-        .map(|(bf, dim_id)| (dim_id, bf))
-        .collect();
-    let mut budget_limited = eligible.len() < eligible_candidate_count;
 
-    let total_postings_est = eligible
-        .iter()
-        .fold(0usize, |total, (_, bf)| total.saturating_add(*bf));
     let entity_scratch_bytes = total_blocks.saturating_mul(32);
     let remap_bytes = max_dims.saturating_mul(4);
     let fixed_bytes = entity_scratch_bytes
         .saturating_add(remap_bytes)
         .saturating_add(blocks_bytes);
-    let estimated_bytes = total_postings_est
-        .saturating_mul(4)
-        .saturating_add(fixed_bytes)
-        .saturating_add(eligible.len().saturating_mul(CANDIDATE_ENTRY_BYTES))
-        .saturating_add(term_degree_bytes(eligible.len()));
-    if estimated_bytes > memory_budget_bytes && !eligible.is_empty() {
-        eligible.sort_by_key(|&(_, bf)| bf);
-        let mut used_bytes = fixed_bytes;
-        let mut cum = 0usize;
-        let mut keep = 0;
-        for &(_, bf) in &eligible {
-            let term_bytes = bf
-                .saturating_mul(4)
-                .saturating_add(TERM_DEGREE_VALUE_BYTES + 1)
-                .saturating_add(CANDIDATE_ENTRY_BYTES);
-            if term_bytes > memory_budget_bytes.saturating_sub(used_bytes) {
-                break;
-            }
-            used_bytes = used_bytes.saturating_add(term_bytes);
-            cum = cum.saturating_add(bf);
-            keep += 1;
-        }
-        let dropped = eligible.len() - keep;
-        budget_limited |= dropped > 0;
+    let fit = fit_candidates_to_budget(&mut eligible, fixed_bytes, memory_budget_bytes);
+    if fit.dropped > 0 {
+        budget_limited = true;
         log::warn!(
             "[reorder] block-level fwd index over budget — dropped {} highest-bf dims",
-            dropped,
+            fit.dropped,
         );
-        eligible.truncate(keep);
     }
 
     if eligible.is_empty() {
@@ -858,7 +884,7 @@ pub(crate) fn build_forward_index_from_blocks(
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
-            parallel_bisect_depth: 0,
+            parallel_bisect_lanes: 1,
             budget_limited,
         };
     }
@@ -868,12 +894,12 @@ pub(crate) fn build_forward_index_from_blocks(
         term_remap[dim_id as usize] = compact as u32;
     }
     let num_terms = eligible.len();
-    let retained_postings = eligible
-        .iter()
-        .fold(0usize, |total, (_, bf)| total.saturating_add(*bf));
-    let non_degree_bytes = fixed_bytes.saturating_add(retained_postings.saturating_mul(4));
-    let parallel_bisect_depth =
-        parallel_bisect_depth(memory_budget_bytes, non_degree_bytes, num_terms);
+    let non_degree_bytes = entity_scratch_bytes.saturating_add(
+        fit.retained_postings
+            .saturating_mul(std::mem::size_of::<u32>()),
+    );
+    let parallel_bisect_lanes =
+        parallel_bisect_lanes(memory_budget_bytes, non_degree_bytes, num_terms);
     drop(eligible);
 
     // Phase 2+3: counts and CSR fill — one entity per block, so each block
@@ -933,7 +959,7 @@ pub(crate) fn build_forward_index_from_blocks(
         terms,
         offsets,
         num_terms,
-        parallel_bisect_depth,
+        parallel_bisect_lanes,
         budget_limited,
     }
 }
@@ -965,50 +991,57 @@ impl BpBudget {
     }
 }
 
-/// Build one partition's term degrees. At the coarse levels, each worker
-/// scans a contiguous document range into a private lazy degree table and
-/// the tables are reduced in parallel. `degree_lanes` is a power of two
-/// derived from `parallel_bisect_depth`, so all simultaneous sibling nodes
-/// together stay within the already-accounted vocabulary-array budget.
+/// Build one partition's term degrees in preallocated lanes.
+///
+/// At coarse levels each worker scans a contiguous document range into a
+/// private lane, then the lanes are reduced into `workspaces[0]`. Recursive
+/// siblings receive disjoint workspace slices, so the complete pass performs
+/// exactly the vocabulary-sized allocations admitted before BP starts.
 fn build_term_degrees(
     docs: &[u32],
     mid: usize,
     fwd: &ForwardIndex,
-    degree_lanes: usize,
-) -> TermDegrees {
-    let build_range = |start: usize, chunk: &[u32]| {
-        let mut degrees = TermDegrees::new(fwd.num_terms);
+    workspaces: &mut [TermDegrees],
+) {
+    debug_assert!(!workspaces.is_empty());
+    let build_range = |degrees: &mut TermDegrees, start: usize, chunk: &[u32]| {
+        degrees.reset();
         for (offset, &doc) in chunk.iter().enumerate() {
             let side = usize::from(start + offset >= mid);
             for &term in fwd.doc_terms(doc as usize) {
                 degrees.entry_mut(term as usize)[side] += 1;
             }
         }
-        degrees
     };
 
     #[cfg(feature = "native")]
     {
-        let workers = degree_lanes
-            .max(1)
+        let workers = workspaces
+            .len()
             .min(docs.len().div_ceil(PARALLEL_BP_MIN_ENTITIES).max(1));
         if workers > 1 {
             let chunk_len = docs.len().div_ceil(workers);
-            return docs
-                .par_chunks(chunk_len)
+            workspaces[..workers]
+                .par_iter_mut()
                 .enumerate()
-                .map(|(chunk, docs)| build_range(chunk * chunk_len, docs))
-                .reduce_with(|mut left, right| {
-                    left.merge_from(&right);
-                    left
-                })
-                .unwrap_or_else(|| TermDegrees::new(fwd.num_terms));
+                .for_each(|(worker, degrees)| {
+                    let start = worker * chunk_len;
+                    let end = (start + chunk_len).min(docs.len());
+                    build_range(degrees, start, &docs[start..end]);
+                });
+            let (degrees, partials) = workspaces[..workers]
+                .split_first_mut()
+                .expect("at least one BP degree workspace");
+            for partial in partials {
+                degrees.merge_from(partial);
+            }
+            return;
         }
+        build_range(&mut workspaces[0], 0, docs);
     }
-    #[cfg(not(feature = "native"))]
-    let _ = degree_lanes;
 
-    build_range(0, docs)
+    #[cfg(not(feature = "native"))]
+    build_range(&mut workspaces[0], 0, docs);
 }
 
 /// Convert `f32::total_cmp` ordering into an unsigned radix key.
@@ -1106,8 +1139,9 @@ fn select_gain_threshold(gains: &[f32], left_count: usize) -> (u32, usize) {
 }
 
 enum PartitionDegreeUpdate {
-    /// Parallel workers already accumulated every moved-term delta.
-    Deltas(TermDeltas),
+    /// Parallel workers accumulated directional movement counts in the first
+    /// reusable movement workspace.
+    Moves,
     /// Small partitions use the former unstable selection order. Keep its
     /// reusable rank map long enough to update only records that crossed the
     /// cut.
@@ -1152,31 +1186,30 @@ fn select_left(key: u32, threshold_key: u32, equal_seen: &mut usize, ties_left: 
 /// Output is stable within each half. Parallel workers also accumulate
 /// per-term degree deltas for moved entities, eliminating the former serial
 /// postings update without rescanning every posting after each iteration.
-/// Small partitions retain the old unstable selector: its allocation is tiny
-/// there, it is faster than four radix scans, and its within-half permutation
-/// supplies the graph algorithm's established symmetry breaking.
+/// Small partitions retain the old unstable selector in their preallocated
+/// rank slice: it is faster than four radix scans, and its within-half
+/// permutation supplies the graph algorithm's established symmetry breaking.
 fn partition_by_gain(
     docs: &[u32],
     gains: &[f32],
     mid: usize,
     fwd: &ForwardIndex,
-    degree_lanes: usize,
+    movement_workspaces: &mut [TermDegrees],
     output: &mut [u32],
-    ranked_scratch: &mut Vec<usize>,
+    ranked_scratch: &mut [usize],
 ) -> PartitionOutcome {
     #[cfg(not(feature = "native"))]
-    let _ = (fwd, degree_lanes);
+    let _ = &movement_workspaces;
 
     #[cfg(feature = "native")]
-    if degree_lanes > 1 && docs.len() >= PARALLEL_BP_MIN_ENTITIES {
+    if !movement_workspaces.is_empty() && docs.len() >= PARALLEL_BP_MIN_ENTITIES {
         let (threshold_key, strictly_lower) = select_gain_threshold(gains, mid);
         let ties_left = mid - strictly_lower;
 
         // `degrees` remains live while these deltas are built. Reserving one
-        // lane for it keeps total vocabulary arrays <= degree_lanes.
-        let chunk_count = degree_lanes
-            .saturating_sub(1)
-            .max(1)
+        // lane for it keeps total vocabulary arrays within the admitted set.
+        let chunk_count = movement_workspaces
+            .len()
             .min(docs.len().div_ceil(PARALLEL_BP_MIN_ENTITIES).max(1));
         let chunk_len = docs.len().div_ceil(chunk_count);
         let mut chunks: Vec<PartitionChunk> = gains
@@ -1230,11 +1263,12 @@ fn partition_by_gain(
         }
         debug_assert!(left_rest.is_empty() && right_rest.is_empty());
 
-        let (swap_count, deltas) = jobs
-            .into_par_iter()
+        let swap_count = movement_workspaces[..chunk_count]
+            .par_iter_mut()
+            .zip(jobs.into_par_iter())
             .map(
-                |(start, docs, gains, ties_for_chunk, left_out, right_out)| {
-                    let mut deltas = TermDeltas::new(fwd.num_terms);
+                |(moves, (start, docs, gains, ties_for_chunk, left_out, right_out))| {
+                    moves.reset();
                     let mut equal_seen = 0usize;
                     let mut left_cursor = 0usize;
                     let mut right_cursor = 0usize;
@@ -1255,32 +1289,38 @@ fn partition_by_gain(
                         let was_left = start + offset < mid;
                         if was_left != now_left {
                             swaps += 1;
-                            let left_delta = if was_left { -1 } else { 1 };
+                            // [right→left, left→right]
+                            let direction = usize::from(was_left);
                             for &term in fwd.doc_terms(doc as usize) {
-                                *deltas.entry_mut(term as usize) += left_delta;
+                                moves.entry_mut(term as usize)[direction] += 1;
                             }
                         }
                     }
                     debug_assert_eq!(left_cursor, left_out.len());
                     debug_assert_eq!(right_cursor, right_out.len());
-                    (swaps, deltas)
+                    swaps
                 },
             )
-            .reduce_with(|(left_swaps, mut left), (right_swaps, right)| {
-                left.merge_from(&right);
-                (left_swaps + right_swaps, left)
-            })
-            .unwrap_or_else(|| (0, TermDeltas::new(fwd.num_terms)));
+            .sum();
+
+        let (moves, partials) = movement_workspaces[..chunk_count]
+            .split_first_mut()
+            .expect("parallel BP partition must use at least one movement workspace");
+        for partial in partials {
+            moves.merge_from(partial);
+        }
 
         return PartitionOutcome {
             swap_count,
-            degree_update: PartitionDegreeUpdate::Deltas(deltas),
+            degree_update: PartitionDegreeUpdate::Moves,
         };
     }
 
     if docs.len() < PARALLEL_BP_MIN_ENTITIES {
-        ranked_scratch.clear();
-        ranked_scratch.extend(0..docs.len());
+        debug_assert_eq!(ranked_scratch.len(), docs.len());
+        for (index, rank) in ranked_scratch.iter_mut().enumerate() {
+            *rank = index;
+        }
         ranked_scratch.select_nth_unstable_by(mid, |&left, &right| {
             gains[left]
                 .total_cmp(&gains[right])
@@ -1663,11 +1703,11 @@ impl BpProgress<'_> {
 }
 
 /// Recursive graph bisection. Returns `(perm, converged)` where
-/// `perm[new_pos] = old_index` and `converged` is false iff the wall-clock
-/// budget ended the pass before it finished (a depth cap alone is a chosen
-/// target, not an interruption — it reports converged).
+/// `perm[new_pos] = old_index`. Convergence is false when the wall-clock or
+/// memory budget prevents the requested work from finishing; a configured
+/// depth cap is a chosen target and reports converged.
 ///
-/// `min_partition_size` should be the BMP block_size (64).
+/// `min_partition_size` should be the configured BMP block size.
 /// `max_iters` controls convergence (20 is standard).
 ///
 /// Term IDs in the forward index must be compact (0..num_terms) so we can
@@ -1746,10 +1786,42 @@ pub(crate) fn graph_bisection_with_progress(
         exhausted: &exhausted,
         progress: &progress,
     };
-    #[cfg(feature = "native")]
-    bisect(&mut docs, fwd.parallel_bisect_depth, 0, &context);
-    #[cfg(not(feature = "native"))]
-    bisect(&mut docs, 0, 0, &context);
+    let immediately_exhausted = {
+        #[cfg(feature = "native")]
+        {
+            deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    };
+    if immediately_exhausted {
+        exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else if n > effective_min_partition {
+        // Entity scratch is allocated once for the pass and carved into
+        // disjoint slices down the recursion tree. Degree lanes are likewise
+        // allocated exactly once from the memory-budgeted lane count.
+        let mut gains = vec![0.0f32; n];
+        let mut partitioned = vec![0u32; n];
+        let mut ranked = vec![0usize; n];
+        #[cfg(feature = "native")]
+        let degree_lanes = fwd.parallel_bisect_lanes.max(1);
+        #[cfg(not(feature = "native"))]
+        let degree_lanes = 1usize;
+        let mut degree_workspaces: Vec<TermDegrees> = (0..degree_lanes)
+            .map(|_| TermDegrees::new(fwd.num_terms))
+            .collect();
+        bisect(
+            &mut docs,
+            &mut gains,
+            &mut partitioned,
+            &mut ranked,
+            &mut degree_workspaces,
+            0,
+            &context,
+        );
+    }
 
     let deadline_exhausted = exhausted.load(std::sync::atomic::Ordering::Relaxed);
     let converged = !fwd.budget_limited && !deadline_exhausted;
@@ -1786,10 +1858,21 @@ struct BisectContext<'a> {
     progress: &'a BpProgress<'a>,
 }
 
-fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &BisectContext<'_>) {
-    #[cfg(not(feature = "native"))]
-    let _ = parallel_depth;
+#[allow(clippy::too_many_arguments)]
+fn bisect(
+    docs: &mut [u32],
+    gains: &mut [f32],
+    partitioned: &mut [u32],
+    ranked_scratch: &mut [usize],
+    degree_workspaces: &mut [TermDegrees],
+    level: usize,
+    context: &BisectContext<'_>,
+) {
     let n = docs.len();
+    debug_assert_eq!(gains.len(), n);
+    debug_assert_eq!(partitioned.len(), n);
+    debug_assert_eq!(ranked_scratch.len(), n);
+    debug_assert!(!degree_workspaces.is_empty());
     if n <= context.min_partition_size {
         return;
     }
@@ -1820,33 +1903,30 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &Bisec
     } else {
         context.max_iters
     };
-    let degree_lanes = 1usize
-        .checked_shl(parallel_depth as u32)
-        .unwrap_or(usize::MAX)
-        .max(1);
 
     // Compact term IDs permit direct indexing. Slots are initialized lazily so
-    // deep partitions do not zero the full vocabulary on every recursive node.
-    // Coarse partitions use memory-budgeted thread-local reductions; recursion
-    // splits the same lane allowance between children.
-    let mut degrees = build_term_degrees(docs, mid, context.fwd, degree_lanes);
+    // deep partitions touch only their active terms. Coarse partitions use
+    // multiple preallocated lanes; recursion splits the exact same workspace
+    // set between children.
+    build_term_degrees(docs, mid, context.fwd, degree_workspaces);
     // A full-vocabulary objective scan pays off only on coarse partitions,
     // where one avoided refinement skips millions of postings. At fine levels
     // it cost more than the work it could save, so retain the cheap gain
     // cooling condition there.
     let track_objective = n >= PARALLEL_BP_MIN_ENTITIES;
+    if track_objective {
+        // The old bitmap scan accumulated terms in ascending order. Sorting
+        // once preserves that exact floating-point order while subsequent
+        // objective evaluations visit only words active in this partition.
+        degree_workspaces[0].sort_touched_words();
+    }
     let mut previous_objective = if track_objective {
-        degrees.bisection_objective(mid, n - mid, context.log_table)
+        degree_workspaces[0].bisection_objective(mid, n - mid, context.log_table)
     } else {
         0.0
     };
     let mut best_objective = previous_objective;
     let mut objective_stalls = 0usize;
-
-    // Scratch buffers reused across iterations
-    let mut gains: Vec<f32> = vec![0.0; n];
-    let mut partitioned: Vec<u32> = vec![0; n];
-    let mut ranked_scratch: Vec<usize> = Vec::new();
 
     for iter in 0..effective_iters {
         // Anytime cutoff between refinement passes: keep the current split.
@@ -1865,9 +1945,9 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &Bisec
             docs,
             context.fwd,
             mid,
-            &degrees,
+            &degree_workspaces[0],
             context.log_table,
-            &mut gains,
+            gains,
         );
 
         // Exact median selection and stable partition. The old path allocated
@@ -1876,12 +1956,12 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &Bisec
         // the same bounded worker lanes used by degree construction.
         let partition = partition_by_gain(
             docs,
-            &gains,
+            gains,
             mid,
             context.fwd,
-            degree_lanes,
-            &mut partitioned,
-            &mut ranked_scratch,
+            &mut degree_workspaces[1..],
+            partitioned,
+            ranked_scratch,
         );
 
         if partition.swap_count == 0 {
@@ -1889,35 +1969,44 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &Bisec
             // Preserve the selector's within-half order before recursing.
             // Small partitions intentionally retain quickselect's established
             // symmetry-breaking permutation.
-            docs.copy_from_slice(&partitioned);
+            docs.copy_from_slice(partitioned);
             break;
         }
 
         match &partition.degree_update {
-            PartitionDegreeUpdate::Deltas(deltas) => deltas.apply_to(&mut degrees),
+            PartitionDegreeUpdate::Moves => {
+                let (degrees, movement_workspaces) = degree_workspaces
+                    .split_first_mut()
+                    .expect("BP always has one degree workspace");
+                movement_workspaces
+                    .first()
+                    .expect("parallel BP movement update requires a spare workspace")
+                    .apply_moves_to(degrees);
+            }
             PartitionDegreeUpdate::Ranked => update_degrees_for_ranked_partition(
                 docs,
-                &ranked_scratch,
+                ranked_scratch,
                 mid,
                 context.fwd,
-                &mut degrees,
+                &mut degree_workspaces[0],
             ),
             PartitionDegreeUpdate::Threshold {
                 threshold_key,
                 ties_left,
             } => update_degrees_for_threshold_partition(
                 docs,
-                &gains,
+                gains,
                 mid,
                 *threshold_key,
                 *ties_left,
                 context.fwd,
-                &mut degrees,
+                &mut degree_workspaces[0],
             ),
         }
 
         let (new_objective, objective_improvement, relative_improvement) = if track_objective {
-            let new_objective = degrees.bisection_objective(mid, n - mid, context.log_table);
+            let new_objective =
+                degree_workspaces[0].bisection_objective(mid, n - mid, context.log_table);
             let objective_improvement = new_objective - previous_objective;
             let relative_improvement = objective_improvement / previous_objective.abs().max(1.0);
             (new_objective, objective_improvement, relative_improvement)
@@ -1937,7 +2026,7 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &Bisec
         // no-op. Instead, accept refinements and stop only after a warm-up plus
         // consecutive iterations that fail to improve the best exact
         // objective by a meaningful relative amount.
-        docs.copy_from_slice(&partitioned);
+        docs.copy_from_slice(partitioned);
         if track_objective {
             previous_objective = new_objective;
             let relative_best_improvement =
@@ -1973,30 +2062,83 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &Bisec
         }
     }
 
-    // Drop scratch before recursion to free memory for sub-problems
-    drop(degrees);
-    drop(gains);
-    drop(partitioned);
     context.progress.partition_finished();
 
     let (left, right) = docs.split_at_mut(mid);
+    let (left_gains, right_gains) = gains.split_at_mut(mid);
+    let (left_partitioned, right_partitioned) = partitioned.split_at_mut(mid);
+    let (left_ranked, right_ranked) = ranked_scratch.split_at_mut(mid);
     #[cfg(feature = "native")]
-    if parallel_depth > 0 {
+    if degree_workspaces.len() > 1 {
+        let left_lanes = degree_workspaces.len() / 2;
+        let (left_workspaces, right_workspaces) = degree_workspaces.split_at_mut(left_lanes);
         rayon::join(
-            || bisect(left, parallel_depth - 1, level + 1, context),
-            || bisect(right, parallel_depth - 1, level + 1, context),
+            || {
+                bisect(
+                    left,
+                    left_gains,
+                    left_partitioned,
+                    left_ranked,
+                    left_workspaces,
+                    level + 1,
+                    context,
+                )
+            },
+            || {
+                bisect(
+                    right,
+                    right_gains,
+                    right_partitioned,
+                    right_ranked,
+                    right_workspaces,
+                    level + 1,
+                    context,
+                )
+            },
         );
     } else {
         // Gain computation inside each node remains parallel, so serializing
         // recursion here bounds vocabulary-sized degree arrays without leaving
         // the Rayon pool idle.
-        bisect(left, 0, level + 1, context);
-        bisect(right, 0, level + 1, context);
+        bisect(
+            left,
+            left_gains,
+            left_partitioned,
+            left_ranked,
+            degree_workspaces,
+            level + 1,
+            context,
+        );
+        bisect(
+            right,
+            right_gains,
+            right_partitioned,
+            right_ranked,
+            degree_workspaces,
+            level + 1,
+            context,
+        );
     }
     #[cfg(not(feature = "native"))]
     {
-        bisect(left, 0, level + 1, context);
-        bisect(right, 0, level + 1, context);
+        bisect(
+            left,
+            left_gains,
+            left_partitioned,
+            left_ranked,
+            degree_workspaces,
+            level + 1,
+            context,
+        );
+        bisect(
+            right,
+            right_gains,
+            right_partitioned,
+            right_ranked,
+            degree_workspaces,
+            level + 1,
+            context,
+        );
     }
 }
 
@@ -2090,8 +2232,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_frequency_count_and_candidate_selection_are_exact() {
+        let items: Vec<u32> = (0..10_000).collect();
+        let frequencies = count_frequencies_bounded(&items, 7, 16 * 1024, |item, counts| {
+            let term = *item as usize % counts.len();
+            counts[term] += 1;
+        })
+        .unwrap();
+        assert_eq!(frequencies.iter().sum::<u32>(), items.len() as u32);
+        for (term, &frequency) in frequencies.iter().enumerate() {
+            let expected = (term..items.len()).step_by(frequencies.len()).count() as u32;
+            assert_eq!(frequency, expected);
+        }
+
+        let (selected, limited) =
+            select_frequency_candidates(&[8, 3, 0, 5, 3], 1, 10, 2 * CANDIDATE_ENTRY_BYTES);
+        assert!(limited);
+        let mut selected = selected;
+        selected.sort_unstable();
+        assert_eq!(selected, vec![(1, 3), (4, 3)]);
+    }
+
+    #[test]
+    fn bounded_frequency_count_rejects_an_undersized_budget() {
+        assert!(
+            count_frequencies_bounded(&[0u32], 32, 32, |_, _| {}).is_none(),
+            "one complete dense frequency table must fit before counting"
+        );
+    }
+
+    #[test]
     fn lazy_term_degrees_initialize_only_on_first_write() {
         let mut degrees = TermDegrees::new(130);
+        let values_ptr = degrees.values.as_ptr();
+        let bitmap_ptr = degrees.initialized.as_ptr();
         assert_eq!(degrees.get(65), [0, 0]);
         degrees.entry_mut(65)[0] += 3;
         degrees.entry_mut(65)[1] += 2;
@@ -2105,6 +2279,51 @@ mod tests {
                 .sum::<u32>(),
             1
         );
+
+        degrees.reset();
+        assert_eq!(degrees.values.as_ptr(), values_ptr);
+        assert_eq!(degrees.initialized.as_ptr(), bitmap_ptr);
+        assert_eq!(degrees.get(65), [0, 0]);
+        assert!(degrees.touched_words.is_empty());
+        degrees.entry_mut(129)[1] = 7;
+        assert_eq!(degrees.get(129), [0, 7]);
+        assert_eq!(degrees.get(65), [0, 0]);
+    }
+
+    #[test]
+    fn sparse_objective_keeps_the_original_ascending_term_order() {
+        let mut degrees = TermDegrees::new(130);
+        *degrees.entry_mut(129) = [5, 2];
+        *degrees.entry_mut(1) = [3, 7];
+        *degrees.entry_mut(65) = [11, 13];
+        assert_eq!(degrees.touched_words, vec![2, 0, 1]);
+        degrees.sort_touched_words();
+        assert_eq!(degrees.touched_words, vec![0, 1, 2]);
+
+        let log_table = build_log_table(4096);
+        let actual = degrees.bisection_objective(31, 32, &log_table);
+        let side_log = [
+            fast_log2_lookup(31, &log_table) as f64,
+            fast_log2_lookup(32, &log_table) as f64,
+        ];
+        let mut original_bitmap_scan = 0.0f64;
+        for (word_idx, &initialized) in degrees.initialized.iter().enumerate() {
+            let mut pending = initialized;
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                let [left, right] = degrees.get(term);
+                for (side, count) in [left, right].into_iter().enumerate() {
+                    if count > 0 {
+                        original_bitmap_scan += count as f64
+                            * (fast_log2_lookup(count as usize + 1, &log_table) as f64
+                                - side_log[side]);
+                    }
+                }
+                pending &= pending - 1;
+            }
+        }
+        assert_eq!(actual.to_bits(), original_bitmap_scan.to_bits());
     }
 
     #[test]
@@ -2167,7 +2386,7 @@ mod tests {
             terms,
             offsets,
             num_terms: TERMS,
-            parallel_bisect_depth: 2,
+            parallel_bisect_lanes: 4,
             budget_limited: false,
         };
         let docs: Vec<u32> = (0..N as u32)
@@ -2203,32 +2422,33 @@ mod tests {
 
         let mut output = vec![0; N];
         let mut ranked_scratch = Vec::new();
+        let mut movement_workspaces: Vec<_> = (0..3).map(|_| TermDegrees::new(TERMS)).collect();
         let outcome = partition_by_gain(
             &docs,
             &gains,
             mid,
             &fwd,
-            4,
+            &mut movement_workspaces,
             &mut output,
             &mut ranked_scratch,
         );
         assert_eq!(output, expected);
         assert!(
-            matches!(&outcome.degree_update, PartitionDegreeUpdate::Deltas(_)),
-            "test must exercise parallel deltas"
+            matches!(&outcome.degree_update, PartitionDegreeUpdate::Moves),
+            "test must exercise parallel movement counts"
         );
 
-        let mut updated = build_term_degrees(&docs, mid, &fwd, 4);
-        let PartitionDegreeUpdate::Deltas(deltas) = outcome.degree_update else {
-            unreachable!("assertion above verifies the parallel path")
-        };
-        deltas.apply_to(&mut updated);
-        let rebuilt = build_term_degrees(&output, mid, &fwd, 4);
+        let mut updated_workspaces: Vec<_> = (0..4).map(|_| TermDegrees::new(TERMS)).collect();
+        build_term_degrees(&docs, mid, &fwd, &mut updated_workspaces);
+        movement_workspaces[0].apply_moves_to(&mut updated_workspaces[0]);
+
+        let mut rebuilt_workspaces: Vec<_> = (0..4).map(|_| TermDegrees::new(TERMS)).collect();
+        build_term_degrees(&output, mid, &fwd, &mut rebuilt_workspaces);
         for term in 0..TERMS {
             assert_eq!(
-                updated.get(term),
-                rebuilt.get(term),
-                "parallel moved-term delta mismatch for term {term}"
+                updated_workspaces[0].get(term),
+                rebuilt_workspaces[0].get(term),
+                "parallel movement-count mismatch for term {term}"
             );
         }
     }
@@ -2261,7 +2481,7 @@ mod tests {
             terms,
             offsets,
             num_terms,
-            parallel_bisect_depth: 0,
+            parallel_bisect_lanes: 1,
             budget_limited: false,
         }
     }
@@ -2272,7 +2492,7 @@ mod tests {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
-            parallel_bisect_depth: 0,
+            parallel_bisect_lanes: 1,
             budget_limited: false,
         };
         let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());

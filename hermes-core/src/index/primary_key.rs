@@ -114,42 +114,18 @@ impl PrimaryKeyIndex {
 
     /// Create from a pre-loaded bloom filter (loaded from `pk_bloom.bin`).
     ///
-    /// Skips dictionary iteration entirely when the persisted bloom covers
-    /// all current segments. `pk_data` contains data for ALL current segments.
-    /// If `new_data` is non-empty, their keys are inserted into the bloom
-    /// before returning (incremental update). `new_data` is a borrowed slice
-    /// pointing to the subset of segments not covered by the persisted bloom.
+    /// Skips dictionary iteration because the caller has already extended the
+    /// persisted bloom with any segments it did not cover. `pk_data` contains
+    /// data for all current segments.
     pub fn from_persisted(
         field: Field,
-        mut bloom: BloomFilter,
+        bloom: BloomFilter,
         pk_data: Vec<PkSegmentData>,
-        new_data: &[PkSegmentData],
         snapshot: SegmentSnapshot,
     ) -> Self {
-        let mut added = 0usize;
-        for data in new_data {
-            if let Some(ff) = data.fast_fields.get(&field.0)
-                && let Some(dict) = ff.text_dict()
-            {
-                for key in dict.iter() {
-                    bloom.insert(key.as_bytes());
-                    added += 1;
-                }
-            }
-        }
-
         log::info!(
-            "[primary_key] bloom filter loaded from cache: {}{}",
+            "[primary_key] bloom filter loaded from cache: {}",
             crate::format_bytes(bloom.size_bytes() as u64),
-            if added > 0 {
-                format!(
-                    ", added {} keys from {} new segment(s)",
-                    added,
-                    new_data.len()
-                )
-            } else {
-                String::new()
-            },
         );
 
         Self {
@@ -163,9 +139,15 @@ impl PrimaryKeyIndex {
         }
     }
 
-    /// Serialize the bloom filter for persistence to `pk_bloom.bin`.
-    pub fn bloom_to_bytes(&self) -> Vec<u8> {
-        self.state.lock().bloom.to_bytes()
+    /// Stream the complete primary-key cache without a corpus-sized
+    /// intermediate allocation.
+    pub fn write_bloom_cache(
+        &self,
+        segment_ids: &[String],
+        writer: &mut (impl std::io::Write + ?Sized),
+    ) -> std::io::Result<()> {
+        let state = self.state.lock();
+        write_pk_bloom(writer, segment_ids, &state.bloom)
     }
 
     /// Memory used by the bloom filter and uncommitted set.
@@ -238,9 +220,6 @@ impl PrimaryKeyIndex {
     /// caller. Existing data for segments still in `snapshot` is retained.
     /// The snapshot keeps ref counts alive so segments aren't deleted.
     pub fn refresh_incremental(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
-        let new_seg_ids: HashSet<&str> =
-            snapshot.segment_ids().iter().map(|s| s.as_str()).collect();
-
         // Insert new segments' keys into bloom (these were uncommitted before).
         // get_mut() bypasses the mutex — safe because we have &mut self.
         let state = self.state.get_mut();
@@ -254,8 +233,22 @@ impl PrimaryKeyIndex {
             }
         }
         state.uncommitted.clear();
+        self.replace_committed_data(new_data, snapshot);
+    }
 
-        // Keep existing data for segments still in the snapshot
+    /// Refresh segment readers after a topology-only replacement.
+    ///
+    /// Merge and BP reorder outputs contain exactly the same primary keys as
+    /// their sources. Their keys are therefore already represented in the
+    /// monotonic bloom filter, and any live ingestion reservations must remain
+    /// registered while only the committed segment topology changes.
+    pub fn refresh_replacement(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
+        self.replace_committed_data(new_data, snapshot);
+    }
+
+    fn replace_committed_data(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
+        let new_seg_ids: HashSet<&str> =
+            snapshot.segment_ids().iter().map(|s| s.as_str()).collect();
         let mut kept: Vec<PkSegmentData> = self
             .committed_data
             .drain(..)
@@ -290,22 +283,34 @@ impl PrimaryKeyIndex {
     }
 }
 
-/// Serialize a bloom filter with the segment IDs it covers into `pk_bloom.bin` format.
+/// Write a bloom filter with the segment IDs it covers in `pk_bloom.bin` format.
 ///
 /// Layout: `[magic:u32][num_segs:u32][seg_id_hex × 32 bytes each...][bloom_bytes...]`
-pub fn serialize_pk_bloom(segment_ids: &[String], bloom_bytes: &[u8]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(8 + segment_ids.len() * 32 + bloom_bytes.len());
-    data.write_u32::<LittleEndian>(PK_BLOOM_MAGIC).unwrap();
-    data.write_u32::<LittleEndian>(segment_ids.len() as u32)
-        .unwrap();
+fn write_pk_bloom(
+    writer: &mut (impl std::io::Write + ?Sized),
+    segment_ids: &[String],
+    bloom: &BloomFilter,
+) -> std::io::Result<()> {
+    writer.write_u32::<LittleEndian>(PK_BLOOM_MAGIC)?;
+    writer.write_u32::<LittleEndian>(u32::try_from(segment_ids.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "primary-key bloom segment count exceeds u32::MAX",
+        )
+    })?)?;
     for seg_id in segment_ids {
         let bytes = seg_id.as_bytes();
-        data.extend_from_slice(bytes);
+        if bytes.len() > 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "primary-key bloom segment ID exceeds 32 bytes",
+            ));
+        }
+        writer.write_all(bytes)?;
         // Pad to 32 bytes (segment IDs are 32-char hex strings)
-        data.extend(std::iter::repeat_n(0u8, 32 - bytes.len()));
+        writer.write_all(&[0u8; 32][..32 - bytes.len()])?;
     }
-    data.extend_from_slice(bloom_bytes);
-    data
+    bloom.write_to(writer)
 }
 
 /// Deserialize `pk_bloom.bin`. Returns the set of covered segment IDs and the bloom filter,
@@ -320,7 +325,7 @@ pub fn deserialize_pk_bloom(data: &[u8]) -> Option<(HashSet<String>, BloomFilter
     }
     let num_segments = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let header_end = 8 + num_segments * 32;
-    if data.len() < header_end + 12 {
+    if data.len() < header_end + BloomFilter::SERIALIZED_HEADER_SIZE {
         return None;
     }
     let mut segment_ids = HashSet::with_capacity(num_segments);
@@ -469,6 +474,20 @@ mod tests {
     }
 
     #[test]
+    fn replacement_refresh_preserves_uncommitted_reservations() {
+        let field = Field(0);
+        let mut pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
+
+        assert!(pk.check_and_insert(&make_doc(field, "queued")).is_ok());
+        pk.refresh_replacement(vec![], empty_snapshot());
+
+        assert!(
+            pk.check_and_insert(&make_doc(field, "queued")).is_err(),
+            "topology-only BP refresh must not erase a queued key reservation"
+        );
+    }
+
+    #[test]
     fn test_pk_bloom_serialize_roundtrip() {
         let field = Field(0);
         let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
@@ -481,8 +500,8 @@ mod tests {
             "00000000000000000000000000000001".to_string(),
             "00000000000000000000000000000002".to_string(),
         ];
-        let bloom_bytes = pk.bloom_to_bytes();
-        let data = serialize_pk_bloom(&seg_ids, &bloom_bytes);
+        let mut data = Vec::new();
+        pk.write_bloom_cache(&seg_ids, &mut data).unwrap();
         let (got_ids, got_bloom) = deserialize_pk_bloom(&data).expect("deserialize failed");
 
         assert_eq!(got_ids.len(), 2);

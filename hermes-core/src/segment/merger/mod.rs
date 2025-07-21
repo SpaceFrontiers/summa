@@ -17,8 +17,9 @@ use super::reader::SegmentReader;
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
-use crate::dsl::Schema;
+use crate::dsl::{FieldType, Schema};
 use crate::index::{ReorderConcurrencyGate, ReorderPriority};
+use crate::structures::SparseFormat;
 
 /// Compute per-segment doc ID offsets (each segment's docs start after the previous).
 ///
@@ -36,6 +37,35 @@ fn doc_offsets(segments: &[SegmentReader]) -> Result<Vec<u32>> {
         })?;
     }
     Ok(offsets)
+}
+
+/// Additive count stored in a `u32` field of the merged segment format.
+///
+/// Source segments are individually valid, so exceeding the limit is a
+/// property of this merge plan rather than source corruption.
+#[derive(Clone, Copy, Debug, Default)]
+struct MergeCapacity(u64);
+
+impl MergeCapacity {
+    #[inline]
+    fn add(&mut self, count: u64) -> Option<u64> {
+        self.0 = self.0.saturating_add(count);
+        (self.0 > u64::from(u32::MAX)).then_some(self.0)
+    }
+}
+
+fn field_capacity_error(
+    field_id: u32,
+    field_name: &str,
+    value_kind: &str,
+    count: u64,
+) -> crate::Error {
+    crate::Error::Schema(format!(
+        "merge would produce {count} {value_kind} for field {field_id} ('{field_name}'), \
+         exceeding the segment format limit {}; lower max_segment_docs for this \
+         multi-valued field",
+        u32::MAX,
+    ))
 }
 
 /// Statistics for merge operations
@@ -94,6 +124,47 @@ pub(crate) fn block_in_place_if_multithread<R>(f: impl FnOnce() -> R) -> R {
     } else {
         f()
     }
+}
+
+/// Append an exact-length temporary directory file to a segment output and
+/// remove it. Used by sparse skip tables so neither merge nor BP rewrite
+/// buffers a corpus-sized metadata section on heap.
+pub(crate) async fn append_and_delete_temp<D: DirectoryWriter>(
+    directory: &D,
+    path: &std::path::Path,
+    expected_bytes: u64,
+    writer: &mut OffsetWriter,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    const COPY_CHUNK: u64 = 4 * 1024 * 1024;
+    let actual_bytes = directory.file_size(path).await?;
+    if actual_bytes != expected_bytes {
+        return Err(crate::Error::Corruption(format!(
+            "temporary sparse section {:?} has {} bytes, expected {}",
+            path, actual_bytes, expected_bytes,
+        )));
+    }
+    let mut offset = 0u64;
+    while offset < expected_bytes {
+        let end = (offset + COPY_CHUNK).min(expected_bytes);
+        let chunk = directory.read_range(path, offset..end).await?;
+        writer
+            .write_all(chunk.as_slice())
+            .map_err(crate::Error::Io)?;
+        offset = end;
+    }
+    if let Err(error) = directory.delete(path).await {
+        // The section is already complete in the output. This output-scoped
+        // scratch file is safe for the startup orphan sweep and must not
+        // invalidate an otherwise successful multi-hour merge.
+        log::warn!(
+            "[merge] failed to remove temporary sparse section {:?}: {}",
+            path,
+            error,
+        );
+    }
+    Ok(())
 }
 
 /// Segment merger - merges multiple segments into one
@@ -181,6 +252,137 @@ impl SegmentMerger {
         self
     }
 
+    /// Reject additive per-field counts that the on-disk formats cannot
+    /// represent. All inputs are already-open metadata views; no vector,
+    /// posting, or document payload is read here.
+    fn validate_merge_capacities(&self, segments: &[SegmentReader]) -> Result<()> {
+        // MaxScore skip entries share one u32-addressed section across fields.
+        let mut maxscore_skip_entries = MergeCapacity::default();
+
+        for (field, entry) in self.schema.fields() {
+            match entry.field_type {
+                FieldType::DenseVector | FieldType::BinaryDenseVector => {
+                    let mut vectors = MergeCapacity::default();
+                    for segment in segments {
+                        let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                            continue;
+                        };
+                        if let Some(total) = vectors.add(flat.num_vectors as u64) {
+                            let value_kind = if entry.field_type == FieldType::BinaryDenseVector {
+                                "binary vectors"
+                            } else {
+                                "dense vectors"
+                            };
+                            return Err(field_capacity_error(
+                                field.0,
+                                &entry.name,
+                                value_kind,
+                                total,
+                            ));
+                        }
+                    }
+                }
+                FieldType::SparseVector => {
+                    let format = entry
+                        .sparse_vector_config
+                        .as_ref()
+                        .map(|config| config.format)
+                        .unwrap_or_default();
+                    match format {
+                        SparseFormat::Bmp => {
+                            let mut vectors = MergeCapacity::default();
+                            let mut blocks = MergeCapacity::default();
+                            let mut real_slots = MergeCapacity::default();
+                            let mut virtual_slots = MergeCapacity::default();
+
+                            for segment in segments {
+                                let Some(index) = segment.bmp_indexes().get(&field.0) else {
+                                    continue;
+                                };
+                                for (capacity, count, value_kind) in [
+                                    (&mut vectors, u64::from(index.total_vectors), "BMP vectors"),
+                                    (&mut blocks, u64::from(index.num_blocks), "BMP blocks"),
+                                    (
+                                        &mut real_slots,
+                                        u64::from(index.num_real_docs()),
+                                        "BMP real vector slots",
+                                    ),
+                                    (
+                                        &mut virtual_slots,
+                                        u64::from(index.num_virtual_docs),
+                                        "BMP padded virtual slots",
+                                    ),
+                                ] {
+                                    if let Some(total) = capacity.add(count) {
+                                        return Err(field_capacity_error(
+                                            field.0,
+                                            &entry.name,
+                                            value_kind,
+                                            total,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        SparseFormat::MaxScore => {
+                            let mut vectors = MergeCapacity::default();
+                            let mut dimensions: FxHashMap<u32, (MergeCapacity, MergeCapacity)> =
+                                FxHashMap::default();
+
+                            for segment in segments {
+                                let Some(index) = segment.sparse_indexes().get(&field.0) else {
+                                    continue;
+                                };
+                                if let Some(total) = vectors.add(u64::from(index.total_vectors)) {
+                                    return Err(field_capacity_error(
+                                        field.0,
+                                        &entry.name,
+                                        "MaxScore vectors",
+                                        total,
+                                    ));
+                                }
+
+                                for (dimension, doc_count, block_count) in index.dimension_counts()
+                                {
+                                    let (docs, blocks) = dimensions.entry(dimension).or_default();
+                                    if let Some(total) = docs.add(u64::from(doc_count)) {
+                                        return Err(field_capacity_error(
+                                            field.0,
+                                            &entry.name,
+                                            &format!("MaxScore postings for dimension {dimension}"),
+                                            total,
+                                        ));
+                                    }
+                                    if let Some(total) = blocks.add(u64::from(block_count)) {
+                                        return Err(field_capacity_error(
+                                            field.0,
+                                            &entry.name,
+                                            &format!("MaxScore blocks for dimension {dimension}"),
+                                            total,
+                                        ));
+                                    }
+                                    if let Some(total) =
+                                        maxscore_skip_entries.add(u64::from(block_count))
+                                    {
+                                        return Err(crate::Error::Schema(format!(
+                                            "merge would produce {total} MaxScore skip entries \
+                                             across sparse fields, exceeding the segment format \
+                                             limit {}; lower max_segment_docs for multi-valued \
+                                             sparse fields",
+                                            u32::MAX,
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Merge segments into one, streaming postings/positions/store directly to files.
     ///
     /// If `trained` is provided, dense vectors use O(1) cluster merge when possible
@@ -209,6 +411,8 @@ impl SegmentMerger {
                     u32::MAX
                 ))
             })?;
+
+        self.validate_merge_capacities(segments)?;
 
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
@@ -421,4 +625,35 @@ pub async fn delete_segment<D: Directory + DirectoryWriter>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::{MergeCapacity, field_capacity_error};
+
+    #[test]
+    fn merge_capacity_accepts_the_exact_u32_boundary() {
+        let mut capacity = MergeCapacity::default();
+        assert_eq!(capacity.add(u64::from(u32::MAX) - 7), None);
+        assert_eq!(capacity.add(7), None);
+    }
+
+    #[test]
+    fn merge_capacity_rejects_the_first_value_beyond_u32() {
+        let mut capacity = MergeCapacity::default();
+        assert_eq!(capacity.add(u64::from(u32::MAX)), None);
+        assert_eq!(capacity.add(1), Some(u64::from(u32::MAX) + 1));
+    }
+
+    #[test]
+    fn merge_capacity_failure_is_not_source_corruption() {
+        let error = field_capacity_error(
+            7,
+            "body_embedding",
+            "dense vectors",
+            u64::from(u32::MAX) + 1,
+        );
+        assert!(matches!(error, crate::Error::Schema(_)));
+        assert!(error.to_string().contains("lower max_segment_docs"));
+    }
 }

@@ -706,8 +706,8 @@ async fn test_commit_with_vectors_and_background_merge() {
     assert_eq!(num_docs, 60, "Expected 60 docs, got {}", num_docs);
 }
 
-/// Stress test: force_merge with many segments (iterative batching).
-/// Verifies that merging 50 segments doesn't OOM or exhaust file descriptors.
+/// Stress test: force_merge with more segments than one merge can open.
+/// Verifies the bounded fan-in hierarchy without exhausting file descriptors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_force_merge_many_segments() {
     use crate::directories::MmapDirectory;
@@ -720,6 +720,7 @@ async fn test_force_merge_many_segments() {
 
     let config = IndexConfig {
         max_indexing_memory_bytes: 512,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
         ..Default::default()
     };
 
@@ -727,8 +728,8 @@ async fn test_force_merge_many_segments() {
         .await
         .unwrap();
 
-    // Create 50 tiny segments
-    for batch in 0..50 {
+    // Create 70 tiny segments, exceeding FORCE_MERGE_MAX_FAN_IN (64).
+    for batch in 0..70 {
         for i in 0..3 {
             let mut doc = Document::new();
             doc.add_text(title, format!("term_{} batch_{}", i, batch));
@@ -744,14 +745,28 @@ async fn test_force_merge_many_segments() {
     eprintln!("Segments before force_merge: {}", pre);
     assert!(pre >= 2, "Expected multiple segments, got {}", pre);
 
-    // Force merge all into one — should iterate in batches, not OOM
-    writer.force_merge().await.unwrap();
+    // Force merge all into one — one block-copy fan-in reduction followed by
+    // one final pass. Consumers must be refreshed after both replacements.
+    let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let refresh_count = std::sync::Arc::clone(&refreshes);
+    writer
+        .force_merge_with_snapshot_refresh(move || {
+            refresh_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshes.load(std::sync::atomic::Ordering::Relaxed),
+        4,
+        "initial/final refreshes plus one fan-in reduction and one final replacement"
+    );
 
     let index2 = Index::open(dir, config).await.unwrap();
     let post = index2.segment_readers().await.unwrap().len();
     eprintln!("Segments after force_merge: {}", post);
     assert_eq!(post, 1);
-    assert_eq!(index2.num_docs().await.unwrap(), 150);
+    assert_eq!(index2.num_docs().await.unwrap(), 210);
 }
 
 /// Test that background merges produce correct generation metadata.

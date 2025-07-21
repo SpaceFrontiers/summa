@@ -130,10 +130,39 @@ pub struct SparseDimTocEntry {
 pub struct SparseFieldToc {
     pub field_id: u32,
     pub quantization: u8,
-    /// Total number of documents that have at least one sparse vector in this field.
-    /// Not the same as segment total_docs when some docs lack the field.
+    /// Total sparse vectors in this field. Multi-valued fields can have more
+    /// vectors than segment documents.
     pub total_vectors: u32,
     pub dims: Vec<SparseDimTocEntry>,
+}
+
+impl SparseFieldToc {
+    /// Build the sentinel TOC entry used by the self-contained BMP blob.
+    pub(crate) fn bmp(field_id: u32, total_vectors: u32, blob_offset: u64, blob_len: u64) -> Self {
+        // V18 always stores u32 dimensions and u8 impacts regardless of the
+        // generic sparse schema knobs. Persist the physical representation,
+        // not a misleading caller-supplied MaxScore descriptor.
+        let config = crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::Bmp,
+            index_size: crate::structures::IndexSize::U32,
+            weight_quantization: crate::structures::WeightQuantization::UInt8,
+            ..Default::default()
+        };
+
+        Self {
+            field_id,
+            quantization: config.to_byte(),
+            total_vectors,
+            dims: vec![SparseDimTocEntry {
+                dim_id: u32::MAX,
+                block_data_offset: blob_offset,
+                skip_start: blob_len as u32,
+                num_blocks: (blob_len >> 32) as u32,
+                doc_count: 0,
+                max_weight: 0.0,
+            }],
+        }
+    }
 }
 
 /// Write V3 sparse TOC + footer.
@@ -172,4 +201,26 @@ pub fn write_sparse_toc_and_footer(
     writer.write_u32::<LittleEndian>(field_tocs.len() as u32)?;
     writer.write_u32::<LittleEndian>(SPARSE_FOOTER_MAGIC)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SparseFieldToc;
+    use crate::structures::{IndexSize, SparseFormat, SparseVectorConfig, WeightQuantization};
+
+    #[test]
+    fn bmp_toc_describes_the_physical_v18_encoding() {
+        let blob_len = u64::from(u32::MAX) + 17;
+        let toc = SparseFieldToc::bmp(7, 11, 23, blob_len);
+        let config = SparseVectorConfig::from_byte(toc.quantization).unwrap();
+
+        assert_eq!(config.format, SparseFormat::Bmp);
+        assert_eq!(config.index_size, IndexSize::U32);
+        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
+        assert_eq!(toc.total_vectors, 11);
+        assert_eq!(toc.dims[0].dim_id, u32::MAX);
+        assert_eq!(toc.dims[0].block_data_offset, 23);
+        assert_eq!(toc.dims[0].skip_start, 16);
+        assert_eq!(toc.dims[0].num_blocks, 1);
+    }
 }

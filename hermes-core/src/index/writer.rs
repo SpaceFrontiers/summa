@@ -152,6 +152,9 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     flushed_segments: Arc<parking_lot::Mutex<Vec<PreparedSegment<D>>>>,
     /// Primary key dedup index (None if schema has no primary field)
     primary_key_index: Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+    /// Serializes async snapshot acquisition/loading across commits and
+    /// lifecycle-owned merge/reorder topology refreshes.
+    primary_key_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     /// Tracks the owned finalizer spawned by `PreparedCommit::commit`. The
     /// requesting future may disappear, but a second commit generation must
     /// not start until this one has made publication and worker state agree.
@@ -497,6 +500,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             num_workers,
         });
         let (doc_sender, workers) = Self::spawn_workers(&worker_state, num_workers);
+        let primary_key_index = Arc::new(parking_lot::RwLock::new(None));
+        let primary_key_refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
 
         Self {
             directory,
@@ -507,7 +512,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             worker_state,
             segment_manager,
             flushed_segments: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            primary_key_index: Arc::new(parking_lot::RwLock::new(None)),
+            primary_key_index,
+            primary_key_refresh_lock,
             commit_finalization: Arc::new(CommitFinalizationState::default()),
             pk_reservations_retained: Arc::new(AtomicBool::new(false)),
             writer_lock: parking_lot::RwLock::new(writer_lock),
@@ -628,11 +634,50 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         use super::primary_key::{PK_BLOOM_FILE, deserialize_pk_bloom};
 
         self.commit_finalization.wait_until_idle().await;
+        self.ensure_writer_lock()?;
 
         let field = match self.schema.primary_field() {
             Some(f) => f,
             None => return Ok(()),
         };
+
+        // A merge/reorder replacement can publish while this initialization
+        // performs async segment loads. Serialize both paths so an older
+        // initialization snapshot cannot overwrite the replacement refresh
+        // and keep retired source segments pinned indefinitely.
+        let _refresh_guard = self.primary_key_refresh_lock.lock().await;
+        {
+            let callback_directory = Arc::clone(&self.directory);
+            let callback_schema = Arc::clone(&self.schema);
+            let callback_manager = Arc::downgrade(&self.segment_manager);
+            let callback_primary_key = Arc::downgrade(&self.primary_key_index);
+            let callback_refresh_lock = Arc::downgrade(&self.primary_key_refresh_lock);
+            self.segment_manager.set_replacement_refresh(move || {
+                let directory = Arc::clone(&callback_directory);
+                let schema = Arc::clone(&callback_schema);
+                let manager = callback_manager.clone();
+                let primary_key = callback_primary_key.clone();
+                let refresh_lock = callback_refresh_lock.clone();
+                async move {
+                    let (Some(manager), Some(primary_key), Some(refresh_lock)) = (
+                        manager.upgrade(),
+                        primary_key.upgrade(),
+                        refresh_lock.upgrade(),
+                    ) else {
+                        return Ok(());
+                    };
+                    refresh_primary_key_snapshot(
+                        &directory,
+                        &schema,
+                        &manager,
+                        &primary_key,
+                        &refresh_lock,
+                        PrimaryKeyRefresh::Replacement,
+                    )
+                    .await
+                }
+            });
+        }
 
         let snapshot = self.segment_manager.acquire_snapshot().await;
         let current_seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
@@ -682,13 +727,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
             let pk_index = if new_start == pk_data.len() {
                 // Fast path: all segments covered by cache.
-                super::primary_key::PrimaryKeyIndex::from_persisted(
-                    field,
-                    bloom,
-                    pk_data,
-                    &[],
-                    snapshot,
-                )
+                super::primary_key::PrimaryKeyIndex::from_persisted(field, bloom, pk_data, snapshot)
             } else {
                 // Incremental: only iterate new segments' keys.
                 tokio::task::spawn_blocking(move || {
@@ -715,11 +754,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         );
                     }
                     super::primary_key::PrimaryKeyIndex::from_persisted(
-                        field,
-                        bloom,
-                        pk_data,
-                        &[],
-                        snapshot,
+                        field, bloom, pk_data, snapshot,
                     )
                 })
                 .await
@@ -759,15 +794,23 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         pk_index: &super::primary_key::PrimaryKeyIndex,
         segment_ids: &[String],
     ) {
-        use super::primary_key::{PK_BLOOM_FILE, serialize_pk_bloom};
+        use super::primary_key::PK_BLOOM_FILE;
 
-        let bloom_bytes = pk_index.bloom_to_bytes();
-        let data = serialize_pk_bloom(segment_ids, &bloom_bytes);
-        if let Err(e) = self
+        let writer = match self
             .directory
-            .write(std::path::Path::new(PK_BLOOM_FILE), &data)
+            .streaming_writer(std::path::Path::new(PK_BLOOM_FILE))
             .await
         {
+            Ok(writer) => writer,
+            Err(error) => {
+                log::warn!("[primary_key] failed to open bloom cache: {}", error);
+                return;
+            }
+        };
+        let result = crate::segment::block_in_place_if_multithread(|| {
+            write_pk_bloom_stream(pk_index, segment_ids, writer)
+        });
+        if let Err(e) = result {
             log::warn!("[primary_key] failed to persist bloom cache: {}", e);
         }
     }
@@ -1263,8 +1306,34 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Force merge all segments into one.
     pub async fn force_merge(&mut self) -> Result<()> {
+        self.force_merge_with_snapshot_refresh(|| std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Force merge while refreshing an external segment consumer after the
+    /// background-merge drain and every durable replacement.
+    ///
+    /// Segment publication refreshes the writer's primary-key topology through
+    /// the manager's lifecycle-owned hook. Servers use this callback to reload
+    /// their cached `IndexReader` as well.
+    pub async fn force_merge_with_snapshot_refresh<F, Fut>(
+        &mut self,
+        refresh_external: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         self.prepare_commit().await?.commit().await?;
-        self.segment_manager.force_merge().await
+
+        self.segment_manager
+            .force_merge_with_snapshot_refresh(refresh_external)
+            .await?;
+
+        // Segment IDs in the on-disk bloom cache need only the final
+        // generation. Persisting the unchanged bloom after every hierarchy
+        // level adds avoidable I/O on large primary-key indexes.
+        self.persist_replacement_snapshot().await
     }
 
     /// Reorder all segments via Recursive Graph Bisection (BP) for better BMP pruning.
@@ -1272,8 +1341,36 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Each segment is individually rebuilt with record-level BP reordering:
     /// ordinals are shuffled across blocks so that similar content clusters tightly.
     pub async fn reorder(&mut self) -> Result<()> {
+        self.reorder_with_snapshot_refresh(|| std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Reorder while refreshing an external reader after each durable segment
+    /// replacement, so retired sources are released during a long pass.
+    pub async fn reorder_with_snapshot_refresh<F, Fut>(&mut self, refresh_external: F) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         self.prepare_commit().await?.commit().await?;
-        self.segment_manager.reorder_segments().await
+
+        self.segment_manager
+            .reorder_segments_with_snapshot_refresh(refresh_external)
+            .await?;
+        self.persist_replacement_snapshot().await
+    }
+
+    /// Persist the final topology after a bounded series of replacements.
+    async fn persist_replacement_snapshot(&self) -> Result<()> {
+        refresh_primary_key_snapshot(
+            &self.directory,
+            &self.schema,
+            &self.segment_manager,
+            &self.primary_key_index,
+            &self.primary_key_refresh_lock,
+            PrimaryKeyRefresh::FinalReplacement,
+        )
+        .await
     }
 
     /// Get the segment manager (for background optimizer access).
@@ -1428,18 +1525,34 @@ struct OwnedCommitFinalization<D: DirectoryWriter + 'static> {
     schema: Arc<Schema>,
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     primary_key_index: Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+    primary_key_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     prepared: PreparedSegmentsGuard<D>,
     finalization: Option<CommitFinalizationGuard<D>>,
     publication_observed: Arc<AtomicBool>,
     pk_reservations_retained: Arc<AtomicBool>,
 }
 
-async fn refresh_primary_key_after_commit<D: DirectoryWriter + 'static>(
+#[derive(Clone, Copy)]
+enum PrimaryKeyRefresh {
+    /// A commit may introduce genuinely new keys and persists the cache.
+    Commit,
+    /// A merge/reorder only changes segment topology; keys are already in the
+    /// monotonic bloom and the intermediate segment IDs need not be persisted.
+    Replacement,
+    /// Final topology refresh: still no key hashing, but persist the new set of
+    /// segment IDs alongside the unchanged bloom.
+    FinalReplacement,
+}
+
+async fn refresh_primary_key_snapshot<D: DirectoryWriter + 'static>(
     directory: &Arc<D>,
     schema: &Arc<Schema>,
     segment_manager: &Arc<crate::merge::SegmentManager<D>>,
     primary_key_index: &Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+    primary_key_refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    refresh: PrimaryKeyRefresh,
 ) -> Result<()> {
+    let _refresh_guard = primary_key_refresh_lock.lock().await;
     let existing_ids: std::collections::HashSet<String> = {
         let guard = primary_key_index.read();
         let Some(pk_index) = guard.as_ref() else {
@@ -1466,26 +1579,55 @@ async fn refresh_primary_key_after_commit<D: DirectoryWriter + 'static>(
     let new_data = futures::future::try_join_all(load_futures).await?;
     let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
 
-    let bloom_file = {
+    let persist_bloom = {
         let mut guard = primary_key_index.write();
         let Some(pk_index) = guard.as_mut() else {
             return Ok(());
         };
-        pk_index.refresh_incremental(new_data, snapshot);
-        let bloom_bytes = pk_index.bloom_to_bytes();
-        super::primary_key::serialize_pk_bloom(&seg_ids, &bloom_bytes)
+        match refresh {
+            PrimaryKeyRefresh::Commit => pk_index.refresh_incremental(new_data, snapshot),
+            PrimaryKeyRefresh::Replacement | PrimaryKeyRefresh::FinalReplacement => {
+                pk_index.refresh_replacement(new_data, snapshot);
+            }
+        }
+        matches!(
+            refresh,
+            PrimaryKeyRefresh::Commit | PrimaryKeyRefresh::FinalReplacement
+        )
     };
 
-    if let Err(error) = directory
-        .write(
-            std::path::Path::new(super::primary_key::PK_BLOOM_FILE),
-            &bloom_file,
-        )
-        .await
-    {
-        log::warn!("[primary_key] failed to persist bloom cache: {}", error);
+    if persist_bloom {
+        let writer = match directory
+            .streaming_writer(std::path::Path::new(super::primary_key::PK_BLOOM_FILE))
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                log::warn!("[primary_key] failed to open bloom cache: {}", error);
+                return Ok(());
+            }
+        };
+        // The outer read guard prevents replacement of the PK index while the
+        // inner state lock streams its bloom. No corpus-sized Vec is created.
+        let guard = primary_key_index.read();
+        if let Some(pk_index) = guard.as_ref()
+            && let Err(error) = crate::segment::block_in_place_if_multithread(|| {
+                write_pk_bloom_stream(pk_index, &seg_ids, writer)
+            })
+        {
+            log::warn!("[primary_key] failed to persist bloom cache: {}", error);
+        }
     }
     Ok(())
+}
+
+fn write_pk_bloom_stream(
+    pk_index: &super::primary_key::PrimaryKeyIndex,
+    segment_ids: &[String],
+    mut writer: Box<dyn crate::directories::StreamingWriter>,
+) -> std::io::Result<()> {
+    pk_index.write_bloom_cache(segment_ids, writer.as_mut())?;
+    writer.finish()
 }
 
 async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
@@ -1521,11 +1663,13 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     // retaining the generation's uncommitted keys may cause conservative
     // duplicate rejections, but can never admit a duplicate or turn a durable
     // commit into an API error.
-    match refresh_primary_key_after_commit(
+    match refresh_primary_key_snapshot(
         &commit.directory,
         &commit.schema,
         &commit.segment_manager,
         &commit.primary_key_index,
+        &commit.primary_key_refresh_lock,
+        PrimaryKeyRefresh::Commit,
     )
     .await
     {
@@ -1588,6 +1732,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
             schema: Arc::clone(&self.writer.schema),
             segment_manager: Arc::clone(&self.writer.segment_manager),
             primary_key_index: Arc::clone(&self.writer.primary_key_index),
+            primary_key_refresh_lock: Arc::clone(&self.writer.primary_key_refresh_lock),
             prepared: PreparedSegmentsGuard {
                 segments: Some(segments),
                 retry_slot: Arc::clone(&self.writer.flushed_segments),

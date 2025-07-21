@@ -135,10 +135,9 @@ struct Args {
     #[arg(long, default_value = "3")]
     optimizer_max_unconverged_passes: u32,
 
-    /// Wall-clock budget in seconds for merge-time BP reorder. Must be finite;
-    /// 0 is invalid and falls back to 600 seconds. A truncated pass still
-    /// produces a valid, better-ordered segment; it is marked unconverged and
-    /// the background optimizer deepens it later.
+    /// Wall-clock budget in seconds for merge-time BP reorder (0 = unbudgeted).
+    /// A truncated pass still produces a valid, better-ordered segment; it is
+    /// marked unconverged and the background optimizer deepens it later.
     #[arg(long, default_value = "600")]
     merge_bp_budget_secs: u64,
 
@@ -351,12 +350,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .bp_memory_budget_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--bp-memory-budget-mb is too large"))?;
-    let merge_bp_budget_secs = if args.merge_bp_budget_secs == 0 {
-        warn!("--merge-bp-budget-secs=0 would leave giant merges unbounded; using 600 seconds");
-        600
-    } else {
-        args.merge_bp_budget_secs
-    };
+    let merge_bp_time_budget = merge_bp_time_budget(args.merge_bp_budget_secs);
     let concurrent_reorder_passes = args
         .optimizer_concurrent_passes
         .clamp(1, hermes_core::index::MAX_CONCURRENT_REORDER_PASSES);
@@ -427,7 +421,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         merge_policy: Box::new(merge_policy),
         max_concurrent_merges: args.max_concurrent_merges,
         background_merge_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent_merges)),
-        merge_bp_time_budget: Some(Duration::from_secs(merge_bp_budget_secs)),
+        merge_bp_time_budget,
         bp_memory_budget_bytes,
         background_reorder_permits: Arc::new(hermes_core::index::ReorderConcurrencyGate::new(
             concurrent_reorder_passes,
@@ -493,6 +487,13 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         args.max_merged_docs,
         args.max_segment_docs,
     );
+    match merge_bp_time_budget {
+        Some(budget) => info!(
+            "Merge BP time budget: {:.0}s per field",
+            budget.as_secs_f64()
+        ),
+        None => info!("Merge BP time budget: unbudgeted"),
+    }
     if args.optimizer_threads > 0 {
         info!(
             "Optimizer: {} shared BP threads, {} concurrent pass(es), {}s scan interval, {}-pass unconverged follow-up threshold",
@@ -572,6 +573,10 @@ async fn shutdown_signal() {
     }
 }
 
+fn merge_bp_time_budget(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +597,11 @@ mod tests {
         .unwrap();
         assert_eq!(configured.vector_training_max_samples, 20_000_000);
         assert_eq!(configured.vector_training_memory_mb, 3_072);
+    }
+
+    #[test]
+    fn zero_merge_bp_budget_is_unbudgeted() {
+        assert_eq!(merge_bp_time_budget(0), None);
+        assert_eq!(merge_bp_time_budget(600), Some(Duration::from_secs(600)));
     }
 }

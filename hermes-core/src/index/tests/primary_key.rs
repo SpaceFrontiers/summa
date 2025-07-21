@@ -562,6 +562,65 @@ async fn test_dedup_reopen_existing_index() {
     writer2.commit().await.unwrap();
 }
 
+#[tokio::test]
+async fn test_force_merge_refreshes_primary_key_snapshot_per_batch() {
+    let (schema, pk, title) = make_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        num_indexing_threads: 1,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+
+    let mut writer = IndexWriter::create(dir.clone(), schema, config)
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+
+    writer
+        .add_document(make_doc(pk, title, "first", "one"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .add_document(make_doc(pk, title, "second", "two"))
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    let old_segment_ids = writer.segment_manager().get_segment_ids().await;
+    assert_eq!(old_segment_ids.len(), 2);
+    let tracker = writer.segment_manager().tracker();
+    assert!(
+        old_segment_ids
+            .iter()
+            .all(|segment_id| tracker.ref_count(segment_id) > 0),
+        "the primary-key index must hold the pre-merge snapshot"
+    );
+
+    writer.force_merge().await.unwrap();
+    writer.segment_manager().wait_for_shutdown().await;
+
+    assert_eq!(writer.segment_manager().get_segment_ids().await.len(), 1);
+    for old_id in old_segment_ids {
+        assert_eq!(
+            tracker.ref_count(&old_id),
+            0,
+            "force merge retained an old primary-key segment snapshot"
+        );
+        let segment_id = crate::segment::SegmentId::from_hex(&old_id).unwrap();
+        let old_paths = crate::segment::SegmentFiles::new(segment_id.0).lifecycle_paths();
+        let remaining = dir.list_files_sync(std::path::Path::new("")).unwrap();
+        assert!(
+            old_paths.iter().all(|path| !remaining.contains(path)),
+            "retired source files remain after the primary-key snapshot refresh"
+        );
+    }
+
+    let error = writer
+        .add_document(make_doc(pk, title, "first", "duplicate"))
+        .unwrap_err();
+    assert!(matches!(error, Error::DuplicatePrimaryKey(_)));
+}
+
 // ---------------------------------------------------------------------------
 // Batch: some succeed, some fail — partial success
 // ---------------------------------------------------------------------------

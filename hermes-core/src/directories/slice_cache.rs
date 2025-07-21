@@ -731,6 +731,10 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
         ))
     }
 
+    fn local_path(&self, path: &Path) -> Option<PathBuf> {
+        self.inner.local_path(path)
+    }
+
     fn set_index_label(&self, label: &str) {
         self.label.set(label);
         self.inner.set_index_label(label);

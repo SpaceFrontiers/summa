@@ -132,6 +132,10 @@ impl Directory for MmapDirectory {
     fn set_index_label(&self, label: &str) {
         self.label.set(label);
     }
+
+    fn local_path(&self, path: &Path) -> Option<PathBuf> {
+        Some(self.resolve(path))
+    }
 }
 
 #[async_trait]
