@@ -66,6 +66,21 @@ pub fn tq_codes_column_len_checked(count: usize, code_size: usize) -> Option<usi
         .checked_mul(tq_block_bytes(code_size))
 }
 
+/// Bytes of one IVF-TQ scoring block: 16 f32 residual scales + 16 f32 gammas
+/// + 16 packed nibble rows.
+#[inline]
+pub const fn tq_ivf_block_bytes(code_size: usize) -> usize {
+    TQ_BLOCK_LANES * (2 * size_of::<f32>() + code_size)
+}
+
+/// Overflow-checked IVF-TQ codes-column length for untrusted header values.
+#[inline]
+pub fn tq_ivf_codes_column_len_checked(count: usize, code_size: usize) -> Option<usize> {
+    count
+        .div_ceil(TQ_BLOCK_LANES)
+        .checked_mul(tq_ivf_block_bytes(code_size))
+}
+
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -341,12 +356,26 @@ impl TqCodec {
         nibbles: &mut [u8],
         scratch: &mut TqEncodeScratch,
     ) -> f32 {
+        self.encode_residual_into(vector, nibbles, scratch).1
+    }
+
+    /// Encode one (possibly non-unit) vector as `scale · unit_direction` and
+    /// return `(scale = ‖vector‖₂, gamma)`. IVF leaves store centroid
+    /// residuals, whose norms carry ranking information; `scale` restores it
+    /// at score time. Zero vectors encode as all-zero nibbles with
+    /// `scale = gamma = 0`.
+    pub fn encode_residual_into(
+        &self,
+        vector: &[f32],
+        nibbles: &mut [u8],
+        scratch: &mut TqEncodeScratch,
+    ) -> (f32, f32) {
         assert_eq!(vector.len(), self.dim, "TQ encode dimension mismatch");
         assert_eq!(nibbles.len(), self.padded_dim, "TQ nibble buffer mismatch");
         let norm = crate::structures::simd::dot_product_f32(vector, vector, vector.len()).sqrt();
         if !norm.is_finite() || norm <= 0.0 {
             nibbles.fill(0);
-            return 0.0;
+            return (0.0, 0.0);
         }
         scratch.normalized.clear();
         scratch
@@ -385,7 +414,7 @@ impl TqCodec {
         for (nibble, &rotated) in nibbles.iter_mut().zip(scratch.rotated_residual.iter()) {
             *nibble |= u8::from(rotated >= 0.0);
         }
-        residual_norm_sq.sqrt()
+        (norm, residual_norm_sq.sqrt())
     }
 }
 
@@ -567,6 +596,31 @@ pub fn tq_pack_block(rows: &[&[u8]], gammas: &[f32], padded_dim: usize, output: 
         let gamma = gammas.get(lane).copied().unwrap_or(0.0);
         output.extend_from_slice(&gamma.to_le_bytes());
     }
+    pack_nibble_rows(rows, padded_dim, output);
+}
+
+/// Pack an IVF-TQ block: per-lane residual scales, gammas, then nibbles.
+pub fn tq_pack_ivf_block(
+    rows: &[&[u8]],
+    scales: &[f32],
+    gammas: &[f32],
+    padded_dim: usize,
+    output: &mut Vec<u8>,
+) {
+    assert!(rows.len() <= TQ_BLOCK_LANES && rows.len() == gammas.len());
+    assert_eq!(scales.len(), gammas.len());
+    for lane in 0..TQ_BLOCK_LANES {
+        let scale = scales.get(lane).copied().unwrap_or(0.0);
+        output.extend_from_slice(&scale.to_le_bytes());
+    }
+    for lane in 0..TQ_BLOCK_LANES {
+        let gamma = gammas.get(lane).copied().unwrap_or(0.0);
+        output.extend_from_slice(&gamma.to_le_bytes());
+    }
+    pack_nibble_rows(rows, padded_dim, output);
+}
+
+fn pack_nibble_rows(rows: &[&[u8]], padded_dim: usize, output: &mut Vec<u8>) {
     for dim in 0..padded_dim {
         for byte_index in 0..TQ_BLOCK_LANES / 2 {
             let low = rows.get(byte_index).map_or(0, |row| row[dim] & 0x0F);
@@ -575,6 +629,47 @@ pub fn tq_pack_block(rows: &[&[u8]], gammas: &[f32], padded_dim: usize, output: 
                 .map_or(0, |row| row[dim] & 0x0F);
             output.push(low | (high << 4));
         }
+    }
+}
+
+/// Score one IVF-TQ block: `score[lane] = cluster_dot + scale · (base +
+/// gamma · qjl)`, where `cluster_dot = ⟨normalized query, centroid⟩` is the
+/// probed cluster's shared contribution and `scale = ‖residual‖`.
+pub fn tq_score_ivf_block(
+    plan: &TqQueryPlan,
+    block: &[u8],
+    cluster_dot: f32,
+    scores: &mut [f32; TQ_BLOCK_LANES],
+) {
+    debug_assert_eq!(block.len(), tq_ivf_block_bytes(plan.padded_dim() / 2));
+    let lane_f32 = TQ_BLOCK_LANES * size_of::<f32>();
+    let (scale_bytes, rest) = block.split_at(lane_f32);
+    let (gamma_bytes, nibble_bytes) = rest.split_at(lane_f32);
+    let mut base = [0i32; TQ_BLOCK_LANES];
+    let mut qjl = [0i32; TQ_BLOCK_LANES];
+    lut16::accumulate_block(
+        &plan.base_lut_i8,
+        &plan.qjl_lut_i8,
+        nibble_bytes,
+        plan.padded_dim,
+        &mut base,
+        &mut qjl,
+    );
+    for lane in 0..TQ_BLOCK_LANES {
+        let scale = f32::from_le_bytes(
+            scale_bytes[lane * 4..lane * 4 + 4]
+                .try_into()
+                .expect("scale slice is 4 bytes"),
+        );
+        let gamma = f32::from_le_bytes(
+            gamma_bytes[lane * 4..lane * 4 + 4]
+                .try_into()
+                .expect("gamma slice is 4 bytes"),
+        );
+        scores[lane] = cluster_dot
+            + scale
+                * (base[lane] as f32 * plan.base_dequant
+                    + gamma * qjl[lane] as f32 * plan.qjl_dequant);
     }
 }
 

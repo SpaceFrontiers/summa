@@ -1,6 +1,6 @@
 # TurboQuant (TQ) — training-free dense ANN codec
 
-Status: implemented (v1, `AnnKind::TqFlat`).
+Status: implemented (v1 `AnnKind::TqFlat`, v1.1 adds `AnnKind::IvfTq`).
 
 ## Motivation
 
@@ -109,9 +109,35 @@ works unchanged. `build_vector_index()` skips TQ fields (nothing to train).
 Non-power-of-two dims pay FWHT padding (768 → 1024, +33%). A structured
 non-pow2 transform (Kac walk / block butterfly) is possible follow-up work.
 
+## IVF-TQ (`index_type: ivf_tq`)
+
+Sub-linear probing with the training-free leaf codec: the trained global
+coarse router (same `build_vector_index()` machinery, HNSW/SOAR supported)
+plus TQ codes of the centroid residual `r = x − c` per leaf. Residual norms
+carry ranking information, so each vector stores `scale = ‖r‖` next to
+`gamma`, and the leaf estimate is
+
+```
+⟨q̂, x⟩ = ⟨q̂, c⟩ + scale · est⟨q̂, r̂⟩
+```
+
+Because residuals are encoded in absolute rotated space (not per-cluster
+tables), the whole query needs **one** LUT set plus one `⟨q̂,c⟩` scalar per
+probed cluster — plan build is `O(P·16 + nprobe·dim)` instead of IVF-PQ's
+`nprobe` ADC tables (which dominated its measured per-query cost). Blocks are
+`[16 scales][16 gammas][nibbles]`; runs are per-leaf, merges byte-copy.
+On disk `quantizer_version` is the trained centroid generation and
+`codebook_version` carries the codec fingerprint; only centroids are stored
+as trained artifacts (`codebook_file` must be absent).
+
+```sdl
+field e: dense_vector<768, f16> [indexed<ivf_tq, num_clusters: 1024, nprobe: 64>]
+```
+
+`num_clusters`, `nprobe`, `routing`, and `soar` all apply (unlike `tq`).
+
 ## Explicit non-goals in v1
 
-- No IVF-routed TQ leaves (would reuse trained coarse centroids; follow-up).
 - No configurable bit width (4 = 3+1 fixed; header carries it for evolution).
 - No WASM in-browser TQ _encoding_ (WASM reads native-built payloads;
   `LocalIndex` encode support is a follow-up).

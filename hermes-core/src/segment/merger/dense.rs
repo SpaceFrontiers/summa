@@ -344,6 +344,24 @@ impl SegmentMerger {
                                 data_offset,
                                 writer.offset() - data_offset,
                             ))
+                        } else if let Some((index, num_clusters)) = self
+                            .rebuild_ivf_tq(field, config, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_ivf_tq(
+                                    &index,
+                                    num_clusters,
+                                    &mut writer,
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::IVF_TQ_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
                         } else {
                             None
                         }
@@ -431,6 +449,15 @@ impl SegmentMerger {
             }
             return Ok(None);
         };
+
+        if entry.field_type == FieldType::DenseVector
+            && let Some(config) = entry
+                .dense_vector_config
+                .as_ref()
+                .filter(|config| config.index_type == VectorIndexType::IvfTq)
+        {
+            return self.copy_ivf_tq_runs(field, config, segments, doc_offs, Some(trained), writer);
+        }
 
         let mut sources = Vec::new();
         let index_type = match entry.field_type {
@@ -732,6 +759,169 @@ impl SegmentMerger {
             data_offset,
             writer.offset() - data_offset,
         )))
+    }
+
+    /// Byte-copy compatible IVF-TQ run columns (the ordinary merge path for
+    /// `ivf_tq` fields). Generation compatibility is the trained centroid
+    /// version plus the derived codec fingerprint.
+    fn copy_ivf_tq_runs(
+        &self,
+        field: crate::dsl::Field,
+        config: &crate::dsl::DenseVectorConfig,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+        writer: &mut OffsetWriter,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let has_source_ann = segments
+            .iter()
+            .any(|segment| segment.vector_indexes().contains_key(&field.0));
+        let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field.0)) else {
+            if has_source_ann {
+                return Err(crate::Error::Corruption(format!(
+                    "IVF-TQ field {} has payloads but no global centroids",
+                    field.0,
+                )));
+            }
+            return Ok(None);
+        };
+        let expected_fingerprint =
+            crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
+        let max_assignments = centroids
+            .soar_config
+            .as_ref()
+            .map_or(1, |soar| 1usize.saturating_add(soar.num_secondary));
+        let mut sources = Vec::new();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            let Some(crate::segment::VectorIndex::IvfTq { index, .. }) =
+                segment.vector_indexes().get(&field.0)
+            else {
+                return Err(crate::Error::Corruption(format!(
+                    "ordinary merge source {:032x} field {} is missing its IVF-TQ payload",
+                    segment.meta().id,
+                    field.0,
+                )));
+            };
+            let disk = index.get();
+            let header = disk.header();
+            let max_vectors = flat
+                .num_vectors
+                .checked_mul(max_assignments)
+                .ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "IVF-TQ assignment count overflows for field {}",
+                        field.0,
+                    ))
+                })?;
+            if header.dim != config.dim
+                || header.num_clusters != centroids.num_clusters
+                || header.quantizer_version != centroids.version
+                || header.codebook_version != expected_fingerprint
+                || header.routing != config.ivf_routing
+                || !(flat.num_vectors..=max_vectors).contains(&header.vector_count)
+            {
+                return Err(crate::Error::Corruption(format!(
+                    "ordinary merge source {:032x} field {} uses an incompatible IVF-TQ generation",
+                    segment.meta().id,
+                    field.0,
+                )));
+            }
+            sources.push((disk, doc_offs[segment_index]));
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let data_offset = writer.offset();
+        super::block_in_place_if_multithread(|| {
+            crate::segment::ann_disk::write_merged_ann(&sources, writer)
+        })
+        .map_err(crate::Error::Io)?;
+        let data_size = writer.offset() - data_offset;
+        log::debug!(
+            "[merge_vectors] field {}: copied {} compatible IVF-TQ run source(s), {} bytes",
+            field.0,
+            sources.len(),
+            data_size,
+        );
+        Ok(Some((
+            crate::segment::ann_build::IVF_TQ_TYPE,
+            data_offset,
+            data_size,
+        )))
+    }
+
+    /// Rebuild the IVF-TQ index for a vector-generation rewrite: re-assign
+    /// every flat vector against the supplied centroid generation and
+    /// re-encode residuals with the derived codec.
+    async fn rebuild_ivf_tq(
+        &self,
+        field: crate::dsl::Field,
+        config: Option<&crate::dsl::DenseVectorConfig>,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<(crate::structures::IvfTqIndex, u32)>> {
+        let Some(config) = config.filter(|config| config.index_type == VectorIndexType::IvfTq)
+        else {
+            return Ok(None);
+        };
+        let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field.0)) else {
+            return Ok(None);
+        };
+
+        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(config.dim));
+        let mut index = crate::structures::IvfTqIndex::new(
+            config.dim,
+            config.ivf_routing,
+            centroids.version,
+            codec,
+        );
+        let mut total_fed = 0usize;
+        let ann_start = std::time::Instant::now();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let fed = feed_segment(
+                segment,
+                field,
+                doc_offs[segment_index],
+                |labels, vectors| {
+                    super::block_in_place_if_multithread(|| {
+                        let mut add = || index.add_vectors_parallel(centroids, labels, vectors);
+                        if let Some(pool) = &self.background_pool {
+                            pool.install(add)
+                        } else {
+                            add()
+                        }
+                    })
+                    .map_err(|error| {
+                        crate::Error::Internal(format!(
+                            "parallel IVF-TQ rebuild failed for field {}: {error}",
+                            field.0,
+                        ))
+                    })
+                },
+            )
+            .await?;
+            total_fed = total_fed.checked_add(fed).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "IVF-TQ rebuild vector count overflows for field {}",
+                    field.0,
+                ))
+            })?;
+        }
+        if total_fed == 0 {
+            return Ok(None);
+        }
+        log::info!(
+            "[merge_vectors] field {} IVF-TQ rebuilt from {} vectors into {} assignments ({:.1}s)",
+            field.0,
+            total_fed,
+            index.len(),
+            ann_start.elapsed().as_secs_f64()
+        );
+        Ok(Some((index, centroids.num_clusters)))
     }
 
     /// Rebuild the binary IVF index for a vector-generation rewrite.

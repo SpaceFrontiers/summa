@@ -148,7 +148,7 @@ index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | ro
 //   token_position - only token position within text for phrase queries
 positions_kwarg = { "positions" | "ordinal" | "token_position" }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
-index_type_spec = { "flat" | "ivf_pq" | "ivf" | "tq" }
+index_type_spec = { "flat" | "ivf_pq" | "ivf_tq" | "ivf" | "tq" }
 num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
 num_clusters_spec = @{ ASCII_DIGIT+ }
 nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }

@@ -47,6 +47,9 @@ enum TrainedFieldArtifacts {
         codebook: crate::structures::PQCodebook,
         pq_sample_count: usize,
     },
+    /// IVF-TQ: only the coarse router is trained; the TQ leaf codec is
+    /// derived from the dimension.
+    FloatCentroids(crate::structures::CoarseCentroids),
     Binary(crate::structures::BinaryCoarseQuantizer),
 }
 
@@ -822,6 +825,19 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     pq_sample_count,
                 }
             }
+            (IvfFieldConfig::Float(config), TrainingSample::Float(vectors))
+                if config.index_type == VectorIndexType::IvfTq =>
+            {
+                let mut coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters)
+                    .with_routing(config.ivf_routing);
+                if let Some(soar) = config.soar.clone() {
+                    coarse_config = coarse_config.with_soar(soar);
+                }
+                TrainedFieldArtifacts::FloatCentroids(crate::structures::CoarseCentroids::train(
+                    &coarse_config,
+                    vectors,
+                ))
+            }
             (IvfFieldConfig::Binary(config), TrainingSample::Binary(codes)) => {
                 let mut binary_config = crate::structures::BinaryIvfConfig::new(dim, num_clusters);
                 binary_config.max_train_samples = sample_count;
@@ -844,6 +860,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         let actual_num_clusters = match &artifacts {
             TrainedFieldArtifacts::Float { centroids, .. } => centroids.num_clusters as usize,
+            TrainedFieldArtifacts::FloatCentroids(centroids) => centroids.num_clusters as usize,
             TrainedFieldArtifacts::Binary(quantizer) => quantizer.num_clusters as usize,
         };
         Ok(TrainedFieldModel {
@@ -882,6 +899,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     update.field_id,
                     centroids.num_clusters,
                     pq_sample_count,
+                );
+            }
+            TrainedFieldArtifacts::FloatCentroids(centroids) => {
+                self.save_trained_artifact(&centroids, &update.centroids_file)
+                    .await?;
+                log::info!(
+                    "Saved IVF-TQ coarse artifact for field {} ({} clusters; leaf codec is derived)",
+                    update.field_id,
+                    centroids.num_clusters,
                 );
             }
             TrainedFieldArtifacts::Binary(quantizer) => {

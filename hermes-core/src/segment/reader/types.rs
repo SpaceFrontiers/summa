@@ -25,6 +25,11 @@ pub enum VectorIndex {
         index: Arc<MmapAnnIndex>,
         codec: Arc<crate::structures::TqCodec>,
     },
+    /// IVF-TQ payload: trained coarse router, TurboQuant residual leaves.
+    IvfTq {
+        index: Arc<MmapAnnIndex>,
+        codec: Arc<crate::structures::TqCodec>,
+    },
 }
 
 /// Thin public wrapper around the shared mmap ANN representation. Its internals
@@ -70,7 +75,7 @@ impl VectorIndex {
         match self {
             VectorIndex::IvfPq(lazy) => lazy.estimated_heap_bytes(),
             VectorIndex::BinaryIvf(lazy) => lazy.estimated_heap_bytes(),
-            VectorIndex::Tq { index, codec } => {
+            VectorIndex::Tq { index, codec } | VectorIndex::IvfTq { index, codec } => {
                 index.estimated_heap_bytes() + codec.estimated_memory_bytes()
             }
         }
@@ -84,7 +89,10 @@ impl VectorIndex {
         report: &mut crate::segment::pin::PinReport,
     ) {
         let index = match self {
-            Self::IvfPq(index) | Self::BinaryIvf(index) | Self::Tq { index, .. } => index,
+            Self::IvfPq(index)
+            | Self::BinaryIvf(index)
+            | Self::Tq { index, .. }
+            | Self::IvfTq { index, .. } => index,
         };
         if let Some(index) = Arc::get_mut(index) {
             index.pin_lookup_directory(mode, remaining, report);

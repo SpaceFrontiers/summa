@@ -262,6 +262,23 @@ pub(super) fn build_vectors_streaming(
                         &builder.vectors,
                     )
                     .map(|b| (super::super::ann_build::TQ_FLAT_TYPE, b)),
+                    VectorIndexType::IvfTq => {
+                        // Only the coarse router is trained; segments stay
+                        // flat until a generation exists (same as IVF-PQ).
+                        let Some(centroids) =
+                            trained.and_then(|trained| trained.centroids.get(field_id))
+                        else {
+                            return Ok(None);
+                        };
+                        super::super::ann_build::build_ivf_tq(
+                            dim,
+                            config.ivf_routing,
+                            centroids,
+                            &builder.doc_ids,
+                            &builder.vectors,
+                        )
+                        .map(|b| (super::super::ann_build::IVF_TQ_TYPE, b))
+                    }
                     _ => return Ok(None),
                 };
                 let (index_type, bytes) = blob?;

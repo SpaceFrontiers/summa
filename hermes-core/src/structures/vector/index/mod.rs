@@ -5,11 +5,13 @@
 
 mod binary_ivf;
 mod ivf_pq;
+mod ivf_tq;
 
 #[cfg(feature = "native")]
 pub(crate) use binary_ivf::BinaryIvfBuilder;
 pub use binary_ivf::{BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex};
 pub use ivf_pq::{IVFPQConfig, IVFPQIndex, IvfPqQueryPlan};
+pub use ivf_tq::{IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan};
 
 #[derive(Clone, Copy)]
 struct RankedEntry {

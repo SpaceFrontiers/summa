@@ -843,6 +843,7 @@ fn validate_ivf_pq_ann(
 pub struct DensePlanCache {
     pub(crate) ivf_pq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
     pub(crate) tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqQueryPlan>>>,
+    pub(crate) ivf_tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqIvfQueryPlan>>>,
 }
 
 /// Search one segment's TQ payload, reusing the per-query plan across
@@ -899,6 +900,96 @@ fn validate_tq_ann(
     {
         return Err(Error::Corruption(format!(
             "TQ payload for field {} does not match the codec derived from schema dimension {dim}",
+            field.0,
+        )));
+    }
+    Ok(())
+}
+
+/// Search one segment's IVF-TQ payload. The probe route, the `⟨q̂,c⟩`
+/// scalars, and the TQ LUTs are all query-global, so the plan is cached and
+/// shared across every segment of the field (same rule as `float_query_plan`).
+#[allow(clippy::too_many_arguments)]
+fn search_ivf_tq_segment(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    centroids: &CoarseCentroids,
+    codec: &crate::structures::TqCodec,
+    query: &[f32],
+    fetch_k: usize,
+    field: Field,
+    nprobe: usize,
+    routing: crate::dsl::IvfRoutingMode,
+    plan_cache: Option<
+        &std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqIvfQueryPlan>>>,
+    >,
+) -> Result<Vec<RawVectorCandidate>> {
+    let effective_nprobe = nprobe.clamp(1, centroids.num_clusters as usize);
+    let request_fingerprint = crate::structures::vector::ivf::routing::float_probe_fingerprint(
+        query,
+        effective_nprobe,
+        routing,
+    );
+    let build = || {
+        std::sync::Arc::new(crate::structures::TqIvfQueryPlan::build(
+            centroids,
+            codec,
+            query,
+            effective_nprobe,
+            routing,
+        ))
+    };
+    let plan = match plan_cache {
+        Some(cache) => {
+            let mut cached = cache
+                .lock()
+                .map_err(|_| Error::Internal("IVF-TQ plan cache is poisoned".into()))?;
+            match cached.as_ref() {
+                Some(plan)
+                    if plan.quantizer_version == centroids.version
+                        && plan.fingerprint == codec.fingerprint()
+                        && plan.request_fingerprint == request_fingerprint
+                        && plan.cluster_ids.len() == effective_nprobe =>
+                {
+                    std::sync::Arc::clone(plan)
+                }
+                _ => {
+                    let plan = build();
+                    *cached = Some(std::sync::Arc::clone(&plan));
+                    plan
+                }
+            }
+        }
+        None => build(),
+    };
+    index
+        .search_ivf_tq_distinct(fetch_k, &plan)
+        .map_err(|error| {
+            Error::Corruption(format!(
+                "invalid IVF-TQ payload for field {}: {error}",
+                field.0
+            ))
+        })
+}
+
+fn validate_ivf_tq_ann(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    centroids: &CoarseCentroids,
+    codec: &crate::structures::TqCodec,
+    dim: usize,
+    routing: crate::dsl::IvfRoutingMode,
+    field: Field,
+) -> Result<()> {
+    let header = index.header();
+    if header.dim != dim
+        || codec.dim() != dim
+        || header.code_size != codec.code_size()
+        || header.num_clusters != centroids.num_clusters
+        || header.quantizer_version != centroids.version
+        || header.codebook_version != codec.fingerprint()
+        || header.routing != routing
+    {
+        return Err(Error::Corruption(format!(
+            "IVF-TQ payload for field {} does not match its quantizer/codec generation",
             field.0,
         )));
     }
@@ -2090,6 +2181,40 @@ impl SegmentReader {
                         plan_cache.map(|cache| &cache.tq),
                     )?
                 }
+                VectorIndex::IvfTq { index: lazy, codec } => {
+                    let index = lazy.get();
+                    let centroids =
+                        self.trained_vectors
+                            .centroids
+                            .get(&field.0)
+                            .ok_or_else(|| {
+                                Error::Schema(format!(
+                                    "IVF-TQ index requires coarse centroids for field {}",
+                                    field.0
+                                ))
+                            })?;
+                    validate_coarse_centroids(centroids, params.dim)?;
+                    let routing = self
+                        .schema
+                        .get_field_entry(field)
+                        .and_then(|entry| entry.dense_vector_config.as_ref())
+                        .map_or(crate::dsl::IvfRoutingMode::Auto, |config| {
+                            config.ivf_routing
+                        });
+                    validate_ivf_tq_ann(index, centroids, codec, params.dim, routing, field)?;
+                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
+                    search_ivf_tq_segment(
+                        index,
+                        centroids,
+                        codec,
+                        query,
+                        fetch_k.min(flat.num_docs_with_vectors()),
+                        field,
+                        params.nprobe,
+                        routing,
+                        plan_cache.map(|cache| &cache.ivf_tq),
+                    )?
+                }
                 VectorIndex::BinaryIvf(_) => {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
                     Vec::new()
@@ -2148,6 +2273,7 @@ impl SegmentReader {
                 Some(VectorIndex::IvfPq(_)) => "ivf_pq",
                 Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
                 Some(VectorIndex::Tq { .. }) => "tq_flat",
+                Some(VectorIndex::IvfTq { .. }) => "ivf_tq",
                 None => "flat",
             };
             crate::observe::dense_l1(
@@ -2739,6 +2865,40 @@ impl SegmentReader {
                         field,
                         params.dim,
                         plan_cache.map(|cache| &cache.tq),
+                    )?
+                }
+                VectorIndex::IvfTq { index: lazy, codec } => {
+                    let index = lazy.get();
+                    let centroids =
+                        self.trained_vectors
+                            .centroids
+                            .get(&field.0)
+                            .ok_or_else(|| {
+                                Error::Schema(format!(
+                                    "IVF-TQ index requires coarse centroids for field {}",
+                                    field.0
+                                ))
+                            })?;
+                    validate_coarse_centroids(centroids, params.dim)?;
+                    let routing = self
+                        .schema
+                        .get_field_entry(field)
+                        .and_then(|entry| entry.dense_vector_config.as_ref())
+                        .map_or(crate::dsl::IvfRoutingMode::Auto, |config| {
+                            config.ivf_routing
+                        });
+                    validate_ivf_tq_ann(index, centroids, codec, params.dim, routing, field)?;
+                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
+                    search_ivf_tq_segment(
+                        index,
+                        centroids,
+                        codec,
+                        query,
+                        fetch_k.min(flat.num_docs_with_vectors()),
+                        field,
+                        params.nprobe,
+                        routing,
+                        plan_cache.map(|cache| &cache.ivf_tq),
                     )?
                 }
                 VectorIndex::BinaryIvf(_) => {

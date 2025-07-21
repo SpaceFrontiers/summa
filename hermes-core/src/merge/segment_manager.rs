@@ -2296,6 +2296,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 {
                     matches!(ann, Some(crate::segment::VectorIndex::Tq { .. }))
                 }
+                crate::dsl::FieldType::DenseVector
+                    if entry.dense_vector_config.as_ref().is_some_and(|config| {
+                        config.index_type == crate::dsl::VectorIndexType::IvfTq
+                    }) =>
+                {
+                    matches!(ann, Some(crate::segment::VectorIndex::IvfTq { .. }))
+                }
                 crate::dsl::FieldType::DenseVector => {
                     matches!(ann, Some(crate::segment::VectorIndex::IvfPq(_)))
                 }

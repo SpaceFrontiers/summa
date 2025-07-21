@@ -42,6 +42,8 @@ pub(crate) enum AnnKind {
     BinaryIvf = 2,
     /// TurboQuant flat scan: single logical cluster, block-packed codes.
     TqFlat = 3,
+    /// Trained IVF router with TurboQuant-coded centroid residuals.
+    IvfTq = 4,
 }
 
 impl AnnKind {
@@ -50,6 +52,7 @@ impl AnnKind {
             1 => Ok(Self::IvfPq),
             2 => Ok(Self::BinaryIvf),
             3 => Ok(Self::TqFlat),
+            4 => Ok(Self::IvfTq),
             _ => Err(invalid_data(format!("unknown ANN kind {value}"))),
         }
     }
@@ -63,11 +66,15 @@ fn expected_codes_column_len(kind: AnnKind, count: usize, code_size: usize) -> i
         AnnKind::IvfPq | AnnKind::BinaryIvf => count
             .checked_mul(code_size)
             .ok_or_else(|| invalid_data("ANN code column size overflows usize")),
-        // Single source of truth for the block-packed layout lives in tq.rs.
+        // Single source of truth for the block-packed layouts lives in tq.rs.
         AnnKind::TqFlat => {
             crate::structures::vector::quantization::tq_codes_column_len_checked(count, code_size)
                 .ok_or_else(|| invalid_data("TQ code column size overflows usize"))
         }
+        AnnKind::IvfTq => crate::structures::vector::quantization::tq_ivf_codes_column_len_checked(
+            count, code_size,
+        )
+        .ok_or_else(|| invalid_data("IVF-TQ code column size overflows usize")),
     }
 }
 
@@ -362,6 +369,49 @@ impl AnnDiskIndex {
         Ok(collector.into_sorted_results())
     }
 
+    /// Score the probed IVF-TQ leaves and keep the top `k` distinct
+    /// documents by estimated similarity (`⟨q̂,c⟩ + scale·⟨q̂,r̂⟩`).
+    pub(crate) fn search_ivf_tq_distinct(
+        &self,
+        k: usize,
+        plan: &crate::structures::TqIvfQueryPlan,
+    ) -> io::Result<Vec<(u32, u16, f32)>> {
+        use crate::structures::vector::quantization::{
+            TQ_BLOCK_LANES, tq_ivf_block_bytes, tq_score_ivf_block,
+        };
+
+        let tq_plan = plan.tq_plan();
+        if tq_plan.padded_dim() != self.header.code_size * 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IVF-TQ query plan does not match the payload dimension",
+            ));
+        }
+        let block_bytes = tq_ivf_block_bytes(self.header.code_size);
+        let bytes = self.raw.as_slice();
+        let mut collector = BoundedAnnCollector::<true, true>::new(k);
+        let mut scores = [0.0f32; TQ_BLOCK_LANES];
+        for (cluster_id, cluster_dot) in plan.cluster_dots() {
+            for run in self.cluster_runs(cluster_id) {
+                let codes = &bytes[run.codes.clone()];
+                for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                    tq_score_ivf_block(tq_plan, block, cluster_dot, &mut scores);
+                    let lane_base = block_index * TQ_BLOCK_LANES;
+                    let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                    for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                        let index = lane_base + lane;
+                        collector.insert(
+                            run_doc_id(bytes, run, index)?,
+                            read_u16(bytes, run.ordinals.start + index * 2),
+                            score,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(collector.into_sorted_results())
+    }
+
     pub(crate) fn search_binary_clusters<const BY_DOCUMENT: bool>(
         &self,
         query: &[u8],
@@ -484,6 +534,78 @@ pub(crate) fn write_built_binary_ivf(
             num_clusters: index.num_clusters,
             quantizer_version: index.quantizer_version,
             codebook_version: 0,
+            vector_count: index.len(),
+        },
+        &runs,
+        writer,
+    )
+}
+
+/// Serialize a populated IVF-TQ build: one run per non-empty leaf, codes
+/// block-packed per run (scales + gammas + dimension-major nibbles).
+#[cfg(feature = "native")]
+pub(crate) fn write_built_ivf_tq(
+    index: &crate::structures::IvfTqIndex,
+    num_clusters: u32,
+    writer: &mut (impl Write + ?Sized),
+) -> io::Result<u64> {
+    use crate::structures::vector::quantization::{TQ_BLOCK_LANES, tq_pack_ivf_block};
+
+    let codec = index.codec();
+    let padded_dim = codec.padded_dim();
+    let mut clusters: Vec<_> = index.clusters.iter().collect();
+    clusters.sort_unstable_by_key(|(cluster_id, _)| **cluster_id);
+    let packed: Vec<(u32, Vec<u8>)> = clusters
+        .iter()
+        .map(|&(&cluster_id, cluster)| {
+            let mut codes = Vec::with_capacity(
+                crate::structures::vector::quantization::tq_ivf_codes_column_len_checked(
+                    cluster.doc_ids.len(),
+                    codec.code_size(),
+                )
+                .unwrap_or_default(),
+            );
+            for block_start in (0..cluster.doc_ids.len()).step_by(TQ_BLOCK_LANES) {
+                let lanes = TQ_BLOCK_LANES.min(cluster.doc_ids.len() - block_start);
+                let rows: Vec<&[u8]> = (0..lanes)
+                    .map(|lane| {
+                        let row = block_start + lane;
+                        &cluster.rows[row * padded_dim..(row + 1) * padded_dim]
+                    })
+                    .collect();
+                tq_pack_ivf_block(
+                    &rows,
+                    &cluster.scales[block_start..block_start + lanes],
+                    &cluster.gammas[block_start..block_start + lanes],
+                    padded_dim,
+                    &mut codes,
+                );
+            }
+            (cluster_id, codes)
+        })
+        .collect();
+    let runs: Vec<_> = clusters
+        .iter()
+        .zip(&packed)
+        .map(|(&(&cluster_id, cluster), (packed_id, codes))| {
+            debug_assert_eq!(cluster_id, *packed_id);
+            BuildRun {
+                cluster_id,
+                doc_ids: &cluster.doc_ids,
+                ordinals: &cluster.ordinals,
+                codes,
+            }
+        })
+        .collect();
+    write_built_runs(
+        AnnDiskHeader {
+            kind: AnnKind::IvfTq,
+            routing: index.routing,
+            dim: index.dim,
+            code_size: codec.code_size(),
+            num_clusters,
+            quantizer_version: index.centroids_version,
+            codebook_version: codec.fingerprint(),
             vector_count: index.len(),
         },
         &runs,
@@ -883,6 +1005,12 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
             && (header.codebook_version != 0
                 || header.num_clusters != 1
                 || header.routing != IvfRoutingMode::Flat
+                || header.code_size * 2
+                    != crate::structures::vector::quantization::tq_padded_dim(header.dim)))
+        // IVF-TQ: quantizer_version is the trained centroid generation and
+        // codebook_version carries the (nonzero) TQ codec fingerprint.
+        || (header.kind == AnnKind::IvfTq
+            && (header.codebook_version == 0
                 || header.code_size * 2
                     != crate::structures::vector::quantization::tq_padded_dim(header.dim)))
     {

@@ -457,7 +457,9 @@ impl IndexMetadata {
                 ))
             })?;
             match field_meta.index_type {
-                VectorFieldIndexType::Float(index_type @ VectorIndexType::IvfPq) => {
+                VectorFieldIndexType::Float(
+                    index_type @ (VectorIndexType::IvfPq | VectorIndexType::IvfTq),
+                ) => {
                     let entry = schema
                         .get_field_entry(crate::dsl::Field(*field_id))
                         .ok_or_else(|| {
@@ -507,25 +509,34 @@ impl IndexMetadata {
                                 "invalid trained centroid routing for field {field_id}: {error}"
                             ))
                         })?;
-                    let codebook_file = field_meta.codebook_file.as_deref().ok_or_else(|| {
-                        Error::Corruption(format!(
-                            "trained float IVF-PQ field {field_id} has no codebook_file"
-                        ))
-                    })?;
-                    let codebook: crate::structures::PQCodebook =
-                        load_trained_artifact(dir, *field_id, "codebook", codebook_file).await?;
-                    codebook.validate().map_err(|error| {
-                        Error::Corruption(format!(
-                            "invalid trained codebook for field {field_id}: {error}"
-                        ))
-                    })?;
-                    if codebook.config.dim != expected_dim {
+                    if index_type == VectorIndexType::IvfPq {
+                        let codebook_file =
+                            field_meta.codebook_file.as_deref().ok_or_else(|| {
+                                Error::Corruption(format!(
+                                    "trained float IVF-PQ field {field_id} has no codebook_file"
+                                ))
+                            })?;
+                        let codebook: crate::structures::PQCodebook =
+                            load_trained_artifact(dir, *field_id, "codebook", codebook_file)
+                                .await?;
+                        codebook.validate().map_err(|error| {
+                            Error::Corruption(format!(
+                                "invalid trained codebook for field {field_id}: {error}"
+                            ))
+                        })?;
+                        if codebook.config.dim != expected_dim {
+                            return Err(Error::Corruption(format!(
+                                "trained codebook for field {field_id} has dimension {}, expected {expected_dim}",
+                                codebook.config.dim
+                            )));
+                        }
+                        codebooks.insert(*field_id, Arc::new(codebook));
+                    } else if field_meta.codebook_file.is_some() {
+                        // IVF-TQ's leaf codec is derived, never trained.
                         return Err(Error::Corruption(format!(
-                            "trained codebook for field {field_id} has dimension {}, expected {expected_dim}",
-                            codebook.config.dim
+                            "trained IVF-TQ field {field_id} unexpectedly references a codebook file"
                         )));
                     }
-                    codebooks.insert(*field_id, Arc::new(codebook));
                     centroids.insert(*field_id, Arc::new(c));
                 }
                 VectorFieldIndexType::Binary(BinaryIndexType::Ivf) => {

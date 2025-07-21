@@ -379,6 +379,7 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             }
             "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
             "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
+            "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
             "tq" => config.index_type = Some(VectorIndexType::Tq),
             _ => {}
         },
@@ -392,6 +393,7 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                     }
                     "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
                     "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
+                    "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
                     "tq" => config.index_type = Some(VectorIndexType::Tq),
                     _ => {}
                 }
