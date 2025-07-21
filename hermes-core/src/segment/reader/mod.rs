@@ -483,13 +483,29 @@ fn plan_vector_read_runs(indexes: &[usize], runs: &mut Vec<VectorReadRun>) -> Re
     Ok(())
 }
 
+/// Plan contiguous raw-vector reads and initiate page-in before either the
+/// synchronous or asynchronous reader starts copying. Keeping prefetch here
+/// prevents the two execution paths from drifting.
+fn prepare_vector_read_runs(
+    flat: &LazyFlatVectorData,
+    indexes: &[usize],
+    runs: &mut Vec<VectorReadRun>,
+) -> Result<()> {
+    plan_vector_read_runs(indexes, runs)?;
+    #[cfg(feature = "native")]
+    flat.prefetch_vectors(indexes.iter().copied());
+    #[cfg(not(feature = "native"))]
+    let _ = flat;
+    Ok(())
+}
+
 async fn read_vector_runs(
     flat: &LazyFlatVectorData,
     indexes: &[usize],
     runs: &mut Vec<VectorReadRun>,
     output: &mut [u8],
 ) -> Result<()> {
-    plan_vector_read_runs(indexes, runs)?;
+    prepare_vector_read_runs(flat, indexes, runs)?;
     let vector_byte_size = flat.vector_byte_size();
     for run in runs {
         let bytes = flat
@@ -518,7 +534,7 @@ fn read_vector_runs_sync(
     runs: &mut Vec<VectorReadRun>,
     output: &mut [u8],
 ) -> Result<()> {
-    plan_vector_read_runs(indexes, runs)?;
+    prepare_vector_read_runs(flat, indexes, runs)?;
     let vector_byte_size = flat.vector_byte_size();
     for run in runs {
         let bytes = flat
@@ -579,8 +595,6 @@ async fn exact_score_dense_candidate_documents(
     while cursor.fill_batch(flat, &mut batch, batch_len)? {
         flat_indexes.clear();
         flat_indexes.extend(batch.iter().map(|&(_, _, flat_index)| flat_index));
-        #[cfg(feature = "native")]
-        flat.prefetch_vectors(flat_indexes.iter().copied());
         let raw_len = batch
             .len()
             .checked_mul(vector_byte_size)
@@ -700,8 +714,6 @@ async fn exact_score_binary_candidate_documents(
         }
         unresolved_flat_indexes.clear();
         unresolved_flat_indexes.extend(unresolved.iter().map(|&(_, flat_index)| flat_index));
-        #[cfg(feature = "native")]
-        flat.prefetch_vectors(unresolved_flat_indexes.iter().copied());
         let raw_len = unresolved
             .len()
             .checked_mul(vector_byte_size)
