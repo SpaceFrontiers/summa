@@ -129,18 +129,12 @@ pub use vector::{
     // IVF core
     CoarseCentroids,
     CoarseConfig,
-    // Quantization
-    DistanceTable,
-    // Indexes
-    IVFPQConfig,
-    IVFPQIndex,
-    IvfPqQueryPlan,
     IvfProbePlan,
+    // Indexes
     IvfTqIndex,
     MultiAssignment,
-    PQCodebook,
-    PQConfig,
     SoarConfig,
+    // Quantization
     TqCodec,
     TqIvfEncodeScratch,
     TqIvfQueryPlan,

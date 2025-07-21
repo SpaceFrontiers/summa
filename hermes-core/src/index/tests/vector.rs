@@ -15,7 +15,7 @@ async fn test_vector_index_threshold_switch() {
         true, // stored
         DenseVectorConfig {
             dim: 8,
-            index_type: VectorIndexType::IvfPq,
+            index_type: VectorIndexType::IvfTq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: Some(4), // Small for test
             ivf_routing: crate::dsl::IvfRoutingMode::Auto,
@@ -103,7 +103,7 @@ async fn test_vector_index_threshold_switch() {
     assert_eq!(segments.len(), 2, "test requires two unmerged segments");
     assert!(segments.iter().all(|segment| matches!(
         segment.vector_indexes().get(&embedding.0),
-        Some(crate::segment::VectorIndex::IvfPq(_))
+        Some(crate::segment::VectorIndex::IvfTq { .. })
     )));
     let results = segments[0]
         .search_dense_vector(
@@ -142,7 +142,7 @@ async fn test_vector_retrain_atomically_replaces_the_complete_generation() {
         "embedding",
         true,
         true,
-        DenseVectorConfig::with_ivf_pq(8, Some(4), 2),
+        DenseVectorConfig::ivf_tq(8, Some(4), 2),
     );
     let schema = sb.build();
     let dir = RamDirectory::new();
@@ -171,10 +171,10 @@ async fn test_vector_retrain_atomically_replaces_the_complete_generation() {
     writer.build_vector_index().await.unwrap();
 
     // Hold a searcher for generation 1 across the complete retrain. It must
-    // retain both its old segments and their matching old codebook.
+    // retain both its old segments and their matching old centroid generation.
     let old_reader = live_index.reader().await.unwrap();
     let old_searcher = old_reader.searcher().await.unwrap();
-    let first_version = writer.segment_manager.trained().unwrap().codebooks[&embedding.0].version;
+    let first_version = writer.segment_manager.trained().unwrap().centroids[&embedding.0].version;
 
     // A materially different third segment changes the training sample and is
     // initially encoded with generation 1 by normal ingestion.
@@ -193,30 +193,28 @@ async fn test_vector_retrain_atomically_replaces_the_complete_generation() {
 
     writer.retrain_vector_index().await.unwrap();
     let trained = writer.segment_manager.trained().unwrap();
-    let second_version = trained.codebooks[&embedding.0].version;
+    let second_version = trained.centroids[&embedding.0].version;
     assert_ne!(
         first_version, second_version,
-        "the expanded corpus must retrain the PQ codebook"
+        "the expanded corpus must retrain the coarse centroids"
     );
 
     let after_ids = writer.segment_manager.get_segment_ids().await;
     assert_eq!(after_ids.len(), before_ids.len());
     assert!(
         after_ids.iter().all(|id| !before_ids.contains(id)),
-        "every segment using the old codebook must be replaced in one generation"
+        "every segment using the old generation must be replaced in one step"
     );
     let current_index = Index::open(dir.clone(), config).await.unwrap();
     for segment in current_index.segment_readers().await.unwrap() {
-        let Some(crate::segment::VectorIndex::IvfPq(index)) = segment.get_vector_index(embedding)
+        let Some(crate::segment::VectorIndex::IvfTq { index, codec }) =
+            segment.get_vector_index(embedding)
         else {
-            panic!("every current segment must contain IVF-PQ");
+            panic!("every current segment must contain IVF-TQ");
         };
         let header = index.get().header();
-        assert_eq!(header.codebook_version, second_version);
-        assert_eq!(
-            header.quantizer_version,
-            trained.centroids[&embedding.0].version
-        );
+        assert_eq!(header.quantizer_version, second_version);
+        assert_eq!(header.codebook_version, codec.fingerprint());
     }
 
     let old_results = old_searcher
@@ -237,8 +235,8 @@ async fn test_vector_retrain_atomically_replaces_the_complete_generation() {
         })
         .count();
     assert_eq!(
-        artifacts, 2,
-        "only the published centroid/codebook pair remains"
+        artifacts, 1,
+        "only the published centroid generation remains (IVF-TQ trains no codebook)"
     );
 }
 

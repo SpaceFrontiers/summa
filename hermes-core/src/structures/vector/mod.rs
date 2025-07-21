@@ -8,11 +8,11 @@
 //!   - `CoarseCentroids` - k-means clustering for coarse quantization
 //!   - `SoarConfig` / `MultiAssignment` - SOAR geometry-aware assignment
 //!
-//! - `quantization` - Residual product quantization
-//!   - `PQCodebook` - the index-global OPQ codebook
+//! - `quantization` - TurboQuant training-free codec
+//!   - `TqCodec` - derived rotation/codebook, no trained artifacts
 //!
 //! - `index` - Segment payloads for the production ANN implementations
-//!   - `IVFPQIndex` - float vectors with residual PQ codes
+//!   - `IvfTqIndex` - float vectors with TQ-coded centroid residuals
 //!   - `BinaryIvfIndex` - exact packed binary vectors
 //!
 //! ## SOAR (Spilling with Orthogonality-Amplified Residuals)
@@ -33,10 +33,10 @@ pub use ivf::{CoarseCentroids, CoarseConfig, IvfProbePlan, MultiAssignment, Soar
 // Quantization
 #[cfg(feature = "native")]
 pub use quantization::TqFlatBuilder;
-pub use quantization::{DistanceTable, PQCodebook, PQConfig, TqCodec, TqQueryPlan};
+pub use quantization::{TqCodec, TqQueryPlan};
 
 // Indexes
 pub use index::{
-    BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, IVFPQConfig, IVFPQIndex,
-    IvfPqQueryPlan, IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan,
+    BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, IvfTqIndex, TqIvfEncodeScratch,
+    TqIvfQueryPlan,
 };

@@ -90,7 +90,7 @@ The index is the central abstraction. Documents are stored in **segments** (writ
 Key modules:
 
 - `index/` - Main `Index` struct with async operations (search, write, merge)
-- `segment/` - Segment building, reading, merging; document storage; vector indexes (flat, global IVF-PQ and binary IVF)
+- `segment/` - Segment building, reading, merging; document storage; vector indexes (flat, TurboQuant tq/ivf_tq and binary IVF)
 - `query/` - Query execution with BM25 ranking, WAND/MaxScore optimizations
 - `directories/` - Storage abstraction layer (filesystem, HTTP, RAM, memory-mapped, caching)
 - `dsl/` - Schema Definition Language parser (pest-based)

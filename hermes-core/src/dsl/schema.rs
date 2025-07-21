@@ -110,19 +110,39 @@ impl PositionMode {
 pub enum VectorIndexType {
     /// Flat - brute-force search over raw vectors (accumulating state)
     Flat,
-    /// Global IVF with residual product quantization. This is the trained
-    /// float ANN format; Flat remains the accumulation/exact-scan
-    /// representation.
-    #[default]
+    /// Removed: global IVF with residual product quantization. The variant is
+    /// kept only so schemas from older indexes deserialize into an actionable
+    /// error instead of an unknown-variant failure. See
+    /// `docs/turboquant-quantization.md` for the IVF-TQ replacement.
     IvfPq,
     /// TurboQuant: training-free per-segment compressed flat scan
     /// (`docs/turboquant-quantization.md`). Available from the first segment
     /// build with no global artifacts.
     Tq,
     /// Trained global IVF router with TurboQuant-coded centroid residuals:
-    /// sub-linear probing like IVF-PQ, but the leaf codec needs no trained
-    /// codebook (only coarse centroids).
+    /// sub-linear probing with a derived (never trained) leaf codec. The
+    /// default trained float ANN format.
+    #[default]
     IvfTq,
+}
+
+/// Reject schemas that reference removed index types. Called on every schema
+/// entry point (index create, metadata load), so SDL/JSON/programmatic
+/// construction all fail loudly with the same actionable message.
+pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), String> {
+    for (_, entry) in schema.fields() {
+        if let Some(config) = entry.dense_vector_config.as_ref()
+            && config.index_type == VectorIndexType::IvfPq
+        {
+            return Err(format!(
+                "dense field '{}' uses index_type `ivf_pq`, which was removed; \
+                 recreate the index with `ivf_tq` (trained router, training-free \
+                 TurboQuant leaves) and reindex — see docs/turboquant-quantization.md",
+                entry.name,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// How an IVF coarse codebook is searched.
@@ -257,25 +277,11 @@ impl DenseVectorConfig {
     pub fn new(dim: usize) -> Self {
         Self {
             dim,
-            index_type: VectorIndexType::IvfPq,
+            index_type: VectorIndexType::IvfTq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: 64,
-            unit_norm: true,
-            soar: None,
-        }
-    }
-
-    /// Create IVF-PQ configuration.
-    pub fn with_ivf_pq(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
-        Self {
-            dim,
-            index_type: VectorIndexType::IvfPq,
-            quantization: DenseVectorQuantization::F32,
-            num_clusters,
-            ivf_routing: IvfRoutingMode::Auto,
-            nprobe,
             unit_norm: true,
             soar: None,
         }
@@ -354,10 +360,7 @@ impl DenseVectorConfig {
 
     /// Check if this config uses IVF
     pub fn uses_ivf(&self) -> bool {
-        matches!(
-            self.index_type,
-            VectorIndexType::IvfPq | VectorIndexType::IvfTq
-        )
+        self.index_type == VectorIndexType::IvfTq
     }
 
     /// Check if this config is flat (brute-force)

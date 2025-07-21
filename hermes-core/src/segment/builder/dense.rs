@@ -206,8 +206,8 @@ pub(super) fn build_vectors_streaming(
     let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(toc_capacity);
     let mut current_offset = 0u64;
 
-    // Pre-build ANN indexes across fields (native only). IVF-PQ requires
-    // trained global structures; TQ is training-free and always builds.
+    // Pre-build ANN indexes across fields (native only). IVF-TQ requires
+    // trained coarse centroids; TQ is training-free and always builds.
     #[cfg(feature = "native")]
     let ann_blobs: Vec<(u32, u8, Vec<u8>)> = {
         let ann_blob_fn = |(field_id, builder): &(u32, DenseVectorBuilder)|
@@ -221,41 +221,6 @@ pub(super) fn build_vectors_streaming(
 
                 let dim = builder.dim;
                 let blob = match config.index_type {
-                    VectorIndexType::IvfPq => {
-                        // Untrained IVF-PQ fields stay flat until a global
-                        // generation exists.
-                        let Some((centroids, codebook)) = trained.and_then(|trained| {
-                            Some((
-                                trained.centroids.get(field_id)?,
-                                trained.codebooks.get(field_id)?,
-                            ))
-                        }) else {
-                            return Ok(None);
-                        };
-                        let mut index = super::super::ann_build::new_ivf_pq(
-                            dim,
-                            config.ivf_routing,
-                            centroids,
-                            codebook,
-                        );
-                        index
-                            .add_vectors_parallel(
-                                centroids,
-                                codebook,
-                                &builder.doc_ids,
-                                &builder.vectors,
-                            )
-                            .map_err(|error| {
-                                crate::Error::Internal(format!(
-                                    "parallel IVF-PQ build failed for field {field_id}: {error}"
-                                ))
-                            })?;
-                        super::super::ann_build::serialize_ivf_pq(
-                            index,
-                            centroids.num_clusters,
-                        )
-                            .map(|b| (super::super::ann_build::IVF_PQ_TYPE, b))
-                    }
                     VectorIndexType::Tq => super::super::ann_build::build_tq_flat(
                         dim,
                         &builder.doc_ids,

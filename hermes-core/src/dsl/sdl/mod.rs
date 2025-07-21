@@ -29,7 +29,7 @@
 //!     field content_hash: bytes [stored]
 //!
 //!     # Dense vector with the production IVF-PQ index
-//!     field embedding: dense_vector<768> [indexed<ivf_pq, routing: hnsw, nprobe: 64>]
+//!     field embedding: dense_vector<768> [indexed<ivf_tq, routing: hnsw, nprobe: 64>]
 //!
 //! }
 //! ```
@@ -37,7 +37,7 @@
 //! # Dense Vector Index Configuration
 //!
 //! Index-related parameters for dense vectors are specified in `indexed<...>`:
-//! - `ivf_pq` - index type
+//! - `ivf_tq` - index type
 //! - `centroids: "path"` - path to pre-trained centroids file
 //! - `nprobe: N` - number of clusters to probe (default: 64)
 
@@ -1805,7 +1805,7 @@ mod tests {
     fn test_dense_vector_with_num_clusters() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_pq, num_clusters: 256>, stored]
+                field embedding: dense_vector<768> [indexed<ivf_tq, num_clusters: 256>, stored]
             }
         "#;
 
@@ -1826,7 +1826,7 @@ mod tests {
     fn test_dense_vector_with_soar() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_pq, num_clusters: 256, soar: selective>, stored]
+                field embedding: dense_vector<768> [indexed<ivf_tq, num_clusters: 256, soar: selective>, stored]
             }
         "#;
 
@@ -1840,7 +1840,7 @@ mod tests {
         // aggressive preset: 2 secondary clusters, no selectivity
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_pq, soar: aggressive>]
+                field embedding: dense_vector<768> [indexed<ivf_tq, soar: aggressive>]
             }
         "#;
         let indexes = parse_sdl(sdl).unwrap();
@@ -1852,7 +1852,7 @@ mod tests {
         // off keeps soar disabled
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<ivf_pq, soar: off>]
+                field embedding: dense_vector<768> [indexed<ivf_tq, soar: off>]
             }
         "#;
         let indexes = parse_sdl(sdl).unwrap();
@@ -1865,7 +1865,7 @@ mod tests {
         let indexes = parse_sdl(
             r#"
             index vectors {
-                field embedding: dense_vector<768> [indexed<ivf_pq, routing: hnsw>]
+                field embedding: dense_vector<768> [indexed<ivf_tq, routing: hnsw>]
                 field hash: binary_dense_vector<512> [indexed<ivf, routing: two_level>]
             }
             "#,
@@ -1939,7 +1939,7 @@ mod tests {
     fn test_dense_vector_with_num_clusters_and_nprobe() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<1536> [indexed<ivf_pq, num_clusters: 512, nprobe: 64>]
+                field embedding: dense_vector<1536> [indexed<ivf_tq, num_clusters: 512, nprobe: 64>]
             }
         "#;
 
@@ -1970,7 +1970,7 @@ mod tests {
     fn test_dense_vector_keyword_syntax_full() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 1536> [indexed<ivf_pq, num_clusters: 256, nprobe: 64>]
+                field embedding: dense_vector<dims: 1536> [indexed<ivf_tq, num_clusters: 256, nprobe: 64>]
             }
         "#;
 
@@ -1986,7 +1986,7 @@ mod tests {
     fn test_dense_vector_keyword_syntax_partial() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<ivf_pq, num_clusters: 128>]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_tq, num_clusters: 128>]
             }
         "#;
 
@@ -1999,12 +1999,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_vector_ivf_pq_index_with_probe() {
+    fn test_dense_vector_ivf_tq_index_with_probe() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<ivf_pq, num_clusters: 256, nprobe: 64>]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_tq, num_clusters: 256, nprobe: 64>]
             }
         "#;
 
@@ -2012,18 +2012,18 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::IvfPq);
+        assert_eq!(config.index_type, VectorIndexType::IvfTq);
         assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 64);
     }
 
     #[test]
-    fn test_dense_vector_ivf_pq_index_without_explicit_probe() {
+    fn test_dense_vector_ivf_tq_index_without_explicit_probe() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 1536> [indexed<ivf_pq, num_clusters: 512>]
+                field embedding: dense_vector<dims: 1536> [indexed<ivf_tq, num_clusters: 512>]
             }
         "#;
 
@@ -2031,17 +2031,17 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 1536);
-        assert_eq!(config.index_type, VectorIndexType::IvfPq);
+        assert_eq!(config.index_type, VectorIndexType::IvfTq);
         assert_eq!(config.num_clusters, Some(512));
     }
 
     #[test]
-    fn test_dense_vector_ivf_pq_no_clusters() {
+    fn test_dense_vector_ivf_tq_no_clusters() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<ivf_pq>]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_tq>]
             }
         "#;
 
@@ -2049,8 +2049,32 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::IvfPq);
+        assert_eq!(config.index_type, VectorIndexType::IvfTq);
         assert!(config.num_clusters.is_none());
+    }
+
+    #[test]
+    fn removed_ivf_pq_still_parses_to_the_reserved_variant() {
+        use crate::dsl::schema::VectorIndexType;
+
+        // The SDL keeps accepting `ivf_pq` purely so index create/open can
+        // reject it with an actionable message instead of a grammar error.
+        let sdl = r#"
+            index test {
+                field embedding: dense_vector<8> [indexed<ivf_pq>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        assert_eq!(config.index_type, VectorIndexType::IvfPq);
+
+        let mut builder = crate::dsl::SchemaBuilder::default();
+        builder.add_dense_vector_field_with_config("embedding", true, true, config.clone());
+        let schema = builder.build();
+        let error = crate::dsl::schema::reject_removed_vector_index_types(&schema)
+            .expect_err("removed index types must be rejected at the index gate");
+        assert!(error.contains("ivf_tq"), "{error}");
+        assert!(error.contains("removed"), "{error}");
     }
 
     #[test]
@@ -2085,7 +2109,7 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::IvfPq);
+        assert_eq!(config.index_type, VectorIndexType::IvfTq);
     }
 
     #[test]
@@ -2103,7 +2127,7 @@ mod tests {
 
         assert_eq!(config.dim, 768);
         assert_eq!(config.quantization, DenseVectorQuantization::F16);
-        assert_eq!(config.index_type, VectorIndexType::IvfPq);
+        assert_eq!(config.index_type, VectorIndexType::IvfTq);
     }
 
     #[test]
@@ -2112,7 +2136,7 @@ mod tests {
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<1024, uint8> [indexed<ivf_pq>]
+                field embedding: dense_vector<1024, uint8> [indexed<ivf_tq>]
             }
         "#;
 

@@ -726,6 +726,8 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             if let Some(ref cfg) = entry.dense_vector_config {
                 let idx_name = match cfg.index_type {
                     VectorIndexType::Flat => "flat",
+                    // Unreachable in practice: schemas with the retired
+                    // ivf_pq type are rejected at index create/open.
                     VectorIndexType::IvfPq => "ivf_pq",
                     VectorIndexType::Tq => "tq",
                     VectorIndexType::IvfTq => "ivf_tq",

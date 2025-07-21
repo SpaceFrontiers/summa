@@ -53,7 +53,7 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 //   field title: text [indexed, stored]
 //   field body: text<en_stem> [indexed]
 //   field name: text<simple> [indexed, stored]
-//   field embedding: dense_vector<768> [indexed<ivf_pq, num_clusters: 65536, nprobe: 64>]
+//   field embedding: dense_vector<768> [indexed<ivf_tq, num_clusters: 65536, nprobe: 64>]
 //   field embedding: dense_vector<768> [indexed<flat>]  # brute-force, no ANN index
 // Note: dense_vector_config matches before binary_dense_vector_config (both match `<N>`).
 // The Rust parser remaps based on field_type when needed.
@@ -91,8 +91,8 @@ weight_threshold_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 //   field embedding: dense_vector<768> [indexed]                           # default f32
 //   field embedding: dense_vector<768, f16> [indexed]                      # half precision, 2× savings
 //   field embedding: dense_vector<768, uint8> [indexed]                    # scalar quantized, 4× savings
-//   field embedding: dense_vector<768> [indexed<ivf_pq>]                  # float ANN
-//   field embedding: dense_vector<768, f16> [indexed<ivf_pq>]             # f16 storage + IVF-PQ
+//   field embedding: dense_vector<768> [indexed<ivf_tq>]                  # float ANN
+//   field embedding: dense_vector<768, f16> [indexed<ivf_tq>]             # f16 storage + IVF-TQ
 //   field embedding: dense_vector<768> [indexed<flat>]                     # brute-force only
 //   field embedding: dense_vector<768> [stored]                            # not indexed, just stored
 dense_vector_config = { "<" ~ dense_vector_params ~ ">" }
@@ -118,7 +118,7 @@ binary_dense_vector_config = { "<" ~ dimension_spec ~ ">" }
 tokenizer_spec = { "<" ~ identifier ~ ">" }
 
 // Attributes like [indexed, stored]
-// indexed can have optional index config: indexed<positions> or indexed<ivf_pq, nprobe: 64>
+// indexed can have optional index config: indexed<positions> or indexed<ivf_tq, nprobe: 64>
 // stored can have optional multi config: stored<multi> for array fields
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
 attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "reorder" }
@@ -134,8 +134,8 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed
 //   indexed<positions>  # for phrase queries
 //   indexed<flat>       # brute-force search (no ANN index)
-//   indexed<ivf_pq> # global IVF with residual product quantization
-//   indexed<ivf_pq, num_clusters: 262144, nprobe: 64>
+//   indexed<ivf_tq> # global IVF with TurboQuant residual leaves
+//   indexed<ivf_tq, num_clusters: 262144, nprobe: 64>
 //   indexed<quantization: uint8, weight_threshold: 0.1>  # for sparse vectors
 //   indexed<positions, quantization: uint8>  # sparse with positions
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config

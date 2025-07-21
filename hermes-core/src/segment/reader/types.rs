@@ -16,8 +16,6 @@ use crate::structures::{BlockSparsePostingList, SparseBlock, SparseSkipEntry};
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
-    /// Float IVF-PQ payload.
-    IvfPq(Arc<MmapAnnIndex>),
     /// Binary IVF (Hamming) payload.
     BinaryIvf(Arc<MmapAnnIndex>),
     /// TurboQuant flat payload with its derived (training-free) codec.
@@ -73,7 +71,6 @@ impl VectorIndex {
     /// remain file-backed and are not included.
     pub fn estimated_heap_bytes(&self) -> usize {
         match self {
-            VectorIndex::IvfPq(lazy) => lazy.estimated_heap_bytes(),
             VectorIndex::BinaryIvf(lazy) => lazy.estimated_heap_bytes(),
             VectorIndex::Tq { index, codec } | VectorIndex::IvfTq { index, codec } => {
                 index.estimated_heap_bytes() + codec.estimated_memory_bytes()
@@ -89,10 +86,7 @@ impl VectorIndex {
         report: &mut crate::segment::pin::PinReport,
     ) {
         let index = match self {
-            Self::IvfPq(index)
-            | Self::BinaryIvf(index)
-            | Self::Tq { index, .. }
-            | Self::IvfTq { index, .. } => index,
+            Self::BinaryIvf(index) | Self::Tq { index, .. } | Self::IvfTq { index, .. } => index,
         };
         if let Some(index) = Arc::get_mut(index) {
             index.pin_lookup_directory(mode, remaining, report);

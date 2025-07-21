@@ -3,13 +3,13 @@
 //! This module manages all index-level metadata in a single `metadata.json` file:
 //! - List of committed segments
 //! - Vector index state per field (Flat/Built)
-//! - Trained centroids/codebooks paths
+//! - Trained centroid artifact paths
 //!
 //! The workflow is:
 //! 1. During initial accumulation, segments store flat vectors.
-//! 2. A manual build trains the first global codebook and ANN generation.
+//! 2. A manual build trains the first coarse-centroid ANN generation.
 //! 3. A manual retrain stages and atomically publishes a replacement generation.
-//! 4. On index open, metadata loads the currently published codebooks.
+//! 4. On index open, metadata loads the currently published artifacts.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -116,7 +116,9 @@ pub struct FieldVectorMeta {
     /// Path to centroids file (relative to index dir)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub centroids_file: Option<String>,
-    /// Path to the index-global codebook file, relative to the index directory.
+    /// Legacy: path to a trained IVF-PQ codebook. Always `None` for current
+    /// formats; kept so pre-removal metadata deserializes into an actionable
+    /// error instead of dropping the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codebook_file: Option<String>,
 }
@@ -327,6 +329,7 @@ impl IndexMetadata {
     fn deserialize_versioned(bytes: &[u8]) -> Result<Self> {
         let meta: Self =
             serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
+        crate::dsl::reject_removed_vector_index_types(&meta.schema).map_err(Error::Schema)?;
         if meta.version != INDEX_META_FORMAT_VERSION {
             return Err(Error::Corruption(format!(
                 "metadata.json format version {} is incompatible with required version {}; \
@@ -414,7 +417,7 @@ impl IndexMetadata {
 
         let mut centroids = rustc_hash::FxHashMap::default();
         let mut binary_quantizers = rustc_hash::FxHashMap::default();
-        let mut codebooks = rustc_hash::FxHashMap::default();
+
         let mut built_fields: Vec<_> = vector_fields
             .iter()
             .filter(|(_, meta)| matches!(meta.state, VectorIndexState::Built { .. }))
@@ -457,9 +460,14 @@ impl IndexMetadata {
                 ))
             })?;
             match field_meta.index_type {
-                VectorFieldIndexType::Float(
-                    index_type @ (VectorIndexType::IvfPq | VectorIndexType::IvfTq),
-                ) => {
+                VectorFieldIndexType::Float(VectorIndexType::IvfPq) => {
+                    return Err(Error::Corruption(format!(
+                        "field {field_id} was trained as IVF-PQ, which is no longer \
+                         supported; recreate the index with `ivf_tq` and reindex \
+                         (docs/turboquant-quantization.md)"
+                    )));
+                }
+                VectorFieldIndexType::Float(index_type @ VectorIndexType::IvfTq) => {
                     let entry = schema
                         .get_field_entry(crate::dsl::Field(*field_id))
                         .ok_or_else(|| {
@@ -509,30 +517,10 @@ impl IndexMetadata {
                                 "invalid trained centroid routing for field {field_id}: {error}"
                             ))
                         })?;
-                    if index_type == VectorIndexType::IvfPq {
-                        let codebook_file =
-                            field_meta.codebook_file.as_deref().ok_or_else(|| {
-                                Error::Corruption(format!(
-                                    "trained float IVF-PQ field {field_id} has no codebook_file"
-                                ))
-                            })?;
-                        let codebook: crate::structures::PQCodebook =
-                            load_trained_artifact(dir, *field_id, "codebook", codebook_file)
-                                .await?;
-                        codebook.validate().map_err(|error| {
-                            Error::Corruption(format!(
-                                "invalid trained codebook for field {field_id}: {error}"
-                            ))
-                        })?;
-                        if codebook.config.dim != expected_dim {
-                            return Err(Error::Corruption(format!(
-                                "trained codebook for field {field_id} has dimension {}, expected {expected_dim}",
-                                codebook.config.dim
-                            )));
-                        }
-                        codebooks.insert(*field_id, Arc::new(codebook));
-                    } else if field_meta.codebook_file.is_some() {
-                        // IVF-TQ's leaf codec is derived, never trained.
+                    // The TQ leaf codec is derived, never trained; ensure
+                    // `index_type` stays referenced for future variants.
+                    let _ = index_type;
+                    if field_meta.codebook_file.is_some() {
                         return Err(Error::Corruption(format!(
                             "trained IVF-TQ field {field_id} unexpectedly references a codebook file"
                         )));
@@ -600,7 +588,6 @@ impl IndexMetadata {
                 _ann_pins: Default::default(),
                 centroids,
                 binary_quantizers,
-                codebooks,
             };
             #[cfg(feature = "native")]
             let trained = {
@@ -767,7 +754,7 @@ mod tests {
     fn dense_schema(index_type: VectorIndexType) -> (Schema, crate::dsl::Field) {
         let mut builder = crate::dsl::SchemaBuilder::default();
         let config = match index_type {
-            VectorIndexType::IvfPq => crate::dsl::DenseVectorConfig::with_ivf_pq(2, Some(1), 1),
+            VectorIndexType::IvfTq => crate::dsl::DenseVectorConfig::ivf_tq(2, Some(1), 1),
             other => panic!("unsupported trained test index type: {other:?}"),
         };
         let field = builder.add_dense_vector_field_with_config("embedding", true, true, config);
@@ -782,19 +769,6 @@ mod tests {
             version: 7,
             soar_config: None,
             routing_index: None,
-        }
-    }
-
-    fn test_codebook() -> crate::structures::PQCodebook {
-        let config = crate::structures::PQConfig::new(2).with_opq(false, 0);
-        crate::structures::PQCodebook {
-            centroids: vec![
-                0.0;
-                config.num_subspaces * config.num_centroids * config.dims_per_block
-            ],
-            rotation_matrix: None,
-            version: 11,
-            config,
         }
     }
 
@@ -814,7 +788,7 @@ mod tests {
         assert!(meta.segment_metas.is_empty());
         assert!(!meta.is_field_built(0));
 
-        meta.init_field(0, VectorIndexType::IvfPq);
+        meta.init_field(0, VectorIndexType::IvfTq);
         assert!(!meta.is_field_built(0));
         assert!(meta.vector_fields.contains_key(&0));
     }
@@ -868,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn trained_artifacts_load_only_when_the_complete_built_set_is_valid() {
         let mut builder = crate::dsl::SchemaBuilder::default();
-        let config = crate::dsl::DenseVectorConfig::with_ivf_pq(2, Some(1), 1);
+        let config = crate::dsl::DenseVectorConfig::ivf_tq(2, Some(1), 1);
         let first = builder.add_dense_vector_field_with_config(
             "first_embedding",
             true,
@@ -880,24 +854,11 @@ mod tests {
         let schema = builder.build();
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(first.0, VectorIndexType::IvfPq);
-        metadata.init_field(second.0, VectorIndexType::IvfPq);
-        metadata.mark_field_built(
-            first.0,
-            10,
-            1,
-            "field_0_centroids.bin".into(),
-            Some("field_0_codebook.bin".into()),
-        );
-        metadata.mark_field_built(
-            second.0,
-            10,
-            1,
-            "field_1_centroids.bin".into(),
-            Some("field_1_codebook.bin".into()),
-        );
+        metadata.init_field(first.0, VectorIndexType::IvfTq);
+        metadata.init_field(second.0, VectorIndexType::IvfTq);
+        metadata.mark_field_built(first.0, 10, 1, "field_0_centroids.bin".into(), None);
+        metadata.mark_field_built(second.0, 10, 1, "field_1_centroids.bin".into(), None);
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
-        write_bincode(&directory, "field_0_codebook.bin", &test_codebook()).await;
 
         let error = IndexMetadata::try_load_trained_from_fields(
             &metadata.vector_fields,
@@ -914,10 +875,10 @@ mod tests {
 
     #[tokio::test]
     async fn index_open_fails_closed_when_built_artifact_is_missing() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
+        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema);
-        metadata.init_field(field.0, VectorIndexType::IvfPq);
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
         metadata.mark_field_built(field.0, 10, 1, "missing_centroids.bin".into(), None);
         metadata.save(&directory).await.unwrap();
 
@@ -931,12 +892,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ivf_pq_built_state_requires_a_codebook() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
+    async fn ivf_tq_built_state_rejects_a_codebook_file() {
+        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfPq);
-        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
+        metadata.mark_field_built(
+            field.0,
+            10,
+            1,
+            "field_0_centroids.bin".into(),
+            Some("field_0_codebook.bin".into()),
+        );
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
 
         let error = IndexMetadata::try_load_trained_from_fields(
@@ -946,9 +913,41 @@ mod tests {
         )
         .await
         .err()
-        .expect("IVF-PQ Built state without a codebook must fail")
+        .expect("IVF-TQ Built state with a codebook file must fail")
         .to_string();
-        assert!(error.contains("has no codebook_file"), "{error}");
+        assert!(error.contains("codebook"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn legacy_ivf_pq_trained_field_fails_with_actionable_error() {
+        // Simulates metadata written by a pre-removal version: the schema
+        // gate rejects `ivf_pq` fields, so build the raw field-state map
+        // directly against a current-format schema.
+        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
+        let directory = crate::directories::RamDirectory::new();
+        let mut metadata = IndexMetadata::new(schema.clone());
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
+        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
+        // Overwrite the recorded type the way pre-removal metadata carries it
+        // (init_field never downgrades an existing entry).
+        metadata
+            .vector_fields
+            .get_mut(&field.0)
+            .expect("field initialized")
+            .index_type = VectorFieldIndexType::Float(VectorIndexType::IvfPq);
+        write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
+
+        let error = IndexMetadata::try_load_trained_from_fields(
+            &metadata.vector_fields,
+            &schema,
+            &directory,
+        )
+        .await
+        .err()
+        .expect("legacy IVF-PQ trained state must fail loudly")
+        .to_string();
+        assert!(error.contains("no longer"), "{error}");
+        assert!(error.contains("ivf_tq"), "{error}");
     }
 
     #[tokio::test]
@@ -958,21 +957,14 @@ mod tests {
             "embedding",
             true,
             true,
-            crate::dsl::DenseVectorConfig::with_ivf_pq(2, Some(4), 1),
+            crate::dsl::DenseVectorConfig::ivf_tq(2, Some(4), 1),
         );
         let schema = builder.build();
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfPq);
-        metadata.mark_field_built(
-            field.0,
-            1,
-            4,
-            "field_0_centroids.bin".into(),
-            Some("field_0_codebook.bin".into()),
-        );
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
+        metadata.mark_field_built(field.0, 1, 4, "field_0_centroids.bin".into(), None);
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
-        write_bincode(&directory, "field_0_codebook.bin", &test_codebook()).await;
 
         let trained = IndexMetadata::try_load_trained_from_fields(
             &metadata.vector_fields,
@@ -987,10 +979,10 @@ mod tests {
 
     #[tokio::test]
     async fn trained_artifact_loader_rejects_trailing_data() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
+        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfPq);
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
         metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
         let mut bytes =
             bincode::serde::encode_to_vec(test_centroids(), bincode::config::standard()).unwrap();
@@ -1028,10 +1020,10 @@ mod tests {
 
     #[tokio::test]
     async fn trained_artifact_decode_limit_rejects_forged_collection_length() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfPq);
+        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfPq);
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
         metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
 
         // CoarseCentroids begins with num_clusters=1, dim=2, then the Vec
@@ -1080,7 +1072,7 @@ mod tests {
     #[test]
     fn test_mark_field_built() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.init_field(0, VectorIndexType::IvfPq);
+        meta.init_field(0, VectorIndexType::IvfTq);
         meta.total_vectors = 10000;
 
         assert!(!meta.is_field_built(0));
@@ -1098,20 +1090,14 @@ mod tests {
     #[test]
     fn total_vectors_is_aggregate_of_built_field_counts() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.init_field(7, VectorIndexType::IvfPq);
-        meta.init_field(3, VectorIndexType::IvfPq);
+        meta.init_field(7, VectorIndexType::IvfTq);
+        meta.init_field(3, VectorIndexType::IvfTq);
 
         // Build in reverse field-id order to ensure the result is not tied to
         // HashMap or training iteration order.
         meta.mark_field_built(7, 400, 20, "field_7_centroids.bin".to_string(), None);
         assert_eq!(meta.total_vectors, 400);
-        meta.mark_field_built(
-            3,
-            250,
-            15,
-            "field_3_centroids.bin".to_string(),
-            Some("field_3_codebook.bin".to_string()),
-        );
+        meta.mark_field_built(3, 250, 15, "field_3_centroids.bin".to_string(), None);
         assert_eq!(meta.total_vectors, 650);
 
         // Rebuilding a field replaces its contribution; it does not add a
@@ -1123,7 +1109,7 @@ mod tests {
     #[test]
     fn test_should_build_field() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.init_field(0, VectorIndexType::IvfPq);
+        meta.init_field(0, VectorIndexType::IvfTq);
 
         // Below threshold
         meta.total_vectors = 500;
@@ -1142,7 +1128,7 @@ mod tests {
     fn test_serialization() {
         let mut meta = IndexMetadata::new(test_schema());
         meta.add_segment("seg1".to_string(), 100);
-        meta.init_field(0, VectorIndexType::IvfPq);
+        meta.init_field(0, VectorIndexType::IvfTq);
         meta.total_vectors = 5000;
 
         let json = serde_json::to_string_pretty(&meta).unwrap();

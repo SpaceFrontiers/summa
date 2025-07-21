@@ -1,16 +1,14 @@
 //! Vector index implementations
 //!
 //! This module provides ready-to-use indexes:
-//! - `IVFPQIndex` - global IVF with residual product quantization
+//! - `IvfTqIndex` - global IVF with TurboQuant-coded residuals
 
 mod binary_ivf;
-mod ivf_pq;
 mod ivf_tq;
 
 #[cfg(feature = "native")]
 pub(crate) use binary_ivf::BinaryIvfBuilder;
 pub use binary_ivf::{BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex};
-pub use ivf_pq::{IVFPQConfig, IVFPQIndex, IvfPqQueryPlan};
 pub use ivf_tq::{IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan};
 
 #[derive(Clone, Copy)]
@@ -148,6 +146,17 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
         self.best.insert(key, candidate);
         self.heap.push(candidate);
         self.rebuild_if_needed();
+    }
+
+    /// Conservative pruning threshold: the k-th best value once `k` entries
+    /// are held, else `None`. The heap root may be stale (an evicted
+    /// duplicate), which only makes the threshold laxer — safe for pruning.
+    #[inline]
+    pub(crate) fn pruning_threshold(&self) -> Option<f32> {
+        if self.best.len() < self.k {
+            return None;
+        }
+        self.heap.peek().map(|entry| Self::value(entry.rank))
     }
 
     pub(crate) fn into_sorted_results(self) -> Vec<(u32, u16, f32)> {

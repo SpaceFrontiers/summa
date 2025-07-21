@@ -13,7 +13,10 @@
 //! mayflower/pg_turboquant, both MIT).
 
 /// Bumping this refuses to mix payloads across incompatible codec revisions.
-pub const TQ_CODEC_VERSION: u32 = 1;
+/// v2: padding-free 3-round rotation (sub-FWHT + signs + permutation per
+/// round) replaced the single-round power-of-two-padded FWHT — 768-dim codes
+/// shrank 33% and the codebook density now uses the true dimension.
+pub const TQ_CODEC_VERSION: u32 = 2;
 /// Bits per padded coordinate: 3-bit stage-1 code + 1-bit QJL sign.
 pub const TQ_BITS: u32 = 4;
 /// Vectors per scoring block; one lane per vector.
@@ -33,17 +36,38 @@ const TQ_LLOYD_TOLERANCE: f64 = 1e-9;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const TQ_ACCUMULATE_CHUNK_DIMS: usize = 128;
 
-/// Padded (power-of-two, ≥ [`TQ_MIN_PADDED_DIM`]) dimension for an input
-/// dimension. Cheap; usable for header validation without building a codec.
+/// Code-layout dimension: the input dimension rounded up to an even count
+/// (two 4-bit coordinates per byte), floored at [`TQ_MIN_PADDED_DIM`]. Since
+/// codec v2 the rotation is padding-free, so this tracks the true dimension
+/// instead of the next power of two. Cheap; usable for header validation
+/// without building a codec.
 #[inline]
 pub fn tq_padded_dim(dim: usize) -> usize {
-    dim.next_power_of_two().max(TQ_MIN_PADDED_DIM)
+    dim.next_multiple_of(2).max(TQ_MIN_PADDED_DIM)
 }
 
 /// Fingerprint every payload built for `dim` must carry (no codebook build).
 #[inline]
 pub fn tq_expected_fingerprint(dim: usize) -> u64 {
     tq_fingerprint(dim, tq_padded_dim(dim))
+}
+
+/// Process-wide codec cache. A codec is a pure function of the dimension and
+/// costs a Lloyd solve to build; segment opens and merges share one instance
+/// per dimension instead of re-deriving it.
+pub fn tq_shared_codec(dim: usize) -> std::sync::Arc<TqCodec> {
+    static CODECS: std::sync::OnceLock<
+        std::sync::Mutex<rustc_hash::FxHashMap<usize, std::sync::Arc<TqCodec>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CODECS.get_or_init(Default::default);
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::sync::Arc::clone(
+        guard
+            .entry(dim)
+            .or_insert_with(|| std::sync::Arc::new(TqCodec::new(dim))),
+    )
 }
 
 /// Bytes of one scoring block: 16 f32 gammas + 16 packed nibble rows.
@@ -90,42 +114,62 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Seeded structured rotation: sign flips → normalized FWHT → permutation.
-/// Orthonormal on `R^padded_dim`; inputs shorter than `padded_dim` are
-/// zero-padded, which embeds them isometrically.
+/// Number of sign/sub-FWHT/permutation rounds in the padding-free rotation.
+/// One round mixes the largest power-of-two prefix; the permutations carry
+/// every coordinate through that prefix across rounds, so three rounds give
+/// near-uniform mixing for any dimension (pinned by the estimator tests).
+const TQ_ROTATION_ROUNDS: usize = 3;
+
+/// Seeded structured rotation, padding-free: per round, sign flips → a
+/// normalized FWHT over the largest power-of-two prefix (identity on the
+/// remainder) → a full random permutation. Every factor is orthonormal on
+/// `R^padded_dim`, so the composition preserves norms and inner products
+/// exactly; inputs shorter than `padded_dim` (odd dims round up by one) are
+/// zero-extended, which embeds them isometrically.
 #[derive(Debug, Clone)]
 pub struct TqRotation {
     input_dim: usize,
     padded_dim: usize,
-    /// +1.0 / -1.0 per padded coordinate.
+    /// Largest power of two ≤ `padded_dim`: the per-round FWHT span.
+    fwht_len: usize,
+    /// +1.0 / -1.0 per coordinate, one strip per round.
     signs: Vec<f32>,
-    /// `output[i] = fwht(signs * input)[perm[i]]`.
-    perm: Vec<u32>,
+    /// `output[i] = mixed[perm[i]]`, one strip per round.
+    perms: Vec<u32>,
 }
 
 impl TqRotation {
     pub fn new(input_dim: usize, seed: u64) -> Self {
         let padded_dim = tq_padded_dim(input_dim);
+        let fwht_len = if padded_dim.is_power_of_two() {
+            padded_dim
+        } else {
+            padded_dim.next_power_of_two() / 2
+        };
         let mut state = seed;
-        let signs = (0..padded_dim)
-            .map(|_| {
+        let mut signs = Vec::with_capacity(TQ_ROTATION_ROUNDS * padded_dim);
+        let mut perms = Vec::with_capacity(TQ_ROTATION_ROUNDS * padded_dim);
+        for _ in 0..TQ_ROTATION_ROUNDS {
+            signs.extend((0..padded_dim).map(|_| {
                 if splitmix64(&mut state) & 1 == 1 {
-                    1.0
+                    1.0f32
                 } else {
-                    -1.0
+                    -1.0f32
                 }
-            })
-            .collect();
-        let mut perm: Vec<u32> = (0..padded_dim as u32).collect();
-        for i in (1..padded_dim).rev() {
-            let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
-            perm.swap(i, j);
+            }));
+            let round_base = perms.len();
+            perms.extend(0..padded_dim as u32);
+            for i in (1..padded_dim).rev() {
+                let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+                perms.swap(round_base + i, round_base + j);
+            }
         }
         Self {
             input_dim,
             padded_dim,
+            fwht_len,
             signs,
-            perm,
+            perms,
         }
     }
 
@@ -140,16 +184,30 @@ impl TqRotation {
     pub fn apply(&self, input: &[f32], scratch: &mut Vec<f32>, output: &mut [f32]) {
         debug_assert!(input.len() == self.input_dim || input.len() == self.padded_dim);
         debug_assert_eq!(output.len(), self.padded_dim);
+        let padded_dim = self.padded_dim;
         scratch.clear();
-        scratch.extend(
-            self.signs
-                .iter()
-                .enumerate()
-                .map(|(index, sign)| input.get(index).copied().unwrap_or(0.0) * sign),
-        );
-        fwht_normalized(scratch);
-        for (slot, &source) in output.iter_mut().zip(&self.perm) {
+        scratch.resize(padded_dim, 0.0);
+        // Round 0 reads straight from the (implicitly zero-extended) input;
+        // later rounds ping-pong between `output` and `scratch`.
+        let signs = &self.signs[..padded_dim];
+        for (slot, (sign, index)) in scratch.iter_mut().zip(signs.iter().zip(0..)) {
+            *slot = input.get(index).copied().unwrap_or(0.0) * sign;
+        }
+        fwht_normalized(&mut scratch[..self.fwht_len]);
+        let perm = &self.perms[..padded_dim];
+        for (slot, &source) in output.iter_mut().zip(perm) {
             *slot = scratch[source as usize];
+        }
+        for round in 1..TQ_ROTATION_ROUNDS {
+            let signs = &self.signs[round * padded_dim..(round + 1) * padded_dim];
+            for (slot, (&value, sign)) in scratch.iter_mut().zip(output.iter().zip(signs)) {
+                *slot = value * sign;
+            }
+            fwht_normalized(&mut scratch[..self.fwht_len]);
+            let perm = &self.perms[round * padded_dim..(round + 1) * padded_dim];
+            for (slot, &source) in output.iter_mut().zip(perm) {
+                *slot = scratch[source as usize];
+            }
         }
     }
 }
@@ -162,11 +220,12 @@ fn fwht_normalized(values: &mut [f32]) {
     while step < len {
         let mut base = 0;
         while base < len {
-            for offset in base..base + step {
-                let left = values[offset];
-                let right = values[offset + step];
-                values[offset] = left + right;
-                values[offset + step] = left - right;
+            let (left_half, right_half) = values[base..base + step * 2].split_at_mut(step);
+            for (left, right) in left_half.iter_mut().zip(right_half.iter_mut()) {
+                let sum = *left + *right;
+                let difference = *left - *right;
+                *left = sum;
+                *right = difference;
             }
             base += step * 2;
         }
@@ -697,6 +756,12 @@ mod lut16 {
         }
         #[cfg(target_arch = "x86_64")]
         {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    accumulate_block_avx2(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
+                }
+                return;
+            }
             if std::arch::is_x86_feature_detected!("ssse3") {
                 unsafe {
                     accumulate_block_ssse3(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
@@ -785,6 +850,101 @@ mod lut16 {
                 vst1q_s32(base.as_mut_ptr().add(quarter * 4), base_lo_i32[quarter]);
                 vst1q_s32(qjl.as_mut_ptr().add(quarter * 4), qjl_lo_i32[quarter]);
             }
+        }
+    }
+
+    /// AVX2: two dimensions per iteration. Adjacent dims' packed rows are
+    /// contiguous (8 bytes each) and so are their 16-entry LUTs, so one 16-byte
+    /// row load + one 32-byte LUT load + a 256-bit `vpshufb` covers both.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn accumulate_block_avx2(
+        base_lut: &[i8],
+        qjl_lut: &[i8],
+        nibble_bytes: &[u8],
+        padded_dim: usize,
+        base: &mut [i32; TQ_BLOCK_LANES],
+        qjl: &mut [i32; TQ_BLOCK_LANES],
+    ) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let mask = _mm_set1_epi8(0x0F);
+            let zero256 = _mm256_setzero_si256();
+            let mut base_i32 = [zero256; 2];
+            let mut qjl_i32 = [zero256; 2];
+            let mut dim = 0;
+            while dim < padded_dim {
+                let chunk_end = (dim + TQ_ACCUMULATE_CHUNK_DIMS).min(padded_dim);
+                let mut base_acc = zero256;
+                let mut qjl_acc = zero256;
+                while dim + 2 <= chunk_end {
+                    // Bytes [dim*8, dim*8+16): rows for `dim` and `dim + 1`.
+                    let rows = _mm_loadu_si128(nibble_bytes.as_ptr().add(dim * 8).cast());
+                    let low = _mm_and_si128(rows, mask);
+                    let high = _mm_and_si128(_mm_srli_epi16(rows, 4), mask);
+                    // Lanes 0..16 of each dim: [low.q0 | high.q0], [low.q1 | high.q1].
+                    let lanes_first = _mm_unpacklo_epi64(low, high);
+                    let lanes_second = _mm_unpackhi_epi64(low, high);
+                    let lanes = _mm256_inserti128_si256(
+                        _mm256_castsi128_si256(lanes_first),
+                        lanes_second,
+                        1,
+                    );
+                    let base_tables = _mm256_loadu_si256(base_lut.as_ptr().add(dim * 16).cast());
+                    let qjl_tables = _mm256_loadu_si256(qjl_lut.as_ptr().add(dim * 16).cast());
+                    let base_values = _mm256_shuffle_epi8(base_tables, lanes);
+                    let qjl_values = _mm256_shuffle_epi8(qjl_tables, lanes);
+                    base_acc = _mm256_add_epi16(
+                        base_acc,
+                        _mm256_cvtepi8_epi16(_mm256_castsi256_si128(base_values)),
+                    );
+                    base_acc = _mm256_add_epi16(
+                        base_acc,
+                        _mm256_cvtepi8_epi16(_mm256_extracti128_si256(base_values, 1)),
+                    );
+                    qjl_acc = _mm256_add_epi16(
+                        qjl_acc,
+                        _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qjl_values)),
+                    );
+                    qjl_acc = _mm256_add_epi16(
+                        qjl_acc,
+                        _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qjl_values, 1)),
+                    );
+                    dim += 2;
+                }
+                // Odd remainder dim within the chunk.
+                while dim < chunk_end {
+                    let row = _mm_loadl_epi64(nibble_bytes.as_ptr().add(dim * 8).cast());
+                    let low = _mm_and_si128(row, mask);
+                    let high = _mm_and_si128(_mm_srli_epi16(row, 4), mask);
+                    let lanes = _mm_unpacklo_epi64(low, high);
+                    let base_table = _mm_loadu_si128(base_lut.as_ptr().add(dim * 16).cast());
+                    let qjl_table = _mm_loadu_si128(qjl_lut.as_ptr().add(dim * 16).cast());
+                    base_acc = _mm256_add_epi16(
+                        base_acc,
+                        _mm256_cvtepi8_epi16(_mm_shuffle_epi8(base_table, lanes)),
+                    );
+                    qjl_acc = _mm256_add_epi16(
+                        qjl_acc,
+                        _mm256_cvtepi8_epi16(_mm_shuffle_epi8(qjl_table, lanes)),
+                    );
+                    dim += 1;
+                }
+                for (accumulators, chunk) in [(&mut base_i32, base_acc), (&mut qjl_i32, qjl_acc)] {
+                    accumulators[0] = _mm256_add_epi32(
+                        accumulators[0],
+                        _mm256_cvtepi16_epi32(_mm256_castsi256_si128(chunk)),
+                    );
+                    accumulators[1] = _mm256_add_epi32(
+                        accumulators[1],
+                        _mm256_cvtepi16_epi32(_mm256_extracti128_si256(chunk, 1)),
+                    );
+                }
+            }
+            _mm256_storeu_si256(base.as_mut_ptr().cast(), base_i32[0]);
+            _mm256_storeu_si256(base.as_mut_ptr().add(8).cast(), base_i32[1]);
+            _mm256_storeu_si256(qjl.as_mut_ptr().cast(), qjl_i32[0]);
+            _mm256_storeu_si256(qjl.as_mut_ptr().add(8).cast(), qjl_i32[1]);
         }
     }
 
@@ -912,8 +1072,8 @@ impl TqFlatBuilder {
         use rayon::prelude::*;
 
         let dim = self.codec.dim();
-        let expected = labels
-            .len()
+        let vector_count = labels.len();
+        let expected = vector_count
             .checked_mul(dim)
             .ok_or("TQ input size overflow")?;
         if vectors.len() != expected {
@@ -921,22 +1081,63 @@ impl TqFlatBuilder {
         }
         let padded_dim = self.codec.padded_dim();
         let codec = std::sync::Arc::clone(&self.codec);
-        let rows: Vec<(Vec<u8>, f32)> = vectors
+        // One contiguous nibble matrix instead of a Vec per vector: each
+        // Rayon task writes its disjoint row range (allocation hygiene on
+        // the ingest/merge path).
+        let mut rows = vec![0u8; vector_count * padded_dim];
+        let mut gammas = vec![0.0f32; vector_count];
+        vectors
             .par_chunks_exact(dim)
-            .map_init(TqEncodeScratch::default, |scratch, vector| {
-                let mut nibbles = vec![0u8; padded_dim];
-                let gamma = codec.encode_into(vector, &mut nibbles, scratch);
-                (nibbles, gamma)
-            })
-            .collect();
-        for (&(doc_id, ordinal), (nibbles, gamma)) in labels.iter().zip(rows) {
+            .zip(rows.par_chunks_exact_mut(padded_dim))
+            .zip(gammas.par_iter_mut())
+            .for_each_init(
+                TqEncodeScratch::default,
+                |scratch, ((vector, row), gamma)| {
+                    *gamma = codec.encode_into(vector, row, scratch);
+                },
+            );
+
+        // Top up a carried-over partial block, pack full blocks straight from
+        // the contiguous matrix (no per-row copies), and carry the tail.
+        let mut index = 0;
+        while index < vector_count && !self.pending_rows.is_empty() {
+            let (doc_id, ordinal) = labels[index];
             self.doc_ids.push(doc_id);
             self.ordinals.push(ordinal);
-            self.pending_rows.push(nibbles);
-            self.pending_gammas.push(gamma);
+            self.pending_rows
+                .push(rows[index * padded_dim..(index + 1) * padded_dim].to_vec());
+            self.pending_gammas.push(gammas[index]);
             if self.pending_rows.len() == TQ_BLOCK_LANES {
                 self.flush_block();
             }
+            index += 1;
+        }
+        while vector_count - index >= TQ_BLOCK_LANES {
+            let row_refs: Vec<&[u8]> = (0..TQ_BLOCK_LANES)
+                .map(|lane| {
+                    let row = index + lane;
+                    &rows[row * padded_dim..(row + 1) * padded_dim]
+                })
+                .collect();
+            tq_pack_block(
+                &row_refs,
+                &gammas[index..index + TQ_BLOCK_LANES],
+                padded_dim,
+                &mut self.codes,
+            );
+            for &(doc_id, ordinal) in &labels[index..index + TQ_BLOCK_LANES] {
+                self.doc_ids.push(doc_id);
+                self.ordinals.push(ordinal);
+            }
+            index += TQ_BLOCK_LANES;
+        }
+        for row in index..vector_count {
+            let (doc_id, ordinal) = labels[row];
+            self.doc_ids.push(doc_id);
+            self.ordinals.push(ordinal);
+            self.pending_rows
+                .push(rows[row * padded_dim..(row + 1) * padded_dim].to_vec());
+            self.pending_gammas.push(gammas[row]);
         }
         Ok(())
     }
@@ -989,10 +1190,15 @@ mod tests {
     #[test]
     fn rotation_is_orthonormal_and_deterministic() {
         let rotation = TqRotation::new(100, 42);
-        assert_eq!(rotation.padded_dim(), 128);
+        assert_eq!(rotation.padded_dim(), 100);
+        let mut fwht_scratch = Vec::new();
+        let mut probe = vec![0.0f32; 100];
+        // Odd dims round up by one zero coordinate.
+        assert_eq!(TqRotation::new(99, 42).padded_dim(), 100);
+        TqRotation::new(99, 42).apply(&vec![1.0; 99], &mut fwht_scratch, &mut probe);
         let input = seeded_unit_vector(100, 7);
         let mut fwht = Vec::new();
-        let mut output = vec![0.0f32; 128];
+        let mut output = vec![0.0f32; 100];
         rotation.apply(&input, &mut fwht, &mut output);
         let norm: f32 = output.iter().map(|v| v * v).sum();
         assert!(
@@ -1000,13 +1206,13 @@ mod tests {
             "rotation must preserve norm, got {norm}"
         );
 
-        let mut second = vec![0.0f32; 128];
+        let mut second = vec![0.0f32; 100];
         TqRotation::new(100, 42).apply(&input, &mut fwht, &mut second);
         assert_eq!(output, second, "rotation must be deterministic");
 
         // Distinct inputs keep their inner product (isometry).
         let other = seeded_unit_vector(100, 8);
-        let mut other_rotated = vec![0.0f32; 128];
+        let mut other_rotated = vec![0.0f32; 100];
         rotation.apply(&other, &mut fwht, &mut other_rotated);
         let dot_before: f32 = input.iter().zip(&other).map(|(a, b)| a * b).sum();
         let dot_after: f32 = output.iter().zip(&other_rotated).map(|(a, b)| a * b).sum();
@@ -1102,7 +1308,7 @@ mod tests {
 
     #[test]
     fn block_scoring_matches_row_estimates() {
-        let dim = 100; // padded to 128; exercises zero-padding
+        let dim = 100;
         let codec = TqCodec::new(dim);
         let mut scratch = TqEncodeScratch::default();
         let query = seeded_unit_vector(dim, 3);
@@ -1180,8 +1386,8 @@ mod tests {
     #[test]
     fn fingerprint_pins_codec_constants() {
         let codec = TqCodec::new(768);
-        assert_eq!(codec.padded_dim(), 1024);
-        assert_eq!(codec.code_size(), 512);
+        assert_eq!(codec.padded_dim(), 768, "codec v2 is padding-free");
+        assert_eq!(codec.code_size(), 384);
         assert_ne!(codec.fingerprint(), 0);
         assert_eq!(codec.fingerprint(), TqCodec::new(768).fingerprint());
         assert_ne!(codec.fingerprint(), TqCodec::new(769).fingerprint());
@@ -1196,7 +1402,7 @@ mod tests {
         );
     }
 
-    const GOLDEN_FINGERPRINT_768: u64 = 4674713535241508736;
+    const GOLDEN_FINGERPRINT_768: u64 = 7026088428300072418;
 
     #[cfg(feature = "native")]
     #[test]

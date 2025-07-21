@@ -824,36 +824,12 @@ fn validate_coarse_centroids(centroids: &CoarseCentroids, dim: usize) -> Result<
     Ok(())
 }
 
-fn validate_ivf_pq_ann(
-    index: &crate::segment::ann_disk::AnnDiskIndex,
-    centroids: &CoarseCentroids,
-    codebook: &crate::structures::PQCodebook,
-    dim: usize,
-    routing: crate::dsl::IvfRoutingMode,
-) -> Result<()> {
-    let header = index.header();
-    if header.dim != dim
-        || codebook.config.dim != dim
-        || header.code_size != codebook.config.num_subspaces
-        || header.num_clusters != centroids.num_clusters
-        || header.quantizer_version != centroids.version
-        || header.codebook_version != codebook.version
-        || header.routing != routing
-    {
-        return Err(Error::Corruption(format!(
-            "IVF-PQ payload/codebook/centroid metadata does not match schema dimension {dim}"
-        )));
-    }
-    Ok(())
-}
-
 /// Per-query dense plan caches, shared by every segment scorer the query
-/// spawns. Both members are query-global: the IVF-PQ probe route and ADC
-/// tables depend only on the query and index-level artifacts, and the TQ
+/// spawns. Both members are query-global: the IVF-TQ probe route and its
+/// LUTs depend only on the query and index-level artifacts, and the TQ
 /// LUTs depend only on the query and the schema dimension.
 #[derive(Debug, Default)]
 pub struct DensePlanCache {
-    pub(crate) ivf_pq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
     pub(crate) tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqQueryPlan>>>,
     pub(crate) ivf_tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqIvfQueryPlan>>>,
 }
@@ -920,7 +896,7 @@ fn validate_tq_ann(
 
 /// Search one segment's IVF-TQ payload. The probe route, the `⟨q̂,c⟩`
 /// scalars, and the TQ LUTs are all query-global, so the plan is cached and
-/// shared across every segment of the field (same rule as `float_query_plan`).
+/// shared across every segment of the field.
 #[allow(clippy::too_many_arguments)]
 fn search_ivf_tq_segment(
     index: &crate::segment::ann_disk::AnnDiskIndex,
@@ -1030,53 +1006,6 @@ fn validate_binary_ann(
         )));
     }
     Ok(())
-}
-
-fn float_query_plan(
-    centroids: &CoarseCentroids,
-    codebook: &crate::structures::PQCodebook,
-    query: &[f32],
-    nprobe: usize,
-    routing: crate::dsl::IvfRoutingMode,
-    cache: Option<&std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>>,
-) -> Result<std::sync::Arc<crate::structures::IvfPqQueryPlan>> {
-    let effective_nprobe = nprobe.clamp(1, centroids.num_clusters as usize);
-    let request_fingerprint = crate::structures::vector::ivf::routing::float_probe_fingerprint(
-        query,
-        effective_nprobe,
-        routing,
-    );
-    if let Some(cache) = cache {
-        let mut cached = cache
-            .lock()
-            .map_err(|_| Error::Internal("dense IVF probe cache is poisoned".into()))?;
-        if let Some(plan) = cached.as_ref()
-            && plan.quantizer_version == centroids.version
-            && plan.codebook_version == codebook.version
-            && plan.request_fingerprint == request_fingerprint
-            && plan.cluster_ids.len() == effective_nprobe
-        {
-            return Ok(std::sync::Arc::clone(plan));
-        }
-        let plan = std::sync::Arc::new(crate::structures::IvfPqQueryPlan::build(
-            centroids,
-            codebook,
-            query,
-            effective_nprobe,
-            routing,
-        ));
-        *cached = Some(std::sync::Arc::clone(&plan));
-        return Ok(plan);
-    }
-    Ok(std::sync::Arc::new(
-        crate::structures::IvfPqQueryPlan::build(
-            centroids,
-            codebook,
-            query,
-            effective_nprobe,
-            routing,
-        ),
-    ))
 }
 
 fn binary_probe_clusters(
@@ -2123,63 +2052,8 @@ impl SegmentReader {
         let t0 = std::time::Instant::now();
         let mut flat_results = None;
         let results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
-            // ANN search through the segment's IVF-PQ payload.
+            // ANN search through the segment's ANN payload.
             match index {
-                VectorIndex::IvfPq(lazy) => {
-                    let index = lazy.get();
-                    let codebook =
-                        self.trained_vectors
-                            .codebooks
-                            .get(&field.0)
-                            .ok_or_else(|| {
-                                Error::Schema(format!(
-                                    "IVF-PQ index requires a global codebook for field {}",
-                                    field.0
-                                ))
-                            })?;
-                    let centroids =
-                        self.trained_vectors
-                            .centroids
-                            .get(&field.0)
-                            .ok_or_else(|| {
-                                Error::Schema(format!(
-                                    "IVF-PQ index requires coarse centroids for field {}",
-                                    field.0
-                                ))
-                            })?;
-                    validate_coarse_centroids(centroids, params.dim)?;
-                    let routing = self
-                        .schema
-                        .get_field_entry(field)
-                        .and_then(|entry| entry.dense_vector_config.as_ref())
-                        .map_or(crate::dsl::IvfRoutingMode::Auto, |config| {
-                            config.ivf_routing
-                        });
-                    validate_ivf_pq_ann(index, centroids, codebook, params.dim, routing)?;
-                    let query_plan = float_query_plan(
-                        centroids,
-                        codebook,
-                        query,
-                        params.nprobe,
-                        routing,
-                        plan_cache.map(|cache| &cache.ivf_pq),
-                    )?;
-                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    index
-                        .search_ivf_pq_distinct(
-                            fetch_k.min(flat.num_docs_with_vectors()),
-                            &query_plan,
-                        )
-                        .map_err(|error| {
-                            Error::Corruption(format!(
-                                "invalid IVF-PQ payload for field {}: {error}",
-                                field.0,
-                            ))
-                        })?
-                        .into_iter()
-                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
-                        .collect()
-                }
                 VectorIndex::Tq { index: lazy, codec } => {
                     let flat = lazy_flat.expect("ANN/flat pairing validated above");
                     // Estimated similarities feed the shared exact re-rank.
@@ -2282,7 +2156,6 @@ impl SegmentReader {
         let l1_elapsed = t0.elapsed();
         {
             let kind = match ann_index {
-                Some(VectorIndex::IvfPq(_)) => "ivf_pq",
                 Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
                 Some(VectorIndex::Tq { .. }) => "tq_flat",
                 Some(VectorIndex::IvfTq { .. }) => "ivf_tq",
@@ -2812,61 +2685,6 @@ impl SegmentReader {
         let results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
             // ANN search (already sync)
             match index {
-                VectorIndex::IvfPq(lazy) => {
-                    let index = lazy.get();
-                    let codebook =
-                        self.trained_vectors
-                            .codebooks
-                            .get(&field.0)
-                            .ok_or_else(|| {
-                                Error::Schema(format!(
-                                    "IVF-PQ index requires a global codebook for field {}",
-                                    field.0
-                                ))
-                            })?;
-                    let centroids =
-                        self.trained_vectors
-                            .centroids
-                            .get(&field.0)
-                            .ok_or_else(|| {
-                                Error::Schema(format!(
-                                    "IVF-PQ index requires coarse centroids for field {}",
-                                    field.0
-                                ))
-                            })?;
-                    validate_coarse_centroids(centroids, params.dim)?;
-                    let routing = self
-                        .schema
-                        .get_field_entry(field)
-                        .and_then(|entry| entry.dense_vector_config.as_ref())
-                        .map_or(crate::dsl::IvfRoutingMode::Auto, |config| {
-                            config.ivf_routing
-                        });
-                    validate_ivf_pq_ann(index, centroids, codebook, params.dim, routing)?;
-                    let query_plan = float_query_plan(
-                        centroids,
-                        codebook,
-                        query,
-                        params.nprobe,
-                        routing,
-                        plan_cache.map(|cache| &cache.ivf_pq),
-                    )?;
-                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
-                    index
-                        .search_ivf_pq_distinct(
-                            fetch_k.min(flat.num_docs_with_vectors()),
-                            &query_plan,
-                        )
-                        .map_err(|error| {
-                            Error::Corruption(format!(
-                                "invalid IVF-PQ payload for field {}: {error}",
-                                field.0,
-                            ))
-                        })?
-                        .into_iter()
-                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
-                        .collect()
-                }
                 VectorIndex::Tq { index: lazy, codec } => {
                     let flat = lazy_flat.expect("ANN/flat pairing validated above");
                     search_tq_segment(
