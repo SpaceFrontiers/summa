@@ -416,7 +416,7 @@ impl BmpIndex {
         log::debug!(
             "BMP V17 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
-             block_grid={}B, superblock_grid={}B, single_valued={}, block_data={}B, doc_map={}B",
+             block_grid={}, superblock_grid={}, single_valued={}, block_data={}, doc_map={}",
             num_blocks,
             num_superblocks,
             dims,
@@ -425,11 +425,11 @@ impl BmpIndex {
             num_real_docs,
             max_weight_scale,
             total_postings,
-            block_grid.encoded_bytes(),
-            superblock_grid.encoded_bytes(),
+            crate::format_bytes(block_grid.encoded_bytes() as u64),
+            crate::format_bytes(superblock_grid.encoded_bytes() as u64),
             single_valued,
-            bds_start,
-            num_virtual_docs as usize * 6,
+            crate::format_bytes(bds_start as u64),
+            crate::format_bytes(u64::from(num_virtual_docs) * 6),
         );
 
         Ok(Self {
@@ -756,18 +756,10 @@ impl BmpIndex {
         self.single_valued
     }
 
-    /// Estimated memory usage in bytes (mmap-backed region sizes).
-    ///
-    /// Fully zero-copy: all data is mmap-backed OwnedBytes, but the
-    /// mapped regions still consume RSS when paged in by the OS.
-    pub fn estimated_memory_bytes(&self) -> usize {
+    /// Estimated heap retained by this index. All corpus-sized sections are
+    /// file-backed `OwnedBytes` slices and therefore excluded.
+    pub fn estimated_heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.block_data_starts_bytes.len()
-            + self.block_data_bytes.len()
-            + self.block_grid.encoded_bytes()
-            + self.superblock_grid.encoded_bytes()
-            + self.doc_map_ids_bytes.len()
-            + self.doc_map_ordinals_bytes.len()
     }
 
     /// Bits per block-grid cell (4 or 2).

@@ -253,8 +253,8 @@ impl AnnDiskIndex {
         &self.header
     }
 
-    pub(crate) fn estimated_memory_bytes(&self) -> usize {
-        self.runs.capacity() * std::mem::size_of::<AnnRun>()
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.runs.capacity() * std::mem::size_of::<AnnRun>()
     }
 
     #[cfg(feature = "native")]
@@ -272,6 +272,7 @@ impl AnnDiskIndex {
         report.pinned_bytes += after.pinned_bytes - before.pinned_bytes;
         report.skipped_budget_bytes += after.skipped_budget_bytes - before.skipped_budget_bytes;
         report.failed_bytes += after.failed_bytes - before.failed_bytes;
+        report.heap_copy_bytes += after.heap_copy_bytes - before.heap_copy_bytes;
     }
 
     fn cluster_runs(&self, cluster_id: u32) -> &[AnnRun] {

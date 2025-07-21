@@ -1007,8 +1007,8 @@ impl SearchService for SearchServiceImpl {
             let stats = segment.memory_stats();
             total_term_dict_cache += stats.term_dict_cache_bytes as u64;
             total_store_cache += stats.store_cache_bytes as u64;
-            total_sparse_index += stats.sparse_index_bytes as u64;
-            total_dense_index += stats.dense_index_bytes as u64;
+            total_sparse_index += stats.sparse_heap_bytes as u64;
+            total_dense_index += stats.dense_heap_bytes as u64;
         }
 
         let segment_reader_stats = SegmentReaderStats {

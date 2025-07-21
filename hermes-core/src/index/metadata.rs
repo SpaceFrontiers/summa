@@ -422,7 +422,7 @@ impl IndexMetadata {
         built_fields.sort_unstable_by_key(|(field_id, _)| **field_id);
 
         log::debug!(
-            "[trained] loading trained structures, vector_fields={:?}",
+            "[trained] loading trained structures, dense_vector_fields={:?}",
             vector_fields.keys().collect::<Vec<_>>()
         );
 

@@ -69,9 +69,9 @@ fn release_memory_to_os() {
     // Log current memory stats
     if let (Ok(allocated), Ok(resident)) = (stats::allocated::read(), stats::resident::read()) {
         tracing::debug!(
-            "Memory: allocated={:.1} MB, resident={:.1} MB",
-            allocated as f64 / (1024.0 * 1024.0),
-            resident as f64 / (1024.0 * 1024.0)
+            "Memory: allocated={}, resident={}",
+            hermes_core::format_bytes(allocated as u64),
+            hermes_core::format_bytes(resident as u64)
         );
     }
 }

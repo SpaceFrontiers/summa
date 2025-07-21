@@ -385,7 +385,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .await?;
         self.cleanup_unreferenced_vector_artifacts().await;
         log::info!(
-            "Vector generation {:?} complete for {} field(s)",
+            "Dense vector ANN generation {:?} complete for {} field(s)",
             mode,
             target_field_ids.len(),
         );
@@ -437,7 +437,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
         if !missing.is_empty() {
             log::info!(
-                "Skipping vector field(s) {missing:?}: the current corpus contains no vectors"
+                "Skipping dense vector field(s) {missing:?}: the current corpus contains no vectors"
             );
         }
         Ok(updates)
@@ -467,7 +467,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let files = match self.directory.list_files(std::path::Path::new("")).await {
             Ok(files) => files,
             Err(error) => {
-                log::warn!("[trained] failed listing abandoned vector artifacts: {error}");
+                log::warn!("[trained] failed listing abandoned dense vector artifacts: {error}");
                 return;
             }
         };
@@ -759,12 +759,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
         if collected < total {
             log::info!(
-                "Sampled {} / {} vectors for field {} (max {} vectors / {} bytes resident)",
+                "Sampled {} / {} dense vectors for field {} (max {} vectors / {} resident)",
                 collected,
                 total,
                 field.0,
                 self.config.vector_training_max_samples,
-                self.config.vector_training_memory_bytes,
+                crate::format_bytes(self.config.vector_training_memory_bytes as u64),
             );
         }
         Ok(Some(sample))
@@ -790,7 +790,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let num_clusters = effective_field_num_clusters(config, corpus_count, sample_count)?;
 
         log::info!(
-            "Training vector index for field {} with {} sampled / {} total vectors, {} clusters (dim={})",
+            "Training dense vector index for field {} with {} sampled / {} total vectors, {} clusters (dim={})",
             field_id,
             sample_count,
             corpus_count,

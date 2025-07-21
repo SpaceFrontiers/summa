@@ -96,7 +96,6 @@ struct BmpScratch {
     query_presence: Vec<u64>,
     local_block_order: Vec<u32>,
     // Two-phase block scoring: phase1 block UBs (sized to BMP_SUPERBLOCK_SIZE)
-    phase1_local_block_ubs: Vec<f32>,
     phase1_local_block_ub_units: Vec<u32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
@@ -125,9 +124,6 @@ impl BmpScratch {
         }
         if self.local_block_order.len() < sb_size {
             self.local_block_order.resize(sb_size, 0);
-        }
-        if self.phase1_local_block_ubs.len() < sb_size {
-            self.phase1_local_block_ubs.resize(sb_size, 0.0);
         }
         if self.phase1_local_block_ub_units.len() < sb_size {
             self.phase1_local_block_ub_units.resize(sb_size, 0);
@@ -183,6 +179,8 @@ struct BmpGridWeight {
 /// prevents a 50-segment index from silently turning γ into `50 × γ`.
 #[derive(Debug)]
 pub(crate) struct LspSegmentPlan {
+    /// Upper bounds aligned one-for-one with `sb_order`. Keeping only selected
+    /// values makes plan residency O(gamma), not O(all superblocks).
     pub(crate) sb_ubs: Vec<f32>,
     pub(crate) sb_order: Vec<u32>,
 }
@@ -534,60 +532,70 @@ fn execute_bmp_inner(
 
         // ── Superblock-at-a-time scoring ─────────────────────────────
         scratch.ensure_capacity_sb(
-            num_superblocks_total,
+            if lsp_plan.is_some() {
+                0
+            } else {
+                num_superblocks_total
+            },
             BMP_SUPERBLOCK_SIZE as usize,
             block_size,
         );
 
-        let (sb_ubs, sb_order, superblock_visit_limit) = if let Some(plan) = lsp_plan {
-            if plan.sb_ubs.len() != num_superblocks_total {
-                return Err(crate::Error::Internal(format!(
-                    "global LSP/0 plan has {} bounds for {} superblocks",
-                    plan.sb_ubs.len(),
-                    num_superblocks_total
-                )));
-            }
-            if plan
-                .sb_order
-                .iter()
-                .any(|&superblock| superblock as usize >= num_superblocks_total)
-            {
-                return Err(crate::Error::Internal(
-                    "global LSP/0 plan contains an invalid superblock id".into(),
-                ));
-            }
-            (
-                plan.sb_ubs.as_slice(),
-                plan.sb_order.as_slice(),
-                plan.sb_order.len(),
-            )
-        } else {
-            // Single-segment/direct execution computes its own SBMax order.
-            compute_sb_ubs_int(
-                index.superblock_grid(),
-                &candidate_grid_weights,
-                dequant,
-                &mut scratch.sb_ub_units,
-                &mut scratch.sb_ubs,
-                &mut scratch.decoded_grid_group,
-            )?;
-            // LSP/0 requires strict non-increasing SBMax order. A secondary
-            // coverage heuristic would change membership in top-γ.
-            sort_sb_desc_into(
-                &scratch.sb_ubs[..num_superblocks_total],
-                &mut scratch.sb_order,
-            );
-            let visit_limit = if lsp_gamma == 0 {
-                scratch.sb_order.len()
-            } else {
-                lsp_gamma.min(scratch.sb_order.len())
+        let (sb_ubs, sb_order, superblock_visit_limit, bounds_follow_order) =
+            match lsp_plan {
+                Some(plan) => {
+                    if plan.sb_ubs.len() != plan.sb_order.len() {
+                        return Err(crate::Error::Internal(format!(
+                            "global LSP/0 plan has {} bounds for {} selected superblocks",
+                            plan.sb_ubs.len(),
+                            plan.sb_order.len()
+                        )));
+                    }
+                    if plan
+                        .sb_order
+                        .iter()
+                        .any(|&superblock| superblock as usize >= num_superblocks_total)
+                    {
+                        return Err(crate::Error::Internal(
+                            "global LSP/0 plan contains an invalid superblock id".into(),
+                        ));
+                    }
+                    (
+                        plan.sb_ubs.as_slice(),
+                        plan.sb_order.as_slice(),
+                        plan.sb_order.len(),
+                        true,
+                    )
+                }
+                None => {
+                    // Single-segment/direct execution computes its own SBMax order.
+                    compute_sb_ubs_int(
+                        index.superblock_grid(),
+                        &candidate_grid_weights,
+                        dequant,
+                        &mut scratch.sb_ub_units,
+                        &mut scratch.sb_ubs,
+                        &mut scratch.decoded_grid_group,
+                    )?;
+                    // LSP/0 requires strict non-increasing SBMax order. A secondary
+                    // coverage heuristic would change membership in top-γ.
+                    sort_sb_desc_into(
+                        &scratch.sb_ubs[..num_superblocks_total],
+                        &mut scratch.sb_order,
+                    );
+                    let visit_limit = if lsp_gamma == 0 {
+                        scratch.sb_order.len()
+                    } else {
+                        lsp_gamma.min(scratch.sb_order.len())
+                    };
+                    (
+                        &scratch.sb_ubs[..num_superblocks_total],
+                        scratch.sb_order.as_slice(),
+                        visit_limit,
+                        false,
+                    )
+                }
             };
-            (
-                &scratch.sb_ubs[..num_superblocks_total],
-                scratch.sb_order.as_slice(),
-                visit_limit,
-            )
-        };
 
         if sb_order.is_empty() {
             return Ok(Vec::new());
@@ -609,7 +617,11 @@ fn execute_bmp_inner(
             if let Some(shared) = threshold_source.shared {
                 collector.seed_threshold(shared.get());
             }
-            let sb_ub = sb_ubs[sb_id as usize];
+            let sb_ub = if bounds_follow_order {
+                sb_ubs[idx]
+            } else {
+                sb_ubs[sb_id as usize]
+            };
 
             // LSP/0's superblock condition is SBMax >= theta. Eta/alpha is
             // deliberately NOT applied here; it belongs only to block
@@ -651,7 +663,6 @@ fn execute_bmp_inner(
                 &mut scratch.local_block_ub_units,
                 &mut scratch.phase1_local_block_ub_units,
                 &mut scratch.local_block_ubs,
-                &mut scratch.phase1_local_block_ubs,
                 &mut scratch.query_presence,
                 &mut scratch.decoded_grid_group,
                 dequant,
@@ -702,6 +713,7 @@ fn execute_bmp_inner(
                 count,
                 &scratch.local_block_order,
                 &scratch.local_block_ubs,
+                &scratch.local_block_ub_units,
                 &scratch.query_presence,
                 &query_by_dim_u16,
                 candidate_mask,
@@ -715,7 +727,7 @@ fn execute_bmp_inner(
                 &mut scratch.acc,
                 phase1_mask,
                 if two_phase_active {
-                    Some(&scratch.phase1_local_block_ubs)
+                    Some(&scratch.phase1_local_block_ub_units)
                 } else {
                     None
                 },
@@ -914,6 +926,7 @@ fn score_superblock_blocks(
     count: usize,
     local_order: &[u32],
     local_ubs: &[f32],
+    local_ub_units: &[u32],
     query_presence: &[u64],
     query_by_dim_u16: &[(u32, u16)],
     candidate_mask: u64,
@@ -926,10 +939,10 @@ fn score_superblock_blocks(
     docmap_lookups: &mut u32,
     acc: &mut [u32],
     phase1_mask: u64,
-    phase1_local_ubs: Option<&[f32]>,
+    phase1_local_ub_units: Option<&[u32]>,
 ) {
     let block_size = index.bmp_block_size as usize;
-    let two_phase = phase1_mask != u64::MAX && phase1_local_ubs.is_some();
+    let two_phase = phase1_mask != u64::MAX && phase1_local_ub_units.is_some();
 
     // Level 2: Pre-warm first few blocks' data (eliminates cold-start for first block).
     // block_data_starts offsets are already in cache from superblock-level prefetch.
@@ -992,13 +1005,16 @@ fn score_superblock_blocks(
                     total_block_postings,
                 );
 
-                // Check if phase2 can be skipped:
-                // max_partial_score + remaining_ub < threshold?
-                // remaining_ub = full_block_ub - phase1_block_ub
-                let max_partial = max_touched_acc(acc, &touched) as f32 * dequant;
-                let phase1_ub = phase1_local_ubs.unwrap()[local_idx as usize];
-                let remaining_ub = (ub - phase1_ub).max(0.0);
-                if (max_partial + remaining_ub) * alpha < collector.threshold() {
+                // Keep the subtraction and addition in integer accumulator
+                // units. Subtracting independently rounded f32 bounds can
+                // underestimate the remaining score by one ULP near 2^24.
+                let max_possible_units = two_phase_upper_bound_units(
+                    max_touched_acc(acc, &touched),
+                    local_ub_units[local_idx as usize],
+                    phase1_local_ub_units.unwrap()[local_idx as usize],
+                );
+                let max_possible = max_possible_units as f32 * dequant;
+                if max_possible * alpha < collector.threshold() {
                     // Skip phase2 — zero touched slots and continue
                     zero_touched_acc(acc, &touched);
                     *blocks_scored += 1;
@@ -1091,6 +1107,15 @@ fn score_superblock_blocks(
 
         *blocks_scored += 1;
     }
+}
+
+#[inline(always)]
+fn two_phase_upper_bound_units(
+    max_partial_units: u32,
+    full_bound_units: u32,
+    phase1_bound_units: u32,
+) -> u32 {
+    max_partial_units.saturating_add(full_bound_units.saturating_sub(phase1_bound_units))
 }
 
 // ============================================================================
@@ -1218,7 +1243,6 @@ fn compute_block_ubs_and_presence(
     units: &mut [u32],
     phase1_units: &mut [u32],
     out: &mut [f32],
-    phase1_out: &mut [f32],
     query_presence: &mut Vec<u64>,
     decoded: &mut [u8],
     dequant: f32,
@@ -1226,7 +1250,6 @@ fn compute_block_ubs_and_presence(
     debug_assert!(units.len() >= count);
     debug_assert!(phase1_units.len() >= count);
     debug_assert!(out.len() >= count);
-    debug_assert!(phase1_out.len() >= count);
     debug_assert!(decoded.len() >= count);
     debug_assert!(count <= BMP_SUPERBLOCK_SIZE as usize);
     let group_id = block_start / GRID_GROUP_CELLS;
@@ -1274,11 +1297,6 @@ fn compute_block_ubs_and_presence(
     for (bound, &integer_units) in out[..count].iter_mut().zip(&units[..count]) {
         *bound = integer_units as f32 * dequant;
     }
-    if use_phase1 {
-        for (bound, &integer_units) in phase1_out[..count].iter_mut().zip(&phase1_units[..count]) {
-            *bound = integer_units as f32 * dequant;
-        }
-    }
     Ok(blocks_with_query_terms)
 }
 
@@ -1288,6 +1306,7 @@ mod tests {
 
     use super::{
         BmpGridWeight, compute_block_ubs_and_presence, recommended_lsp_gamma, sort_sb_desc_into,
+        two_phase_upper_bound_units,
     };
     use crate::directories::OwnedBytes;
     use crate::segment::BMP_SUPERBLOCK_SIZE;
@@ -1347,7 +1366,6 @@ mod tests {
         let mut bounds = [0.0f32; 1];
 
         let mut phase1_units = [0u32; 1];
-        let mut phase1_bounds = [0.0f32; 1];
         let mut presence = Vec::new();
         let mut decoded = [0u8; GRID_GROUP_CELLS];
         compute_block_ubs_and_presence(
@@ -1361,7 +1379,6 @@ mod tests {
             &mut units,
             &mut phase1_units,
             &mut bounds,
-            &mut phase1_bounds,
             &mut presence,
             &mut decoded,
             dequant,
@@ -1375,6 +1392,22 @@ mod tests {
     }
 
     #[test]
+    fn two_phase_bound_is_combined_before_f32_rounding() {
+        // Around 2^24, independently converting the full and phase-one
+        // bounds to f32 loses a unit in their difference:
+        // f32(max_partial) + (f32(full) - f32(phase1)) = 16_777_215,
+        // while the integer-domain upper bound is 16_777_216.
+        let max_partial = 16_777_199u32;
+        let full = 16_777_217u32;
+        let phase1 = 16_777_200u32;
+        let rounded_subtraction = max_partial as f32 + (full as f32 - phase1 as f32).max(0.0);
+        let integer_bound = two_phase_upper_bound_units(max_partial, full, phase1) as f32;
+
+        assert!(rounded_subtraction < integer_bound);
+        assert_eq!(integer_bound, 16_777_216.0);
+    }
+
+    #[test]
     fn packed_integer_bound_kernel_matches_every_4bit_cell() {
         let blocks = 64usize;
         let grid = test_grid(
@@ -1385,7 +1418,6 @@ mod tests {
             let mut units = [0u32; BMP_SUPERBLOCK_SIZE as usize];
             let mut phase1_units = [0u32; BMP_SUPERBLOCK_SIZE as usize];
             let mut bounds = [0.0f32; BMP_SUPERBLOCK_SIZE as usize];
-            let mut phase1_bounds = [0.0f32; BMP_SUPERBLOCK_SIZE as usize];
             let mut presence = Vec::new();
             let mut decoded = [0u8; GRID_GROUP_CELLS];
 
@@ -1404,7 +1436,6 @@ mod tests {
                 &mut units,
                 &mut phase1_units,
                 &mut bounds,
-                &mut phase1_bounds,
                 &mut presence,
                 &mut decoded,
                 1.0,

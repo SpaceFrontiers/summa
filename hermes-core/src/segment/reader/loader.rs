@@ -20,14 +20,20 @@ use crate::dsl::{
 pub struct SparseFileData {
     pub maxscore_indexes: FxHashMap<u32, SparseIndex>,
     pub bmp_indexes: FxHashMap<u32, BmpIndex>,
+    /// Logical size of the retained `.sparse` file handle. With
+    /// `MmapDirectory` this is mapped address space, not resident memory.
+    pub file_backed_bytes: u64,
 }
 
 /// Vectors file loading result
 pub struct VectorsFileData {
     /// Segment-level IVF payloads per field, loaded lazily for search.
     pub indexes: FxHashMap<u32, VectorIndex>,
-    /// Lazy flat vectors per field — doc_ids in memory, vectors via mmap for reranking/merge
+    /// Lazy flat vectors per field — document maps and vectors stay file-backed.
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
+    /// Logical size of the retained `.vectors` file handle. With
+    /// `MmapDirectory` this is mapped address space, not resident memory.
+    pub file_backed_bytes: u64,
     /// ANN field IDs declared by the validated TOC. Training-only callers use
     /// this without opening corpus-sized ANN payloads.
     #[cfg(feature = "native")]
@@ -296,6 +302,7 @@ async fn load_vectors_file_impl<D: Directory>(
     let empty = || VectorsFileData {
         indexes: FxHashMap::default(),
         flat_vectors: FxHashMap::default(),
+        file_backed_bytes: 0,
         #[cfg(feature = "native")]
         ann_fields: Vec::new(),
     };
@@ -524,6 +531,7 @@ async fn load_vectors_file_impl<D: Directory>(
     Ok(VectorsFileData {
         indexes,
         flat_vectors,
+        file_backed_bytes: file_size,
         #[cfg(feature = "native")]
         ann_fields,
     })
@@ -552,6 +560,7 @@ pub async fn load_sparse_file<D: Directory>(
     let empty = || SparseFileData {
         maxscore_indexes: FxHashMap::default(),
         bmp_indexes: FxHashMap::default(),
+        file_backed_bytes: 0,
     };
 
     let mut maxscore_indexes = FxHashMap::default();
@@ -614,8 +623,8 @@ pub async fn load_sparse_file<D: Directory>(
     }
 
     log::debug!(
-        "Loading sparse: size={} bytes, num_fields={}, skip_offset={}, toc_offset={}",
-        file_size,
+        "Loading sparse vectors: size={}, num_fields={}, skip_offset={}, toc_offset={}",
+        crate::format_bytes(file_size),
         num_fields,
         skip_offset,
         toc_offset,
@@ -722,7 +731,7 @@ pub async fn load_sparse_file<D: Directory>(
             ) {
                 Ok(idx) => {
                     log::debug!(
-                        "Loaded BMP index for field {}: dims={}, num_blocks={}, total_vectors={}",
+                        "Loaded BMP sparse vector index for field {}: dims={}, num_blocks={}, total_vectors={}",
                         field_id,
                         idx.dims(),
                         idx.num_blocks,
@@ -797,11 +806,11 @@ pub async fn load_sparse_file<D: Directory>(
             }
 
             log::debug!(
-                "Loaded sparse index for field {}: num_dims={}, total_vectors={}, skip_bytes={}",
+                "Loaded sparse vector index for field {}: num_dims={}, total_vectors={}, skip={}",
                 field_id,
                 dims.len(),
                 total_vectors,
-                skip_section.len(),
+                crate::format_bytes(skip_section.len() as u64),
             );
 
             maxscore_indexes.insert(
@@ -863,6 +872,7 @@ pub async fn load_sparse_file<D: Directory>(
     Ok(SparseFileData {
         maxscore_indexes,
         bmp_indexes,
+        file_backed_bytes: file_size,
     })
 }
 

@@ -254,11 +254,11 @@ pub(super) fn build_vectors_streaming(
                 };
                 let (index_type, bytes) = blob?;
                 log::info!(
-                    "[segment_build] built ANN(type={}) for field {} ({} vectors, {} bytes)",
+                    "[dense_vector_build] built ANN(type={}) for field {} ({} vectors, {})",
                     index_type,
                     field_id,
                     builder.doc_ids.len(),
-                    bytes.len()
+                    crate::format_bytes(bytes.len() as u64)
                 );
                 Ok(Some((*field_id, index_type, bytes)))
             };
@@ -415,11 +415,11 @@ pub(super) fn build_vectors_streaming(
                     })?;
                 }
                 log::debug!(
-                    "[build_vectors] field {}: binary IVF built ({} vectors, {} clusters, {} bytes)",
+                    "[dense_vector_build] field {}: binary IVF built ({} vectors, {} clusters, {})",
                     field_id,
                     num_vectors,
                     quantizer.num_clusters,
-                    blob_len,
+                    crate::format_bytes(blob_len),
                 );
             }
         }

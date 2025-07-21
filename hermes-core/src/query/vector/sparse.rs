@@ -484,7 +484,7 @@ impl Query for SparseVectorQuery {
 
             // Auto-detect: try BMP executor first (coupled to index format)
             if let Some((raw, info)) =
-                crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, &options)
+                crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, &options)?
             {
                 return Ok(crate::query::planner::combine_sparse_results(
                     raw,
@@ -535,7 +535,7 @@ impl Query for SparseVectorQuery {
 
         // Auto-detect: try BMP executor first (coupled to index format)
         if let Some((raw, info)) =
-            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, &options)
+            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, &options)?
         {
             return Ok(crate::query::planner::combine_sparse_results(
                 raw,
@@ -683,7 +683,7 @@ impl SparseTermQuery {
             lsp_gamma: None,
         }];
         if let Some((raw, info)) =
-            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, options)
+            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, options)?
         {
             return Ok(crate::query::planner::combine_sparse_results(
                 raw,

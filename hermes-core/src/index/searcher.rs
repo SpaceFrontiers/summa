@@ -384,34 +384,59 @@ impl<D: Directory + 'static> Searcher<D> {
 
         let segments: Vec<Arc<SegmentReader>> = loaded.into_iter().map(|(_, seg)| seg).collect();
 
-        // Log searcher loading summary with per-segment memory breakdown
+        // Keep heap, file-backed address space, and pinned residency separate.
+        // Mapped bytes are not necessarily resident; process RSS is the
+        // authoritative whole-process residency measurement.
         let total_docs: u64 = segments.iter().map(|s| s.meta().num_docs as u64).sum();
-        let mut total_mem = 0usize;
+        let mut total_heap = 0usize;
+        let mut total_file_backed = 0u64;
+        let mut total_pinned = 0u64;
+        let mut total_pin_intended = 0u64;
         for seg in &segments {
             let stats = seg.memory_stats();
-            let seg_total = stats.total_bytes();
-            total_mem += seg_total;
+            let heap = stats.estimated_heap_bytes();
+            let file_backed = stats.file_backed_bytes();
+            total_heap = total_heap.saturating_add(heap);
+            total_file_backed = total_file_backed.saturating_add(file_backed);
+            total_pinned = total_pinned.saturating_add(stats.pinned_metadata_bytes);
+            total_pin_intended = total_pin_intended.saturating_add(stats.pin_intended_bytes);
             log::info!(
-                "[searcher] segment {:016x}: docs={}, mem={:.2} MB \
-                 (term_dict={:.2} MB, store={:.2} MB, sparse={:.2} MB, dense={:.2} MB, bloom={:.2} MB)",
+                "[searcher] segment {:016x}: docs={}, heap_estimate={} \
+                 (term_cache={}, store_cache={}, sparse_vectors={}, dense_vectors={}), \
+                 file_backed={} (term_bloom={}, sparse_vectors={}, dense_vectors={}), \
+                 pinned_metadata={} of {} eligible \
+                 (sparse_vectors={} of {}, dense_vectors={} of {})",
                 stats.segment_id,
                 stats.num_docs,
-                seg_total as f64 / (1024.0 * 1024.0),
-                stats.term_dict_cache_bytes as f64 / (1024.0 * 1024.0),
-                stats.store_cache_bytes as f64 / (1024.0 * 1024.0),
-                stats.sparse_index_bytes as f64 / (1024.0 * 1024.0),
-                stats.dense_index_bytes as f64 / (1024.0 * 1024.0),
-                stats.bloom_filter_bytes as f64 / (1024.0 * 1024.0),
+                crate::format_bytes(heap as u64),
+                crate::format_bytes(stats.term_dict_cache_bytes as u64),
+                crate::format_bytes(stats.store_cache_bytes as u64),
+                crate::format_bytes(stats.sparse_heap_bytes as u64),
+                crate::format_bytes(stats.dense_heap_bytes as u64),
+                crate::format_bytes(file_backed),
+                crate::format_bytes(stats.term_bloom_file_bytes),
+                crate::format_bytes(stats.sparse_file_backed_bytes),
+                crate::format_bytes(stats.dense_file_backed_bytes),
+                crate::format_bytes(stats.pinned_metadata_bytes),
+                crate::format_bytes(stats.pin_intended_bytes),
+                crate::format_bytes(stats.sparse_pinned_metadata_bytes),
+                crate::format_bytes(stats.sparse_pin_intended_bytes),
+                crate::format_bytes(stats.dense_pinned_metadata_bytes),
+                crate::format_bytes(stats.dense_pin_intended_bytes),
             );
         }
         // Log process RSS if available (helps diagnose OOM)
-        let rss_mb = process_rss_mb();
+        let rss_bytes = process_rss_bytes();
         log::info!(
-            "[searcher] loaded {} segments: total_docs={}, estimated_mem={:.2} MB, process_rss={:.1} MB",
+            "[searcher] loaded {} segments: total_docs={}, heap_estimate={}, \
+             file_backed={}, pinned_metadata={} of {} eligible, process_rss={}",
             segments.len(),
             total_docs,
-            total_mem as f64 / (1024.0 * 1024.0),
-            rss_mb,
+            crate::format_bytes(total_heap as u64),
+            crate::format_bytes(total_file_backed),
+            crate::format_bytes(total_pinned),
+            crate::format_bytes(total_pin_intended),
+            crate::format_bytes(rss_bytes),
         );
 
         Ok(segments)
@@ -598,13 +623,33 @@ impl<D: Directory + 'static> Searcher<D> {
         {
             return Ok(empty());
         }
+        let field = first.field;
+        let (total_superblocks, planning_depth) = self
+            .segments
+            .iter()
+            .filter_map(|segment| segment.bmp_index(field))
+            .fold((0usize, retrieval_depth), |(total, depth), bmp| {
+                (
+                    total.saturating_add(bmp.num_superblocks as usize),
+                    depth.max(crate::query::bmp_executor_limit(
+                        retrieval_depth,
+                        first.over_fetch_factor,
+                        bmp,
+                    )),
+                )
+            });
         let gamma = first
             .lsp_gamma
-            .unwrap_or_else(|| crate::query::bmp::recommended_lsp_gamma(retrieval_depth));
+            .unwrap_or_else(|| crate::query::bmp::recommended_lsp_gamma(planning_depth));
         if gamma == 0 {
             return Ok(empty());
         }
-        let field = first.field;
+        if total_superblocks == 0 || gamma >= total_superblocks {
+            // A cap covering the whole index is exhaustive. Let each segment
+            // compute and traverse its local order once instead of building a
+            // query-global heap and retaining an all-superblock plan.
+            return Ok(empty());
+        }
         let candidate_terms: Vec<(u32, f32)> = infos
             .iter()
             .filter(|info| info.candidate)
@@ -667,9 +712,13 @@ impl<D: Directory + 'static> Searcher<D> {
                     .total_cmp(&segment_bounds[left as usize])
                     .then_with(|| left.cmp(&right))
             });
+            let selected_bounds = selected[segment]
+                .iter()
+                .map(|&superblock| segment_bounds[superblock as usize])
+                .collect();
             plans.push(Some(std::sync::Arc::new(
                 crate::query::bmp::LspSegmentPlan {
-                    sb_ubs: segment_bounds,
+                    sb_ubs: selected_bounds,
                     sb_order: std::mem::take(&mut selected[segment]),
                 },
             )));
@@ -1208,25 +1257,25 @@ fn checked_search_window(limit: usize, offset: usize) -> Result<usize> {
         .ok_or_else(|| crate::Error::Query("search offset + limit overflow".into()))
 }
 
-/// Get current process RSS in MB (best-effort, returns 0.0 on failure)
-fn process_rss_mb() -> f64 {
+/// Get current process RSS in bytes (best-effort, returns zero on failure).
+fn process_rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         // Read from /proc/self/status — VmRSS line
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    let kb: f64 = rest
+                    let kib: u64 = rest
                         .trim()
                         .trim_end_matches("kB")
                         .trim()
                         .parse()
-                        .unwrap_or(0.0);
-                    return kb / 1024.0;
+                        .unwrap_or(0);
+                    return kib.saturating_mul(1024);
                 }
             }
         }
-        0.0
+        0
     }
     #[cfg(target_os = "macos")]
     {
@@ -1257,15 +1306,11 @@ fn process_rss_mb() -> f64 {
                 &mut count,
             )
         };
-        if ret == 0 {
-            info.resident_size as f64 / (1024.0 * 1024.0)
-        } else {
-            0.0
-        }
+        if ret == 0 { info.resident_size } else { 0 }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        0.0
+        0
     }
 }
 

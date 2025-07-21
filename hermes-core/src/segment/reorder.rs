@@ -413,7 +413,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
     let dst_files = SegmentFiles::new(output_id.0);
 
     log::info!(
-        "[vector_rewrite] finalizing segment {} → {} ({} docs)",
+        "[dense_vector_rewrite] finalizing segment {} → {} ({} docs)",
         source_id.to_hex(),
         output_id.to_hex(),
         num_docs,
@@ -1074,10 +1074,10 @@ fn reorder_bmp_field_blockwise(
     });
 
     log::info!(
-        "[reorder_bmp] field {}: blockwise reorder done — {} blocks, {:.2} MB",
+        "[reorder_bmp] field {}: blockwise reorder done — {} blocks, {}",
         field_id,
         num_blocks_total,
-        blob_len as f64 / (1024.0 * 1024.0),
+        crate::format_bytes(blob_len),
     );
 
     Ok((writer, field_tocs, converged))
@@ -1334,10 +1334,10 @@ pub(crate) fn reorder_bmp_field(
     const MIN_RECORD_WORKSPACE: usize = 16 * 1024 * 1024;
     if record_fixed_peak > memory_budget.saturating_sub(MIN_RECORD_WORKSPACE) {
         log::warn!(
-            "[reorder_bmp] field {}: record maps need {:.0} MB of the {:.0} MB total budget; falling back to blockwise order",
+            "[reorder_bmp] field {}: record maps need {} of the {} total budget; falling back to blockwise order",
             field_id,
-            record_fixed_peak as f64 / (1024.0 * 1024.0),
-            memory_budget as f64 / (1024.0 * 1024.0),
+            crate::format_bytes(record_fixed_peak as u64),
+            crate::format_bytes(memory_budget as u64),
         );
         let (writer, field_tocs, _) = reorder_bmp_field_blockwise(
             sources,
@@ -1903,12 +1903,12 @@ pub(crate) fn reorder_bmp_field(
     });
 
     log::info!(
-        "[reorder_bmp] field {}: done — {} blocks, {} terms, {} postings, {:.2} MB",
+        "[reorder_bmp] field {}: done — {} blocks, {} terms, {} postings, {}",
         field_id,
         new_num_blocks,
         total_terms,
         total_postings,
-        blob_len as f64 / (1024.0 * 1024.0),
+        crate::format_bytes(blob_len),
     );
 
     Ok((writer, field_tocs, converged))

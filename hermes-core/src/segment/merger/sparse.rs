@@ -91,6 +91,15 @@ impl SegmentMerger {
                     .map(|seg| seg.bmp_indexes().get(&field.0))
                     .collect();
                 let has_bmp_data = bmp_indexes.iter().any(|bi| bi.is_some());
+                if segments
+                    .iter()
+                    .any(|segment| segment.sparse_indexes().contains_key(&field.0))
+                {
+                    return Err(crate::Error::Corruption(format!(
+                        "field {} is configured as BMP but a source segment contains MaxScore data; rebuild the index",
+                        field.0
+                    )));
+                }
                 if has_bmp_data {
                     let total_vectors_bmp: u32 = bmp_indexes
                         .iter()
@@ -232,10 +241,18 @@ impl SegmentMerger {
                             &mut field_tocs,
                         )
                     })?;
-                    continue;
                 }
-                // No BMP data — fall through to MaxScore path
-                // (handles legacy segments that used MaxScore format)
+                continue;
+            }
+
+            if segments
+                .iter()
+                .any(|segment| segment.bmp_indexes().contains_key(&field.0))
+            {
+                return Err(crate::Error::Corruption(format!(
+                    "field {} is configured as MaxScore but a source segment contains BMP data; rebuild the index",
+                    field.0
+                )));
             }
 
             // MaxScore format: byte-level block stacking
@@ -275,7 +292,7 @@ impl SegmentMerger {
                 })?;
 
             log::debug!(
-                "[merge] sparse field {}: {} unique dims across {} segments, total_vectors={}",
+                "[sparse_vector_merge] field {}: {} unique dims across {} segments, total_vectors={}",
                 field.0,
                 all_dims.len(),
                 segments.len(),
@@ -483,8 +500,8 @@ impl SegmentMerger {
 
         let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
         log::info!(
-            "[merge_sparse] file written: {:.2} MB ({} fields, {} dims, {} skip entries)",
-            output_size as f64 / (1024.0 * 1024.0),
+            "[sparse_vector_merge] file written: {} ({} fields, {} dims, {} skip entries)",
+            crate::format_bytes(output_size as u64),
             field_tocs.len(),
             total_dims,
             skip_count,

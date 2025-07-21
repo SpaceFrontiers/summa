@@ -146,7 +146,7 @@ impl ActiveSegmentOperations {
             return None;
         }
         if !indexing && !vector_update && inner.non_indexing_paused {
-            log::debug!("[segment_lifecycle] deferred operation during vector retraining");
+            log::debug!("[segment_lifecycle] deferred operation during dense vector retraining");
             return None;
         }
         // Check for overlap with any active lifecycle operation.
@@ -1247,7 +1247,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     crate::segment::delete_segment(directory.as_ref(), segment_id).await
                 {
                     log::warn!(
-                        "[segment_cleanup] immediate vector-generation delete failed for {}: {}",
+                        "[segment_cleanup] immediate dense-vector generation delete failed for {}: {}",
                         segment_id.to_hex(),
                         error,
                     );
@@ -2582,7 +2582,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
             if !conflicted && !changed {
                 log::info!(
-                    "[vector_rewrite] ANN finalization complete ({} segment(s) rewritten)",
+                    "[dense_vector_rewrite] ANN finalization complete ({} segment(s) rewritten)",
                     rewritten,
                 );
                 return Ok(rewritten);
@@ -2630,7 +2630,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         Ok(_) => break,
                         Err(error) => {
                             log::error!(
-                                "[vector_rewrite] failed to upgrade newly committed segment {}: {}",
+                                "[dense_vector_rewrite] failed to upgrade newly committed segment {}: {}",
                                 segment_id,
                                 error,
                             );
@@ -2642,12 +2642,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             log::warn!(
-                "[vector_rewrite] runtime unavailable; newly committed flat segment upgrade deferred"
+                "[dense_vector_rewrite] runtime unavailable; newly committed flat segment upgrade deferred"
             );
             return;
         };
         if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
-            log::warn!("[vector_rewrite] runtime rejected newly committed flat segment upgrade");
+            log::warn!(
+                "[dense_vector_rewrite] runtime rejected newly committed flat segment upgrade"
+            );
         }
     }
 

@@ -642,7 +642,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
 
                     let survivor_vectors = survivor_entries.len();
                     log::debug!(
-                        "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} docs and {}/{} vectors survived",
+            "[dense_vector_rerank] matryoshka pre-filter: {}/{} dims, {}/{} docs and {}/{} vectors survived",
                         trunc_dim,
                         query_dim,
                         survivor_docs.len(),
@@ -706,7 +706,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
 
     if total_vectors == 0 {
         log::debug!(
-            "[reranker] field {}: {} candidates, all skipped (no flat vectors)",
+            "[dense_vector_rerank] field {}: {} candidates, all skipped (no flat vectors)",
             field_id,
             candidates.len()
         );
@@ -761,7 +761,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     }
 
     log::debug!(
-        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors, unit_norm={}, rrf_k={}): read+score={:.1}ms total={:.1}ms",
+        "[dense_vector_rerank] field {}: {} candidates -> {} results (skipped {}, {} vectors, unit_norm={}, rrf_k={}): read+score={:.1}ms total={:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),
@@ -935,7 +935,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
     }
 
     log::debug!(
-        "[reranker-binary] field {}: {} candidates -> {} results ({} docs scored, {} bytes/vec, rrf_k={}): {:.1}ms",
+        "[dense_vector_binary_rerank] field {}: {} candidates -> {} results ({} docs scored, bytes_per_vector={}, rrf_k={}): {:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),

@@ -96,9 +96,9 @@ impl PrimaryKeyIndex {
 
         let bloom_bytes = bloom.size_bytes();
         log::info!(
-            "[primary_key] bloom filter: {} keys, {:.2} MB",
+            "[primary_key] bloom filter: {} keys, {}",
             total_keys,
-            bloom_bytes as f64 / (1024.0 * 1024.0),
+            crate::format_bytes(bloom_bytes as u64),
         );
 
         Self {
@@ -139,8 +139,8 @@ impl PrimaryKeyIndex {
         }
 
         log::info!(
-            "[primary_key] bloom filter loaded from cache: {:.2} MB{}",
-            bloom.size_bytes() as f64 / (1024.0 * 1024.0),
+            "[primary_key] bloom filter loaded from cache: {}{}",
+            crate::format_bytes(bloom.size_bytes() as u64),
             if added > 0 {
                 format!(
                     ", added {} keys from {} new segment(s)",

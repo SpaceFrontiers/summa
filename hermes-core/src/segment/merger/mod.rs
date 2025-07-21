@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
+use super::OffsetWriter;
 use super::reader::SegmentReader;
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
-use super::{OffsetWriter, format_bytes};
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::Schema;
@@ -66,14 +66,14 @@ impl std::fmt::Display for MergeStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "terms={}, term_dict={}, postings={}, store={}, vectors={}, sparse={}, fast={}",
+            "terms={}, term_dict={}, postings={}, store={}, dense_vectors={}, sparse_vectors={}, fast_fields={}",
             self.terms_processed,
-            format_bytes(self.term_dict_bytes),
-            format_bytes(self.postings_bytes),
-            format_bytes(self.store_bytes),
-            format_bytes(self.vectors_bytes),
-            format_bytes(self.sparse_bytes),
-            format_bytes(self.fast_bytes),
+            crate::format_bytes(self.term_dict_bytes as u64),
+            crate::format_bytes(self.postings_bytes as u64),
+            crate::format_bytes(self.store_bytes as u64),
+            crate::format_bytes(self.vectors_bytes as u64),
+            crate::format_bytes(self.sparse_bytes as u64),
+            crate::format_bytes(self.fast_bytes as u64),
         )
     }
 }
@@ -251,9 +251,9 @@ impl SegmentMerger {
             log::info!(
                 "[merge] postings done: {} terms, term_dict={}, postings={}, positions={}",
                 terms_processed,
-                format_bytes(term_dict_bytes),
-                format_bytes(postings_bytes),
-                format_bytes(positions_bytes as usize),
+                crate::format_bytes(term_dict_bytes as u64),
+                crate::format_bytes(postings_bytes as u64),
+                crate::format_bytes(positions_bytes),
             );
             Ok::<(usize, usize, usize), crate::Error>((
                 terms_processed,

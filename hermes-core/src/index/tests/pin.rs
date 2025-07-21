@@ -64,9 +64,29 @@ async fn test_pin_metadata_copy_mode_preserves_search() {
         mode: PinMode::Copy,
     });
     let stats = reader.memory_stats();
+    assert!(stats.sparse_file_backed_bytes > 0);
+    assert!(stats.dense_file_backed_bytes > 0);
+    assert!(
+        stats.sparse_file_backed_bytes > stats.sparse_heap_bytes as u64,
+        "BMP corpus bytes must be reported as file-backed, not heap"
+    );
     assert!(
         stats.pinned_metadata_bytes > 0,
         "BMP starts/doc-maps/sb_grid + flat doc_ids should be pinnable"
+    );
+    assert!(stats.sparse_pinned_metadata_bytes > 0);
+    assert!(stats.dense_pinned_metadata_bytes > 0);
+    assert_eq!(
+        stats.pinned_metadata_bytes,
+        stats
+            .sparse_pinned_metadata_bytes
+            .saturating_add(stats.dense_pinned_metadata_bytes)
+    );
+    assert_eq!(
+        stats.pin_intended_bytes,
+        stats
+            .sparse_pin_intended_bytes
+            .saturating_add(stats.dense_pin_intended_bytes)
     );
     assert_eq!(
         stats.pinned_metadata_bytes, stats.pin_intended_bytes,
@@ -102,6 +122,12 @@ async fn test_pin_metadata_budget_exhaustion_reported() {
     });
     let stats = reader.memory_stats();
     assert!(stats.pinned_metadata_bytes <= budget);
+    assert_eq!(
+        stats.pinned_metadata_bytes,
+        stats
+            .sparse_pinned_metadata_bytes
+            .saturating_add(stats.dense_pinned_metadata_bytes)
+    );
     assert!(
         stats.pin_intended_bytes > stats.pinned_metadata_bytes,
         "tiny budget must leave a visible intended-vs-pinned gap"

@@ -38,20 +38,6 @@ pub use tracker::{SegmentSnapshot, SegmentTracker};
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta, TrainedVectorStructures};
 pub use vector_data::{FlatVectorData, LazyFlatVectorData, dequantize_raw};
 
-/// Format byte count as human-readable string
-#[cfg(any(feature = "native", feature = "wasm"))]
-pub(crate) fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.2} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 /// Write adapter that tracks bytes written.
 ///
 /// Concrete type so it works with generic `serialize<W: Write>` functions

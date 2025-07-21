@@ -387,8 +387,8 @@ impl SegmentMerger {
         let output_size = writer.offset() as usize;
         super::block_in_place_if_multithread(move || writer.finish())?;
         log::info!(
-            "[merge_vectors] file written: {} ({} entries) in {:.1}s",
-            super::format_bytes(output_size),
+            "[dense_vector_merge] file written: {} ({} fields) in {:.1}s",
+            crate::format_bytes(output_size as u64),
             toc.len(),
             write_start.elapsed().as_secs_f64()
         );
@@ -568,10 +568,10 @@ impl SegmentMerger {
         .map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
         log::debug!(
-            "[merge_vectors] field {}: copied {} compatible ANN run source(s), {} bytes",
+            "[dense_vector_merge] field {}: copied {} compatible ANN run source(s), {}",
             field.0,
             sources.len(),
-            data_size,
+            crate::format_bytes(data_size),
         );
         Ok(Some((index_type, data_offset, data_size)))
     }
@@ -652,11 +652,11 @@ impl SegmentMerger {
         let num_clusters = quantizer.num_clusters;
         let index = builder.finish().map_err(crate::Error::Io)?;
         log::debug!(
-            "[merge_vectors] field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {} bytes)",
+            "[dense_vector_merge] field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {})",
             field.0,
             vector_count,
             num_clusters,
-            index.estimated_memory_bytes(),
+            crate::format_bytes(index.estimated_memory_bytes() as u64),
         );
         Ok(Some(index))
     }
@@ -725,11 +725,11 @@ impl SegmentMerger {
         }
 
         log::info!(
-            "[merge_vectors] field {} IVF-PQ rebuilt from {} vectors into {} assignments (estimated {}, {:.1}s)",
+            "[dense_vector_merge] field {} IVF-PQ rebuilt from {} vectors into {} assignments (estimated {}, {:.1}s)",
             field.0,
             total_fed,
             index.len(),
-            super::format_bytes(index.estimated_memory_bytes()),
+            crate::format_bytes(index.estimated_memory_bytes() as u64),
             ann_start.elapsed().as_secs_f64()
         );
         Ok(Some((index, centroids.num_clusters)))
