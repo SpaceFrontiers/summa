@@ -72,7 +72,7 @@ async fn test_pin_metadata_copy_mode_preserves_search() {
     );
     assert!(
         stats.pinned_metadata_bytes > 0,
-        "BMP starts/doc-maps/sb_grid + flat doc_ids should be pinnable"
+        "BMP starts/doc-maps/E offsets/H grid + flat doc_ids should be pinnable"
     );
     assert!(stats.sparse_pinned_metadata_bytes > 0);
     assert!(stats.dense_pinned_metadata_bytes > 0);

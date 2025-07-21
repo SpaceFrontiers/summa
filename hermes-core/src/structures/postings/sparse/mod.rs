@@ -736,17 +736,27 @@ mod tests {
         assert_eq!(default.weight_quantization, WeightQuantization::Float32);
         assert_eq!(default.bytes_per_entry(), 8.0); // 4 + 4
 
-        // Test SPLADE config (research-validated defaults)
+        // The SPLADE preset compresses weights but keeps quality-sensitive
+        // posting/query pruning opt-in.
         let splade = SparseVectorConfig::splade();
         assert_eq!(splade.index_size, IndexSize::U16);
         assert_eq!(splade.weight_quantization, WeightQuantization::UInt8);
         assert_eq!(splade.bytes_per_entry(), 3.0); // 2 + 1
         assert_eq!(splade.weight_threshold, 0.01);
-        assert_eq!(splade.pruning, Some(0.1));
+        assert_eq!(splade.pruning, None);
         assert!(splade.query_config.is_some());
         let query_cfg = splade.query_config.as_ref().unwrap();
-        assert_eq!(query_cfg.heap_factor, 0.8);
-        assert_eq!(query_cfg.max_query_dims, Some(20));
+        assert_eq!(query_cfg.heap_factor, 1.0);
+        assert_eq!(query_cfg.max_query_dims, None);
+        assert_eq!(query_cfg.pruning, None);
+
+        let bmp = SparseVectorConfig::splade_bmp();
+        assert_eq!(bmp.format, SparseFormat::Bmp);
+        assert_eq!(bmp.pruning, None);
+        let bmp_query_cfg = bmp.query_config.as_ref().unwrap();
+        assert_eq!(bmp_query_cfg.heap_factor, 1.0);
+        assert_eq!(bmp_query_cfg.max_query_dims, None);
+        assert_eq!(bmp_query_cfg.pruning, None);
 
         // Test compact config
         let compact = SparseVectorConfig::compact();

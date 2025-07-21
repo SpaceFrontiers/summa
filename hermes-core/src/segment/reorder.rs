@@ -768,6 +768,8 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
 fn reorder_bmp_field_blockwise(
     sources: &[(crate::segment::BmpIndex, u32)],
     field_id: u32,
+    index_label: &str,
+    field_name: &str,
     quantization: crate::structures::WeightQuantization,
     dims: u32,
     effective_block_size: usize,
@@ -784,7 +786,7 @@ fn reorder_bmp_field_blockwise(
         GridRunReader, stream_write_grids, stream_write_grids_merged, write_bmp_footer,
     };
     use crate::segment::builder::graph_bisection::{
-        build_forward_index_from_blocks, graph_bisection,
+        BpProgressLabel, build_forward_index_from_blocks, graph_bisection_with_progress,
     };
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
@@ -804,7 +806,7 @@ fn reorder_bmp_field_blockwise(
     }
     if num_blocks_total > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V17 u32 format limit".into(),
+            "reordered BMP block count exceeds the V18 u32 format limit".into(),
         ));
     }
     let num_virtual_docs = num_blocks_total
@@ -812,7 +814,7 @@ fn reorder_bmp_field_blockwise(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V17 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the V18 u32 format limit".into(),
             )
         })?;
 
@@ -853,7 +855,17 @@ fn reorder_bmp_field_blockwise(
                     .time_budget
                     .map(|budget| budget.saturating_sub(bp_start.elapsed())),
             };
-            graph_bisection(&fwd, sb, 20, block_budget)
+            graph_bisection_with_progress(
+                &fwd,
+                sb,
+                20,
+                block_budget,
+                BpProgressLabel {
+                    index: index_label,
+                    field: field_name,
+                    entity_kind: "blocks",
+                },
+            )
         } else {
             (
                 (0..num_blocks_total as u32).collect(),
@@ -951,10 +963,10 @@ fn reorder_bmp_field_blockwise(
     }
     drop(block_data_starts);
 
-    // Sections D + E: exact maxima from the copied blocks, compressed in one
+    // Sections D + E + H: exact maxima from the copied blocks, compressed in one
     // bounded external-sort pass. Block payloads above remained byte-identical.
     let grid_offset = writer.offset() - blob_start;
-    let (block_grid_bytes, _) = if run_files.is_empty() {
+    let (block_grid_bytes, superblock_grid_bytes, _) = if run_files.is_empty() {
         grid_entries.sort_unstable();
         let result = stream_write_grids(
             &grid_entries,
@@ -987,6 +999,7 @@ fn reorder_bmp_field_blockwise(
         result
     };
     let sb_grid_offset = grid_offset + block_grid_bytes;
+    let coarse_grid_offset = sb_grid_offset + superblock_grid_bytes;
 
     // Sections F + G: doc maps copied per block chunk, ids offset-patched
     let doc_map_offset = writer.offset() - blob_start;
@@ -997,7 +1010,7 @@ fn reorder_bmp_field_blockwise(
             .checked_add(b.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "reordered BMP real-document count exceeds the V17 u32 format limit".into(),
+                    "reordered BMP real-document count exceeds the V18 u32 format limit".into(),
                 )
             })?;
     }
@@ -1043,6 +1056,7 @@ fn reorder_bmp_field_blockwise(
         total_postings,
         grid_offset,
         sb_grid_offset,
+        coarse_grid_offset,
         num_blocks_total as u32,
         dims,
         effective_block_size as u32,
@@ -1240,7 +1254,8 @@ pub(crate) fn reorder_bmp_field(
         GridRunReader, stream_write_grids, stream_write_grids_merged, write_bmp_footer,
     };
     use crate::segment::builder::graph_bisection::{
-        build_forward_index_from_bmps_with_maps, build_vid_maps, graph_bisection,
+        BpProgressLabel, build_forward_index_from_bmps_with_maps, build_vid_maps,
+        graph_bisection_with_progress,
     };
 
     if sources.is_empty() {
@@ -1298,6 +1313,8 @@ pub(crate) fn reorder_bmp_field(
         return reorder_bmp_field_blockwise(
             sources,
             field_id,
+            index_label,
+            field_name,
             quantization,
             dims,
             effective_block_size,
@@ -1342,6 +1359,8 @@ pub(crate) fn reorder_bmp_field(
         let (writer, field_tocs, _) = reorder_bmp_field_blockwise(
             sources,
             field_id,
+            index_label,
+            field_name,
             quantization,
             dims,
             effective_block_size,
@@ -1392,7 +1411,7 @@ pub(crate) fn reorder_bmp_field(
     }
     if num_real_docs > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP real-document count exceeds the V17 u32 format limit".into(),
+            "reordered BMP real-document count exceeds the V18 u32 format limit".into(),
         ));
     }
 
@@ -1471,7 +1490,19 @@ pub(crate) fn reorder_bmp_field(
                     .time_budget
                     .map(|budget| budget.saturating_sub(bp_start.elapsed())),
             };
-            let run_graph = || graph_bisection(&fwd, effective_block_size, 20, graph_budget);
+            let run_graph = || {
+                graph_bisection_with_progress(
+                    &fwd,
+                    effective_block_size,
+                    20,
+                    graph_budget,
+                    BpProgressLabel {
+                        index: index_label,
+                        field: field_name,
+                        entity_kind: "records",
+                    },
+                )
+            };
             let (perm, converged) = if let Some(ref pool) = rayon_pool {
                 pool.install(run_graph)
             } else {
@@ -1505,7 +1536,7 @@ pub(crate) fn reorder_bmp_field(
     let new_num_blocks = num_real_docs.div_ceil(effective_block_size);
     if new_num_blocks > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V17 u32 format limit".into(),
+            "reordered BMP block count exceeds the V18 u32 format limit".into(),
         ));
     }
     let new_num_virtual_docs = new_num_blocks
@@ -1513,7 +1544,7 @@ pub(crate) fn reorder_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V17 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the V18 u32 format limit".into(),
             )
         })?;
 
@@ -1554,7 +1585,7 @@ pub(crate) fn reorder_bmp_field(
     let mut run_files = GridRunFiles::new(field_id);
 
     // Encode one output block: gather its records from source blocks and
-    // serialize the V17 block layout. Pure function of `perm` + read-only
+    // serialize the current block layout. Pure function of `perm` + read-only
     // sources — output blocks encode independently.
     //
     // Global real ids resolve to a source via `real_base`, then to a
@@ -1766,9 +1797,9 @@ pub(crate) fn reorder_bmp_field(
     }
     drop(block_data_starts);
 
-    // Sections D+E: packed grid + sb_grid
+    // Sections D+E+H: block, superblock, and coarse-superblock grids.
     let grid_offset = writer.offset() - blob_start;
-    let (packed_bytes, _sb_bytes) = if run_files.is_empty() {
+    let (packed_bytes, sb_bytes, _coarse_bytes) = if run_files.is_empty() {
         // Fast path: all entries fit in memory, use existing function
         grid_entries.sort_unstable();
         let result = stream_write_grids(
@@ -1809,6 +1840,7 @@ pub(crate) fn reorder_bmp_field(
         result
     };
     let sb_grid_offset = grid_offset + packed_bytes;
+    let coarse_grid_offset = sb_grid_offset + sb_bytes;
 
     // Sections F+G: doc_map [new_num_virtual_docs each]
     let doc_map_offset = writer.offset() - blob_start;
@@ -1862,13 +1894,14 @@ pub(crate) fn reorder_bmp_field(
             .map_err(crate::Error::Io)?;
     }
 
-    // V17 footer.
+    // V18 footer.
     write_bmp_footer(
         &mut writer,
         total_terms,
         total_postings,
         grid_offset,
         sb_grid_offset,
+        coarse_grid_offset,
         new_num_blocks as u32,
         dims,
         effective_block_size as u32,

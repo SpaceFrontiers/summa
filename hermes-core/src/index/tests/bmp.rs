@@ -177,6 +177,58 @@ async fn test_bmp_pruned_candidate_query_scores_with_full_query() {
     );
 }
 
+/// A bounded query must read the persisted H row, expand its winning E group,
+/// and reach the same winner as exhaustive traversal.
+#[tokio::test]
+async fn test_bmp_hierarchy_matches_exhaustive_winner() {
+    let (schema, _title, sparse) = bmp_schema_with_config(SparseVectorConfig {
+        format: SparseFormat::Bmp,
+        weight_quantization: WeightQuantization::UInt8,
+        bmp_block_size: 32,
+        dims: Some(1),
+        max_weight: Some(5.0),
+        ..SparseVectorConfig::default()
+    });
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // 300 documents produce two superblocks at block_size=32. The second
+    // superblock has the only competitive bound.
+    for doc_id in 0..300 {
+        let mut document = Document::new();
+        let weight = if doc_id < 256 { 0.1 } else { 5.0 };
+        document.add_sparse_vector(sparse, vec![(0, weight)]);
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let exhaustive = searcher
+        .search(
+            &SparseVectorQuery::new(sparse, vec![(0, 1.0)]).with_lsp_gamma(0),
+            1,
+        )
+        .await
+        .unwrap();
+    let hierarchical = searcher
+        .search(
+            &SparseVectorQuery::new(sparse, vec![(0, 1.0)]).with_lsp_gamma(1),
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(hierarchical.len(), 1);
+    assert_eq!(hierarchical[0].doc_id, exhaustive[0].doc_id);
+    assert_eq!(hierarchical[0].score, exhaustive[0].score);
+    assert!(hierarchical[0].doc_id >= 256);
+}
+
 /// A live global BMP floor may change traversal work, never the exact top-k.
 /// This also exercises physical single-value detection on many small segments:
 /// each segment should collect `k`, not the sparse query's default `2k`.
@@ -1097,6 +1149,9 @@ async fn test_bmp_merge_repacked_group_uses_exact_local_width() {
         .unwrap()
         .decode(0, 2, &mut decoded);
     assert_eq!(&decoded[..2], &[15, 15]);
+    let coarse_grid = bmp.coarse_grid();
+    coarse_grid.group(0, 0).unwrap().decode(0, 1, &mut decoded);
+    assert_eq!(decoded[0], 15);
 }
 
 /// BMP merge large: stress test with many blocks and multi-segment merge.

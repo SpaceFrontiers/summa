@@ -48,6 +48,13 @@ struct Args {
     #[arg(long, default_value = "16384")]
     max_indexing_memory_mb: usize,
 
+    /// Process-wide budget (MB) for decompressed stored-document blocks.
+    /// The cache is shared by every index and byte-bounded; blocks larger than
+    /// 8 MiB bypass it so one large stored body cannot displace thousands of
+    /// ordinary result blocks. Set to 0 to disable decompressed store caching.
+    #[arg(long, default_value = "2048")]
+    store_cache_budget_mb: usize,
+
     /// Maximum number of vectors sampled for one field's global ANN training.
     /// The memory limit below is enforced simultaneously.
     #[arg(long, default_value = "10000000")]
@@ -81,6 +88,11 @@ struct Args {
     #[arg(long)]
     search_threads: Option<usize>,
 
+    /// Maximum BMP segment scorers issuing random mmap reads concurrently
+    /// across all indexes and queries.
+    #[arg(long, default_value = "4")]
+    bmp_io_concurrency: usize,
+
     /// Validate all indexes on startup, remove corrupt segments
     #[arg(long)]
     doctor: bool,
@@ -91,8 +103,8 @@ struct Args {
     optimizer_threads: usize,
 
     /// Maximum simultaneous whole-segment BP passes across optimizer,
-    /// merge-time, and manual reorders. Each pass can use all optimizer threads
-    /// and up to the full BP memory budget, so keep this small.
+    /// merge-time, and manual reorders. Clamped to 1..=2 because each pass can
+    /// use all optimizer threads and up to the full BP memory budget.
     #[arg(long, default_value = "2")]
     optimizer_concurrent_passes: usize,
 
@@ -123,9 +135,10 @@ struct Args {
     #[arg(long, default_value = "3")]
     optimizer_max_unconverged_passes: u32,
 
-    /// Wall-clock budget in seconds for merge-time BP reorder (0 = unbudgeted).
-    /// A truncated pass still produces a valid, better-ordered segment; it is
-    /// marked unconverged and the background optimizer deepens it later.
+    /// Wall-clock budget in seconds for merge-time BP reorder. Must be finite;
+    /// 0 is invalid and falls back to 600 seconds. A truncated pass still
+    /// produces a valid, better-ordered segment; it is marked unconverged and
+    /// the background optimizer deepens it later.
     #[arg(long, default_value = "600")]
     merge_bp_budget_secs: u64,
 
@@ -136,7 +149,7 @@ struct Args {
     bp_memory_budget_mb: usize,
 
     /// Budget (MB) for pinning hot per-segment metadata resident in RAM
-    /// (BMP block-offset tables, sparse skip sections, doc-id maps). 0 = off.
+    /// (BMP block offsets/coarse hierarchy, sparse skips, doc-id maps). 0 = off.
     /// Overrides the HERMES_PIN_METADATA_BUDGET_MB env var when set.
     #[arg(long)]
     pin_metadata_budget_mb: Option<u64>,
@@ -268,7 +281,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
 
     // Hot-metadata pinning policy. CLI flags take precedence; each unset flag
-    // falls back to its HERMES_PIN_* env var (backward compat). Must be set
+    // falls back to its HERMES_PIN_* environment value. Must be set
     // before the first segment is opened (registry cleanup / doctor below).
     let env_policy = PinPolicy::from_env();
     let pin_budget_bytes = match args.pin_metadata_budget_mb {
@@ -311,11 +324,20 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             "--search-threads must be greater than zero"
         ));
     }
+    if args.bmp_io_concurrency == 0 {
+        return Err(anyhow::anyhow!(
+            "--bmp-io-concurrency must be greater than zero"
+        ));
+    }
 
     let max_indexing_memory_bytes = args
         .max_indexing_memory_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--max-indexing-memory-mb is too large"))?;
+    let store_cache_budget_bytes = args
+        .store_cache_budget_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--store-cache-budget-mb is too large"))?;
     if args.vector_training_max_samples == 0 || args.vector_training_memory_mb == 0 {
         return Err(anyhow::anyhow!(
             "--vector-training-max-samples and --vector-training-memory-mb must be greater than zero"
@@ -329,9 +351,22 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .bp_memory_budget_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--bp-memory-budget-mb is too large"))?;
-    let concurrent_reorder_passes = args.optimizer_concurrent_passes.max(1);
-    if args.optimizer_concurrent_passes == 0 {
-        warn!("--optimizer-concurrent-passes=0 is invalid; using 1");
+    let merge_bp_budget_secs = if args.merge_bp_budget_secs == 0 {
+        warn!("--merge-bp-budget-secs=0 would leave giant merges unbounded; using 600 seconds");
+        600
+    } else {
+        args.merge_bp_budget_secs
+    };
+    let concurrent_reorder_passes = args
+        .optimizer_concurrent_passes
+        .clamp(1, hermes_core::index::MAX_CONCURRENT_REORDER_PASSES);
+    if concurrent_reorder_passes != args.optimizer_concurrent_passes {
+        warn!(
+            "--optimizer-concurrent-passes={} is outside the supported 1..={} range; using {}",
+            args.optimizer_concurrent_passes,
+            hermes_core::index::MAX_CONCURRENT_REORDER_PASSES,
+            concurrent_reorder_passes,
+        );
     }
 
     // One application-owned pool is cloned into every index. Optimizer and
@@ -382,6 +417,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
 
     let config = IndexConfig {
         num_threads: search_threads,
+        bmp_io_concurrency: args.bmp_io_concurrency,
+        store_cache_budget_bytes,
         max_indexing_memory_bytes,
         vector_training_max_samples: args.vector_training_max_samples,
         vector_training_memory_bytes,
@@ -390,10 +427,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         merge_policy: Box::new(merge_policy),
         max_concurrent_merges: args.max_concurrent_merges,
         background_merge_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent_merges)),
-        merge_bp_time_budget: (args.merge_bp_budget_secs > 0)
-            .then(|| Duration::from_secs(args.merge_bp_budget_secs)),
+        merge_bp_time_budget: Some(Duration::from_secs(merge_bp_budget_secs)),
         bp_memory_budget_bytes,
-        background_reorder_permits: Arc::new(tokio::sync::Semaphore::new(
+        background_reorder_permits: Arc::new(hermes_core::index::ReorderConcurrencyGate::new(
             concurrent_reorder_passes,
         )),
         background_reorder_pool,
@@ -436,12 +472,17 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Data directory: {:?}", args.data_dir);
     info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
     info!(
+        "Shared document-store cache budget: {} MB",
+        args.store_cache_budget_mb
+    );
+    info!(
         "Vector training sample: max {} vectors / {} MB per field",
         args.vector_training_max_samples, args.vector_training_memory_mb,
     );
     info!("Indexing threads: {}", num_indexing_threads);
     info!("Worker threads: {}", worker_threads);
     info!("Search CPU threads: {}", search_threads);
+    info!("BMP random-I/O concurrency: {}", args.bmp_io_concurrency);
     info!("Maximum concurrent searches: {}", max_concurrent_searches);
     info!("Reload interval: {} ms", args.reload_interval_ms);
     info!(

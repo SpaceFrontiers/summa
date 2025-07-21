@@ -13,6 +13,13 @@
 use rayon::prelude::*;
 const TERM_DEGREE_VALUE_BYTES: usize = std::mem::size_of::<[u32; 2]>();
 const CANDIDATE_ENTRY_BYTES: usize = std::mem::size_of::<(usize, u32)>();
+// Radix selection scans the gain array four times and parallel degree updates
+// require private vocabulary arrays. Quickselect wins decisively below this
+// scale; above it, bounded memory and worker utilization dominate.
+const PARALLEL_BP_MIN_ENTITIES: usize = 1_048_576;
+const MIN_RELATIVE_OBJECTIVE_IMPROVEMENT: f64 = 1e-6;
+const MIN_OBJECTIVE_ITERATIONS: usize = 4;
+const OBJECTIVE_STALL_ITERATIONS: usize = 2;
 
 fn term_degree_bytes(num_terms: usize) -> usize {
     num_terms
@@ -82,6 +89,123 @@ impl TermDegrees {
         // SAFETY: an initialized bit is published only after the slot write;
         // scoring reads degrees after construction, with no concurrent writes.
         unsafe { *self.values[term].assume_init_ref() }
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        for (word_idx, &initialized) in other.initialized.iter().enumerate() {
+            let mut pending = initialized;
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                // SAFETY: `pending` is derived from the initialized bitmap.
+                let [left, right] = unsafe { *other.values[term].assume_init_ref() };
+                let entry = self.entry_mut(term);
+                entry[0] += left;
+                entry[1] += right;
+                pending &= pending - 1;
+            }
+        }
+    }
+
+    /// Exact bisection objective optimized by the BP gain approximation.
+    ///
+    /// This returns the negative assignment-dependent BiMLogA bisection cost
+    /// from Dhulipala et al., so a larger value means lower cost. Keeping the
+    /// partition-size term matters for odd-sized partitions, whose halves
+    /// differ by one entity.
+    fn bisection_objective(&self, left_size: usize, right_size: usize, log_table: &[f32]) -> f64 {
+        let mut objective = 0.0f64;
+        let side_log = [
+            fast_log2_lookup(left_size, log_table) as f64,
+            fast_log2_lookup(right_size, log_table) as f64,
+        ];
+        for (word_idx, &initialized) in self.initialized.iter().enumerate() {
+            let mut pending = initialized;
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                // SAFETY: `pending` is derived from the initialized bitmap.
+                let [left, right] = unsafe { *self.values[term].assume_init_ref() };
+                for (side, count) in [left, right].into_iter().enumerate() {
+                    if count > 0 {
+                        objective += count as f64
+                            * (fast_log2_lookup(count as usize + 1, log_table) as f64
+                                - side_log[side]);
+                    }
+                }
+                pending &= pending - 1;
+            }
+        }
+        objective
+    }
+}
+
+/// Per-term change to the left degree. The right change is its negation
+/// because every moved document leaves one side and enters the other.
+///
+/// This uses the same lazy dense representation as [`TermDegrees`]. Parallel
+/// partition workers therefore pay one vocabulary-sized allocation each, but
+/// the number of workers is carved from the existing degree-array memory
+/// allowance rather than multiplying the configured BP budget.
+struct TermDeltas {
+    values: Vec<std::mem::MaybeUninit<i64>>,
+    initialized: Vec<u64>,
+}
+
+impl TermDeltas {
+    fn new(num_terms: usize) -> Self {
+        let mut values = Vec::with_capacity(num_terms);
+        values.resize_with(num_terms, std::mem::MaybeUninit::uninit);
+        Self {
+            values,
+            initialized: vec![0; num_terms.div_ceil(64)],
+        }
+    }
+
+    #[inline]
+    fn entry_mut(&mut self, term: usize) -> &mut i64 {
+        let word = term / 64;
+        let mask = 1u64 << (term % 64);
+        if self.initialized[word] & mask == 0 {
+            self.values[term].write(0);
+            self.initialized[word] |= mask;
+        }
+        // SAFETY: the bit above is set only after writing this exact slot.
+        unsafe { self.values[term].assume_init_mut() }
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        for (word_idx, &initialized) in other.initialized.iter().enumerate() {
+            let mut pending = initialized;
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                // SAFETY: `pending` is derived from the initialized bitmap.
+                let delta = unsafe { *other.values[term].assume_init_ref() };
+                *self.entry_mut(term) += delta;
+                pending &= pending - 1;
+            }
+        }
+    }
+
+    fn apply_to(&self, degrees: &mut TermDegrees) {
+        for (word_idx, &initialized) in self.initialized.iter().enumerate() {
+            let mut pending = initialized;
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                // SAFETY: `pending` is derived from the initialized bitmap.
+                let delta = unsafe { *self.values[term].assume_init_ref() };
+                let degree = degrees.entry_mut(term);
+                let new_left = degree[0] as i64 + delta;
+                let new_right = degree[1] as i64 - delta;
+                debug_assert!(new_left >= 0 && new_right >= 0);
+                debug_assert!(new_left <= u32::MAX as i64 && new_right <= u32::MAX as i64);
+                degree[0] = new_left as u32;
+                degree[1] = new_right as u32;
+                pending &= pending - 1;
+            }
+        }
     }
 }
 
@@ -841,6 +965,703 @@ impl BpBudget {
     }
 }
 
+/// Build one partition's term degrees. At the coarse levels, each worker
+/// scans a contiguous document range into a private lazy degree table and
+/// the tables are reduced in parallel. `degree_lanes` is a power of two
+/// derived from `parallel_bisect_depth`, so all simultaneous sibling nodes
+/// together stay within the already-accounted vocabulary-array budget.
+fn build_term_degrees(
+    docs: &[u32],
+    mid: usize,
+    fwd: &ForwardIndex,
+    degree_lanes: usize,
+) -> TermDegrees {
+    let build_range = |start: usize, chunk: &[u32]| {
+        let mut degrees = TermDegrees::new(fwd.num_terms);
+        for (offset, &doc) in chunk.iter().enumerate() {
+            let side = usize::from(start + offset >= mid);
+            for &term in fwd.doc_terms(doc as usize) {
+                degrees.entry_mut(term as usize)[side] += 1;
+            }
+        }
+        degrees
+    };
+
+    #[cfg(feature = "native")]
+    {
+        let workers = degree_lanes
+            .max(1)
+            .min(docs.len().div_ceil(PARALLEL_BP_MIN_ENTITIES).max(1));
+        if workers > 1 {
+            let chunk_len = docs.len().div_ceil(workers);
+            return docs
+                .par_chunks(chunk_len)
+                .enumerate()
+                .map(|(chunk, docs)| build_range(chunk * chunk_len, docs))
+                .reduce_with(|mut left, right| {
+                    left.merge_from(&right);
+                    left
+                })
+                .unwrap_or_else(|| TermDegrees::new(fwd.num_terms));
+        }
+    }
+    #[cfg(not(feature = "native"))]
+    let _ = degree_lanes;
+
+    build_range(0, docs)
+}
+
+/// Convert `f32::total_cmp` ordering into an unsigned radix key.
+///
+/// BP gains are finite, but preserving the complete IEEE total order makes
+/// the parallel selector exactly equivalent to the former comparator even if
+/// malformed input ever produces a signed zero, infinity, or NaN.
+#[inline]
+fn gain_order_key(gain: f32) -> u32 {
+    let bits = gain.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits ^ 0x8000_0000
+    }
+}
+
+/// Find the gain key of the last entity admitted to the left half and the
+/// number of strictly lower keys. Four byte-histogram passes replace the old
+/// serial `select_nth_unstable_by` over an 8-byte index per entity.
+fn select_gain_threshold(gains: &[f32], left_count: usize) -> (u32, usize) {
+    debug_assert!(left_count > 0 && left_count <= gains.len());
+    let mut rank_within_prefix = left_count - 1;
+    let mut strictly_lower = 0usize;
+    let mut prefix = 0u32;
+    let mut prefix_mask = 0u32;
+
+    for shift in [24u32, 16, 8, 0] {
+        let histogram = {
+            #[cfg(feature = "native")]
+            {
+                if gains.len() >= PARALLEL_BP_MIN_ENTITIES {
+                    gains
+                        .par_iter()
+                        .fold(
+                            || Box::new([0usize; 256]),
+                            |mut counts, &gain| {
+                                let key = gain_order_key(gain);
+                                if key & prefix_mask == prefix {
+                                    counts[((key >> shift) & 0xff) as usize] += 1;
+                                }
+                                counts
+                            },
+                        )
+                        .reduce(
+                            || Box::new([0usize; 256]),
+                            |mut left, right| {
+                                for (dst, &count) in left.iter_mut().zip(right.iter()) {
+                                    *dst += count;
+                                }
+                                left
+                            },
+                        )
+                } else {
+                    let mut counts = [0usize; 256];
+                    for &gain in gains {
+                        let key = gain_order_key(gain);
+                        if key & prefix_mask == prefix {
+                            counts[((key >> shift) & 0xff) as usize] += 1;
+                        }
+                    }
+                    Box::new(counts)
+                }
+            }
+            #[cfg(not(feature = "native"))]
+            {
+                let mut counts = [0usize; 256];
+                for &gain in gains {
+                    let key = gain_order_key(gain);
+                    if key & prefix_mask == prefix {
+                        counts[((key >> shift) & 0xff) as usize] += 1;
+                    }
+                }
+                counts
+            }
+        };
+
+        let mut before_bucket = 0usize;
+        let mut selected_bucket = None;
+        for (bucket, count) in histogram.iter().copied().enumerate() {
+            if rank_within_prefix < before_bucket + count {
+                selected_bucket = Some(bucket as u32);
+                rank_within_prefix -= before_bucket;
+                strictly_lower += before_bucket;
+                break;
+            }
+            before_bucket += count;
+        }
+        let selected_bucket = selected_bucket.expect("BP radix selection lost the requested rank");
+        prefix |= selected_bucket << shift;
+        prefix_mask |= 0xffu32 << shift;
+    }
+
+    (prefix, strictly_lower)
+}
+
+enum PartitionDegreeUpdate {
+    /// Parallel workers already accumulated every moved-term delta.
+    Deltas(TermDeltas),
+    /// Small partitions use the former unstable selection order. Keep its
+    /// reusable rank map long enough to update only records that crossed the
+    /// cut.
+    Ranked,
+    /// A large partition with only one affordable degree lane still uses the
+    /// bounded-memory radix selector, then applies deltas serially.
+    Threshold {
+        threshold_key: u32,
+        ties_left: usize,
+    },
+}
+
+struct PartitionOutcome {
+    swap_count: usize,
+    degree_update: PartitionDegreeUpdate,
+}
+
+#[derive(Clone, Copy)]
+struct PartitionChunk {
+    start: usize,
+    end: usize,
+    strictly_lower: usize,
+    equal: usize,
+    ties_left: usize,
+}
+
+#[inline]
+fn select_left(key: u32, threshold_key: u32, equal_seen: &mut usize, ties_left: usize) -> bool {
+    if key < threshold_key {
+        true
+    } else if key == threshold_key {
+        let selected = *equal_seen < ties_left;
+        *equal_seen += 1;
+        selected
+    } else {
+        false
+    }
+}
+
+/// Exact, deterministic parallel partition by `(gain.total_cmp(), old_index)`.
+///
+/// Output is stable within each half. Parallel workers also accumulate
+/// per-term degree deltas for moved entities, eliminating the former serial
+/// postings update without rescanning every posting after each iteration.
+/// Small partitions retain the old unstable selector: its allocation is tiny
+/// there, it is faster than four radix scans, and its within-half permutation
+/// supplies the graph algorithm's established symmetry breaking.
+fn partition_by_gain(
+    docs: &[u32],
+    gains: &[f32],
+    mid: usize,
+    fwd: &ForwardIndex,
+    degree_lanes: usize,
+    output: &mut [u32],
+    ranked_scratch: &mut Vec<usize>,
+) -> PartitionOutcome {
+    #[cfg(not(feature = "native"))]
+    let _ = (fwd, degree_lanes);
+
+    #[cfg(feature = "native")]
+    if degree_lanes > 1 && docs.len() >= PARALLEL_BP_MIN_ENTITIES {
+        let (threshold_key, strictly_lower) = select_gain_threshold(gains, mid);
+        let ties_left = mid - strictly_lower;
+
+        // `degrees` remains live while these deltas are built. Reserving one
+        // lane for it keeps total vocabulary arrays <= degree_lanes.
+        let chunk_count = degree_lanes
+            .saturating_sub(1)
+            .max(1)
+            .min(docs.len().div_ceil(PARALLEL_BP_MIN_ENTITIES).max(1));
+        let chunk_len = docs.len().div_ceil(chunk_count);
+        let mut chunks: Vec<PartitionChunk> = gains
+            .par_chunks(chunk_len)
+            .enumerate()
+            .map(|(chunk_id, chunk)| {
+                let mut lower = 0usize;
+                let mut equal = 0usize;
+                for &gain in chunk {
+                    match gain_order_key(gain).cmp(&threshold_key) {
+                        std::cmp::Ordering::Less => lower += 1,
+                        std::cmp::Ordering::Equal => equal += 1,
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+                let start = chunk_id * chunk_len;
+                PartitionChunk {
+                    start,
+                    end: start + chunk.len(),
+                    strictly_lower: lower,
+                    equal,
+                    ties_left: 0,
+                }
+            })
+            .collect();
+
+        let mut remaining_ties = ties_left;
+        for chunk in &mut chunks {
+            chunk.ties_left = remaining_ties.min(chunk.equal);
+            remaining_ties -= chunk.ties_left;
+        }
+        debug_assert_eq!(remaining_ties, 0);
+
+        let (mut left_rest, mut right_rest) = output.split_at_mut(mid);
+        let mut jobs = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let left_len = chunk.strictly_lower + chunk.ties_left;
+            let right_len = chunk.end - chunk.start - left_len;
+            let (left_out, next_left) = left_rest.split_at_mut(left_len);
+            let (right_out, next_right) = right_rest.split_at_mut(right_len);
+            jobs.push((
+                chunk.start,
+                &docs[chunk.start..chunk.end],
+                &gains[chunk.start..chunk.end],
+                chunk.ties_left,
+                left_out,
+                right_out,
+            ));
+            left_rest = next_left;
+            right_rest = next_right;
+        }
+        debug_assert!(left_rest.is_empty() && right_rest.is_empty());
+
+        let (swap_count, deltas) = jobs
+            .into_par_iter()
+            .map(
+                |(start, docs, gains, ties_for_chunk, left_out, right_out)| {
+                    let mut deltas = TermDeltas::new(fwd.num_terms);
+                    let mut equal_seen = 0usize;
+                    let mut left_cursor = 0usize;
+                    let mut right_cursor = 0usize;
+                    let mut swaps = 0usize;
+
+                    for (offset, (&doc, &gain)) in docs.iter().zip(gains).enumerate() {
+                        let key = gain_order_key(gain);
+                        let now_left =
+                            select_left(key, threshold_key, &mut equal_seen, ties_for_chunk);
+                        if now_left {
+                            left_out[left_cursor] = doc;
+                            left_cursor += 1;
+                        } else {
+                            right_out[right_cursor] = doc;
+                            right_cursor += 1;
+                        }
+
+                        let was_left = start + offset < mid;
+                        if was_left != now_left {
+                            swaps += 1;
+                            let left_delta = if was_left { -1 } else { 1 };
+                            for &term in fwd.doc_terms(doc as usize) {
+                                *deltas.entry_mut(term as usize) += left_delta;
+                            }
+                        }
+                    }
+                    debug_assert_eq!(left_cursor, left_out.len());
+                    debug_assert_eq!(right_cursor, right_out.len());
+                    (swaps, deltas)
+                },
+            )
+            .reduce_with(|(left_swaps, mut left), (right_swaps, right)| {
+                left.merge_from(&right);
+                (left_swaps + right_swaps, left)
+            })
+            .unwrap_or_else(|| (0, TermDeltas::new(fwd.num_terms)));
+
+        return PartitionOutcome {
+            swap_count,
+            degree_update: PartitionDegreeUpdate::Deltas(deltas),
+        };
+    }
+
+    if docs.len() < PARALLEL_BP_MIN_ENTITIES {
+        ranked_scratch.clear();
+        ranked_scratch.extend(0..docs.len());
+        ranked_scratch.select_nth_unstable_by(mid, |&left, &right| {
+            gains[left]
+                .total_cmp(&gains[right])
+                .then_with(|| left.cmp(&right))
+        });
+
+        let mut swaps = 0usize;
+        for (rank, &old_index) in ranked_scratch.iter().enumerate() {
+            output[rank] = docs[old_index];
+            swaps += usize::from((old_index < mid) != (rank < mid));
+        }
+        return PartitionOutcome {
+            swap_count: swaps,
+            degree_update: PartitionDegreeUpdate::Ranked,
+        };
+    }
+
+    let (threshold_key, strictly_lower) = select_gain_threshold(gains, mid);
+    let ties_left = mid - strictly_lower;
+    let mut equal_seen = 0usize;
+    let mut left_cursor = 0usize;
+    let mut right_cursor = mid;
+    let mut swaps = 0usize;
+    for (idx, (&doc, &gain)) in docs.iter().zip(gains).enumerate() {
+        let key = gain_order_key(gain);
+        let now_left = select_left(key, threshold_key, &mut equal_seen, ties_left);
+        if now_left {
+            output[left_cursor] = doc;
+            left_cursor += 1;
+        } else {
+            output[right_cursor] = doc;
+            right_cursor += 1;
+        }
+        swaps += usize::from((idx < mid) != now_left);
+    }
+    debug_assert_eq!(left_cursor, mid);
+    debug_assert_eq!(right_cursor, docs.len());
+
+    PartitionOutcome {
+        swap_count: swaps,
+        degree_update: PartitionDegreeUpdate::Threshold {
+            threshold_key,
+            ties_left,
+        },
+    }
+}
+
+/// Apply degree changes for a bounded-memory serial radix partition.
+fn update_degrees_for_threshold_partition(
+    docs: &[u32],
+    gains: &[f32],
+    mid: usize,
+    threshold_key: u32,
+    ties_left: usize,
+    fwd: &ForwardIndex,
+    degrees: &mut TermDegrees,
+) {
+    let mut equal_seen = 0usize;
+    for (idx, (&doc, &gain)) in docs.iter().zip(gains).enumerate() {
+        let key = gain_order_key(gain);
+        let now_left = select_left(key, threshold_key, &mut equal_seen, ties_left);
+        let was_left = idx < mid;
+        if was_left == now_left {
+            continue;
+        }
+        let left_delta = if was_left { -1i64 } else { 1i64 };
+        for &term in fwd.doc_terms(doc as usize) {
+            let degree = degrees.entry_mut(term as usize);
+            let new_left = degree[0] as i64 + left_delta;
+            let new_right = degree[1] as i64 - left_delta;
+            debug_assert!(new_left >= 0 && new_right >= 0);
+            degree[0] = new_left as u32;
+            degree[1] = new_right as u32;
+        }
+    }
+}
+
+/// Apply degree changes using the exact unstable rank order selected for a
+/// small partition.
+fn update_degrees_for_ranked_partition(
+    docs: &[u32],
+    ranked: &[usize],
+    mid: usize,
+    fwd: &ForwardIndex,
+    degrees: &mut TermDegrees,
+) {
+    for (rank, &old_index) in ranked.iter().enumerate() {
+        let was_left = old_index < mid;
+        let now_left = rank < mid;
+        if was_left == now_left {
+            continue;
+        }
+        let left_delta = if was_left { -1i64 } else { 1i64 };
+        for &term in fwd.doc_terms(docs[old_index] as usize) {
+            let degree = degrees.entry_mut(term as usize);
+            let new_left = degree[0] as i64 + left_delta;
+            let new_right = degree[1] as i64 - left_delta;
+            debug_assert!(new_left >= 0 && new_right >= 0);
+            degree[0] = new_left as u32;
+            degree[1] = new_right as u32;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BpProgressLabel<'a> {
+    pub index: &'a str,
+    pub field: &'a str,
+    pub entity_kind: &'static str,
+}
+
+#[cfg(test)]
+impl BpProgressLabel<'static> {
+    fn anonymous() -> Self {
+        Self {
+            index: "unknown",
+            field: "unknown",
+            entity_kind: "entities",
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+struct BpProgress<'a> {
+    label: BpProgressLabel<'a>,
+    start: std::time::Instant,
+    total_entities: usize,
+    total_postings: u64,
+    expected_depth: usize,
+    next_log_ms: std::sync::atomic::AtomicU64,
+    active_partitions: std::sync::atomic::AtomicU64,
+    partitions_started: std::sync::atomic::AtomicU64,
+    partitions_completed: std::sync::atomic::AtomicU64,
+    iterations: std::sync::atomic::AtomicU64,
+    entity_passes: std::sync::atomic::AtomicU64,
+    swaps: std::sync::atomic::AtomicU64,
+    deepest_level: std::sync::atomic::AtomicU64,
+    objective_stops: std::sync::atomic::AtomicU64,
+    last_objective_delta_bits: std::sync::atomic::AtomicU64,
+    last_relative_delta_bits: std::sync::atomic::AtomicU64,
+    active_metric_released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "native")]
+impl<'a> BpProgress<'a> {
+    fn new(
+        label: BpProgressLabel<'a>,
+        total_entities: usize,
+        total_postings: u64,
+        expected_depth: usize,
+    ) -> Self {
+        log::info!(
+            "[reorder][bp] started: index={} field={} entity_kind={} entities={} postings={} expected_depth={} objective_stall_threshold={:.1e}x{} min_objective_iterations={}",
+            label.index,
+            label.field,
+            label.entity_kind,
+            total_entities,
+            total_postings,
+            expected_depth,
+            MIN_RELATIVE_OBJECTIVE_IMPROVEMENT,
+            OBJECTIVE_STALL_ITERATIONS,
+            MIN_OBJECTIVE_ITERATIONS,
+        );
+        crate::observe::reorder_bp_started(label.index, label.field, label.entity_kind);
+        Self {
+            label,
+            start: std::time::Instant::now(),
+            total_entities,
+            total_postings,
+            expected_depth,
+            next_log_ms: std::sync::atomic::AtomicU64::new(30_000),
+            active_partitions: std::sync::atomic::AtomicU64::new(0),
+            partitions_started: std::sync::atomic::AtomicU64::new(0),
+            partitions_completed: std::sync::atomic::AtomicU64::new(0),
+            iterations: std::sync::atomic::AtomicU64::new(0),
+            entity_passes: std::sync::atomic::AtomicU64::new(0),
+            swaps: std::sync::atomic::AtomicU64::new(0),
+            deepest_level: std::sync::atomic::AtomicU64::new(0),
+            objective_stops: std::sync::atomic::AtomicU64::new(0),
+            last_objective_delta_bits: std::sync::atomic::AtomicU64::new(0f64.to_bits()),
+            last_relative_delta_bits: std::sync::atomic::AtomicU64::new(0f64.to_bits()),
+            active_metric_released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn partition_started(&self, level: usize) {
+        self.active_partitions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.partitions_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.deepest_level
+            .fetch_max(level as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn partition_finished(&self) {
+        self.partitions_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.active_partitions
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn iteration(&self, entities: usize, swaps: usize, objective_delta: f64, relative_delta: f64) {
+        self.iterations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.entity_passes
+            .fetch_add(entities as u64, std::sync::atomic::Ordering::Relaxed);
+        self.swaps
+            .fetch_add(swaps as u64, std::sync::atomic::Ordering::Relaxed);
+        self.last_objective_delta_bits.store(
+            objective_delta.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.last_relative_delta_bits.store(
+            relative_delta.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.maybe_log();
+    }
+
+    fn objective_stop(&self) {
+        self.objective_stops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn maybe_log(&self) {
+        let elapsed_ms = self.start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let next = self.next_log_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if elapsed_ms < next
+            || self
+                .next_log_ms
+                .compare_exchange(
+                    next,
+                    elapsed_ms.saturating_add(30_000),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+
+        let active = self
+            .active_partitions
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let started = self
+            .partitions_started
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let completed = self
+            .partitions_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let iterations = self.iterations.load(std::sync::atomic::Ordering::Relaxed);
+        let entity_passes = self
+            .entity_passes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let swaps = self.swaps.load(std::sync::atomic::Ordering::Relaxed);
+        let deepest = self
+            .deepest_level
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let objective_delta = f64::from_bits(
+            self.last_objective_delta_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let relative_delta = f64::from_bits(
+            self.last_relative_delta_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        log::info!(
+            "[reorder][bp] progress: index={} field={} entity_kind={} elapsed={:.1}s depth={}/{} partitions={}/{} active={} iterations={} entity_passes={} swaps={} last_objective_delta={:.3} relative={:.3e}",
+            self.label.index,
+            self.label.field,
+            self.label.entity_kind,
+            self.start.elapsed().as_secs_f64(),
+            deepest,
+            self.expected_depth,
+            completed,
+            started,
+            active,
+            iterations,
+            entity_passes,
+            swaps,
+            objective_delta,
+            relative_delta,
+        );
+    }
+
+    fn finish(&self, converged: bool, memory_limited: bool, deadline_exhausted: bool) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let partitions = self
+            .partitions_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let iterations = self.iterations.load(std::sync::atomic::Ordering::Relaxed);
+        let entity_passes = self
+            .entity_passes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let swaps = self.swaps.load(std::sync::atomic::Ordering::Relaxed);
+        let deepest = self
+            .deepest_level
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let objective_stops = self
+            .objective_stops
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let stop_reason = if memory_limited {
+            "memory_budget"
+        } else if deadline_exhausted {
+            "time_budget"
+        } else if objective_stops > 0 {
+            "objective"
+        } else {
+            "complete"
+        };
+        log::info!(
+            "[reorder][bp] completed: index={} field={} entity_kind={} entities={} postings={} elapsed={:.1}s depth={}/{} partitions={} iterations={} entity_passes={} swaps={} objective_stops={} converged={} stop_reason={}",
+            self.label.index,
+            self.label.field,
+            self.label.entity_kind,
+            self.total_entities,
+            self.total_postings,
+            elapsed,
+            deepest,
+            self.expected_depth,
+            partitions,
+            iterations,
+            entity_passes,
+            swaps,
+            objective_stops,
+            converged,
+            stop_reason,
+        );
+        crate::observe::reorder_bp_pass(
+            self.label.index,
+            self.label.field,
+            self.label.entity_kind,
+            stop_reason,
+            elapsed,
+            self.total_entities,
+            self.total_postings,
+            partitions,
+            iterations,
+            entity_passes,
+            swaps,
+            converged,
+        );
+        self.release_active_metric();
+    }
+
+    fn release_active_metric(&self) {
+        if !self
+            .active_metric_released
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            crate::observe::reorder_bp_finished(
+                self.label.index,
+                self.label.field,
+                self.label.entity_kind,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for BpProgress<'_> {
+    fn drop(&mut self) {
+        self.release_active_metric();
+    }
+}
+
+#[cfg(not(feature = "native"))]
+struct BpProgress<'a>(std::marker::PhantomData<&'a ()>);
+
+#[cfg(not(feature = "native"))]
+impl BpProgress<'_> {
+    fn new(_: BpProgressLabel<'_>, _: usize, _: u64, _: usize) -> Self {
+        Self(std::marker::PhantomData)
+    }
+    fn partition_started(&self, _: usize) {}
+    fn partition_finished(&self) {}
+    fn iteration(&self, _: usize, _: usize, _: f64, _: f64) {}
+    fn objective_stop(&self) {}
+    fn finish(&self, _: bool, _: bool, _: bool) {}
+}
+
 /// Recursive graph bisection. Returns `(perm, converged)` where
 /// `perm[new_pos] = old_index` and `converged` is false iff the wall-clock
 /// budget ended the pass before it finished (a depth cap alone is a chosen
@@ -851,11 +1672,28 @@ impl BpBudget {
 ///
 /// Term IDs in the forward index must be compact (0..num_terms) so we can
 /// use flat arrays for O(1) degree lookups instead of hash maps.
+#[cfg(test)]
 pub(crate) fn graph_bisection(
     fwd: &ForwardIndex,
     min_partition_size: usize,
     max_iters: usize,
     budget: BpBudget,
+) -> (Vec<u32>, bool) {
+    graph_bisection_with_progress(
+        fwd,
+        min_partition_size,
+        max_iters,
+        budget,
+        BpProgressLabel::anonymous(),
+    )
+}
+
+pub(crate) fn graph_bisection_with_progress(
+    fwd: &ForwardIndex,
+    min_partition_size: usize,
+    max_iters: usize,
+    budget: BpBudget,
+    progress_label: BpProgressLabel<'_>,
 ) -> (Vec<u32>, bool) {
     let n = fwd.num_docs();
     if n == 0 {
@@ -876,6 +1714,7 @@ pub(crate) fn graph_bisection(
         0
     };
     let log_table = build_log_table(4096);
+    let progress = BpProgress::new(progress_label, n, fwd.total_postings(), depth);
 
     log::debug!(
         "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}, time_budget={:?}",
@@ -905,13 +1744,16 @@ pub(crate) fn graph_bisection(
         #[cfg(not(feature = "native"))]
         deadline,
         exhausted: &exhausted,
+        progress: &progress,
     };
     #[cfg(feature = "native")]
-    bisect(&mut docs, fwd.parallel_bisect_depth, &context);
+    bisect(&mut docs, fwd.parallel_bisect_depth, 0, &context);
     #[cfg(not(feature = "native"))]
-    bisect(&mut docs, 0, &context);
+    bisect(&mut docs, 0, 0, &context);
 
-    let converged = !fwd.budget_limited && !exhausted.load(std::sync::atomic::Ordering::Relaxed);
+    let deadline_exhausted = exhausted.load(std::sync::atomic::Ordering::Relaxed);
+    let converged = !fwd.budget_limited && !deadline_exhausted;
+    progress.finish(converged, fwd.budget_limited, deadline_exhausted);
     if !converged {
         log::info!(
             "BP graph_bisection: budget incomplete at n={} (time={:?}, memory_limited={}) — emitting partial (still valid) permutation",
@@ -941,9 +1783,10 @@ struct BisectContext<'a> {
     #[cfg(not(feature = "native"))]
     deadline: Option<()>,
     exhausted: &'a std::sync::atomic::AtomicBool,
+    progress: &'a BpProgress<'a>,
 }
 
-fn bisect(docs: &mut [u32], parallel_depth: usize, context: &BisectContext<'_>) {
+fn bisect(docs: &mut [u32], parallel_depth: usize, level: usize, context: &BisectContext<'_>) {
     #[cfg(not(feature = "native"))]
     let _ = parallel_depth;
     let n = docs.len();
@@ -966,8 +1809,8 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, context: &BisectContext<'_>) 
     #[cfg(not(feature = "native"))]
     let _ = context.deadline;
 
+    context.progress.partition_started(level);
     let mid = n / 2;
-    let nt = context.fwd.num_terms;
 
     // Adaptive iteration count: large partitions converge faster with
     // coarse splits, so fewer refinement passes suffice. The fine-grained
@@ -977,23 +1820,33 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, context: &BisectContext<'_>) 
     } else {
         context.max_iters
     };
+    let degree_lanes = 1usize
+        .checked_shl(parallel_depth as u32)
+        .unwrap_or(usize::MAX)
+        .max(1);
 
     // Compact term IDs permit direct indexing. Slots are initialized lazily so
     // deep partitions do not zero the full vocabulary on every recursive node.
-    let mut degrees = TermDegrees::new(nt);
-
-    for (i, &doc) in docs.iter().enumerate() {
-        let side = usize::from(i >= mid);
-        for &term in context.fwd.doc_terms(doc as usize) {
-            degrees.entry_mut(term as usize)[side] += 1;
-        }
-    }
+    // Coarse partitions use memory-budgeted thread-local reductions; recursion
+    // splits the same lane allowance between children.
+    let mut degrees = build_term_degrees(docs, mid, context.fwd, degree_lanes);
+    // A full-vocabulary objective scan pays off only on coarse partitions,
+    // where one avoided refinement skips millions of postings. At fine levels
+    // it cost more than the work it could save, so retain the cheap gain
+    // cooling condition there.
+    let track_objective = n >= PARALLEL_BP_MIN_ENTITIES;
+    let mut previous_objective = if track_objective {
+        degrees.bisection_objective(mid, n - mid, context.log_table)
+    } else {
+        0.0
+    };
+    let mut best_objective = previous_objective;
+    let mut objective_stalls = 0usize;
 
     // Scratch buffers reused across iterations
     let mut gains: Vec<f32> = vec![0.0; n];
-    let mut indices: Vec<usize> = (0..n).collect();
-    let mut new_left: Vec<u32> = Vec::with_capacity(mid);
-    let mut new_right: Vec<u32> = Vec::with_capacity(n - mid);
+    let mut partitioned: Vec<u32> = vec![0; n];
+    let mut ranked_scratch: Vec<usize> = Vec::new();
 
     for iter in 0..effective_iters {
         // Anytime cutoff between refinement passes: keep the current split.
@@ -1017,58 +1870,99 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, context: &BisectContext<'_>) 
             &mut gains,
         );
 
-        // Partition: the `mid` LOWEST keys (strongest left affinity) go left
-        indices.clear();
-        indices.extend(0..n);
-        indices.select_nth_unstable_by(mid, |&a, &b| {
-            gains[a].total_cmp(&gains[b]).then_with(|| a.cmp(&b))
-        });
+        // Exact median selection and stable partition. The old path allocated
+        // `Vec<usize>` (8 bytes/entity) and selected/applied it serially; the
+        // radix path is O(4n), parallel, and accumulates moved-term deltas in
+        // the same bounded worker lanes used by degree construction.
+        let partition = partition_by_gain(
+            docs,
+            &gains,
+            mid,
+            context.fwd,
+            degree_lanes,
+            &mut partitioned,
+            &mut ranked_scratch,
+        );
 
-        // Apply partition, update degree arrays for swapped docs
-        new_left.clear();
-        new_right.clear();
-        let mut swap_count: usize = 0;
-
-        for (rank, &idx) in indices.iter().enumerate() {
-            let doc = docs[idx];
-            let was_left = idx < mid;
-            let now_left = rank < mid;
-
-            if now_left {
-                new_left.push(doc);
-            } else {
-                new_right.push(doc);
-            }
-
-            if was_left != now_left {
-                swap_count += 1;
-                for &term in context.fwd.doc_terms(doc as usize) {
-                    let degree = degrees.entry_mut(term as usize);
-                    if was_left {
-                        degree[0] -= 1;
-                        degree[1] += 1;
-                    } else {
-                        degree[1] -= 1;
-                        degree[0] += 1;
-                    }
-                }
-            }
+        if partition.swap_count == 0 {
+            context.progress.iteration(n, 0, 0.0, 0.0);
+            // Preserve the selector's within-half order before recursing.
+            // Small partitions intentionally retain quickselect's established
+            // symmetry-breaking permutation.
+            docs.copy_from_slice(&partitioned);
+            break;
         }
 
-        docs[..mid].copy_from_slice(&new_left);
-        docs[mid..].copy_from_slice(&new_right);
+        match &partition.degree_update {
+            PartitionDegreeUpdate::Deltas(deltas) => deltas.apply_to(&mut degrees),
+            PartitionDegreeUpdate::Ranked => update_degrees_for_ranked_partition(
+                docs,
+                &ranked_scratch,
+                mid,
+                context.fwd,
+                &mut degrees,
+            ),
+            PartitionDegreeUpdate::Threshold {
+                threshold_key,
+                ties_left,
+            } => update_degrees_for_threshold_partition(
+                docs,
+                &gains,
+                mid,
+                *threshold_key,
+                *ties_left,
+                context.fwd,
+                &mut degrees,
+            ),
+        }
 
-        if swap_count == 0 {
-            break;
+        let (new_objective, objective_improvement, relative_improvement) = if track_objective {
+            let new_objective = degrees.bisection_objective(mid, n - mid, context.log_table);
+            let objective_improvement = new_objective - previous_objective;
+            let relative_improvement = objective_improvement / previous_objective.abs().max(1.0);
+            (new_objective, objective_improvement, relative_improvement)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        context.progress.iteration(
+            n,
+            partition.swap_count,
+            objective_improvement,
+            relative_improvement,
+        );
+
+        // Keep the existing approximate-BP semantics: one median refinement
+        // can temporarily reduce the exact objective before the reciprocal
+        // move settles. Rejecting that first step made valid clustered inputs
+        // no-op. Instead, accept refinements and stop only after a warm-up plus
+        // consecutive iterations that fail to improve the best exact
+        // objective by a meaningful relative amount.
+        docs.copy_from_slice(&partitioned);
+        if track_objective {
+            previous_objective = new_objective;
+            let relative_best_improvement =
+                (new_objective - best_objective) / best_objective.abs().max(1.0);
+            if relative_best_improvement >= MIN_RELATIVE_OBJECTIVE_IMPROVEMENT {
+                best_objective = new_objective;
+                objective_stalls = 0;
+            } else if iter + 1 >= MIN_OBJECTIVE_ITERATIONS {
+                objective_stalls += 1;
+            }
+            if objective_stalls >= OBJECTIVE_STALL_ITERATIONS {
+                context.progress.objective_stop();
+                break;
+            }
         }
 
         // Early termination: if < 0.5% of docs swapped, partition is stable
-        if iter > 2 && swap_count < n / 200 {
+        if iter > 2 && partition.swap_count < n / 200 {
             break;
         }
 
-        // Cooling: break early if gains are negligible
-        if iter > 5 {
+        // Fine partitions retain the previous cheap cooling rule. Computing
+        // an exact vocabulary objective here costs more than the posting work
+        // it can avoid.
+        if !track_objective && iter > 5 {
             let max_abs_gain = gains
                 .iter()
                 .copied()
@@ -1082,28 +1976,27 @@ fn bisect(docs: &mut [u32], parallel_depth: usize, context: &BisectContext<'_>) 
     // Drop scratch before recursion to free memory for sub-problems
     drop(degrees);
     drop(gains);
-    drop(indices);
-    drop(new_left);
-    drop(new_right);
+    drop(partitioned);
+    context.progress.partition_finished();
 
     let (left, right) = docs.split_at_mut(mid);
     #[cfg(feature = "native")]
     if parallel_depth > 0 {
         rayon::join(
-            || bisect(left, parallel_depth - 1, context),
-            || bisect(right, parallel_depth - 1, context),
+            || bisect(left, parallel_depth - 1, level + 1, context),
+            || bisect(right, parallel_depth - 1, level + 1, context),
         );
     } else {
         // Gain computation inside each node remains parallel, so serializing
         // recursion here bounds vocabulary-sized degree arrays without leaving
         // the Rayon pool idle.
-        bisect(left, 0, context);
-        bisect(right, 0, context);
+        bisect(left, 0, level + 1, context);
+        bisect(right, 0, level + 1, context);
     }
     #[cfg(not(feature = "native"))]
     {
-        bisect(left, 0, context);
-        bisect(right, 0, context);
+        bisect(left, 0, level + 1, context);
+        bisect(right, 0, level + 1, context);
     }
 }
 
@@ -1212,6 +2105,132 @@ mod tests {
                 .sum::<u32>(),
             1
         );
+    }
+
+    #[test]
+    fn gain_radix_key_matches_total_cmp() {
+        let values = [
+            f32::from_bits(0xffc0_0001),
+            f32::NEG_INFINITY,
+            -42.0,
+            -0.0,
+            0.0,
+            42.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_0001),
+        ];
+        let mut by_cmp = values;
+        by_cmp.sort_by(f32::total_cmp);
+        let mut by_key = values;
+        by_key.sort_by_key(|value| gain_order_key(*value));
+        assert_eq!(
+            by_cmp.map(f32::to_bits),
+            by_key.map(f32::to_bits),
+            "radix selection must preserve the former total_cmp order"
+        );
+    }
+
+    #[test]
+    fn radix_threshold_matches_exact_rank_with_ties() {
+        let gains = [3.0, -1.0, 7.0, -1.0, 0.0, -0.0, 3.0, 9.0, 3.0, 2.0, 2.0];
+        let mut sorted: Vec<(u32, usize)> = gains
+            .iter()
+            .enumerate()
+            .map(|(idx, &gain)| (gain_order_key(gain), idx))
+            .collect();
+        sorted.sort_unstable();
+
+        for left_count in 1..=gains.len() {
+            let (threshold, lower) = select_gain_threshold(&gains, left_count);
+            assert_eq!(threshold, sorted[left_count - 1].0);
+            assert_eq!(lower, sorted.partition_point(|&(key, _)| key < threshold),);
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn parallel_partition_matches_exact_selection_and_degree_rebuild() {
+        const N: usize = PARALLEL_BP_MIN_ENTITIES + 1;
+        const TERMS: usize = 101;
+        let mut terms = Vec::with_capacity(N * 3);
+        let mut offsets = Vec::with_capacity(N + 1);
+        offsets.push(0);
+        for doc in 0..N {
+            terms.extend_from_slice(&[
+                (doc % TERMS) as u32,
+                ((doc / 7) % TERMS) as u32,
+                ((doc * 13) % TERMS) as u32,
+            ]);
+            offsets.push(terms.len() as u64);
+        }
+        let fwd = ForwardIndex {
+            terms,
+            offsets,
+            num_terms: TERMS,
+            parallel_bisect_depth: 2,
+            budget_limited: false,
+        };
+        let docs: Vec<u32> = (0..N as u32)
+            .map(|idx| ((idx as usize * 7_919) % N) as u32)
+            .collect();
+        let gains: Vec<f32> = docs
+            .iter()
+            .map(|&doc| ((doc as usize * 37) % 257) as f32 - 128.0)
+            .collect();
+        let mid = N / 2;
+
+        let mut ranked: Vec<usize> = (0..N).collect();
+        ranked.sort_unstable_by(|&left, &right| {
+            gains[left]
+                .total_cmp(&gains[right])
+                .then_with(|| left.cmp(&right))
+        });
+        let mut selected_left = vec![false; N];
+        for &idx in &ranked[..mid] {
+            selected_left[idx] = true;
+        }
+        let expected: Vec<u32> = docs
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| selected_left[*idx])
+            .chain(
+                docs.iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !selected_left[*idx]),
+            )
+            .map(|(_, &doc)| doc)
+            .collect();
+
+        let mut output = vec![0; N];
+        let mut ranked_scratch = Vec::new();
+        let outcome = partition_by_gain(
+            &docs,
+            &gains,
+            mid,
+            &fwd,
+            4,
+            &mut output,
+            &mut ranked_scratch,
+        );
+        assert_eq!(output, expected);
+        assert!(
+            matches!(&outcome.degree_update, PartitionDegreeUpdate::Deltas(_)),
+            "test must exercise parallel deltas"
+        );
+
+        let mut updated = build_term_degrees(&docs, mid, &fwd, 4);
+        let PartitionDegreeUpdate::Deltas(deltas) = outcome.degree_update else {
+            unreachable!("assertion above verifies the parallel path")
+        };
+        deltas.apply_to(&mut updated);
+        let rebuilt = build_term_degrees(&output, mid, &fwd, 4);
+        for term in 0..TERMS {
+            assert_eq!(
+                updated.get(term),
+                rebuilt.get(term),
+                "parallel moved-term delta mismatch for term {term}"
+            );
+        }
     }
 
     /// Regression: CSR offsets were u32 and wrapped past 4.29B postings —

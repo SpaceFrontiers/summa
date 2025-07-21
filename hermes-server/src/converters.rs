@@ -381,8 +381,6 @@ pub fn convert_query(
                 .get_field_entry(field)
                 .and_then(|entry| entry.sparse_vector_config.as_ref());
             let schema_qc = sparse_config.and_then(|config| config.query_config.as_ref());
-            let is_bmp = sparse_config
-                .is_some_and(|config| config.format == hermes_core::structures::SparseFormat::Bmp);
 
             // heap_factor: per-request > schema default > 1.0
             if sv_query.heap_factor > 0.0 {
@@ -410,10 +408,6 @@ pub fn convert_query(
                 query = query.with_pruning(sv_query.pruning);
             } else if let Some(Some(p)) = schema_qc.map(|qc| qc.pruning) {
                 query = query.with_pruning(p);
-            } else if is_bmp {
-                // LSP/0's robust zero-shot configuration keeps the top third
-                // of query terms by absolute weight.
-                query = query.with_pruning(0.33);
             }
 
             // min_query_dims: schema default (no per-request override)
@@ -1226,6 +1220,36 @@ mod tests {
         builder.add_binary_dense_vector_field("binary", 16, true, false);
         builder.add_text_field("title", true, false);
         builder.build()
+    }
+
+    fn bmp_sparse_test_schema() -> Schema {
+        let mut builder = hermes_core::SchemaBuilder::default();
+        let mut config = hermes_core::structures::SparseVectorConfig::splade_bmp();
+        config.dims = Some(16);
+        builder.add_sparse_vector_field_with_config("sparse", true, false, config);
+        builder.build()
+    }
+
+    fn sparse_proto_query(pruning: f32) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: "sparse".to_string(),
+                indices: vec![1, 2, 3, 4, 5, 6],
+                values: vec![1.0; 6],
+                pruning,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn bmp_query_dimension_pruning_is_explicit_not_a_server_fallback() {
+        let schema = bmp_sparse_test_schema();
+        let default_query = convert_query(&sparse_proto_query(0.0), &schema, None, None).unwrap();
+        assert!(!default_query.to_string().contains("orig="));
+
+        let pruned_query = convert_query(&sparse_proto_query(0.33), &schema, None, None).unwrap();
+        assert!(pruned_query.to_string().contains("orig=6"));
     }
 
     #[test]

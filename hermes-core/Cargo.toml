@@ -28,6 +28,7 @@ num_cpus = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 log = "0.4"
+lru = "0.12"
 rust-stemmers = { workspace = true }
 stop-words = { workspace = true }
 pest = { workspace = true }

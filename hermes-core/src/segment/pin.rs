@@ -2,7 +2,7 @@
 //! structures (a meta/data residency split).
 //!
 //! Every query must touch certain small metadata sections — BMP block-offset
-//! tables, sparse skip sections, doc-id maps, superblock grids. Under memory
+//! tables, sparse skip sections, doc-id maps, and the coarse BMP hierarchy. Under memory
 //! pressure the kernel evicts them like bulk data, and queries then pay major
 //! faults on structures they cannot skip. This module pins them, in priority
 //! order (smallest/hottest first), until a per-segment budget is exhausted.
@@ -51,10 +51,9 @@ impl PinPolicy {
     /// `HERMES_PIN_METADATA_BUDGET_MB` (default 0 = off),
     /// `HERMES_PIN_MODE` = `mlock` (default) | `copy`.
     ///
-    /// Used as the default initializer for [`pin_policy`], and as the
-    /// backward-compatible fallback for consumers (e.g. hermes-server) that
-    /// surface these as CLI flags but still honor the env vars when the flags
-    /// are left unset.
+    /// Used as the default initializer for [`pin_policy`]. Consumers such as
+    /// hermes-server expose CLI flags and honor these environment values when
+    /// the corresponding flags are unset.
     pub fn from_env() -> Self {
         let budget_mb: u64 = std::env::var("HERMES_PIN_METADATA_BUDGET_MB")
             .ok()

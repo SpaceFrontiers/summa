@@ -297,6 +297,10 @@ fn build_sparse_bmp_results_inner(
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
     options: &super::ScorerOptions,
 ) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
+    let infos = options
+        .lsp_plan
+        .as_ref()
+        .map_or(infos, |plan| plan.infos.as_ref());
     let Some(&info) = infos.first() else {
         return Ok(None);
     };
@@ -304,18 +308,26 @@ fn build_sparse_bmp_results_inner(
     let Some(bmp) = reader.bmp_index(field) else {
         return Ok(None);
     };
-    let candidate_terms: Vec<(u32, f32)> = infos
-        .iter()
-        .filter(|info| info.candidate)
-        .map(|info| (info.dim_id, info.weight))
-        .collect();
-    if candidate_terms.is_empty() {
-        return Ok(None);
-    }
-    let scoring_terms: Vec<(u32, f32)> = infos
-        .iter()
-        .map(|info| (info.dim_id, info.weight))
-        .collect();
+    // Global LSP already resolved and quantized the complete query. Rebuilding
+    // these two vectors in every segment used to duplicate bounded query work
+    // and allocations. Direct/single-segment calls still prepare locally.
+    let (candidate_terms, scoring_terms) = if options.lsp_plan.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        let candidate_terms: Vec<_> = infos
+            .iter()
+            .filter(|info| info.candidate)
+            .map(|info| (info.dim_id, info.weight))
+            .collect();
+        if candidate_terms.is_empty() {
+            return Ok(None);
+        }
+        let scoring_terms = infos
+            .iter()
+            .map(|info| (info.dim_id, info.weight))
+            .collect();
+        (candidate_terms, scoring_terms)
+    };
     let executor_limit = bmp_executor_limit(limit, info.over_fetch_factor, bmp);
     let lsp_gamma = info
         .lsp_gamma

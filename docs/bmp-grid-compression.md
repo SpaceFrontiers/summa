@@ -1,6 +1,6 @@
 # BMP LSP/0 and Maximum-Grid Compression
 
-Status: implemented in the BMP V17 format (2026-07-23).
+Status: implemented in the BMP V18 format (2026-07-23).
 
 The production field shape is:
 
@@ -10,12 +10,11 @@ field embedding: sparse_vector<u32> [indexed<
     dims: 105879,
     max_weight: 5.0,
     bmp_block_size: 32,
-    bmp_grid_bits: 4,
-    query<pruning: 0.33>
+    bmp_grid_bits: 4
 >]
 ```
 
-V17 is the only supported BMP representation. There is no compatibility
+V18 is the only supported BMP representation. There is no compatibility
 reader or migration path; rebuild the index after upgrading.
 
 ## Space anatomy
@@ -24,28 +23,30 @@ Let `n` be stored vectors/ordinals, `d` the vocabulary size, `b = 32` vectors
 per block, and `c = 8` blocks per superblock. Multi-valued fields count every
 ordinal, not only logical documents.
 
-Before local bit packing, the two maximum grids would occupy:
+Before local bit packing, the three maximum grids would occupy:
 
 ```text
 blocks      = ceil(n / b)
 superblocks = ceil(blocks / c)
+coarse      = ceil(superblocks / 256)
 D bytes     = d × ceil(blocks / 2)       # ceil-u4 block maxima
 E bytes     = d × ceil(superblocks / 2)  # ceil-u4 superblock maxima
+H bytes     = d × ceil(coarse / 2)       # ceil-u4 256-superblock maxima
 ```
 
 For `d = 105,879`:
 
-| vectors | blocks | superblocks | dense D | dense E | dense D + E |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 18M | 562,500 | 70,313 | 29.78 GB | 3.72 GB | **33.50 GB** |
-| 100M | 3,125,000 | 390,625 | 165.44 GB | 20.68 GB | **186.12 GB** |
-| 1B | 31,250,000 | 3,906,250 | 1.654 TB | 206.79 GB | **1.861 TB** |
+| vectors | blocks | superblocks | coarse | dense D | dense E | dense H | dense total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 18M | 562,500 | 70,313 | 275 | 29.78 GB | 3.72 GB | 14.61 MB | **33.52 GB** |
+| 100M | 3,125,000 | 390,625 | 1,526 | 165.44 GB | 20.68 GB | 80.79 MB | **186.20 GB** |
+| 1B | 31,250,000 | 3,906,250 | 15,259 | 1.654 TB | 206.79 GB | 807.86 MB | **1.862 TB** |
 
-Those are dense-reference sizes, not the V17 on-disk sizes. V17 omits
+Those are dense-reference sizes, not the V18 on-disk sizes. V18 omits
 all-zero payload groups and uses each group’s actual local width. The encoded
 size depends on term density and BP ordering, so projections captured for the
-old 64-block/exact-u8 hierarchy are not valid for V17. The segment load log’s
-separate D/E byte counts are authoritative after a rebuild.
+old 64-block/exact-u8 hierarchy are not valid for V18. The segment load log’s
+separate D/E/H byte counts are authoritative after a rebuild.
 
 The other persistent sections are:
 
@@ -67,17 +68,18 @@ exact maximum costs `T` bytes, but lets a D2 BP/reorder regenerate a tight
 ceil-u4 E grid without rereading `2P` posting bytes. Empty blocks have no
 Section B payload.
 
-## V17 grid representation
+## V18 grid representation
 
-D and E are independent dimension-major grids partitioned into 256-cell
-groups. Each exact block-header maximum is ceiling-quantized before projection:
+D, E, and H are independent dimension-major grids partitioned into 256-cell
+codec groups. H has one logical cell per 256 E superblocks. Each exact
+block-header maximum is ceiling-quantized before projection:
 
 ```text
 u4 = ceil(exact_u8 / 17)
 u2 = ceil(exact_u8 / 85)  # D only, when bmp_grid_bits = 2
 ```
 
-E always uses ceil-u4. Taking the maximum of ceiling-quantized block values is
+E and H always use ceil-u4. Taking the maximum of ceiling-quantized values is
 equivalent to ceiling-quantizing their exact maximum. Query-time multiplication
 by 17 (or 85 for u2 D) makes every decoded cell an upper bound, never a rounded
 down estimate.
@@ -85,7 +87,7 @@ down estimate.
 A 256-cell group is encoded at its smallest sufficient bit width:
 
 - D has local width `0..=bmp_grid_bits`.
-- E has local width `0..=4`.
+- E and H have local width `0..=4`.
 - An all-zero group has width zero and no payload.
 - A group payload is exactly `width × 32` bytes.
 
@@ -115,18 +117,23 @@ Codec groups do not pad the logical BMP block or superblock counts.
 
 ## LSP/0 execution
 
-V17 implements LSP/0 as a query-level operation:
+V18 implements LSP/0 as a query-level operation:
 
-1. Keep the strongest query dimensions for candidate generation
-   (`beta = 0.33` by default for BMP).
-2. Sweep E for those dimensions and compute SBMax for every physical segment.
-3. Select one global top-`gamma` set across the entire index, then partition
-   the selected superblock IDs back to their segments.
-4. Visit selected superblocks in non-increasing SBMax order while
+1. Use all bounded query dimensions for candidate generation by default.
+   An explicit `query<pruning: beta>` can retain only the strongest fraction,
+   but is an approximation whose Recall@K must be measured.
+2. Sweep the small H grid and push its coarse upper bounds into one global
+   best-first frontier.
+3. Expand only H cells whose bound can still enter global top-`gamma`; each
+   expansion reads the corresponding independently addressable 256-cell group
+   from E. Stop only when the next H bound is strictly below the current
+   `gamma`-th E bound, preserving score ties exactly.
+4. Partition the exact global top-`gamma` E cells back to their segments.
+5. Visit selected superblocks in non-increasing SBMax order while
    `SBMax >= theta`.
-5. Within a selected superblock, decode D once per candidate dimension, order
+6. Within a selected superblock, decode D once per candidate dimension, order
    its eight blocks by BlockMax, and apply `heap_factor` only at this level.
-6. Score documents in visited blocks with the bounded full query, including
+7. Score documents in visited blocks with the bounded full query, including
    dimensions removed from candidate generation.
 
 The global selection is important: 50 immutable segments still visit at most
@@ -156,7 +163,7 @@ floating-point rounding difference from lowering an unpruned bound.
 
 Initial build and BP/reorder write grids from sorted
 `(dimension, block, exact_u8_maximum)` entries. Exact maxima are retained in
-each block header, so both D and E can be regenerated without scanning or
+each block header, so D, E, and H can be regenerated without scanning or
 reserializing postings.
 
 Ordinary merge remains a streaming block-copy operation:
@@ -167,9 +174,11 @@ Ordinary merge remains a streaming block-copy operation:
 - E values are remapped to destination superblocks. If a source superblock
   straddles a destination boundary, its ceiling bound is max-propagated to
   both destinations. The bound may be temporarily loose but cannot be unsafe.
+- H is streamed from the remapped E row by reducing each 256-superblock group;
+  postings are never decoded or reserialized.
 - Document maps are chunked copies with document-ID offset patching.
 
-A later BP pass rebuilds tight E values from exact block headers. Reordering
+A later BP pass rebuilds tight E/H values from exact block headers. Reordering
 changes block coordinates first and then projects exact maxima into
 `floor(new_block / 8)`, so ceil quantization composes correctly with any
 permutation.
@@ -180,24 +189,24 @@ The production codec and hot loops are Rust:
 
 - x86_64 uses BMI2 for variable-width unpacking and SSE4.1 for u4/u8 bound
   accumulation, including the eight-block LSP unit;
-- AArch64 uses bounded unpacking and NEON for the same D/E accumulation paths;
+- AArch64 uses bounded unpacking and NEON for the same D/E/H accumulation paths;
 - other targets use a result-identical scalar fallback.
 
-All large sections remain mmap-backed. E and the compact offset/selector
-structures are eligible for priority pinning because every BMP query uses
-them. D payload and block payload remain pageable. D receives random-access
-advice; E receives sequential advice.
+All large sections remain mmap-backed. H is approximately 256 times smaller
+than dense E and is pinned with its row offsets because every BMP query sweeps
+it. Only E's small row-offset table is pinned; selected E payload groups, D,
+and block payload remain pageable with random-access advice.
 
 ## Match to the LSP paper
 
-V17 follows the core design in
+V18 follows the core design in
 [Carlson et al., “Efficiency Optimizations for Superblock-based Sparse Retrieval”](https://arxiv.org/html/2602.02883v1):
 
 - 256 independently decodable maximum cells per compressed group;
 - random group access rather than BMP-Sparse’s binary-search/scatter path;
 - four-bit ceiling maxima at both hierarchy levels;
 - a superblock footprint no larger than 256 vectors (`b = 32`, `c = 8`);
-- beta query pruning, strict SBMax top-gamma selection, safe
+- optional beta query pruning, strict SBMax top-gamma selection, safe
   `SBMax >= theta`, block-level eta/`heap_factor`, and full-query scoring of
   visited candidates.
 
@@ -205,6 +214,10 @@ Hermes’s codec is equivalent in access granularity and bounds but is not the
 paper implementation’s wire format. Its selector checkpoints are interleaved
 every 32 groups rather than stored as one long selector prefix, which bounds
 random lookup work on very long 1B-scale rows.
+
+The persisted H level is a Hermes exact-search acceleration around LSP/0, not
+a new approximation: it is a maximum hierarchy over E and produces the same
+global top-`gamma` membership as a complete E sweep.
 
 The paper reports its best latency around block sizes 4–16. Hermes keeps the
 requested block size 32 and compensates with eight-block superblocks; this
@@ -249,12 +262,7 @@ The test suite pins:
 - exact BMP-versus-MaxScore top-k parity in exhaustive mode;
 - u2-versus-u4 rank-safe parity;
 - a single global gamma across multiple segments;
-- non-aligned D merge and overlapping E-bound propagation;
+- non-aligned D merge and overlapping E/H-bound propagation;
 - record and blockwise BP reorder;
 - E regeneration from exact block-header maxima;
 - bounded external-run construction.
-
-After a production rebuild, record D/E encoded bytes, hot and cold
-p50/p95/p99, page faults, global selected/visited superblocks, blocks visited,
-and recall against `lsp_gamma: 0`. The new hierarchy should be judged from
-those measurements rather than the obsolete V16 projections.

@@ -10,6 +10,20 @@ use crate::query::traits::{CountFuture, MatchedPositions, Query, Scorer, ScorerF
 
 const DEFAULT_SPARSE_OVER_FETCH_FACTOR: f32 = crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32;
 
+enum SparseQueryInfos {
+    Local(Vec<crate::query::SparseTermQueryInfo>),
+    Shared(std::sync::Arc<[crate::query::SparseTermQueryInfo]>),
+}
+
+impl SparseQueryInfos {
+    fn as_slice(&self) -> &[crate::query::SparseTermQueryInfo] {
+        match self {
+            Self::Local(infos) => infos,
+            Self::Shared(infos) => infos,
+        }
+    }
+}
+
 /// Sparse vector query for similarity search
 #[derive(Debug, Clone)]
 pub struct SparseVectorQuery {
@@ -82,7 +96,7 @@ impl SparseVectorQuery {
             lsp_gamma: None,
             pruned: None,
         };
-        q.pruned = Some(q.compute_pruned_vector());
+        q.pruned = q.compute_pruned_vector();
         q
     }
 
@@ -160,7 +174,7 @@ impl SparseVectorQuery {
     /// Dimensions with abs(weight) below this are dropped before search.
     pub fn with_weight_threshold(mut self, threshold: f32) -> Self {
         self.weight_threshold = threshold;
-        self.pruned = Some(self.compute_pruned_vector());
+        self.pruned = self.compute_pruned_vector();
         self
     }
 
@@ -169,7 +183,7 @@ impl SparseVectorQuery {
         // MaxScore and BMP use a u64 query-term mask in their hot paths.  Keep
         // this invariant here even when an SDL or RPC override asks for more.
         self.max_query_dims = Some(max_dims.min(crate::query::MAX_QUERY_TERMS));
-        self.pruned = Some(self.compute_pruned_vector());
+        self.pruned = self.compute_pruned_vector();
         self
     }
 
@@ -177,7 +191,7 @@ impl SparseVectorQuery {
     /// Same semantics as indexing-time `pruning`.
     pub fn with_pruning(mut self, fraction: f32) -> Self {
         self.pruning = Some(fraction.clamp(0.0, 1.0));
-        self.pruned = Some(self.compute_pruned_vector());
+        self.pruned = self.compute_pruned_vector();
         self
     }
 
@@ -185,7 +199,7 @@ impl SparseVectorQuery {
     /// Queries with fewer dimensions than this skip weight_threshold and pruning.
     pub fn with_min_query_dims(mut self, min_dims: usize) -> Self {
         self.min_query_dims = min_dims;
-        self.pruned = Some(self.compute_pruned_vector());
+        self.pruned = self.compute_pruned_vector();
         self
     }
 
@@ -196,22 +210,34 @@ impl SparseVectorQuery {
         self
     }
 
-    /// Apply weight_threshold, pruning, and max_query_dims, returning the pruned vector.
-    fn compute_pruned_vector(&self) -> Vec<(u32, f32)> {
+    /// Apply weight_threshold, pruning, and max_query_dims. `None` aliases the
+    /// original query vector and avoids a second allocation on the default
+    /// unpruned path.
+    fn compute_pruned_vector(&self) -> Option<Vec<(u32, f32)>> {
         let original_len = self.vector.len();
+        let max_dims = self
+            .max_query_dims
+            .unwrap_or(crate::query::MAX_QUERY_TERMS)
+            .min(crate::query::MAX_QUERY_TERMS);
+        let filtering_enabled = self.weight_threshold > 0.0 && original_len > self.min_query_dims;
+        let pruning_enabled = self
+            .pruning
+            .is_some_and(|fraction| fraction < 1.0 && original_len > self.min_query_dims);
+        if !filtering_enabled && !pruning_enabled && original_len <= max_dims {
+            return None;
+        }
 
         // Step 1: weight_threshold — drop dimensions below minimum weight
         // Skip when query has fewer than min_query_dims dimensions
-        let mut v: Vec<(u32, f32)> =
-            if self.weight_threshold > 0.0 && self.vector.len() > self.min_query_dims {
-                self.vector
-                    .iter()
-                    .copied()
-                    .filter(|(_, w)| w.abs() >= self.weight_threshold)
-                    .collect()
-            } else {
-                self.vector.clone()
-            };
+        let mut v: Vec<(u32, f32)> = if filtering_enabled {
+            self.vector
+                .iter()
+                .copied()
+                .filter(|(_, w)| w.abs() >= self.weight_threshold)
+                .collect()
+        } else {
+            self.vector.clone()
+        };
         let after_threshold = v.len();
 
         // Step 2: pruning — keep top fraction by abs(weight), same as indexing
@@ -231,10 +257,6 @@ impl SparseVectorQuery {
         // Step 3: max_query_dims — absolute cap on dimensions.  The hard
         // MAX_QUERY_TERMS bound is a correctness requirement, not merely a
         // tuning default: both sparse executors represent query terms in u64.
-        let max_dims = self
-            .max_query_dims
-            .unwrap_or(crate::query::MAX_QUERY_TERMS)
-            .min(crate::query::MAX_QUERY_TERMS);
         if v.len() > max_dims {
             if !sorted_by_weight {
                 v.sort_unstable_by(|a, b| {
@@ -269,7 +291,7 @@ impl SparseVectorQuery {
             );
         }
 
-        v
+        Some(v)
     }
 
     /// Create from separate indices and weights vectors
@@ -430,35 +452,46 @@ impl SparseVectorQuery {
     /// for candidate generation. LSP/BMP scores visited documents with the
     /// full list; MaxScore continues to consume only marked candidate terms.
     fn sparse_infos(&self) -> Vec<crate::query::SparseTermQueryInfo> {
-        let candidate_dims: rustc_hash::FxHashSet<u32> = self
-            .pruned_dims()
-            .iter()
-            .map(|&(dimension, _)| dimension)
-            .collect();
-        let mut scoring_dims = self.vector.clone();
-        if scoring_dims.len() > crate::query::MAX_QUERY_TERMS {
-            scoring_dims.sort_unstable_by(|left, right| {
-                right
-                    .1
-                    .abs()
-                    .total_cmp(&left.1.abs())
-                    .then_with(|| left.0.cmp(&right.0))
-            });
-            scoring_dims.truncate(crate::query::MAX_QUERY_TERMS);
+        let candidate_dims: Option<rustc_hash::FxHashSet<u32>> = self
+            .pruned
+            .as_ref()
+            .map(|dimensions| dimensions.iter().map(|&(dimension, _)| dimension).collect());
+        let make_info = |(dim_id, weight)| crate::query::SparseTermQueryInfo {
+            field: self.field,
+            dim_id,
+            weight,
+            candidate: candidate_dims
+                .as_ref()
+                .is_none_or(|dimensions| dimensions.contains(&dim_id)),
+            heap_factor: self.heap_factor,
+            combiner: self.combiner,
+            over_fetch_factor: self.over_fetch_factor,
+            lsp_gamma: self.lsp_gamma,
+        };
+        if self.vector.len() <= crate::query::MAX_QUERY_TERMS {
+            return self.vector.iter().copied().map(make_info).collect();
         }
-        scoring_dims
-            .into_iter()
-            .map(|(dim_id, weight)| crate::query::SparseTermQueryInfo {
-                field: self.field,
-                dim_id,
-                weight,
-                candidate: candidate_dims.contains(&dim_id),
-                heap_factor: self.heap_factor,
-                combiner: self.combiner,
-                over_fetch_factor: self.over_fetch_factor,
-                lsp_gamma: self.lsp_gamma,
-            })
-            .collect()
+
+        let mut scoring_dims = self.vector.clone();
+        scoring_dims.sort_unstable_by(|left, right| {
+            right
+                .1
+                .abs()
+                .total_cmp(&left.1.abs())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        scoring_dims.truncate(crate::query::MAX_QUERY_TERMS);
+        scoring_dims.into_iter().map(make_info).collect()
+    }
+
+    fn sparse_infos_for_plan(
+        &self,
+        plan: Option<&std::sync::Arc<crate::query::bmp::LspSegmentPlan>>,
+    ) -> SparseQueryInfos {
+        match plan {
+            Some(plan) => SparseQueryInfos::Shared(std::sync::Arc::clone(&plan.infos)),
+            None => SparseQueryInfos::Local(self.sparse_infos()),
+        }
     }
 }
 
@@ -474,17 +507,18 @@ impl Query for SparseVectorQuery {
         options: crate::query::ScorerOptions,
     ) -> ScorerFuture<'a> {
         let validation = self.validate(reader);
-        let infos = self.sparse_infos();
+        let infos = self.sparse_infos_for_plan(options.lsp_plan.as_ref());
 
         Box::pin(async move {
             validation?;
+            let infos = infos.as_slice();
             if infos.is_empty() {
                 return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>);
             }
 
             // Auto-detect: try BMP executor first (coupled to index format)
             if let Some((raw, info)) =
-                crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, &options)?
+                crate::query::planner::build_sparse_bmp_results(infos, reader, limit, &options)?
             {
                 return Ok(crate::query::planner::combine_sparse_results(
                     raw,
@@ -496,7 +530,7 @@ impl Query for SparseVectorQuery {
 
             // Fall back to MaxScore execution
             if let Some((executor, info)) =
-                crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
+                crate::query::planner::build_sparse_maxscore_executor(infos, reader, limit, None)
             {
                 let raw = executor.execute().await?;
                 return Ok(crate::query::planner::combine_sparse_results(
@@ -528,14 +562,15 @@ impl Query for SparseVectorQuery {
         options: crate::query::ScorerOptions,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         self.validate(reader)?;
-        let infos = self.sparse_infos();
+        let infos = self.sparse_infos_for_plan(options.lsp_plan.as_ref());
+        let infos = infos.as_slice();
         if infos.is_empty() {
             return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>);
         }
 
         // Auto-detect: try BMP executor first (coupled to index format)
         if let Some((raw, info)) =
-            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, &options)?
+            crate::query::planner::build_sparse_bmp_results(infos, reader, limit, &options)?
         {
             return Ok(crate::query::planner::combine_sparse_results(
                 raw,
@@ -547,7 +582,7 @@ impl Query for SparseVectorQuery {
 
         // Fall back to MaxScore execution
         if let Some((executor, info)) =
-            crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
+            crate::query::planner::build_sparse_maxscore_executor(infos, reader, limit, None)
         {
             let raw = executor.execute_sync()?;
             return Ok(crate::query::planner::combine_sparse_results(
@@ -868,6 +903,10 @@ mod tests {
 
         assert_eq!(query.field, Field(0));
         assert_eq!(query.vector, sparse);
+        assert!(
+            query.pruned.is_none(),
+            "the default path must alias the source vector instead of cloning it"
+        );
     }
 
     #[test]

@@ -14,6 +14,8 @@
 //! payload. Row offsets are a small, separately pinnable `u64` table.
 
 use std::io::Write;
+#[cfg(feature = "native")]
+use std::ops::Range;
 
 use crate::directories::OwnedBytes;
 
@@ -1096,6 +1098,84 @@ impl CompressedGrid {
             width,
             bytes: &rows[payload_start..payload_end],
         })
+    }
+
+    /// Byte range containing one group's checkpoint and width selector.
+    ///
+    /// Unlike `group()`, this needs no row payload metadata and can therefore
+    /// be advised far enough ahead to hide a cold header-page fault.
+    #[cfg(feature = "native")]
+    pub(crate) fn group_metadata_range(
+        &self,
+        dimension: usize,
+        group: usize,
+    ) -> crate::Result<Range<usize>> {
+        if group >= self.layout.groups() {
+            return Err(crate::Error::Corruption(format!(
+                "BMP compressed-grid group {group} exceeds {}",
+                self.layout.groups()
+            )));
+        }
+        let (row_start, row_end) = self.row_range(dimension)?;
+        let chunk = group / META_GROUPS;
+        let selectors = META_GROUPS.min(self.layout.groups() - chunk * META_GROUPS);
+        let start = row_start + chunk * META_RECORD_BYTES;
+        let end = start + std::mem::size_of::<u32>() + selector_bytes(selectors);
+        if end > row_end {
+            return Err(crate::Error::Corruption(
+                "BMP compressed-grid metadata extends beyond row".into(),
+            ));
+        }
+        Ok(start..end)
+    }
+
+    /// Byte range of one group's packed payload. Call after its metadata range
+    /// has had prefetch lead; locating the payload reads the checkpoint and
+    /// selector but does not decode its cells.
+    #[cfg(feature = "native")]
+    pub(crate) fn group_payload_range(
+        &self,
+        dimension: usize,
+        group: usize,
+    ) -> crate::Result<Option<Range<usize>>> {
+        let packed = self.group(dimension, group)?;
+        if packed.bytes.is_empty() {
+            return Ok(None);
+        }
+        let base = self.rows.as_slice().as_ptr() as usize;
+        let start = (packed.bytes.as_ptr() as usize)
+            .checked_sub(base)
+            .ok_or_else(|| crate::Error::Internal("BMP grid pointer underflow".into()))?;
+        Ok(Some(start..start + packed.bytes.len()))
+    }
+
+    /// Coalesce nearby row ranges and issue bounded `MADV_WILLNEED` hints.
+    #[cfg(feature = "native")]
+    pub(crate) fn prefetch_ranges(&self, ranges: &mut Vec<Range<usize>>) -> (usize, usize) {
+        if ranges.is_empty() {
+            return (0, 0);
+        }
+        const PAGE_NEAR_BYTES: usize = 4096;
+        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        let mut advised_bytes = 0usize;
+        let mut calls = 0usize;
+        let mut current = ranges[0].clone();
+        for range in &ranges[1..] {
+            if range.start <= current.end.saturating_add(PAGE_NEAR_BYTES) {
+                current.end = current.end.max(range.end);
+                continue;
+            }
+            advised_bytes = advised_bytes.saturating_add(current.end - current.start);
+            calls += 1;
+            self.rows
+                .madvise_range(current.clone(), libc::MADV_WILLNEED);
+            current = range.clone();
+        }
+        advised_bytes = advised_bytes.saturating_add(current.end - current.start);
+        calls += 1;
+        self.rows.madvise_range(current, libc::MADV_WILLNEED);
+        ranges.clear();
+        (advised_bytes, calls)
     }
 
     /// Visit every group in one row using a single sequential metadata pass.

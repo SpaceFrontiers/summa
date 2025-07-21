@@ -123,13 +123,10 @@ pub enum QueryWeighting {
 
 /// Query-time configuration for sparse vectors
 ///
-/// Research-validated query optimization strategies:
-/// - **weight_threshold (0.01-0.05)**: Drop query dimensions with weight below threshold
-///   - Filters low-IDF tokens that add latency without improving relevance
-/// - **max_query_dims (10-20)**: Process only top-k dimensions by weight
-///   - 30-50% latency reduction with <2% nDCG loss (Qiao et al., 2023)
-/// - **heap_factor (0.8)**: Skip blocks with low max score contribution
-///   - ~20% speedup with minor recall loss (SEISMIC-style)
+/// Quality-sensitive query optimization knobs. Weight filtering, dimension
+/// caps, fractional pruning, finite LSP gamma, and heap factors below 1.0 can
+/// all change the candidate set. They are disabled by default and should be
+/// tuned against representative Recall@K or relevance judgments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseQueryConfig {
     /// HuggingFace tokenizer path/name for query-time tokenization
@@ -142,10 +139,8 @@ pub struct SparseQueryConfig {
     /// Heap factor for approximate search (SEISMIC-style optimization)
     /// A block is skipped if its max possible score < heap_factor * threshold
     ///
-    /// Research recommendation:
     /// - 1.0 = exact search (default)
-    /// - 0.8 = approximate, ~20% faster with minor recall loss (RECOMMENDED for production)
-    /// - 0.5 = very approximate, much faster but higher recall loss
+    /// - values below 1.0 = increasingly aggressive block pruning
     #[serde(default = "default_heap_factor")]
     pub heap_factor: f32,
     /// Minimum weight for query dimensions (query-time pruning)
@@ -153,17 +148,14 @@ pub struct SparseQueryConfig {
     /// Useful for filtering low-IDF tokens that add latency without improving relevance.
     ///
     /// - 0.0 = no filtering (default)
-    /// - 0.01-0.05 = recommended for SPLADE/learned sparse models
+    /// - positive values drop dimensions and require quality validation
     #[serde(default)]
     pub weight_threshold: f32,
     /// Maximum number of query dimensions to process (query pruning)
     /// Processes only the top-k dimensions by weight
     ///
-    /// Research recommendation (Multiple papers 2022-2024):
     /// - None = process all dimensions (default, exact)
-    /// - Some(10-20) = process top 10-20 dimensions only (RECOMMENDED for SPLADE)
-    ///   - 30-50% latency reduction
-    ///   - <2% nDCG@10 loss
+    /// - Some(k) = process only the top-k dimensions by absolute weight
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_query_dims: Option<usize>,
     /// Fraction of query dimensions to keep (0.0-1.0), same semantics as
@@ -206,11 +198,12 @@ impl Default for SparseQueryConfig {
 
 /// Configuration for sparse vector storage
 ///
-/// Research-validated optimizations for learned sparse retrieval (SPLADE, uniCOIL, etc.):
-/// - **Weight threshold (0.01-0.05)**: Removes ~30-50% of postings with minimal nDCG impact
-/// - **Posting list pruning (0.1)**: Keeps top 10% per dimension, 50-70% index reduction, <1% nDCG loss
-/// - **Query pruning (top 10-20 dims)**: 30-50% latency reduction, <2% nDCG loss
-/// - **UInt8 quantization**: 4x compression, 1-2% nDCG loss (optimal trade-off)
+/// Configuration knobs for learned sparse retrieval (SPLADE, uniCOIL, etc.).
+///
+/// Destructive posting-list and query-dimension pruning are opt-in. Their
+/// quality impact is corpus/model dependent and must be established with
+/// Recall@K or relevance judgments; a fixed retained fraction is not a safe
+/// production default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseVectorConfig {
     /// Index format: MaxScore (DAAT) or BMP (BAAT)
@@ -222,19 +215,16 @@ pub struct SparseVectorConfig {
     pub weight_quantization: WeightQuantization,
     /// Minimum weight threshold - weights below this value are not indexed
     ///
-    /// Research recommendation (Guo et al., 2022; SPLADE v2):
-    /// - 0.01-0.05 for SPLADE models removes ~30-50% of postings
-    /// - Minimal impact on nDCG@10 (<1% loss)
-    /// - Major reduction in index size and query latency
+    /// Positive values reduce posting count but are model/corpus dependent.
+    /// Benchmark retrieval quality before choosing a production threshold.
     #[serde(default)]
     pub weight_threshold: f32,
     /// Document-side mass cropping: keep the top-|weight| entries covering
     /// this fraction of a sparse vector's total |weight| mass; the excessive
     /// tail is dropped at indexing time.
     ///
-    /// SPLADE-style vectors concentrate importance in a few head terms; the
-    /// long tail inflates the index and query cost with little relevance
-    /// signal. 0.9-0.95 typically drops 20-40% of postings with <1% nDCG loss.
+    /// SPLADE-style vectors can concentrate importance in a few head terms,
+    /// but the relevance carried by the tail is model/corpus dependent.
     ///
     /// - None or >= 1.0 = keep all entries (default)
     /// - Applied after `weight_threshold`; vectors with <= `min_terms`
@@ -267,12 +257,12 @@ pub struct SparseVectorConfig {
     /// Static pruning: fraction of postings to keep per inverted list (SEISMIC-style)
     /// Lists are sorted by weight descending and truncated to top fraction.
     ///
-    /// Research recommendation (SPLADE v2, Formal et al., 2021):
-    /// - None = keep all postings (default, exact)
-    /// - Some(0.1) = keep top 10% of postings per dimension
-    ///   - 50-70% index size reduction
-    ///   - <1% nDCG@10 loss
-    ///   - Exploits "concentration of importance" in learned representations
+    /// - None = keep all postings (default)
+    /// - Some(0.1) = keep only the top 10% of each dimension's postings
+    ///
+    /// A fraction is deliberately not enabled by the SPLADE presets. Per-list
+    /// frequency and score distributions vary widely, and keeping one posting
+    /// from a list of 4-10 entries can destroy candidate recall.
     ///
     /// Applied only during initial segment build, not during merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,19 +343,12 @@ impl SparseVectorConfig {
     pub const DEFAULT_BMP_BLOCK_SIZE: u32 = 32;
     pub const DEFAULT_BMP_GRID_BITS: u8 = 4;
 
-    /// SPLADE-optimized config with research-validated defaults
+    /// Recall-preserving SPLADE storage preset
     ///
     /// Optimized for SPLADE, uniCOIL, and similar learned sparse retrieval models.
-    /// Based on research findings from:
-    /// - Pati (2025): UInt8 quantization = 4x compression, 1-2% nDCG loss
-    /// - Formal et al. (2021): SPLADE v2 posting list pruning
-    /// - Qiao et al. (2023): Query dimension pruning and approximate search
-    /// - Guo et al. (2022): Weight thresholding for efficiency
-    ///
-    /// Expected performance vs. full precision baseline:
-    /// - Index size: ~15-25% of original (combined effect of all optimizations)
-    /// - Query latency: 40-60% faster
-    /// - Effectiveness: 2-4% nDCG@10 loss (typically acceptable for production)
+    /// UInt8 impacts and a small weight threshold reduce storage. Destructive
+    /// per-list, query-dimension, and heap pruning remain disabled; enable them
+    /// only after a representative quality benchmark.
     ///
     /// Vocabulary: ~30K dimensions (fits in u16)
     pub fn splade() -> Self {
@@ -378,14 +361,14 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
-            pruning: Some(0.1), // Keep top 10% per dimension
+            pruning: None,
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
                 weighting: QueryWeighting::One,
-                heap_factor: 0.8,         // 20% faster approximate search
-                weight_threshold: 0.01,   // Drop low-IDF query tokens
-                max_query_dims: Some(20), // Process top 20 query dimensions
-                pruning: Some(0.1),       // Keep top 10% of query dims
+                heap_factor: 1.0,
+                weight_threshold: 0.01,
+                max_query_dims: None,
+                pruning: None,
                 min_query_dims: 4,
                 lsp_gamma: None,
             }),
@@ -412,14 +395,14 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
-            pruning: Some(0.1),
+            pruning: None,
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
                 weighting: QueryWeighting::One,
                 heap_factor: 1.0,
                 weight_threshold: 0.01,
                 max_query_dims: None,
-                pruning: Some(0.33),
+                pruning: None,
                 min_query_dims: 4,
                 lsp_gamma: None,
             }),

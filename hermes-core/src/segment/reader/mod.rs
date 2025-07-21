@@ -1088,22 +1088,27 @@ impl SegmentReader {
         dir: &D,
         segment_id: SegmentId,
         schema: Arc<Schema>,
-        cache_blocks: usize,
+        term_cache_blocks: usize,
     ) -> Result<Self> {
-        Self::open_with_cache_blocks(dir, segment_id, schema, cache_blocks, cache_blocks).await
+        Self::open_with_store_cache(
+            dir,
+            segment_id,
+            schema,
+            term_cache_blocks,
+            dir as *const D as usize,
+            Arc::new(super::SharedStoreCache::new(0)),
+        )
+        .await
     }
 
-    /// Open a segment with independent term-dictionary and document-store caches.
-    ///
-    /// [`Self::open`] keeps the historical single-capacity API for standalone
-    /// callers. Native indexes use this method so `IndexConfig::store_cache_blocks`
-    /// is not silently replaced by the (usually much larger) term cache capacity.
-    pub async fn open_with_cache_blocks<D: Directory>(
+    /// Open a search segment against the process-wide document-store cache.
+    pub(crate) async fn open_with_store_cache<D: Directory>(
         dir: &D,
         segment_id: SegmentId,
         schema: Arc<Schema>,
         term_cache_blocks: usize,
-        store_cache_blocks: usize,
+        store_cache_directory_namespace: usize,
+        store_cache: Arc<super::SharedStoreCache>,
     ) -> Result<Self> {
         let files = SegmentFiles::new(segment_id.0);
 
@@ -1122,7 +1127,13 @@ impl SegmentReader {
 
         // Open store with lazy loading
         let store_handle = dir.open_lazy(&files.store).await?;
-        let store = AsyncStoreReader::open(store_handle, store_cache_blocks).await?;
+        let store = AsyncStoreReader::open(
+            store_handle,
+            store_cache_directory_namespace,
+            segment_id.0,
+            store_cache,
+        )
+        .await?;
 
         // Load dense vector indexes from unified .vectors file
         let vectors_data = loader::load_vectors_file(dir, &files, &schema, meta.num_docs).await?;
@@ -1221,8 +1232,8 @@ impl SegmentReader {
     /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
     ///
     /// Priority: ANN run directories → BMP block-offset tables → sparse skip
-    /// sections → doc-id maps → BMP superblock grids. Bulk data (ANN codes,
-    /// 4-bit grids, block data, raw vectors) is never pinned. Fail-loud: budget
+    /// sections → doc-id maps → BMP E offsets + coarse H. Bulk data (ANN codes,
+    /// D/E grid payloads, block data, raw vectors) is never pinned. Fail-loud: budget
     /// exhaustion and mlock failures are
     /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
     /// pinned_metadata_bytes}`.
@@ -1256,9 +1267,9 @@ impl SegmentReader {
         for bmp in self.bmp_indexes.values_mut() {
             bmp.pin_doc_maps(policy.mode, &mut remaining, &mut sparse_report);
         }
-        // Priority 5: BMP superblock grids
+        // Priority 5: BMP E offsets and coarse H
         for bmp in self.bmp_indexes.values_mut() {
-            bmp.pin_sb_grid(policy.mode, &mut remaining, &mut sparse_report);
+            bmp.pin_query_hierarchy(policy.mode, &mut remaining, &mut sparse_report);
         }
 
         let report = PinReport {

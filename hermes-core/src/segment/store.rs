@@ -10,6 +10,7 @@
 //! Reader only loads index into memory, blocks are loaded on-demand.
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::io::{self, Write};
@@ -35,7 +36,7 @@ pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
 
 /// Hard safety bounds for individual on-disk store objects. Writers normally
 /// emit ~16 KiB blocks and 4 KiB dictionaries; these generous limits preserve
-/// large legacy documents while bounding corrupt compressed frames.
+/// unusually large stored documents while bounding corrupt compressed frames.
 const MAX_STORE_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STORE_DICTIONARY_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -493,8 +494,10 @@ pub struct AsyncStoreReader {
     num_docs: u32,
     /// Optional compression dictionary
     dict: Option<CompressionDict>,
-    /// Block cache
-    cache: RwLock<StoreBlockCache>,
+    /// Process-wide byte-bounded block cache.
+    cache: Arc<SharedStoreCache>,
+    /// Stable directory + segment namespace for shared-cache keys.
+    cache_namespace: StoreCacheNamespace,
 }
 
 /// Decompressed block with pre-built doc offset table.
@@ -603,68 +606,200 @@ impl CachedBlock {
     }
 }
 
-/// Bounded block cache with a contention-free read path.
-///
-/// Normal reads use [`StoreBlockCache::peek`] under a shared lock and do not
-/// promote hits, so normal eviction order is insertion order. `get()` promotes
-/// only on the exclusive race-resolution path.
-struct StoreBlockCache {
-    blocks: FxHashMap<DocId, Arc<CachedBlock>>,
-    lru_order: std::collections::VecDeque<DocId>,
-    max_blocks: usize,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct StoreCacheNamespace {
+    directory: usize,
+    segment: u128,
 }
 
-impl StoreBlockCache {
-    fn new(max_blocks: usize) -> Self {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct StoreCacheKey {
+    namespace: StoreCacheNamespace,
+    first_doc_id: DocId,
+}
+
+struct SharedStoreCacheState {
+    blocks: LruCache<StoreCacheKey, Arc<CachedBlock>>,
+    retained_bytes: usize,
+    namespace_bytes: FxHashMap<StoreCacheNamespace, usize>,
+    namespace_readers: FxHashMap<StoreCacheNamespace, usize>,
+}
+
+/// Process-wide byte-bounded cache for decompressed document-store blocks.
+///
+/// The old cache bounded each segment by an entry count. One large stored
+/// body can make a block close to `MAX_STORE_BLOCK_BYTES`, so 32 entries per
+/// segment retained up to 2 GiB and multiplied that by segment fan-out. This
+/// cache has one hard byte ceiling across all indexes using the same policy.
+/// Hits take a shared read lock; eviction is insertion-ordered rather than
+/// serializing every hit solely for exact LRU promotion.
+pub(crate) struct SharedStoreCache {
+    state: RwLock<SharedStoreCacheState>,
+    max_bytes: usize,
+    /// Very large one-document blocks have almost no spatial reuse and can
+    /// evict thousands of ordinary result blocks. The OS compressed-file page
+    /// cache remains available when decompressed admission is bypassed.
+    max_entry_bytes: usize,
+}
+
+impl std::fmt::Debug for SharedStoreCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedStoreCache")
+            .field("max_bytes", &self.max_bytes)
+            .field("max_entry_bytes", &self.max_entry_bytes)
+            .field("retained_bytes", &self.total_bytes())
+            .finish()
+    }
+}
+
+impl SharedStoreCache {
+    const MAX_ADMITTED_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self::with_limits(max_bytes, max_bytes.min(Self::MAX_ADMITTED_ENTRY_BYTES))
+    }
+
+    fn with_limits(max_bytes: usize, max_entry_bytes: usize) -> Self {
         Self {
-            blocks: FxHashMap::default(),
-            lru_order: std::collections::VecDeque::with_capacity(max_blocks),
-            max_blocks,
+            state: RwLock::new(SharedStoreCacheState {
+                blocks: LruCache::unbounded(),
+                retained_bytes: 0,
+                namespace_bytes: FxHashMap::default(),
+                namespace_readers: FxHashMap::default(),
+            }),
+            max_bytes,
+            max_entry_bytes: max_entry_bytes.min(max_bytes),
         }
     }
 
-    /// Check cache without LRU promotion (safe for read-lock fast path)
-    fn peek(&self, first_doc_id: DocId) -> Option<Arc<CachedBlock>> {
-        self.blocks.get(&first_doc_id).map(Arc::clone)
-    }
-
-    fn get(&mut self, first_doc_id: DocId) -> Option<Arc<CachedBlock>> {
-        let block = self.blocks.get(&first_doc_id).map(Arc::clone)?;
-        self.promote(first_doc_id);
-        Some(block)
-    }
-
-    fn insert(&mut self, first_doc_id: DocId, block: Arc<CachedBlock>) {
-        if self.max_blocks == 0 {
+    fn register(&self, namespace: StoreCacheNamespace) {
+        if self.max_bytes == 0 {
             return;
         }
-        if self.blocks.contains_key(&first_doc_id) {
-            self.promote(first_doc_id);
+        let mut state = self.state.write();
+        *state.namespace_readers.entry(namespace).or_default() += 1;
+    }
+
+    fn unregister(&self, namespace: StoreCacheNamespace) {
+        if self.max_bytes == 0 {
             return;
         }
-        while self.blocks.len() >= self.max_blocks {
-            if let Some(evict) = self.lru_order.pop_front() {
-                self.blocks.remove(&evict);
-            } else {
-                break;
+        let mut state = self.state.write();
+        let Some(readers) = state.namespace_readers.get_mut(&namespace) else {
+            return;
+        };
+        *readers -= 1;
+        if *readers > 0 {
+            return;
+        }
+        state.namespace_readers.remove(&namespace);
+
+        // A merged-away segment will never hit these entries again. Remove
+        // them immediately instead of waiting for unrelated searches to
+        // create enough pressure for ordinary LRU eviction.
+        let keys: Vec<_> = state
+            .blocks
+            .iter()
+            .filter_map(|(key, _)| (key.namespace == namespace).then_some(*key))
+            .collect();
+        for key in keys {
+            if let Some(block) = state.blocks.pop(&key) {
+                state.retained_bytes = state.retained_bytes.saturating_sub(block.retained_bytes());
             }
         }
-        self.blocks.insert(first_doc_id, block);
-        self.lru_order.push_back(first_doc_id);
+        state.namespace_bytes.remove(&namespace);
     }
 
-    fn promote(&mut self, key: DocId) {
-        if let Some(pos) = self.lru_order.iter().position(|&k| k == key) {
-            self.lru_order.remove(pos);
-            self.lru_order.push_back(key);
+    fn get(&self, key: StoreCacheKey) -> Option<Arc<CachedBlock>> {
+        // Do not serialize all process-wide hits merely to update exact LRU
+        // order. Concurrent readers use a shared lock; insertion and
+        // decompression-race resolution still promote entries.
+        self.state.read().blocks.peek(&key).map(Arc::clone)
+    }
+
+    /// Admit one block and return the canonical cached allocation if another
+    /// request won the decompression race.
+    fn insert(&self, key: StoreCacheKey, block: Arc<CachedBlock>) -> Arc<CachedBlock> {
+        let bytes = block.retained_bytes();
+        if self.max_bytes == 0 || bytes == 0 || bytes > self.max_entry_bytes {
+            return block;
         }
+
+        let mut state = self.state.write();
+        if let Some(existing) = state.blocks.get(&key) {
+            return Arc::clone(existing);
+        }
+
+        state.retained_bytes = state.retained_bytes.saturating_add(bytes);
+        *state.namespace_bytes.entry(key.namespace).or_default() = state
+            .namespace_bytes
+            .get(&key.namespace)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(bytes);
+        state.blocks.put(key, Arc::clone(&block));
+
+        while state.retained_bytes > self.max_bytes {
+            let Some((evicted_key, evicted)) = state.blocks.pop_lru() else {
+                state.retained_bytes = 0;
+                state.namespace_bytes.clear();
+                break;
+            };
+            let evicted_bytes = evicted.retained_bytes();
+            state.retained_bytes = state.retained_bytes.saturating_sub(evicted_bytes);
+            if let Some(namespace_bytes) = state.namespace_bytes.get_mut(&evicted_key.namespace) {
+                *namespace_bytes = namespace_bytes.saturating_sub(evicted_bytes);
+                if *namespace_bytes == 0 {
+                    state.namespace_bytes.remove(&evicted_key.namespace);
+                }
+            }
+        }
+        block
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.state.read().retained_bytes
+    }
+
+    pub(crate) fn total_blocks(&self) -> usize {
+        self.state.read().blocks.len()
+    }
+
+    fn namespace_bytes(&self, namespace: StoreCacheNamespace) -> usize {
+        self.state
+            .read()
+            .namespace_bytes
+            .get(&namespace)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn namespace_blocks(&self, namespace: StoreCacheNamespace) -> usize {
+        self.state
+            .read()
+            .blocks
+            .iter()
+            .filter(|(key, _)| key.namespace == namespace)
+            .count()
+    }
+}
+
+impl Drop for AsyncStoreReader {
+    fn drop(&mut self) {
+        self.cache.unregister(self.cache_namespace);
     }
 }
 
 impl AsyncStoreReader {
     /// Open a document store from FileHandle
     /// Only loads footer and index into memory, data blocks are fetched on-demand
-    pub async fn open(file_handle: FileHandle, cache_blocks: usize) -> io::Result<Self> {
+    pub(crate) async fn open(
+        file_handle: FileHandle,
+        directory_namespace: usize,
+        segment_namespace: u128,
+        cache: Arc<SharedStoreCache>,
+    ) -> io::Result<Self> {
         let file_len = file_handle.len();
         // Footer: data_end(8) + dict_offset(8) + num_docs(4) + has_dict(4) + version(4) + magic(4) = 32 bytes
         if file_len < 32 {
@@ -837,12 +972,18 @@ impl AsyncStoreReader {
         // Create lazy slice for data portion only
         let data_slice = file_handle.slice(0..data_end_offset);
 
+        let cache_namespace = StoreCacheNamespace {
+            directory: directory_namespace,
+            segment: segment_namespace,
+        };
+        cache.register(cache_namespace);
         Ok(Self {
             data_slice,
             index,
             num_docs,
             dict,
-            cache: RwLock::new(StoreBlockCache::new(cache_blocks)),
+            cache,
+            cache_namespace,
         })
     }
 
@@ -853,17 +994,12 @@ impl AsyncStoreReader {
 
     /// Number of blocks currently in the cache
     pub fn cached_blocks(&self) -> usize {
-        self.cache.read().blocks.len()
+        self.cache.namespace_blocks(self.cache_namespace)
     }
 
     /// Heap bytes retained by decompressed blocks and their document offsets.
     pub fn cached_bytes(&self) -> usize {
-        self.cache
-            .read()
-            .blocks
-            .values()
-            .map(|block| block.retained_bytes())
-            .sum()
+        self.cache.namespace_bytes(self.cache_namespace)
     }
 
     /// Get a document by doc_id (async - may load block)
@@ -927,18 +1063,12 @@ impl AsyncStoreReader {
     }
 
     async fn load_block(&self, entry: &StoreBlockIndex) -> io::Result<Arc<CachedBlock>> {
-        // Fast path: read lock to check cache (allows concurrent readers)
-        {
-            let cache = self.cache.read();
-            if let Some(block) = cache.peek(entry.first_doc_id) {
-                return Ok(block);
-            }
-        }
-        // Resolve a race where another reader inserted after our shared probe.
-        {
-            if let Some(block) = self.cache.write().get(entry.first_doc_id) {
-                return Ok(block);
-            }
+        let key = StoreCacheKey {
+            namespace: self.cache_namespace,
+            first_doc_id: entry.first_doc_id,
+        };
+        if let Some(block) = self.cache.get(key) {
+            return Ok(block);
         }
 
         // Load from FileSlice
@@ -961,15 +1091,7 @@ impl AsyncStoreReader {
 
         // Build offset table for O(1) doc lookup within the block
         let cached = CachedBlock::build(decompressed, entry.num_docs)?;
-        let block = Arc::new(cached);
-
-        // Insert into cache
-        {
-            let mut cache = self.cache.write();
-            cache.insert(entry.first_doc_id, Arc::clone(&block));
-        }
-
-        Ok(block)
+        Ok(self.cache.insert(key, Arc::new(cached)))
     }
 }
 
@@ -1352,6 +1474,10 @@ impl AsyncStoreReader {
 mod tests {
     use super::*;
 
+    fn cached_test_block(byte: u8) -> Arc<CachedBlock> {
+        Arc::new(CachedBlock::build(vec![4, 0, 0, 0, byte, byte, byte, byte], 1).unwrap())
+    }
+
     #[test]
     fn cached_block_rejects_truncated_and_trailing_documents() {
         assert!(CachedBlock::build(vec![8, 0, 0, 0, 1], 1).is_err());
@@ -1366,5 +1492,80 @@ mod tests {
 
         let truncated_sparse = [1, 0, 0, 0, 5, 2, 0, 0, 0, 1, 0, 0, 0];
         assert!(deserialize_document(&truncated_sparse, &schema).is_err());
+    }
+
+    #[test]
+    fn shared_store_cache_is_byte_bounded_and_read_concurrent() {
+        let block_bytes = cached_test_block(1).retained_bytes();
+        let cache = SharedStoreCache::with_limits(block_bytes * 2, block_bytes);
+        let key = |first_doc_id| StoreCacheKey {
+            namespace: StoreCacheNamespace {
+                directory: 1,
+                segment: 7,
+            },
+            first_doc_id,
+        };
+
+        cache.insert(key(1), cached_test_block(1));
+        cache.insert(key(2), cached_test_block(2));
+        assert!(cache.get(key(1)).is_some());
+        cache.insert(key(3), cached_test_block(3));
+
+        assert!(cache.get(key(1)).is_none());
+        assert!(cache.get(key(2)).is_some());
+        assert!(cache.get(key(3)).is_some());
+        assert!(cache.total_bytes() <= block_bytes * 2);
+    }
+
+    #[test]
+    fn shared_store_cache_bypasses_oversized_entries() {
+        let block = cached_test_block(1);
+        let cache = SharedStoreCache::with_limits(1024, block.retained_bytes() - 1);
+        let key = StoreCacheKey {
+            namespace: StoreCacheNamespace {
+                directory: 1,
+                segment: 9,
+            },
+            first_doc_id: 0,
+        };
+        cache.insert(key, block);
+        assert_eq!(cache.total_bytes(), 0);
+        assert!(cache.get(key).is_none());
+    }
+
+    #[test]
+    fn shared_store_cache_purges_closed_segment_namespace() {
+        let block = cached_test_block(1);
+        let cache = SharedStoreCache::with_limits(1024, 1024);
+        let key = StoreCacheKey {
+            namespace: StoreCacheNamespace {
+                directory: 1,
+                segment: 11,
+            },
+            first_doc_id: 0,
+        };
+        cache.register(key.namespace);
+        cache.insert(key, block);
+        assert!(cache.total_bytes() > 0);
+        cache.unregister(key.namespace);
+        assert_eq!(cache.total_bytes(), 0);
+        assert!(cache.get(key).is_none());
+    }
+
+    #[test]
+    fn shared_store_cache_isolates_equal_segment_ids_across_directories() {
+        let cache = SharedStoreCache::with_limits(1024, 1024);
+        let key = |directory| StoreCacheKey {
+            namespace: StoreCacheNamespace {
+                directory,
+                segment: 42,
+            },
+            first_doc_id: 0,
+        };
+        let left = cache.insert(key(1), cached_test_block(1));
+        let right = cache.insert(key(2), cached_test_block(2));
+
+        assert!(!Arc::ptr_eq(&left, &right));
+        assert_eq!(cache.total_blocks(), 2);
     }
 }

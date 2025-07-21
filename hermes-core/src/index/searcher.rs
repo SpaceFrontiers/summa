@@ -22,7 +22,9 @@ use crate::segment::{SegmentSnapshot, SegmentTracker};
 #[derive(Clone)]
 pub(crate) struct SearcherResources {
     pub(crate) term_cache_blocks: usize,
-    pub(crate) store_cache_blocks: usize,
+    pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
+    pub(crate) bmp_io_gate: Arc<super::BmpIoGate>,
+    pub(crate) bmp_io_concurrency: usize,
     #[cfg(feature = "sync")]
     pub(crate) search_pool: Arc<rayon::ThreadPool>,
 }
@@ -31,12 +33,18 @@ pub(crate) struct SearcherResources {
 impl SearcherResources {
     pub(crate) fn new(
         term_cache_blocks: usize,
-        store_cache_blocks: usize,
+        store_cache_budget_bytes: usize,
         num_threads: usize,
+        bmp_io_concurrency: usize,
     ) -> Result<Self> {
         if num_threads == 0 {
             return Err(crate::Error::Internal(
                 "IndexConfig.num_threads must be greater than zero".into(),
+            ));
+        }
+        if bmp_io_concurrency == 0 {
+            return Err(crate::Error::Internal(
+                "IndexConfig.bmp_io_concurrency must be greater than zero".into(),
             ));
         }
 
@@ -45,7 +53,9 @@ impl SearcherResources {
 
         Ok(Self {
             term_cache_blocks,
-            store_cache_blocks,
+            store_cache: super::shared_store_cache(store_cache_budget_bytes),
+            bmp_io_gate: super::shared_bmp_io_gate(bmp_io_concurrency),
+            bmp_io_concurrency,
             #[cfg(feature = "sync")]
             search_pool,
         })
@@ -81,6 +91,11 @@ pub struct Searcher<D: Directory + 'static> {
     /// Bounded process-wide-by-width pool for the complete nested search tree.
     #[cfg(feature = "sync")]
     search_pool: Arc<rayon::ThreadPool>,
+    /// Shared random-I/O gate and per-query wave width for BMP.
+    #[cfg(feature = "native")]
+    bmp_io_gate: Arc<super::BmpIoGate>,
+    #[cfg(feature = "native")]
+    bmp_io_concurrency: usize,
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -94,31 +109,20 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        Self::open_with_cache_blocks(
-            directory,
-            schema,
-            segment_ids,
-            term_cache_blocks,
-            term_cache_blocks,
-        )
-        .await
-    }
-
-    /// Create a read-only searcher with independent cache capacities.
-    pub async fn open_with_cache_blocks(
-        directory: Arc<D>,
-        schema: Arc<Schema>,
-        segment_ids: &[String],
-        term_cache_blocks: usize,
-        store_cache_blocks: usize,
-    ) -> Result<Self> {
+        const STANDALONE_STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+        #[cfg(feature = "native")]
+        let store_cache = super::shared_store_cache(STANDALONE_STORE_CACHE_BYTES);
+        #[cfg(not(feature = "native"))]
+        let store_cache = Arc::new(crate::segment::SharedStoreCache::new(
+            STANDALONE_STORE_CACHE_BYTES,
+        ));
         Self::create(
             directory,
             schema,
             segment_ids,
             Arc::new(TrainedVectorStructures::default()),
             term_cache_blocks,
-            store_cache_blocks,
+            store_cache,
         )
         .await
     }
@@ -138,7 +142,7 @@ impl<D: Directory + 'static> Searcher<D> {
             snapshot.segment_ids(),
             &trained_vectors,
             resources.term_cache_blocks,
-            resources.store_cache_blocks,
+            Arc::clone(&resources.store_cache),
             &[],
         )
         .await?;
@@ -156,6 +160,8 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool: resources.search_pool,
+            bmp_io_gate: resources.bmp_io_gate,
+            bmp_io_concurrency: resources.bmp_io_concurrency,
         })
     }
 
@@ -177,7 +183,7 @@ impl<D: Directory + 'static> Searcher<D> {
             snapshot.segment_ids(),
             &trained_vectors,
             resources.term_cache_blocks,
-            resources.store_cache_blocks,
+            Arc::clone(&resources.store_cache),
             existing_segments,
         )
         .await?;
@@ -195,6 +201,8 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool: resources.search_pool,
+            bmp_io_gate: resources.bmp_io_gate,
+            bmp_io_concurrency: resources.bmp_io_concurrency,
         })
     }
 
@@ -205,7 +213,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_vectors: Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
-        store_cache_blocks: usize,
+        store_cache: Arc<crate::segment::SharedStoreCache>,
     ) -> Result<Self> {
         let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
             &directory,
@@ -213,7 +221,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             &trained_vectors,
             term_cache_blocks,
-            store_cache_blocks,
+            store_cache,
             &[],
         )
         .await?;
@@ -226,6 +234,10 @@ impl<D: Directory + 'static> Searcher<D> {
 
         #[cfg(feature = "sync")]
         let search_pool = super::shared_search_pool(crate::default_search_threads())?;
+        #[cfg(feature = "native")]
+        let bmp_io_concurrency = 4;
+        #[cfg(feature = "native")]
+        let bmp_io_gate = super::shared_bmp_io_gate(bmp_io_concurrency);
 
         let _ = directory; // suppress unused warning on wasm
         Ok(Self {
@@ -242,6 +254,10 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool,
+            #[cfg(feature = "native")]
+            bmp_io_gate,
+            #[cfg(feature = "native")]
+            bmp_io_concurrency,
         })
     }
 
@@ -252,7 +268,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
-        store_cache_blocks: usize,
+        store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
     ) -> Result<(
         Vec<Arc<SegmentReader>>,
@@ -267,7 +283,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             trained_vectors,
             term_cache_blocks,
-            store_cache_blocks,
+            store_cache,
             existing_segments,
         )
         .await?;
@@ -292,7 +308,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
-        store_cache_blocks: usize,
+        store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
     ) -> Result<Vec<Arc<SegmentReader>>> {
         // Build lookup from existing segment readers for reuse
@@ -334,20 +350,27 @@ impl<D: Directory + 'static> Searcher<D> {
             );
         }
 
+        // Include the live directory allocation in document-cache keys.
+        // Segment IDs can legitimately repeat when two independent indexes
+        // are copied/opened in the same process.
+        let store_cache_directory_namespace = Arc::as_ptr(directory) as usize;
+
         // Load only NEW segments in parallel
         let futures: Vec<_> = to_load
             .iter()
             .map(|(_, segment_id)| {
                 let dir = Arc::clone(directory);
                 let sch = Arc::clone(schema);
+                let store_cache = Arc::clone(&store_cache);
                 let sid = *segment_id;
                 async move {
-                    SegmentReader::open_with_cache_blocks(
+                    SegmentReader::open_with_store_cache(
                         dir.as_ref(),
                         sid,
                         sch,
                         term_cache_blocks,
-                        store_cache_blocks,
+                        store_cache_directory_namespace,
+                        store_cache,
                     )
                     .await
                 }
@@ -429,13 +452,16 @@ impl<D: Directory + 'static> Searcher<D> {
         let rss_bytes = process_rss_bytes();
         log::info!(
             "[searcher] loaded {} segments: total_docs={}, heap_estimate={}, \
-             file_backed={}, pinned_metadata={} of {} eligible, process_rss={}",
+             file_backed={}, pinned_metadata={} of {} eligible, \
+             shared_store_cache={} in {} blocks, process_rss={}",
             segments.len(),
             total_docs,
             crate::format_bytes(total_heap as u64),
             crate::format_bytes(total_file_backed),
             crate::format_bytes(total_pinned),
             crate::format_bytes(total_pin_intended),
+            crate::format_bytes(store_cache.total_bytes() as u64),
+            store_cache.total_blocks(),
             crate::format_bytes(rss_bytes),
         );
 
@@ -607,6 +633,7 @@ impl<D: Directory + 'static> Searcher<D> {
         retrieval_depth: usize,
         parallel: bool,
     ) -> Result<Vec<Option<std::sync::Arc<crate::query::bmp::LspSegmentPlan>>>> {
+        let total_start = std::time::Instant::now();
         let empty = || vec![None; self.segments.len()];
         if retrieval_depth == 0 {
             return Ok(empty());
@@ -614,7 +641,7 @@ impl<D: Directory + 'static> Searcher<D> {
         let crate::query::QueryDecomposition::SparseTerms(infos) = query.decompose() else {
             return Ok(empty());
         };
-        let Some(first) = infos.first() else {
+        let Some(&first) = infos.first() else {
             return Ok(empty());
         };
         if infos
@@ -624,59 +651,92 @@ impl<D: Directory + 'static> Searcher<D> {
             return Ok(empty());
         }
         let field = first.field;
-        let (total_superblocks, planning_depth) = self
+        let field_label = self.schema.get_field_name(field).unwrap_or("?");
+        let (total_superblocks, total_coarse_groups, planning_depth) = self
             .segments
             .iter()
             .filter_map(|segment| segment.bmp_index(field))
-            .fold((0usize, retrieval_depth), |(total, depth), bmp| {
-                (
-                    total.saturating_add(bmp.num_superblocks as usize),
-                    depth.max(crate::query::bmp_executor_limit(
-                        retrieval_depth,
-                        first.over_fetch_factor,
-                        bmp,
-                    )),
-                )
+            .fold(
+                (0usize, 0usize, retrieval_depth),
+                |(total, coarse, depth), bmp| {
+                    (
+                        total.saturating_add(bmp.num_superblocks as usize),
+                        coarse.saturating_add(bmp.num_coarse_groups as usize),
+                        depth.max(crate::query::bmp_executor_limit(
+                            retrieval_depth,
+                            first.over_fetch_factor,
+                            bmp,
+                        )),
+                    )
+                },
+            );
+        let Some(reference_bmp) = self
+            .segments
+            .iter()
+            .find_map(|segment| segment.bmp_index(field))
+        else {
+            return Ok(empty());
+        };
+        if !infos.iter().any(|info| info.candidate) {
+            return Ok(empty());
+        }
+        let prepare_start = std::time::Instant::now();
+        let Some(prepared_query) =
+            crate::query::bmp::prepare_bmp_query_infos(reference_bmp.dims(), &infos)?
+        else {
+            return Ok(empty());
+        };
+        let infos: std::sync::Arc<[crate::query::SparseTermQueryInfo]> = infos.into();
+        let prepared_query = std::sync::Arc::new(prepared_query);
+        let prepare_secs = prepare_start.elapsed().as_secs_f64();
+
+        let local_plans = || {
+            let plan = std::sync::Arc::new(crate::query::bmp::LspSegmentPlan {
+                infos: std::sync::Arc::clone(&infos),
+                prepared_query: std::sync::Arc::clone(&prepared_query),
+                selection: None,
             });
+            self.segments
+                .iter()
+                .map(|segment| {
+                    segment
+                        .bmp_index(field)
+                        .map(|_| std::sync::Arc::clone(&plan))
+                })
+                .collect()
+        };
         let gamma = first
             .lsp_gamma
             .unwrap_or_else(|| crate::query::bmp::recommended_lsp_gamma(planning_depth));
-        if gamma == 0 {
-            return Ok(empty());
-        }
-        if total_superblocks == 0 || gamma >= total_superblocks {
+        if gamma == 0 || gamma >= total_superblocks {
             // A cap covering the whole index is exhaustive. Let each segment
             // compute and traverse its local order once instead of building a
-            // query-global heap and retaining an all-superblock plan.
-            return Ok(empty());
+            // query-global heap and retaining an all-superblock selection.
+            crate::observe::bmp_lsp(
+                self.schema.index_label(),
+                field_label,
+                total_start.elapsed().as_secs_f64(),
+                prepare_secs,
+                0.0,
+                0.0,
+                total_superblocks,
+                gamma,
+                total_coarse_groups,
+                0,
+                0,
+            );
+            return Ok(local_plans());
         }
-        let candidate_terms: Vec<(u32, f32)> = infos
-            .iter()
-            .filter(|info| info.candidate)
-            .map(|info| (info.dim_id, info.weight))
-            .collect();
-        if candidate_terms.is_empty() {
-            return Ok(empty());
-        }
-        let scoring_terms: Vec<(u32, f32)> = infos
-            .iter()
-            .map(|info| (info.dim_id, info.weight))
-            .collect();
+        let hierarchy_scan_start = std::time::Instant::now();
         let prepare = |segment: &std::sync::Arc<crate::segment::SegmentReader>| {
             segment
                 .bmp_index(field)
-                .map(|bmp| {
-                    crate::query::bmp::prepare_lsp_superblock_ubs(
-                        bmp,
-                        &candidate_terms,
-                        &scoring_terms,
-                    )
-                })
+                .map(|bmp| crate::query::bmp::prepare_lsp_coarse_ubs(bmp, &prepared_query))
                 .transpose()
         };
 
         #[cfg(feature = "sync")]
-        let bounds: Vec<Option<Vec<f32>>> = if parallel {
+        let coarse_bounds: Vec<Option<Vec<f32>>> = if parallel {
             use rayon::prelude::*;
             self.search_pool.install(|| {
                 self.segments
@@ -691,39 +751,113 @@ impl<D: Directory + 'static> Searcher<D> {
                 .collect::<Result<Vec<_>>>()?
         };
         #[cfg(not(feature = "sync"))]
-        let bounds: Vec<Option<Vec<f32>>> = {
+        let coarse_bounds: Vec<Option<Vec<f32>>> = {
             let _ = parallel;
             self.segments
                 .iter()
                 .map(prepare)
                 .collect::<Result<Vec<_>>>()?
         };
+        let hierarchy_scan_secs = hierarchy_scan_start.elapsed().as_secs_f64();
 
-        let mut selected = select_global_lsp_superblocks(&bounds, gamma);
-
+        let select_start = std::time::Instant::now();
+        let selection =
+            select_global_lsp_hierarchical(&coarse_bounds, gamma, |segment, group, out| {
+                let bmp = self.segments[segment].bmp_index(field).ok_or_else(|| {
+                    crate::Error::Internal(
+                        "BMP coarse plan references a segment without the sparse field".into(),
+                    )
+                })?;
+                crate::query::bmp::expand_lsp_coarse_group(bmp, &prepared_query, group, out)
+            })?;
         let mut plans = Vec::with_capacity(self.segments.len());
-        for (segment, segment_bounds) in bounds.into_iter().enumerate() {
-            let Some(segment_bounds) = segment_bounds else {
+        for (segment, selected) in selection.selected.into_iter().enumerate() {
+            if self.segments[segment].bmp_index(field).is_none() {
                 plans.push(None);
                 continue;
-            };
-            selected[segment].sort_unstable_by(|&left, &right| {
-                segment_bounds[right as usize]
-                    .total_cmp(&segment_bounds[left as usize])
-                    .then_with(|| left.cmp(&right))
-            });
-            let selected_bounds = selected[segment]
-                .iter()
-                .map(|&superblock| segment_bounds[superblock as usize])
-                .collect();
+            }
+            let (selected_superblocks, selected_bounds): (Vec<_>, Vec<_>) =
+                selected.into_iter().unzip();
             plans.push(Some(std::sync::Arc::new(
                 crate::query::bmp::LspSegmentPlan {
-                    sb_ubs: selected_bounds,
-                    sb_order: std::mem::take(&mut selected[segment]),
+                    infos: std::sync::Arc::clone(&infos),
+                    prepared_query: std::sync::Arc::clone(&prepared_query),
+                    selection: Some(crate::query::bmp::LspSelection {
+                        sb_ubs: selected_bounds,
+                        sb_order: selected_superblocks,
+                    }),
                 },
             )));
         }
+        let select_secs = select_start.elapsed().as_secs_f64();
+        crate::observe::bmp_lsp(
+            self.schema.index_label(),
+            field_label,
+            total_start.elapsed().as_secs_f64(),
+            prepare_secs,
+            hierarchy_scan_secs,
+            select_secs,
+            total_superblocks,
+            gamma,
+            total_coarse_groups,
+            selection.expanded_groups,
+            selection.evaluated_superblocks,
+        );
+        log::debug!(
+            "BMP hierarchical LSP: field={}, coarse_groups={}/{}, E_superblocks={}/{}, gamma={}",
+            field_label,
+            selection.expanded_groups,
+            coarse_bounds
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(Vec::len)
+                .sum::<usize>(),
+            selection.evaluated_superblocks,
+            total_superblocks,
+            gamma,
+        );
         Ok(plans)
+    }
+
+    fn ordered_lsp_segments(
+        &self,
+        plans: &[Option<std::sync::Arc<crate::query::bmp::LspSegmentPlan>>],
+    ) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.segments.len()).collect();
+        order.sort_unstable_by(|&left, &right| {
+            let left_priority = plans[left]
+                .as_ref()
+                .map_or(f32::NEG_INFINITY, |plan| plan.priority());
+            let right_priority = plans[right]
+                .as_ref()
+                .map_or(f32::NEG_INFINITY, |plan| plan.priority());
+            right_priority
+                .total_cmp(&left_priority)
+                .then_with(|| {
+                    self.segments[right]
+                        .num_docs()
+                        .cmp(&self.segments[left].num_docs())
+                })
+                .then_with(|| {
+                    self.segments[left]
+                        .meta()
+                        .id
+                        .cmp(&self.segments[right].meta().id)
+                })
+        });
+        order
+    }
+
+    #[inline]
+    fn bmp_wave_width(&self) -> usize {
+        #[cfg(feature = "native")]
+        {
+            self.bmp_io_concurrency
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            4
+        }
     }
 
     /// Internal search implementation
@@ -759,39 +893,75 @@ impl<D: Directory + 'static> Searcher<D> {
         // segments share it via an atomic; ordering is best-effort.
         let shared = crate::query::SharedThreshold::new();
         let lsp_plans = self.prepare_global_lsp(query, fetch_limit, false)?;
-        let searches = futures::stream::iter(self.segments.iter().cloned().zip(lsp_plans).map(
-            |(segment, lsp_plan)| {
-                let sid = segment.meta().id;
-                let shared = shared.clone();
-                async move {
-                    let (mut results, segment_seen) = crate::query::search_segment_shared_planned(
-                        segment.as_ref(),
-                        query,
-                        fetch_limit,
-                        collect_positions,
-                        shared.clone(),
-                        lsp_plan,
-                    )
-                    .await?;
-                    if fetch_limit > 0 && results.len() >= fetch_limit {
-                        shared.raise(results[fetch_limit - 1].score);
-                    }
-                    // Stamp segment_id on each result
-                    for r in &mut results {
-                        r.segment_id = sid;
-                    }
-                    Ok::<_, crate::error::Error>((results, segment_seen))
-                }
-            },
-        ))
-        .buffer_unordered(MAX_ASYNC_SEGMENT_SEARCHES);
-        futures::pin_mut!(searches);
-
         let mut total_seen: u32 = 0;
         let mut merged = Vec::new();
+        let mut merge_scratch = Vec::new();
+        let bmp_planned = lsp_plans.iter().any(Option::is_some);
+        let order = if bmp_planned {
+            self.ordered_lsp_segments(&lsp_plans)
+        } else {
+            (0..self.segments.len()).collect()
+        };
+        #[cfg(feature = "native")]
+        let bmp_io_gate = Arc::clone(&self.bmp_io_gate);
+        let run_segment = |segment_index: usize| {
+            let segment = Arc::clone(&self.segments[segment_index]);
+            let lsp_plan = lsp_plans[segment_index].clone();
+            let shared = shared.clone();
+            #[cfg(feature = "native")]
+            let bmp_io_gate = Arc::clone(&bmp_io_gate);
+            async move {
+                if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
+                    return Ok((Vec::new(), 0u32));
+                }
+                #[cfg(feature = "native")]
+                let _io_permit = if lsp_plan.is_some() {
+                    Some(bmp_io_gate.acquire_async().await)
+                } else {
+                    None
+                };
+                let sid = segment.meta().id;
+                let (mut results, segment_seen) = crate::query::search_segment_shared_planned(
+                    segment.as_ref(),
+                    query,
+                    fetch_limit,
+                    collect_positions,
+                    shared.clone(),
+                    lsp_plan,
+                )
+                .await?;
+                if fetch_limit > 0 && results.len() >= fetch_limit {
+                    shared.raise(results[fetch_limit - 1].score);
+                }
+                for result in &mut results {
+                    result.segment_id = sid;
+                }
+                Ok::<_, crate::error::Error>((results, segment_seen))
+            }
+        };
+
+        let mut remainder = order.as_slice();
+        if bmp_planned {
+            // Match the synchronous policy: score the highest-bound pilot
+            // first so lower-bound async work starts with a useful theta.
+            if let Some((&pilot, rest)) = order.split_first() {
+                let (batch, segment_seen) = run_segment(pilot).await?;
+                total_seen = total_seen.saturating_add(segment_seen);
+                merge_ranked_reuse(&mut merged, batch, fetch_limit, &mut merge_scratch);
+                remainder = rest;
+            }
+        }
+        let concurrency = if bmp_planned {
+            self.bmp_wave_width()
+        } else {
+            MAX_ASYNC_SEGMENT_SEARCHES
+        };
+        let searches = futures::stream::iter(remainder.iter().copied().map(run_segment))
+            .buffer_unordered(concurrency);
+        futures::pin_mut!(searches);
         while let Some((batch, segment_seen)) = searches.try_next().await? {
             total_seen = total_seen.saturating_add(segment_seen);
-            merged = merge_two_ranked(merged, batch, fetch_limit);
+            merge_ranked_reuse(&mut merged, batch, fetch_limit, &mut merge_scratch);
         }
 
         let results = apply_result_offset(merged, fetch_limit, offset);
@@ -827,48 +997,94 @@ impl<D: Directory + 'static> Searcher<D> {
         offset: usize,
         collect_positions: bool,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
-        use rayon::prelude::*;
-
-        let lsp_plans = self.prepare_global_lsp(query, fetch_limit, true)?;
-        // Cross-segment top-k floor: each segment seeds its pruning from the
-        // running global k-th score and raises it once it fills its own heap.
-        let shared = crate::query::SharedThreshold::new();
-        let (merged, total_seen) = self.search_pool.install(|| {
-            self.segments
-                .par_iter()
-                .zip(lsp_plans.par_iter())
-                .map(|(segment, lsp_plan)| {
-                    let sid = segment.meta().id;
-                    let (mut results, segment_seen) =
-                        crate::query::search_segment_shared_sync_planned(
-                            segment.as_ref(),
-                            query,
-                            fetch_limit,
-                            collect_positions,
-                            shared.clone(),
-                            lsp_plan.clone(),
-                        )?;
-                    if fetch_limit > 0 && results.len() >= fetch_limit {
-                        shared.raise(results[fetch_limit - 1].score);
-                    }
-                    for r in &mut results {
-                        r.segment_id = sid;
-                    }
-                    Ok::<_, crate::Error>((results, segment_seen))
-                })
-                .try_reduce(
-                    || (Vec::new(), 0u32),
-                    |(left, left_seen), (right, right_seen)| {
-                        Ok((
-                            merge_two_ranked(left, right, fetch_limit),
-                            left_seen.saturating_add(right_seen),
-                        ))
-                    },
-                )
-        })?;
+        let (merged, total_seen) =
+            self.search_segments_sync(query, fetch_limit, collect_positions)?;
 
         let results = apply_result_offset(merged, fetch_limit, offset);
         Ok((results, total_seen))
+    }
+
+    /// Score all segments with one shared threshold.
+    ///
+    /// Ordinary queries retain full CPU parallelism. BMP uses a highest-bound
+    /// pilot followed by bounded waves, and every active BMP segment also
+    /// holds a process-wide random-I/O permit. This lets theta mature before
+    /// lower-bound segments touch pageable D/payload pages and prevents
+    /// concurrent queries from multiplying the wave width.
+    #[cfg(feature = "sync")]
+    fn search_segments_sync(
+        &self,
+        query: &dyn crate::query::Query,
+        fetch_limit: usize,
+        collect_positions: bool,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        use rayon::prelude::*;
+
+        let lsp_plans = self.prepare_global_lsp(query, fetch_limit, true)?;
+        let shared = crate::query::SharedThreshold::new();
+        let run_segment = |segment_index: &usize| {
+            let segment = &self.segments[*segment_index];
+            let lsp_plan = lsp_plans[*segment_index].clone();
+            if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
+                return Ok((Vec::new(), 0u32));
+            }
+            let _io_permit = lsp_plan.as_ref().map(|_| self.bmp_io_gate.acquire());
+            let sid = segment.meta().id;
+            let (mut results, segment_seen) = crate::query::search_segment_shared_sync_planned(
+                segment.as_ref(),
+                query,
+                fetch_limit,
+                collect_positions,
+                shared.clone(),
+                lsp_plan,
+            )?;
+            if fetch_limit > 0 && results.len() >= fetch_limit {
+                shared.raise(results[fetch_limit - 1].score);
+            }
+            for result in &mut results {
+                result.segment_id = sid;
+            }
+            Ok::<_, crate::Error>((results, segment_seen))
+        };
+
+        if !lsp_plans.iter().any(Option::is_some) {
+            return self.search_pool.install(|| {
+                (0..self.segments.len())
+                    .into_par_iter()
+                    .map(|segment| run_segment(&segment))
+                    .try_reduce(
+                        || (Vec::new(), 0u32),
+                        |(left, left_seen), (right, right_seen)| {
+                            Ok((
+                                merge_two_ranked(left, right, fetch_limit),
+                                left_seen.saturating_add(right_seen),
+                            ))
+                        },
+                    )
+            });
+        }
+
+        let order = self.ordered_lsp_segments(&lsp_plans);
+
+        let mut merged = Vec::new();
+        let mut merge_scratch = Vec::new();
+        let mut total_seen = 0u32;
+        if let Some((&pilot, rest)) = order.split_first() {
+            let (pilot_results, pilot_seen) = self.search_pool.install(|| run_segment(&pilot))?;
+            merge_ranked_reuse(&mut merged, pilot_results, fetch_limit, &mut merge_scratch);
+            total_seen = total_seen.saturating_add(pilot_seen);
+
+            for wave in rest.chunks(self.bmp_wave_width()) {
+                let batches = self
+                    .search_pool
+                    .install(|| wave.par_iter().map(run_segment).collect::<Result<Vec<_>>>())?;
+                for (results, seen) in batches {
+                    merge_ranked_reuse(&mut merged, results, fetch_limit, &mut merge_scratch);
+                    total_seen = total_seen.saturating_add(seen);
+                }
+            }
+        }
+        Ok((merged, total_seen))
     }
 
     /// Synchronous search across all segments using rayon for parallelism.
@@ -881,46 +1097,8 @@ impl<D: Directory + 'static> Searcher<D> {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
-        use rayon::prelude::*;
-
         let fetch_limit = checked_search_window(limit, offset)?;
-
-        let lsp_plans = self.prepare_global_lsp(query, fetch_limit, true)?;
-        // Cross-segment top-k floor (see search_internal_sync).
-        let shared = crate::query::SharedThreshold::new();
-        let (merged, total_seen) = self.search_pool.install(|| {
-            self.segments
-                .par_iter()
-                .zip(lsp_plans.par_iter())
-                .map(|(segment, lsp_plan)| {
-                    let sid = segment.meta().id;
-                    let (mut results, segment_seen) =
-                        crate::query::search_segment_shared_sync_planned(
-                            segment.as_ref(),
-                            query,
-                            fetch_limit,
-                            false,
-                            shared.clone(),
-                            lsp_plan.clone(),
-                        )?;
-                    if fetch_limit > 0 && results.len() >= fetch_limit {
-                        shared.raise(results[fetch_limit - 1].score);
-                    }
-                    for r in &mut results {
-                        r.segment_id = sid;
-                    }
-                    Ok::<_, crate::Error>((results, segment_seen))
-                })
-                .try_reduce(
-                    || (Vec::new(), 0u32),
-                    |(left, left_seen), (right, right_seen)| {
-                        Ok((
-                            merge_two_ranked(left, right, fetch_limit),
-                            left_seen.saturating_add(right_seen),
-                        ))
-                    },
-                )
-        })?;
+        let (merged, total_seen) = self.search_segments_sync(query, fetch_limit, false)?;
 
         let results = apply_result_offset(merged, fetch_limit, offset);
         Ok((results, total_seen))
@@ -1176,9 +1354,92 @@ impl<D: Directory + 'static> Searcher<D> {
     }
 }
 
+struct HierarchicalLspSelection {
+    selected: Vec<Vec<(u32, f32)>>,
+    expanded_groups: usize,
+    evaluated_superblocks: usize,
+}
+
+/// Select the exact global top-gamma E cells through safe H upper bounds.
+///
+/// Best-first expansion stops only when the next H bound is strictly below
+/// the current gamma-th E bound. Equality must still expand because the
+/// deterministic `(score, segment, superblock)` tie-break can change
+/// membership. Memory is O(number of H cells + gamma), never O(all E cells).
+fn select_global_lsp_hierarchical(
+    coarse_bounds: &[Option<Vec<f32>>],
+    gamma: usize,
+    mut expand: impl FnMut(usize, u32, &mut Vec<(u32, f32)>) -> Result<()>,
+) -> Result<HierarchicalLspSelection> {
+    if gamma == 0 {
+        return Err(crate::Error::Internal(
+            "hierarchical LSP selection requires a positive gamma".into(),
+        ));
+    }
+    let mut frontier = std::collections::BinaryHeap::<(u32, usize, u32)>::new();
+    for (segment, bounds) in coarse_bounds.iter().enumerate() {
+        let Some(bounds) = bounds else {
+            continue;
+        };
+        for (coarse_group, &bound) in bounds.iter().enumerate() {
+            debug_assert!(bound.is_finite() && bound >= 0.0);
+            if bound > 0.0 {
+                frontier.push((bound.to_bits(), segment, coarse_group as u32));
+            }
+        }
+    }
+    let mut top =
+        std::collections::BinaryHeap::<std::cmp::Reverse<(u32, usize, u32)>>::with_capacity(
+            gamma.min(65_536),
+        );
+    let mut expanded =
+        Vec::with_capacity(crate::segment::reader::bmp::BMP_COARSE_SUPERBLOCKS as usize);
+    let mut expanded_groups = 0usize;
+    let mut evaluated_superblocks = 0usize;
+    while let Some((coarse_bound, segment, coarse_group)) = frontier.pop() {
+        if top.len() == gamma && top.peek().is_some_and(|minimum| coarse_bound < minimum.0.0) {
+            break;
+        }
+        expand(segment, coarse_group, &mut expanded)?;
+        expanded_groups += 1;
+        evaluated_superblocks = evaluated_superblocks.saturating_add(expanded.len());
+        for &(superblock, bound) in &expanded {
+            debug_assert!(bound.is_finite() && bound >= 0.0);
+            if bound <= 0.0 {
+                continue;
+            }
+            let candidate = (bound.to_bits(), segment, superblock);
+            if top.len() < gamma {
+                top.push(std::cmp::Reverse(candidate));
+            } else if top.peek().is_some_and(|minimum| candidate > minimum.0) {
+                top.pop();
+                top.push(std::cmp::Reverse(candidate));
+            }
+        }
+    }
+
+    let mut selected = vec![Vec::<(u32, f32)>::new(); coarse_bounds.len()];
+    for std::cmp::Reverse((bound, segment, superblock)) in top {
+        selected[segment].push((superblock, f32::from_bits(bound)));
+    }
+    for segment in &mut selected {
+        segment.sort_unstable_by(|&(left_sb, left_bound), &(right_sb, right_bound)| {
+            right_bound
+                .total_cmp(&left_bound)
+                .then_with(|| left_sb.cmp(&right_sb))
+        });
+    }
+    Ok(HierarchicalLspSelection {
+        selected,
+        expanded_groups,
+        evaluated_superblocks,
+    })
+}
+
 /// Select one query-level top-γ set without allocating one tuple per
 /// superblock. Prepared BMP bounds are finite and non-negative, so their f32
 /// bit patterns have the same order as their numeric values.
+#[cfg(test)]
 fn select_global_lsp_superblocks(bounds: &[Option<Vec<f32>>], gamma: usize) -> Vec<Vec<u32>> {
     let mut top =
         std::collections::BinaryHeap::<std::cmp::Reverse<(u32, usize, u32)>>::with_capacity(
@@ -1209,9 +1470,46 @@ fn select_global_lsp_superblocks(bounds: &[Option<Vec<f32>>], gamma: usize) -> V
     selected
 }
 
+/// Merge one segment batch into the running top-k while alternating two
+/// retained buffers. Search results are moved, not cloned, and segment fan-out
+/// no longer allocates a fresh `limit`-sized vector for every merge.
+fn merge_ranked_reuse(
+    merged: &mut Vec<crate::query::SearchResult>,
+    batch: Vec<crate::query::SearchResult>,
+    limit: usize,
+    scratch: &mut Vec<crate::query::SearchResult>,
+) {
+    scratch.clear();
+    let output_len = limit.min(merged.len().saturating_add(batch.len()));
+    if scratch.capacity() < output_len {
+        scratch.reserve_exact(output_len);
+    }
+    {
+        let mut left = merged.drain(..).peekable();
+        let mut right = batch.into_iter().peekable();
+        while scratch.len() < output_len {
+            let take_left = match (left.peek(), right.peek()) {
+                (Some(left), Some(right)) => {
+                    !crate::query::compare_search_results_desc(left, right).is_gt()
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_left {
+                scratch.push(left.next().expect("peeked left result"));
+            } else {
+                scratch.push(right.next().expect("peeked right result"));
+            }
+        }
+    }
+    std::mem::swap(merged, scratch);
+}
+
 /// Merge two canonically sorted batches while moving (not cloning) hits.
-/// Reductions use this eagerly, so retained cross-segment results stay O(k)
-/// instead of O(number_of_segments × k).
+/// Native parallel reductions use this eagerly, so retained cross-segment
+/// results stay O(k) instead of O(number_of_segments × k).
+#[cfg(any(feature = "native", test))]
 fn merge_two_ranked(
     left: Vec<crate::query::SearchResult>,
     right: Vec<crate::query::SearchResult>,
@@ -1240,10 +1538,17 @@ fn merge_two_ranked(
 }
 
 fn apply_result_offset(
-    results: Vec<crate::query::SearchResult>,
+    mut results: Vec<crate::query::SearchResult>,
     fetch_limit: usize,
     offset: usize,
 ) -> Vec<crate::query::SearchResult> {
+    if offset == 0 {
+        results.truncate(fetch_limit);
+        return results;
+    }
+    // Pagination usually returns a small window from a much larger fetch.
+    // Allocate that small result rather than retaining the fetch-sized backing
+    // allocation through response serialization.
     results
         .into_iter()
         .skip(offset)
@@ -1342,7 +1647,8 @@ mod load_segments_tests {
 #[cfg(test)]
 mod search_window_tests {
     use super::{
-        apply_result_offset, checked_search_window, merge_two_ranked, select_global_lsp_superblocks,
+        apply_result_offset, checked_search_window, merge_ranked_reuse, merge_two_ranked,
+        select_global_lsp_hierarchical, select_global_lsp_superblocks,
     };
     use crate::query::SearchResult;
 
@@ -1366,7 +1672,12 @@ mod search_window_tests {
         let left = vec![result(2, 9, 10.0), result(2, 3, 7.0)];
         let right = vec![result(1, 8, 10.0), result(1, 2, 7.0)];
 
-        let merged = merge_two_ranked(left, right, 3);
+        let expected = merge_two_ranked(left.clone(), right.clone(), 3);
+        let mut merged = left;
+        let mut scratch = Vec::new();
+        merge_ranked_reuse(&mut merged, right, 3, &mut scratch);
+        assert_eq!(merged, expected);
+        assert!(scratch.is_empty());
         let keys: Vec<_> = merged
             .iter()
             .map(|result| (result.score, result.segment_id, result.doc_id))
@@ -1404,6 +1715,73 @@ mod search_window_tests {
         assert_eq!(selected[1], vec![0, 1]);
         assert!(selected[2].is_empty());
         assert!(selected[3].is_empty());
+    }
+
+    #[test]
+    fn hierarchical_lsp_matches_full_e_scan_exactly() {
+        const GROUP: usize = crate::segment::reader::bmp::BMP_COARSE_SUPERBLOCKS as usize;
+        let full = vec![
+            Some(
+                (0..700)
+                    .map(|index| 1_000.0 - index as f32)
+                    .collect::<Vec<_>>(),
+            ),
+            Some(
+                (0..530)
+                    .map(|index| 995.0 - index as f32 * 1.25)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ];
+        let coarse: Vec<Option<Vec<f32>>> = full
+            .iter()
+            .map(|segment| {
+                segment.as_ref().map(|bounds| {
+                    bounds
+                        .chunks(GROUP)
+                        .map(|group| group.iter().copied().fold(0.0, f32::max))
+                        .collect()
+                })
+            })
+            .collect();
+        let gamma = 37;
+        let hierarchy = select_global_lsp_hierarchical(&coarse, gamma, |segment, group, output| {
+            output.clear();
+            let Some(bounds) = &full[segment] else {
+                return Ok(());
+            };
+            let start = group as usize * GROUP;
+            output.extend(
+                bounds[start..(start + GROUP).min(bounds.len())]
+                    .iter()
+                    .enumerate()
+                    .map(|(within, &bound)| ((start + within) as u32, bound)),
+            );
+            Ok(())
+        })
+        .unwrap();
+        let mut expected = select_global_lsp_superblocks(&full, gamma);
+        for segment in &mut expected {
+            segment.sort_unstable();
+        }
+        let mut actual: Vec<Vec<u32>> = hierarchy
+            .selected
+            .iter()
+            .map(|segment| {
+                let mut ids: Vec<_> = segment.iter().map(|&(id, _)| id).collect();
+                ids.sort_unstable();
+                ids
+            })
+            .collect();
+        for segment in &mut actual {
+            segment.sort_unstable();
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.iter().map(Vec::len).sum::<usize>(), gamma);
+        assert!(
+            hierarchy.evaluated_superblocks
+                < full.iter().filter_map(Option::as_ref).map(Vec::len).sum()
+        );
     }
 }
 

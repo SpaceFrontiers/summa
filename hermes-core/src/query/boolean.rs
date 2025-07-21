@@ -27,6 +27,14 @@ pub struct BooleanQuery {
     global_stats: Option<Arc<GlobalStats>>,
 }
 
+fn shared_or_extract_sparse_infos<'a>(
+    plan: Option<&'a Arc<super::bmp::LspSegmentPlan>>,
+    should: &[Arc<dyn Query>],
+) -> Option<std::borrow::Cow<'a, [super::SparseTermQueryInfo]>> {
+    plan.map(|plan| std::borrow::Cow::Borrowed(plan.infos.as_ref()))
+        .or_else(|| extract_all_sparse_infos(should).map(std::borrow::Cow::Owned))
+}
+
 impl std::fmt::Debug for BooleanQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BooleanQuery")
@@ -224,7 +232,9 @@ macro_rules! boolean_plan {
 
             // 2b. Sparse (single-field, all sparse term queries)
             // Auto-detect: BMP executor if field has BMP index, else MaxScore
-            if let Some(infos) = extract_all_sparse_infos(should) {
+            if let Some(infos) =
+                shared_or_extract_sparse_infos(scorer_options.lsp_plan.as_ref(), should)
+            {
                 if let Some((raw, info)) =
                     build_sparse_bmp_results(&infos, reader, limit, &scorer_options)?
                 {
@@ -291,7 +301,8 @@ macro_rules! boolean_plan {
             // so all qualifying docs are found. For text SHOULD, we must NOT convert
             // MUST to a predicate (PredicatedScorer would drop MUST-only docs that
             // don't match SHOULD), so those go to verifier → BooleanScorer.
-            let should_is_sparse = extract_all_sparse_infos(should).is_some();
+            let should_is_sparse = scorer_options.lsp_plan.is_some()
+                || extract_all_sparse_infos(should).is_some();
 
             // 3a. Compile MUST → predicates (O(1)) vs verifier scorers (seek)
             //
@@ -349,7 +360,9 @@ macro_rules! boolean_plan {
                 && must_not_verifiers.is_empty()
                 && !predicates.is_empty()
             {
-                if let Some(infos) = extract_all_sparse_infos(should) {
+                let sparse_infos =
+                    shared_or_extract_sparse_infos(scorer_options.lsp_plan.as_ref(), should);
+                if let Some(infos) = sparse_infos {
                     // Try BMP with bitset first: build compact bitset from MUST/MUST_NOT
                     // posting lists (O(M) for term queries) for fast per-slot lookup.
                     let bitset_result = build_combined_bitset(must, must_not, reader);
