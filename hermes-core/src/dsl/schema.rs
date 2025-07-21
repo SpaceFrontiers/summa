@@ -119,6 +119,10 @@ pub enum VectorIndexType {
     /// (`docs/turboquant-quantization.md`). Available from the first segment
     /// build with no global artifacts.
     Tq,
+    /// Trained global IVF router with TurboQuant-coded centroid residuals:
+    /// sub-linear probing like IVF-PQ, but the leaf codec needs no trained
+    /// codebook (only coarse centroids).
+    IvfTq,
 }
 
 /// How an IVF coarse codebook is searched.
@@ -305,6 +309,20 @@ impl DenseVectorConfig {
         }
     }
 
+    /// Create IVF-TQ configuration: trained coarse router, TurboQuant leaves.
+    pub fn ivf_tq(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
+        Self {
+            dim,
+            index_type: VectorIndexType::IvfTq,
+            quantization: DenseVectorQuantization::F32,
+            num_clusters,
+            ivf_routing: IvfRoutingMode::Auto,
+            nprobe,
+            unit_norm: true,
+            soar: None,
+        }
+    }
+
     /// Set storage quantization
     pub fn with_quantization(mut self, quantization: DenseVectorQuantization) -> Self {
         self.quantization = quantization;
@@ -336,7 +354,10 @@ impl DenseVectorConfig {
 
     /// Check if this config uses IVF
     pub fn uses_ivf(&self) -> bool {
-        self.index_type == VectorIndexType::IvfPq
+        matches!(
+            self.index_type,
+            VectorIndexType::IvfPq | VectorIndexType::IvfTq
+        )
     }
 
     /// Check if this config is flat (brute-force)

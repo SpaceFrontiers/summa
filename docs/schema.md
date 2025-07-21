@@ -283,12 +283,15 @@ for exact brute-force search and as the accumulation format before an
 field e: dense_vector<768, f16> [indexed]                                      # global IVF-PQ
 field e: dense_vector<768, f16> [indexed<ivf_pq, routing: hnsw, nprobe: 64>]
 field e: dense_vector<768, f16> [indexed<tq>]                                  # training-free TQ
+field e: dense_vector<768, f16> [indexed<ivf_tq, nprobe: 64>]                  # trained router, TQ leaves
 field e: dense_vector<768, f16> [indexed<flat>]                                # exact full scan
 field e: dense_vector<768> [stored]                                            # stored, not indexed
 ```
 
 `tq` ignores `num_clusters`, `nprobe`, `routing`, and `soar` (it scans every
 code) and warns when they are set; `rerank_factor` applies unchanged.
+`ivf_tq` combines the trained coarse router (all IVF knobs apply) with the
+training-free TQ leaf codec — only centroids are trained, never a codebook.
 
 When `num_clusters` is omitted, training chooses a corpus-sized leaf count
 using an 8×sqrt(N) target bounded by sample quality and artifact memory. Routing

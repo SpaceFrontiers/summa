@@ -37,5 +37,6 @@ pub use quantization::{DistanceTable, PQCodebook, PQConfig, TqCodec, TqQueryPlan
 
 // Indexes
 pub use index::{
-    BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, IVFPQConfig, IVFPQIndex, IvfPqQueryPlan,
+    BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, IVFPQConfig, IVFPQIndex,
+    IvfPqQueryPlan, IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan,
 };

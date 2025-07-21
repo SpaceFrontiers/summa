@@ -136,11 +136,14 @@ pub use vector::{
     IVFPQIndex,
     IvfPqQueryPlan,
     IvfProbePlan,
+    IvfTqIndex,
     MultiAssignment,
     PQCodebook,
     PQConfig,
     SoarConfig,
     TqCodec,
+    TqIvfEncodeScratch,
+    TqIvfQueryPlan,
     TqQueryPlan,
 };
 

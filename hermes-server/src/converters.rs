@@ -728,6 +728,7 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     VectorIndexType::Flat => "flat",
                     VectorIndexType::IvfPq => "ivf_pq",
                     VectorIndexType::Tq => "tq",
+                    VectorIndexType::IvfTq => "ivf_tq",
                 };
                 idx_params.push(idx_name.to_string());
                 // TQ scans every code: IVF knobs do not apply and re-parsing
