@@ -350,20 +350,22 @@ impl IndexService for IndexServiceImpl {
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
+        let reload_index = Arc::clone(&index);
         writer
             .write()
             .await
-            .force_merge()
+            .force_merge_with_snapshot_refresh(move || {
+                let index = Arc::clone(&reload_index);
+                async move {
+                    index.reader().await?.reload().await?;
+                    Ok(())
+                }
+            })
             .await
             .map_err(crate::error::hermes_error_to_status)?;
 
-        // Force reader reload to pick up merged segments
         let reader = index
             .reader()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
-        reader
-            .reload()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader
@@ -420,20 +422,22 @@ impl IndexService for IndexServiceImpl {
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
+        let reload_index = Arc::clone(&index);
         writer
             .write()
             .await
-            .reorder()
+            .reorder_with_snapshot_refresh(move || {
+                let index = Arc::clone(&reload_index);
+                async move {
+                    index.reader().await?.reload().await?;
+                    Ok(())
+                }
+            })
             .await
             .map_err(crate::error::hermes_error_to_status)?;
 
-        // Force reader reload to pick up reordered segments
         let reader = index
             .reader()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
-        reader
-            .reload()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader

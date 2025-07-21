@@ -135,27 +135,12 @@ pub(super) fn build_sparse_streaming(
                 if blob_len > 0 {
                     current_offset += blob_len;
 
-                    // For BMP, we encode the format bit in the quant byte and use
-                    // num_dims=0 with a single pseudo-dim entry containing blob location.
-                    let mut config_for_byte =
-                        crate::structures::SparseVectorConfig::from_byte(quantization as u8)
-                            .unwrap_or_default();
-                    config_for_byte.format = SparseFormat::Bmp;
-                    config_for_byte.weight_quantization = quantization;
-
-                    field_tocs.push(SparseFieldToc {
+                    field_tocs.push(SparseFieldToc::bmp(
                         field_id,
-                        quantization: config_for_byte.to_byte(),
                         total_vectors,
-                        dims: vec![SparseDimTocEntry {
-                            dim_id: 0xFFFFFFFF, // sentinel for BMP
-                            block_data_offset: blob_offset,
-                            skip_start: (blob_len & 0xFFFFFFFF) as u32,
-                            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
-                            doc_count: 0,
-                            max_weight: 0.0,
-                        }],
-                    });
+                        blob_offset,
+                        blob_len,
+                    ));
                 }
             }
             SparseFormat::MaxScore => {

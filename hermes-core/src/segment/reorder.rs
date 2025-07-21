@@ -51,41 +51,99 @@ fn grid_run_prefix(field_id: u32) -> String {
 /// partially-written files on success, `?`, and panic unwind. UUID prefixes
 /// also avoid colliding with leftovers from a prior process using the same
 /// PID (common for PID 1 in containers).
-struct GridRunFiles {
+struct GridScratchFiles {
+    directory: PathBuf,
     prefix: String,
-    paths: Vec<PathBuf>,
+    run_paths: Vec<PathBuf>,
+    auxiliary_paths: Vec<PathBuf>,
+    all_paths: Vec<PathBuf>,
+    next_run_id: usize,
 }
 
-impl GridRunFiles {
-    fn new(field_id: u32) -> Self {
+impl GridScratchFiles {
+    fn new(field_id: u32, output_path: PathBuf) -> Self {
+        let directory = output_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let output_name = output_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "hermes".into());
         Self {
-            prefix: grid_run_prefix(field_id),
-            paths: Vec::new(),
+            directory,
+            prefix: format!("{output_name}.grid_run_{}", grid_run_prefix(field_id)),
+            run_paths: Vec::new(),
+            auxiliary_paths: Vec::new(),
+            all_paths: Vec::new(),
+            next_run_id: 0,
         }
     }
 
-    fn allocate(&mut self) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("{}_{}.tmp", self.prefix, self.paths.len()));
-        self.paths.push(path.clone());
+    fn allocate_run(&mut self) -> PathBuf {
+        let path = self
+            .directory
+            .join(format!("{}_run_{}.tmp", self.prefix, self.next_run_id));
+        self.next_run_id += 1;
+        self.run_paths.push(path.clone());
+        self.all_paths.push(path.clone());
         path
     }
 
-    fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+    fn allocate_auxiliary(&mut self, name: &str) -> PathBuf {
+        let path = self.directory.join(format!(
+            "{}_{}_{}.tmp",
+            self.prefix,
+            name,
+            self.auxiliary_paths.len()
+        ));
+        self.auxiliary_paths.push(path.clone());
+        self.all_paths.push(path.clone());
+        path
     }
 
-    fn len(&self) -> usize {
-        self.paths.len()
+    fn runs_are_empty(&self) -> bool {
+        self.run_paths.is_empty()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &PathBuf> {
-        self.paths.iter()
+    fn num_runs(&self) -> usize {
+        self.run_paths.len()
+    }
+
+    fn runs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.run_paths.iter()
+    }
+
+    fn consolidate_runs(&mut self, max_fan_in: usize) -> Result<()> {
+        while self.run_paths.len() > max_fan_in {
+            let inputs = std::mem::take(&mut self.run_paths);
+            for group in inputs.chunks(max_fan_in) {
+                if group.len() == 1 {
+                    self.run_paths.push(group[0].clone());
+                    continue;
+                }
+                let output = self.allocate_run();
+                crate::segment::builder::bmp::merge_grid_runs(group, &output)
+                    .map_err(crate::Error::Io)?;
+                // Retire each input group as soon as its replacement exists.
+                // Waiting for a complete new generation temporarily doubled
+                // multi-GB scratch usage.
+                for input in group {
+                    match std::fs::remove_file(input) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(crate::Error::Io(error)),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-impl Drop for GridRunFiles {
+impl Drop for GridScratchFiles {
     fn drop(&mut self) {
-        for path in &self.paths {
+        for path in &self.all_paths {
             if let Err(error) = std::fs::remove_file(path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -97,42 +155,594 @@ impl Drop for GridRunFiles {
 
 type BmpGridEntry = (u32, u32, u8);
 const MAX_GRID_RUN_ENTRIES: usize = 16 * 1024 * 1024;
+const REWRITE_IO_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct RecordRoute {
+    source: u32,
+    old_block: u32,
+    out_local: u32,
+    old_slot: u8,
+    new_slot: u8,
+}
+
+#[derive(Clone, Copy)]
+struct SourceBlockJob {
+    source: u32,
+    old_block: u32,
+    route_start: u32,
+    route_end: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RoutedPosting {
+    out_local: u32,
+    dimension: u32,
+    slot: u8,
+    impact: u8,
+}
 
 fn spill_grid_entries(
     entries: &mut Vec<BmpGridEntry>,
-    runs: &mut GridRunFiles,
+    scratch: &mut GridScratchFiles,
     field_id: u32,
+    rayon_pool: Option<&rayon::ThreadPool>,
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    entries.sort_unstable();
-    let path = runs.allocate();
+    use rayon::prelude::*;
+    install_on_pool(rayon_pool, || entries.par_sort_unstable());
+    let path = scratch.allocate_run();
     crate::segment::builder::bmp::write_grid_run(entries, &path).map_err(crate::Error::Io)?;
     entries.clear();
     log::debug!(
         "[reorder_bmp] field {}: spilled grid run {} to disk",
         field_id,
-        runs.len(),
+        scratch.num_runs(),
     );
     Ok(())
 }
 
-fn extend_grid_entries_bounded(
-    entries: &mut Vec<BmpGridEntry>,
-    mut additional: &[BmpGridEntry],
-    limit: usize,
-    runs: &mut GridRunFiles,
+#[allow(clippy::too_many_arguments)]
+fn write_reorder_grids(
+    mut entries: Vec<BmpGridEntry>,
+    scratch: &mut GridScratchFiles,
     field_id: u32,
-) -> Result<()> {
-    debug_assert!(limit > 0);
-    while !additional.is_empty() {
-        if entries.len() >= limit {
-            spill_grid_entries(entries, runs, field_id)?;
+    dims: usize,
+    num_blocks: usize,
+    grid_bits: u8,
+    rayon_pool: Option<&rayon::ThreadPool>,
+    writer: &mut OffsetWriter,
+) -> Result<(u64, u64, u64)> {
+    use crate::segment::builder::bmp::{
+        GridRunReader, stream_write_grids, stream_write_grids_merged,
+    };
+
+    if scratch.runs_are_empty() {
+        use rayon::prelude::*;
+        install_on_pool(rayon_pool, || entries.par_sort_unstable());
+        return stream_write_grids(&entries, dims, num_blocks, grid_bits, writer)
+            .map_err(crate::Error::Io);
+    }
+
+    if !entries.is_empty() {
+        spill_grid_entries(&mut entries, scratch, field_id, rayon_pool)?;
+    }
+    drop(entries);
+    // Bound both file descriptors and BufReader memory. Extremely large
+    // fields can produce hundreds of sorted runs even with 16M-entry chunks.
+    scratch.consolidate_runs(64)?;
+    let mut readers: Vec<GridRunReader> = scratch
+        .runs()
+        .map(|path| GridRunReader::open(path).map_err(crate::Error::Io))
+        .collect::<Result<_>>()?;
+    // The hierarchy rows must follow the complete block-grid section in the
+    // output. Spool only the much smaller E/H rows beside the index while the
+    // second and final merged-run pass emits all three projections.
+    let superblock_spool = scratch.allocate_auxiliary("superblock");
+    let coarse_spool = scratch.allocate_auxiliary("coarse");
+    let result = stream_write_grids_merged(
+        &mut readers,
+        dims,
+        num_blocks,
+        grid_bits,
+        &superblock_spool,
+        &coarse_spool,
+        writer,
+    )
+    .map_err(crate::Error::Io);
+    // Close readers before GridScratchFiles removes the spill paths.
+    drop(readers);
+    result
+}
+
+fn install_on_pool<T: Send>(
+    pool: Option<&rayon::ThreadPool>,
+    operation: impl FnOnce() -> T + Send,
+) -> T {
+    match pool {
+        Some(pool) => pool.install(operation),
+        None => operation(),
+    }
+}
+
+#[inline]
+fn resolve_real_vid(
+    global_real: usize,
+    real_base: &[usize],
+    real_to_virtual: &[Vec<u32>],
+) -> (usize, usize) {
+    let source = if real_to_virtual.len() == 1 {
+        0
+    } else {
+        real_base.partition_point(|&base| base <= global_real) - 1
+    };
+    (
+        source,
+        real_to_virtual[source][global_real - real_base[source]] as usize,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_record_route_plan(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    permutation: &[u32],
+    real_base: &[usize],
+    real_to_virtual: &[Vec<u32>],
+    block_size: usize,
+    num_real_docs: usize,
+    window_start: usize,
+    window_end: usize,
+    rayon_pool: Option<&rayon::ThreadPool>,
+) -> Result<(Vec<RecordRoute>, Vec<SourceBlockJob>)> {
+    use rayon::prelude::*;
+
+    let first_record = window_start
+        .checked_mul(block_size)
+        .ok_or_else(|| crate::Error::Internal("BMP route window start overflows usize".into()))?;
+    let last_record = window_end
+        .checked_mul(block_size)
+        .map(|end| end.min(num_real_docs))
+        .ok_or_else(|| crate::Error::Internal("BMP route window end overflows usize".into()))?;
+    let mut routes = Vec::with_capacity(last_record.saturating_sub(first_record));
+
+    for out_block in window_start..window_end {
+        let new_vid_start = out_block * block_size;
+        let new_vid_end = ((out_block + 1) * block_size).min(num_real_docs);
+        let out_local = u32::try_from(out_block - window_start).map_err(|_| {
+            crate::Error::Internal("BMP reorder window exceeds u32::MAX blocks".into())
+        })?;
+        for new_slot in 0..new_vid_end.saturating_sub(new_vid_start) {
+            let global_real = permutation[new_vid_start + new_slot] as usize;
+            let (source, old_vid) = resolve_real_vid(global_real, real_base, real_to_virtual);
+            let source_block_size = sources[source].0.bmp_block_size as usize;
+            routes.push(RecordRoute {
+                source: u32::try_from(source).map_err(|_| {
+                    crate::Error::Internal("BMP source index exceeds u32::MAX".into())
+                })?,
+                old_block: u32::try_from(old_vid / source_block_size).map_err(|_| {
+                    crate::Error::Internal("BMP source block exceeds u32::MAX".into())
+                })?,
+                out_local,
+                old_slot: (old_vid % source_block_size) as u8,
+                new_slot: new_slot as u8,
+            });
         }
-        let count = (limit - entries.len()).min(additional.len());
-        entries.extend_from_slice(&additional[..count]);
-        additional = &additional[count..];
+    }
+    install_on_pool(rayon_pool, || {
+        routes.par_sort_unstable_by_key(|route| (route.source, route.old_block, route.old_slot));
+    });
+
+    let mut jobs = Vec::new();
+    let mut start = 0usize;
+    while start < routes.len() {
+        let source = routes[start].source;
+        let old_block = routes[start].old_block;
+        let mut end = start + 1;
+        while end < routes.len()
+            && routes[end].source == source
+            && routes[end].old_block == old_block
+        {
+            end += 1;
+        }
+        jobs.push(SourceBlockJob {
+            source,
+            old_block,
+            route_start: u32::try_from(start)
+                .map_err(|_| crate::Error::Internal("BMP route count exceeds u32::MAX".into()))?,
+            route_end: u32::try_from(end)
+                .map_err(|_| crate::Error::Internal("BMP route count exceeds u32::MAX".into()))?,
+        });
+        start = end;
+    }
+    Ok((routes, jobs))
+}
+
+fn source_job_route_maps(
+    job: &SourceBlockJob,
+    routes: &[RecordRoute],
+) -> Result<([u32; 256], [u8; 256])> {
+    let mut output_blocks = [u32::MAX; 256];
+    let mut output_slots = [0u8; 256];
+    let job_routes = routes
+        .get(job.route_start as usize..job.route_end as usize)
+        .ok_or_else(|| crate::Error::Internal("BMP source-job route range is invalid".into()))?;
+    for route in job_routes {
+        if route.source != job.source || route.old_block != job.old_block {
+            return Err(crate::Error::Internal(
+                "BMP source-job routes are not grouped".into(),
+            ));
+        }
+        let slot = route.old_slot as usize;
+        if output_blocks[slot] != u32::MAX {
+            return Err(crate::Error::Internal(format!(
+                "BMP permutation maps source block {} slot {} more than once",
+                job.old_block, route.old_slot,
+            )));
+        }
+        output_blocks[slot] = route.out_local;
+        output_slots[slot] = route.new_slot;
+    }
+    Ok((output_blocks, output_slots))
+}
+
+fn count_source_job_postings(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    job: &SourceBlockJob,
+    routes: &[RecordRoute],
+) -> Result<usize> {
+    let (output_blocks, _) = source_job_route_maps(job, routes)?;
+    let source = &sources[job.source as usize].0;
+    let mut count = 0usize;
+    for (_, _, postings) in source.iter_block_terms(job.old_block) {
+        for posting in postings {
+            if output_blocks[posting.local_slot as usize] != u32::MAX {
+                count = count.checked_add(1).ok_or_else(|| {
+                    crate::Error::Internal("BMP routed posting count overflows usize".into())
+                })?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn fill_source_job_postings(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    job: &SourceBlockJob,
+    routes: &[RecordRoute],
+    output: &mut [RoutedPosting],
+) -> Result<()> {
+    let (output_blocks, output_slots) = source_job_route_maps(job, routes)?;
+    let source = &sources[job.source as usize].0;
+    let mut cursor = 0usize;
+    for (dimension, _, postings) in source.iter_block_terms(job.old_block) {
+        for posting in postings {
+            let out_local = output_blocks[posting.local_slot as usize];
+            if out_local == u32::MAX {
+                continue;
+            }
+            let destination = output.get_mut(cursor).ok_or_else(|| {
+                crate::Error::Internal("BMP routed posting count changed between passes".into())
+            })?;
+            *destination = RoutedPosting {
+                out_local,
+                dimension,
+                slot: output_slots[posting.local_slot as usize],
+                impact: posting.impact,
+            };
+            cursor += 1;
+        }
+    }
+    if cursor != output.len() {
+        return Err(crate::Error::Internal(format!(
+            "BMP routed posting count changed between passes: counted {}, wrote {}",
+            output.len(),
+            cursor,
+        )));
+    }
+    Ok(())
+}
+
+fn record_window_memory_bytes(
+    routes: &Vec<RecordRoute>,
+    jobs: &Vec<SourceBlockJob>,
+    counts: &Vec<usize>,
+    posting_count: usize,
+) -> Option<usize> {
+    let routes_bytes = routes
+        .capacity()
+        .checked_mul(std::mem::size_of::<RecordRoute>())?;
+    let jobs_bytes = jobs
+        .capacity()
+        .checked_mul(std::mem::size_of::<SourceBlockJob>())?;
+    let counts_bytes = counts
+        .capacity()
+        .checked_mul(std::mem::size_of::<usize>())?;
+    let partitions_bytes = jobs
+        .capacity()
+        .checked_mul(std::mem::size_of::<(&SourceBlockJob, &mut [RoutedPosting])>())?;
+    let routed_bytes = posting_count.checked_mul(std::mem::size_of::<RoutedPosting>())?;
+    routes_bytes
+        .checked_add(jobs_bytes)?
+        .checked_add(counts_bytes)?
+        .checked_add(partitions_bytes)?
+        .checked_add(routed_bytes)
+}
+
+fn push_rewrite_bytes(buffer: &mut Vec<u8>, bytes: &[u8], writer: &mut OffsetWriter) -> Result<()> {
+    if buffer.len() + bytes.len() > buffer.capacity() {
+        writer.write_all(buffer).map_err(crate::Error::Io)?;
+        buffer.clear();
+    }
+    if bytes.len() > buffer.capacity() {
+        writer.write_all(bytes).map_err(crate::Error::Io)
+    } else {
+        buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn flush_rewrite_bytes(buffer: &mut Vec<u8>, writer: &mut OffsetWriter) -> Result<()> {
+    if !buffer.is_empty() {
+        writer.write_all(buffer).map_err(crate::Error::Io)?;
+        buffer.clear();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_sorted_routed_block(
+    out_block: u32,
+    postings: &[RoutedPosting],
+    grid_entries: &mut Vec<BmpGridEntry>,
+    grid_run_entries: usize,
+    run_files: &mut GridScratchFiles,
+    field_id: u32,
+    rayon_pool: Option<&rayon::ThreadPool>,
+    posting_buffer: &mut Vec<u8>,
+    writer: &mut OffsetWriter,
+) -> Result<(u64, usize)> {
+    if postings.is_empty() {
+        return Ok((0, 0));
+    }
+    debug_assert!(
+        postings
+            .iter()
+            .all(|posting| posting.out_local == postings[0].out_local)
+    );
+
+    let num_terms = 1 + postings
+        .windows(2)
+        .filter(|pair| pair[0].dimension != pair[1].dimension)
+        .count();
+    let start_offset = writer.offset();
+    posting_buffer.clear();
+    push_rewrite_bytes(
+        posting_buffer,
+        &u32::try_from(num_terms)
+            .map_err(|_| crate::Error::Internal("BMP block term count exceeds u32::MAX".into()))?
+            .to_le_bytes(),
+        writer,
+    )?;
+
+    push_rewrite_bytes(posting_buffer, &postings[0].dimension.to_le_bytes(), writer)?;
+    for pair in postings.windows(2) {
+        if pair[0].dimension != pair[1].dimension {
+            push_rewrite_bytes(posting_buffer, &pair[1].dimension.to_le_bytes(), writer)?;
+        }
+    }
+
+    push_rewrite_bytes(posting_buffer, &0u32.to_le_bytes(), writer)?;
+    for (index, pair) in postings.windows(2).enumerate() {
+        if pair[0].dimension != pair[1].dimension {
+            push_rewrite_bytes(
+                posting_buffer,
+                &u32::try_from(index + 1)
+                    .map_err(|_| {
+                        crate::Error::Internal("BMP block posting prefix exceeds u32::MAX".into())
+                    })?
+                    .to_le_bytes(),
+                writer,
+            )?;
+        }
+    }
+    push_rewrite_bytes(
+        posting_buffer,
+        &u32::try_from(postings.len())
+            .map_err(|_| {
+                crate::Error::Internal("BMP block posting prefix exceeds u32::MAX".into())
+            })?
+            .to_le_bytes(),
+        writer,
+    )?;
+
+    let mut term_start = 0usize;
+    while term_start < postings.len() {
+        let dimension = postings[term_start].dimension;
+        let mut term_end = term_start + 1;
+        let mut max_impact = postings[term_start].impact;
+        while term_end < postings.len() && postings[term_end].dimension == dimension {
+            max_impact = max_impact.max(postings[term_end].impact);
+            term_end += 1;
+        }
+        push_rewrite_bytes(posting_buffer, &[max_impact], writer)?;
+        if grid_entries.len() == grid_run_entries {
+            spill_grid_entries(grid_entries, run_files, field_id, rayon_pool)?;
+        }
+        grid_entries.push((dimension, out_block, max_impact));
+        term_start = term_end;
+    }
+
+    for posting in postings {
+        push_rewrite_bytes(posting_buffer, &[posting.slot, posting.impact], writer)?;
+    }
+    flush_rewrite_bytes(posting_buffer, writer)?;
+    Ok((writer.offset() - start_offset, num_terms))
+}
+
+fn write_blockwise_doc_maps(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    permuted_blocks: &[(u32, u32)],
+    block_size: usize,
+    writer: &mut OffsetWriter,
+    rayon_pool: Option<&rayon::ThreadPool>,
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    let id_block_bytes = block_size * 4;
+    let blocks_per_chunk = (REWRITE_IO_BUFFER_BYTES / id_block_bytes).max(1);
+    let mut buffer = Vec::with_capacity(blocks_per_chunk * id_block_bytes);
+    for blocks in permuted_blocks.chunks(blocks_per_chunk) {
+        buffer.resize(blocks.len() * id_block_bytes, 0);
+        install_on_pool(rayon_pool, || {
+            buffer
+                .par_chunks_exact_mut(id_block_bytes)
+                .zip(blocks.par_iter())
+                .try_for_each(|(output, &(source, local_block))| -> Result<()> {
+                    let (bmp, doc_offset) = &sources[source as usize];
+                    let start = local_block as usize * id_block_bytes;
+                    output.copy_from_slice(&bmp.doc_map_ids_slice()[start..start + id_block_bytes]);
+                    if *doc_offset != 0 {
+                        let (ids, _) = output.as_chunks_mut::<4>();
+                        for id in ids {
+                            let source_doc_id = u32::from_le_bytes(*id);
+                            if source_doc_id != u32::MAX {
+                                *id = source_doc_id
+                                    .checked_add(*doc_offset)
+                                    .ok_or_else(|| {
+                                        crate::Error::Corruption(format!(
+                                            "BMP doc-id offset overflow: {} + {}",
+                                            source_doc_id, doc_offset,
+                                        ))
+                                    })?
+                                    .to_le_bytes();
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+        })?;
+        writer.write_all(&buffer).map_err(crate::Error::Io)?;
+    }
+
+    let ordinal_block_bytes = block_size * 2;
+    let blocks_per_chunk = (REWRITE_IO_BUFFER_BYTES / ordinal_block_bytes).max(1);
+    buffer.clear();
+    buffer.reserve(
+        blocks_per_chunk
+            .saturating_mul(ordinal_block_bytes)
+            .saturating_sub(buffer.capacity()),
+    );
+    for blocks in permuted_blocks.chunks(blocks_per_chunk) {
+        buffer.resize(blocks.len() * ordinal_block_bytes, 0);
+        install_on_pool(rayon_pool, || {
+            buffer
+                .par_chunks_exact_mut(ordinal_block_bytes)
+                .zip(blocks.par_iter())
+                .for_each(|(output, &(source, local_block))| {
+                    let bmp = &sources[source as usize].0;
+                    let start = local_block as usize * ordinal_block_bytes;
+                    output.copy_from_slice(
+                        &bmp.doc_map_ordinals_slice()[start..start + ordinal_block_bytes],
+                    );
+                });
+        });
+        writer.write_all(&buffer).map_err(crate::Error::Io)?;
+    }
+    Ok(())
+}
+
+fn write_record_doc_maps(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    permutation: &[u32],
+    real_base: &[usize],
+    real_to_virtual: &[Vec<u32>],
+    num_virtual_docs: usize,
+    writer: &mut OffsetWriter,
+    rayon_pool: Option<&rayon::ThreadPool>,
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    let id_records_per_chunk = (REWRITE_IO_BUFFER_BYTES / 4).max(1);
+    let mut buffer = Vec::with_capacity(
+        permutation
+            .len()
+            .min(id_records_per_chunk)
+            .saturating_mul(4),
+    );
+    for records in permutation.chunks(id_records_per_chunk) {
+        buffer.resize(records.len() * 4, 0);
+        install_on_pool(rayon_pool, || {
+            buffer
+                .par_chunks_exact_mut(4)
+                .zip(records.par_iter())
+                .try_for_each(|(output, &global_real)| -> Result<()> {
+                    let (source, virtual_id) =
+                        resolve_real_vid(global_real as usize, real_base, real_to_virtual);
+                    let ids = sources[source].0.doc_map_ids_slice();
+                    let offset = virtual_id * 4;
+                    let source_doc_id =
+                        u32::from_le_bytes(ids[offset..offset + 4].try_into().unwrap());
+                    let output_doc_id =
+                        source_doc_id
+                            .checked_add(sources[source].1)
+                            .ok_or_else(|| {
+                                crate::Error::Corruption(format!(
+                                    "BMP doc-id offset overflow: {} + {}",
+                                    source_doc_id, sources[source].1,
+                                ))
+                            })?;
+                    output.copy_from_slice(&output_doc_id.to_le_bytes());
+                    Ok(())
+                })
+        })?;
+        writer.write_all(&buffer).map_err(crate::Error::Io)?;
+    }
+    let padding = num_virtual_docs
+        .checked_sub(permutation.len())
+        .ok_or_else(|| {
+            crate::Error::Internal(format!(
+                "BMP document-map permutation has {} records for {} virtual slots",
+                permutation.len(),
+                num_virtual_docs,
+            ))
+        })?;
+    if padding > 0 {
+        buffer.clear();
+        buffer.resize(padding * 4, u8::MAX);
+        writer.write_all(&buffer).map_err(crate::Error::Io)?;
+    }
+
+    let ordinal_records_per_chunk = (REWRITE_IO_BUFFER_BYTES / 2).max(1);
+    buffer.clear();
+    buffer.reserve(
+        permutation
+            .len()
+            .min(ordinal_records_per_chunk)
+            .saturating_mul(2)
+            .saturating_sub(buffer.capacity()),
+    );
+    for records in permutation.chunks(ordinal_records_per_chunk) {
+        buffer.resize(records.len() * 2, 0);
+        install_on_pool(rayon_pool, || {
+            buffer
+                .par_chunks_exact_mut(2)
+                .zip(records.par_iter())
+                .for_each(|(output, &global_real)| {
+                    let (source, virtual_id) =
+                        resolve_real_vid(global_real as usize, real_base, real_to_virtual);
+                    let ordinals = sources[source].0.doc_map_ordinals_slice();
+                    let offset = virtual_id * 2;
+                    output.copy_from_slice(&ordinals[offset..offset + 2]);
+                });
+        });
+        writer.write_all(&buffer).map_err(crate::Error::Io)?;
+    }
+    if padding > 0 {
+        buffer.clear();
+        buffer.resize(padding * 2, 0);
+        writer.write_all(&buffer).map_err(crate::Error::Io)?;
     }
     Ok(())
 }
@@ -194,8 +804,9 @@ struct CoherenceStats {
 
 /// Compute [`CoherenceStats`] from a streaming pass over block headers:
 /// per-dim record frequencies come from posting-slice lengths, no weight
-/// decode. Dim ids in block headers are raw (not bounded by the configured
-/// grid dims), so counts live in a hash map; segments above
+/// decode. Rewrite validation has already proved every dim is below the
+/// configured vocabulary size, so a compact direct-addressed table avoids
+/// hashing up to a million sampled headers. Segments above
 /// [`MAX_COHERENCE_SCAN_BLOCKS`] are stride-sampled and all aggregates
 /// come from the sampled sub-population, which keeps the estimator
 /// consistent at both the clustered and scrambled extremes.
@@ -209,6 +820,7 @@ struct CoherenceStats {
 fn block_coherence(
     sources: &[(crate::segment::BmpIndex, u32)],
     block_size: usize,
+    dims: usize,
 ) -> CoherenceStats {
     let total_blocks: usize = sources.iter().map(|(b, _)| b.num_blocks as usize).sum();
     if total_blocks == 0 {
@@ -216,7 +828,7 @@ fn block_coherence(
             d: 0.0,
             d_rand: 0.0,
             d_max: 0.0,
-            norm: 0.0,
+            norm: 1.0,
             scanned_blocks: 0,
             total_blocks,
         };
@@ -224,7 +836,7 @@ fn block_coherence(
 
     let stride = total_blocks.div_ceil(MAX_COHERENCE_SCAN_BLOCKS).max(1);
     // dim → (record count, block count) within the sampled blocks
-    let mut df: rustc_hash::FxHashMap<u32, (u64, u64)> = rustc_hash::FxHashMap::default();
+    let mut df = vec![(0u64, 0u64); dims];
     let mut scanned_blocks = 0usize;
     let mut global_block = 0usize;
     for (bmp, _) in sources {
@@ -232,7 +844,7 @@ fn block_coherence(
             if global_block.is_multiple_of(stride) {
                 scanned_blocks += 1;
                 for (dim_id, _, posts) in bmp.iter_block_terms(block_id) {
-                    let e = df.entry(dim_id).or_insert((0, 0));
+                    let e = &mut df[dim_id as usize];
                     e.0 += posts.len() as u64;
                     e.1 += 1;
                 }
@@ -247,7 +859,7 @@ fn block_coherence(
     let mut terms: u64 = 0;
     let mut expected_rand_pairs = 0.0f64;
     let mut min_pairs = 0u64;
-    for &(records, blocks) in df.values() {
+    for &(records, blocks) in &df {
         if records < 2 {
             continue; // singleton: inert for clustering, see above
         }
@@ -262,7 +874,7 @@ fn block_coherence(
             d: 0.0,
             d_rand: 0.0,
             d_max: 0.0,
-            norm: 0.0,
+            norm: 1.0,
             scanned_blocks,
             total_blocks,
         };
@@ -525,7 +1137,7 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
             .read_bytes_range(offset..end)
             .await
             .map_err(crate::Error::Io)?;
-        writer = tokio::task::spawn_blocking(move || {
+        writer = super::merger::block_in_place_if_multithread(move || {
             writer.write_all(data.as_slice())?;
             // Drop source pages behind the copy cursor — a whole-file copy
             // must not leave the complete source resident in page cache.
@@ -533,10 +1145,6 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
             data.madvise_range(0..data.len(), libc::MADV_DONTNEED);
             Ok::<_, std::io::Error>(writer)
         })
-        .await
-        .map_err(|error| {
-            crate::Error::Internal(format!("segment clone worker failed for {src:?}: {error}"))
-        })?
         .map_err(crate::Error::Io)?;
         offset = end;
     }
@@ -549,13 +1157,7 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
             source_len,
         )));
     }
-    tokio::task::spawn_blocking(move || writer.finish())
-        .await
-        .map_err(|error| {
-            crate::Error::Internal(format!(
-                "segment clone finalizer failed for {dst:?}: {error}"
-            ))
-        })?
+    super::merger::block_in_place_if_multithread(move || writer.finish())
         .map_err(crate::Error::Io)?;
 
     Ok(())
@@ -621,13 +1223,26 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     }
 
     let mut all_converged = true;
+    let scratch_path = dir.local_path(&dst_files.sparse).unwrap_or_else(|| {
+        std::env::temp_dir().join(
+            dst_files
+                .sparse
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("hermes.sparse")),
+        )
+    });
     let mut writer = OffsetWriter::new(
         dir.streaming_writer_cold(&dst_files.sparse)
             .await
             .map_err(crate::Error::Io)?,
     );
+    let skip_tmp = dst_files.sparse_skip_temp();
+    let mut skip_writer = dir
+        .streaming_writer_cold(&skip_tmp)
+        .await
+        .map_err(crate::Error::Io)?;
     let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
-    let mut all_skip_bytes: Vec<u8> = Vec::new();
+    let mut skip_entry_buffer = Vec::with_capacity(crate::structures::SparseSkipEntry::SIZE);
     let mut skip_count: u32 = 0;
 
     for (field, sparse_config, reorder, field_name) in &sparse_fields {
@@ -648,7 +1263,6 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                     copy_bmp_blob(
                         bmp_idx,
                         field.0,
-                        quantization,
                         bmp_idx.total_vectors,
                         &mut writer,
                         &mut field_tocs,
@@ -681,13 +1295,13 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 let fname = field_name.clone();
                 let ilabel = schema.index_label().to_owned();
                 let pool = rayon_pool.clone();
-                let (w, ft, converged) = tokio::task::spawn_blocking(move || {
+                let scratch_path = scratch_path.clone();
+                let (w, ft, converged) = super::merger::block_in_place_if_multithread(move || {
                     reorder_bmp_field(
                         &bmp_sources,
                         fid,
                         &ilabel,
                         &fname,
-                        quantization,
                         dims,
                         effective_block_size,
                         grid_bits,
@@ -696,15 +1310,12 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                         memory_budget,
                         bp_budget,
                         granularity,
+                        scratch_path,
                         writer,
                         field_tocs,
                         pool,
                     )
-                })
-                .await
-                .map_err(|e| {
-                    crate::Error::Internal(format!("reorder_bmp_field panicked: {}", e))
-                })??;
+                })?;
                 writer = w;
                 field_tocs = ft;
                 all_converged &= converged;
@@ -718,28 +1329,29 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                     quantization,
                     &mut writer,
                     &mut field_tocs,
-                    &mut all_skip_bytes,
+                    skip_writer.as_mut(),
+                    &mut skip_entry_buffer,
                     &mut skip_count,
                 )
                 .await?;
             }
         }
     }
+    skip_writer.finish().map_err(crate::Error::Io)?;
 
     if field_tocs.is_empty() {
         drop(writer);
         let _ = dir.delete(&dst_files.sparse).await;
+        let _ = dir.delete(&skip_tmp).await;
         return Ok(all_converged);
     }
 
     // Write skip section (MaxScore fields only)
     let skip_offset = writer.offset();
-    if !all_skip_bytes.is_empty() {
-        writer
-            .write_all(&all_skip_bytes)
-            .map_err(crate::Error::Io)?;
-    }
-    drop(all_skip_bytes);
+    let skip_bytes = u64::from(skip_count)
+        .checked_mul(crate::structures::SparseSkipEntry::SIZE as u64)
+        .ok_or_else(|| crate::Error::Internal("sparse skip section exceeds u64::MAX".into()))?;
+    super::merger::append_and_delete_temp(dir, &skip_tmp, skip_bytes, &mut writer).await?;
 
     // Write TOC + footer
     let toc_offset = writer.offset();
@@ -770,7 +1382,6 @@ fn reorder_bmp_field_blockwise(
     field_id: u32,
     index_label: &str,
     field_name: &str,
-    quantization: crate::structures::WeightQuantization,
     dims: u32,
     effective_block_size: usize,
     grid_bits: u8,
@@ -778,21 +1389,27 @@ fn reorder_bmp_field_blockwise(
     total_vectors: u32,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    scratch_path: PathBuf,
+    source_pages: &crate::segment::reader::bmp::BmpScanPageGuard<'_>,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
-    use crate::segment::builder::bmp::{
-        GridRunReader, stream_write_grids, stream_write_grids_merged, write_bmp_footer,
-    };
+    use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::builder::graph_bisection::{
         BpProgressLabel, build_forward_index_from_blocks, graph_bisection_with_progress,
     };
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
     let bmp_refs: Vec<&crate::segment::BmpIndex> = sources.iter().map(|(b, _)| b).collect();
-    let source_pages =
-        crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| bmp));
+    {
+        use rayon::prelude::*;
+        install_on_pool(rayon_pool.as_deref(), || {
+            bmp_refs
+                .par_iter()
+                .try_for_each(|bmp| bmp.visit_real_slots_for_rewrite(|_| {}))
+        })?;
+    }
     let num_blocks_total = bmp_refs
         .iter()
         .try_fold(0usize, |total, bmp| {
@@ -889,6 +1506,7 @@ fn reorder_bmp_field_blockwise(
             (source as u32, local_block as u32)
         })
         .collect();
+    drop(perm);
     log::info!(
         "[reorder_bmp] field {}: blockwise BP over {} blocks in {:.1}ms (converged={})",
         field_id,
@@ -899,6 +1517,7 @@ fn reorder_bmp_field_blockwise(
     source_pages.switch_to_random();
 
     // ── Write blob: permuted block copy ─────────────────────────────────
+    let rewrite_start = std::time::Instant::now();
     let blob_start = writer.offset();
 
     // Section B: block data verbatim, in permuted order
@@ -925,7 +1544,7 @@ fn reorder_bmp_field_blockwise(
     let grid_run_entries =
         (grid_budget / std::mem::size_of::<BmpGridEntry>()).clamp(1, MAX_GRID_RUN_ENTRIES);
     let mut grid_entries = Vec::with_capacity(grid_run_entries);
-    let mut run_files = GridRunFiles::new(field_id);
+    let mut run_files = GridScratchFiles::new(field_id, scratch_path);
 
     for (new_block, &(src, lb)) in permuted_blocks.iter().enumerate() {
         let bmp = bmp_refs[src as usize];
@@ -941,7 +1560,12 @@ fn reorder_bmp_field_blockwise(
         cumulative += bytes.len() as u64;
         for (dimension, max_impact, _) in bmp.iter_block_terms(lb) {
             if grid_entries.len() == grid_run_entries {
-                spill_grid_entries(&mut grid_entries, &mut run_files, field_id)?;
+                spill_grid_entries(
+                    &mut grid_entries,
+                    &mut run_files,
+                    field_id,
+                    rayon_pool.as_deref(),
+                )?;
             }
             grid_entries.push((dimension, new_block as u32, max_impact));
         }
@@ -956,52 +1580,34 @@ fn reorder_bmp_field_blockwise(
             .write_all(&[0u8; 8][..padding])
             .map_err(crate::Error::Io)?;
     }
-    for &v in &block_data_starts {
-        writer
-            .write_all(&v.to_le_bytes())
-            .map_err(crate::Error::Io)?;
-    }
+    crate::segment::builder::bmp::write_u64_slice_le(&mut writer, &block_data_starts)
+        .map_err(crate::Error::Io)?;
     drop(block_data_starts);
+    let block_data_elapsed = rewrite_start.elapsed();
 
     // Sections D + E + H: exact maxima from the copied blocks, compressed in one
     // bounded external-sort pass. Block payloads above remained byte-identical.
+    let grids_start = std::time::Instant::now();
     let grid_offset = writer.offset() - blob_start;
-    let (block_grid_bytes, superblock_grid_bytes, _) = if run_files.is_empty() {
-        grid_entries.sort_unstable();
-        let result = stream_write_grids(
-            &grid_entries,
-            dims as usize,
-            num_blocks_total,
-            grid_bits,
-            &mut writer,
-        )
-        .map_err(crate::Error::Io)?;
-        drop(grid_entries);
-        result
-    } else {
-        if !grid_entries.is_empty() {
-            spill_grid_entries(&mut grid_entries, &mut run_files, field_id)?;
-        }
-        drop(grid_entries);
-        let mut readers: Vec<GridRunReader> = run_files
-            .iter()
-            .map(|path| GridRunReader::open(path).map_err(crate::Error::Io))
-            .collect::<Result<_>>()?;
-        let result = stream_write_grids_merged(
-            &mut readers,
-            dims as usize,
-            num_blocks_total,
-            grid_bits,
-            &mut writer,
-        )
-        .map_err(crate::Error::Io)?;
-        drop(readers);
-        result
-    };
+    let (block_grid_bytes, superblock_grid_bytes, _) = write_reorder_grids(
+        grid_entries,
+        &mut run_files,
+        field_id,
+        dims as usize,
+        num_blocks_total,
+        grid_bits,
+        rayon_pool.as_deref(),
+        &mut writer,
+    )?;
     let sb_grid_offset = grid_offset + block_grid_bytes;
     let coarse_grid_offset = sb_grid_offset + superblock_grid_bytes;
+    // Release potentially multi-GB sorted runs and hierarchy spools before
+    // the doc-map phase starts consuming more output space.
+    drop(run_files);
+    let grids_elapsed = grids_start.elapsed();
 
     // Sections F + G: doc maps copied per block chunk, ids offset-patched
+    let doc_maps_start = std::time::Instant::now();
     let doc_map_offset = writer.offset() - blob_start;
     let bs = effective_block_size;
     let mut num_real_docs: u32 = 0;
@@ -1014,40 +1620,14 @@ fn reorder_bmp_field_blockwise(
                 )
             })?;
     }
-    let mut id_chunk = vec![0u8; bs * 4];
-    for &(src, lb) in &permuted_blocks {
-        let src = src as usize;
-        let lb = lb as usize;
-        let (bmp, doc_offset) = (&sources[src].0, sources[src].1);
-        let ids = bmp.doc_map_ids_slice();
-        id_chunk.copy_from_slice(&ids[lb * bs * 4..(lb + 1) * bs * 4]);
-        if doc_offset != 0 {
-            let (chunks, _) = id_chunk.as_chunks_mut::<4>();
-            for e in chunks {
-                let doc_id = u32::from_le_bytes(*e);
-                if doc_id != u32::MAX {
-                    *e = doc_id
-                        .checked_add(doc_offset)
-                        .ok_or_else(|| {
-                            crate::Error::Corruption(format!(
-                                "BMP doc-id offset overflow: {} + {}",
-                                doc_id, doc_offset
-                            ))
-                        })?
-                        .to_le_bytes();
-                }
-            }
-        }
-        writer.write_all(&id_chunk).map_err(crate::Error::Io)?;
-    }
-    for &(src, lb) in &permuted_blocks {
-        let src = src as usize;
-        let lb = lb as usize;
-        let ords = bmp_refs[src].doc_map_ordinals_slice();
-        writer
-            .write_all(&ords[lb * bs * 2..(lb + 1) * bs * 2])
-            .map_err(crate::Error::Io)?;
-    }
+    write_blockwise_doc_maps(
+        sources,
+        &permuted_blocks,
+        bs,
+        &mut writer,
+        rayon_pool.as_deref(),
+    )?;
+    let doc_maps_elapsed = doc_maps_start.elapsed();
 
     // Footer
     write_bmp_footer(
@@ -1069,29 +1649,22 @@ fn reorder_bmp_field_blockwise(
     .map_err(crate::Error::Io)?;
 
     let blob_len = writer.offset() - blob_start;
-    let mut config_for_byte =
-        crate::structures::SparseVectorConfig::from_byte(quantization as u8).unwrap_or_default();
-    config_for_byte.format = SparseFormat::Bmp;
-    config_for_byte.weight_quantization = quantization;
-    field_tocs.push(SparseFieldToc {
+    field_tocs.push(SparseFieldToc::bmp(
         field_id,
-        quantization: config_for_byte.to_byte(),
         total_vectors,
-        dims: vec![crate::segment::format::SparseDimTocEntry {
-            dim_id: 0xFFFFFFFF,
-            block_data_offset: blob_start,
-            skip_start: (blob_len & 0xFFFFFFFF) as u32,
-            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
-            doc_count: 0,
-            max_weight: 0.0,
-        }],
-    });
+        blob_start,
+        blob_len,
+    ));
 
     log::info!(
-        "[reorder_bmp] field {}: blockwise reorder done — {} blocks, {}",
+        "[reorder_bmp] field {}: blockwise reorder done — {} blocks, {}, phases: data+offsets={:.1}s grids={:.1}s doc_maps={:.1}s total={:.1}s",
         field_id,
         num_blocks_total,
         crate::format_bytes(blob_len),
+        block_data_elapsed.as_secs_f64(),
+        grids_elapsed.as_secs_f64(),
+        doc_maps_elapsed.as_secs_f64(),
+        rewrite_start.elapsed().as_secs_f64(),
     );
 
     Ok((writer, field_tocs, converged))
@@ -1103,7 +1676,6 @@ fn reorder_bmp_field_blockwise(
 fn copy_bmp_blob(
     bmp: &crate::segment::BmpIndex,
     field_id: u32,
-    quantization: crate::structures::WeightQuantization,
     total_vectors: u32,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
@@ -1116,24 +1688,12 @@ fn copy_bmp_blob(
     }
     let blob_len = writer.offset() - blob_start;
 
-    let mut config_for_byte =
-        crate::structures::SparseVectorConfig::from_byte(quantization as u8).unwrap_or_default();
-    config_for_byte.format = SparseFormat::Bmp;
-    config_for_byte.weight_quantization = quantization;
-
-    field_tocs.push(SparseFieldToc {
+    field_tocs.push(SparseFieldToc::bmp(
         field_id,
-        quantization: config_for_byte.to_byte(),
         total_vectors,
-        dims: vec![crate::segment::format::SparseDimTocEntry {
-            dim_id: 0xFFFFFFFF, // sentinel for BMP
-            block_data_offset: blob_start,
-            skip_start: (blob_len & 0xFFFFFFFF) as u32,
-            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
-            doc_count: 0,
-            max_weight: 0.0,
-        }],
-    });
+        blob_start,
+        blob_len,
+    ));
     Ok(())
 }
 
@@ -1145,7 +1705,8 @@ async fn copy_maxscore_field(
     quantization: crate::structures::WeightQuantization,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
-    all_skip_bytes: &mut Vec<u8>,
+    skip_writer: &mut (dyn Write + Send),
+    skip_entry_buffer: &mut Vec<u8>,
     skip_count: &mut u32,
 ) -> Result<()> {
     let all_dims: Vec<u32> = sparse_idx.active_dimensions().collect();
@@ -1168,17 +1729,26 @@ async fn copy_maxscore_field(
 
         let block_data_offset = writer.offset();
         let skip_start = *skip_count;
-        let num_blocks = raw.skip_entries.len() as u32;
+        let num_blocks = u32::try_from(raw.skip_entries.len()).map_err(|_| {
+            crate::Error::Internal("sparse dimension skip-entry count exceeds u32::MAX".into())
+        })?;
 
         // Write raw block data (identity copy)
         writer
             .write_all(raw.raw_block_data.as_slice())
             .map_err(crate::Error::Io)?;
 
-        // Accumulate skip entries (offsets are already correct for single source)
+        // Stream skip entries to the segment-scoped temp file. Offsets are
+        // already correct for a single source.
         for entry in &raw.skip_entries {
-            entry.write_to_vec(all_skip_bytes);
-            *skip_count += 1;
+            skip_entry_buffer.clear();
+            entry.write_to_vec(skip_entry_buffer);
+            skip_writer
+                .write_all(skip_entry_buffer)
+                .map_err(crate::Error::Io)?;
+            *skip_count = skip_count.checked_add(1).ok_or_else(|| {
+                crate::Error::Internal("sparse skip-entry count exceeds u32::MAX".into())
+            })?;
         }
 
         dim_toc_entries.push(crate::segment::format::SparseDimTocEntry {
@@ -1218,10 +1788,10 @@ async fn copy_maxscore_field(
 /// padding. Interior padding is compacted away in the output: the written
 /// blob always has tail-only padding.
 ///
-/// This is a synchronous function called from `spawn_blocking` so the
-/// entire CPU-heavy reorder (forward index build, BP, blob write) runs
-/// off tokio worker threads. The `OffsetWriter` streams directly to disk
-/// — no in-memory buffering of the output blob.
+/// This is a synchronous function called from a Tokio block-in-place section,
+/// so cancellation cannot detach its owned output writer. The
+/// `OffsetWriter` streams directly to disk — no in-memory buffering of the
+/// output blob.
 ///
 /// When `rayon_pool` is `Some`, all rayon parallel work runs on that pool
 /// instead of the global pool, bounding optimizer CPU usage.
@@ -1231,7 +1801,6 @@ pub(crate) fn reorder_bmp_field(
     field_id: u32,
     index_label: &str,
     field_name: &str,
-    quantization: crate::structures::WeightQuantization,
     dims: u32,
     effective_block_size: usize,
     grid_bits: u8,
@@ -1240,6 +1809,7 @@ pub(crate) fn reorder_bmp_field(
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
     granularity: BpGranularity,
+    scratch_path: PathBuf,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
@@ -1250,9 +1820,7 @@ pub(crate) fn reorder_bmp_field(
             effective_block_size
         )));
     }
-    use crate::segment::builder::bmp::{
-        GridRunReader, stream_write_grids, stream_write_grids_merged, write_bmp_footer,
-    };
+    use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::builder::graph_bisection::{
         BpProgressLabel, build_forward_index_from_bmps_with_maps, build_vid_maps,
         graph_bisection_with_progress,
@@ -1261,6 +1829,40 @@ pub(crate) fn reorder_bmp_field(
     if sources.is_empty() {
         return Ok((writer, field_tocs, true));
     }
+    // Validation, coherence, forward construction, and rewrite are exhaustive
+    // scans. Apply sequential page advice before the first one, not only after
+    // two cold passes have already completed.
+    let source_pages =
+        crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| bmp));
+    for (source, _) in sources {
+        source.validate_rewrite_layout(
+            "BMP reorder",
+            dims,
+            effective_block_size as u32,
+            grid_bits,
+            max_weight_scale,
+        )?;
+    }
+    let validation_start = std::time::Instant::now();
+    {
+        use rayon::prelude::*;
+        install_on_pool(rayon_pool.as_deref(), || {
+            sources.par_iter().try_for_each(|(source, _)| {
+                (0..source.num_blocks)
+                    .into_par_iter()
+                    .try_for_each(|block| source.validate_block_for_rewrite(block))
+            })
+        })?;
+    }
+    log::info!(
+        "[reorder_bmp] field {}: validated {} source block(s) in {:.1}ms",
+        field_id,
+        sources
+            .iter()
+            .map(|(source, _)| u64::from(source.num_blocks))
+            .sum::<u64>(),
+        validation_start.elapsed().as_secs_f64() * 1000.0,
+    );
 
     // ── Granularity decision (docs/block-level-reorder.md) ──────────────
     // The coherence scan runs only for `Auto`: explicit granularity (manual
@@ -1269,7 +1871,7 @@ pub(crate) fn reorder_bmp_field(
     let effective_granularity = match granularity {
         BpGranularity::Auto => {
             let stats_start = std::time::Instant::now();
-            let coherence = block_coherence(sources, effective_block_size);
+            let coherence = block_coherence(sources, effective_block_size, dims as usize);
             let chosen = if coherence.norm >= BLOCKWISE_NORM_COHERENCE_THRESHOLD {
                 BpGranularity::Blocks
             } else {
@@ -1315,7 +1917,6 @@ pub(crate) fn reorder_bmp_field(
             field_id,
             index_label,
             field_name,
-            quantization,
             dims,
             effective_block_size,
             grid_bits,
@@ -1323,6 +1924,8 @@ pub(crate) fn reorder_bmp_field(
             total_vectors,
             memory_budget,
             bp_budget,
+            scratch_path,
+            &source_pages,
             writer,
             field_tocs,
             rayon_pool,
@@ -1361,7 +1964,6 @@ pub(crate) fn reorder_bmp_field(
             field_id,
             index_label,
             field_name,
-            quantization,
             dims,
             effective_block_size,
             grid_bits,
@@ -1369,15 +1971,14 @@ pub(crate) fn reorder_bmp_field(
             total_vectors,
             memory_budget,
             bp_budget,
+            scratch_path,
+            &source_pages,
             writer,
             field_tocs,
             rayon_pool,
         )?;
         return Ok((writer, field_tocs, false));
     }
-
-    let source_pages =
-        crate::segment::reader::bmp::BmpScanPageGuard::new(sources.iter().map(|(bmp, _)| bmp));
 
     // ── Phase 1: Build forward index and run BP ─────────────────────────
     let bp_start = std::time::Instant::now();
@@ -1386,10 +1987,15 @@ pub(crate) fn reorder_bmp_field(
     // Build padding-aware maps once. Forward-index construction needs both
     // directions; output encoding reuses real→virtual instead of rescanning
     // every source document map.
-    let mut vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmp_refs
-        .iter()
-        .map(|bmp| build_vid_maps(bmp))
-        .collect::<Result<_>>()?;
+    let mut vid_maps: Vec<(Vec<u32>, Vec<u32>)> = {
+        use rayon::prelude::*;
+        install_on_pool(rayon_pool.as_deref(), || {
+            bmp_refs
+                .par_iter()
+                .map(|bmp| build_vid_maps(bmp))
+                .collect::<Result<_>>()
+        })?
+    };
     // Prefix sums of real doc counts: source s owns global real ids
     // real_base[s]..real_base[s+1].
     let mut real_base = Vec::with_capacity(vid_maps.len() + 1);
@@ -1461,7 +2067,7 @@ pub(crate) fn reorder_bmp_field(
                 forward_budget,
             )
         };
-        let (fwd, _source_doc_counts) = if let Some(ref pool) = rayon_pool {
+        let fwd = if let Some(ref pool) = rayon_pool {
             pool.install(build_forward)
         } else {
             build_forward()
@@ -1548,6 +2154,7 @@ pub(crate) fn reorder_bmp_field(
             )
         })?;
 
+    let rewrite_start = std::time::Instant::now();
     let blob_start = writer.offset();
     let mut block_data_starts: Vec<u64> = Vec::with_capacity(new_num_blocks + 1);
     let mut total_terms: u64 = 0;
@@ -1582,195 +2189,161 @@ pub(crate) fn reorder_bmp_field(
     let grid_run_entries =
         (grid_entries_budget / std::mem::size_of::<BmpGridEntry>()).clamp(1, MAX_GRID_RUN_ENTRIES);
     let mut grid_entries: Vec<BmpGridEntry> = Vec::with_capacity(grid_run_entries);
-    let mut run_files = GridRunFiles::new(field_id);
+    let mut run_files = GridScratchFiles::new(field_id, scratch_path);
 
-    // Encode one output block: gather its records from source blocks and
-    // serialize the current block layout. Pure function of `perm` + read-only
-    // sources — output blocks encode independently.
-    //
-    // Global real ids resolve to a source via `real_base`, then to a
-    // virtual vid (block/slot position) via that source's real→virtual map.
-    // Old block/slot arithmetic uses each source's own stored block size
-    // (uniform with the output in practice — merge validates it — but the
-    // source footer is the ground truth for parsing source blocks).
-    // (serialized block bytes, its (dim, out_block, max_impact) grid entries)
-    type EncodedBlock = (Vec<u8>, Vec<BmpGridEntry>);
-    let encode_block = |out_block: usize| -> Result<EncodedBlock> {
-        let new_vid_start = out_block * effective_block_size;
-        if new_vid_start >= num_real_docs {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let new_vid_end = ((out_block + 1) * effective_block_size).min(num_real_docs);
-        let slots_count = new_vid_end - new_vid_start;
-
-        // Group records by (source, source block), scatter matching slots
-        // All 256 u8 values are valid slots when bmp_block_size=256. The old
-        // u8::MAX "unmapped" sentinel therefore dropped a posting whenever
-        // source slot 255 mapped to output slot 255.
-        let mut slot_map = [u16::MAX; 256];
-        let mut block_mappings: rustc_hash::FxHashMap<(usize, usize), Vec<(u8, u8)>> =
-            rustc_hash::FxHashMap::default();
-        for new_local_slot in 0..slots_count {
-            let global_real = perm[new_vid_start + new_local_slot] as usize;
-            let src = real_base.partition_point(|&b| b <= global_real) - 1;
-            let old_vid = real_to_virtual[src][global_real - real_base[src]] as usize;
-            let src_block_size = sources[src].0.bmp_block_size.max(1) as usize;
-            let old_block = old_vid / src_block_size;
-            let old_slot = (old_vid % src_block_size) as u8;
-            block_mappings
-                .entry((src, old_block))
-                .or_default()
-                .push((old_slot, new_local_slot as u8));
-        }
-
-        let mut dim_postings: rustc_hash::FxHashMap<u32, Vec<(u8, u8)>> =
-            rustc_hash::FxHashMap::default();
-        for (&(src, old_block), mappings) in &block_mappings {
-            for &(old_s, new_s) in mappings {
-                slot_map[old_s as usize] = u16::from(new_s);
-            }
-
-            for (dim_id, _, postings) in sources[src].0.iter_block_terms(old_block as u32) {
-                for p in postings {
-                    let new_slot = slot_map[p.local_slot as usize];
-                    if new_slot != u16::MAX {
-                        dim_postings
-                            .entry(dim_id)
-                            .or_default()
-                            .push((new_slot as u8, p.impact));
-                    }
-                }
-            }
-
-            for &(old_s, _) in mappings {
-                slot_map[old_s as usize] = u16::MAX;
-            }
-        }
-
-        if dim_postings.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let mut sorted_dims: Vec<u32> = dim_postings.keys().copied().collect();
-        sorted_dims.sort_unstable();
-        let nt = sorted_dims.len();
-
-        let mut blk_buf: Vec<u8> = Vec::with_capacity(4 + nt * 8 + 4);
-        let nt_u32 = u32::try_from(nt)
-            .map_err(|_| crate::Error::Internal("BMP block term count exceeds u32::MAX".into()))?;
-        blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
-
-        for &dim_id in &sorted_dims {
-            blk_buf.extend_from_slice(&dim_id.to_le_bytes());
-        }
-
-        // u32 prefix sums: a block/dimension can exceed 65,535 postings.
-        let mut cum: u32 = 0;
-        for &dim_id in &sorted_dims {
-            blk_buf.extend_from_slice(&cum.to_le_bytes());
-            let posting_count = u32::try_from(dim_postings[&dim_id].len()).map_err(|_| {
-                crate::Error::Internal("BMP block/dimension posting count exceeds u32::MAX".into())
-            })?;
-            cum = cum.checked_add(posting_count).ok_or_else(|| {
-                crate::Error::Internal("BMP block posting prefix exceeds u32::MAX".into())
-            })?;
-        }
-        blk_buf.extend_from_slice(&cum.to_le_bytes());
-
-        let max_impacts: Vec<u8> = sorted_dims
-            .iter()
-            .map(|dim_id| {
-                dim_postings[dim_id]
-                    .iter()
-                    .map(|&(_, impact)| impact)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect();
-        blk_buf.extend_from_slice(&max_impacts);
-
-        let mut grid: Vec<(u32, u32, u8)> = Vec::with_capacity(nt);
-        for (&dim_id, &max_impact) in sorted_dims.iter().zip(&max_impacts) {
-            for &(slot, impact) in &dim_postings[&dim_id] {
-                blk_buf.push(slot);
-                blk_buf.push(impact);
-            }
-            grid.push((dim_id, out_block as u32, max_impact));
-        }
-        Ok((blk_buf, grid))
-    };
-
-    // Encode blocks in parallel per bounded window (blob order is fixed, so
-    // the write itself stays serial; the window caps buffered bytes).
-    let source_block_bytes = bmp_refs
-        .iter()
-        .map(|bmp| bmp.block_data_slice().len())
-        .fold(0usize, usize::saturating_add);
-    let source_blocks = bmp_refs
-        .iter()
-        .map(|bmp| bmp.num_blocks as usize)
-        .fold(0usize, usize::saturating_add);
-    // Encoded bytes and grid tuples coexist. Twice the average source block
-    // size is a conservative estimate; the byte budget prevents a pathological
-    // high-dimensional corpus from buffering several GB merely because the
-    // old fixed window admitted 4096 blocks.
-    let estimated_bytes_per_block = source_block_bytes
-        .checked_div(source_blocks.max(1))
+    // Transpose records through exact-counted flat tuples. Block encoding
+    // streams directly to the buffered output, so admission covers only the
+    // live routes/jobs/counts/partitions/tuples plus one reusable write buffer.
+    let posting_buffer_bytes = (encode_window_budget / 16)
+        .clamp(64 * 1024, REWRITE_IO_BUFFER_BYTES)
+        .min(encode_window_budget.saturating_div(2))
+        .max(2);
+    let transpose_budget = encode_window_budget.saturating_sub(posting_buffer_bytes);
+    let mut posting_buffer = Vec::with_capacity(posting_buffer_bytes);
+    let total_source_postings = sources.iter().fold(0u64, |total, (source, _)| {
+        total.saturating_add(source.total_postings())
+    });
+    let average_postings = usize::try_from(
+        total_source_postings.div_ceil(u64::try_from(num_real_docs).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(usize::MAX);
+    let estimated_record_bytes = std::mem::size_of::<RecordRoute>()
+        .saturating_add(average_postings.saturating_mul(std::mem::size_of::<RoutedPosting>()))
+        // A fully scattered output window can touch one distinct source block
+        // per routed record, so speculative route planning must charge job,
+        // count, and partition metadata per record too.
+        .saturating_add(std::mem::size_of::<SourceBlockJob>())
+        .saturating_add(std::mem::size_of::<usize>())
+        .saturating_add(std::mem::size_of::<(&SourceBlockJob, &mut [RoutedPosting])>());
+    let estimated_block_bytes = effective_block_size
+        .saturating_mul(estimated_record_bytes)
+        .max(1);
+    let max_parallel_window = transpose_budget
+        .checked_div(estimated_block_bytes)
         .unwrap_or(0)
-        .saturating_mul(2)
         .max(1);
-    // More queued blocks than workers cannot improve parallelism, but their
-    // variable-size buffers all remain live until the serial write phase.
-    // Two waves keep workers fed while imposing a hard small-count ceiling on
-    // estimation error from heavily skewed blocks.
-    let parallel_width = rayon_pool
-        .as_ref()
-        .map(|pool| pool.current_num_threads())
-        .unwrap_or_else(rayon::current_num_threads)
-        .max(1);
-    let max_parallel_window = parallel_width.saturating_mul(2);
-    let encode_window =
-        (encode_window_budget / estimated_bytes_per_block).clamp(1, max_parallel_window);
-    let mut encoded: Vec<Result<EncodedBlock>> = Vec::new();
-    for window_start in (0..new_num_blocks).step_by(encode_window) {
-        let window_end = (window_start + encode_window).min(new_num_blocks);
-        encoded.clear();
+    let mut source_block_scans = 0u64;
+    let mut window_start = 0usize;
+    while window_start < new_num_blocks {
+        let initial_end = window_start
+            .saturating_add(max_parallel_window)
+            .min(new_num_blocks);
+        let mut window_end = initial_end;
+        let (routes, jobs, counts, posting_count, admitted_bytes) = loop {
+            let (routes, jobs) = build_record_route_plan(
+                sources,
+                &perm,
+                &real_base,
+                &real_to_virtual,
+                effective_block_size,
+                num_real_docs,
+                window_start,
+                window_end,
+                rayon_pool.as_deref(),
+            )?;
+            let counts = {
+                use rayon::prelude::*;
+                install_on_pool(rayon_pool.as_deref(), || {
+                    jobs.par_iter()
+                        .map(|job| count_source_job_postings(sources, job, &routes))
+                        .collect::<Result<Vec<_>>>()
+                })?
+            };
+            let posting_count = counts.iter().try_fold(0usize, |total, &count| {
+                total.checked_add(count).ok_or_else(|| {
+                    crate::Error::Internal("BMP routed posting count overflows usize".into())
+                })
+            })?;
+            let required = record_window_memory_bytes(&routes, &jobs, &counts, posting_count)
+                .ok_or_else(|| {
+                    crate::Error::Internal("BMP route-window memory size overflows usize".into())
+                })?;
+            if required <= transpose_budget {
+                break (routes, jobs, counts, posting_count, required);
+            }
+            let window_blocks = window_end - window_start;
+            if window_blocks == 1 {
+                return Err(crate::Error::Internal(format!(
+                    "one BMP output block needs {} of the {} record-transpose budget",
+                    crate::format_bytes(required as u64),
+                    crate::format_bytes(transpose_budget as u64),
+                )));
+            }
+            window_end = window_start + (window_blocks / 2).max(1);
+        };
+        if window_end < initial_end {
+            log::debug!(
+                "[reorder_bmp] field {}: record window reduced from {} to {} blocks ({} admitted of {} budget)",
+                field_id,
+                initial_end - window_start,
+                window_end - window_start,
+                crate::format_bytes(admitted_bytes as u64),
+                crate::format_bytes(transpose_budget as u64),
+            );
+        }
+        source_block_scans = source_block_scans.saturating_add(jobs.len() as u64);
+
+        let mut routed = vec![RoutedPosting::default(); posting_count];
+        let mut partitions = Vec::with_capacity(jobs.len());
+        let mut remaining = routed.as_mut_slice();
+        for (job, &count) in jobs.iter().zip(&counts) {
+            let (output, tail) = remaining.split_at_mut(count);
+            partitions.push((job, output));
+            remaining = tail;
+        }
+        debug_assert!(remaining.is_empty());
         {
             use rayon::prelude::*;
-            let run = |out: &mut Vec<Result<EncodedBlock>>| {
-                (window_start..window_end)
-                    .into_par_iter()
-                    .map(encode_block)
-                    .collect_into_vec(out);
-            };
-            if let Some(ref pool) = rayon_pool {
-                pool.install(|| run(&mut encoded));
-            } else {
-                run(&mut encoded);
-            }
+            install_on_pool(rayon_pool.as_deref(), || {
+                partitions.into_par_iter().try_for_each(|(job, output)| {
+                    fill_source_job_postings(sources, job, &routes, output)
+                })
+            })?;
+            install_on_pool(rayon_pool.as_deref(), || {
+                routed.par_sort_unstable_by_key(|posting| {
+                    (
+                        posting.out_local,
+                        posting.dimension,
+                        posting.slot,
+                        posting.impact,
+                    )
+                });
+            });
         }
 
-        for encoded_block in encoded.drain(..) {
-            let (blk_buf, grid) = encoded_block?;
+        let mut posting_cursor = 0usize;
+        for out_local in 0..window_end - window_start {
+            let block_posting_start = posting_cursor;
+            while posting_cursor < routed.len()
+                && routed[posting_cursor].out_local == out_local as u32
+            {
+                posting_cursor += 1;
+            }
+            let block_postings = &routed[block_posting_start..posting_cursor];
             block_data_starts.push(cumulative_bytes);
-            if blk_buf.is_empty() {
+            if block_postings.is_empty() {
                 continue;
             }
-            total_terms += grid.len() as u64;
-            // layout: 4 + nt*4 dims + (nt+1)*4 prefixes + nt maxima + postings*2
-            total_postings += ((blk_buf.len() - 8 - grid.len() * 9) / 2) as u64;
-            extend_grid_entries_bounded(
+            let global_block = u32::try_from(window_start + out_local)
+                .map_err(|_| crate::Error::Internal("BMP output block exceeds u32::MAX".into()))?;
+            let (block_bytes, block_terms) = write_sorted_routed_block(
+                global_block,
+                block_postings,
                 &mut grid_entries,
-                &grid,
                 grid_run_entries,
                 &mut run_files,
                 field_id,
+                rayon_pool.as_deref(),
+                &mut posting_buffer,
+                &mut writer,
             )?;
-            writer.write_all(&blk_buf).map_err(crate::Error::Io)?;
-            cumulative_bytes += blk_buf.len() as u64;
+            total_terms = total_terms.saturating_add(block_terms as u64);
+            total_postings = total_postings.saturating_add(block_postings.len() as u64);
+            cumulative_bytes = cumulative_bytes.saturating_add(block_bytes);
         }
+        debug_assert_eq!(posting_cursor, routed.len());
+        window_start = window_end;
     }
-    drop(encoded);
 
     // Sentinel
     block_data_starts.push(cumulative_bytes);
@@ -1790,109 +2363,45 @@ pub(crate) fn reorder_bmp_field(
     }
 
     // Section A: block_data_starts
-    for &val in &block_data_starts {
-        writer
-            .write_all(&val.to_le_bytes())
-            .map_err(crate::Error::Io)?;
-    }
+    crate::segment::builder::bmp::write_u64_slice_le(&mut writer, &block_data_starts)
+        .map_err(crate::Error::Io)?;
     drop(block_data_starts);
+    let block_data_elapsed = rewrite_start.elapsed();
 
     // Sections D+E+H: block, superblock, and coarse-superblock grids.
+    let grids_start = std::time::Instant::now();
     let grid_offset = writer.offset() - blob_start;
-    let (packed_bytes, sb_bytes, _coarse_bytes) = if run_files.is_empty() {
-        // Fast path: all entries fit in memory, use existing function
-        grid_entries.sort_unstable();
-        let result = stream_write_grids(
-            &grid_entries,
-            dims as usize,
-            new_num_blocks,
-            grid_bits,
-            &mut writer,
-        )
-        .map_err(crate::Error::Io)?;
-        drop(grid_entries);
-        result
-    } else {
-        // Flush remaining in-memory entries as the final run if non-empty
-        if !grid_entries.is_empty() {
-            spill_grid_entries(&mut grid_entries, &mut run_files, field_id)?;
-        }
-        drop(grid_entries);
-
-        // Open run readers for K-way merge
-        let mut run_readers: Vec<GridRunReader> = Vec::with_capacity(run_files.len());
-        for path in run_files.iter() {
-            run_readers.push(GridRunReader::open(path).map_err(crate::Error::Io)?);
-        }
-
-        let result = stream_write_grids_merged(
-            &mut run_readers,
-            dims as usize,
-            new_num_blocks,
-            grid_bits,
-            &mut writer,
-        )
-        .map_err(crate::Error::Io)?;
-
-        // Readers must close before the RAII owner removes the run files.
-        drop(run_readers);
-
-        result
-    };
+    let (packed_bytes, sb_bytes, _coarse_bytes) = write_reorder_grids(
+        grid_entries,
+        &mut run_files,
+        field_id,
+        dims as usize,
+        new_num_blocks,
+        grid_bits,
+        rayon_pool.as_deref(),
+        &mut writer,
+    )?;
     let sb_grid_offset = grid_offset + packed_bytes;
     let coarse_grid_offset = sb_grid_offset + sb_bytes;
+    // The grids are durable in the output stream now; keep no external-sort
+    // scratch alive during the doc-map/footer phases.
+    drop(run_files);
+    let grids_elapsed = grids_start.elapsed();
 
     // Sections F+G: doc_map [new_num_virtual_docs each]
+    let doc_maps_start = std::time::Instant::now();
     let doc_map_offset = writer.offset() - blob_start;
 
-    // Resolve a global real id to (source, virtual vid within source).
-    let resolve = |global_real: usize| -> (usize, usize) {
-        let src = real_base.partition_point(|&b| b <= global_real) - 1;
-        (
-            src,
-            real_to_virtual[src][global_real - real_base[src]] as usize,
-        )
-    };
-
-    // Section F: doc_map_ids [u32-LE × new_num_virtual_docs], doc ids patched
-    // with each source's offset in the output segment. Real slots are never
-    // the u32::MAX sentinel (realness came from the doc map itself).
-    for &global_real in perm.iter().take(num_real_docs) {
-        let (src, vid) = resolve(global_real as usize);
-        let ids = sources[src].0.doc_map_ids_slice();
-        let off = vid * 4;
-        let source_doc_id = u32::from_le_bytes(ids[off..off + 4].try_into().unwrap());
-        let doc_id = source_doc_id.checked_add(sources[src].1).ok_or_else(|| {
-            crate::Error::Corruption(format!(
-                "BMP doc-id offset overflow: {} + {}",
-                source_doc_id, sources[src].1
-            ))
-        })?;
-        writer
-            .write_all(&doc_id.to_le_bytes())
-            .map_err(crate::Error::Io)?;
-    }
-    for _ in num_real_docs..new_num_virtual_docs {
-        writer
-            .write_all(&u32::MAX.to_le_bytes())
-            .map_err(crate::Error::Io)?;
-    }
-
-    // Section G: doc_map_ordinals [u16-LE × new_num_virtual_docs]
-    for &global_real in perm.iter().take(num_real_docs) {
-        let (src, vid) = resolve(global_real as usize);
-        let ords = sources[src].0.doc_map_ordinals_slice();
-        let off = vid * 2;
-        let ordinal = u16::from_le_bytes(ords[off..off + 2].try_into().unwrap());
-        writer
-            .write_all(&ordinal.to_le_bytes())
-            .map_err(crate::Error::Io)?;
-    }
-    for _ in num_real_docs..new_num_virtual_docs {
-        writer
-            .write_all(&0u16.to_le_bytes())
-            .map_err(crate::Error::Io)?;
-    }
+    write_record_doc_maps(
+        sources,
+        &perm[..num_real_docs],
+        &real_base,
+        &real_to_virtual,
+        new_num_virtual_docs,
+        &mut writer,
+        rayon_pool.as_deref(),
+    )?;
+    let doc_maps_elapsed = doc_maps_start.elapsed();
 
     // V18 footer.
     write_bmp_footer(
@@ -1915,33 +2424,25 @@ pub(crate) fn reorder_bmp_field(
 
     let blob_len = writer.offset() - blob_start;
 
-    // Push BMP sentinel TOC entry
-    let mut config_for_byte =
-        crate::structures::SparseVectorConfig::from_byte(quantization as u8).unwrap_or_default();
-    config_for_byte.format = SparseFormat::Bmp;
-    config_for_byte.weight_quantization = quantization;
-
-    field_tocs.push(SparseFieldToc {
+    field_tocs.push(SparseFieldToc::bmp(
         field_id,
-        quantization: config_for_byte.to_byte(),
         total_vectors,
-        dims: vec![crate::segment::format::SparseDimTocEntry {
-            dim_id: 0xFFFFFFFF, // sentinel for BMP
-            block_data_offset: blob_start,
-            skip_start: (blob_len & 0xFFFFFFFF) as u32,
-            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
-            doc_count: 0,
-            max_weight: 0.0,
-        }],
-    });
+        blob_start,
+        blob_len,
+    ));
 
     log::info!(
-        "[reorder_bmp] field {}: done — {} blocks, {} terms, {} postings, {}",
+        "[reorder_bmp] field {}: done — {} blocks, {} terms, {} postings, {}, source-block scans={}, phases: transpose+data+offsets={:.1}s grids={:.1}s doc_maps={:.1}s total={:.1}s",
         field_id,
         new_num_blocks,
         total_terms,
         total_postings,
         crate::format_bytes(blob_len),
+        source_block_scans,
+        block_data_elapsed.as_secs_f64(),
+        grids_elapsed.as_secs_f64(),
+        doc_maps_elapsed.as_secs_f64(),
+        rewrite_start.elapsed().as_secs_f64(),
     );
 
     Ok((writer, field_tocs, converged))
@@ -2005,9 +2506,11 @@ mod grid_run_prefix_tests {
 
     #[test]
     fn grid_run_files_remove_partial_spills_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
         let path = {
-            let mut runs = super::GridRunFiles::new(7);
-            let path = runs.allocate();
+            let mut runs =
+                super::GridScratchFiles::new(7, directory.path().join("seg_test.sparse"));
+            let path = runs.allocate_run();
             std::fs::write(&path, b"partial run").unwrap();
             assert!(path.exists());
             path
@@ -2016,23 +2519,5 @@ mod grid_run_prefix_tests {
             !path.exists(),
             "spill owner must remove files on unwind/drop"
         );
-    }
-
-    #[test]
-    fn grid_entry_spills_never_exceed_the_run_limit() {
-        let mut entries = Vec::with_capacity(3);
-        let mut runs = super::GridRunFiles::new(9);
-        let additional: Vec<super::BmpGridEntry> =
-            (0..8).rev().map(|block| (1, block, 1)).collect();
-
-        super::extend_grid_entries_bounded(&mut entries, &additional, 3, &mut runs, 9).unwrap();
-
-        assert_eq!(runs.len(), 2);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries.capacity(), 3);
-        for path in runs.iter() {
-            // Three 9-byte serialized entries per complete run.
-            assert_eq!(std::fs::metadata(path).unwrap().len(), 27);
-        }
     }
 }

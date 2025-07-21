@@ -104,6 +104,9 @@ pub struct BmpIndex {
     pub max_weight_scale: f32,
     /// Total sparse vectors (from TOC entry)
     pub total_vectors: u32,
+    /// Number of documents in the containing segment. Document-map entries
+    /// must be either padding or strictly below this bound.
+    segment_num_docs: u32,
 
     // ── Section metadata ──────────────────────────────────────────────
     /// Fixed vocabulary size — grid has `dims` rows
@@ -168,7 +171,7 @@ impl BmpIndex {
         handle: FileHandle,
         blob_offset: u64,
         blob_len: u64,
-        _total_docs: u32,
+        total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
         use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
@@ -236,6 +239,7 @@ impl BmpIndex {
                 num_virtual_docs,
                 max_weight_scale,
                 total_vectors,
+                segment_num_docs: total_docs,
                 dims,
                 total_terms: 0,
                 total_postings: 0,
@@ -473,6 +477,7 @@ impl BmpIndex {
             num_virtual_docs,
             max_weight_scale,
             total_vectors,
+            segment_num_docs: total_docs,
             dims,
             total_terms,
             total_postings,
@@ -519,6 +524,9 @@ impl BmpIndex {
         debug_assert!((virtual_id as usize + 1) * 2 <= ords.len());
         unsafe {
             let doc_id = read_u32_unchecked(ids.as_ptr(), virtual_id as usize);
+            if doc_id >= self.segment_num_docs {
+                return (u32::MAX, 0);
+            }
             let p = ords.as_ptr().add(virtual_id as usize * 2);
             let ordinal = u16::from_le((p as *const u16).read_unaligned());
             (doc_id, ordinal)
@@ -534,7 +542,12 @@ impl BmpIndex {
         }
         let d = self.doc_map_ids_bytes.as_slice();
         debug_assert!((virtual_id as usize + 1) * 4 <= d.len());
-        unsafe { read_u32_unchecked(d.as_ptr(), virtual_id as usize) }
+        let doc_id = unsafe { read_u32_unchecked(d.as_ptr(), virtual_id as usize) };
+        if doc_id < self.segment_num_docs {
+            doc_id
+        } else {
+            u32::MAX
+        }
     }
 
     // ── Hot-path block-data accessors ────────────────────────────────
@@ -812,6 +825,210 @@ impl BmpIndex {
         self.dims
     }
 
+    /// Validate the persisted layout before a merge or reorder interprets it
+    /// using schema-derived output parameters.
+    ///
+    /// The footer is the source of truth for reading this blob. Rewriting with
+    /// a different block width, grid width, vocabulary, or impact scale would
+    /// otherwise make block slicing or copied upper bounds invalid.
+    #[cfg(any(feature = "native", test))]
+    pub(crate) fn validate_rewrite_layout(
+        &self,
+        context: &str,
+        expected_dims: u32,
+        expected_block_size: u32,
+        expected_grid_bits: u8,
+        expected_max_weight_scale: f32,
+    ) -> crate::Result<()> {
+        if expected_dims == 0 {
+            return Err(crate::Error::Corruption(format!(
+                "{context}: expected vocabulary is empty",
+            )));
+        }
+        if self.dims != expected_dims {
+            return Err(crate::Error::Corruption(format!(
+                "{context}: source dims={} != expected {expected_dims}",
+                self.dims,
+            )));
+        }
+        if self.bmp_block_size != expected_block_size {
+            return Err(crate::Error::Corruption(format!(
+                "{context}: source block_size={} != expected {expected_block_size}",
+                self.bmp_block_size,
+            )));
+        }
+        if self.grid_bits != expected_grid_bits {
+            return Err(crate::Error::Corruption(format!(
+                "{context}: source grid_bits={} != expected {expected_grid_bits}",
+                self.grid_bits,
+            )));
+        }
+        if !expected_max_weight_scale.is_finite() || expected_max_weight_scale <= 0.0 {
+            return Err(crate::Error::Corruption(format!(
+                "{context}: invalid expected max_weight_scale={expected_max_weight_scale}",
+            )));
+        }
+        if self.max_weight_scale.to_bits() != expected_max_weight_scale.to_bits() {
+            return Err(crate::Error::Corruption(format!(
+                "{context}: source max_weight_scale={:.4} != expected {:.4}",
+                self.max_weight_scale, expected_max_weight_scale,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate the document map and visit each non-padding virtual slot.
+    ///
+    /// All rewrite paths share this scan so block-copy cannot offset corrupt
+    /// source IDs into another segment while record reorder rejects them.
+    pub(crate) fn visit_real_slots_for_rewrite(
+        &self,
+        mut visitor: impl FnMut(usize),
+    ) -> crate::Result<()> {
+        let expected_real = self.num_real_docs as usize;
+        let mut real_slots = 0usize;
+        for (virtual_id, chunk) in self
+            .doc_map_ids_bytes
+            .as_slice()
+            .chunks_exact(4)
+            .enumerate()
+        {
+            let doc_id = u32::from_le_bytes(chunk.try_into().unwrap());
+            if doc_id == u32::MAX {
+                continue;
+            }
+            if doc_id >= self.segment_num_docs {
+                return Err(crate::Error::Corruption(format!(
+                    "BMP document map contains doc id {doc_id} outside segment bound {}",
+                    self.segment_num_docs,
+                )));
+            }
+            if real_slots == expected_real {
+                return Err(crate::Error::Corruption(format!(
+                    "BMP document map contains more than the footer's {expected_real} real slots"
+                )));
+            }
+            visitor(virtual_id);
+            real_slots += 1;
+        }
+        if real_slots != expected_real {
+            return Err(crate::Error::Corruption(format!(
+                "BMP document map has {real_slots} real slots but footer declares {expected_real}",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate one block before a rewrite feeds it into infallible hot-path
+    /// iterators. Query parsing deliberately degrades malformed blocks to
+    /// empty for availability; a rewrite must instead fail loudly so it never
+    /// publishes silent data loss or indexes an invalid local slot.
+    #[cfg(any(feature = "native", test))]
+    pub(crate) fn validate_block_for_rewrite(&self, block_id: u32) -> crate::Result<()> {
+        if block_id >= self.num_blocks {
+            return Err(crate::Error::Corruption(format!(
+                "BMP rewrite block {block_id} exceeds block count {}",
+                self.num_blocks,
+            )));
+        }
+        let (start, end) = self.block_data_range(block_id);
+        let start = usize::try_from(start)
+            .map_err(|_| crate::Error::Corruption("BMP block start exceeds usize".into()))?;
+        let end = usize::try_from(end)
+            .map_err(|_| crate::Error::Corruption("BMP block end exceeds usize".into()))?;
+        let block = self
+            .block_data_bytes
+            .as_slice()
+            .get(start..end)
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "BMP block {block_id} range {start}..{end} exceeds block data",
+                ))
+            })?;
+        if block.is_empty() {
+            return Ok(());
+        }
+        if block.len() < 8 {
+            return Err(crate::Error::Corruption(format!(
+                "BMP block {block_id} is too short: {} bytes",
+                block.len(),
+            )));
+        }
+
+        let num_terms = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
+        let header_len = num_terms
+            .checked_mul(9)
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "BMP block {block_id} header length overflows usize",
+                ))
+            })?;
+        if header_len > block.len() || !(block.len() - header_len).is_multiple_of(2) {
+            return Err(crate::Error::Corruption(format!(
+                "BMP block {block_id} has invalid header/data lengths: header={header_len}, total={}",
+                block.len(),
+            )));
+        }
+
+        let dims_start = 4;
+        let prefixes_start = dims_start + num_terms * 4;
+        let maxima_start = prefixes_start + (num_terms + 1) * 4;
+        let postings_start = maxima_start + num_terms;
+        debug_assert_eq!(postings_start, header_len);
+        let total_postings = (block.len() - postings_start) / 2;
+        let read_prefix = |index: usize| {
+            let offset = prefixes_start + index * 4;
+            u32::from_le_bytes(block[offset..offset + 4].try_into().unwrap()) as usize
+        };
+        if read_prefix(0) != 0 || read_prefix(num_terms) != total_postings {
+            return Err(crate::Error::Corruption(format!(
+                "BMP block {block_id} posting prefixes do not span 0..{total_postings}",
+            )));
+        }
+
+        let mut previous_dim = None;
+        for term in 0..num_terms {
+            let dim_offset = dims_start + term * 4;
+            let dimension =
+                u32::from_le_bytes(block[dim_offset..dim_offset + 4].try_into().unwrap());
+            if dimension >= self.dims || previous_dim.is_some_and(|previous| dimension <= previous)
+            {
+                return Err(crate::Error::Corruption(format!(
+                    "BMP block {block_id} has invalid/non-increasing dimension {dimension} at term {term}",
+                )));
+            }
+            previous_dim = Some(dimension);
+
+            let posting_start = read_prefix(term);
+            let posting_end = read_prefix(term + 1);
+            if posting_start >= posting_end || posting_end > total_postings {
+                return Err(crate::Error::Corruption(format!(
+                    "BMP block {block_id} term {term} has invalid posting range {posting_start}..{posting_end}",
+                )));
+            }
+            let postings =
+                &block[postings_start + posting_start * 2..postings_start + posting_end * 2];
+            let mut observed_max = 0u8;
+            for posting in postings.chunks_exact(2) {
+                if u32::from(posting[0]) >= self.bmp_block_size {
+                    return Err(crate::Error::Corruption(format!(
+                        "BMP block {block_id} term {term} has local slot {} outside block size {}",
+                        posting[0], self.bmp_block_size,
+                    )));
+                }
+                observed_max = observed_max.max(posting[1]);
+            }
+            let stored_max = block[maxima_start + term];
+            if stored_max != observed_max {
+                return Err(crate::Error::Corruption(format!(
+                    "BMP block {block_id} term {term} maximum {stored_max} != observed {observed_max}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Total number of terms (unique dim×block pairs) stored in the index.
     pub fn total_terms(&self) -> u64 {
         self.total_terms
@@ -827,6 +1044,7 @@ impl BmpIndex {
         self.num_real_docs
     }
 
+    /// Number of documents in the containing segment.
     /// Whether this segment physically contains at most one vector per
     /// document. Unlike the schema's `multi` flag, this remains reliable for
     /// old or externally-created segments with inaccurate metadata.
@@ -1208,5 +1426,64 @@ mod safety_tests {
         .unwrap();
         let multi = parse(blob).unwrap();
         assert!(!multi.is_single_valued());
+    }
+
+    #[test]
+    fn rewrite_validation_rejects_out_of_range_local_slot() {
+        let mut blob = test_blob();
+        // One-term block header is 8 + 9 bytes; postings follow immediately.
+        blob[17] = 64;
+        let index = parse(blob).unwrap();
+        let error = index.validate_block_for_rewrite(0).unwrap_err();
+        assert!(matches!(error, crate::Error::Corruption(_)));
+    }
+
+    #[test]
+    fn rewrite_validation_rejects_bad_dimension_and_maximum() {
+        let mut bad_dimension = test_blob();
+        bad_dimension[4..8].copy_from_slice(&16u32.to_le_bytes());
+        let index = parse(bad_dimension).unwrap();
+        assert!(matches!(
+            index.validate_block_for_rewrite(0),
+            Err(crate::Error::Corruption(_))
+        ));
+
+        let mut bad_maximum = test_blob();
+        bad_maximum[16] = 0;
+        let index = parse(bad_maximum).unwrap();
+        assert!(matches!(
+            index.validate_block_for_rewrite(0),
+            Err(crate::Error::Corruption(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_doc_map_id_is_bounded_and_rewrite_rejects_it() {
+        let mut blob = test_blob();
+        let footer = blob.len() - BMP_BLOB_FOOTER_SIZE;
+        let doc_map =
+            u64::from_le_bytes(blob[footer + 60..footer + 68].try_into().unwrap()) as usize;
+        blob[doc_map..doc_map + 4].copy_from_slice(&2u32.to_le_bytes());
+        let index = parse(blob).unwrap();
+
+        assert_eq!(index.doc_id_for_virtual(0), u32::MAX);
+        assert!(matches!(
+            crate::segment::builder::graph_bisection::build_vid_maps(&index),
+            Err(crate::Error::Corruption(_))
+        ));
+    }
+
+    #[test]
+    fn rewrite_layout_requires_exact_finite_scale() {
+        let index = parse(test_blob()).unwrap();
+        let adjacent_scale = f32::from_bits(index.max_weight_scale.to_bits() + 1);
+        assert!(matches!(
+            index.validate_rewrite_layout("test", 16, 64, 4, adjacent_scale),
+            Err(crate::Error::Corruption(_))
+        ));
+        assert!(matches!(
+            index.validate_rewrite_layout("test", 16, 64, 4, f32::NAN),
+            Err(crate::Error::Corruption(_))
+        ));
     }
 }

@@ -594,7 +594,7 @@ fn execute_bmp_inner(
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
     threshold_source: BmpThreshold<'_>,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    let total_start = std::time::Instant::now();
+    let total_start = crate::observe::WallTimer::start();
     if index.num_blocks == 0
         || k == 0
         || lsp_plan.is_none() && (candidate_terms.is_empty() || scoring_terms.is_empty())
@@ -611,7 +611,7 @@ fn execute_bmp_inner(
     let num_superblocks_total = index.num_superblocks as usize;
 
     // ── Phase 1: Resolve query dimensions and quantize weights ────────
-    let prepare_start = std::time::Instant::now();
+    let prepare_start = crate::observe::WallTimer::start();
     let local_prepared;
     let prepared_query = if let Some(plan) = lsp_plan {
         plan.prepared_query.as_ref()
@@ -623,7 +623,7 @@ fn execute_bmp_inner(
         local_prepared = prepared;
         &local_prepared
     };
-    let prepare_secs = prepare_start.elapsed().as_secs_f64();
+    let prepare_secs = prepare_start.secs();
     let query_by_dim_u16 = prepared_query.query_by_dim_u16.as_slice();
     let candidate_grid_weights = prepared_query.candidate_grid_weights.as_slice();
     let candidate_mask = prepared_query.candidate_mask;
@@ -798,7 +798,7 @@ fn execute_bmp_inner(
                 phases.prefetch_ranges = phases.prefetch_ranges.saturating_add(calls);
             }
 
-            let d_grid_start = std::time::Instant::now();
+            let d_grid_start = crate::observe::WallTimer::start();
             scratch.prepared_superblocks.clear();
             let window_threshold = collector.threshold();
             let mut stop_after_window = false;
@@ -853,7 +853,7 @@ fn execute_bmp_inner(
             }
             let prepared_count = scratch.prepared_superblocks.len();
             cursor = window_start.saturating_add(prepared_count);
-            phases.d_grid_secs += d_grid_start.elapsed().as_secs_f64();
+            phases.d_grid_secs += d_grid_start.secs();
             if prepared_count == 0 {
                 break;
             }
@@ -919,7 +919,7 @@ fn execute_bmp_inner(
                     stop_after_window = true;
                     break;
                 }
-                let score_start = std::time::Instant::now();
+                let score_start = crate::observe::WallTimer::start();
                 score_superblock_blocks(
                     index,
                     prepared.block_start,
@@ -946,7 +946,7 @@ fn execute_bmp_inner(
                     },
                     &mut phases.docmap_secs,
                 );
-                phases.block_score_secs += score_start.elapsed().as_secs_f64();
+                phases.block_score_secs += score_start.secs();
                 sbs_scored += 1;
 
                 if threshold_source.publish
@@ -967,13 +967,13 @@ fn execute_bmp_inner(
             }
         }
 
-        let elapsed_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_ms = total_start.secs() * 1000.0;
         let threshold = collector.threshold();
         let returned = collector.real_len();
         crate::observe::bmp_query(
             index_label,
             field_label,
-            total_start.elapsed().as_secs_f64(),
+            total_start.secs(),
             phases,
             sbs_scored as usize,
             num_superblocks_total,
@@ -1278,7 +1278,7 @@ fn score_superblock_blocks(
         // doc_id. The combine_ordinal_results layer handles multi-ordinal grouping.
         let base = block_id as usize * block_size;
         let num_vdocs = index.num_virtual_docs as usize;
-        let docmap_start = std::time::Instant::now();
+        let docmap_start = crate::observe::WallTimer::start();
 
         for (word, &touched_word) in touched.iter().enumerate() {
             let mut scan = touched_word;
@@ -1323,7 +1323,7 @@ fn score_superblock_blocks(
                 }
             }
         }
-        *docmap_secs += docmap_start.elapsed().as_secs_f64();
+        *docmap_secs += docmap_start.secs();
 
         *blocks_scored += 1;
     }

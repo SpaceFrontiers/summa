@@ -642,14 +642,6 @@ pub async fn load_sparse_file<D: Directory>(
     let mut maxscore_indexes = FxHashMap::default();
     let mut bmp_indexes = FxHashMap::default();
 
-    // Skip loading sparse file if schema has no sparse vector fields
-    let has_sparse_vectors = schema
-        .fields()
-        .any(|(_, entry)| entry.sparse_vector_config.is_some());
-    if !has_sparse_vectors {
-        return Ok(empty());
-    }
-
     // Try to open sparse file lazily (may not exist if no sparse vectors were indexed)
     let handle = match dir.open_lazy(&files.sparse).await {
         Ok(h) => h,
@@ -765,8 +757,38 @@ pub async fn load_sparse_file<D: Directory>(
                 "invalid sparse configuration byte {quantization:#04x} for field {field_id}"
             ))
         })?;
+        let schema_field = schema
+            .get_field_entry(Field(field_id))
+            .filter(|entry| entry.field_type == FieldType::SparseVector)
+            .ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "sparse data references field {field_id}, which is absent or not sparse in the schema"
+                ))
+            })?;
+        let configured_format = schema_field
+            .sparse_vector_config
+            .as_ref()
+            .map(|config| config.format)
+            .unwrap_or_default();
+        if stored_config.format != configured_format {
+            return Err(crate::Error::Corruption(format!(
+                "sparse field {field_id} ('{}') is stored as {:?} but configured as {:?}; rebuild the index",
+                schema_field.name, stored_config.format, configured_format,
+            )));
+        }
         let is_bmp = stored_config.format == crate::structures::SparseFormat::Bmp;
 
+        if is_bmp
+            && (stored_config.index_size != crate::structures::IndexSize::U32
+                || stored_config.weight_quantization
+                    != crate::structures::WeightQuantization::UInt8)
+        {
+            return Err(crate::Error::Corruption(format!(
+                "BMP field {field_id} has non-canonical sparse descriptor \
+                 (index_size={:?}, weight_quantization={:?}); rebuild the index",
+                stored_config.index_size, stored_config.weight_quantization,
+            )));
+        }
         if is_bmp && ndims != 1 {
             return Err(crate::Error::Corruption(format!(
                 "BMP field {field_id} has {ndims} TOC entries, expected one blob marker"
@@ -1027,9 +1049,12 @@ pub async fn load_fast_fields_file<D: Directory>(
 mod tests {
     use crate::directories::{DirectoryWriter, RamDirectory};
     use crate::dsl::{DenseVectorQuantization, SchemaBuilder};
-    use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
+    use crate::segment::format::{
+        DenseVectorTocEntry, SparseFieldToc, write_dense_toc_and_footer,
+        write_sparse_toc_and_footer,
+    };
     use crate::segment::{FlatVectorData, ann_build};
-    use crate::structures::{SparseSkipEntry, SparseVectorConfig};
+    use crate::structures::{SparseFormat, SparseSkipEntry, SparseVectorConfig};
 
     use super::{
         SegmentFiles, load_flat_vectors_file, load_sparse_file, load_vectors_file,
@@ -1071,6 +1096,12 @@ mod tests {
         vectors_file_with_payloads(vec![(0, ann_build::FLAT_TYPE, payload)])
     }
 
+    fn sparse_file_with_toc(toc: SparseFieldToc) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_sparse_toc_and_footer(&mut bytes, 0, 0, &[toc]).unwrap();
+        bytes
+    }
+
     fn one_dense_flat_payload() -> Vec<u8> {
         let mut payload = Vec::new();
         FlatVectorData::serialize_binary_from_flat_streaming(
@@ -1100,6 +1131,92 @@ mod tests {
 
         let result = load_sparse_file(&dir, &files, 1, &schema).await;
         assert!(matches!(result, Err(crate::Error::Corruption(_))));
+    }
+
+    #[tokio::test]
+    async fn sparse_file_format_must_match_schema() {
+        let files = SegmentFiles::new(70);
+        let dir = RamDirectory::new();
+        let maxscore = SparseVectorConfig::default();
+        dir.write(
+            &files.sparse,
+            &sparse_file_with_toc(SparseFieldToc {
+                field_id: 0,
+                quantization: maxscore.weight_quantization as u8,
+                total_vectors: 0,
+                dims: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let bmp = SparseVectorConfig {
+            format: SparseFormat::Bmp,
+            ..Default::default()
+        };
+        let mut schema = SchemaBuilder::default();
+        schema.add_sparse_vector_field_with_config("sparse", true, true, bmp);
+        let error = match load_sparse_file(&dir, &files, 0, &schema.build()).await {
+            Err(error) => error,
+            Ok(_) => panic!("MaxScore storage must be rejected by a BMP schema"),
+        };
+        assert!(
+            matches!(error, crate::Error::Corruption(message) if message.contains("stored as MaxScore") && message.contains("configured as Bmp"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bmp_file_format_must_match_schema() {
+        let files = SegmentFiles::new(72);
+        let dir = RamDirectory::new();
+        dir.write(
+            &files.sparse,
+            &sparse_file_with_toc(SparseFieldToc::bmp(0, 0, 0, 0)),
+        )
+        .await
+        .unwrap();
+
+        let mut schema = SchemaBuilder::default();
+        schema.add_sparse_vector_field_with_config(
+            "sparse",
+            true,
+            true,
+            SparseVectorConfig::default(),
+        );
+        let error = match load_sparse_file(&dir, &files, 0, &schema.build()).await {
+            Err(error) => error,
+            Ok(_) => panic!("BMP storage must be rejected by a MaxScore schema"),
+        };
+        assert!(
+            matches!(error, crate::Error::Corruption(message) if message.contains("stored as Bmp") && message.contains("configured as MaxScore"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_sparse_field_must_exist_in_schema() {
+        let files = SegmentFiles::new(71);
+        let dir = RamDirectory::new();
+        let maxscore = SparseVectorConfig::default();
+        dir.write(
+            &files.sparse,
+            &sparse_file_with_toc(SparseFieldToc {
+                field_id: 0,
+                quantization: maxscore.weight_quantization as u8,
+                total_vectors: 0,
+                dims: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let error = match load_sparse_file(&dir, &files, 0, &SchemaBuilder::default().build()).await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("stored sparse fields must exist in the schema"),
+        };
+        assert!(
+            matches!(error, crate::Error::Corruption(message) if message.contains("absent or not sparse"))
+        );
     }
 
     #[tokio::test]

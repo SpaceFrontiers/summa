@@ -61,6 +61,194 @@ use crate::segment::{SegmentMerger, SegmentReader};
 
 use super::{MergePolicy, SegmentInfo};
 
+const FORCE_MERGE_MAX_FAN_IN: usize = 64;
+
+#[derive(Debug)]
+struct ForceMergeGroup {
+    segments: Vec<(String, u32)>,
+    total_docs: u64,
+}
+
+/// Deterministically pack segments into near-minimal final outputs.
+///
+/// Best-fit decreasing avoids the pathological smallest-first behavior where,
+/// for example, `4 + 4` is merged before two `6 + 4` pairs under a 10-doc
+/// limit. That old order both left excess segments and made its intermediate
+/// outputs eligible for another full BP pass. Bin packing is NP-hard; BFD is a
+/// bounded, deterministic approximation that produces maximal groups (no two
+/// output groups can still fit together).
+fn plan_force_merge_groups(
+    mut segments: Vec<(String, u32)>,
+    max_docs: u64,
+) -> Vec<ForceMergeGroup> {
+    segments.sort_unstable_by(|(left_id, left_docs), (right_id, right_docs)| {
+        right_docs
+            .cmp(left_docs)
+            .then_with(|| left_id.cmp(right_id))
+    });
+
+    let mut groups: Vec<ForceMergeGroup> = Vec::new();
+    for segment in segments {
+        let docs = u64::from(segment.1);
+        let best_group = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                group
+                    .total_docs
+                    .checked_add(docs)
+                    .filter(|&total| total <= max_docs)
+                    .map(|_| (index, group.total_docs))
+            })
+            .max_by_key(|&(index, used)| (used, std::cmp::Reverse(index)))
+            .map(|(index, _)| index);
+
+        if let Some(index) = best_group {
+            groups[index].total_docs += docs;
+            groups[index].segments.push(segment);
+        } else {
+            groups.push(ForceMergeGroup {
+                segments: vec![segment],
+                total_docs: docs,
+            });
+        }
+    }
+
+    // Preserve the old small-to-large source order inside each output. Besides
+    // stable document ordering, BMP block-copy compression depends on source
+    // alignment at group boundaries.
+    for group in &mut groups {
+        group
+            .segments
+            .sort_unstable_by(|(left_id, left_docs), (right_id, right_docs)| {
+                left_docs
+                    .cmp(right_docs)
+                    .then_with(|| left_id.cmp(right_id))
+            });
+    }
+
+    // Smallest outputs first limit transient disk headroom. Tie-break on the
+    // first (deterministically ordered) segment ID for reproducible plans.
+    groups.sort_unstable_by(|left, right| {
+        left.total_docs
+            .cmp(&right.total_docs)
+            .then_with(|| left.segments[0].0.cmp(&right.segments[0].0))
+    });
+    groups
+}
+
+fn force_merge_output_count(source_count: usize) -> usize {
+    if source_count < 2 {
+        return 0;
+    }
+    (source_count - 1).div_ceil(FORCE_MERGE_MAX_FAN_IN - 1)
+}
+
+#[derive(Debug)]
+struct ForceMergeStep {
+    /// Source or earlier-step node IDs, in final document order.
+    inputs: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct ForceMergeHierarchy {
+    steps: Vec<ForceMergeStep>,
+    root: usize,
+}
+
+/// Build a shallow ordered 64-ary reduction tree with the minimum possible
+/// number of merge outputs. All internal nodes have full fan-in except one
+/// deepest partial node; distributing internal nodes evenly keeps source
+/// rewrite depth balanced without changing concatenation order.
+fn plan_force_merge_hierarchy(source_count: usize) -> ForceMergeHierarchy {
+    debug_assert!(source_count >= 2);
+    let internal_count = force_merge_output_count(source_count);
+    let max_leaves = 1usize
+        .checked_add(internal_count.saturating_mul(FORCE_MERGE_MAX_FAN_IN - 1))
+        .expect("force-merge hierarchy size exceeds usize");
+    let deficit = max_leaves - source_count;
+    debug_assert!(deficit < FORCE_MERGE_MAX_FAN_IN - 1);
+
+    fn build(
+        leaf_start: usize,
+        leaf_count: usize,
+        internal_count: usize,
+        deficit: usize,
+        source_count: usize,
+        steps: &mut Vec<ForceMergeStep>,
+    ) -> usize {
+        debug_assert!(internal_count > 0);
+        if internal_count == 1 {
+            let arity = FORCE_MERGE_MAX_FAN_IN - deficit;
+            debug_assert_eq!(leaf_count, arity);
+            debug_assert!((2..=FORCE_MERGE_MAX_FAN_IN).contains(&arity));
+            let output = source_count + steps.len();
+            steps.push(ForceMergeStep {
+                inputs: (leaf_start..leaf_start + arity).collect(),
+            });
+            return output;
+        }
+
+        // Keep this node full and place the one partial arity, if any, in the
+        // deepest/largest child. This minimizes bytes rewritten versus making
+        // the root partial (65 inputs become 2 + 63 leaves, then one final
+        // merge, rather than rewriting a 64-input prefix).
+        let child_internal_total = internal_count - 1;
+        let base = child_internal_total / FORCE_MERGE_MAX_FAN_IN;
+        let extra = child_internal_total % FORCE_MERGE_MAX_FAN_IN;
+        let mut child_internal = vec![base; FORCE_MERGE_MAX_FAN_IN];
+        for count in &mut child_internal[..extra] {
+            *count += 1;
+        }
+        let partial_child = (deficit > 0).then(|| {
+            child_internal
+                .iter()
+                .position(|&count| count > 0)
+                .expect("a non-root partial node requires an internal child")
+        });
+
+        let mut cursor = leaf_start;
+        let mut inputs = Vec::with_capacity(FORCE_MERGE_MAX_FAN_IN);
+        for (child, &child_internals) in child_internal.iter().enumerate() {
+            if child_internals == 0 {
+                inputs.push(cursor);
+                cursor += 1;
+                continue;
+            }
+            let child_deficit = usize::from(partial_child == Some(child)) * deficit;
+            let child_leaves = 1usize
+                .checked_add(child_internals.saturating_mul(FORCE_MERGE_MAX_FAN_IN - 1))
+                .and_then(|maximum| maximum.checked_sub(child_deficit))
+                .expect("force-merge child size exceeds usize");
+            inputs.push(build(
+                cursor,
+                child_leaves,
+                child_internals,
+                child_deficit,
+                source_count,
+                steps,
+            ));
+            cursor += child_leaves;
+        }
+        debug_assert_eq!(cursor, leaf_start + leaf_count);
+        let output = source_count + steps.len();
+        steps.push(ForceMergeStep { inputs });
+        output
+    }
+
+    let mut steps = Vec::with_capacity(internal_count);
+    let root = build(
+        0,
+        source_count,
+        internal_count,
+        deficit,
+        source_count,
+        &mut steps,
+    );
+    debug_assert_eq!(steps.len(), internal_count);
+    ForceMergeHierarchy { steps, root }
+}
+
 // ============================================================================
 // RAII active-operation tracking
 // ============================================================================
@@ -441,6 +629,39 @@ struct ManagerState {
     merge_policy: Box<dyn MergePolicy>,
 }
 
+type ReplacementRefresh = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Reconcile a long-lived consumer after a durable segment replacement.
+/// This runs inside the same lifecycle-owned task as metadata publication, so
+/// cancelling the caller cannot leave the replacement published but unannounced.
+async fn refresh_replacement_topology(refresh: Option<ReplacementRefresh>) {
+    let Some(refresh) = refresh else {
+        return;
+    };
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match refresh().await {
+            Ok(()) => return,
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        log::warn!(
+            "[segment_lifecycle] replacement topology refresh failed after 3 attempts: {}",
+            error,
+        );
+    }
+}
+
 #[cfg(feature = "native")]
 struct MergeTaskError {
     error: Error,
@@ -497,13 +718,45 @@ type MergeTaskResult<T> = std::result::Result<T, MergeTaskError>;
 
 #[derive(Clone, Copy)]
 enum ReplacementLayout {
-    Recomputed {
-        reordered: bool,
-        bp_converged: bool,
-    },
+    /// No BP ran while combining these sources. The combined segment is not
+    /// globally reordered, but an interrupted BP lineage remains owed its
+    /// record-level deepening pass.
+    BlockCopy,
+    /// A BP pass produced the replacement layout.
+    BpReordered { converged: bool },
     /// A vector-only rewrite leaves document order and sparse layout exactly
     /// unchanged, so its persisted BP progress must not be reset or advanced.
     PreserveSingleSource,
+}
+
+fn replacement_bp_state(
+    parent_has_debt: bool,
+    parent_unconverged_passes: u32,
+    layout: ReplacementLayout,
+) -> (bool, bool, u32) {
+    match layout {
+        ReplacementLayout::BlockCopy => (
+            false,
+            !parent_has_debt,
+            if parent_has_debt {
+                parent_unconverged_passes
+            } else {
+                0
+            },
+        ),
+        ReplacementLayout::BpReordered { converged } => (
+            true,
+            converged,
+            if converged {
+                0
+            } else {
+                parent_unconverged_passes.saturating_add(1)
+            },
+        ),
+        ReplacementLayout::PreserveSingleSource => {
+            unreachable!("preserved layouts retain the complete source metadata")
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -621,6 +874,10 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Application-owned shared pool, when configured. This is the server
     /// path and ensures optimizer and merge-time work use the same threads.
     background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Writer-owned topology reconciler. Every durable replacement invokes
+    /// it from tracked lifecycle work so background merges cannot leave
+    /// primary-key snapshots pinning retired sources indefinitely.
+    replacement_refresh: parking_lot::RwLock<Option<ReplacementRefresh>>,
 }
 
 struct ForceMergeActivityGuard<'a>(&'a AtomicUsize);
@@ -736,7 +993,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             merge_bp_time_budget,
             bp_memory_budget_bytes,
             background_reorder_pool,
+            replacement_refresh: parking_lot::RwLock::new(None),
         }
+    }
+
+    pub(crate) fn set_replacement_refresh<F, Fut>(&self, refresh: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        *self.replacement_refresh.write() = Some(Arc::new(move || Box::pin(refresh())));
     }
 
     /// Bounded rayon pool for background CPU (merge-time BP, manual reorder,
@@ -1232,6 +1498,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let directory = Arc::clone(&self.directory);
         let trained = Arc::clone(&self.trained);
         let tracker = Arc::clone(&self.tracker);
+        let replacement_refresh = self.replacement_refresh.read().clone();
         // Keep the producer gate raised if the requesting future is cancelled
         // after the metadata transaction has been detached. The last guard
         // clone drops only after durable metadata and ArcSwap state agree.
@@ -1269,6 +1536,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             }
             tracker.complete_deletion(&ready_to_delete);
+            refresh_replacement_topology(replacement_refresh).await;
             Ok(())
         })
         .await
@@ -1516,56 +1784,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let ids = segment_ids_to_merge;
 
         Some(tokio::spawn(async move {
-            let mut output_cleanup = sm.output_cleanup_guard(output_id);
             let mut reevaluate = false;
             let mut retry_delay = None;
 
-            let trained_snap = sm.trained_for_segment_build();
-            let granularity = sm.merge_granularity(&ids).await;
-            let result = Self::do_merge(
-                sm.directory.as_ref(),
-                &sm.schema,
-                &ids,
-                output_id,
-                sm.term_cache_blocks,
-                trained_snap.as_deref(),
-                sm.reorder_on_merge,
-                granularity,
-                sm.merge_bp_time_budget,
-                sm.bp_memory_budget_bytes,
-                Arc::clone(&sm.reorder_permits),
-                ReorderPriority::Background,
-                Some(sm.background_cpu_pool()),
-            )
-            .await;
+            let result = sm
+                .merge_and_replace_registered(
+                    &ids,
+                    output_id,
+                    sm.reorder_on_merge,
+                    ReorderPriority::Background,
+                )
+                .await;
 
             match result {
-                Ok((new_id, doc_count, bp_converged)) => {
-                    match sm
-                        .replace_segments(
-                            &ids,
-                            new_id,
-                            doc_count,
-                            ReplacementLayout::Recomputed {
-                                reordered: sm.reorder_on_merge,
-                                bp_converged,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            output_cleanup.disarm();
-                            sm.clear_merge_retry_backoff();
-                            reevaluate = true;
-                        }
-                        Err(e) => {
-                            sm.delete_output_if_unregistered(output_id, "replacement failure")
-                                .await;
-                            output_cleanup.disarm();
-                            retry_delay = Some(sm.pause_merge_retries(&e));
-                            log::error!("[merge] failed to publish merged segment: {}", e);
-                        }
-                    }
+                Ok(_) => {
+                    sm.clear_merge_retry_backoff();
+                    reevaluate = true;
                 }
                 Err(MergeTaskError {
                     error,
@@ -1577,19 +1811,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         error
                     );
                     if !unavailable_segments.is_empty() {
-                        for segment_id in &unavailable_segments {
-                            sm.quarantine_segment(segment_id, &error);
-                        }
-                        // Recompute without this known-bad input. This is not a
+                        // Recompute without known-bad inputs. This is not a
                         // retry of the same candidate because policy filtering
                         // excludes every quarantined ID.
                         reevaluate = true;
                     } else {
                         retry_delay = Some(sm.pause_merge_retries(&error));
                     }
-                    sm.delete_output_if_unregistered(output_id, "merge failure")
-                        .await;
-                    output_cleanup.disarm();
                 }
             }
             // Release source/output ownership before re-evaluating policy, so
@@ -1611,6 +1839,76 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 sm.schedule_merge_retry_wakeup(retry_delay);
             }
         }))
+    }
+
+    /// Execute the common build → validate → durable replacement transaction
+    /// for a batch whose source/output IDs are already lifecycle-owned.
+    ///
+    /// Scheduling, retry policy, and post-replacement snapshot refresh remain
+    /// with the caller. Keeping the transaction here prevents background and
+    /// force-merge paths from drifting on cleanup or BP metadata semantics.
+    async fn merge_and_replace_registered(
+        self: &Arc<Self>,
+        ids: &[String],
+        output_id: SegmentId,
+        reorder_bmp: bool,
+        priority: ReorderPriority,
+    ) -> MergeTaskResult<(String, u32, bool)> {
+        let mut output_cleanup = self.output_cleanup_guard(output_id);
+        let trained = self.trained_for_segment_build();
+        let granularity = if reorder_bmp {
+            self.merge_granularity(ids).await
+        } else {
+            crate::segment::reorder::BpGranularity::Auto
+        };
+        let result = Self::do_merge(
+            self.directory.as_ref(),
+            &self.schema,
+            ids,
+            output_id,
+            self.term_cache_blocks,
+            trained.as_deref(),
+            reorder_bmp,
+            granularity,
+            self.merge_bp_time_budget,
+            self.bp_memory_budget_bytes,
+            Arc::clone(&self.reorder_permits),
+            priority,
+            Some(self.background_cpu_pool()),
+        )
+        .await;
+
+        let (new_id, doc_count, bp_converged) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                for segment_id in &error.unavailable_segments {
+                    self.quarantine_segment(segment_id, &error.error);
+                }
+                self.delete_output_if_unregistered(output_id, "merge failure")
+                    .await;
+                output_cleanup.disarm();
+                return Err(error);
+            }
+        };
+
+        let layout = if reorder_bmp {
+            ReplacementLayout::BpReordered {
+                converged: bp_converged,
+            }
+        } else {
+            ReplacementLayout::BlockCopy
+        };
+        if let Err(error) = self
+            .replace_segments(ids, new_id.clone(), doc_count, layout)
+            .await
+        {
+            self.delete_output_if_unregistered(output_id, "replacement failure")
+                .await;
+            output_cleanup.disarm();
+            return Err(MergeTaskError::from(error));
+        }
+        output_cleanup.disarm();
+        Ok((new_id, doc_count, bp_converged))
     }
 
     /// Re-evaluate merge policy after a failure backoff, outside the tracked
@@ -1692,10 +1990,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         let replacement_info = match layout {
-            ReplacementLayout::Recomputed {
-                reordered,
-                bp_converged,
-            } => {
+            ReplacementLayout::BlockCopy | ReplacementLayout::BpReordered { .. } => {
                 let generation = old_ids
                     .iter()
                     .filter_map(|id| st.metadata.segment_metas.get(id))
@@ -1710,18 +2005,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .map(|info| info.bp_unconverged_passes)
                     .max()
                     .unwrap_or(0);
-                let passes = if reordered && !bp_converged {
-                    parent_unconverged_passes.saturating_add(1)
-                } else {
-                    0
-                };
+                let parent_has_debt = old_ids
+                    .iter()
+                    .filter_map(|id| st.metadata.segment_metas.get(id))
+                    .any(|info| !info.bp_converged);
+                let (reordered, bp_converged, bp_unconverged_passes) =
+                    replacement_bp_state(parent_has_debt, parent_unconverged_passes, layout);
                 SegmentMetaInfo {
                     num_docs: doc_count,
                     ancestors: old_ids.to_vec(),
                     generation,
                     reordered,
                     bp_converged,
-                    bp_unconverged_passes: passes,
+                    bp_unconverged_passes,
                 }
             }
             ReplacementLayout::PreserveSingleSource => {
@@ -1753,6 +2049,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let directory = Arc::clone(&self.directory);
         let tracker = Arc::clone(&self.tracker);
+        let replacement_refresh = self.replacement_refresh.read().clone();
         self.run_lifecycle_transaction(async move {
             // Durable-before-visible. If persistence fails, old metadata and
             // tracker ownership stay intact and source deletion is never armed.
@@ -1777,6 +2074,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             }
             tracker.complete_deletion(&ready_to_delete);
+            refresh_replacement_topology(replacement_refresh).await;
             Ok(())
         })
         .await
@@ -1962,11 +2260,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Drain all in-flight merge tasks safely.
     ///
-    /// Tokio cannot abort a `spawn_blocking` closure once it has started. The
-    /// old implementation aborted only the async wrapper and returned while
-    /// merge-time BP still owned an `OffsetWriter`, allowing index deletion or
-    /// orphan cleanup to race a live writer. Awaiting is the only sound generic
-    /// behavior until every merge phase supports cooperative cancellation.
+    /// Merge/reorder writers use synchronous block-in-place sections, so an
+    /// abort request takes effect only after the owned writer reaches its next
+    /// await. Draining the complete task remains necessary before index
+    /// deletion or orphan cleanup can safely proceed.
     ///
     /// Cancellation-safe: dropping this future mid-drain returns un-awaited
     /// handles to `merge_handles` so later drains still see in-flight merges.
@@ -2035,7 +2332,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Force merge segments into the fewest possible segments, respecting
+    /// Force merge segments into compact, size-balanced groups, respecting
     /// `max_segment_docs` from the merge policy.
     ///
     /// If the policy defines a max segment size, segments are merged in batches
@@ -2044,7 +2341,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Each batch is registered in `active_operations` via an RAII guard to prevent
     /// `maybe_merge` from spawning a conflicting background merge.
     pub async fn force_merge(self: &Arc<Self>) -> Result<()> {
-        const FORCE_MERGE_BATCH: usize = 64;
+        self.force_merge_with_snapshot_refresh(|| std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Force merge while refreshing long-lived segment snapshots after the
+    /// initial background-merge drain and every durable replacement.
+    ///
+    /// Long-lived consumers such as the primary-key index and cached
+    /// `IndexReader` hold segment snapshots. Refreshing them only after the
+    /// complete force merge retains every retired source file for the entire
+    /// operation, which can temporarily double a large index on disk. The
+    /// hook lets the owning `IndexWriter`/server advance those snapshots after
+    /// each batch while the force merge remains otherwise memory bounded.
+    pub(crate) async fn force_merge_with_snapshot_refresh<F, Fut>(
+        self: &Arc<Self>,
+        mut refresh_snapshots: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         // Conflicting owners that never appear in `merge_handles` (background
         // reorders, a concurrent force-merge) can hold a batch segment for
         // minutes to hours; retrying without parking would busy-spin a runtime
@@ -2070,31 +2387,32 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         // Wait for all in-flight background merges (including cascading)
         // before starting forced merges to avoid try_register conflicts.
+        let drain_start = std::time::Instant::now();
         self.wait_for_all_merges().await;
-
-        // Once pre-existing merges are drained, stop admitting new background
-        // BP passes and reserve all but one reorder slot. Existing optimizer
-        // passes finish normally; this force merge then owns the remaining
-        // capacity instead of sitting behind a continually replenished queue.
-        // Keep the guard for every force-merge batch so background work cannot
-        // interleave between batches.
-        let _foreground_reorder = if self.reorder_on_merge {
+        if drain_start.elapsed() >= std::time::Duration::from_secs(1) {
             log::info!(
-                "[force_merge] prioritizing BP capacity ({} total pass slot(s))",
-                self.reorder_permits.limit(),
+                "[force_merge] drained background merges in {:.1}s",
+                drain_start.elapsed().as_secs_f64(),
             );
-            Some(
-                Arc::clone(&self.reorder_permits)
-                    .begin_foreground()
-                    .await
-                    .map_err(|_| {
-                        Error::Internal("background reorder scheduler is closed".into())
-                    })?,
-            )
-        } else {
-            None
-        };
+        }
 
+        // A background merge may have published after the writer's preceding
+        // commit refresh but before the drain completed. Advance PK/search
+        // snapshots now so its retired sources do not survive until the first
+        // forced replacement (or forever when no batch is needed).
+        let refresh_start = std::time::Instant::now();
+        refresh_snapshots().await?;
+        if refresh_start.elapsed() >= std::time::Duration::from_secs(1) {
+            log::info!(
+                "[force_merge] initial snapshot refresh took {:.1}s",
+                refresh_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        // Outputs produced by a completed bin are already maximal according
+        // to the BFD plan. Excluding them from later replanning prevents an
+        // expensive final BP output from being selected and reordered again.
+        let mut completed_outputs = HashSet::new();
         // One INFO line per wait episode, not per 1s poll; DEBUG afterwards.
         let mut logged_held_wait = false;
 
@@ -2102,68 +2420,64 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             if !self.active_operations.is_accepting() {
                 return Err(Error::IndexClosed);
             }
-            // Get segment IDs with their doc counts, sorted ascending by size
-            let mut segments: Vec<(String, u32)> = {
+
+            let segments: Vec<(String, u32)> = {
                 let st = self.state.lock().await;
                 st.metadata
                     .segment_metas
                     .iter()
+                    .filter(|(id, _)| !completed_outputs.contains(*id))
                     .map(|(id, info)| (id.clone(), info.num_docs))
                     .collect()
             };
 
-            if segments.len() < 2 {
-                return Ok(());
-            }
-
-            segments.sort_by_key(|(_, docs)| *docs);
-
-            // Route around segments owned by active operations (background
-            // reorders, concurrent force-merges) instead of insisting on the
-            // deterministic smallest-N batch: retrying a batch that contains a
-            // segment mid-BP-pass livelocked here for the whole pass (observed
-            // in prod: the optimizer holds exactly the small fresh segments
-            // force_merge wants first). Held segments are merged on a later
-            // iteration, after their owner releases them.
+            // Route around segments owned by active operations instead of
+            // retrying the same conflicting batch. Group ownership is claimed
+            // before foreground capacity, so an in-flight optimizer/retrain
+            // can finish without a capacity/ownership lock inversion.
             let active_ids = self.active_operations.snapshot();
-            let held: usize = segments
+            let held = segments
                 .iter()
                 .filter(|(id, _)| active_ids.contains(id))
                 .count();
+            let free_segments: Vec<_> = segments
+                .into_iter()
+                .filter(|(id, _)| !active_ids.contains(id))
+                .collect();
+            // Every segment format and doc map uses u32 document IDs. A policy
+            // with no explicit cap therefore means "up to the format limit",
+            // not an unrepresentable u64-sized output.
+            let max_docs = max_segment_docs
+                .map(u64::from)
+                .unwrap_or(u64::from(u32::MAX));
+            let next_group = plan_force_merge_groups(free_segments, max_docs)
+                .into_iter()
+                .find(|group| group.segments.len() >= 2);
 
-            // Build a batch of free segments respecting max_segment_docs
-            let max_docs = max_segment_docs.map(|m| m as u64).unwrap_or(u64::MAX);
-            let mut batch = Vec::new();
-            let mut batch_docs = 0u64;
-
-            for (id, docs) in &segments {
-                if active_ids.contains(id) {
-                    continue;
-                }
-                if batch.len() >= FORCE_MERGE_BATCH {
-                    break;
-                }
-                let next_total = batch_docs + *docs as u64;
-                if next_total > max_docs && !batch.is_empty() {
-                    break;
-                }
-                batch.push(id.clone());
-                batch_docs += *docs as u64;
-            }
-
-            if batch.len() < 2 {
+            let Some(group) = next_group else {
                 if held == 0 {
-                    // Nothing left that can merge and nobody will release
-                    // more candidates: force merge is complete.
+                    if !completed_outputs.is_empty() {
+                        // A segment held while earlier groups ran may now fit
+                        // with one of those outputs. Reconsider completed bins
+                        // once before declaring convergence. In the normal
+                        // no-conflict path BFD groups are pairwise maximal, so
+                        // this extra planning round performs no merge.
+                        completed_outputs.clear();
+                        continue;
+                    }
+                    // Every remaining free segment is either already at the
+                    // size cap or cannot be paired without exceeding it.
+                    // A reorder that was already running when foreground
+                    // admission began may have published after the preceding
+                    // callback. Reconcile external readers one final time so
+                    // they cannot retain its retired source indefinitely.
+                    refresh_snapshots().await?;
                     return Ok(());
                 }
-                // All remaining work is behind active owners. Their guards
-                // are RAII and their passes are time-budgeted, so this always
-                // unblocks; poll slowly rather than spinning.
                 if !logged_held_wait {
                     log::info!(
                         "[force_merge] waiting: {} segment(s) held by active \
-                         merge/reorder operations, none free to merge",
+                         merge/reorder operations, no free group can merge",
                         held
                     );
                     logged_held_wait = true;
@@ -2181,38 +2495,29 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     () = tokio::time::sleep(FORCE_MERGE_HELD_BACKOFF) => {}
                 }
                 continue;
-            }
+            };
             logged_held_wait = false;
 
-            let _global_merge_permit = tokio::select! {
-                biased;
-                () = self.active_operations.wait_for_shutdown() => {
-                    return Err(Error::IndexClosed);
-                }
-                permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
-                    permit.map_err(|_| {
-                        Error::Internal("global background merge scheduler is closed".into())
-                    })?
-                }
-            };
-
-            let output_id = SegmentId::new();
-            let output_hex = output_id.to_hex();
-
-            // Register batch + output under `state`, matching orphan cleanup's
-            // deletion barrier and preventing a stale batch from starting.
-            let mut all_ids = batch.clone();
-            all_ids.push(output_hex);
-            let guard = {
+            // Claim the complete final group and all of its future output IDs
+            // up front. This freezes the hierarchy while allowing every
+            // durable intermediate replacement to release its source files.
+            let hierarchy = plan_force_merge_hierarchy(group.segments.len());
+            let output_ids: Vec<_> = (0..hierarchy.steps.len())
+                .map(|_| SegmentId::new())
+                .collect();
+            let source_ids: Vec<_> = group.segments.iter().map(|(id, _)| id.clone()).collect();
+            let mut all_ids = source_ids.clone();
+            all_ids.extend(output_ids.iter().map(|id| id.to_hex()));
+            let group_guard = {
                 let st = self.state.lock().await;
-                batch
+                source_ids
                     .iter()
                     .all(|id| st.metadata.has_segment(id))
                     .then(|| self.active_operations.try_register(all_ids))
                     .flatten()
             };
-            let _guard = match guard {
-                Some(g) => g,
+            let _group_guard = match group_guard {
+                Some(guard) => guard,
                 None if !self.active_operations.is_accepting() => {
                     return Err(Error::IndexClosed);
                 }
@@ -2220,15 +2525,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     #[cfg(test)]
                     self.force_merge_conflict_retries
                         .fetch_add(1, Ordering::Relaxed);
-                    // Do not reserve application-wide merge capacity while
-                    // parked on a conflict.
-                    drop(_global_merge_permit);
-                    // The ownership snapshot above is advisory: an operation
-                    // can register one of our batch segments between the
-                    // snapshot and try_register. A tracked background merge
-                    // may also have slipped in — drain those first, then back
-                    // off briefly and rebuild the batch from a fresh snapshot.
-                    log::debug!("[force_merge] batch lost a registration race, rebuilding");
+                    log::debug!("[force_merge] group lost a registration race, replanning");
                     let had_tracked_merges = !self.merge_handles.lock().is_empty();
                     self.wait_for_merging_thread().await;
                     if !had_tracked_merges {
@@ -2237,70 +2534,160 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     continue;
                 }
             };
-            // Announce only after ownership is secured: this line used to
-            // print before registration, spamming once per 100ms retry while
-            // a reorder held a batch segment.
-            log::info!(
-                "[force_merge] merging batch of {} segments ({} docs)",
-                batch.len(),
-                batch_docs
-            );
-            let mut output_cleanup = self.output_cleanup_guard(output_id);
 
-            let trained_snap = self.trained_for_segment_build();
-            let granularity = self.merge_granularity(&batch).await;
-            let merge_result = Self::do_merge(
-                self.directory.as_ref(),
-                &self.schema,
-                &batch,
-                output_id,
-                self.term_cache_blocks,
-                trained_snap.as_deref(),
-                self.reorder_on_merge,
-                granularity,
-                self.merge_bp_time_budget,
-                self.bp_memory_budget_bytes,
-                Arc::clone(&self.reorder_permits),
-                ReorderPriority::Foreground,
-                Some(self.background_cpu_pool()),
-            )
-            .await;
-            let (new_segment_id, total_docs, bp_converged) = match merge_result {
-                Ok(v) => v,
-                Err(MergeTaskError {
-                    error,
-                    unavailable_segments,
-                }) => {
-                    for segment_id in &unavailable_segments {
-                        self.quarantine_segment(segment_id, &error);
+            log::info!(
+                "[force_merge] planned final group: {} segments, {} docs, {} merge pass(es)",
+                group.segments.len(),
+                group.total_docs,
+                output_ids.len(),
+            );
+
+            // Claiming the complete group before any capacity wait prevents a
+            // vector-generation pause from waiting for a global slot retained
+            // by force merge while force merge waits for that pause to end.
+            //
+            // Background merges acquire global merge capacity before the
+            // shared BP gate. Preserve that order here: wait for one group
+            // slot while background BP remains admitted, then pause new BP
+            // passes. The retained slot guarantees this hierarchy can make
+            // progress even if other indexes subsequently park at the gate.
+            let group_global_merge_permit = if self.reorder_on_merge {
+                let capacity_start = std::time::Instant::now();
+                let permit = tokio::select! {
+                    biased;
+                    () = self.active_operations.wait_for_shutdown() => {
+                        return Err(Error::IndexClosed);
                     }
-                    self.delete_output_if_unregistered(output_id, "force-merge failure")
-                        .await;
-                    output_cleanup.disarm();
-                    return Err(error);
+                    permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
+                        permit.map_err(|_| {
+                            Error::Internal(
+                                "global background merge scheduler is closed".into(),
+                            )
+                        })?
+                    }
+                };
+                if capacity_start.elapsed() >= std::time::Duration::from_secs(1) {
+                    log::info!(
+                        "[force_merge] waited {:.1}s for foreground global merge capacity",
+                        capacity_start.elapsed().as_secs_f64(),
+                    );
                 }
+                Some(permit)
+            } else {
+                None
+            };
+            let _foreground_reorder = if self.reorder_on_merge {
+                log::info!(
+                    "[force_merge] prioritizing BP capacity ({} total pass slot(s))",
+                    self.reorder_permits.limit(),
+                );
+                let admission_start = std::time::Instant::now();
+                let guard = Arc::clone(&self.reorder_permits)
+                    .begin_foreground()
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("background reorder scheduler is closed".into())
+                    })?;
+                if admission_start.elapsed() >= std::time::Duration::from_secs(1) {
+                    log::info!(
+                        "[force_merge] acquired foreground BP capacity in {:.1}s",
+                        admission_start.elapsed().as_secs_f64(),
+                    );
+                }
+                Some(guard)
+            } else {
+                None
             };
 
-            if let Err(e) = self
-                .replace_segments(
-                    &batch,
-                    new_segment_id,
-                    total_docs,
-                    ReplacementLayout::Recomputed {
-                        reordered: self.reorder_on_merge,
-                        bp_converged,
-                    },
-                )
-                .await
-            {
-                self.delete_output_if_unregistered(output_id, "replacement failure")
-                    .await;
-                output_cleanup.disarm();
-                return Err(e);
-            }
-            output_cleanup.disarm();
+            let source_count = group.segments.len();
+            let mut nodes: Vec<Option<(String, u32)>> =
+                group.segments.into_iter().map(Some).collect();
+            nodes.resize_with(source_count + hierarchy.steps.len(), || None);
+            for (step_index, step) in hierarchy.steps.iter().enumerate() {
+                let final_pass = step_index + 1 == hierarchy.steps.len();
+                let mut batch_entries = Vec::with_capacity(step.inputs.len());
+                for &node in &step.inputs {
+                    let entry = nodes
+                        .get_mut(node)
+                        .and_then(Option::take)
+                        .expect("force-merge hierarchy must reference an available node");
+                    batch_entries.push(entry);
+                }
+                let batch: Vec<_> = batch_entries.iter().map(|(id, _)| id.clone()).collect();
+                let batch_docs: u64 = batch_entries.iter().map(|(_, docs)| u64::from(*docs)).sum();
+                let output_id = output_ids[step_index];
 
-            // _guard drops here, releasing operation ownership.
+                let capacity_start = std::time::Instant::now();
+                let step_global_merge_permit = if group_global_merge_permit.is_none() {
+                    Some(tokio::select! {
+                        biased;
+                        () = self.active_operations.wait_for_shutdown() => {
+                            return Err(Error::IndexClosed);
+                        }
+                        permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
+                            permit.map_err(|_| {
+                                Error::Internal(
+                                    "global background merge scheduler is closed".into(),
+                                )
+                            })?
+                        }
+                    })
+                } else {
+                    None
+                };
+                if capacity_start.elapsed() >= std::time::Duration::from_secs(1) {
+                    log::info!(
+                        "[force_merge] waited {:.1}s for global merge capacity",
+                        capacity_start.elapsed().as_secs_f64(),
+                    );
+                }
+
+                // Intermediate reductions are streaming block-copy merges.
+                // Only the final pass pays BP, so a group with hundreds of
+                // tiny sources never reorders the same documents repeatedly.
+                let reorder_bmp = final_pass && self.reorder_on_merge;
+                log::info!(
+                    "[force_merge] {} pass: {} segments ({} docs, bp={})",
+                    if final_pass {
+                        "final"
+                    } else {
+                        "fan-in reduction"
+                    },
+                    batch.len(),
+                    batch_docs,
+                    reorder_bmp,
+                );
+                let (new_segment_id, total_docs, _) = self
+                    .merge_and_replace_registered(
+                        &batch,
+                        output_id,
+                        reorder_bmp,
+                        ReorderPriority::Foreground,
+                    )
+                    .await
+                    .map_err(|error| error.error)?;
+                drop(step_global_merge_permit);
+
+                // Advance PK/read snapshots after every hierarchy level so
+                // retired sources do not accumulate until the final output.
+                let refresh_start = std::time::Instant::now();
+                refresh_snapshots().await?;
+                if refresh_start.elapsed() >= std::time::Duration::from_secs(1) {
+                    log::info!(
+                        "[force_merge] post-replacement snapshot refresh took {:.1}s",
+                        refresh_start.elapsed().as_secs_f64(),
+                    );
+                }
+
+                let output_node = source_count + step_index;
+                debug_assert!(nodes[output_node].is_none());
+                nodes[output_node] = Some((new_segment_id, total_docs));
+            }
+            let (root_id, _) = nodes[hierarchy.root]
+                .take()
+                .expect("force-merge hierarchy must produce its root");
+            debug_assert!(nodes.into_iter().all(|node| node.is_none()));
+            completed_outputs.insert(root_id);
         }
     }
 
@@ -2728,7 +3115,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ///
     /// Uses active-operation ownership to prevent concurrent work on the same segment.
     pub async fn reorder_segments(self: &Arc<Self>) -> Result<()> {
+        self.reorder_segments_with_snapshot_refresh(|| std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Reorder all segments while advancing long-lived snapshots after the
+    /// background-merge drain and every durable replacement.
+    pub(crate) async fn reorder_segments_with_snapshot_refresh<F, Fut>(
+        self: &Arc<Self>,
+        mut refresh_snapshots: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         self.wait_for_all_merges().await;
+        refresh_snapshots().await?;
         let segment_ids = self.get_segment_ids().await;
 
         if segment_ids.is_empty() {
@@ -2743,12 +3145,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .reorder_single_segment(&seg_id, None, crate::segment::BpBudget::full())
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => refresh_snapshots().await?,
                 Ok(false) => log::warn!("[reorder] segment {} skipped (in merge)", seg_id),
                 Err(e) => return Err(e),
             }
         }
 
+        // A segment skipped because another lifecycle owner held it may have
+        // been replaced after the preceding callback.
+        refresh_snapshots().await?;
         log::info!("[reorder] all segments reordered");
         Ok(())
     }
@@ -2777,6 +3182,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .iter()
             .filter(|(id, info)| {
                 !info.reordered
+                    && info.bp_converged
                     && !active_ids.contains(*id)
                     && !quarantined.contains(*id)
                     && !paused.contains(*id)
@@ -2810,8 +3216,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .segment_metas
             .iter()
             .filter(|(id, info)| {
-                info.reordered
-                    && !info.bp_converged
+                !info.bp_converged
                     && info.bp_unconverged_passes < max_unconverged_passes
                     && !active_ids.contains(*id)
                     && !quarantined.contains(*id)
@@ -2822,7 +3227,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Granularity for a BP pass whose sources are `ids`: `Records` when any
-    /// source is an unconverged partial reorder, `Auto` otherwise.
+    /// source carries unconverged BP debt, `Auto` otherwise.
     ///
     /// Alignment with the depth budget (docs/block-level-reorder.md): an
     /// unconverged segment is owed a deepening pass, and the output of this
@@ -2836,12 +3241,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             st.metadata
                 .segment_metas
                 .get(id)
-                .is_some_and(|info| info.reordered && !info.bp_converged)
+                .is_some_and(|info| !info.bp_converged)
         });
         drop(st);
         if deepening {
             log::info!(
-                "[reorder] source segment(s) unconverged — forcing record-level BP (deepening pass)",
+                "[reorder] source BP lineage unconverged — forcing record-level BP (deepening pass)",
             );
             crate::segment::reorder::BpGranularity::Records
         } else {
@@ -2866,6 +3271,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 "segment {} is quarantined after a deterministic source failure; repair it and restart before reordering",
                 seg_id
             )));
+        }
+        if self.force_merge_active.load(Ordering::Acquire) > 0 {
+            log::debug!(
+                "[optimizer] explicit force merge active, skipping reorder of {}",
+                seg_id,
+            );
+            return Ok(false);
         }
 
         // Whole-pass concurrency is independent from Rayon width. One pass
@@ -2898,6 +3310,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let all_ids = vec![seg_id.to_string(), output_hex];
         let (_guard, source_docs) = {
             let st = self.state.lock().await;
+            // Force merge raises this barrier under the same state lock, so
+            // this second check closes the race with the cheap early check
+            // above and prevents optimizer starvation between final groups.
+            if self.force_merge_active.load(Ordering::Acquire) > 0 {
+                log::debug!(
+                    "[optimizer] explicit force merge active, skipping reorder of {}",
+                    seg_id,
+                );
+                return Ok(false);
+            }
             let Some(source_meta) = st.metadata.segment_metas.get(seg_id) else {
                 log::info!(
                     "[optimizer] segment {} no longer in metadata (merged away), skipping reorder",
@@ -2974,9 +3396,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 &[seg_id.to_string()],
                 new_id,
                 total_docs,
-                ReplacementLayout::Recomputed {
-                    reordered: true,
-                    bp_converged: ladder_converged,
+                ReplacementLayout::BpReordered {
+                    converged: ladder_converged,
                 },
             )
             .await
@@ -3102,6 +3523,288 @@ mod tests {
             Arc::new(ReorderConcurrencyGate::new(1)),
             None,
         ))
+    }
+
+    #[test]
+    fn force_merge_planner_pairs_large_and_small_segments() {
+        let groups = plan_force_merge_groups(
+            vec![
+                ("a".into(), 6),
+                ("b".into(), 6),
+                ("c".into(), 4),
+                ("d".into(), 4),
+            ],
+            10,
+        );
+
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| group.total_docs == 10));
+        assert!(groups.iter().all(|group| group.segments.len() == 2));
+    }
+
+    #[test]
+    fn force_merge_planner_leaves_oversized_segments_alone() {
+        let groups = plan_force_merge_groups(
+            vec![
+                ("oversized".into(), 11),
+                ("small-a".into(), 5),
+                ("small-b".into(), 5),
+            ],
+            10,
+        );
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].total_docs, 10);
+        assert_eq!(groups[0].segments.len(), 2);
+        assert_eq!(groups[1].total_docs, 11);
+        assert_eq!(groups[1].segments.len(), 1);
+    }
+
+    #[test]
+    fn force_merge_planner_never_exceeds_segment_format_limit() {
+        let groups = plan_force_merge_groups(
+            vec![
+                ("large-a".into(), 3_000_000_000),
+                ("large-b".into(), 2_000_000_000),
+            ],
+            u64::from(u32::MAX),
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.total_docs <= u64::from(u32::MAX))
+        );
+    }
+
+    #[test]
+    fn force_merge_hierarchy_has_one_final_bp_pass() {
+        assert_eq!(force_merge_output_count(1), 0);
+        assert_eq!(force_merge_output_count(2), 1);
+        assert_eq!(force_merge_output_count(64), 1);
+        assert_eq!(force_merge_output_count(65), 2);
+        assert_eq!(force_merge_output_count(127), 2);
+        assert_eq!(force_merge_output_count(128), 3);
+        assert_eq!(force_merge_output_count(1_000), 16);
+    }
+
+    fn expand_force_merge_node(
+        hierarchy: &ForceMergeHierarchy,
+        source_count: usize,
+        node: usize,
+        sources: &mut Vec<usize>,
+    ) {
+        if node < source_count {
+            sources.push(node);
+            return;
+        }
+
+        let step_index = node - source_count;
+        let step = hierarchy
+            .steps
+            .get(step_index)
+            .expect("merge input must refer to an existing source or output");
+        for &input in &step.inputs {
+            assert!(
+                input < node,
+                "merge step {step_index} refers to a future output node {input}"
+            );
+            expand_force_merge_node(hierarchy, source_count, input, sources);
+        }
+    }
+
+    #[test]
+    fn force_merge_hierarchy_has_minimal_valid_arity() {
+        let source_counts = (2..=1_024).chain([4_095, 4_096, 4_097, 10_000]);
+
+        for source_count in source_counts {
+            let hierarchy = plan_force_merge_hierarchy(source_count);
+            let output_count = hierarchy.steps.len();
+
+            assert!(
+                hierarchy
+                    .steps
+                    .iter()
+                    .all(|step| (2..=FORCE_MERGE_MAX_FAN_IN).contains(&step.inputs.len())),
+                "invalid merge arity for {source_count} sources"
+            );
+            assert!(
+                source_count <= 1 + output_count * (FORCE_MERGE_MAX_FAN_IN - 1),
+                "{output_count} outputs cannot reduce {source_count} sources"
+            );
+            assert!(
+                output_count == 1
+                    || source_count > 1 + (output_count - 1) * (FORCE_MERGE_MAX_FAN_IN - 1),
+                "{output_count} outputs are not minimal for {source_count} sources"
+            );
+            assert_eq!(output_count, force_merge_output_count(source_count));
+        }
+    }
+
+    #[test]
+    fn force_merge_hierarchy_preserves_exact_source_order() {
+        for source_count in [2, 3, 63, 64, 65, 66, 126, 127, 128, 129, 1_000, 4_097] {
+            let hierarchy = plan_force_merge_hierarchy(source_count);
+            let mut sources = Vec::with_capacity(source_count);
+            expand_force_merge_node(&hierarchy, source_count, hierarchy.root, &mut sources);
+            assert_eq!(
+                sources,
+                (0..source_count).collect::<Vec<_>>(),
+                "source order changed for {source_count} sources"
+            );
+        }
+    }
+
+    fn force_merge_rewrite_cost(source_count: usize) -> usize {
+        let hierarchy = plan_force_merge_hierarchy(source_count);
+        let mut node_weights = vec![1usize; source_count];
+        let mut rewrite_cost = 0usize;
+
+        for (step_index, step) in hierarchy.steps.iter().enumerate() {
+            let output = source_count + step_index;
+            let output_weight = step
+                .inputs
+                .iter()
+                .map(|&input| {
+                    assert!(
+                        input < output,
+                        "merge step {step_index} refers to future output {input}"
+                    );
+                    node_weights[input]
+                })
+                .sum::<usize>();
+            rewrite_cost += output_weight;
+            node_weights.push(output_weight);
+        }
+
+        assert_eq!(node_weights[hierarchy.root], source_count);
+        rewrite_cost
+    }
+
+    #[test]
+    fn force_merge_hierarchy_avoids_growing_prefix_rewrites() {
+        assert_eq!(force_merge_rewrite_cost(65), 67);
+        assert_eq!(force_merge_rewrite_cost(1_000), 1_951);
+    }
+
+    #[test]
+    fn block_copy_carries_bp_debt_without_spending_an_attempt() {
+        assert_eq!(
+            replacement_bp_state(true, 3, ReplacementLayout::BlockCopy),
+            (false, false, 3),
+        );
+        assert_eq!(
+            replacement_bp_state(true, 3, ReplacementLayout::BpReordered { converged: false },),
+            (true, false, 4),
+        );
+        assert_eq!(
+            replacement_bp_state(true, 3, ReplacementLayout::BpReordered { converged: true },),
+            (true, true, 0),
+        );
+    }
+
+    #[tokio::test]
+    async fn force_merge_reconsiders_outputs_after_a_held_source_releases() {
+        let mut schema_builder = crate::dsl::SchemaBuilder::default();
+        let field = schema_builder.add_text_field("text", true, true);
+        let schema = schema_builder.build();
+        let directory = crate::directories::RamDirectory::new();
+        let config = crate::index::IndexConfig {
+            num_indexing_threads: 1,
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        };
+        let mut writer = crate::index::IndexWriter::create(directory, schema, config)
+            .await
+            .unwrap();
+        for value in ["one", "two", "three"] {
+            let mut document = crate::dsl::Document::new();
+            document.add_text(field, value);
+            writer.add_document(document).unwrap();
+            writer.commit().await.unwrap();
+        }
+
+        let manager = Arc::clone(writer.segment_manager());
+        let held_id = manager.get_segment_ids().await.pop().unwrap();
+        let mut held = Some(
+            manager
+                .active_operations
+                .try_register(vec![held_id])
+                .unwrap(),
+        );
+        let batches = Arc::new(AtomicUsize::new(0));
+        let batch_count = Arc::clone(&batches);
+        writer
+            .force_merge_with_snapshot_refresh(move || {
+                let refresh = batch_count.fetch_add(1, Ordering::Relaxed) + 1;
+                // Refresh #1 follows the startup drain. Keep the source held
+                // until refresh #2, after the two free sources were replaced.
+                if refresh == 2 {
+                    drop(held.take());
+                }
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(manager.get_segment_ids().await.len(), 1);
+        assert_eq!(
+            batches.load(Ordering::Relaxed),
+            4,
+            "initial/final refreshes plus two replacements are required after the held source releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_merge_does_not_hold_global_capacity_while_vector_update_pauses_claims() {
+        let mut schema_builder = crate::dsl::SchemaBuilder::default();
+        schema_builder.set_reorder_on_merge(true);
+        let schema = schema_builder.build();
+        let mut metadata = IndexMetadata::new(schema.clone());
+        metadata.add_segment("00000000000000000000000000000001".into(), 1);
+        metadata.add_segment("00000000000000000000000000000002".into(), 1);
+
+        let global_merge_permits = Arc::new(Semaphore::new(1));
+        let manager = Arc::new(SegmentManager::new(
+            Arc::new(crate::directories::RamDirectory::new()),
+            Arc::new(schema),
+            metadata,
+            Box::new(crate::merge::NoMergePolicy),
+            0,
+            1,
+            Arc::clone(&global_merge_permits),
+            None,
+            1024,
+            Arc::new(ReorderConcurrencyGate::new(1)),
+            None,
+        ));
+
+        // Vector-generation staging rejects ordinary lifecycle claims while
+        // acquiring the shared global merge permit separately for each source.
+        // Force merge must wait before capacity admission; retaining the only
+        // global slot here would deadlock both operations between sources.
+        manager.active_operations.pause_non_indexing();
+        let force_merge = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.force_merge().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.force_merge_conflict_retries.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("force merge never reached the paused group claim");
+
+        assert_eq!(
+            global_merge_permits.available_permits(),
+            1,
+            "force merge retained global capacity while vector staging blocked group ownership"
+        );
+
+        force_merge.abort();
+        let _ = force_merge.await;
+        manager.active_operations.resume_non_indexing();
     }
 
     #[test]
@@ -3355,6 +4058,28 @@ mod tests {
                 },
             );
             state.metadata.add_segment_meta(
+                "carried-debt".into(),
+                SegmentMetaInfo {
+                    num_docs: 15,
+                    ancestors: Vec::new(),
+                    generation: 2,
+                    reordered: false,
+                    bp_converged: false,
+                    bp_unconverged_passes: 2,
+                },
+            );
+            state.metadata.add_segment_meta(
+                "carried-debt-at-limit".into(),
+                SegmentMetaInfo {
+                    num_docs: 25,
+                    ancestors: Vec::new(),
+                    generation: 2,
+                    reordered: false,
+                    bp_converged: false,
+                    bp_unconverged_passes: 3,
+                },
+            );
+            state.metadata.add_segment_meta(
                 "converged".into(),
                 SegmentMetaInfo {
                     num_docs: 30,
@@ -3369,8 +4094,15 @@ mod tests {
         }
 
         assert_eq!(
-            manager.unconverged_segments_below(3).await,
-            vec![("eligible".into(), 10, 2)]
+            manager.unreordered_segments().await,
+            vec![("fresh".into(), 40)],
+            "a block-copy output with BP debt is not a fresh first-pass candidate",
+        );
+        let mut eligible = manager.unconverged_segments_below(3).await;
+        eligible.sort_unstable();
+        assert_eq!(
+            eligible,
+            vec![("carried-debt".into(), 15, 2), ("eligible".into(), 10, 2),],
         );
         assert!(manager.unconverged_segments_below(0).await.is_empty());
     }

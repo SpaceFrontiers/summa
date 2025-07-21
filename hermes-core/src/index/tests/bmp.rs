@@ -3040,7 +3040,7 @@ async fn test_bmp_block_posting_overflow_256() {
 
     // BP forward-index build over the oversized block must not read wild
     // slices (this is the exact prod crash path).
-    let (fwd, _) =
+    let fwd =
         crate::segment::build_forward_index_from_bmps(&[bmp], 2, 1_000_000, 2 * 1024 * 1024 * 1024)
             .unwrap();
     // Needle dims have df=1 and are correctly filtered by min_doc_freq=2;

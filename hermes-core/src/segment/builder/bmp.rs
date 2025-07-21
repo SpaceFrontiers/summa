@@ -391,26 +391,9 @@ pub(crate) fn build_bmp_blob(
             grid_entries.push((dim_id, block_id, max_impact));
 
             // Advance cursor
+            cursors[dim_idx] = pos;
             if let Some(nb) = next_block {
-                cursors[dim_idx] = pos;
                 heap.push(Reverse((nb, dim_id, dim_idx)));
-            } else {
-                cursors[dim_idx] = pos;
-                while pos < posts.len() {
-                    let (doc_id, ordinal, weight) = posts[pos];
-                    let abs_w = weight.abs();
-                    if skip_wt || abs_w >= weight_threshold {
-                        let impact = quantize_weight(abs_w, max_weight_scale);
-                        if impact > 0 {
-                            let virtual_id = vid_lookup.get((doc_id, ordinal)) as u64;
-                            let nb = (virtual_id / bs64) as u32;
-                            cursors[dim_idx] = pos;
-                            heap.push(Reverse((nb, dim_id, dim_idx)));
-                            break;
-                        }
-                    }
-                    pos += 1;
-                }
             }
         }
 
@@ -897,32 +880,109 @@ pub(crate) fn write_grid_run(
     Ok(())
 }
 
+/// Merge sorted grid runs into one sorted run without materializing entries.
 #[cfg(feature = "native")]
-fn visit_merged_dimension(
-    run_readers: &mut [GridRunReader],
-    dimension: u32,
-    mut visitor: impl FnMut(u32, u8) -> std::io::Result<()>,
+pub(crate) fn merge_grid_runs(
+    input_paths: &[std::path::PathBuf],
+    output_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    let mut heap: BinaryHeap<Reverse<(u32, u8, usize)>> =
-        BinaryHeap::with_capacity(run_readers.len());
-    for (run, reader) in run_readers.iter().enumerate() {
-        if let Some((dim, block, impact)) = reader.current
-            && dim == dimension
-        {
-            heap.push(Reverse((block, impact, run)));
+    if let [input] = input_paths {
+        let mut reader = std::io::BufReader::with_capacity(256 * 1024, std::fs::File::open(input)?);
+        let mut writer =
+            std::io::BufWriter::with_capacity(256 * 1024, std::fs::File::create(output_path)?);
+        std::io::copy(&mut reader, &mut writer)?;
+        return writer.flush();
+    }
+    let mut readers: Vec<GridRunReader> = input_paths
+        .iter()
+        .map(|path| GridRunReader::open(path))
+        .collect::<std::io::Result<_>>()?;
+    let output = std::fs::File::create(output_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, output);
+    let mut heap: BinaryHeap<Reverse<(u32, u32, u8, usize)>> =
+        BinaryHeap::with_capacity(readers.len());
+    for (run, reader) in readers.iter().enumerate() {
+        if let Some((dimension, block, impact)) = reader.current {
+            heap.push(Reverse((dimension, block, impact, run)));
         }
     }
-    while let Some(Reverse((block, impact, run))) = heap.pop() {
-        visitor(block, impact)?;
-        let reader = &mut run_readers[run];
+    let mut buffer = [0u8; GRID_ENTRY_DISK_SIZE];
+    while let Some(mut head) = heap.peek_mut() {
+        let Reverse((dimension, block, impact, run)) = *head;
+        buffer[0..4].copy_from_slice(&dimension.to_le_bytes());
+        buffer[4..8].copy_from_slice(&block.to_le_bytes());
+        buffer[8] = impact;
+        writer.write_all(&buffer)?;
+        let reader = &mut readers[run];
         reader.advance()?;
-        if let Some((dim, next_block, next_impact)) = reader.current
-            && dim == dimension
-        {
-            heap.push(Reverse((next_block, next_impact, run)));
+        if let Some((next_dimension, next_block, next_impact)) = reader.current {
+            *head = Reverse((next_dimension, next_block, next_impact, run));
+        } else {
+            std::collections::binary_heap::PeekMut::pop(head);
         }
     }
-    Ok(())
+    writer.flush()
+}
+
+#[cfg(feature = "native")]
+struct MergedGridCursor<'a> {
+    readers: &'a mut [GridRunReader],
+    heap: BinaryHeap<Reverse<(u32, u32, u8, usize)>>,
+}
+
+#[cfg(feature = "native")]
+impl<'a> MergedGridCursor<'a> {
+    fn new(readers: &'a mut [GridRunReader]) -> Self {
+        let mut heap = BinaryHeap::with_capacity(readers.len());
+        for (run, reader) in readers.iter().enumerate() {
+            if let Some((dimension, block, impact)) = reader.current {
+                heap.push(Reverse((dimension, block, impact, run)));
+            }
+        }
+        Self { readers, heap }
+    }
+
+    fn visit_dimension(
+        &mut self,
+        dimension: u32,
+        mut visitor: impl FnMut(u32, u8) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self
+            .heap
+            .peek()
+            .is_some_and(|Reverse((next, _, _, _))| *next < dimension)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP external grid runs are not sorted by dimension",
+            ));
+        }
+        while let Some(mut head) = self.heap.peek_mut() {
+            let Reverse((next_dimension, block, impact, run)) = *head;
+            if next_dimension != dimension {
+                break;
+            }
+            visitor(block, impact)?;
+            let reader = &mut self.readers[run];
+            reader.advance()?;
+            if let Some((next_dimension, next_block, next_impact)) = reader.current {
+                *head = Reverse((next_dimension, next_block, next_impact, run));
+            } else {
+                std::collections::binary_heap::PeekMut::pop(head);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, num_dims: usize) -> std::io::Result<()> {
+        if let Some(Reverse((dimension, _, _, _))) = self.heap.peek() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("BMP grid run dimension {dimension} exceeds configured dims={num_dims}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "native")]
@@ -930,6 +990,7 @@ struct ProjectedRowEncoder {
     projection: GridProjection,
     cells: usize,
     widths: Vec<u8>,
+    touched_groups: Vec<usize>,
     payload: Vec<u8>,
     values: [u8; GRID_GROUP_CELLS],
     packed: [u8; GRID_GROUP_CELLS],
@@ -949,6 +1010,7 @@ impl ProjectedRowEncoder {
             projection,
             cells,
             widths: vec![0; groups],
+            touched_groups: Vec::new(),
             payload: Vec::with_capacity(payload_capacity),
             values: [0; GRID_GROUP_CELLS],
             packed: [0; GRID_GROUP_CELLS],
@@ -993,135 +1055,350 @@ impl ProjectedRowEncoder {
         let maximum = self.values.iter().copied().max().unwrap_or(0);
         let width = bit_width(maximum);
         self.widths[group] = width;
+        if width > 0 {
+            self.touched_groups.push(group);
+        }
         let payload_len = pack_group(&self.values, width, &mut self.packed)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.payload.extend_from_slice(&self.packed[..payload_len]);
         Ok(())
     }
 
-    fn finish(mut self) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    fn finish_row(&mut self) -> std::io::Result<()> {
         self.finish_current_group()?;
-        Ok((self.widths, self.payload))
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        for group in self.touched_groups.drain(..) {
+            self.widths[group] = 0;
+        }
+        self.payload.clear();
+        self.current_group = None;
+        self.previous_cell = None;
     }
 }
 
 #[cfg(feature = "native")]
-fn write_compressed_grid_section_merged(
-    run_readers: &mut [GridRunReader],
-    num_dims: usize,
-    num_blocks: usize,
+struct MergedGridPlan {
     projection: GridProjection,
-    writer: &mut dyn Write,
-) -> std::io::Result<u64> {
-    let cells = projection.cells(num_blocks);
-    let layout = CompressedGridLayout::new(num_dims, cells);
-    let mut widths = vec![0u8; layout.groups()];
-    let mut row_sizes = Vec::with_capacity(num_dims);
+    cells: usize,
+    layout: CompressedGridLayout,
+    widths: Vec<u8>,
+    touched_groups: Vec<usize>,
+    payload_units: u64,
+    row_sizes: Vec<u64>,
+}
 
-    for dim in 0..num_dims as u32 {
-        widths.fill(0);
-        visit_merged_dimension(run_readers, dim, |block, impact| {
-            let (cell, value) = projection.project(block, impact);
-            if cell >= cells {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("BMP grid cell {cell} exceeds configured cell count {cells}"),
-                ));
-            }
-            let group = cell / GRID_GROUP_CELLS;
-            widths[group] = widths[group].max(bit_width(value));
-            Ok(())
-        })?;
-        row_sizes.push(
-            layout
-                .row_bytes(&widths)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
-        );
-    }
-    for reader in run_readers.iter() {
-        if let Some((dimension, _, _)) = reader.current {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("BMP grid run dimension {dimension} exceeds configured dims={num_dims}"),
-            ));
+#[cfg(feature = "native")]
+impl MergedGridPlan {
+    fn new(projection: GridProjection, num_dims: usize, num_blocks: usize) -> Self {
+        let cells = projection.cells(num_blocks);
+        let layout = CompressedGridLayout::new(num_dims, cells);
+        Self {
+            projection,
+            cells,
+            layout,
+            widths: vec![0; layout.groups()],
+            touched_groups: Vec::new(),
+            payload_units: 0,
+            row_sizes: Vec::with_capacity(num_dims),
         }
     }
 
-    for reader in run_readers.iter_mut() {
-        reader.reset()?;
+    fn observe(&mut self, block: u32, impact: u8) -> std::io::Result<()> {
+        let (cell, value) = self.projection.project(block, impact);
+        if cell >= self.cells {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "BMP grid cell {cell} exceeds configured cell count {}",
+                    self.cells
+                ),
+            ));
+        }
+        let group = cell / GRID_GROUP_CELLS;
+        let old_width = self.widths[group];
+        let new_width = old_width.max(bit_width(value));
+        if new_width != old_width {
+            if old_width == 0 {
+                self.touched_groups.push(group);
+            }
+            self.widths[group] = new_width;
+            self.payload_units = self
+                .payload_units
+                .checked_add(u64::from(new_width - old_width))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "BMP compressed-grid row size exceeds u64",
+                    )
+                })?;
+        }
+        Ok(())
     }
-    let table_bytes = layout.write_row_offsets(&row_sizes, writer)?;
-    for (dim, &expected_row_size) in (0..num_dims as u32).zip(&row_sizes) {
-        let expected_row_size = usize::try_from(expected_row_size).map_err(|_| {
+
+    fn finish_sizing_row(&mut self) -> std::io::Result<()> {
+        let payload_bytes = self
+            .payload_units
+            .checked_mul((GRID_GROUP_CELLS / 8) as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP compressed-grid row size exceeds u64",
+                )
+            })?;
+        let row_size = (self.layout.row_header_bytes() as u64)
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP compressed-grid row size exceeds u64",
+                )
+            })?;
+        self.row_sizes.push(row_size);
+        for group in self.touched_groups.drain(..) {
+            self.widths[group] = 0;
+        }
+        self.payload_units = 0;
+        Ok(())
+    }
+
+    fn encoder(&self) -> std::io::Result<ProjectedRowEncoder> {
+        let largest_row = self.row_sizes.iter().copied().max().unwrap_or(0);
+        let largest_row = usize::try_from(largest_row).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "BMP compressed-grid row exceeds addressable memory",
             )
         })?;
-        let payload_capacity = expected_row_size
-            .checked_sub(layout.row_header_bytes())
+        let payload_capacity = largest_row
+            .checked_sub(self.layout.row_header_bytes())
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "BMP compressed-grid row is shorter than its header",
                 )
             })?;
-        let mut row =
-            ProjectedRowEncoder::new(projection, cells, layout.groups(), payload_capacity);
-        visit_merged_dimension(run_readers, dim, |block, impact| row.push(block, impact))?;
-        let (widths, payload) = row.finish()?;
-        if payload.len() != payload_capacity {
+        Ok(ProjectedRowEncoder::new(
+            self.projection,
+            self.cells,
+            self.layout.groups(),
+            payload_capacity,
+        ))
+    }
+
+    fn write_row(
+        &self,
+        dimension: usize,
+        row: &mut ProjectedRowEncoder,
+        writer: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        let expected_row_size = usize::try_from(self.row_sizes[dimension]).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP compressed-grid row exceeds addressable memory",
+            )
+        })?;
+        let expected_payload = expected_row_size
+            .checked_sub(self.layout.row_header_bytes())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP compressed-grid row is shorter than its header",
+                )
+            })?;
+        row.finish_row()?;
+        if row.payload.len() != expected_payload {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "BMP compressed-grid row size changed between sizing and encoding",
             ));
         }
-        layout.write_row_header(&widths, projection.max_width(), writer)?;
-        writer.write_all(&payload)?;
+        self.layout
+            .write_row_header(&row.widths, self.projection.max_width(), writer)?;
+        writer.write_all(&row.payload)?;
+        row.reset();
+        Ok(())
     }
-    Ok(table_bytes + row_sizes.into_iter().sum::<u64>())
+
+    fn rows_bytes(&self) -> std::io::Result<u64> {
+        self.row_sizes.iter().try_fold(0u64, |total, &size| {
+            total.checked_add(size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BMP compressed-grid section exceeds u64",
+                )
+            })
+        })
+    }
+}
+
+#[cfg(feature = "native")]
+fn copy_grid_spool(
+    path: &std::path::Path,
+    expected_bytes: u64,
+    writer: &mut dyn Write,
+) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let actual_bytes = file.metadata()?.len();
+    if actual_bytes != expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "BMP compressed-grid spool size changed: expected {expected_bytes}, got {actual_bytes}"
+            ),
+        ));
+    }
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        copied = copied.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP compressed-grid spool copy exceeds u64",
+            )
+        })?;
+    }
+    if copied != expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "short BMP compressed-grid spool copy: expected {expected_bytes}, copied {copied}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Stream-write compressed grids from multiple sorted run files.
 ///
-/// Each section uses one sizing pass and one encoding pass. Encoding buffers at
-/// most one already-compressed row, so peak memory is bounded even when a head
-/// dimension occurs in every block.
+/// The complete D/E/H hierarchy uses one sizing pass and one encoding pass
+/// over the external runs. D rows stream directly to the output; E/H rows are
+/// temporarily spooled because their offset tables follow the complete D
+/// section. Encoding buffers at most one compressed row per projection.
 #[cfg(feature = "native")]
 pub(crate) fn stream_write_grids_merged(
     run_readers: &mut [GridRunReader],
     num_dims: usize,
     num_blocks: usize,
     grid_bits: u8,
+    superblock_spool: &std::path::Path,
+    coarse_spool: &std::path::Path,
     writer: &mut dyn Write,
 ) -> std::io::Result<(u64, u64, u64)> {
-    let block_bytes = write_compressed_grid_section_merged(
-        run_readers,
-        num_dims,
-        num_blocks,
-        GridProjection::Block { bits: grid_bits },
-        writer,
-    )?;
+    let num_dims_u32 = u32::try_from(num_dims).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BMP grid dimensions exceed u32::MAX",
+        )
+    })?;
+    let mut plans = [
+        MergedGridPlan::new(
+            GridProjection::Block { bits: grid_bits },
+            num_dims,
+            num_blocks,
+        ),
+        MergedGridPlan::new(GridProjection::Superblock, num_dims, num_blocks),
+        MergedGridPlan::new(GridProjection::CoarseSuperblock, num_dims, num_blocks),
+    ];
+
+    {
+        let mut merged = MergedGridCursor::new(run_readers);
+        for dimension in 0..num_dims_u32 {
+            merged.visit_dimension(dimension, |block, impact| {
+                for plan in &mut plans {
+                    plan.observe(block, impact)?;
+                }
+                Ok(())
+            })?;
+            for plan in &mut plans {
+                plan.finish_sizing_row()?;
+            }
+        }
+        merged.finish(num_dims)?;
+    }
     for reader in run_readers.iter_mut() {
         reader.reset()?;
     }
-    let superblock_bytes = write_compressed_grid_section_merged(
-        run_readers,
-        num_dims,
-        num_blocks,
-        GridProjection::Superblock,
-        writer,
-    )?;
-    for reader in run_readers.iter_mut() {
-        reader.reset()?;
+
+    let block_table_bytes = plans[0]
+        .layout
+        .write_row_offsets(&plans[0].row_sizes, writer)?;
+    let superblock_file = std::fs::File::create(superblock_spool)?;
+    let coarse_file = std::fs::File::create(coarse_spool)?;
+    let mut superblock_writer = std::io::BufWriter::with_capacity(1024 * 1024, superblock_file);
+    let mut coarse_writer = std::io::BufWriter::with_capacity(1024 * 1024, coarse_file);
+    let mut rows = plans
+        .iter()
+        .map(MergedGridPlan::encoder)
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    {
+        let mut merged = MergedGridCursor::new(run_readers);
+        for dimension in 0..num_dims_u32 {
+            let dimension_index = dimension as usize;
+            merged.visit_dimension(dimension, |block, impact| {
+                for row in &mut rows {
+                    row.push(block, impact)?;
+                }
+                Ok(())
+            })?;
+            plans[0].write_row(dimension_index, &mut rows[0], writer)?;
+            plans[1].write_row(dimension_index, &mut rows[1], &mut superblock_writer)?;
+            plans[2].write_row(dimension_index, &mut rows[2], &mut coarse_writer)?;
+        }
+        merged.finish(num_dims)?;
     }
-    let coarse_bytes = write_compressed_grid_section_merged(
-        run_readers,
-        num_dims,
-        num_blocks,
-        GridProjection::CoarseSuperblock,
-        writer,
-    )?;
+    superblock_writer.flush()?;
+    coarse_writer.flush()?;
+    drop(superblock_writer);
+    drop(coarse_writer);
+
+    let block_rows_bytes = plans[0].rows_bytes()?;
+    let superblock_rows_bytes = plans[1].rows_bytes()?;
+    let coarse_rows_bytes = plans[2].rows_bytes()?;
+    let superblock_table_bytes = plans[1]
+        .layout
+        .write_row_offsets(&plans[1].row_sizes, writer)?;
+    copy_grid_spool(superblock_spool, superblock_rows_bytes, writer)?;
+    let coarse_table_bytes = plans[2]
+        .layout
+        .write_row_offsets(&plans[2].row_sizes, writer)?;
+    copy_grid_spool(coarse_spool, coarse_rows_bytes, writer)?;
+
+    let block_bytes = block_table_bytes
+        .checked_add(block_rows_bytes)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP block-grid section exceeds u64",
+            )
+        })?;
+    let superblock_bytes = superblock_table_bytes
+        .checked_add(superblock_rows_bytes)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP superblock-grid section exceeds u64",
+            )
+        })?;
+    let coarse_bytes = coarse_table_bytes
+        .checked_add(coarse_rows_bytes)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BMP coarse-grid section exceeds u64",
+            )
+        })?;
     Ok((block_bytes, superblock_bytes, coarse_bytes))
 }
 
@@ -1350,6 +1627,65 @@ mod tests {
             .advance()
             .expect_err("a partial grid record must not be treated as clean EOF");
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn merged_grid_runs_are_byte_identical_to_in_memory_encoding() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = vec![
+            (0, 0, 1),
+            (0, 63, 17),
+            (0, 64, 31),
+            (0, 64, 200), // duplicate cell across runs: maximum must win
+            (0, 16_383, 127),
+            (0, 16_384, 255),
+            // Dimension 1 intentionally empty.
+            (2, 1, 9),
+            (2, 64, 66),
+            (2, 16_384, 129),
+            (3, 16_383, 254),
+        ];
+        entries.sort_unstable();
+        let mut runs = [Vec::new(), Vec::new(), Vec::new()];
+        for (index, &entry) in entries.iter().enumerate() {
+            runs[index % runs.len()].push(entry);
+        }
+        let run_paths: Vec<_> = runs
+            .iter()
+            .enumerate()
+            .map(|(index, run)| {
+                let path = directory.path().join(format!("run-{index}"));
+                write_grid_run(run, &path).unwrap();
+                path
+            })
+            .collect();
+
+        for grid_bits in [2, 4] {
+            let mut expected = Vec::new();
+            let expected_sizes =
+                stream_write_grids(&entries, 4, 16_385, grid_bits, &mut expected).unwrap();
+            let mut readers: Vec<_> = run_paths
+                .iter()
+                .map(|path| GridRunReader::open(path).unwrap())
+                .collect();
+            let superblock_spool = directory.path().join(format!("sb-{grid_bits}"));
+            let coarse_spool = directory.path().join(format!("coarse-{grid_bits}"));
+            let mut actual = Vec::new();
+            let actual_sizes = stream_write_grids_merged(
+                &mut readers,
+                4,
+                16_385,
+                grid_bits,
+                &superblock_spool,
+                &coarse_spool,
+                &mut actual,
+            )
+            .unwrap();
+
+            assert_eq!(actual_sizes, expected_sizes);
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

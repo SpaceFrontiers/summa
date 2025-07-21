@@ -290,6 +290,7 @@ async fn scan_and_optimize(
             let idx_name = name.clone();
             let sid = seg_id.clone();
             let pool = segment_manager.background_cpu_pool();
+            let refresh_index = Arc::clone(&index);
 
             // Size-tiered budget: small segments get full-depth BP (seconds of
             // work); large ones get a depth- and wall-clock-budgeted FIRST
@@ -333,6 +334,20 @@ async fn scan_and_optimize(
 
                 match sm.reorder_single_segment(&sid, Some(pool), budget).await {
                     Ok(true) => {
+                        match refresh_index.reader().await {
+                            Ok(reader) => {
+                                if let Err(error) = reader.reload().await {
+                                    warn!(
+                                        "[optimizer] reordered segment {} in index '{}' but failed to reload reader: {}",
+                                        sid, idx_name, error,
+                                    );
+                                }
+                            }
+                            Err(error) => warn!(
+                                "[optimizer] reordered segment {} in index '{}' but failed to open reader: {}",
+                                sid, idx_name, error,
+                            ),
+                        }
                         info!(
                             "[optimizer] reordered segment {} in index '{}' ({:.1}s)",
                             sid,
