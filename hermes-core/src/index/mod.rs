@@ -65,7 +65,13 @@ pub const MAX_CONCURRENT_REORDER_PASSES: usize = 2;
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReorderPriority {
-    Background,
+    /// Periodic optimizer and explicit standalone reorder work. This class
+    /// must retain capacity while automatic merges continuously arrive,
+    /// otherwise fresh segments stay unordered for minutes behind giant BP
+    /// passes and query pruning recovers slowly after ingestion.
+    Optimizer,
+    /// BP performed while producing an automatic merge output.
+    AutomaticMerge,
     Foreground,
 }
 
@@ -78,6 +84,10 @@ pub(crate) enum ReorderPriority {
 #[derive(Debug)]
 pub struct ReorderConcurrencyGate {
     permits: Arc<tokio::sync::Semaphore>,
+    /// Automatic merges may consume all but one whole-pass slot. The reserved
+    /// slot lets short optimizer passes continuously retire fresh segments.
+    /// With a one-pass configuration both classes share the only slot.
+    automatic_merge_permits: Arc<tokio::sync::Semaphore>,
     limit: usize,
     foreground_lock: Arc<tokio::sync::Mutex<()>>,
     foreground_active: std::sync::atomic::AtomicBool,
@@ -154,8 +164,10 @@ impl Drop for BmpIoPermit<'_> {
 impl ReorderConcurrencyGate {
     pub fn new(requested_limit: usize) -> Self {
         let limit = requested_limit.clamp(1, MAX_CONCURRENT_REORDER_PASSES);
+        let automatic_merge_limit = limit.saturating_sub(1).max(1);
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            automatic_merge_permits: Arc::new(tokio::sync::Semaphore::new(automatic_merge_limit)),
             limit,
             foreground_lock: Arc::new(tokio::sync::Mutex::new(())),
             foreground_active: std::sync::atomic::AtomicBool::new(false),
@@ -170,9 +182,15 @@ impl ReorderConcurrencyGate {
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         priority: ReorderPriority,
-    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    ) -> std::result::Result<ReorderPermit, tokio::sync::AcquireError> {
         match priority {
-            ReorderPriority::Background => self.acquire_background().await,
+            ReorderPriority::Optimizer => self.acquire_background(None).await,
+            ReorderPriority::AutomaticMerge => {
+                let merge_permit = Arc::clone(&self.automatic_merge_permits)
+                    .acquire_owned()
+                    .await?;
+                self.acquire_background(Some(merge_permit)).await
+            }
             ReorderPriority::Foreground => self.acquire_foreground().await,
         }
     }
@@ -180,7 +198,8 @@ impl ReorderConcurrencyGate {
     /// Acquire capacity for periodic optimizer or automatic merge work.
     async fn acquire_background(
         self: &Arc<Self>,
-    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        automatic_merge: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> std::result::Result<ReorderPermit, tokio::sync::AcquireError> {
         loop {
             if self
                 .foreground_active
@@ -201,7 +220,10 @@ impl ReorderConcurrencyGate {
                 .foreground_active
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                return Ok(permit);
+                return Ok(ReorderPermit {
+                    _permit: permit,
+                    _automatic_merge: automatic_merge,
+                });
             }
             // A foreground operation started between the check and permit
             // acquisition. Yield the slot instead of extending its queue.
@@ -212,8 +234,12 @@ impl ReorderConcurrencyGate {
     /// Acquire the one BP slot left available to a foreground force merge.
     async fn acquire_foreground(
         self: &Arc<Self>,
-    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        Arc::clone(&self.permits).acquire_owned().await
+    ) -> std::result::Result<ReorderPermit, tokio::sync::AcquireError> {
+        let permit = Arc::clone(&self.permits).acquire_owned().await?;
+        Ok(ReorderPermit {
+            _permit: permit,
+            _automatic_merge: None,
+        })
     }
 
     /// Prioritize one explicit force merge across all indexes using this gate.
@@ -245,6 +271,12 @@ impl ReorderConcurrencyGate {
         }
         Ok(guard)
     }
+}
+
+#[cfg(feature = "native")]
+pub(crate) struct ReorderPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _automatic_merge: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[cfg(feature = "native")]

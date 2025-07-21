@@ -1792,7 +1792,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     &ids,
                     output_id,
                     sm.reorder_on_merge,
-                    ReorderPriority::Background,
+                    ReorderPriority::AutomaticMerge,
                 )
                 .await;
 
@@ -3290,7 +3290,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             () = self.active_operations.wait_for_shutdown() => {
                 return Err(Error::IndexClosed);
             }
-            permit = reorder_gate.acquire(ReorderPriority::Background) => {
+            permit = reorder_gate.acquire(ReorderPriority::Optimizer) => {
                 permit.map_err(|_| {
                     Error::Internal("background reorder scheduler is closed".into())
                 })?
