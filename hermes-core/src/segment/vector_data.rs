@@ -1066,9 +1066,9 @@ impl LazyFlatVectorData {
         &self.handle
     }
 
-    /// Estimated memory usage — doc_ids are mmap-backed (only Arc overhead).
-    pub fn estimated_memory_bytes(&self) -> usize {
-        size_of::<Self>() + size_of::<OwnedBytes>()
+    /// Estimated heap usage — document IDs and vectors are file-backed.
+    pub fn estimated_heap_bytes(&self) -> usize {
+        size_of::<Self>()
     }
 }
 

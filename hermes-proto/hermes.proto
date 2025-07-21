@@ -330,7 +330,9 @@ message IndexingBufferStats {
   uint32 unique_terms = 8;
 }
 
-// Segment reader memory (search structures)
+// Segment-reader heap memory (search structures and decompressed caches).
+// File-backed mappings and pinned residency are intentionally excluded:
+// mapped file extent is not equivalent to resident memory.
 message SegmentReaderStats {
   uint64 total_bytes = 1;
   uint64 term_dict_cache_bytes = 2;

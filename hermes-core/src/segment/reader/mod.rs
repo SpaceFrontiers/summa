@@ -23,7 +23,11 @@ const DENSE_SCORE_BATCH: usize = 4_096;
 const BINARY_SCORE_BATCH: usize = 8_192;
 const MAX_VECTOR_SCORE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
-/// Memory statistics for a single segment
+/// Runtime memory accounting for a single segment.
+///
+/// Heap, file-backed address space, and pinned residency are deliberately
+/// separate: file-backed bytes are not resident merely because they are
+/// mapped, and pinned bytes are a subset rather than an additive allocation.
 #[derive(Debug, Clone, Default)]
 pub struct SegmentMemoryStats {
     /// Segment ID
@@ -34,27 +38,47 @@ pub struct SegmentMemoryStats {
     pub term_dict_cache_bytes: usize,
     /// Document store block cache bytes
     pub store_cache_bytes: usize,
-    /// Sparse vector index bytes (in-memory posting lists)
-    pub sparse_index_bytes: usize,
-    /// Dense vector index bytes (cluster assignments, quantized codes)
-    pub dense_index_bytes: usize,
-    /// Bloom filter bytes
-    pub bloom_filter_bytes: usize,
+    /// Sparse-vector lookup structures retained on the heap.
+    pub sparse_heap_bytes: usize,
+    /// Dense-vector ANN lookup structures retained on the heap.
+    pub dense_heap_bytes: usize,
+    /// File-backed term-dictionary bloom-filter bytes.
+    pub term_bloom_file_bytes: u64,
+    /// Logical `.sparse` file bytes retained by the reader.
+    pub sparse_file_backed_bytes: u64,
+    /// Logical `.vectors` file bytes retained by the reader.
+    pub dense_file_backed_bytes: u64,
     /// Hot metadata bytes actually pinned (mlock/heap-copy) at open
     pub pinned_metadata_bytes: u64,
     /// Hot metadata bytes eligible for pinning (gap vs pinned = budget
     /// exhausted or mlock failures — operator-visible)
     pub pin_intended_bytes: u64,
+    /// Sparse-vector subset of `pinned_metadata_bytes`.
+    pub sparse_pinned_metadata_bytes: u64,
+    /// Sparse-vector bytes eligible for pinning.
+    pub sparse_pin_intended_bytes: u64,
+    /// Dense-vector subset of `pinned_metadata_bytes`.
+    pub dense_pinned_metadata_bytes: u64,
+    /// Dense-vector bytes eligible for pinning.
+    pub dense_pin_intended_bytes: u64,
 }
 
 impl SegmentMemoryStats {
-    /// Total estimated memory for this segment
-    pub fn total_bytes(&self) -> usize {
+    /// Total estimated heap retained by this segment reader.
+    pub fn estimated_heap_bytes(&self) -> usize {
         self.term_dict_cache_bytes
             + self.store_cache_bytes
-            + self.sparse_index_bytes
-            + self.dense_index_bytes
-            + self.bloom_filter_bytes
+            + self.sparse_heap_bytes
+            + self.dense_heap_bytes
+    }
+
+    /// Total logical bytes in the explicitly accounted file-backed sections.
+    ///
+    /// This is mapped address space for `MmapDirectory`, not resident memory.
+    pub fn file_backed_bytes(&self) -> u64 {
+        self.term_bloom_file_bytes
+            .saturating_add(self.sparse_file_backed_bytes)
+            .saturating_add(self.dense_file_backed_bytes)
     }
 }
 
@@ -932,24 +956,28 @@ pub struct SegmentReader {
     schema: Arc<Schema>,
     /// Per-segment ANN payloads.
     vector_indexes: FxHashMap<u32, VectorIndex>,
-    /// Lazy flat vectors per field — for reranking and merge (doc_ids in memory, vectors via mmap)
+    /// Lazy flat vectors per field — document maps and vectors stay file-backed.
     flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
+    /// Logical size of the retained `.vectors` file handle.
+    dense_file_backed_bytes: u64,
     /// One immutable generation of all index-global ANN artifacts.
     trained_vectors: Arc<crate::segment::TrainedVectorStructures>,
     /// Sparse vector indexes per field (MaxScore format)
     sparse_indexes: FxHashMap<u32, SparseIndex>,
     /// BMP sparse vector indexes per field (BMP format)
     bmp_indexes: FxHashMap<u32, BmpIndex>,
+    /// Logical size of the retained `.sparse` file handle.
+    sparse_file_backed_bytes: u64,
     /// Position file handle for phrase queries (lazy loading)
     positions_handle: Option<FileHandle>,
     /// Fast-field columnar readers per field_id
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
-    /// Per-segment MaxScore threshold (f32 stored as AtomicU32 bits).
-    /// Allows per-field MaxScore groups within a single query to share thresholds:
-    /// field A's result seeds field B's pruning on the same segment.
-    /// Hot-metadata pin accounting (see `segment::pin`)
+    /// Dense-vector hot-metadata pin accounting (see `segment::pin`).
     #[cfg(feature = "native")]
-    pin_report: crate::segment::pin::PinReport,
+    dense_pin_report: crate::segment::pin::PinReport,
+    /// Sparse-vector hot-metadata pin accounting (see `segment::pin`).
+    #[cfg(feature = "native")]
+    sparse_pin_report: crate::segment::pin::PinReport,
 }
 
 impl SegmentReader {
@@ -996,6 +1024,7 @@ impl SegmentReader {
 
         // Load dense vector indexes from unified .vectors file
         let vectors_data = loader::load_vectors_file(dir, &files, &schema, meta.num_docs).await?;
+        let dense_file_backed_bytes = vectors_data.file_backed_bytes;
         let vector_indexes = vectors_data.indexes;
         let flat_vectors = vectors_data.flat_vectors;
 
@@ -1012,6 +1041,7 @@ impl SegmentReader {
 
         // Load sparse vector indexes from .sparse file (MaxScore + BMP)
         let sparse_data = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
+        let sparse_file_backed_bytes = sparse_data.file_backed_bytes;
         let sparse_indexes = sparse_data.maxscore_indexes;
         let bmp_indexes = sparse_data.bmp_indexes;
 
@@ -1065,13 +1095,17 @@ impl SegmentReader {
             schema,
             vector_indexes,
             flat_vectors,
+            dense_file_backed_bytes,
             trained_vectors: Arc::new(crate::segment::TrainedVectorStructures::default()),
             sparse_indexes,
             bmp_indexes,
+            sparse_file_backed_bytes,
             positions_handle,
             fast_fields,
             #[cfg(feature = "native")]
-            pin_report: Default::default(),
+            dense_pin_report: Default::default(),
+            #[cfg(feature = "native")]
+            sparse_pin_report: Default::default(),
         };
 
         // Pin hot metadata per the process-wide policy (no-op when disabled)
@@ -1098,32 +1132,50 @@ impl SegmentReader {
             return;
         }
         let mut remaining = policy.budget_bytes;
-        let mut report = PinReport::default();
+        let mut dense_report = PinReport::default();
+        let mut sparse_report = PinReport::default();
 
         // Priority 1: compact ANN lookup directories
         for index in self.vector_indexes.values_mut() {
-            index.pin_lookup_directory(policy.mode, &mut remaining, &mut report);
+            index.pin_lookup_directory(policy.mode, &mut remaining, &mut dense_report);
         }
         // Priority 2: BMP block-offset tables
         for bmp in self.bmp_indexes.values_mut() {
-            bmp.pin_block_starts(policy.mode, &mut remaining, &mut report);
+            bmp.pin_block_starts(policy.mode, &mut remaining, &mut sparse_report);
         }
         // Priority 3: sparse skip sections
         for sparse in self.sparse_indexes.values_mut() {
-            sparse.pin_skip_section(policy.mode, &mut remaining, &mut report);
+            sparse.pin_skip_section(policy.mode, &mut remaining, &mut sparse_report);
         }
         // Priority 4: doc-id maps
         for flat in self.flat_vectors.values_mut() {
-            flat.pin_doc_ids(policy.mode, &mut remaining, &mut report);
+            flat.pin_doc_ids(policy.mode, &mut remaining, &mut dense_report);
         }
         for bmp in self.bmp_indexes.values_mut() {
-            bmp.pin_doc_maps(policy.mode, &mut remaining, &mut report);
+            bmp.pin_doc_maps(policy.mode, &mut remaining, &mut sparse_report);
         }
         // Priority 5: BMP superblock grids
         for bmp in self.bmp_indexes.values_mut() {
-            bmp.pin_sb_grid(policy.mode, &mut remaining, &mut report);
+            bmp.pin_sb_grid(policy.mode, &mut remaining, &mut sparse_report);
         }
 
+        let report = PinReport {
+            intended_bytes: dense_report
+                .intended_bytes
+                .saturating_add(sparse_report.intended_bytes),
+            pinned_bytes: dense_report
+                .pinned_bytes
+                .saturating_add(sparse_report.pinned_bytes),
+            skipped_budget_bytes: dense_report
+                .skipped_budget_bytes
+                .saturating_add(sparse_report.skipped_budget_bytes),
+            failed_bytes: dense_report
+                .failed_bytes
+                .saturating_add(sparse_report.failed_bytes),
+            heap_copy_bytes: dense_report
+                .heap_copy_bytes
+                .saturating_add(sparse_report.heap_copy_bytes),
+        };
         if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
             log::warn!(
                 "[pin] segment {:016x}: pinned {}/{} (budget skipped {}, mlock failed {}) — \
@@ -1142,7 +1194,8 @@ impl SegmentReader {
                 policy.mode,
             );
         }
-        self.pin_report = report;
+        self.dense_pin_report = dense_report;
+        self.sparse_pin_report = sparse_report;
     }
 
     // NOTE: cross-group MaxScore threshold seeding is query-execution-local
@@ -1215,7 +1268,7 @@ impl SegmentReader {
         self.term_dict.stats()
     }
 
-    /// Estimate memory usage of this segment reader
+    /// Account for heap, file-backed, and pinned bytes separately.
     pub fn memory_stats(&self) -> SegmentMemoryStats {
         let term_dict_stats = self.term_dict.stats();
 
@@ -1225,42 +1278,82 @@ impl SegmentReader {
         let term_dict_cache_bytes = self.term_dict.cached_bytes();
         let store_cache_bytes = self.store.cached_bytes();
 
-        // Sparse index: SoA dim table + OwnedBytes skip section + BMP grids
-        let sparse_index_bytes: usize = self
+        // Sparse heap: SoA dimension tables and small reader objects. Posting
+        // payloads, BMP grids, and document maps remain file-backed.
+        let sparse_heap_bytes: usize = self
             .sparse_indexes
             .values()
-            .map(|s| s.estimated_memory_bytes())
+            .map(|s| s.estimated_heap_bytes())
             .sum::<usize>()
             + self
                 .bmp_indexes
                 .values()
-                .map(|b| b.estimated_memory_bytes())
+                .map(|b| b.estimated_heap_bytes())
                 .sum::<usize>();
 
-        // Dense corpus columns are memory-mapped; only compact ANN run
-        // directories and other lookup structures count as heap memory here.
-        let dense_index_bytes: usize = self
+        // Dense corpus columns are file-backed. Only compact ANN run
+        // directories and flat-reader objects count as heap here.
+        let dense_heap_bytes: usize = self
             .vector_indexes
             .values()
-            .map(|v| v.estimated_memory_bytes())
-            .sum();
+            .map(|v| v.estimated_heap_bytes())
+            .sum::<usize>()
+            + self
+                .flat_vectors
+                .values()
+                .map(LazyFlatVectorData::estimated_heap_bytes)
+                .sum::<usize>();
 
         #[cfg(feature = "native")]
-        let (pinned_metadata_bytes, pin_intended_bytes) =
-            (self.pin_report.pinned_bytes, self.pin_report.intended_bytes);
+        let (sparse_heap_bytes, dense_heap_bytes) = (
+            sparse_heap_bytes.saturating_add(
+                usize::try_from(self.sparse_pin_report.heap_copy_bytes).unwrap_or(usize::MAX),
+            ),
+            dense_heap_bytes.saturating_add(
+                usize::try_from(self.dense_pin_report.heap_copy_bytes).unwrap_or(usize::MAX),
+            ),
+        );
+
+        #[cfg(feature = "native")]
+        let (
+            sparse_pinned_metadata_bytes,
+            sparse_pin_intended_bytes,
+            dense_pinned_metadata_bytes,
+            dense_pin_intended_bytes,
+        ) = (
+            self.sparse_pin_report.pinned_bytes,
+            self.sparse_pin_report.intended_bytes,
+            self.dense_pin_report.pinned_bytes,
+            self.dense_pin_report.intended_bytes,
+        );
         #[cfg(not(feature = "native"))]
-        let (pinned_metadata_bytes, pin_intended_bytes) = (0u64, 0u64);
+        let (
+            sparse_pinned_metadata_bytes,
+            sparse_pin_intended_bytes,
+            dense_pinned_metadata_bytes,
+            dense_pin_intended_bytes,
+        ) = (0u64, 0u64, 0u64, 0u64);
+
+        let pinned_metadata_bytes =
+            sparse_pinned_metadata_bytes.saturating_add(dense_pinned_metadata_bytes);
+        let pin_intended_bytes = sparse_pin_intended_bytes.saturating_add(dense_pin_intended_bytes);
 
         SegmentMemoryStats {
             segment_id: self.meta.id,
             num_docs: self.meta.num_docs,
             term_dict_cache_bytes,
             store_cache_bytes,
-            sparse_index_bytes,
-            dense_index_bytes,
-            bloom_filter_bytes: term_dict_stats.bloom_filter_size,
+            sparse_heap_bytes,
+            dense_heap_bytes,
+            term_bloom_file_bytes: term_dict_stats.bloom_filter_size as u64,
+            sparse_file_backed_bytes: self.sparse_file_backed_bytes,
+            dense_file_backed_bytes: self.dense_file_backed_bytes,
             pinned_metadata_bytes,
             pin_intended_bytes,
+            sparse_pinned_metadata_bytes,
+            sparse_pin_intended_bytes,
+            dense_pinned_metadata_bytes,
+            dense_pin_intended_bytes,
         }
     }
 

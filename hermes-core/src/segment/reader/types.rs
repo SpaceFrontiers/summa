@@ -39,8 +39,8 @@ impl MmapAnnIndex {
         })
     }
 
-    pub fn estimated_memory_bytes(&self) -> usize {
-        self.index.estimated_memory_bytes()
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.index.estimated_heap_bytes()
     }
 
     pub(crate) fn get(&self) -> &crate::segment::ann_disk::AnnDiskIndex {
@@ -59,11 +59,12 @@ impl MmapAnnIndex {
 }
 
 impl VectorIndex {
-    /// Estimate memory usage of this vector index
-    pub fn estimated_memory_bytes(&self) -> usize {
+    /// Estimate heap retained by this vector index. Corpus-sized ANN columns
+    /// remain file-backed and are not included.
+    pub fn estimated_heap_bytes(&self) -> usize {
         match self {
-            VectorIndex::IvfPq(lazy) => lazy.estimated_memory_bytes(),
-            VectorIndex::BinaryIvf(lazy) => lazy.estimated_memory_bytes(),
+            VectorIndex::IvfPq(lazy) => lazy.estimated_heap_bytes(),
+            VectorIndex::BinaryIvf(lazy) => lazy.estimated_heap_bytes(),
         }
     }
 
@@ -193,9 +194,9 @@ impl DimensionTable {
     }
 
     /// Estimated heap memory in bytes (6 Vecs × capacity × element_size)
-    pub fn estimated_memory_bytes(&self) -> usize {
+    pub fn estimated_heap_bytes(&self) -> usize {
         let n = self.dim_ids.capacity();
-        n * (4 + 8 + 4 + 4 + 4 + 4) // u32×4 + u64×1 + f32×1 = 28 bytes per entry
+        std::mem::size_of::<Self>() + n * (4 + 8 + 4 + 4 + 4 + 4) // u32×4 + u64×1 + f32×1 = 28 bytes per entry
     }
 }
 
@@ -544,16 +545,10 @@ impl SparseIndex {
         dim_ids.iter().map(|&d| self.idf(d)).collect()
     }
 
-    /// Estimated memory usage in bytes
-    ///
-    /// - DimensionTable: SoA arrays (6 × ndims × 4 bytes)
-    /// - Skip section: OwnedBytes (Arc overhead only; data is mmap-backed)
-    /// - Handle: LazyFileHandle overhead
-    pub fn estimated_memory_bytes(&self) -> usize {
-        let dim_table = self.dims.estimated_memory_bytes();
-        // OwnedBytes: just Arc + range (no heap copy for mmap)
-        let skip_overhead = std::mem::size_of::<OwnedBytes>() + self.skip_bytes.len();
-        dim_table + skip_overhead
+    /// Estimated heap retained by this index. The skip section and posting
+    /// blocks are file-backed and therefore excluded.
+    pub fn estimated_heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.dims.estimated_heap_bytes()
     }
 
     /// Whether the handle supports synchronous reads (mmap/RAM-backed).

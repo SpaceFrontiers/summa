@@ -756,18 +756,10 @@ impl BmpIndex {
         self.single_valued
     }
 
-    /// Estimated memory usage in bytes (mmap-backed region sizes).
-    ///
-    /// Fully zero-copy: all data is mmap-backed OwnedBytes, but the
-    /// mapped regions still consume RSS when paged in by the OS.
-    pub fn estimated_memory_bytes(&self) -> usize {
+    /// Estimated heap retained by this index. All corpus-sized sections are
+    /// file-backed `OwnedBytes` slices and therefore excluded.
+    pub fn estimated_heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.block_data_starts_bytes.len()
-            + self.block_data_bytes.len()
-            + self.block_grid.encoded_bytes()
-            + self.superblock_grid.encoded_bytes()
-            + self.doc_map_ids_bytes.len()
-            + self.doc_map_ordinals_bytes.len()
     }
 
     /// Bits per block-grid cell (4 or 2).

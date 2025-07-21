@@ -384,33 +384,58 @@ impl<D: Directory + 'static> Searcher<D> {
 
         let segments: Vec<Arc<SegmentReader>> = loaded.into_iter().map(|(_, seg)| seg).collect();
 
-        // Log searcher loading summary with per-segment memory breakdown
+        // Keep heap, file-backed address space, and pinned residency separate.
+        // Mapped bytes are not necessarily resident; process RSS is the
+        // authoritative whole-process residency measurement.
         let total_docs: u64 = segments.iter().map(|s| s.meta().num_docs as u64).sum();
-        let mut total_mem = 0usize;
+        let mut total_heap = 0usize;
+        let mut total_file_backed = 0u64;
+        let mut total_pinned = 0u64;
+        let mut total_pin_intended = 0u64;
         for seg in &segments {
             let stats = seg.memory_stats();
-            let seg_total = stats.total_bytes();
-            total_mem += seg_total;
+            let heap = stats.estimated_heap_bytes();
+            let file_backed = stats.file_backed_bytes();
+            total_heap = total_heap.saturating_add(heap);
+            total_file_backed = total_file_backed.saturating_add(file_backed);
+            total_pinned = total_pinned.saturating_add(stats.pinned_metadata_bytes);
+            total_pin_intended = total_pin_intended.saturating_add(stats.pin_intended_bytes);
             log::info!(
-                "[searcher] segment {:016x}: docs={}, estimated_memory={} \
-                 (term_dict={}, store={}, sparse_vectors={}, dense_vectors={}, bloom={})",
+                "[searcher] segment {:016x}: docs={}, heap_estimate={} \
+                 (term_cache={}, store_cache={}, sparse_vectors={}, dense_vectors={}), \
+                 file_backed={} (term_bloom={}, sparse_vectors={}, dense_vectors={}), \
+                 pinned_metadata={} of {} eligible \
+                 (sparse_vectors={} of {}, dense_vectors={} of {})",
                 stats.segment_id,
                 stats.num_docs,
-                crate::format_bytes(seg_total as u64),
+                crate::format_bytes(heap as u64),
                 crate::format_bytes(stats.term_dict_cache_bytes as u64),
                 crate::format_bytes(stats.store_cache_bytes as u64),
-                crate::format_bytes(stats.sparse_index_bytes as u64),
-                crate::format_bytes(stats.dense_index_bytes as u64),
-                crate::format_bytes(stats.bloom_filter_bytes as u64),
+                crate::format_bytes(stats.sparse_heap_bytes as u64),
+                crate::format_bytes(stats.dense_heap_bytes as u64),
+                crate::format_bytes(file_backed),
+                crate::format_bytes(stats.term_bloom_file_bytes),
+                crate::format_bytes(stats.sparse_file_backed_bytes),
+                crate::format_bytes(stats.dense_file_backed_bytes),
+                crate::format_bytes(stats.pinned_metadata_bytes),
+                crate::format_bytes(stats.pin_intended_bytes),
+                crate::format_bytes(stats.sparse_pinned_metadata_bytes),
+                crate::format_bytes(stats.sparse_pin_intended_bytes),
+                crate::format_bytes(stats.dense_pinned_metadata_bytes),
+                crate::format_bytes(stats.dense_pin_intended_bytes),
             );
         }
         // Log process RSS if available (helps diagnose OOM)
         let rss_bytes = process_rss_bytes();
         log::info!(
-            "[searcher] loaded {} segments: total_docs={}, estimated_memory={}, process_rss={}",
+            "[searcher] loaded {} segments: total_docs={}, heap_estimate={}, \
+             file_backed={}, pinned_metadata={} of {} eligible, process_rss={}",
             segments.len(),
             total_docs,
-            crate::format_bytes(total_mem as u64),
+            crate::format_bytes(total_heap as u64),
+            crate::format_bytes(total_file_backed),
+            crate::format_bytes(total_pinned),
+            crate::format_bytes(total_pin_intended),
             crate::format_bytes(rss_bytes),
         );
 

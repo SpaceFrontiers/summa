@@ -104,6 +104,9 @@ pub struct PinReport {
     pub skipped_budget_bytes: u64,
     /// Bytes where mlock failed (RLIMIT_MEMLOCK etc.)
     pub failed_bytes: u64,
+    /// Additional heap allocated by `PinMode::Copy`. Already-heap ANN routing
+    /// structures are resident but do not contribute here.
+    pub heap_copy_bytes: u64,
 }
 
 /// RAII owner for heap pages locked on behalf of one immutable ANN artifact
@@ -283,6 +286,7 @@ pub(crate) fn pin_section(
             *bytes = OwnedBytes::new(bytes.to_vec());
             *remaining -= len;
             report.pinned_bytes += len;
+            report.heap_copy_bytes += len;
         }
     }
 }
