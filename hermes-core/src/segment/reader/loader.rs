@@ -159,6 +159,13 @@ fn validate_ann_schema(schema: &Schema, field_id: u32, index_type: u8) -> Result
                     .as_ref()
                     .is_some_and(|config| config.index_type == BinaryIndexType::Ivf)
         }
+        ann_build::TQ_FLAT_TYPE => {
+            field.field_type == FieldType::DenseVector
+                && field
+                    .dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == VectorIndexType::Tq)
+        }
         _ => false,
     };
 
@@ -201,7 +208,7 @@ fn is_ann_vector_type(index_type: u8) -> bool {
 
     matches!(
         index_type,
-        ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE
+        ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE | ann_build::TQ_FLAT_TYPE
     )
 }
 
@@ -375,7 +382,7 @@ async fn load_vectors_file_impl<D: Directory>(
     for entry in &entries {
         let inserted = match entry.index_type {
             ann_build::FLAT_TYPE => flat_toc_fields.insert(entry.field_id),
-            ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE => {
+            ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE | ann_build::TQ_FLAT_TYPE => {
                 ann_toc_fields.insert(entry.field_id)
             }
             _ => continue,
@@ -475,7 +482,7 @@ async fn load_vectors_file_impl<D: Directory>(
                     )));
                 }
             }
-            ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE => {
+            ann_build::IVF_PQ_TYPE | ann_build::BINARY_IVF_TYPE | ann_build::TQ_FLAT_TYPE => {
                 validate_ann_schema(schema, field_id, index_type)?;
                 if !load_ann {
                     continue;
@@ -508,6 +515,39 @@ async fn load_vectors_file_impl<D: Directory>(
                             ))
                         })?,
                     )),
+                    ann_build::TQ_FLAT_TYPE => {
+                        let index = super::types::MmapAnnIndex::open(
+                            data,
+                            crate::segment::ann_disk::AnnKind::TqFlat,
+                            total_docs,
+                        )
+                        .map_err(|error| {
+                            crate::Error::Corruption(format!(
+                                "invalid TQ payload for field {field_id}: {error}"
+                            ))
+                        })?;
+                        let dim = schema
+                            .get_field_entry(Field(field_id))
+                            .and_then(|entry| entry.dense_vector_config.as_ref())
+                            .map(|config| config.dim)
+                            .expect("validated as a TQ dense field above");
+                        let header = index.get().header();
+                        let expected =
+                            crate::structures::vector::quantization::tq_expected_fingerprint(dim);
+                        if header.dim != dim || header.quantizer_version != expected {
+                            return Err(crate::Error::Corruption(format!(
+                                "TQ payload for field {field_id} was built with an \
+                                 incompatible codec (dim {} fingerprint {:#x}, schema \
+                                 expects dim {dim} fingerprint {expected:#x}); rebuild \
+                                 the segment",
+                                header.dim, header.quantizer_version,
+                            )));
+                        }
+                        VectorIndex::Tq {
+                            index: Arc::new(index),
+                            codec: Arc::new(crate::structures::TqCodec::new(dim)),
+                        }
+                    }
                     _ => {
                         return Err(crate::Error::Corruption(format!(
                             "unknown vector index type {index_type} for field {field_id}"

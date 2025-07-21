@@ -31,7 +31,9 @@ pub mod quantization;
 pub use ivf::{CoarseCentroids, CoarseConfig, IvfProbePlan, MultiAssignment, SoarConfig};
 
 // Quantization
-pub use quantization::{DistanceTable, PQCodebook, PQConfig};
+#[cfg(feature = "native")]
+pub use quantization::TqFlatBuilder;
+pub use quantization::{DistanceTable, PQCodebook, PQConfig, TqCodec, TqQueryPlan};
 
 // Indexes
 pub use index::{

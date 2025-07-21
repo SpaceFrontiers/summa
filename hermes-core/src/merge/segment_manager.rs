@@ -2286,6 +2286,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 ))
             })?;
             let current = match entry.field_type {
+                // TQ payloads carry no trained generation, so an existing one
+                // is always current; a tq field must never be staged for a
+                // vector-generation rewrite.
+                crate::dsl::FieldType::DenseVector
+                    if entry.dense_vector_config.as_ref().is_some_and(|config| {
+                        config.index_type == crate::dsl::VectorIndexType::Tq
+                    }) =>
+                {
+                    matches!(ann, Some(crate::segment::VectorIndex::Tq { .. }))
+                }
                 crate::dsl::FieldType::DenseVector => {
                     matches!(ann, Some(crate::segment::VectorIndex::IvfPq(_)))
                 }

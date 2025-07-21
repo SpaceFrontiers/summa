@@ -110,10 +110,15 @@ impl PositionMode {
 pub enum VectorIndexType {
     /// Flat - brute-force search over raw vectors (accumulating state)
     Flat,
-    /// Global IVF with residual product quantization. This is the sole float
-    /// ANN format; Flat remains the accumulation/exact-scan representation.
+    /// Global IVF with residual product quantization. This is the trained
+    /// float ANN format; Flat remains the accumulation/exact-scan
+    /// representation.
     #[default]
     IvfPq,
+    /// TurboQuant: training-free per-segment compressed flat scan
+    /// (`docs/turboquant-quantization.md`). Available from the first segment
+    /// build with no global artifacts.
+    Tq,
 }
 
 /// How an IVF coarse codebook is searched.
@@ -280,6 +285,20 @@ impl DenseVectorConfig {
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
             ivf_routing: IvfRoutingMode::Auto,
+            nprobe: 0,
+            unit_norm: true,
+            soar: None,
+        }
+    }
+
+    /// Create TurboQuant configuration: training-free compressed flat scan.
+    pub fn tq(dim: usize) -> Self {
+        Self {
+            dim,
+            index_type: VectorIndexType::Tq,
+            quantization: DenseVectorQuantization::F32,
+            num_clusters: None,
+            ivf_routing: IvfRoutingMode::Flat,
             nprobe: 0,
             unit_norm: true,
             soar: None,

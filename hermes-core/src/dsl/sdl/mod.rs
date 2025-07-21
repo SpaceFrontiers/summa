@@ -379,6 +379,7 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             }
             "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
             "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
+            "tq" => config.index_type = Some(VectorIndexType::Tq),
             _ => {}
         },
         Rule::index_type_kwarg => {
@@ -391,6 +392,7 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                     }
                     "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
                     "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
+                    "tq" => config.index_type = Some(VectorIndexType::Tq),
                     _ => {}
                 }
             }
@@ -823,6 +825,29 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
         config.index_type = index_type;
     }
 
+    // TQ scans every code (no probing, no clusters, no routing); accepting
+    // these knobs silently would misrepresent how the field is searched.
+    if config.index_type == super::schema::VectorIndexType::Tq {
+        for (option, present) in [
+            ("num_clusters", idx_cfg.num_clusters.is_some()),
+            ("nprobe", idx_cfg.nprobe.is_some()),
+            ("routing", idx_cfg.ivf_routing.is_some()),
+        ] {
+            if present {
+                log::warn!(
+                    "'{option}' has no effect on the 'tq' index (training-free full \
+                     scan); ignoring"
+                );
+            }
+        }
+        // Canonicalize to the same shape as DenseVectorConfig::tq() so every
+        // construction path yields an identical config for a `tq` field.
+        config.num_clusters = None;
+        config.nprobe = 0;
+        config.ivf_routing = super::schema::IvfRoutingMode::Flat;
+        return apply_soar_to_dense_vector(config, idx_cfg);
+    }
+
     // Apply num_clusters for IVF-based indexes
     if idx_cfg.num_clusters.is_some() {
         config.num_clusters = idx_cfg.num_clusters;
@@ -836,7 +861,11 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
         config.ivf_routing = routing;
     }
 
-    // Apply SOAR spilling if specified (IVF-based indexes only)
+    apply_soar_to_dense_vector(config, idx_cfg);
+}
+
+/// Apply SOAR spilling if specified (IVF-based indexes only)
+fn apply_soar_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) {
     if idx_cfg.soar.is_some() {
         if config.uses_ivf() {
             config.soar = idx_cfg.soar;

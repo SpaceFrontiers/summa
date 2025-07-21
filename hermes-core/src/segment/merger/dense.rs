@@ -281,59 +281,72 @@ impl SegmentMerger {
             let config = entry.dense_vector_config.as_ref();
 
             // ── ANN entry (written first, index_type != FLAT_TYPE) ───────
-            let ann_entry = match ann_mode {
-                AnnWriteMode::Copy => {
-                    self.copy_ann_runs(field, entry, segments, &doc_offs, trained, &mut writer)?
-                }
-                AnnWriteMode::Rebuild if entry.field_type == FieldType::BinaryDenseVector => {
-                    if let Some(index) = self
-                        .rebuild_binary_ivf(field, entry, segments, &doc_offs, trained)
-                        .await?
-                    {
-                        let data_offset = writer.offset();
-                        let routing = entry
-                            .binary_dense_vector_config
-                            .as_ref()
-                            .expect("binary field configuration validated")
-                            .ivf_routing;
-                        super::block_in_place_if_multithread(|| {
-                            crate::segment::ann_disk::write_built_binary_ivf(
-                                &index,
-                                routing,
-                                &mut writer,
-                            )
-                        })
-                        .map_err(crate::Error::Io)?;
-                        Some((
-                            crate::segment::ann_build::BINARY_IVF_TYPE,
-                            data_offset,
-                            writer.offset() - data_offset,
-                        ))
-                    } else {
-                        None
+            let tq_config = config.filter(|config| {
+                entry.field_type == FieldType::DenseVector
+                    && config.index_type == VectorIndexType::Tq
+            });
+            let ann_entry = if let Some(tq_config) = tq_config {
+                // TQ payloads carry no trained generation: every merge mode
+                // byte-copies compatible runs; only sources without a payload
+                // (pre-TQ builds or a schema switch to `tq`) are upgraded by
+                // re-encoding from their flat vectors.
+                self.write_tq_entry(field, tq_config, segments, &doc_offs, &mut writer)
+                    .await?
+            } else {
+                match ann_mode {
+                    AnnWriteMode::Copy => {
+                        self.copy_ann_runs(field, entry, segments, &doc_offs, trained, &mut writer)?
                     }
-                }
-                AnnWriteMode::Rebuild => {
-                    if let Some((index, num_clusters)) = self
-                        .rebuild_float_ivf(field, config, segments, &doc_offs, trained)
-                        .await?
-                    {
-                        let data_offset = writer.offset();
-                        super::block_in_place_if_multithread(|| {
-                            crate::segment::ann_disk::write_built_ivf_pq(
-                                &index,
-                                num_clusters,
-                                &mut writer,
-                            )
-                        })
-                        .map_err(crate::Error::Io)?;
-                        Some((
-                            crate::segment::ann_build::IVF_PQ_TYPE,
-                            data_offset,
-                            writer.offset() - data_offset,
-                        ))
-                    } else {
-                        None
+                    AnnWriteMode::Rebuild if entry.field_type == FieldType::BinaryDenseVector => {
+                        if let Some(index) = self
+                            .rebuild_binary_ivf(field, entry, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            let routing = entry
+                                .binary_dense_vector_config
+                                .as_ref()
+                                .expect("binary field configuration validated")
+                                .ivf_routing;
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_binary_ivf(
+                                    &index,
+                                    routing,
+                                    &mut writer,
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::BINARY_IVF_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    AnnWriteMode::Rebuild => {
+                        if let Some((index, num_clusters)) = self
+                            .rebuild_float_ivf(field, config, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_ivf_pq(
+                                    &index,
+                                    num_clusters,
+                                    &mut writer,
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::IVF_PQ_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
                     }
                 }
             };
@@ -574,6 +587,151 @@ impl SegmentMerger {
             crate::format_bytes(data_size),
         );
         Ok(Some((index_type, data_offset, data_size)))
+    }
+
+    /// Write the merged TQ payload for one field.
+    ///
+    /// The normal path is the same pure byte-copy as every other ANN merge:
+    /// TQ payloads have no trained generation, so compatibility is only the
+    /// codec fingerprint. Sources without a payload (segments built before
+    /// the field used `tq`) are upgraded by re-encoding from flat storage —
+    /// loudly, and only for this field.
+    async fn write_tq_entry(
+        &self,
+        field: crate::dsl::Field,
+        config: &crate::dsl::DenseVectorConfig,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        writer: &mut OffsetWriter,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let expected_fingerprint =
+            crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
+        let mut sources = Vec::new();
+        let mut segments_with_vectors = 0usize;
+        let mut missing_payloads = 0usize;
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            segments_with_vectors += 1;
+            match segment.vector_indexes().get(&field.0) {
+                Some(crate::segment::VectorIndex::Tq { index, .. }) => {
+                    let header = index.get().header();
+                    if header.dim != config.dim
+                        || header.quantizer_version != expected_fingerprint
+                        || header.vector_count != flat.num_vectors
+                    {
+                        return Err(crate::Error::Corruption(format!(
+                            "merge source {:032x} field {} carries an incompatible TQ payload \
+                             (dim {} fingerprint {:#x} count {}, expected dim {} fingerprint \
+                             {:#x} count {})",
+                            segment.meta().id,
+                            field.0,
+                            header.dim,
+                            header.quantizer_version,
+                            header.vector_count,
+                            config.dim,
+                            expected_fingerprint,
+                            flat.num_vectors,
+                        )));
+                    }
+                    sources.push((index.get(), doc_offs[segment_index]));
+                }
+                Some(_) => {
+                    return Err(crate::Error::Corruption(format!(
+                        "merge source {:032x} field {} has a non-TQ ANN payload for a tq field",
+                        segment.meta().id,
+                        field.0,
+                    )));
+                }
+                None => missing_payloads += 1,
+            }
+        }
+        if segments_with_vectors == 0 {
+            return Ok(None);
+        }
+
+        if missing_payloads == 0 {
+            let data_offset = writer.offset();
+            super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_merged_ann(&sources, writer)
+            })
+            .map_err(crate::Error::Io)?;
+            let data_size = writer.offset() - data_offset;
+            log::debug!(
+                "[merge_vectors] field {}: copied {} compatible TQ run source(s), {} bytes",
+                field.0,
+                sources.len(),
+                data_size,
+            );
+            return Ok(Some((
+                crate::segment::ann_build::TQ_FLAT_TYPE,
+                data_offset,
+                data_size,
+            )));
+        }
+
+        log::info!(
+            "[merge_vectors] field {}: {}/{} TQ source(s) have no payload; re-encoding from \
+             flat vectors (training-free)",
+            field.0,
+            missing_payloads,
+            segments_with_vectors,
+        );
+        drop(sources);
+        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(config.dim));
+        let mut builder = crate::structures::TqFlatBuilder::new(codec);
+        let encode_start = std::time::Instant::now();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            feed_segment(
+                segment,
+                field,
+                doc_offs[segment_index],
+                |labels, vectors| {
+                    super::block_in_place_if_multithread(|| {
+                        let mut add = || builder.add_batch(labels, vectors);
+                        if let Some(pool) = &self.background_pool {
+                            pool.install(add)
+                        } else {
+                            add()
+                        }
+                    })
+                    .map_err(|error| {
+                        crate::Error::Internal(format!(
+                            "TQ re-encode failed for field {}: {error}",
+                            field.0,
+                        ))
+                    })
+                },
+            )
+            .await?;
+        }
+        if builder.is_empty() {
+            log::warn!(
+                "[merge_vectors] field {}: TQ re-encode found no vectors in any source; \
+                 the merged segment will carry no TQ payload and fall back to exact scan",
+                field.0,
+            );
+            return Ok(None);
+        }
+        builder.finish();
+        let vector_count = builder.len();
+        let data_offset = writer.offset();
+        super::block_in_place_if_multithread(|| {
+            crate::segment::ann_disk::write_built_tq_flat(&builder, writer)
+        })
+        .map_err(crate::Error::Io)?;
+        log::info!(
+            "[merge_vectors] field {}: TQ re-encoded {} vectors in {:.1}s",
+            field.0,
+            vector_count,
+            encode_start.elapsed().as_secs_f64(),
+        );
+        Ok(Some((
+            crate::segment::ann_build::TQ_FLAT_TYPE,
+            data_offset,
+            writer.offset() - data_offset,
+        )))
     }
 
     /// Rebuild the binary IVF index for a vector-generation rewrite.

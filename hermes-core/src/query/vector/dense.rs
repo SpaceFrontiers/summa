@@ -2,7 +2,7 @@
 
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::VectorResultScorer;
 use super::combiner::MultiValueCombiner;
@@ -33,10 +33,10 @@ pub struct DenseVectorQuery {
     pub rerank_factor: f32,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
-    /// One global-quantizer route, shared by all segment scorers spawned for
-    /// this query. The cache is versioned, so a query reused after an index
-    /// generation change recomputes safely.
-    probe_cache: Arc<Mutex<Option<Arc<crate::structures::IvfPqQueryPlan>>>>,
+    /// Query-global dense plans (IVF-PQ probe route / TQ LUTs), shared by all
+    /// segment scorers spawned for this query. The caches are versioned, so a
+    /// query reused after an index generation change recomputes safely.
+    plan_cache: Arc<crate::segment::DensePlanCache>,
 }
 
 impl std::fmt::Display for DenseVectorQuery {
@@ -61,7 +61,7 @@ impl DenseVectorQuery {
             nprobe: 64,
             rerank_factor: DEFAULT_DENSE_RERANK_FACTOR,
             combiner: MultiValueCombiner::Max,
-            probe_cache: Arc::new(Mutex::new(None)),
+            plan_cache: Arc::new(Default::default()),
         }
     }
 
@@ -97,7 +97,7 @@ impl Query for DenseVectorQuery {
         let nprobe = self.nprobe;
         let rerank_factor = self.rerank_factor;
         let combiner = self.combiner;
-        let probe_cache = Arc::clone(&self.probe_cache);
+        let plan_cache = Arc::clone(&self.plan_cache);
         Box::pin(async move {
             let results = reader
                 .search_dense_vector_with_probe_cache(
@@ -107,7 +107,7 @@ impl Query for DenseVectorQuery {
                     nprobe,
                     rerank_factor,
                     combiner,
-                    &probe_cache,
+                    &plan_cache,
                 )
                 .await?;
 
@@ -128,7 +128,7 @@ impl Query for DenseVectorQuery {
             self.nprobe,
             self.rerank_factor,
             self.combiner,
-            &self.probe_cache,
+            &self.plan_cache,
         )?;
         Ok(Box::new(VectorResultScorer::new(results, self.field.0)) as Box<dyn Scorer>)
     }

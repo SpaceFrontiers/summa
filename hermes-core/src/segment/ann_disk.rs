@@ -40,6 +40,8 @@ const BINARY_SCORE_BATCH: usize = 8_192;
 pub(crate) enum AnnKind {
     IvfPq = 1,
     BinaryIvf = 2,
+    /// TurboQuant flat scan: single logical cluster, block-packed codes.
+    TqFlat = 3,
 }
 
 impl AnnKind {
@@ -47,7 +49,24 @@ impl AnnKind {
         match value {
             1 => Ok(Self::IvfPq),
             2 => Ok(Self::BinaryIvf),
+            3 => Ok(Self::TqFlat),
             _ => Err(invalid_data(format!("unknown ANN kind {value}"))),
+        }
+    }
+}
+
+/// Codes-column byte length for one run. TQ packs vectors into 16-lane
+/// blocks (gammas + dimension-major nibbles), so its column is block-padded
+/// rather than `count * code_size`.
+fn expected_codes_column_len(kind: AnnKind, count: usize, code_size: usize) -> io::Result<usize> {
+    match kind {
+        AnnKind::IvfPq | AnnKind::BinaryIvf => count
+            .checked_mul(code_size)
+            .ok_or_else(|| invalid_data("ANN code column size overflows usize")),
+        // Single source of truth for the block-packed layout lives in tq.rs.
+        AnnKind::TqFlat => {
+            crate::structures::vector::quantization::tq_codes_column_len_checked(count, code_size)
+                .ok_or_else(|| invalid_data("TQ code column size overflows usize"))
         }
     }
 }
@@ -191,9 +210,7 @@ impl AnnDiskIndex {
             let ordinals_len = count
                 .checked_mul(std::mem::size_of::<u16>())
                 .ok_or_else(|| invalid_data("ANN ordinal column size overflows usize"))?;
-            let expected_codes_len = count
-                .checked_mul(code_size)
-                .ok_or_else(|| invalid_data("ANN code column size overflows usize"))?;
+            let expected_codes_len = expected_codes_column_len(kind, count, code_size)?;
             let doc_ids_end = doc_ids_offset
                 .checked_add(doc_ids_len)
                 .ok_or_else(|| invalid_data("ANN doc-ID range overflows usize"))?;
@@ -300,6 +317,44 @@ impl AnnDiskIndex {
                         run_doc_id(bytes, run, index)?,
                         read_u16(bytes, run.ordinals.start + index * 2),
                         distance,
+                    );
+                }
+            }
+        }
+        Ok(collector.into_sorted_results())
+    }
+
+    /// Score every TQ block against the query plan and keep the top `k`
+    /// distinct documents by estimated similarity.
+    pub(crate) fn search_tq_distinct(
+        &self,
+        k: usize,
+        plan: &crate::structures::TqQueryPlan,
+    ) -> io::Result<Vec<(u32, u16, f32)>> {
+        use crate::structures::vector::quantization::{TQ_BLOCK_LANES, tq_block_bytes};
+
+        if plan.padded_dim() != self.header.code_size * 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TQ query plan does not match the payload dimension",
+            ));
+        }
+        let block_bytes = tq_block_bytes(self.header.code_size);
+        let bytes = self.raw.as_slice();
+        let mut collector = BoundedAnnCollector::<true, true>::new(k);
+        let mut scores = [0.0f32; TQ_BLOCK_LANES];
+        for run in &self.runs {
+            let codes = &bytes[run.codes.clone()];
+            for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                crate::structures::vector::quantization::tq_score_block(plan, block, &mut scores);
+                let lane_base = block_index * TQ_BLOCK_LANES;
+                let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                    let index = lane_base + lane;
+                    collector.insert(
+                        run_doc_id(bytes, run, index)?,
+                        read_u16(bytes, run.ordinals.start + index * 2),
+                        score,
                     );
                 }
             }
@@ -436,6 +491,35 @@ pub(crate) fn write_built_binary_ivf(
     )
 }
 
+/// Serialize a populated TQ builder as a single-run payload.
+#[cfg(feature = "native")]
+pub(crate) fn write_built_tq_flat(
+    builder: &crate::structures::TqFlatBuilder,
+    writer: &mut (impl Write + ?Sized),
+) -> io::Result<u64> {
+    let codec = builder.codec();
+    let runs = [BuildRun {
+        cluster_id: 0,
+        doc_ids: &builder.doc_ids,
+        ordinals: &builder.ordinals,
+        codes: &builder.codes,
+    }];
+    write_built_runs(
+        AnnDiskHeader {
+            kind: AnnKind::TqFlat,
+            routing: IvfRoutingMode::Flat,
+            dim: codec.dim(),
+            code_size: codec.code_size(),
+            num_clusters: 1,
+            quantizer_version: codec.fingerprint(),
+            codebook_version: 0,
+            vector_count: builder.len(),
+        },
+        &runs,
+        writer,
+    )
+}
+
 #[cfg(feature = "native")]
 struct BuildRun<'a> {
     cluster_id: u32,
@@ -478,10 +562,7 @@ fn write_built_runs(
             || run.cluster_id >= header.num_clusters
             || previous_cluster.is_some_and(|cluster| cluster >= run.cluster_id)
             || run.ordinals.len() != count
-            || run.codes.len()
-                != count
-                    .checked_mul(header.code_size)
-                    .ok_or_else(|| invalid_data("ANN build code column size overflows usize"))?
+            || run.codes.len() != expected_codes_column_len(header.kind, count, header.code_size)?
         {
             return Err(invalid_data("ANN build run columns are inconsistent"));
         }
@@ -798,6 +879,12 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
             && (header.codebook_version != 0
                 || !header.dim.is_multiple_of(8)
                 || header.code_size != header.dim.div_ceil(8)))
+        || (header.kind == AnnKind::TqFlat
+            && (header.codebook_version != 0
+                || header.num_clusters != 1
+                || header.routing != IvfRoutingMode::Flat
+                || header.code_size * 2
+                    != crate::structures::vector::quantization::tq_padded_dim(header.dim)))
     {
         return Err(invalid_data("ANN header contains invalid metadata"));
     }
@@ -961,6 +1048,102 @@ mod tests {
             .collect();
         docs.sort_unstable();
         assert_eq!(docs, [0, 1, 2, 3, 4, 5]);
+    }
+
+    fn build_tq_payload(dim: usize, count: usize, seed: u64) -> (Vec<u8>, Vec<Vec<f32>>) {
+        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(dim));
+        let mut builder = crate::structures::TqFlatBuilder::new(std::sync::Arc::clone(&codec));
+        let mut state = seed;
+        let mut vectors = Vec::new();
+        let mut flat = Vec::new();
+        for _ in 0..count {
+            let vector: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+                })
+                .collect();
+            flat.extend_from_slice(&vector);
+            vectors.push(vector);
+        }
+        let labels: Vec<(u32, u16)> = (0..count).map(|index| (index as u32, 0)).collect();
+        builder.add_batch(&labels, &flat).unwrap();
+        builder.finish();
+        let mut bytes = Vec::new();
+        write_built_tq_flat(&builder, &mut bytes).unwrap();
+        (bytes, vectors)
+    }
+
+    #[test]
+    fn tq_payload_roundtrip_search_and_pure_copy_merge() {
+        let dim = 20; // pads to 32; exercises padding + partial final block
+        let count = 21;
+        let (bytes, vectors) = build_tq_payload(dim, count, 42);
+        let index = AnnDiskIndex::open(
+            OwnedBytes::new(bytes.clone()),
+            AnnKind::TqFlat,
+            count as u32,
+        )
+        .unwrap();
+        assert_eq!(index.header().vector_count, count);
+
+        // The stored estimate must rank an exact-duplicate query's own row first.
+        let codec = crate::structures::TqCodec::new(dim);
+        for target in [0usize, 7, 20] {
+            let plan = crate::structures::TqQueryPlan::build(&codec, &vectors[target]);
+            let results = index.search_tq_distinct(3, &plan).unwrap();
+            assert_eq!(
+                results[0].0, target as u32,
+                "query duplicating vector {target} must rank it first: {results:?}"
+            );
+        }
+
+        // Ordinary merge must not decode or rewrite the corpus columns.
+        let (second_bytes, _) = build_tq_payload(dim, 5, 77);
+        let second =
+            AnnDiskIndex::open(OwnedBytes::new(second_bytes.clone()), AnnKind::TqFlat, 5).unwrap();
+        let mut merged_bytes = Vec::new();
+        write_merged_ann(&[(&index, 0), (&second, count as u32)], &mut merged_bytes).unwrap();
+        let merged = AnnDiskIndex::open(
+            OwnedBytes::new(merged_bytes.clone()),
+            AnnKind::TqFlat,
+            count as u32 + 5,
+        )
+        .unwrap();
+        let mut expected_payload = bytes[ANN_HEADER_SIZE..payload_end(&index)].to_vec();
+        expected_payload.extend_from_slice(&second_bytes[ANN_HEADER_SIZE..payload_end(&second)]);
+        assert_eq!(
+            &merged_bytes[ANN_HEADER_SIZE..payload_end(&merged)],
+            expected_payload.as_slice(),
+            "TQ merge must be a pure byte copy of the source columns",
+        );
+        let plan = crate::structures::TqQueryPlan::build(&codec, &vectors[7]);
+        let results = merged.search_tq_distinct(1, &plan).unwrap();
+        assert_eq!(results[0].0, 7, "merged payload must keep doc bases");
+    }
+
+    #[test]
+    fn open_rejects_tq_payload_with_inconsistent_geometry() {
+        let (bytes, _) = build_tq_payload(20, 4, 9);
+        // code_size (header bytes 12..16) is P/2 = 16 for dim 20; corrupt to 15.
+        let mut corrupted = bytes.clone();
+        corrupted[12..16].copy_from_slice(&15u32.to_le_bytes());
+        assert!(
+            AnnDiskIndex::open(OwnedBytes::new(corrupted), AnnKind::TqFlat, 4).is_err(),
+            "TQ header with code_size != padded_dim/2 must be refused"
+        );
+
+        // A truncated codes column (not block-padded) must also be refused.
+        let (short_bytes, _) = build_tq_payload(20, 4, 9);
+        let mut wrong_kind = short_bytes.clone();
+        wrong_kind[4] = AnnKind::IvfPq as u8;
+        assert!(
+            AnnDiskIndex::open(OwnedBytes::new(wrong_kind), AnnKind::IvfPq, 4).is_err(),
+            "TQ block-padded columns must not validate under another kind"
+        );
+        assert!(AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, 4).is_ok());
     }
 
     #[test]

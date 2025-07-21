@@ -727,32 +727,37 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 let idx_name = match cfg.index_type {
                     VectorIndexType::Flat => "flat",
                     VectorIndexType::IvfPq => "ivf_pq",
+                    VectorIndexType::Tq => "tq",
                 };
                 idx_params.push(idx_name.to_string());
-                if let Some(nc) = cfg.num_clusters {
-                    idx_params.push(format!("num_clusters: {}", nc));
-                }
-                if cfg.nprobe != 64 {
-                    idx_params.push(format!("nprobe: {}", cfg.nprobe));
-                }
-                if cfg.ivf_routing != IvfRoutingMode::Auto {
-                    let routing = match cfg.ivf_routing {
-                        IvfRoutingMode::Auto => unreachable!(),
-                        IvfRoutingMode::Flat => "flat",
-                        IvfRoutingMode::TwoLevel => "two_level",
-                        IvfRoutingMode::Hnsw => "hnsw",
-                    };
-                    idx_params.push(format!("routing: {routing}"));
-                }
-                if let Some(soar) = &cfg.soar {
-                    let mode = if soar.selective {
-                        "selective"
-                    } else if soar.num_secondary > 1 {
-                        "aggressive"
-                    } else {
-                        "full"
-                    };
-                    idx_params.push(format!("soar: {mode}"));
+                // TQ scans every code: IVF knobs do not apply and re-parsing
+                // them would warn.
+                if cfg.index_type != VectorIndexType::Tq {
+                    if let Some(nc) = cfg.num_clusters {
+                        idx_params.push(format!("num_clusters: {}", nc));
+                    }
+                    if cfg.nprobe != 64 {
+                        idx_params.push(format!("nprobe: {}", cfg.nprobe));
+                    }
+                    if cfg.ivf_routing != IvfRoutingMode::Auto {
+                        let routing = match cfg.ivf_routing {
+                            IvfRoutingMode::Auto => unreachable!(),
+                            IvfRoutingMode::Flat => "flat",
+                            IvfRoutingMode::TwoLevel => "two_level",
+                            IvfRoutingMode::Hnsw => "hnsw",
+                        };
+                        idx_params.push(format!("routing: {routing}"));
+                    }
+                    if let Some(soar) = &cfg.soar {
+                        let mode = if soar.selective {
+                            "selective"
+                        } else if soar.num_secondary > 1 {
+                            "aggressive"
+                        } else {
+                            "full"
+                        };
+                        idx_params.push(format!("soar: {mode}"));
+                    }
                 }
             }
 

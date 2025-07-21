@@ -268,19 +268,27 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4Ã
 
 ### Index Types and Routing
 
-Float fields have one production ANN format: corpus-trained global IVF-PQ.
-Every segment shares the index's centroid router and residual-PQ codebook;
-segments store only mmap-backed cluster runs and PQ codes. Ordinary segment
-merges copy those immutable run columns byte-for-byte and rewrite only their
-compact document-base directory. `flat` remains available for exact
-brute-force search and as the accumulation format before ANN build.
+Float fields have two ANN formats. `ivf_pq` is the corpus-trained global
+IVF-PQ: every segment shares the index's centroid router and residual-PQ
+codebook; segments store only mmap-backed cluster runs and PQ codes. `tq`
+(TurboQuant, `docs/turboquant-quantization.md`) is training-free: each segment
+carries a 4-bit compressed payload built at commit with no global artifacts,
+scanned exhaustively with SIMD lookup tables and exact-reranked. Ordinary
+segment merges copy both formats' immutable run columns byte-for-byte and
+rewrite only their compact document-base directory. `flat` remains available
+for exact brute-force search and as the accumulation format before an
+`ivf_pq` build.
 
 ```
 field e: dense_vector<768, f16> [indexed]                                      # global IVF-PQ
 field e: dense_vector<768, f16> [indexed<ivf_pq, routing: hnsw, nprobe: 64>]
+field e: dense_vector<768, f16> [indexed<tq>]                                  # training-free TQ
 field e: dense_vector<768, f16> [indexed<flat>]                                # exact full scan
 field e: dense_vector<768> [stored]                                            # stored, not indexed
 ```
+
+`tq` ignores `num_clusters`, `nprobe`, `routing`, and `soar` (it scans every
+code) and warns when they are set; `rerank_factor` applies unchanged.
 
 When `num_clusters` is omitted, training chooses a corpus-sized leaf count
 using an 8Ã—sqrt(N) target bounded by sample quality and artifact memory. Routing

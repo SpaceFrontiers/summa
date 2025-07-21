@@ -835,6 +835,76 @@ fn validate_ivf_pq_ann(
     Ok(())
 }
 
+/// Per-query dense plan caches, shared by every segment scorer the query
+/// spawns. Both members are query-global: the IVF-PQ probe route and ADC
+/// tables depend only on the query and index-level artifacts, and the TQ
+/// LUTs depend only on the query and the schema dimension.
+#[derive(Debug, Default)]
+pub struct DensePlanCache {
+    pub(crate) ivf_pq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+    pub(crate) tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqQueryPlan>>>,
+}
+
+/// Search one segment's TQ payload, reusing the per-query plan across
+/// segments: the codec is a pure function of the schema dimension, so the
+/// LUTs are identical for every segment of the field (mirrors the IVF-PQ
+/// `probe_cache` hot-path rule — no repeated per-segment plan allocation).
+fn search_tq_segment(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    codec: &crate::structures::TqCodec,
+    query: &[f32],
+    fetch_k: usize,
+    field: Field,
+    dim: usize,
+    plan_cache: Option<&std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqQueryPlan>>>>,
+) -> Result<Vec<RawVectorCandidate>> {
+    validate_tq_ann(index, codec, dim, field)?;
+    let plan = match plan_cache {
+        Some(cache) => {
+            let mut cached = cache
+                .lock()
+                .map_err(|_| Error::Internal("TQ plan cache is poisoned".into()))?;
+            match cached.as_ref() {
+                Some(plan) if plan.fingerprint() == codec.fingerprint() => {
+                    std::sync::Arc::clone(plan)
+                }
+                _ => {
+                    let plan =
+                        std::sync::Arc::new(crate::structures::TqQueryPlan::build(codec, query));
+                    *cached = Some(std::sync::Arc::clone(&plan));
+                    plan
+                }
+            }
+        }
+        None => std::sync::Arc::new(crate::structures::TqQueryPlan::build(codec, query)),
+    };
+    index.search_tq_distinct(fetch_k, &plan).map_err(|error| {
+        Error::Corruption(format!("invalid TQ payload for field {}: {error}", field.0))
+    })
+}
+
+fn validate_tq_ann(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    codec: &crate::structures::TqCodec,
+    dim: usize,
+    field: Field,
+) -> Result<()> {
+    let header = index.header();
+    if header.dim != dim
+        || codec.dim() != dim
+        || header.code_size != codec.code_size()
+        || header.quantizer_version != codec.fingerprint()
+        || header.codebook_version != 0
+        || header.num_clusters != 1
+    {
+        return Err(Error::Corruption(format!(
+            "TQ payload for field {} does not match the codec derived from schema dimension {dim}",
+            field.0,
+        )));
+    }
+    Ok(())
+}
+
 fn validate_binary_ann(
     index: &crate::segment::ann_disk::AnnDiskIndex,
     quantizer: &crate::structures::BinaryCoarseQuantizer,
@@ -1891,7 +1961,7 @@ impl SegmentReader {
         nprobe: usize,
         rerank_factor: f32,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+        plan_cache: &DensePlanCache,
     ) -> Result<Vec<VectorSearchResult>> {
         self.search_dense_vector_impl(
             field,
@@ -1900,7 +1970,7 @@ impl SegmentReader {
             nprobe,
             rerank_factor,
             combiner,
-            Some(probe_cache),
+            Some(plan_cache),
         )
         .await
     }
@@ -1914,9 +1984,7 @@ impl SegmentReader {
         nprobe: usize,
         rerank_factor: f32,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: Option<
-            &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
-        >,
+        plan_cache: Option<&DensePlanCache>,
     ) -> Result<Vec<VectorSearchResult>> {
         let params =
             self.validate_dense_search_request(field, query, nprobe, rerank_factor, combiner)?;
@@ -1991,7 +2059,7 @@ impl SegmentReader {
                         query,
                         params.nprobe,
                         routing,
-                        probe_cache,
+                        plan_cache.map(|cache| &cache.ivf_pq),
                     )?;
                     let flat = lazy_flat.expect("ANN/flat pairing validated above");
                     index
@@ -2008,6 +2076,19 @@ impl SegmentReader {
                         .into_iter()
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
+                }
+                VectorIndex::Tq { index: lazy, codec } => {
+                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
+                    // Estimated similarities feed the shared exact re-rank.
+                    search_tq_segment(
+                        lazy.get(),
+                        codec,
+                        query,
+                        fetch_k.min(flat.num_docs_with_vectors()),
+                        field,
+                        params.dim,
+                        plan_cache.map(|cache| &cache.tq),
+                    )?
                 }
                 VectorIndex::BinaryIvf(_) => {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
@@ -2066,6 +2147,7 @@ impl SegmentReader {
             let kind = match ann_index {
                 Some(VectorIndex::IvfPq(_)) => "ivf_pq",
                 Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
+                Some(VectorIndex::Tq { .. }) => "tq_flat",
                 None => "flat",
             };
             crate::observe::dense_l1(
@@ -2535,7 +2617,7 @@ impl SegmentReader {
         nprobe: usize,
         rerank_factor: f32,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
+        plan_cache: &DensePlanCache,
     ) -> Result<Vec<VectorSearchResult>> {
         self.search_dense_vector_sync_impl(
             field,
@@ -2544,7 +2626,7 @@ impl SegmentReader {
             nprobe,
             rerank_factor,
             combiner,
-            Some(probe_cache),
+            Some(plan_cache),
         )
     }
 
@@ -2558,9 +2640,7 @@ impl SegmentReader {
         nprobe: usize,
         rerank_factor: f32,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: Option<
-            &std::sync::Mutex<Option<std::sync::Arc<crate::structures::IvfPqQueryPlan>>>,
-        >,
+        plan_cache: Option<&DensePlanCache>,
     ) -> Result<Vec<VectorSearchResult>> {
         let params =
             self.validate_dense_search_request(field, query, nprobe, rerank_factor, combiner)?;
@@ -2631,7 +2711,7 @@ impl SegmentReader {
                         query,
                         params.nprobe,
                         routing,
-                        probe_cache,
+                        plan_cache.map(|cache| &cache.ivf_pq),
                     )?;
                     let flat = lazy_flat.expect("ANN/flat pairing validated above");
                     index
@@ -2648,6 +2728,18 @@ impl SegmentReader {
                         .into_iter()
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
+                }
+                VectorIndex::Tq { index: lazy, codec } => {
+                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
+                    search_tq_segment(
+                        lazy.get(),
+                        codec,
+                        query,
+                        fetch_k.min(flat.num_docs_with_vectors()),
+                        field,
+                        params.dim,
+                        plan_cache.map(|cache| &cache.tq),
+                    )?
                 }
                 VectorIndex::BinaryIvf(_) => {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)

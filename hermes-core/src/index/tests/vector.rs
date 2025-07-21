@@ -1402,3 +1402,321 @@ async fn test_binary_ivf_multi_value_exact_scores_async_path() {
 async fn test_binary_ivf_multi_value_exact_scores_sync_path() {
     binary_ivf_multi_value_exact_scores().await;
 }
+
+/// TurboQuant end-to-end: the payload is built at commit with no training,
+/// searched via the estimated-similarity scan, and exact-reranked.
+/// Pins recall vs brute force and the needle ranking on the async path.
+#[tokio::test]
+async fn test_tq_dense_search_end_to_end() {
+    use crate::dsl::DenseVectorConfig;
+    use crate::query::DenseVectorQuery;
+
+    let dim = 48; // pads to 64
+    let doc_count = 400usize;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let embedding =
+        sb.add_dense_vector_field_with_config("embedding", true, true, DenseVectorConfig::tq(dim));
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Hash-based coordinates: sin-of-linear-index aliases badly (distinct
+    // seeds can produce near-identical vectors), which breaks ranking tests.
+    let unit_vector = |seed: usize| -> Vec<f32> {
+        let mut values: Vec<f32> = (0..dim)
+            .map(|d| {
+                let mut state = (seed as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(d as u64);
+                state ^= state >> 33;
+                state = state.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                state ^= state >> 33;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect();
+        let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        values.iter_mut().for_each(|v| *v /= norm);
+        values
+    };
+    // 20 clusters of 10 near-duplicates plus 200 background docs. Cluster
+    // members sit at cosine ~0.9 to their center while background stays near
+    // zero, so exact top-10 for a center query is its own cluster — the
+    // separation a 4-bit estimator must preserve.
+    let normalize = |mut values: Vec<f32>| -> Vec<f32> {
+        let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        values.iter_mut().for_each(|v| *v /= norm);
+        values
+    };
+    let clusters = 20usize;
+    let members = 10usize;
+    let mut doc_vectors: Vec<(String, Vec<f32>)> = Vec::new();
+    for cluster in 0..clusters {
+        let center = unit_vector(cluster);
+        for member in 0..members {
+            let noise = unit_vector(10_000 + cluster * members + member);
+            let vector = normalize(
+                center
+                    .iter()
+                    .zip(&noise)
+                    .map(|(c, n)| c + 0.35 * n)
+                    .collect(),
+            );
+            doc_vectors.push((format!("cluster {cluster} member {member}"), vector));
+        }
+    }
+    for background in 0..(doc_count - clusters * members) {
+        doc_vectors.push((format!("bg {background}"), unit_vector(50_000 + background)));
+    }
+    for (doc_title, vector) in &doc_vectors {
+        let mut doc = Document::new();
+        doc.add_text(title, doc_title.clone());
+        doc.add_dense_vector(embedding, vector.clone());
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    // The TQ payload must exist without any build_vector_index() call.
+    let segments = index.segment_readers().await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert!(
+        matches!(
+            segments[0].vector_indexes().get(&embedding.0),
+            Some(crate::segment::VectorIndex::Tq { .. })
+        ),
+        "TQ segment payload must be built at commit with no training"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    // Exact-duplicate queries must rank their document first (post re-rank),
+    // including against nine near-duplicates from the same cluster.
+    for target in [0usize, 137, 399] {
+        let (target_title, target_vector) = &doc_vectors[target];
+        let query = DenseVectorQuery::new(embedding, target_vector.clone());
+        let results = searcher.search(&query, 5).await.unwrap();
+        let top = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            top.get_first(title).unwrap().as_text().unwrap(),
+            target_title.as_str(),
+            "duplicate query must rank its own document first"
+        );
+        assert!(
+            results[0].score > 0.999,
+            "exact re-rank must restore the true cosine, got {}",
+            results[0].score
+        );
+    }
+
+    // Recall@10 vs exact cosine for every cluster-center query.
+    let k = 10;
+    let mut recall_hits = 0usize;
+    let mut recall_total = 0usize;
+    for cluster in 0..clusters {
+        let query_vector = unit_vector(cluster);
+        let mut exact: Vec<(usize, f32)> = doc_vectors
+            .iter()
+            .enumerate()
+            .map(|(index, (_, vector))| {
+                let dot: f32 = vector.iter().zip(&query_vector).map(|(a, b)| a * b).sum();
+                (index, dot)
+            })
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let expected: std::collections::HashSet<&str> = exact[..k]
+            .iter()
+            .map(|(index, _)| doc_vectors[*index].0.as_str())
+            .collect();
+
+        let query = DenseVectorQuery::new(embedding, query_vector);
+        let results = searcher.search(&query, k).await.unwrap();
+        for result in &results {
+            let doc = searcher
+                .doc(result.segment_id, result.doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let doc_title = doc.get_first(title).unwrap().as_text().unwrap().to_string();
+            recall_hits += usize::from(expected.contains(doc_title.as_str()));
+        }
+        recall_total += k;
+    }
+    let recall = recall_hits as f32 / recall_total as f32;
+    assert!(
+        recall >= 0.9,
+        "TQ recall@{k} vs exact cosine must stay high with 2x re-rank, got {recall}"
+    );
+}
+
+/// TQ on the sync scorer path (multi-thread runtime), mirroring
+/// test_binary_dense_search_multi_thread_runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tq_dense_search_multi_thread_runtime() {
+    use crate::dsl::DenseVectorConfig;
+    use crate::query::DenseVectorQuery;
+
+    let dim = 24; // pads to 32
+    let mut sb = SchemaBuilder::default();
+    let embedding =
+        sb.add_dense_vector_field_with_config("embedding", true, true, DenseVectorConfig::tq(dim));
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    let needle: Vec<f32> = {
+        let mut v = vec![1.0f32; dim];
+        let norm = (dim as f32).sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    };
+    let mut doc = Document::new();
+    doc.add_dense_vector(embedding, needle.clone());
+    writer.add_document(doc).unwrap();
+    for i in 0..40 {
+        let mut doc = Document::new();
+        let mut v: Vec<f32> = (0..dim)
+            .map(|d| (((i * 13 + d * 7) as f32) * 1.3).sin())
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        doc.add_dense_vector(embedding, v);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let results = searcher
+        .search(&DenseVectorQuery::new(embedding, needle), 5)
+        .await
+        .expect("TQ search must work on multi-thread runtime (sync scorer path)");
+    assert!(!results.is_empty());
+    assert!(
+        results[0].score > 0.999,
+        "needle must be an exact match after re-rank, got {}",
+        results[0].score
+    );
+}
+
+/// TQ payloads across a merge: the merged segment keeps a TQ payload
+/// (pure byte-copy path) and search results survive doc-base remapping.
+#[tokio::test]
+async fn test_tq_dense_multi_segment_merge_preserves_payload() {
+    use crate::dsl::DenseVectorConfig;
+    use crate::query::DenseVectorQuery;
+
+    let dim = 24;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let embedding =
+        sb.add_dense_vector_field_with_config("embedding", true, true, DenseVectorConfig::tq(dim));
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+
+    let unit_vector = |seed: usize| -> Vec<f32> {
+        let mut values: Vec<f32> = (0..dim)
+            .map(|d| (((seed * 29 + d * 11) as f32) * 0.9).cos())
+            .collect();
+        let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        values.iter_mut().for_each(|v| *v /= norm);
+        values
+    };
+
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+    for i in 0..30 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("seg1 doc {}", i));
+        doc.add_dense_vector(embedding, unit_vector(i));
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    for i in 0..30 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("seg2 doc {}", i));
+        doc.add_dense_vector(embedding, unit_vector(1_000 + i));
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 2);
+
+    async fn top_result(
+        searcher: &crate::index::Searcher<RamDirectory>,
+        embedding: crate::dsl::Field,
+        title: crate::dsl::Field,
+        query_vector: Vec<f32>,
+    ) -> (String, f32) {
+        let query = DenseVectorQuery::new(embedding, query_vector);
+        let results = searcher.search(&query, 3).await.unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            doc.get_first(title).unwrap().as_text().unwrap().to_string(),
+            results[0].score,
+        )
+    }
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let (pre_first, pre_first_score) =
+        top_result(&searcher, embedding, title, unit_vector(7)).await;
+    let (pre_second, pre_second_score) =
+        top_result(&searcher, embedding, title, unit_vector(1_012)).await;
+    assert_eq!(pre_first, "seg1 doc 7");
+    assert_eq!(pre_second, "seg2 doc 12");
+
+    let mut writer = IndexWriter::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert!(
+        matches!(
+            segments[0].vector_indexes().get(&embedding.0),
+            Some(crate::segment::VectorIndex::Tq { .. })
+        ),
+        "merged segment must keep its TQ payload (byte-copy merge)"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let (post_first, post_first_score) =
+        top_result(&searcher, embedding, title, unit_vector(7)).await;
+    let (post_second, post_second_score) =
+        top_result(&searcher, embedding, title, unit_vector(1_012)).await;
+    assert_eq!(post_first, "seg1 doc 7", "doc bases must survive the merge");
+    assert_eq!(post_second, "seg2 doc 12");
+    assert!((post_first_score - pre_first_score).abs() < 1e-5);
+    assert!((post_second_score - pre_second_score).abs() < 1e-5);
+}

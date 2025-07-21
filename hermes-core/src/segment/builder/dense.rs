@@ -206,9 +206,10 @@ pub(super) fn build_vectors_streaming(
     let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(toc_capacity);
     let mut current_offset = 0u64;
 
-    // Pre-build ANN indexes across fields (native only — requires trained structures).
+    // Pre-build ANN indexes across fields (native only). IVF-PQ requires
+    // trained global structures; TQ is training-free and always builds.
     #[cfg(feature = "native")]
-    let ann_blobs: Vec<(u32, u8, Vec<u8>)> = if let Some(trained) = trained {
+    let ann_blobs: Vec<(u32, u8, Vec<u8>)> = {
         let ann_blob_fn = |(field_id, builder): &(u32, DenseVectorBuilder)|
          -> Result<Option<(u32, u8, Vec<u8>)>> {
                 let Some(config) = schema
@@ -220,12 +221,17 @@ pub(super) fn build_vectors_streaming(
 
                 let dim = builder.dim;
                 let blob = match config.index_type {
-                    VectorIndexType::IvfPq
-                        if trained.centroids.contains_key(field_id)
-                            && trained.codebooks.contains_key(field_id) =>
-                    {
-                        let centroids = &trained.centroids[field_id];
-                        let codebook = &trained.codebooks[field_id];
+                    VectorIndexType::IvfPq => {
+                        // Untrained IVF-PQ fields stay flat until a global
+                        // generation exists.
+                        let Some((centroids, codebook)) = trained.and_then(|trained| {
+                            Some((
+                                trained.centroids.get(field_id)?,
+                                trained.codebooks.get(field_id)?,
+                            ))
+                        }) else {
+                            return Ok(None);
+                        };
                         let mut index = super::super::ann_build::new_ivf_pq(
                             dim,
                             config.ivf_routing,
@@ -250,6 +256,12 @@ pub(super) fn build_vectors_streaming(
                         )
                             .map(|b| (super::super::ann_build::IVF_PQ_TYPE, b))
                     }
+                    VectorIndexType::Tq => super::super::ann_build::build_tq_flat(
+                        dim,
+                        &builder.doc_ids,
+                        &builder.vectors,
+                    )
+                    .map(|b| (super::super::ann_build::TQ_FLAT_TYPE, b)),
                     _ => return Ok(None),
                 };
                 let (index_type, bytes) = blob?;
@@ -270,8 +282,6 @@ pub(super) fn build_vectors_streaming(
             .into_iter()
             .flatten()
             .collect()
-    } else {
-        Vec::new()
     };
     // WASM: no ANN index building (requires trained structures from SegmentManager)
     #[cfg(not(feature = "native"))]
