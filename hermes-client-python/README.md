@@ -14,22 +14,29 @@ pip install hermes-client-python
 import asyncio
 from hermes_client_python import HermesClient
 
+
 async def main():
     async with HermesClient("localhost:50051") as client:
         # Create index with SDL schema
-        await client.create_index("articles", '''
+        await client.create_index(
+            "articles",
+            """
             index articles {
                 field title: text [indexed, stored]
                 field body: text [indexed, stored]
                 field score: f64 [stored]
             }
-        ''')
+        """,
+        )
 
         # Index documents
-        await client.index_documents("articles", [
-            {"title": "Hello World", "body": "First article", "score": 1.5},
-            {"title": "Goodbye World", "body": "Last article", "score": 2.0},
-        ])
+        await client.index_documents(
+            "articles",
+            [
+                {"title": "Hello World", "body": "First article", "score": 1.5},
+                {"title": "Goodbye World", "body": "Last article", "score": 2.0},
+            ],
+        )
 
         # Commit changes
         await client.commit("articles")
@@ -45,6 +52,7 @@ async def main():
 
         # Delete index
         await client.delete_index("articles")
+
 
 asyncio.run(main())
 ```
@@ -75,22 +83,28 @@ await client.close()
 
 ```python
 # Create index with SDL schema
-await client.create_index("myindex", '''
+await client.create_index(
+    "myindex",
+    """
     index myindex {
         field title: text [indexed, stored]
         field body: text [indexed, stored]
     }
-''')
+""",
+)
 
 # Create index with JSON schema
-await client.create_index("myindex", '''
+await client.create_index(
+    "myindex",
+    """
 {
     "fields": [
         {"name": "title", "type": "text", "indexed": true, "stored": true},
         {"name": "body", "type": "text", "indexed": true, "stored": true}
     ]
 }
-''')
+""",
+)
 
 # Get index info
 info = await client.get_index_info("myindex")
@@ -104,18 +118,23 @@ await client.delete_index("myindex")
 
 ```python
 # Index multiple documents (batch)
-indexed, errors = await client.index_documents("myindex", [
-    {"title": "Doc 1", "body": "Content 1"},
-    {"title": "Doc 2", "body": "Content 2"},
-])
+indexed, errors = await client.index_documents(
+    "myindex",
+    [
+        {"title": "Doc 1", "body": "Content 1"},
+        {"title": "Doc 2", "body": "Content 2"},
+    ],
+)
 
 # Index single document
 await client.index_document("myindex", {"title": "Doc", "body": "Content"})
+
 
 # Stream documents (for large datasets)
 async def doc_generator():
     for i in range(10000):
         yield {"title": f"Doc {i}", "body": f"Content {i}"}
+
 
 count = await client.index_documents_stream("myindex", doc_generator())
 
@@ -133,20 +152,21 @@ num_segments = await client.force_merge("myindex")
 results = await client.search("myindex", term=("title", "hello"), limit=10)
 
 # Boolean query
-results = await client.search("myindex", boolean={
-    "must": [("title", "hello")],
-    "should": [("body", "world")],
-    "must_not": [("title", "spam")],
-})
+results = await client.search(
+    "myindex",
+    boolean={
+        "must": [("title", "hello")],
+        "should": [("body", "world")],
+        "must_not": [("title", "spam")],
+    },
+)
 
 # With pagination
 results = await client.search("myindex", term=("title", "hello"), limit=10, offset=20)
 
 # With field loading
 results = await client.search(
-    "myindex",
-    term=("title", "hello"),
-    fields_to_load=["title", "body"]
+    "myindex", term=("title", "hello"), fields_to_load=["title", "body"]
 )
 
 # Access results

@@ -158,20 +158,27 @@ Python client:
 from hermes_client_python import HermesClient
 
 async with HermesClient("localhost:50051") as client:
-    await client.create_index("articles", '''
+    await client.create_index(
+        "articles",
+        """
         index articles {
             field title: text<en_stem> [indexed, stored]
             field body: text [indexed, stored]
         }
-    ''')
+    """,
+    )
 
-    await client.index_documents("articles", [
-        {"title": "Hybrid Search", "body": "Combining BM25 with vectors"},
-    ])
+    await client.index_documents(
+        "articles",
+        [
+            {"title": "Hybrid Search", "body": "Combining BM25 with vectors"},
+        ],
+    )
     await client.commit("articles")
 
-    results = await client.search("articles",
-        query={"match": {"field": "title", "text": "hybrid"}})
+    results = await client.search(
+        "articles", query={"match": {"field": "title", "text": "hybrid"}}
+    )
     for hit in results.hits:
         print(hit.score, hit.address)
 ```

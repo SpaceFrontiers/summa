@@ -313,48 +313,50 @@ import grpc
 from hermes_pb2 import *
 from hermes_pb2_grpc import IndexServiceStub, SearchServiceStub
 
-channel = grpc.insecure_channel('localhost:50051')
+channel = grpc.insecure_channel("localhost:50051")
 index_service = IndexServiceStub(channel)
 search_service = SearchServiceStub(channel)
 
 # Create index
-schema = '''
+schema = """
 index articles {
     title: text indexed stored
     body: text indexed stored
 }
-'''
-index_service.CreateIndex(CreateIndexRequest(
-    index_name="articles",
-    schema=schema
-))
+"""
+index_service.CreateIndex(CreateIndexRequest(index_name="articles", schema=schema))
 
 # Index documents
 docs = [
-    NamedDocument(fields={
-        "title": FieldValue(text="Hello World"),
-        "body": FieldValue(text="This is my first article")
-    }),
-    NamedDocument(fields={
-        "title": FieldValue(text="Goodbye World"),
-        "body": FieldValue(text="This is my last article")
-    })
+    NamedDocument(
+        fields={
+            "title": FieldValue(text="Hello World"),
+            "body": FieldValue(text="This is my first article"),
+        }
+    ),
+    NamedDocument(
+        fields={
+            "title": FieldValue(text="Goodbye World"),
+            "body": FieldValue(text="This is my last article"),
+        }
+    ),
 ]
-index_service.BatchIndexDocuments(BatchIndexDocumentsRequest(
-    index_name="articles",
-    documents=docs
-))
+index_service.BatchIndexDocuments(
+    BatchIndexDocumentsRequest(index_name="articles", documents=docs)
+)
 
 # Commit
 index_service.Commit(CommitRequest(index_name="articles"))
 
 # Search
-response = search_service.Search(SearchRequest(
-    index_name="articles",
-    query=Query(term=TermQuery(field="title", term="hello")),
-    limit=10,
-    fields_to_load=["title", "body"]
-))
+response = search_service.Search(
+    SearchRequest(
+        index_name="articles",
+        query=Query(term=TermQuery(field="title", term="hello")),
+        limit=10,
+        fields_to_load=["title", "body"],
+    )
+)
 
 for hit in response.hits:
     print(f"Doc {hit.doc_id}: {hit.score} - {hit.fields}")
