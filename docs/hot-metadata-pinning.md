@@ -5,7 +5,7 @@ Status: implemented (2026-07-22).
 ## Problem
 
 Every query must touch certain small metadata sections — BMP block-offset
-tables, sparse skip sections, doc-id maps, superblock grids. Hermes maps whole
+tables, sparse skip sections, doc-id maps, and the coarse query hierarchy. Hermes maps whole
 segment files and slices them zero-copy, so residency of those sections is
 decided by the kernel's page-cache LRU, not by us. Under memory pressure the
 kernel evicts them exactly like bulk data, and every subsequent query pays
@@ -28,25 +28,31 @@ arrays touched by every ANN route.
 | --------------- | ---------------------------------------- | ------------------------ | ----------- | -------------------------------------------- |
 | Sparse MaxScore | `DimensionTable` (SoA Vecs)              | heap (de-facto pinned)   | block data  | evictable mmap                               |
 |                 | skip section (`skip_bytes`)              | **pinnable**             |             |                                              |
-| BMP             | `block_data_starts`, `sb_grid`, doc maps | **pinnable**             | block data  | evictable (MADV_RANDOM + WILLNEED prefetch)  |
-|                 | 4-bit `grid`                             | never pinned (see below) |             |                                              |
+| BMP             | `block_data_starts`, E row offsets, H, doc maps | **pinnable**       | block data  | evictable (MADV_RANDOM + WILLNEED prefetch)  |
+|                 | 4-bit block grid D and superblock grid E | never pinned (see below) |             |                                              |
 | Dense flat      | header + doc-id map                      | **pinnable**             | raw vectors | evictable (+ RANDOM/prefetch for ANN fields) |
 | ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable** | quantized codes and IDs | evictable (clustered: MADV_RANDOM + selected-run WILLNEED; flat TQ: sequential) |
 
-Sizes for a representative 18.2M-doc production segment (284,690 blocks,
-4,449 superblocks, SPLADE dims ≈ 105,879):
+Sizes for a representative 18.2M-vector segment at block size 32
+(568,750 blocks, 71,094 superblocks, 278 coarse groups, SPLADE
+dims ≈ 105,879):
 
-| Structure                           | Size         | Pin priority                                 |
-| ----------------------------------- | ------------ | -------------------------------------------- |
-| BMP `block_data_starts`             | ~2.3 MB      | 1 (every scored block does an offset lookup) |
-| Sparse skip sections                | tens of MB   | 2 (every posting traversal)                  |
-| Flat + BMP doc-id maps (6 B/vector) | ~110 MB each | 3 (every top-k resolution)                   |
-| BMP `sb_grid` (dims × superblocks)  | ~470 MB      | 4 (every query dim reads a row)              |
-| BMP 4-bit `grid` (dims × blocks/2)  | ~15 GB       | **never**                                    |
+| Structure                                      | Dense upper size | Pin priority                                      |
+| ---------------------------------------------- | ---------------- | ------------------------------------------------- |
+| BMP `block_data_starts`                        | ~4.34 MiB        | 2 (every scored block does an offset lookup)      |
+| Sparse skip sections                           | workload-specific | 3 (every posting traversal)                      |
+| BMP doc maps (6 B/padded vector)               | ~104.14 MiB      | 4 (only competitive candidates resolve through it) |
+| E row-offset table                             | ~0.81 MiB        | 5 (selected E groups need one row lookup)         |
+| Coarse H grid (`dims × ceil(groups / 2)`)      | ~14.04 MiB       | 5 (every query dimension sweeps its H row)        |
+| Superblock E grid (`dims × ceil(SBs / 2)`)     | ~3.50 GiB        | **never**                                         |
+| Block D grid (`dims × ceil(blocks / 2)`)       | ~28.04 GiB       | **never**                                         |
 
-The 4-bit grid is meta-shaped but data-sized: it must stay evictable and is
-treated like bulk data. LSP/0 touches selected eight-cell groups at scattered
-offsets, so the mapping uses `MADV_RANDOM` to prevent readahead amplification.
+D and E are meta-shaped but data-sized, so their payloads stay evictable.
+Global LSP scans the small H level, then touches only selected independently
+addressable E groups; block traversal does the same for D. Both mappings use
+`MADV_RANDOM` plus bounded `MADV_WILLNEED` ranges to avoid readahead
+amplification. The sizes above are dense four-bit upper bounds; the
+row-local variable-width codec is smaller whenever groups need fewer bits.
 
 ## Phase 1 (implemented): budgeted metadata pinning
 
@@ -71,9 +77,9 @@ asynchronous execution. Fail-loud: mlock failure logs a warning and continues;
 `SegmentMemoryStats` carries `pin_intended_bytes` vs `pinned_metadata_bytes`
 for per-segment accounting, while generation pinning logs its own totals.
 
-Suggested starting budget: 150–700 MB/segment depending on host RAM —
-enough for offsets + skips + doc maps everywhere, plus `sb_grid` on hosts
-that can afford it.
+Suggested starting budget: 150–300 MiB/segment depending on skip-section and
+dense-field metadata — enough for offsets, H, and BMP doc maps without ever
+pinning the corpus-sized D/E payloads.
 
 ## Phase 2 (implemented): cold-IO merge writes — see `docs/cold-io.md`
 

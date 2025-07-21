@@ -18,6 +18,7 @@ use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::Schema;
+use crate::index::{ReorderConcurrencyGate, ReorderPriority};
 
 /// Compute per-segment doc ID offsets (each segment's docs start after the previous).
 ///
@@ -119,7 +120,10 @@ pub struct SegmentMerger {
     bp_memory_budget: usize,
     /// Shared whole-pass concurrency limit. Tests and low-level callers may
     /// omit it; SegmentManager always supplies the application-wide gate.
-    reorder_permits: Option<Arc<tokio::sync::Semaphore>>,
+    reorder_permits: Option<Arc<ReorderConcurrencyGate>>,
+    /// Automatic merges are background work. An explicit force merge holds a
+    /// foreground guard and bypasses the background pause for its BP fields.
+    reorder_priority: ReorderPriority,
 }
 
 impl SegmentMerger {
@@ -132,6 +136,7 @@ impl SegmentMerger {
             bp_budget: crate::segment::BpBudget::full(),
             bp_memory_budget: crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
             reorder_permits: None,
+            reorder_priority: ReorderPriority::Background,
         }
     }
 
@@ -166,8 +171,13 @@ impl SegmentMerger {
     }
 
     /// Share the application-wide whole-segment reorder gate.
-    pub fn with_reorder_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
+    pub fn with_reorder_permits(mut self, permits: Arc<ReorderConcurrencyGate>) -> Self {
         self.reorder_permits = Some(permits);
+        self
+    }
+
+    pub(crate) fn with_reorder_priority(mut self, priority: ReorderPriority) -> Self {
+        self.reorder_priority = priority;
         self
     }
 

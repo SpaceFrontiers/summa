@@ -124,9 +124,10 @@ hermes-server --data-dir /data \
   periodic optimizer, while merge-time and manual BP use the bounded fallback
   pool.
 - `--optimizer-concurrent-passes` limits whole-segment passes across the
-  optimizer, merge-time reorder, and manual reorder. It is not a thread count;
-  keep it small because each pass can use the shared pool and its own memory
-  budget.
+  optimizer, merge-time reorder, and manual reorder. It is hard-capped at two,
+  because each pass can use the complete shared pool and its own memory budget.
+  Explicit force merge pauses new background BP admission and reserves
+  foreground capacity once existing merges have drained.
 - `--optimizer-max-unconverged-passes` is a hard eligibility bound for
   optimizer follow-up on one budget-truncated replacement lineage (the default
   `3` includes the initial partial pass). This prevents a segment that cannot

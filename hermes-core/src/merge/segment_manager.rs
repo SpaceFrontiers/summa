@@ -42,7 +42,7 @@
 //! **Rule:** Never hold a sync lock while `.await`-ing.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwapOption;
@@ -52,7 +52,7 @@ use tokio::task::JoinHandle;
 
 use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
-use crate::index::{IndexMetadata, SegmentMetaInfo};
+use crate::index::{IndexMetadata, ReorderConcurrencyGate, ReorderPriority, SegmentMetaInfo};
 use crate::segment::{
     SegmentFiles, SegmentId, SegmentMeta, SegmentSnapshot, SegmentTracker, TrainedVectorStructures,
 };
@@ -558,6 +558,12 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// forever when no later commit happens to re-run merge policy evaluation.
     global_merge_wakeup_pending: AtomicBool,
 
+    /// Non-zero while an explicit force merge is draining/running. Automatic
+    /// merges do not start during this window; otherwise a merge spawned
+    /// between the initial drain and foreground BP reservation could claim
+    /// source segments and then wait behind the foreground gate.
+    force_merge_active: AtomicUsize,
+
     /// Times `force_merge` observed a conflicting active operation and retried.
     /// Test-only observability for the conflict-retry backoff.
     #[cfg(test)]
@@ -599,7 +605,7 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Shared across every index opened from the same `IndexConfig`. This
     /// bounds whole BP rewrites (optimizer + merge-time + manual) separately
     /// from Rayon thread width, preventing N × memory-budget amplification.
-    reorder_permits: Arc<Semaphore>,
+    reorder_permits: Arc<ReorderConcurrencyGate>,
     /// Run BP reordering of `reorder`-attributed BMP fields inside merges.
     /// Persisted index configuration (schema-level `reorder_on_merge: true`
     /// in SDL); merged segments are marked `reordered` and skipped by the
@@ -617,6 +623,14 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
+struct ForceMergeActivityGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ForceMergeActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Create a new segment manager with existing metadata
     #[allow(clippy::too_many_arguments)]
@@ -630,7 +644,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         global_merge_permits: Arc<Semaphore>,
         merge_bp_time_budget: Option<std::time::Duration>,
         bp_memory_budget_bytes: usize,
-        reorder_permits: Arc<Semaphore>,
+        reorder_permits: Arc<ReorderConcurrencyGate>,
         background_reorder_pool: Option<Arc<rayon::ThreadPool>>,
     ) -> Self {
         // Persisted index option: set via `reorder_on_merge: true` in the SDL
@@ -704,6 +718,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             reorder_retries: parking_lot::Mutex::new(HashMap::new()),
             merge_handles: parking_lot::Mutex::new(Vec::new()),
             global_merge_wakeup_pending: AtomicBool::new(false),
+            force_merge_active: AtomicUsize::new(0),
             #[cfg(test)]
             force_merge_conflict_retries: std::sync::atomic::AtomicU64::new(0),
             lifecycle_handles,
@@ -1389,7 +1404,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // Hold state lock through spawn_merge to make filter + register atomic.
         // This closes the TOCTOU window where concurrent maybe_merge calls could
         // both see the same segments as eligible before either registers them.
-        let new_handles = {
+        {
             let st = self.state.lock().await;
             let quarantined = self.quarantined_segments.lock().clone();
             let active_ids = self.active_operations.snapshot();
@@ -1445,15 +1460,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     handles.push(h);
                 }
             }
-            handles
-            // State lock released after spawn_merge claimed operation ownership.
-        };
-
-        if !new_handles.is_empty() {
-            // Synchronous insertion is part of spawning: there must be no
-            // cancellation point where a live task exists but shutdown and
-            // force-merge draining cannot see its JoinHandle.
-            self.merge_handles.lock().extend(new_handles);
+            if !handles.is_empty() {
+                // Publish handles before releasing `state`. A force merge
+                // raises its admission barrier under the same lock, then
+                // drains this list, so no spawned merge can fall into the
+                // otherwise-deadlocking gap between spawn and bookkeeping.
+                self.merge_handles.lock().extend(handles);
+            }
         }
     }
 
@@ -1466,6 +1479,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// On completion, the task auto-triggers `maybe_merge` to evaluate cascading merges.
     /// Returns the JoinHandle if the merge was spawned, None if it was skipped.
     fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) -> Option<JoinHandle<()>> {
+        if self.force_merge_active.load(Ordering::Acquire) > 0 {
+            log::debug!("[spawn_merge] skipped: explicit force merge has priority");
+            return None;
+        }
         let global_merge_permit = match Arc::clone(&self.global_merge_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -1517,6 +1534,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 sm.merge_bp_time_budget,
                 sm.bp_memory_budget_bytes,
                 Arc::clone(&sm.reorder_permits),
+                ReorderPriority::Background,
                 Some(sm.background_cpu_pool()),
             )
             .await;
@@ -1780,7 +1798,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         granularity: crate::segment::reorder::BpGranularity,
         merge_bp_time_budget: Option<std::time::Duration>,
         bp_memory_budget_bytes: usize,
-        reorder_permits: Arc<Semaphore>,
+        reorder_permits: Arc<ReorderConcurrencyGate>,
+        reorder_priority: ReorderPriority,
         bg_cpu_pool: Option<Arc<rayon::ThreadPool>>,
     ) -> MergeTaskResult<(String, u32, bool)> {
         let output_hex = output_segment_id.to_hex();
@@ -1898,6 +1917,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             })
             .with_bp_memory_budget(bp_memory_budget_bytes)
             .with_reorder_permits(reorder_permits)
+            .with_reorder_priority(reorder_priority)
             .with_background_pool(bg_cpu_pool);
 
         log::info!(
@@ -2036,14 +2056,44 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // wait for a release; those passes run for minutes, so poll slowly.
         const FORCE_MERGE_HELD_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
-        let max_segment_docs = {
+        let (_force_merge_activity, max_segment_docs) = {
             let st = self.state.lock().await;
-            st.merge_policy.max_segment_docs()
+            // `maybe_merge` registers and publishes every task handle under
+            // this same state lock. Raising the barrier here therefore makes
+            // the subsequent drain race-free.
+            self.force_merge_active.fetch_add(1, Ordering::AcqRel);
+            (
+                ForceMergeActivityGuard(&self.force_merge_active),
+                st.merge_policy.max_segment_docs(),
+            )
         };
 
         // Wait for all in-flight background merges (including cascading)
         // before starting forced merges to avoid try_register conflicts.
         self.wait_for_all_merges().await;
+
+        // Once pre-existing merges are drained, stop admitting new background
+        // BP passes and reserve all but one reorder slot. Existing optimizer
+        // passes finish normally; this force merge then owns the remaining
+        // capacity instead of sitting behind a continually replenished queue.
+        // Keep the guard for every force-merge batch so background work cannot
+        // interleave between batches.
+        let _foreground_reorder = if self.reorder_on_merge {
+            log::info!(
+                "[force_merge] prioritizing BP capacity ({} total pass slot(s))",
+                self.reorder_permits.limit(),
+            );
+            Some(
+                Arc::clone(&self.reorder_permits)
+                    .begin_foreground()
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("background reorder scheduler is closed".into())
+                    })?,
+            )
+        } else {
+            None
+        };
 
         // One INFO line per wait episode, not per 1s poll; DEBUG afterwards.
         let mut logged_held_wait = false;
@@ -2211,6 +2261,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 self.merge_bp_time_budget,
                 self.bp_memory_budget_bytes,
                 Arc::clone(&self.reorder_permits),
+                ReorderPriority::Foreground,
                 Some(self.background_cpu_pool()),
             )
             .await;
@@ -2821,12 +2872,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // can already use every configured BP worker; this permit bounds the
         // much larger forward-index and rewrite working set across indexes,
         // optimizer tasks, and merge-time BP.
+        let reorder_gate = Arc::clone(&self.reorder_permits);
         let _reorder_permit = tokio::select! {
             biased;
             () = self.active_operations.wait_for_shutdown() => {
                 return Err(Error::IndexClosed);
             }
-            permit = Arc::clone(&self.reorder_permits).acquire_owned() => {
+            permit = reorder_gate.acquire(ReorderPriority::Background) => {
                 permit.map_err(|_| {
                     Error::Internal("background reorder scheduler is closed".into())
                 })?
@@ -3047,7 +3099,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             None,
             1024,
-            Arc::new(Semaphore::new(1)),
+            Arc::new(ReorderConcurrencyGate::new(1)),
             None,
         ))
     }
@@ -3658,7 +3710,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             None,
             1024,
-            Arc::new(Semaphore::new(1)),
+            Arc::new(ReorderConcurrencyGate::new(1)),
             None,
         ));
 

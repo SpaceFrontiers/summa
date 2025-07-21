@@ -56,8 +56,9 @@ cold-IO writer, so at least they no longer evict the cache.
   merge-time BP pass, and resets after convergence or a non-reordered merge.
   `0` disables optimizer follow-up deepening; it does not disable explicitly
   configured merge-time reorder.
-- Merge-time reorder uses its own `--merge-bp-budget-secs` deadline. A
-  truncated output joins the same paced deepening ladder.
+- Merge-time reorder uses its own finite `--merge-bp-budget-secs` deadline. A
+  server value of `0` falls back to 600 seconds instead of making a giant
+  merge unbounded. A truncated output joins the same paced deepening ladder.
 
 Observability: `converged` in reorder logs, `bp_converged` in metadata, and
 the Grafana superblock/block skip-ratio panels are the quality metric — a
@@ -154,8 +155,10 @@ Thread width and operation concurrency are intentionally independent:
 
 - `--optimizer-threads` controls CPU parallelism inside the shared pool. A
   running BP pass is expected to keep up to that many cores busy.
-- `--optimizer-concurrent-passes` (default 2) gates complete reorder passes
-  across every index and every entry point: optimizer, merge-time, and manual.
+- `--optimizer-concurrent-passes` (default 2, hard maximum 2) gates complete
+  reorder passes across every index and every entry point: optimizer,
+  merge-time, and manual. An explicit force merge pauses new background
+  admission and reserves all but one slot after pre-existing merges drain.
   Concurrent passes share the CPU pool, but each may consume its own forward
   index budget and rewrite buffers.
 - `--bp-memory-budget-mb` is therefore a **per-pass algorithmic working-set
@@ -177,3 +180,28 @@ permits are nonblocking, indexes are visited with a rotating start point, fresh
 segments are ordered small-first, and at most one unconverged candidate is
 selected first. This prevents a quiet index or repeated deepening candidate
 from monopolizing capacity.
+
+## Parallel selection and objective stopping (2026-07-23)
+
+Coarse record-level partitions no longer build an 8-byte `usize` index for
+every entity and run serial `select_nth_unstable_by`. Four exact parallel radix
+histogram passes select the same `(gain.total_cmp(), old_index)` median, write
+the two output halves in parallel, and accumulate moved-term degree deltas in
+thread-local lazy arrays. The number of arrays is taken from the existing
+degree-array budget, so this increases CPU utilization without multiplying the
+configured memory bound. Partitions below 1M entities retain quickselect: its
+allocation is small there, it is faster than four radix scans, and its
+within-half permutation preserves the established BP symmetry breaking.
+
+Coarse BP partitions (1M+ entities) now measure the exact negative BiMLogA
+bisection cost
+`Σ_{s,t} d(s,t) × (log2(d(s,t) + 1) - log2(|s|))` after each refinement.
+Approximate median refinements are retained because a reciprocal move may
+improve the exact objective only after an intermediate step. After a
+four-iteration warm-up, two consecutive iterations that fail to improve the
+best exact objective by at least `1e-6` stop that partition. The static
+iteration count is now only an upper safety bound. Fine partitions retain the
+cheaper gain-cooling stop because a serial full-vocabulary objective scan costs
+more there than the posting passes it can avoid. Long passes log progress every
+30 seconds and export aggregate depth, partition, iteration, entity-pass, swap,
+duration, and stop-reason metrics.

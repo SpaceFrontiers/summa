@@ -65,28 +65,12 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         term_cache_blocks: usize,
         reload_interval_ms: u64,
     ) -> Result<Self> {
-        Self::from_segment_manager_with_cache_blocks(
-            schema,
-            segment_manager,
-            term_cache_blocks,
-            term_cache_blocks,
-            reload_interval_ms,
-        )
-        .await
-    }
-
-    /// Create an IndexReader with independent term and document-store caches.
-    pub async fn from_segment_manager_with_cache_blocks(
-        schema: Arc<Schema>,
-        segment_manager: Arc<crate::merge::SegmentManager<D>>,
-        term_cache_blocks: usize,
-        store_cache_blocks: usize,
-        reload_interval_ms: u64,
-    ) -> Result<Self> {
+        const STANDALONE_STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
         let resources = SearcherResources::new(
             term_cache_blocks,
-            store_cache_blocks,
+            STANDALONE_STORE_CACHE_BYTES,
             crate::default_search_threads(),
+            4,
         )?;
         Self::from_segment_manager_with_resources(
             schema,

@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V17 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V18 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -18,7 +18,7 @@
 //!
 //! Peak memory: `input + grid_entries + O(num_blocks) block_data_starts`.
 //!
-//! ## BMP V17 Blob Layout (data-first, block-interleaved)
+//! ## BMP V18 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -26,6 +26,7 @@
 //! Section A:  block_data_starts  [u64-LE × (num_blocks + 1)]   byte offsets into Section B
 //! Section D:  compressed block grid       [random-access 256-cell groups]
 //! Section E:  compressed superblock grid  [ceil-u4, random-access 256-cell groups]
+//! Section H:  compressed coarse grid      [ceil-u4, one cell per 256 superblocks]
 //! Section F:  doc_map_ids        [u32-LE × num_virtual_docs]
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
 //!
@@ -36,20 +37,21 @@
 //!   term_max_impacts: [u8 × num_terms]                exact per-block maxima
 //!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
 //!
-//! BMP V17 Footer (72 bytes):
+//! BMP V18 Footer (80 bytes):
 //!   total_terms: u64              //  0- 7  (stats only)
 //!   total_postings: u64           //  8-15  (stats only)
 //!   grid_offset: u64              // 16-23  (byte offset of Section D)
 //!   sb_grid_offset: u64           // 24-31  (byte offset of Section E)
-//!   num_blocks: u32               // 32-35
-//!   dims: u32                     // 36-39  (fixed vocabulary size)
-//!   bmp_block_size: u32           // 40-43
-//!   num_virtual_docs: u32         // 44-47  (= num_blocks × bmp_block_size, padded)
-//!   max_weight_scale: f32         // 48-51
-//!   doc_map_offset: u64           // 52-59  (byte offset of Section F)
-//!   num_real_docs: u32            // 60-63  (actual vector count before padding)
-//!   grid_bits: u32                // 64-67  (2 or 4)
-//!   magic: u32                    // 68-71  (BMP7 = 0x37504D42)
+//!   coarse_grid_offset: u64       // 32-39  (byte offset of Section H)
+//!   num_blocks: u32               // 40-43
+//!   dims: u32                     // 44-47  (fixed vocabulary size)
+//!   bmp_block_size: u32           // 48-51
+//!   num_virtual_docs: u32         // 52-55  (= num_blocks × bmp_block_size, padded)
+//!   max_weight_scale: f32         // 56-59
+//!   doc_map_offset: u64           // 60-67  (byte offset of Section F)
+//!   num_real_docs: u32            // 68-71  (actual vector count before padding)
+//!   grid_bits: u32                // 72-75  (2 or 4)
+//!   magic: u32                    // 76-79  (BMP8 = 0x38504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -94,7 +96,7 @@ use crate::segment::bmp_grid::{
 use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V17 blob from per-dimension postings.
+/// Build a BMP V18 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -194,7 +196,7 @@ pub(crate) fn build_bmp_blob(
     if num_real_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP real document count exceeds the V17 u32 format limit",
+            "BMP real document count exceeds the V18 u32 format limit",
         ));
     }
 
@@ -219,7 +221,7 @@ pub(crate) fn build_bmp_blob(
     if num_virtual_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP padded document count exceeds the V17 u32 format limit",
+            "BMP padded document count exceeds the V18 u32 format limit",
         ));
     }
 
@@ -421,7 +423,7 @@ pub(crate) fn build_bmp_blob(
             let nt_u32 = u32::try_from(nt).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "BMP block term count exceeds the V17 u32 format limit",
+                    "BMP block term count exceeds the V18 u32 format limit",
                 )
             })?;
             blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
@@ -470,7 +472,7 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V17 vectors={} padded={} blocks={} dims={} \
+        "[bmp_build] V18 vectors={} padded={} blocks={} dims={} \
          terms={} postings={} grid_entries={}",
         num_real_docs,
         num_virtual_docs,
@@ -500,13 +502,14 @@ pub(crate) fn build_bmp_blob(
     bytes_written += write_u64_slice_le(writer, &block_data_starts)?;
     drop(block_data_starts);
 
-    // Sections D+E: packed grid + sb_grid (streaming from sparse grid entries)
+    // Sections D+E+H: block, superblock, and coarse-superblock grids.
     // `dims` rows (not num_dims)
     let grid_offset = bytes_written;
-    let (packed_bytes, sb_bytes) =
+    let (packed_bytes, sb_bytes, coarse_bytes) =
         stream_write_grids(&grid_entries, dims as usize, num_blocks, grid_bits, writer)?;
     let sb_grid_offset = bytes_written + packed_bytes;
-    bytes_written += packed_bytes + sb_bytes;
+    let coarse_grid_offset = sb_grid_offset + sb_bytes;
+    bytes_written += packed_bytes + sb_bytes + coarse_bytes;
     drop(grid_entries); // Free grid entries before doc_map write
 
     // Section F: doc_map_ids [u32-LE × num_virtual_docs]
@@ -533,13 +536,14 @@ pub(crate) fn build_bmp_blob(
 
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V17 footer.
+    // BMP V18 footer.
     write_bmp_footer(
         writer,
         total_terms,
         total_postings,
         grid_offset,
         sb_grid_offset,
+        coarse_grid_offset,
         num_blocks as u32,
         dims,
         effective_block_size,
@@ -554,7 +558,7 @@ pub(crate) fn build_bmp_blob(
     Ok(bytes_written)
 }
 
-/// Write the BMP V17 footer.
+/// Write the BMP V18 footer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
@@ -562,6 +566,7 @@ pub(crate) fn write_bmp_footer(
     total_postings: u64,
     grid_offset: u64,
     sb_grid_offset: u64,
+    coarse_grid_offset: u64,
     num_blocks: u32,
     dims: u32,
     bmp_block_size: u32,
@@ -575,15 +580,16 @@ pub(crate) fn write_bmp_footer(
     writer.write_u64::<LittleEndian>(total_postings)?; //  8-15
     writer.write_u64::<LittleEndian>(grid_offset)?; // 16-23
     writer.write_u64::<LittleEndian>(sb_grid_offset)?; // 24-31
-    writer.write_u32::<LittleEndian>(num_blocks)?; // 32-35
-    writer.write_u32::<LittleEndian>(dims)?; // 36-39
-    writer.write_u32::<LittleEndian>(bmp_block_size)?; // 40-43
-    writer.write_u32::<LittleEndian>(num_virtual_docs)?; // 44-47
-    writer.write_f32::<LittleEndian>(max_weight_scale)?; // 48-51
-    writer.write_u64::<LittleEndian>(doc_map_offset)?; // 52-59
-    writer.write_u32::<LittleEndian>(num_real_docs)?; // 60-63
-    writer.write_u32::<LittleEndian>(grid_bits as u32)?; // 64-67
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC)?; // 68-71
+    writer.write_u64::<LittleEndian>(coarse_grid_offset)?; // 32-39
+    writer.write_u32::<LittleEndian>(num_blocks)?; // 40-43
+    writer.write_u32::<LittleEndian>(dims)?; // 44-47
+    writer.write_u32::<LittleEndian>(bmp_block_size)?; // 48-51
+    writer.write_u32::<LittleEndian>(num_virtual_docs)?; // 52-55
+    writer.write_f32::<LittleEndian>(max_weight_scale)?; // 56-59
+    writer.write_u64::<LittleEndian>(doc_map_offset)?; // 60-67
+    writer.write_u32::<LittleEndian>(num_real_docs)?; // 68-71
+    writer.write_u32::<LittleEndian>(grid_bits as u32)?; // 72-75
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC)?; // 76-79
     Ok(())
 }
 
@@ -615,6 +621,7 @@ pub(crate) fn write_u64_slice_le(writer: &mut dyn Write, data: &[u64]) -> std::i
 enum GridProjection {
     Block { bits: u8 },
     Superblock,
+    CoarseSuperblock,
 }
 
 impl GridProjection {
@@ -623,6 +630,10 @@ impl GridProjection {
         match self {
             Self::Block { .. } => num_blocks,
             Self::Superblock => num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize),
+            Self::CoarseSuperblock => num_blocks.div_ceil(
+                BMP_SUPERBLOCK_SIZE as usize
+                    * crate::segment::reader::bmp::BMP_COARSE_SUPERBLOCKS as usize,
+            ),
         }
     }
 
@@ -630,7 +641,7 @@ impl GridProjection {
     fn max_width(self) -> u8 {
         match self {
             Self::Block { bits } => bits,
-            Self::Superblock => LSP_SUPERBLOCK_GRID_BITS,
+            Self::Superblock | Self::CoarseSuperblock => LSP_SUPERBLOCK_GRID_BITS,
         }
     }
 
@@ -640,6 +651,12 @@ impl GridProjection {
             Self::Block { bits } => (block as usize, quantize_block_maximum(impact, bits)),
             Self::Superblock => (
                 block as usize / BMP_SUPERBLOCK_SIZE as usize,
+                quantize_block_maximum(impact, LSP_SUPERBLOCK_GRID_BITS),
+            ),
+            Self::CoarseSuperblock => (
+                block as usize
+                    / (BMP_SUPERBLOCK_SIZE as usize
+                        * crate::segment::reader::bmp::BMP_COARSE_SUPERBLOCKS as usize),
                 quantize_block_maximum(impact, LSP_SUPERBLOCK_GRID_BITS),
             ),
         }
@@ -759,23 +776,24 @@ fn write_compressed_grid_section(
     Ok(table_bytes + row_sizes.into_iter().sum::<u64>())
 }
 
-/// Stream-write compressed ceil-quantized block (D) and LSP/0 superblock (E)
-/// grids. Both levels use four bits by default; an explicitly configured
-/// two-bit block grid does not reduce the four-bit superblock grid.
+/// Stream-write compressed ceil-quantized block (D), LSP/0 superblock (E),
+/// and coarse-superblock (H) grids. All pruning levels use four bits by
+/// default; an explicitly configured two-bit block grid does not reduce
+/// either safe upper hierarchy.
 ///
 /// `grid_entries` sorted by `(dim_id, block_id)`. `num_dims` is the fixed
 /// vocabulary size (dims), so the grid has `num_dims` rows.
 /// Each entry is `(dim_id, block_id, max_impact_u8)`.
 ///
 /// Memory is bounded by one selector row plus two 256-byte group buffers.
-/// Returns `(block_grid_bytes, superblock_grid_bytes)`.
+/// Returns `(block_grid_bytes, superblock_grid_bytes, coarse_grid_bytes)`.
 pub(crate) fn stream_write_grids(
     grid_entries: &[(u32, u32, u8)],
     num_dims: usize,
     num_blocks: usize,
     grid_bits: u8,
     writer: &mut dyn Write,
-) -> std::io::Result<(u64, u64)> {
+) -> std::io::Result<(u64, u64, u64)> {
     let block_bytes = write_compressed_grid_section(
         grid_entries,
         num_dims,
@@ -790,7 +808,14 @@ pub(crate) fn stream_write_grids(
         GridProjection::Superblock,
         writer,
     )?;
-    Ok((block_bytes, superblock_bytes))
+    let coarse_bytes = write_compressed_grid_section(
+        grid_entries,
+        num_dims,
+        num_blocks,
+        GridProjection::CoarseSuperblock,
+        writer,
+    )?;
+    Ok((block_bytes, superblock_bytes, coarse_bytes))
 }
 
 /// Size of a single grid entry on disk: dim_id(4) + block_id(4) + impact(1) = 9 bytes.
@@ -1069,7 +1094,7 @@ pub(crate) fn stream_write_grids_merged(
     num_blocks: usize,
     grid_bits: u8,
     writer: &mut dyn Write,
-) -> std::io::Result<(u64, u64)> {
+) -> std::io::Result<(u64, u64, u64)> {
     let block_bytes = write_compressed_grid_section_merged(
         run_readers,
         num_dims,
@@ -1087,7 +1112,17 @@ pub(crate) fn stream_write_grids_merged(
         GridProjection::Superblock,
         writer,
     )?;
-    Ok((block_bytes, superblock_bytes))
+    for reader in run_readers.iter_mut() {
+        reader.reset()?;
+    }
+    let coarse_bytes = write_compressed_grid_section_merged(
+        run_readers,
+        num_dims,
+        num_blocks,
+        GridProjection::CoarseSuperblock,
+        writer,
+    )?;
+    Ok((block_bytes, superblock_bytes, coarse_bytes))
 }
 
 /// Quantize a weight to u8 (0-255) given the global max scale.
@@ -1113,6 +1148,73 @@ mod tests {
     }
 
     #[test]
+    fn coarse_grid_is_exact_max_projection_of_superblock_grid() {
+        use crate::directories::OwnedBytes;
+        use crate::segment::bmp_grid::{CompressedGrid, GRID_GROUP_CELLS};
+
+        let num_blocks = BMP_SUPERBLOCK_SIZE as usize * GRID_GROUP_CELLS + 1;
+        let entries = vec![
+            (0, 0, 100),
+            (0, num_blocks as u32 - 1, 200),
+            (1, num_blocks as u32 - 2, 150),
+        ];
+        let mut encoded = Vec::new();
+        let (block_bytes, superblock_bytes, coarse_bytes) =
+            stream_write_grids(&entries, 2, num_blocks, 4, &mut encoded).unwrap();
+        assert_eq!(
+            encoded.len() as u64,
+            block_bytes + superblock_bytes + coarse_bytes
+        );
+
+        let bytes = OwnedBytes::new(encoded);
+        let superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
+        let coarse_cells = superblocks.div_ceil(GRID_GROUP_CELLS);
+        let superblock = CompressedGrid::parse(
+            bytes.slice(block_bytes as usize..(block_bytes + superblock_bytes) as usize),
+            2,
+            superblocks,
+            4,
+            "test E",
+        )
+        .unwrap();
+        let coarse = CompressedGrid::parse(
+            bytes.slice(
+                (block_bytes + superblock_bytes) as usize
+                    ..(block_bytes + superblock_bytes + coarse_bytes) as usize,
+            ),
+            2,
+            coarse_cells,
+            4,
+            "test H",
+        )
+        .unwrap();
+
+        for dimension in 0..2 {
+            let mut e = vec![0u8; superblocks];
+            let mut decoded = [0u8; GRID_GROUP_CELLS];
+            superblock
+                .try_for_each_row_group(dimension, |group, packed| {
+                    let start = group * GRID_GROUP_CELLS;
+                    let count = GRID_GROUP_CELLS.min(superblocks - start);
+                    packed.decode(0, count, &mut decoded);
+                    e[start..start + count].copy_from_slice(&decoded[..count]);
+                    Ok(())
+                })
+                .unwrap();
+            let mut h = vec![0u8; coarse_cells];
+            coarse
+                .group(dimension, 0)
+                .unwrap()
+                .decode(0, coarse_cells, &mut h);
+            let expected: Vec<_> = e
+                .chunks(GRID_GROUP_CELLS)
+                .map(|group| group.iter().copied().max().unwrap_or(0))
+                .collect();
+            assert_eq!(h, expected);
+        }
+    }
+
+    #[test]
     fn bmp_footer_preserves_u64_statistics() {
         let total_terms = u32::MAX as u64 + 17;
         let total_postings = u32::MAX as u64 + 29;
@@ -1124,6 +1226,7 @@ mod tests {
             total_postings,
             11,
             22,
+            25,
             33,
             44,
             32,
@@ -1135,7 +1238,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(footer.len(), 72);
+        assert_eq!(footer.len(), BMP_BLOB_FOOTER_SIZE);
         assert_eq!(
             u64::from_le_bytes(footer[0..8].try_into().unwrap()),
             total_terms
@@ -1207,11 +1310,11 @@ mod tests {
         // 3 real docs padded to 64
         let footer_start = buf.len() - BMP_BLOB_FOOTER_SIZE;
         let fb = &buf[footer_start..];
-        let num_virtual_docs = u32::from_le_bytes(fb[44..48].try_into().unwrap());
+        let num_virtual_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
         assert_eq!(num_virtual_docs, 64); // padded to block_size
 
         // num_real_docs should be 3
-        let num_real_docs = u32::from_le_bytes(fb[60..64].try_into().unwrap());
+        let num_real_docs = u32::from_le_bytes(fb[68..72].try_into().unwrap());
         assert_eq!(num_real_docs, 3);
     }
 
@@ -1231,7 +1334,7 @@ mod tests {
         // Verify max_weight_scale in the footer.
         let footer_start = buf.len() - BMP_BLOB_FOOTER_SIZE;
         let fb = &buf[footer_start..];
-        let scale = f32::from_le_bytes(fb[48..52].try_into().unwrap());
+        let scale = f32::from_le_bytes(fb[56..60].try_into().unwrap());
         assert!((scale - 5.0).abs() < 0.001, "scale={}, expected 5.0", scale);
     }
 
@@ -1266,12 +1369,12 @@ mod tests {
         let mut buf_a = Vec::new();
         build_bmp_blob(postings_a, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
         let footer_a = buf_a.len() - BMP_BLOB_FOOTER_SIZE;
-        let scale_a = f32::from_le_bytes(buf_a[footer_a + 48..footer_a + 52].try_into().unwrap());
+        let scale_a = f32::from_le_bytes(buf_a[footer_a + 56..footer_a + 60].try_into().unwrap());
 
         let mut buf_b = Vec::new();
         build_bmp_blob(postings_b, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
         let footer_b = buf_b.len() - BMP_BLOB_FOOTER_SIZE;
-        let scale_b = f32::from_le_bytes(buf_b[footer_b + 48..footer_b + 52].try_into().unwrap());
+        let scale_b = f32::from_le_bytes(buf_b[footer_b + 56..footer_b + 60].try_into().unwrap());
         assert_eq!(
             scale_a, scale_b,
             "Fixed max_weight scales must be identical"

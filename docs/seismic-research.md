@@ -38,11 +38,13 @@ An _approximate_ sparse index that abandons the document-space grid entirely:
 
 ## Why this matters for Hermes at 1B scale
 
-BMP's maximum grids are O(dims × vectors / block_size) before V17's local
+BMP's maximum grids are O(dims × vectors / block_size) before V18's local
 bit packing. At 1B vectors, `dims=105879`, `b=32`, and eight blocks per
-superblock, the dense D+E reference is 1.861 TB; actual V17 size is
+superblock, the dense D+E+H reference is 1.862 TB; actual V18 size is
 data-dependent because zero groups disappear and every 256-cell group uses
-its local width. Seismic's memory is O(kept postings): λ caps every list, so
+its local width. H adds only 807.86 MB in that dense reference and avoids
+sweeping the 206.79 GB dense E reference at query time. Seismic's memory is
+O(kept postings): λ caps every list, so
 the index grows with _vocabulary_, not corpus × dims. That is a structurally
 attractive shape for 1B vectors. The trade: approximate-only (no rank-safe
 mode), parameter-sensitive, and per-list clustering makes incremental

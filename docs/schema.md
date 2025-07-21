@@ -360,9 +360,9 @@ Sparse vectors are indexed as posting lists with float weights. At query time, y
 `doc_mass` crops the excessive low-weight tail of each document's sparse vector
 at indexing time: entries are ranked by |weight| and only the head covering the
 given fraction of the vector's total |weight| mass is kept. SPLADE-style vectors
-concentrate importance in a few head terms, so `doc_mass: 0.9` typically drops
-20-40% of postings with <1% nDCG loss. Vectors with at most `min_terms` entries
-are never cropped.
+often concentrate importance in a few head terms, but the quality impact is
+corpus-dependent. Measure Recall@K or judged relevance before enabling it.
+Vectors with at most `min_terms` entries are never cropped.
 
 ```
 field emb: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
@@ -378,7 +378,7 @@ The BMP (block-max pruning) format takes additional `indexed<...>` options:
 ```
 field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.0,
     bmp_block_size: 32, bmp_grid_bits: 4,
-    query<pruning: 0.33, lsp_gamma: 1000>>, reorder]
+    query<lsp_gamma: 1000>>, reorder]
 ```
 
 - `bmp_block_size` (power of two, max 256; default 32) — vectors per BMP
@@ -391,9 +391,8 @@ field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.
   workload-dependent.
 - `query<pruning: 0.33>` — retain the highest-weight third of query
   dimensions for BMP candidate generation, matching the LSP/0 zero-shot beta.
-  Visited documents are still scored with the bounded full query. The BMP
-  preset and server fallback use 0.33; use 1.0 for unpruned candidate
-  generation.
+  Visited documents are still scored with the bounded full query. This is
+  disabled by default because candidate and block selection can still lose
 - `query<lsp_gamma: N>` — cap traversal to the global top-N superblocks across
   all physical segments. When omitted, Hermes derives gamma from candidate
   depth (250/500/1000 for depths 10/100/1000). Set zero for exhaustive
@@ -406,11 +405,10 @@ merge/reorder invariants, and the Flat-Inv versus Fwd design choice.
 
 Sparse posting lists support configurable weight quantization and pruning via `SparseVectorConfig`:
 
-| Preset         | Quantization | Compression | Speed    | Quality loss |
-| -------------- | ------------ | ----------- | -------- | ------------ |
-| `conservative` | Float16      | 2x          | Baseline | <1%          |
-| `splade`       | UInt8        | 5-7x        | 40-60%   | 2-4%         |
-| `compact`      | UInt4        | 7-10x       | 50-70%   | 3-5%         |
+| Preset         | Quantization | Destructive pruning |
+| -------------- | ------------ | ------------------- |
+| `conservative` | Float16      | disabled            |
+| `splade`       | UInt8        | disabled            |
 
 These are configured programmatically, not in SDL.
 

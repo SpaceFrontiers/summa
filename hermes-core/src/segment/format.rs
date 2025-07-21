@@ -91,17 +91,22 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for the current BMP V17 blob footer ("BMP7" in LE).
+/// Magic number for the current BMP V18 blob footer ("BMP8" in LE).
 ///
-/// V17 uses LSP/0's 256-vector superblocks and ceil-u4 maximum weights at both
-/// pruning levels. It retains independently addressable, locally bit-packed
-/// 256-cell groups and exact per-term block-header maxima.
+/// V18 uses LSP/0's 256-vector superblocks and ceil-u4 maximum weights at all
+/// pruning levels. In addition to the block and superblock grids, it persists
+/// an exact coarse grid over groups of 256 superblocks. The coarse grid lets
+/// query planning find the global top-gamma superblocks without sweeping the
+/// data-sized superblock grid.
+///
+/// Every grid retains independently addressable, locally bit-packed 256-cell
+/// groups and exact per-term block-header maxima.
 /// This is the only accepted BMP representation; indexes are rebuilt on format
 /// changes rather than carrying compatibility parsers.
-pub const BMP_BLOB_MAGIC: u32 = 0x37504D42;
+pub const BMP_BLOB_MAGIC: u32 = 0x38504D42;
 
-/// Current BMP V17 blob footer size.
-pub const BMP_BLOB_FOOTER_SIZE: usize = 72;
+/// Current BMP V18 blob footer size.
+pub const BMP_BLOB_FOOTER_SIZE: usize = 80;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

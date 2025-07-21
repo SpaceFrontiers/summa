@@ -15,7 +15,7 @@ use crate::error::Result;
 use std::collections::HashMap;
 #[cfg(feature = "native")]
 use std::sync::Arc;
-#[cfg(feature = "sync")]
+#[cfg(feature = "native")]
 use std::sync::{OnceLock, Weak};
 
 mod searcher;
@@ -56,6 +56,216 @@ pub use helpers::{
 /// Default file name for the slice cache
 pub const SLICE_CACHE_FILENAME: &str = "index.slicecache";
 
+/// A BP pass can consume every background CPU worker and the complete
+/// per-pass memory allowance. More than two simultaneous passes only
+/// oversubscribe the same pool and multiply memory-bandwidth pressure.
+#[cfg(feature = "native")]
+pub const MAX_CONCURRENT_REORDER_PASSES: usize = 2;
+
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReorderPriority {
+    Background,
+    Foreground,
+}
+
+/// Application-wide gate shared by optimizer, merge-time, and manual BP.
+///
+/// Besides enforcing the hard two-pass ceiling, the gate lets an explicit
+/// force merge reserve all but one slot. Background passes already running
+/// finish normally; new ones wait until the force merge releases its guard.
+#[cfg(feature = "native")]
+#[derive(Debug)]
+pub struct ReorderConcurrencyGate {
+    permits: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    foreground_lock: Arc<tokio::sync::Mutex<()>>,
+    foreground_active: std::sync::atomic::AtomicBool,
+    foreground_finished: tokio::sync::Notify,
+}
+
+/// Process-wide cap on simultaneously active BMP segment scorers.
+///
+/// Each scorer performs random mmap reads. Letting every segment of every
+/// concurrent query run at once multiplies page faults without increasing
+/// useful NVMe throughput, so this gate is independent from the CPU pool.
+#[cfg(feature = "native")]
+#[derive(Debug)]
+pub(crate) struct BmpIoGate {
+    limit: usize,
+    active: parking_lot::Mutex<usize>,
+    available: parking_lot::Condvar,
+    async_available: tokio::sync::Notify,
+}
+
+#[cfg(feature = "native")]
+impl BmpIoGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: parking_lot::Mutex::new(0),
+            available: parking_lot::Condvar::new(),
+            async_available: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn acquire(&self) -> BmpIoPermit<'_> {
+        let mut active = self.active.lock();
+        while *active >= self.limit {
+            self.available.wait(&mut active);
+        }
+        *active += 1;
+        BmpIoPermit { gate: self }
+    }
+
+    async fn acquire_async(&self) -> BmpIoPermit<'_> {
+        loop {
+            // Register before checking the counter, so a release between the
+            // check and await cannot be lost.
+            let notified = self.async_available.notified();
+            {
+                let mut active = self.active.lock();
+                if *active < self.limit {
+                    *active += 1;
+                    return BmpIoPermit { gate: self };
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+struct BmpIoPermit<'a> {
+    gate: &'a BmpIoGate,
+}
+
+#[cfg(feature = "native")]
+impl Drop for BmpIoPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self.gate.active.lock();
+        *active -= 1;
+        self.gate.available.notify_one();
+        self.gate.async_available.notify_one();
+    }
+}
+
+#[cfg(feature = "native")]
+impl ReorderConcurrencyGate {
+    pub fn new(requested_limit: usize) -> Self {
+        let limit = requested_limit.clamp(1, MAX_CONCURRENT_REORDER_PASSES);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+            foreground_lock: Arc::new(tokio::sync::Mutex::new(())),
+            foreground_active: std::sync::atomic::AtomicBool::new(false),
+            foreground_finished: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        priority: ReorderPriority,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        match priority {
+            ReorderPriority::Background => self.acquire_background().await,
+            ReorderPriority::Foreground => self.acquire_foreground().await,
+        }
+    }
+
+    /// Acquire capacity for periodic optimizer or automatic merge work.
+    async fn acquire_background(
+        self: &Arc<Self>,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        loop {
+            if self
+                .foreground_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let notified = self.foreground_finished.notified();
+                if self
+                    .foreground_active
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    notified.await;
+                    continue;
+                }
+            }
+
+            let permit = Arc::clone(&self.permits).acquire_owned().await?;
+            if !self
+                .foreground_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(permit);
+            }
+            // A foreground operation started between the check and permit
+            // acquisition. Yield the slot instead of extending its queue.
+            drop(permit);
+        }
+    }
+
+    /// Acquire the one BP slot left available to a foreground force merge.
+    async fn acquire_foreground(
+        self: &Arc<Self>,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        Arc::clone(&self.permits).acquire_owned().await
+    }
+
+    /// Prioritize one explicit force merge across all indexes using this gate.
+    ///
+    /// Foreground operations are serialized to avoid two force merges each
+    /// reserving one slot and then waiting for the other. The guard is
+    /// cancellation-safe and releases reservations on drop.
+    pub(crate) async fn begin_foreground(
+        self: &Arc<Self>,
+    ) -> std::result::Result<ForegroundReorderGuard, tokio::sync::AcquireError> {
+        let exclusive = Arc::clone(&self.foreground_lock).lock_owned().await;
+        self.foreground_active
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Construct the guard before awaiting capacity. If this future is
+        // cancelled while existing background work drains, Drop clears the
+        // active flag and releases the foreground mutex.
+        let mut guard = ForegroundReorderGuard {
+            gate: Arc::clone(self),
+            reserved: None,
+            _exclusive: exclusive,
+        };
+        if self.limit > 1 {
+            guard.reserved = Some(
+                Arc::clone(&self.permits)
+                    .acquire_many_owned((self.limit - 1) as u32)
+                    .await?,
+            );
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(feature = "native")]
+pub(crate) struct ForegroundReorderGuard {
+    gate: Arc<ReorderConcurrencyGate>,
+    reserved: Option<tokio::sync::OwnedSemaphorePermit>,
+    _exclusive: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(feature = "native")]
+impl Drop for ForegroundReorderGuard {
+    fn drop(&mut self) {
+        // Make capacity visible before waking background waiters.
+        drop(self.reserved.take());
+        self.gate
+            .foreground_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.gate.foreground_finished.notify_waiters();
+    }
+}
+
 /// Index configuration
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
@@ -65,14 +275,24 @@ pub struct IndexConfig {
     /// pool. A value of zero is invalid and is rejected by `Index::create` and
     /// `Index::open`.
     pub num_threads: usize,
+    /// Maximum BMP segment scorers issuing random mmap reads concurrently
+    /// across the process. CPU parallelism remains controlled by
+    /// `num_threads`; this separate cap protects the page cache and storage
+    /// queue from segment/query fan-out.
+    pub bmp_io_concurrency: usize,
     /// Number of parallel segment builders (documents distributed round-robin)
     pub num_indexing_threads: usize,
     /// Number of threads for parallel block compression within each segment
     pub num_compression_threads: usize,
     /// Block cache size for term dictionary per segment
     pub term_cache_blocks: usize,
-    /// Block cache size for document store per segment
-    pub store_cache_blocks: usize,
+    /// Process-wide byte budget for decompressed document-store blocks.
+    ///
+    /// Indexes opened with the same budget share one read-concurrent,
+    /// byte-bounded cache. This is a byte limit rather than a block count
+    /// because a stored document can legitimately make one decompressed block
+    /// tens of MiB.
+    pub store_cache_budget_bytes: usize,
     /// Max memory (bytes) across all builders before auto-commit (global limit)
     pub max_indexing_memory_bytes: usize,
     /// Maximum vectors retained for one field's global ANN training sample.
@@ -114,7 +334,7 @@ pub struct IndexConfig {
     /// separate from the Rayon pool width: one pass can already use every
     /// background CPU thread and consume the full BP memory budget.
     #[cfg(feature = "native")]
-    pub background_reorder_permits: Arc<tokio::sync::Semaphore>,
+    pub background_reorder_permits: Arc<ReorderConcurrencyGate>,
     /// Optional process/application-owned Rayon pool for BP work. Supplying
     /// one lets every index and the optimizer share the same worker threads;
     /// `None` lazily uses one process-wide cores/2 fallback pool.
@@ -128,6 +348,53 @@ pub struct IndexConfig {
 #[cfg(feature = "sync")]
 static SEARCH_CPU_POOLS: OnceLock<parking_lot::Mutex<HashMap<usize, Weak<rayon::ThreadPool>>>> =
     OnceLock::new();
+
+/// Store caches are shared process-wide by configured byte budget, just like
+/// search CPU pools are shared by width. `IndexRegistry` clones one config for
+/// every index, but standalone callers with the same policy also converge on
+/// the same bounded cache.
+#[cfg(feature = "native")]
+static STORE_CACHE_POOLS: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, Weak<crate::segment::SharedStoreCache>>>,
+> = OnceLock::new();
+
+#[cfg(feature = "native")]
+static BMP_IO_GATES: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, Weak<BmpIoGate>>>,
+> = OnceLock::new();
+
+#[cfg(feature = "native")]
+pub(crate) fn shared_bmp_io_gate(limit: usize) -> Arc<BmpIoGate> {
+    let mut gates = BMP_IO_GATES
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+        .lock();
+    if let Some(gate) = gates.get(&limit).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(BmpIoGate::new(limit));
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    gates.insert(limit, Arc::downgrade(&gate));
+    log::info!("[bmp] process-wide random-I/O concurrency={limit}");
+    gate
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn shared_store_cache(budget_bytes: usize) -> Arc<crate::segment::SharedStoreCache> {
+    let mut caches = STORE_CACHE_POOLS
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+        .lock();
+    if let Some(cache) = caches.get(&budget_bytes).and_then(Weak::upgrade) {
+        return cache;
+    }
+    let cache = Arc::new(crate::segment::SharedStoreCache::new(budget_bytes));
+    caches.retain(|_, cache| cache.strong_count() > 0);
+    caches.insert(budget_bytes, Arc::downgrade(&cache));
+    log::info!(
+        "[store_cache] process-wide budget={}",
+        crate::format_bytes(budget_bytes as u64)
+    );
+    cache
+}
 
 #[cfg(feature = "sync")]
 fn shared_search_pool(num_threads: usize) -> Result<Arc<rayon::ThreadPool>> {
@@ -178,10 +445,17 @@ impl Default for IndexConfig {
 
         Self {
             num_threads: search_threads,
+            bmp_io_concurrency: 4,
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: 256,
-            store_cache_blocks: 32,
+            // Stored bodies can be much larger than the writer's nominal
+            // 16-KiB block target. Keep this process-wide and byte bounded so
+            // segment fan-out cannot multiply it into tens of GiB.
+            #[cfg(target_pointer_width = "64")]
+            store_cache_budget_bytes: 2 * 1024 * 1024 * 1024,
+            #[cfg(not(target_pointer_width = "64"))]
+            store_cache_budget_bytes: 32 * 1024 * 1024,
             max_indexing_memory_bytes: 256 * 1024 * 1024, // 256 MB default
             vector_training_max_samples: 10_000_000,
             #[cfg(target_pointer_width = "64")]
@@ -212,7 +486,7 @@ impl Default for IndexConfig {
             #[cfg(not(target_pointer_width = "64"))]
             bp_memory_budget_bytes: usize::MAX,
             #[cfg(feature = "native")]
-            background_reorder_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            background_reorder_permits: Arc::new(ReorderConcurrencyGate::new(2)),
             #[cfg(feature = "native")]
             background_reorder_pool: None,
         }
@@ -246,8 +520,9 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
         let search_resources = searcher::SearcherResources::new(
             config.term_cache_blocks,
-            config.store_cache_blocks,
+            config.store_cache_budget_bytes,
             config.num_threads,
+            config.bmp_io_concurrency,
         )?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
@@ -302,8 +577,9 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
         let search_resources = searcher::SearcherResources::new(
             config.term_cache_blocks,
-            config.store_cache_blocks,
+            config.store_cache_budget_bytes,
             config.num_threads,
+            config.bmp_io_concurrency,
         )?;
         let directory = Arc::new(directory);
 

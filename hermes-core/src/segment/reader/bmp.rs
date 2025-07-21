@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V17 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V18 zero-copy**.
 //!
-//! V17 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! V18 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -29,6 +29,13 @@ use crate::segment::bmp_grid::CompressedGrid;
 /// 256-vector superblock. Eight divides the 256-cell compressed-grid group,
 /// ensuring a selected superblock never crosses a codec group.
 pub const BMP_SUPERBLOCK_SIZE: u32 = 8;
+
+/// Number of LSP/0 superblocks summarized by one cell in the coarse grid.
+///
+/// This deliberately matches the compressed-grid addressing group. Expanding
+/// one promising coarse cell therefore reads one independently addressable
+/// 256-superblock group from E for each query dimension.
+pub const BMP_COARSE_SUPERBLOCKS: u32 = 256;
 
 /// A single posting in BMP's block-local flat inverted index.
 ///
@@ -72,17 +79,19 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V17 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V18 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V17 format with Recursive Graph Bisection (BP) document ordering.
+/// V18 format with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
 /// a zero-copy OwnedBytes slice.
 ///
-/// Uses two-level pruning hierarchy (Carlson et al., SIGIR 2025):
-/// 1. **Superblock grid**: coarse upper bounds over groups of `BMP_SUPERBLOCK_SIZE` blocks
-/// 2. **Block grid**: fine-grained upper bounds per individual block (4-bit packed)
+/// Uses a three-level pruning hierarchy:
+/// 1. **Coarse grid**: upper bounds over groups of `BMP_COARSE_SUPERBLOCKS`
+///    superblocks, used to find the exact global top-gamma without sweeping E
+/// 2. **Superblock grid**: upper bounds over `BMP_SUPERBLOCK_SIZE` blocks
+/// 3. **Block grid**: fine-grained upper bounds per individual block
 #[derive(Clone)]
 pub struct BmpIndex {
     /// BMP block size (number of consecutive virtual_ids per block)
@@ -121,6 +130,10 @@ pub struct BmpIndex {
     superblock_grid: CompressedGrid,
     /// Number of superblocks
     pub num_superblocks: u32,
+    /// Locally bit-packed ceil-u4 maxima over 256-superblock groups.
+    coarse_grid: CompressedGrid,
+    /// Number of coarse superblock groups.
+    pub num_coarse_groups: u32,
     /// doc_map_ids[virtual_id] = original doc_id — zero-copy OwnedBytes
     doc_map_ids_bytes: OwnedBytes,
     /// doc_map_ordinals[virtual_id] = original ordinal — zero-copy OwnedBytes
@@ -144,12 +157,12 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V17 blob from the given file handle.
+    /// Parse a BMP V18 blob from the given file handle.
     ///
     /// Reads the footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V17 data-first layout: Section B (per-block interleaved data) first,
+    /// V18 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
     pub fn parse(
         handle: FileHandle,
@@ -162,7 +175,7 @@ impl BmpIndex {
 
         if blob_len < BMP_BLOB_FOOTER_SIZE as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V17 footer".into(),
+                "BMP blob too small for V18 footer".into(),
             ));
         }
 
@@ -180,19 +193,20 @@ impl BmpIndex {
         let total_postings = u64::from_le_bytes(fb[8..16].try_into().unwrap());
         let grid_offset = u64::from_le_bytes(fb[16..24].try_into().unwrap());
         let sb_grid_offset = u64::from_le_bytes(fb[24..32].try_into().unwrap());
-        let num_blocks = u32::from_le_bytes(fb[32..36].try_into().unwrap());
-        let dims = u32::from_le_bytes(fb[36..40].try_into().unwrap());
-        let bmp_block_size = u32::from_le_bytes(fb[40..44].try_into().unwrap());
-        let num_virtual_docs = u32::from_le_bytes(fb[44..48].try_into().unwrap());
-        let max_weight_scale = f32::from_le_bytes(fb[48..52].try_into().unwrap());
-        let doc_map_offset = u64::from_le_bytes(fb[52..60].try_into().unwrap());
-        let num_real_docs = u32::from_le_bytes(fb[60..64].try_into().unwrap());
-        let grid_bits_raw = u32::from_le_bytes(fb[64..68].try_into().unwrap());
-        let magic = u32::from_le_bytes(fb[68..72].try_into().unwrap());
+        let coarse_grid_offset = u64::from_le_bytes(fb[32..40].try_into().unwrap());
+        let num_blocks = u32::from_le_bytes(fb[40..44].try_into().unwrap());
+        let dims = u32::from_le_bytes(fb[44..48].try_into().unwrap());
+        let bmp_block_size = u32::from_le_bytes(fb[48..52].try_into().unwrap());
+        let num_virtual_docs = u32::from_le_bytes(fb[52..56].try_into().unwrap());
+        let max_weight_scale = f32::from_le_bytes(fb[56..60].try_into().unwrap());
+        let doc_map_offset = u64::from_le_bytes(fb[60..68].try_into().unwrap());
+        let num_real_docs = u32::from_le_bytes(fb[68..72].try_into().unwrap());
+        let grid_bits_raw = u32::from_le_bytes(fb[72..76].try_into().unwrap());
+        let magic = u32::from_le_bytes(fb[76..80].try_into().unwrap());
 
         if magic != BMP_BLOB_MAGIC {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP7 {:#x}); rebuild \
+                "Invalid BMP blob magic: {:#x} (expected BMP8 {:#x}); rebuild \
                  the index with this version.",
                 magic, BMP_BLOB_MAGIC
             )));
@@ -233,6 +247,8 @@ impl BmpIndex {
                 block_grid: CompressedGrid::empty(),
                 superblock_grid: CompressedGrid::empty(),
                 num_superblocks: 0,
+                coarse_grid: CompressedGrid::empty(),
+                num_coarse_groups: 0,
                 doc_map_ids_bytes: OwnedBytes::empty(),
                 doc_map_ordinals_bytes: OwnedBytes::empty(),
                 source: handle,
@@ -306,11 +322,12 @@ impl BmpIndex {
         // Section A: block_data_starts [bds_start..grid_offset)
         let block_data_starts_bytes = blob.slice(bds_start..grid_start);
 
-        // Sections D+E: compressed ceil-u4 block and superblock grids, then
-        // document maps. Their byte lengths are carried
+        // Sections D+E+H: compressed ceil-u4 block, superblock, and coarse
+        // grids, then document maps. Their byte lengths are carried
         // by the footer's section offsets; each grid validates its own row
         // table before exposing random group access.
         let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
+        let num_coarse_groups = num_superblocks.div_ceil(BMP_COARSE_SUPERBLOCKS);
         let sb_grid_start = usize::try_from(sb_grid_offset).map_err(|_| {
             crate::Error::Corruption("BMP superblock-grid offset is too large".into())
         })?;
@@ -320,13 +337,21 @@ impl BmpIndex {
                 grid_start, sb_grid_start, data_len_usize
             )));
         }
+        let coarse_grid_start = usize::try_from(coarse_grid_offset)
+            .map_err(|_| crate::Error::Corruption("BMP coarse-grid offset is too large".into()))?;
+        if coarse_grid_start < sb_grid_start || coarse_grid_start > data_len_usize {
+            return Err(crate::Error::Corruption(format!(
+                "BMP section order mismatch: superblock grid starts at {}, coarse grid at {}, data ends at {}",
+                sb_grid_start, coarse_grid_start, data_len_usize
+            )));
+        }
 
         let dm_start = usize::try_from(doc_map_offset)
             .map_err(|_| crate::Error::Corruption("BMP document-map offset is too large".into()))?;
-        if dm_start < sb_grid_start || dm_start > data_len_usize {
+        if dm_start < coarse_grid_start || dm_start > data_len_usize {
             return Err(crate::Error::Corruption(format!(
-                "BMP section order mismatch: superblock grid starts at {}, document map at {}, data ends at {}",
-                sb_grid_start, dm_start, data_len_usize
+                "BMP section order mismatch: coarse grid starts at {}, document map at {}, data ends at {}",
+                coarse_grid_start, dm_start, data_len_usize
             )));
         }
         let dm_ids_len = (num_virtual_docs as usize).checked_mul(4).ok_or_else(|| {
@@ -357,11 +382,18 @@ impl BmpIndex {
             "BMP block grid",
         )?;
         let superblock_grid = CompressedGrid::parse(
-            blob.slice(sb_grid_start..dm_start),
+            blob.slice(sb_grid_start..coarse_grid_start),
             dims as usize,
             num_superblocks as usize,
             4,
             "BMP superblock grid",
+        )?;
+        let coarse_grid = CompressedGrid::parse(
+            blob.slice(coarse_grid_start..dm_start),
+            dims as usize,
+            num_coarse_groups as usize,
+            4,
+            "BMP coarse grid",
         )?;
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
@@ -402,23 +434,25 @@ impl BmpIndex {
         // random offsets. Default readahead can amplify each tiny probe into
         // 128KB of page cache and march a data-sized grid into memory.
         //
-        // sb_grid keeps default readahead: its rows are swept contiguously
-        // per query dim, and it is pinnable (priority 4).
+        // E is now accessed only for selected 256-superblock groups and is
+        // random. H is tiny, swept contiguously, and pinnable (priority 4).
         #[cfg(feature = "native")]
         {
             block_data_bytes.madvise(libc::MADV_RANDOM);
             doc_map_ids_bytes.madvise(libc::MADV_RANDOM);
             doc_map_ordinals_bytes.madvise(libc::MADV_RANDOM);
             block_grid.madvise_rows(libc::MADV_RANDOM);
-            superblock_grid.madvise_rows(libc::MADV_SEQUENTIAL);
+            superblock_grid.madvise_rows(libc::MADV_RANDOM);
+            coarse_grid.madvise_rows(libc::MADV_SEQUENTIAL);
         }
 
         log::debug!(
-            "BMP V17 index loaded: num_blocks={}, num_superblocks={}, dims={}, bmp_block_size={}, \
+            "BMP V18 index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
-             block_grid={}, superblock_grid={}, single_valued={}, block_data={}, doc_map={}",
+             block_grid={}, superblock_grid={}, coarse_grid={}, single_valued={}, block_data={}, doc_map={}",
             num_blocks,
             num_superblocks,
+            num_coarse_groups,
             dims,
             bmp_block_size,
             num_virtual_docs,
@@ -427,6 +461,7 @@ impl BmpIndex {
             total_postings,
             crate::format_bytes(block_grid.encoded_bytes() as u64),
             crate::format_bytes(superblock_grid.encoded_bytes() as u64),
+            crate::format_bytes(coarse_grid.encoded_bytes() as u64),
             single_valued,
             crate::format_bytes(bds_start as u64),
             crate::format_bytes(u64::from(num_virtual_docs) * 6),
@@ -449,6 +484,8 @@ impl BmpIndex {
             block_grid,
             superblock_grid,
             num_superblocks,
+            coarse_grid,
+            num_coarse_groups,
             doc_map_ids_bytes,
             doc_map_ordinals_bytes,
             source: handle,
@@ -457,7 +494,7 @@ impl BmpIndex {
         })
     }
 
-    /// Read the entire raw V17 blob (including footer) from the source file.
+    /// Read the entire raw V18 blob (including footer) from the source file.
     ///
     /// Used by reorder paths (native-only) to copy a field byte-identically
     /// when its `reorder` schema attribute is unset.
@@ -559,19 +596,24 @@ impl BmpIndex {
         );
     }
 
-    /// Pin the superblock grid (priority 4: every query dim reads a row).
-    /// The compressed block-grid payload is deliberately never pinned
-    /// (data-sized); its small row-offset table is priority 1 above.
+    /// Pin the sparse planning hierarchy (priority 4).
+    ///
+    /// E is data-sized and only accessed for selected coarse groups, so only
+    /// its row offsets are pinned. H is roughly 256x smaller and is swept for
+    /// every BMP query, so both its offsets and rows are pinned. The block-grid
+    /// payload is deliberately never pinned; its row offsets are priority 1.
     #[cfg(feature = "native")]
-    pub(crate) fn pin_sb_grid(
+    pub(crate) fn pin_query_hierarchy(
         &mut self,
         mode: crate::segment::pin::PinMode,
         remaining: &mut u64,
         report: &mut crate::segment::pin::PinReport,
     ) {
-        self.superblock_grid.pin_all(
-            "bmp sb_grid row_offsets",
-            "bmp sb_grid rows",
+        self.superblock_grid
+            .pin_offsets("bmp sb_grid row_offsets", mode, remaining, report);
+        self.coarse_grid.pin_all(
+            "bmp coarse_grid row_offsets",
+            "bmp coarse_grid rows",
             mode,
             remaining,
             report,
@@ -590,6 +632,42 @@ impl BmpIndex {
     pub(crate) fn prefetch_block_data(&self, byte_start: u64, byte_end: u64) {
         self.block_data_bytes
             .madvise_range(byte_start as usize..byte_end as usize, libc::MADV_WILLNEED);
+    }
+
+    /// Coalesce page-near block payload ranges before issuing WILLNEED.
+    ///
+    /// Selected LSP superblocks are score-ordered rather than file-ordered, so
+    /// one giant min..max advice span can pull gigabytes of unvisited data.
+    /// This keeps distant extents independent while collapsing ranges that the
+    /// kernel would round onto the same/adjacent pages anyway.
+    #[cfg(feature = "native")]
+    pub(crate) fn prefetch_block_data_ranges(
+        &self,
+        ranges: &mut Vec<std::ops::Range<u64>>,
+    ) -> (usize, usize) {
+        if ranges.is_empty() {
+            return (0, 0);
+        }
+        const PAGE_NEAR_BYTES: u64 = 4096;
+        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        let mut advised_bytes = 0usize;
+        let mut calls = 0usize;
+        let mut current = ranges[0].clone();
+        for range in &ranges[1..] {
+            if range.start <= current.end.saturating_add(PAGE_NEAR_BYTES) {
+                current.end = current.end.max(range.end);
+                continue;
+            }
+            advised_bytes = advised_bytes.saturating_add((current.end - current.start) as usize);
+            calls += 1;
+            self.prefetch_block_data(current.start, current.end);
+            current = range.clone();
+        }
+        advised_bytes = advised_bytes.saturating_add((current.end - current.start) as usize);
+        calls += 1;
+        self.prefetch_block_data(current.start, current.end);
+        ranges.clear();
+        (advised_bytes, calls)
     }
 
     /// Get a raw pointer to the start of a block's contiguous data.
@@ -779,6 +857,12 @@ impl BmpIndex {
         &self.superblock_grid
     }
 
+    /// Direct access to the ceil-u4 grid over 256-superblock groups.
+    #[inline]
+    pub(crate) fn coarse_grid(&self) -> &CompressedGrid {
+        &self.coarse_grid
+    }
+
     /// Visit independently decoded chunks of one block-grid row.
     ///
     /// This is intended for diagnostics such as the CLI heatmap. `None`
@@ -857,6 +941,7 @@ impl BmpIndex {
         Self::madvise_owned(&self.block_data_starts_bytes, libc::MADV_SEQUENTIAL);
         self.block_grid.madvise_rows(libc::MADV_SEQUENTIAL);
         self.superblock_grid.madvise_rows(libc::MADV_SEQUENTIAL);
+        self.coarse_grid.madvise_rows(libc::MADV_SEQUENTIAL);
         Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_SEQUENTIAL);
         Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_SEQUENTIAL);
     }
@@ -875,7 +960,8 @@ impl BmpIndex {
     pub fn madvise_random_query(&self) {
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_RANDOM);
         self.block_grid.madvise_rows(libc::MADV_RANDOM);
-        self.superblock_grid.madvise_rows(libc::MADV_SEQUENTIAL);
+        self.superblock_grid.madvise_rows(libc::MADV_RANDOM);
+        self.coarse_grid.madvise_rows(libc::MADV_SEQUENTIAL);
         Self::madvise_owned(&self.doc_map_ids_bytes, libc::MADV_RANDOM);
         Self::madvise_owned(&self.doc_map_ordinals_bytes, libc::MADV_RANDOM);
     }
@@ -885,6 +971,7 @@ impl BmpIndex {
     pub fn madvise_dontneed_grids(&self) {
         self.block_grid.madvise_rows(libc::MADV_DONTNEED);
         self.superblock_grid.madvise_rows(libc::MADV_DONTNEED);
+        self.coarse_grid.madvise_rows(libc::MADV_DONTNEED);
     }
 
     /// Release document-map pages faulted by a full reorder scan. They remain
@@ -1101,7 +1188,7 @@ mod safety_tests {
         let grid_offset =
             u64::from_le_bytes(blob[footer + 16..footer + 24].try_into().unwrap()) as usize;
         let num_blocks =
-            u32::from_le_bytes(blob[footer + 32..footer + 36].try_into().unwrap()) as usize;
+            u32::from_le_bytes(blob[footer + 40..footer + 44].try_into().unwrap()) as usize;
         let starts = grid_offset - (num_blocks + 1) * 8;
         blob[starts..starts + 8].copy_from_slice(&1u64.to_le_bytes());
         assert!(matches!(parse(blob), Err(crate::Error::Corruption(_))));
