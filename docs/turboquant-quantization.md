@@ -8,7 +8,7 @@ IVF-PQ requires corpus-trained global artifacts (coarse centroids + OPQ-PQ
 codebook). Until `build_vector_index()` runs, dense queries brute-force the
 flat vectors; every trained generation adds version gates, and OPQ training is
 disabled on WASM. TurboQuant (Zandieh, Daliri et al., arXiv 2504.19874; see
-also mayflower/pg_turboquant, MIT) is a _data-oblivious_ quantizer: its
+also mayflower/pg_turboquant, MIT) is a **data-oblivious** quantizer: its
 codebook is derived analytically from the geometry of the unit sphere, so a
 segment can carry a compressed ANN payload from its very first build with
 **zero training** and no cross-segment compatibility surface beyond fixed
