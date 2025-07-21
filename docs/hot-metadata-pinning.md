@@ -31,7 +31,7 @@ arrays touched by every ANN route.
 | BMP             | `block_data_starts`, `sb_grid`, doc maps | **pinnable**             | block data  | evictable (MADV_RANDOM + WILLNEED prefetch)  |
 |                 | 4-bit `grid`                             | never pinned (see below) |             |                                              |
 | Dense flat      | header + doc-id map                      | **pinnable**             | raw vectors | evictable (+ RANDOM/prefetch for ANN fields) |
-| ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable** | PQ/binary codes and IDs | evictable mmap |
+| ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable** | quantized codes and IDs | evictable (clustered: MADV_RANDOM + selected-run WILLNEED; flat TQ: sequential) |
 
 Sizes for a representative 18.2M-doc production segment (284,690 blocks,
 4,449 superblocks, SPLADE dims ≈ 105,879):
@@ -45,8 +45,8 @@ Sizes for a representative 18.2M-doc production segment (284,690 blocks,
 | BMP 4-bit `grid` (dims × blocks/2)  | ~15 GB       | **never**                                    |
 
 The 4-bit grid is meta-shaped but data-sized: it must stay evictable and is
-treated like bulk data (rows are read contiguously per query dim, so default
-readahead serves it well).
+treated like bulk data. LSP/0 touches selected eight-cell groups at scattered
+offsets, so the mapping uses `MADV_RANDOM` to prevent readahead amplification.
 
 ## Phase 1 (implemented): budgeted metadata pinning
 
@@ -65,7 +65,9 @@ until the budget is exhausted. Loading a trained ANN generation additionally
 locks HNSW/two-level topology, parent centroids, PQ/OPQ tables, and then leaf
 centroids. Each segment locks its compact cluster-run lookup directory. The
 corpus-sized PQ/binary run columns and exact rerank vectors remain mmap-backed
-and evictable. Fail-loud: mlock failure logs a warning and continues;
+and evictable. ANN queries prefetch only the selected physical run extents;
+exact reranking applies the same bounded prefetch in synchronous and
+asynchronous execution. Fail-loud: mlock failure logs a warning and continues;
 `SegmentMemoryStats` carries `pin_intended_bytes` vs `pinned_metadata_bytes`
 for per-segment accounting, while generation pinning logs its own totals.
 

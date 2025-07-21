@@ -51,7 +51,8 @@ the copy cursor (`MADV_DONTNEED` per copied chunk).
 ## Trade-off
 
 A freshly merged segment starts serving with a cold page cache and warms on
-demand — metadata is pinned at open by Phase 1, and BMP prefetch covers
-scoring reads. That is the right trade under memory pressure: a few
-on-demand faults on the new segment instead of evicting the entire serving
-working set during the merge.
+demand — metadata is pinned at open by Phase 1, while BMP and clustered ANN
+query paths prefetch only the selected scoring ranges (flat TQ retains its
+deliberate sequential scan). That is the right trade under memory pressure:
+bounded on-demand reads on the new segment instead of evicting the entire
+serving working set during the merge.

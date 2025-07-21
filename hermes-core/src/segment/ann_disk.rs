@@ -34,6 +34,8 @@ const ANN_RUN_SIZE: usize = 48;
 const ANN_FOOTER_SIZE: usize = 24;
 #[cfg(feature = "native")]
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
+#[cfg(feature = "native")]
+const PREFETCH_COALESCE_GAP: usize = 4 * 1024;
 const BINARY_SCORE_BATCH: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +266,22 @@ impl AnnDiskIndex {
             ));
         }
 
+        // Clustered queries visit a small set of runs at unrelated offsets.
+        // Disable default mmap readahead for those corpus-sized payloads:
+        // without this, each small run can pull in ~128 KiB and amplify
+        // cold-query IO by an order of magnitude. Their search methods issue
+        // exact WILLNEED ranges before scoring. Flat TQ deliberately scans its
+        // sole cluster and therefore retains a sequential access policy.
+        #[cfg(feature = "native")]
+        raw.madvise_range(
+            ANN_HEADER_SIZE..directory_offset,
+            if kind == AnnKind::TqFlat {
+                libc::MADV_SEQUENTIAL
+            } else {
+                libc::MADV_RANDOM
+            },
+        );
+
         Ok(Self {
             #[cfg(feature = "native")]
             heap_pins: Default::default(),
@@ -307,12 +325,39 @@ impl AnnDiskIndex {
         &self.runs[start..end]
     }
 
+    /// Prefetch exactly the mmap ranges needed by the selected IVF leaves.
+    ///
+    /// A pure-copy merge preserves each source payload as one physical extent,
+    /// so runs for one logical cluster can be far apart. Sorting by file offset
+    /// lets us coalesce overlaps and page-near ranges without reading through
+    /// unrelated clusters.
+    #[cfg(feature = "native")]
+    fn prefetch_cluster_runs(&self, cluster_ids: &[u32]) {
+        if cluster_ids.is_empty() || !self.raw.is_mmap() {
+            return;
+        }
+        let mut ranges = Vec::with_capacity(cluster_ids.len());
+        for &cluster_id in cluster_ids {
+            ranges.extend(
+                self.cluster_runs(cluster_id)
+                    .iter()
+                    .map(|run| run.doc_ids.start..run.codes.end),
+            );
+        }
+        coalesce_prefetch_ranges(&mut ranges);
+        for range in ranges {
+            self.raw.madvise_range(range, libc::MADV_WILLNEED);
+        }
+    }
+
     pub(crate) fn search_ivf_pq_distinct(
         &self,
         k: usize,
         plan: &IvfPqQueryPlan,
     ) -> io::Result<Vec<(u32, u16, f32)>> {
         let mut collector = BoundedAnnCollector::<true, false>::new(k);
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(&plan.cluster_ids);
         let bytes = self.raw.as_slice();
         for (cluster_id, distance_table) in plan.cluster_distance_tables() {
             for run in self.cluster_runs(cluster_id) {
@@ -387,6 +432,8 @@ impl AnnDiskIndex {
                 "IVF-TQ query plan does not match the payload dimension",
             ));
         }
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(&plan.cluster_ids);
         let block_bytes = tq_ivf_block_bytes(self.header.code_size);
         let bytes = self.raw.as_slice();
         let mut collector = BoundedAnnCollector::<true, true>::new(k);
@@ -425,6 +472,8 @@ impl AnnDiskIndex {
                 "binary ANN query has the wrong byte length",
             ));
         }
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(cluster_ids);
         let bytes = self.raw.as_slice();
         let mut scores = vec![0.0f32; BINARY_SCORE_BATCH.min(self.header.vector_count)];
         for &cluster_id in cluster_ids {
@@ -442,6 +491,27 @@ impl AnnDiskIndex {
         }
         Ok(collector.into_sorted_results())
     }
+}
+
+#[cfg(feature = "native")]
+fn coalesce_prefetch_ranges(ranges: &mut Vec<Range<usize>>) {
+    if ranges.len() < 2 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut output_len = 1usize;
+    for input_index in 1..ranges.len() {
+        let next_start = ranges[input_index].start;
+        let next_end = ranges[input_index].end;
+        let previous = &mut ranges[output_len - 1];
+        if next_start <= previous.end.saturating_add(PREFETCH_COALESCE_GAP) {
+            previous.end = previous.end.max(next_end);
+        } else {
+            ranges[output_len] = next_start..next_end;
+            output_len += 1;
+        }
+    }
+    ranges.truncate(output_len);
 }
 
 fn score_binary_run<const BY_DOCUMENT: bool>(
@@ -774,7 +844,6 @@ pub(crate) fn write_merged_ann(
     })?;
     let mut output_payload_starts = Vec::with_capacity(sources.len());
     for &(source, _) in sources {
-        let bytes = source.raw.as_slice();
         let payload_end = source
             .runs
             .iter()
@@ -783,7 +852,7 @@ pub(crate) fn write_merged_ann(
             .ok_or_else(|| invalid_data("ANN source has no payload runs"))?;
         let output_payload_start = offset;
         output_payload_starts.push(output_payload_start);
-        copy_range(writer, bytes, ANN_HEADER_SIZE..payload_end)?;
+        copy_range(writer, &source.raw, ANN_HEADER_SIZE..payload_end)?;
         offset = checked_advance(offset, payload_end - ANN_HEADER_SIZE)?;
     }
 
@@ -972,11 +1041,26 @@ fn write_u16_column(
 #[cfg(feature = "native")]
 fn copy_range(
     writer: &mut (impl Write + ?Sized),
-    bytes: &[u8],
+    bytes: &OwnedBytes,
     range: Range<usize>,
 ) -> io::Result<()> {
-    for chunk in bytes[range].chunks(COPY_CHUNK) {
-        writer.write_all(chunk)?;
+    if range.is_empty() {
+        return Ok(());
+    }
+    let range_end = range.end;
+    let mut chunk_start = range.start;
+    let first_end = chunk_start.saturating_add(COPY_CHUNK).min(range_end);
+    bytes.madvise_range(chunk_start..first_end, libc::MADV_WILLNEED);
+    while chunk_start < range_end {
+        let chunk_end = chunk_start.saturating_add(COPY_CHUNK).min(range_end);
+        let next_end = chunk_end.saturating_add(COPY_CHUNK).min(range_end);
+        if chunk_end < next_end {
+            // Keep one bounded window of IO in flight while the current
+            // window is copied. The query mapping remains MADV_RANDOM.
+            bytes.madvise_range(chunk_end..next_end, libc::MADV_WILLNEED);
+        }
+        writer.write_all(&bytes.as_slice()[chunk_start..chunk_end])?;
+        chunk_start = chunk_end;
     }
     Ok(())
 }
@@ -1082,6 +1166,19 @@ mod tests {
 
     fn payload_end(index: &AnnDiskIndex) -> usize {
         index.runs.iter().map(|run| run.codes.end).max().unwrap()
+    }
+
+    #[test]
+    fn ann_prefetch_ranges_are_sorted_and_only_merge_page_near_extents() {
+        let mut ranges = vec![
+            15_000..16_000,
+            0..1_000,
+            9_000..10_000,
+            1_000..2_000,
+            7_000..8_000,
+        ];
+        coalesce_prefetch_ranges(&mut ranges);
+        assert_eq!(ranges, [0..2_000, 7_000..10_000, 15_000..16_000]);
     }
 
     #[test]
