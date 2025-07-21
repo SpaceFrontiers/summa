@@ -633,7 +633,7 @@ impl<D: Directory + 'static> Searcher<D> {
         retrieval_depth: usize,
         parallel: bool,
     ) -> Result<Vec<Option<std::sync::Arc<crate::query::bmp::LspSegmentPlan>>>> {
-        let total_start = std::time::Instant::now();
+        let total_start = crate::observe::WallTimer::start();
         let empty = || vec![None; self.segments.len()];
         if retrieval_depth == 0 {
             return Ok(empty());
@@ -680,7 +680,7 @@ impl<D: Directory + 'static> Searcher<D> {
         if !infos.iter().any(|info| info.candidate) {
             return Ok(empty());
         }
-        let prepare_start = std::time::Instant::now();
+        let prepare_start = crate::observe::WallTimer::start();
         let Some(prepared_query) =
             crate::query::bmp::prepare_bmp_query_infos(reference_bmp.dims(), &infos)?
         else {
@@ -688,7 +688,7 @@ impl<D: Directory + 'static> Searcher<D> {
         };
         let infos: std::sync::Arc<[crate::query::SparseTermQueryInfo]> = infos.into();
         let prepared_query = std::sync::Arc::new(prepared_query);
-        let prepare_secs = prepare_start.elapsed().as_secs_f64();
+        let prepare_secs = prepare_start.secs();
 
         let local_plans = || {
             let plan = std::sync::Arc::new(crate::query::bmp::LspSegmentPlan {
@@ -715,7 +715,7 @@ impl<D: Directory + 'static> Searcher<D> {
             crate::observe::bmp_lsp(
                 self.schema.index_label(),
                 field_label,
-                total_start.elapsed().as_secs_f64(),
+                total_start.secs(),
                 prepare_secs,
                 0.0,
                 0.0,
@@ -727,7 +727,7 @@ impl<D: Directory + 'static> Searcher<D> {
             );
             return Ok(local_plans());
         }
-        let hierarchy_scan_start = std::time::Instant::now();
+        let hierarchy_scan_start = crate::observe::WallTimer::start();
         let prepare = |segment: &std::sync::Arc<crate::segment::SegmentReader>| {
             segment
                 .bmp_index(field)
@@ -758,9 +758,9 @@ impl<D: Directory + 'static> Searcher<D> {
                 .map(prepare)
                 .collect::<Result<Vec<_>>>()?
         };
-        let hierarchy_scan_secs = hierarchy_scan_start.elapsed().as_secs_f64();
+        let hierarchy_scan_secs = hierarchy_scan_start.secs();
 
-        let select_start = std::time::Instant::now();
+        let select_start = crate::observe::WallTimer::start();
         let selection =
             select_global_lsp_hierarchical(&coarse_bounds, gamma, |segment, group, out| {
                 let bmp = self.segments[segment].bmp_index(field).ok_or_else(|| {
@@ -789,11 +789,11 @@ impl<D: Directory + 'static> Searcher<D> {
                 },
             )));
         }
-        let select_secs = select_start.elapsed().as_secs_f64();
+        let select_secs = select_start.secs();
         crate::observe::bmp_lsp(
             self.schema.index_label(),
             field_label,
-            total_start.elapsed().as_secs_f64(),
+            total_start.secs(),
             prepare_secs,
             hierarchy_scan_secs,
             select_secs,

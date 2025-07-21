@@ -20,6 +20,39 @@ pub(crate) struct BmpQueryPhases {
     pub prefetch_ranges: usize,
 }
 
+/// Wall-clock timer for diagnostics that must also compile on platforms where
+/// `std::time::Instant` is unavailable at runtime (notably wasm32).
+///
+/// Native builds retain real timings; non-native builds fold the timer and its
+/// readings away. Metrics-only call sites should use [`Timer`] instead so they
+/// remain free when metrics are disabled.
+pub(crate) struct WallTimer {
+    #[cfg(feature = "native")]
+    start: std::time::Instant,
+}
+
+impl WallTimer {
+    #[inline]
+    pub fn start() -> Self {
+        Self {
+            #[cfg(feature = "native")]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    #[inline]
+    pub fn secs(&self) -> f64 {
+        #[cfg(feature = "native")]
+        {
+            self.start.elapsed().as_secs_f64()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            0.0
+        }
+    }
+}
+
 #[cfg(all(feature = "metrics", feature = "native"))]
 mod imp {
     use super::BmpQueryPhases;
