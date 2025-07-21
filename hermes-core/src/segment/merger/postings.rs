@@ -109,6 +109,7 @@ impl SegmentMerger {
         let mut sources: Vec<(usize, TermInfo, u32)> = Vec::with_capacity(segments.len());
 
         while !heap.is_empty() {
+            self.ensure_not_cancelled()?;
             // Get the smallest key (move, not clone)
             let first = heap.pop().unwrap();
             let current_key = first.key;

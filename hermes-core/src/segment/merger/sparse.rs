@@ -13,7 +13,7 @@
 //! skip entries (24 bytes per block) are written fresh in a separate section.
 //! The raw block bytes are copied directly from mmap.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use super::OffsetWriter;
@@ -28,6 +28,10 @@ use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc
 use crate::segment::reader::{DimRawData, SegmentReader};
 use crate::segment::types::SegmentFiles;
 use crate::structures::{SparseFormat, SparseSkipEntry};
+
+fn cancellation_requested(cancellation: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancellation.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+}
 
 impl SegmentMerger {
     /// Merge sparse vector indexes via byte-level block stacking (V3 format).
@@ -86,6 +90,7 @@ impl SegmentMerger {
         let mut skip_entry_buf = Vec::with_capacity(SparseSkipEntry::SIZE);
 
         for (field, sparse_config, field_reorder, field_name) in &sparse_fields {
+            self.ensure_not_cancelled()?;
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
@@ -166,6 +171,7 @@ impl SegmentMerger {
                             sources.len(),
                         );
                         let bp_budget = self.bp_budget;
+                        let cancellation = self.cancellation.clone();
                         let bp_memory_budget = self.bp_memory_budget;
                         let out_grid_bits = grid_bits;
                         let scratch_path = scratch_path.clone();
@@ -203,6 +209,7 @@ impl SegmentMerger {
                                 // pass is marked unconverged and the background
                                 // optimizer deepens it (warm-started).
                                 bp_budget,
+                                cancellation,
                                 // Auto unless a source is an unconverged
                                 // partial reorder (then Records, see
                                 // SegmentMerger::granularity).
@@ -234,6 +241,7 @@ impl SegmentMerger {
                             &scratch_path,
                             &mut writer,
                             &mut field_tocs,
+                            self.cancellation.as_deref(),
                         )
                     })?;
                 }
@@ -287,6 +295,7 @@ impl SegmentMerger {
             let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(all_dims.len());
 
             for &dim_id in &all_dims {
+                self.ensure_not_cancelled()?;
                 // Collect raw data from each segment (skip entries + raw block bytes)
                 let mut sources = Vec::with_capacity(segments.len());
                 for (seg_idx, sparse_idx) in sparse_indexes.iter().enumerate() {
@@ -595,6 +604,7 @@ fn merge_bmp_field(
     scratch_path: &std::path::Path,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use crate::segment::builder::bmp::write_bmp_footer;
     let effective_block_size = bmp_block_size.clamp(1, 256);
@@ -621,6 +631,9 @@ fn merge_bmp_field(
     let mut num_real_docs_total: u32 = 0;
 
     for &(bmp, _) in &sources {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         bmp.validate_rewrite_layout(
             "BMP merge",
             dims,
@@ -693,6 +706,9 @@ fn merge_bmp_field(
         let sentinel = bmp.block_data_sentinel() as usize;
         let src_data = &bmp.block_data_slice()[..sentinel];
         for chunk in src_data.chunks(CHUNK_SIZE) {
+            if cancellation_requested(cancellation) {
+                return Err(crate::Error::IndexClosed);
+            }
             writer.write_all(chunk).map_err(crate::Error::Io)?;
         }
         cumulative_bytes += sentinel as u64;
@@ -731,8 +747,14 @@ fn merge_bmp_field(
     // coordinates are copied byte-for-byte; shifted output groups use a
     // bounded 256-cell decode/repack.
     let grid_offset = writer.offset() - blob_start;
-    let block_grid_bytes =
-        write_merged_block_grid(&sources, dims as usize, num_blocks, grid_bits, writer)?;
+    let block_grid_bytes = write_merged_block_grid(
+        &sources,
+        dims as usize,
+        num_blocks,
+        grid_bits,
+        writer,
+        cancellation,
+    )?;
 
     // ── Phase 4: Stream Sections E+H together. Source superblock coordinates
     // restart at every segment, so E is remapped by source block offsets.
@@ -747,8 +769,14 @@ fn merge_bmp_field(
             .unwrap_or_else(|| "hermes.sparse".into()),
         field_id,
     ));
-    let (sb_grid_bytes, coarse_grid_bytes) =
-        write_merged_superblock_grids(&sources, dims as usize, num_blocks, &coarse_spool, writer)?;
+    let (sb_grid_bytes, coarse_grid_bytes) = write_merged_superblock_grids(
+        &sources,
+        dims as usize,
+        num_blocks,
+        &coarse_spool,
+        writer,
+        cancellation,
+    )?;
     let coarse_grid_offset = sb_grid_offset
         .checked_add(sb_grid_bytes)
         .ok_or_else(|| crate::Error::Internal("merged BMP grid offset exceeds u64".into()))?;
@@ -775,10 +803,16 @@ fn merge_bmp_field(
 
         if doc_offset == 0 {
             for chunk in src_ids[..n * 4].chunks(CHUNK_SIZE) {
+                if cancellation_requested(cancellation) {
+                    return Err(crate::Error::IndexClosed);
+                }
                 writer.write_all(chunk).map_err(crate::Error::Io)?;
             }
         } else {
             for chunk_start in (0..n).step_by(DOC_MAP_CHUNK) {
+                if cancellation_requested(cancellation) {
+                    return Err(crate::Error::IndexClosed);
+                }
                 let chunk_end = (chunk_start + DOC_MAP_CHUNK).min(n);
                 let chunk_len = chunk_end - chunk_start;
                 let src = &src_ids[chunk_start * 4..chunk_end * 4];
@@ -808,6 +842,9 @@ fn merge_bmp_field(
         let src_ords = bmp.doc_map_ordinals_slice();
         let n = bmp.num_virtual_docs as usize;
         for chunk in src_ords[..n * 2].chunks(CHUNK_SIZE) {
+            if cancellation_requested(cancellation) {
+                return Err(crate::Error::IndexClosed);
+            }
             writer.write_all(chunk).map_err(crate::Error::Io)?;
         }
     }
@@ -934,6 +971,7 @@ fn write_merged_block_grid<'a>(
     num_blocks: usize,
     grid_bits: u8,
     writer: &mut dyn Write,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<u64> {
     use crate::segment::bmp_grid::{CompressedGridLayout, GRID_GROUP_CELLS, pack_group};
 
@@ -1020,6 +1058,9 @@ fn write_merged_block_grid<'a>(
     };
 
     for dimension in 0..dims {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         load_row(dimension, &mut row_groups)?;
         collect_widths(&mut widths, &row_groups, &mut group_values)?;
         row_sizes.push(layout.row_bytes(&widths)?);
@@ -1039,6 +1080,9 @@ fn write_merged_block_grid<'a>(
     })?);
     let mut packed = [0u8; GRID_GROUP_CELLS];
     for (dimension, &row_size) in row_sizes.iter().enumerate() {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         load_row(dimension, &mut row_groups)?;
         row_payload.clear();
         let mut source = 0usize;
@@ -1251,6 +1295,7 @@ fn write_merged_superblock_grids<'a>(
     num_blocks: usize,
     coarse_spool: &std::path::Path,
     writer: &mut dyn Write,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(u64, u64)> {
     use crate::segment::bmp_grid::{CompressedGridLayout, GRID_GROUP_CELLS, pack_group};
 
@@ -1303,6 +1348,9 @@ fn write_merged_superblock_grids<'a>(
         };
 
     for dimension in 0..dims {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         rows.prepare(
             sources,
             &source_block_bases,
@@ -1376,6 +1424,9 @@ fn write_merged_superblock_grids<'a>(
     };
 
     for dimension in 0..dims {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         rows.prepare(
             sources,
             &source_block_bases,
@@ -1422,7 +1473,25 @@ fn write_merged_superblock_grids<'a>(
         .map_err(crate::Error::Io)?;
     let coarse_file = std::fs::File::open(coarse_spool).map_err(crate::Error::Io)?;
     let mut coarse_reader = std::io::BufReader::with_capacity(1024 * 1024, coarse_file);
-    let copied = std::io::copy(&mut coarse_reader, writer).map_err(crate::Error::Io)?;
+    let mut copy_buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
+        let read = coarse_reader
+            .read(&mut copy_buffer)
+            .map_err(crate::Error::Io)?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&copy_buffer[..read])
+            .map_err(crate::Error::Io)?;
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| crate::Error::Internal("merged BMP coarse grid exceeds u64".into()))?;
+    }
     if copied != coarse_rows_bytes {
         return Err(crate::Error::Corruption(format!(
             "short BMP coarse-grid spool copy: copied {copied}, expected {coarse_rows_bytes}"

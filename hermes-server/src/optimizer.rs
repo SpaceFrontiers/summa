@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use hermes_core::segment::BpBudget;
 use log::{debug, info, warn};
-use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::sync::{Semaphore, TryAcquireError, watch};
+use tokio::task::JoinSet;
 
 use crate::registry::IndexRegistry;
 
@@ -104,6 +105,7 @@ impl Drop for DeepeningPermit {
 pub fn spawn_optimizer(
     registry: Arc<IndexRegistry>,
     config: OptimizerConfig,
+    shutdown: watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if config.threads == 0 {
         return None;
@@ -120,7 +122,7 @@ pub fn spawn_optimizer(
     let semaphore = Arc::new(Semaphore::new(config.concurrent_passes.max(1)));
 
     Some(tokio::spawn(async move {
-        optimizer_loop(registry, semaphore, config).await;
+        optimizer_loop(registry, semaphore, config, shutdown).await;
     }))
 }
 
@@ -129,30 +131,68 @@ async fn optimizer_loop(
     registry: Arc<IndexRegistry>,
     semaphore: Arc<Semaphore>,
     config: OptimizerConfig,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     // Initial delay: let the server finish startup before scanning.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        _ = shutdown.changed() => return,
+    }
 
     // A timed-out pass replaces its source with a new unconverged segment ID.
     // Gate that lineage globally and start its cooldown only when work ends.
     let deepening_gate = Arc::new(DeepeningGate::default());
     let mut next_index = 0usize;
+    let mut tasks = JoinSet::new();
 
-    loop {
-        if let Err(e) = scan_and_optimize(
+    'optimizer: loop {
+        let scan = scan_and_optimize(
             &registry,
             &semaphore,
             &config,
             &deepening_gate,
             &mut next_index,
-        )
-        .await
-        {
+            &mut tasks,
+        );
+        let scan_result = tokio::select! {
+            result = scan => result,
+            _ = shutdown.changed() => break 'optimizer,
+        };
+        if *shutdown.borrow() {
+            break;
+        }
+        if let Err(e) = scan_result {
             warn!("[optimizer] scan failed: {}", e);
         }
 
-        tokio::time::sleep(config.scan_interval).await;
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result {
+                warn!("[optimizer] reorder task failed: {}", error);
+            }
+        }
+
+        let sleep = tokio::time::sleep(config.scan_interval);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                _ = shutdown.changed() => break 'optimizer,
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        warn!("[optimizer] reorder task failed: {}", error);
+                    }
+                }
+            }
+        }
     }
+
+    semaphore.close();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            warn!("[optimizer] reorder task failed during shutdown: {}", error);
+        }
+    }
+    info!("[optimizer] shut down");
 }
 
 /// One scan cycle: list indexes, find candidates, spawn reorder tasks.
@@ -166,6 +206,7 @@ async fn scan_and_optimize(
     config: &OptimizerConfig,
     deepening_gate: &Arc<DeepeningGate>,
     next_index: &mut usize,
+    tasks: &mut JoinSet<()>,
 ) -> Result<(), tonic::Status> {
     let mut index_names = registry.list_indexes().await?;
     // A busy first index used to consume every slot on every scan. Rotate the
@@ -325,7 +366,7 @@ async fn scan_and_optimize(
                 BpBudget::full()
             };
 
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _permit = permit;
                 // Starts cooldown when the task finishes, not when it was
                 // queued. Also releases the in-flight gate on panic unwind.
@@ -359,6 +400,12 @@ async fn scan_and_optimize(
                         debug!(
                             "[optimizer] segment {} in index '{}' skipped (in merge)",
                             sid, idx_name
+                        );
+                    }
+                    Err(hermes_core::Error::IndexClosed) => {
+                        debug!(
+                            "[optimizer] segment {} in index '{}' cancelled during shutdown",
+                            sid, idx_name,
                         );
                     }
                     Err(e) => {
@@ -400,5 +447,35 @@ mod tests {
             gate.try_acquire(Duration::ZERO).is_some(),
             "the gate should reopen after its cooldown"
         );
+    }
+
+    #[tokio::test]
+    async fn optimizer_supervisor_stops_on_application_shutdown() {
+        let registry = Arc::new(IndexRegistry::new(
+            std::env::temp_dir().join("hermes_optimizer_shutdown_test"),
+            hermes_core::IndexConfig::default(),
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_optimizer(
+            registry,
+            OptimizerConfig {
+                threads: 1,
+                concurrent_passes: 1,
+                scan_interval: Duration::from_secs(60),
+                large_segment_docs: 1_000_000,
+                time_budget: Duration::from_secs(60),
+                partial_min_partition_docs: 256,
+                unconverged_cooldown: Duration::from_secs(60),
+                max_unconverged_passes: 1,
+            },
+            shutdown_rx,
+        )
+        .expect("optimizer must be enabled");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("optimizer ignored shutdown")
+            .unwrap();
     }
 }

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::RwLock;
@@ -90,6 +91,7 @@ pub struct IndexRegistry {
     open_locks: RwLock<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     pub(crate) data_dir: PathBuf,
     config: IndexConfig,
+    shutting_down: AtomicBool,
 }
 
 impl IndexRegistry {
@@ -99,6 +101,62 @@ impl IndexRegistry {
             open_locks: RwLock::new(HashMap::new()),
             data_dir,
             config,
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    fn ensure_running(&self) -> Result<(), Status> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(Status::unavailable("Hermes server is shutting down"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Close lifecycle admission immediately when process shutdown starts.
+    ///
+    /// This method is synchronous so the signal future can stop new work
+    /// before tonic finishes draining in-flight RPCs.
+    pub fn begin_shutdown(&self) {
+        if self.shutting_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for handle in self.handles.read().values() {
+            handle.index.segment_manager().begin_shutdown();
+        }
+    }
+
+    /// Stop all index writers while Tokio is still alive, then drain every
+    /// merge, reorder, metadata transaction, and deferred cleanup.
+    pub async fn shutdown(&self) -> Result<(), Status> {
+        self.begin_shutdown();
+        let handles = std::mem::take(&mut *self.handles.write());
+        info!(
+            "[shutdown] stopping writers for {} open index(es)",
+            handles.len()
+        );
+        let mut managers = Vec::with_capacity(handles.len());
+        let mut first_error = None;
+
+        for (name, handle) in handles {
+            let manager = Arc::clone(handle.index.segment_manager());
+            if let Err(error) = handle.writer.write().await.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(crate::error::hermes_error_to_status(error));
+            }
+            drop(handle);
+            managers.push((name, manager));
+        }
+
+        for (name, manager) in managers {
+            manager.wait_for_shutdown().await;
+            info!("[shutdown] index '{}' drained", name);
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -154,6 +212,7 @@ impl IndexRegistry {
     /// Without this, two concurrent requests can both miss the cache and open the
     /// index twice (wasting ~30s loading segments redundantly).
     pub async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<MmapDirectory>>, Status> {
+        self.ensure_running()?;
         Self::validate_index_name(name)?;
 
         // Fast path: already cached
@@ -166,6 +225,7 @@ impl IndexRegistry {
 
         // Serialize open attempts for the same index name
         let _guard = lock.lock().await;
+        self.ensure_running()?;
 
         // Re-check cache after acquiring lock (another task may have opened it)
         if let Some(h) = self.handles.read().get(name) {
@@ -208,20 +268,40 @@ impl IndexRegistry {
 
         Self::precache_idf_files(&index);
 
-        self.handles.write().insert(
-            name.to_string(),
-            IndexHandle {
-                index: Arc::clone(&index),
-                writer,
-            },
-        );
-        Ok(index)
+        {
+            let mut handles = self.handles.write();
+            if !self.shutting_down.load(Ordering::Acquire) {
+                handles.insert(
+                    name.to_string(),
+                    IndexHandle {
+                        index: Arc::clone(&index),
+                        writer,
+                    },
+                );
+                return Ok(index);
+            }
+        }
+
+        let manager = Arc::clone(index.segment_manager());
+        manager.begin_shutdown();
+        writer
+            .write()
+            .await
+            .shutdown()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+        drop(writer);
+        drop(index);
+        manager.wait_for_shutdown().await;
+        Err(Status::unavailable("Hermes server is shutting down"))
     }
 
     /// Create a new index
     pub async fn create_index(&self, name: &str, schema: Schema) -> Result<(), Status> {
+        self.ensure_running()?;
         Self::validate_index_name(name)?;
         let _open_guard = self.open_lock(name).lock_owned().await;
+        self.ensure_running()?;
         let index_path = self.data_dir.join(name);
 
         if index_path.exists() {
@@ -248,14 +328,32 @@ impl IndexRegistry {
 
         Self::precache_idf_files(&index);
 
-        self.handles.write().insert(
-            name.to_string(),
-            IndexHandle {
-                index: Arc::clone(&index),
-                writer,
-            },
-        );
-        Ok(())
+        {
+            let mut handles = self.handles.write();
+            if !self.shutting_down.load(Ordering::Acquire) {
+                handles.insert(
+                    name.to_string(),
+                    IndexHandle {
+                        index: Arc::clone(&index),
+                        writer,
+                    },
+                );
+                return Ok(());
+            }
+        }
+
+        let manager = Arc::clone(index.segment_manager());
+        manager.begin_shutdown();
+        writer
+            .write()
+            .await
+            .shutdown()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+        drop(writer);
+        drop(index);
+        manager.wait_for_shutdown().await;
+        Err(Status::unavailable("Hermes server is shutting down"))
     }
 
     /// Get writer for an index (opens index if needed)
@@ -263,6 +361,7 @@ impl IndexRegistry {
         &self,
         name: &str,
     ) -> Result<Arc<tokio::sync::RwLock<IndexWriter<MmapDirectory>>>, Status> {
+        self.ensure_running()?;
         if let Some(h) = self.handles.read().get(name) {
             return Ok(Arc::clone(&h.writer));
         }
@@ -316,6 +415,7 @@ impl IndexRegistry {
     /// open/create. The marker is installed before eviction and the returned
     /// lease keeps the lock until filesystem removal completes.
     pub async fn begin_delete(&self, name: &str) -> Result<IndexDeleteLease, Status> {
+        self.ensure_running()?;
         Self::validate_index_name(name)?;
         let open_guard = self.open_lock(name).lock_owned().await;
         let index_path = self.data_dir.join(name);
@@ -485,6 +585,7 @@ impl IndexRegistry {
     /// Filesystem I/O is done inside `spawn_blocking` to avoid stalling
     /// the tokio worker threads under heavy load.
     pub async fn list_indexes(&self) -> Result<Vec<String>, Status> {
+        self.ensure_running()?;
         let data_dir = self.data_dir.clone();
         tokio::task::spawn_blocking(move || {
             let mut names: Vec<String> = std::fs::read_dir(&data_dir)
@@ -553,6 +654,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!root.join("held").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_shutdown_drains_indexes_and_rejects_new_work() {
+        let root = std::env::temp_dir().join(format!(
+            "hermes_registry_shutdown_{}",
+            SegmentId::new().to_hex()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = IndexRegistry::new(
+            root.clone(),
+            IndexConfig {
+                num_indexing_threads: 1,
+                ..Default::default()
+            },
+        );
+        registry
+            .create_index("open", hermes_core::SchemaBuilder::default().build())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), registry.shutdown())
+            .await
+            .expect("registry shutdown timed out")
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .get_or_open_index("open")
+                .await
+                .err()
+                .expect("open must be rejected")
+                .code(),
+            tonic::Code::Unavailable,
+        );
+        assert_eq!(
+            registry
+                .create_index("new", hermes_core::SchemaBuilder::default().build())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable,
+        );
+        assert_eq!(
+            registry.list_indexes().await.unwrap_err().code(),
+            tonic::Code::Unavailable,
+        );
+
+        drop(registry);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -447,8 +447,12 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         registry: Arc::clone(&registry),
     };
 
+    // One application-level signal coordinates tonic admission, optimizer
+    // admission, and index lifecycle cancellation.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Spawn background optimizer
-    let _optimizer_handle = optimizer::spawn_optimizer(
+    let optimizer_handle = optimizer::spawn_optimizer(
         Arc::clone(&registry),
         optimizer::OptimizerConfig {
             threads: args.optimizer_threads,
@@ -460,6 +464,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             unconverged_cooldown: Duration::from_secs(args.optimizer_unconverged_cooldown_secs),
             max_unconverged_passes: args.optimizer_max_unconverged_passes,
         },
+        shutdown_rx,
     );
 
     info!("Hermes server v{}", env!("CARGO_PKG_VERSION"));
@@ -511,7 +516,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     const INDEX_MAX_DECODE: usize = 256 * 1024 * 1024; // 256 MB (batch indexing)
     const INDEX_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (responses are medium)
 
-    Server::builder()
+    let signal_registry = Arc::clone(&registry);
+    let signal_shutdown = shutdown_tx.clone();
+    let serve_result = Server::builder()
         // Connection management
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
@@ -539,9 +546,30 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
                 .accept_compressed(CompressionEncoding::Zstd)
                 .send_compressed(CompressionEncoding::Zstd),
         )
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+        .serve_with_shutdown(addr, async move {
+            shutdown_signal().await;
+            // Stop core lifecycle admission immediately; BP observes this
+            // cancellation while tonic drains requests.
+            signal_registry.begin_shutdown();
+            let _ = signal_shutdown.send(true);
+        })
+        .await;
 
+    // A transport failure also takes the complete application through the
+    // same ordered shutdown path.
+    registry.begin_shutdown();
+    let _ = shutdown_tx.send(true);
+
+    info!("[shutdown] gRPC server drained; waiting for background work");
+    let optimizer_result = match optimizer_handle {
+        Some(handle) => handle.await,
+        None => Ok(()),
+    };
+    let registry_result = registry.shutdown().await;
+
+    serve_result?;
+    optimizer_result?;
+    registry_result?;
     info!("Hermes server shut down gracefully");
     Ok(())
 }

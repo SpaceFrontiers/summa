@@ -29,6 +29,10 @@ use crate::structures::SparseFormat;
 /// `IndexConfig::default().bp_memory_budget_bytes`.
 pub const DEFAULT_MEMORY_BUDGET: usize = 24 * 1024 * 1024 * 1024;
 
+fn cancellation_requested(cancellation: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancellation.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// Unique prefix for a pass's spilled grid-run temp files.
 ///
 /// MUST be unique per pass, not per (process, field): in a container the
@@ -214,6 +218,7 @@ fn write_reorder_grids(
     grid_bits: u8,
     rayon_pool: Option<&rayon::ThreadPool>,
     writer: &mut OffsetWriter,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(u64, u64, u64)> {
     use crate::segment::builder::bmp::{
         GridRunReader, stream_write_grids, stream_write_grids_merged,
@@ -221,18 +226,32 @@ fn write_reorder_grids(
 
     if scratch.runs_are_empty() {
         use rayon::prelude::*;
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         install_on_pool(rayon_pool, || entries.par_sort_unstable());
-        return stream_write_grids(&entries, dims, num_blocks, grid_bits, writer)
-            .map_err(crate::Error::Io);
+        let result =
+            stream_write_grids(&entries, dims, num_blocks, grid_bits, writer, cancellation);
+        return if cancellation_requested(cancellation) {
+            Err(crate::Error::IndexClosed)
+        } else {
+            result.map_err(crate::Error::Io)
+        };
     }
 
     if !entries.is_empty() {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         spill_grid_entries(&mut entries, scratch, field_id, rayon_pool)?;
     }
     drop(entries);
     // Bound both file descriptors and BufReader memory. Extremely large
     // fields can produce hundreds of sorted runs even with 16M-entry chunks.
     scratch.consolidate_runs(64)?;
+    if cancellation_requested(cancellation) {
+        return Err(crate::Error::IndexClosed);
+    }
     let mut readers: Vec<GridRunReader> = scratch
         .runs()
         .map(|path| GridRunReader::open(path).map_err(crate::Error::Io))
@@ -250,11 +269,15 @@ fn write_reorder_grids(
         &superblock_spool,
         &coarse_spool,
         writer,
-    )
-    .map_err(crate::Error::Io);
+        cancellation,
+    );
     // Close readers before GridScratchFiles removes the spill paths.
     drop(readers);
-    result
+    if cancellation_requested(cancellation) {
+        Err(crate::Error::IndexClosed)
+    } else {
+        result.map_err(crate::Error::Io)
+    }
 }
 
 fn install_on_pool<T: Send>(
@@ -587,6 +610,7 @@ fn write_blockwise_doc_maps(
     block_size: usize,
     writer: &mut OffsetWriter,
     rayon_pool: Option<&rayon::ThreadPool>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use rayon::prelude::*;
 
@@ -594,6 +618,9 @@ fn write_blockwise_doc_maps(
     let blocks_per_chunk = (REWRITE_IO_BUFFER_BYTES / id_block_bytes).max(1);
     let mut buffer = Vec::with_capacity(blocks_per_chunk * id_block_bytes);
     for blocks in permuted_blocks.chunks(blocks_per_chunk) {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         buffer.resize(blocks.len() * id_block_bytes, 0);
         install_on_pool(rayon_pool, || {
             buffer
@@ -635,6 +662,9 @@ fn write_blockwise_doc_maps(
             .saturating_sub(buffer.capacity()),
     );
     for blocks in permuted_blocks.chunks(blocks_per_chunk) {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         buffer.resize(blocks.len() * ordinal_block_bytes, 0);
         install_on_pool(rayon_pool, || {
             buffer
@@ -653,6 +683,7 @@ fn write_blockwise_doc_maps(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_record_doc_maps(
     sources: &[(crate::segment::BmpIndex, u32)],
     permutation: &[u32],
@@ -661,6 +692,7 @@ fn write_record_doc_maps(
     num_virtual_docs: usize,
     writer: &mut OffsetWriter,
     rayon_pool: Option<&rayon::ThreadPool>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use rayon::prelude::*;
 
@@ -672,6 +704,9 @@ fn write_record_doc_maps(
             .saturating_mul(4),
     );
     for records in permutation.chunks(id_records_per_chunk) {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         buffer.resize(records.len() * 4, 0);
         install_on_pool(rayon_pool, || {
             buffer
@@ -724,6 +759,9 @@ fn write_record_doc_maps(
             .saturating_sub(buffer.capacity()),
     );
     for records in permutation.chunks(ordinal_records_per_chunk) {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         buffer.resize(records.len() * 2, 0);
         install_on_pool(rayon_pool, || {
             buffer
@@ -925,7 +963,7 @@ fn block_coherence(
 /// residual coherence, potentially take the blockwise path, report converged,
 /// and end the deepening cascade at partial quality.
 #[allow(clippy::too_many_arguments)]
-pub async fn reorder_segment<D: Directory + DirectoryWriter>(
+pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     dir: &D,
     schema: &Arc<Schema>,
     source_id: SegmentId,
@@ -935,6 +973,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
     bp_budget: crate::segment::BpBudget,
     granularity: BpGranularity,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(String, u32, bool)> {
     let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
     let num_docs = reader.num_docs();
@@ -971,7 +1010,10 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
             !reader.vector_indexes().is_empty() || !reader.flat_vectors().is_empty(),
         ),
     ] {
-        clone_segment_file(dir, src, dst, required).await?;
+        if cancellation_requested(cancellation.as_deref()) {
+            return Err(crate::Error::IndexClosed);
+        }
+        clone_segment_file(dir, src, dst, required, cancellation.as_deref()).await?;
     }
     log::info!(
         "[reorder] copied files in {:.1}s",
@@ -986,6 +1028,7 @@ pub async fn reorder_segment<D: Directory + DirectoryWriter>(
         schema,
         memory_budget,
         bp_budget,
+        cancellation,
         granularity,
         rayon_pool,
     )
@@ -1051,7 +1094,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
             !reader.sparse_indexes().is_empty() || !reader.bmp_indexes().is_empty(),
         ),
     ] {
-        clone_segment_file(dir, src, dst, required).await?;
+        clone_segment_file(dir, src, dst, required, None).await?;
     }
 
     let merger = SegmentMerger::new(Arc::clone(schema)).with_background_pool(rayon_pool);
@@ -1095,7 +1138,11 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
     src: &Path,
     dst: &Path,
     required: bool,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    if cancellation_requested(cancellation) {
+        return Err(crate::Error::IndexClosed);
+    }
     match dir.link(src, dst).await {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
@@ -1132,6 +1179,9 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
     let source_len = handle.len();
     let mut offset = 0u64;
     while offset < source_len {
+        if cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         let end = (offset + CHUNK as u64).min(source_len);
         let data = handle
             .read_bytes_range(offset..end)
@@ -1176,6 +1226,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     schema: &Schema,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     granularity: BpGranularity,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<bool> {
@@ -1218,7 +1269,14 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
             reader.meta().id,
         );
         let src_files = SegmentFiles::new(reader.meta().id);
-        clone_segment_file(dir, &src_files.sparse, &dst_files.sparse, true).await?;
+        clone_segment_file(
+            dir,
+            &src_files.sparse,
+            &dst_files.sparse,
+            true,
+            cancellation.as_deref(),
+        )
+        .await?;
         return Ok(true);
     }
 
@@ -1246,6 +1304,9 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     let mut skip_count: u32 = 0;
 
     for (field, sparse_config, reorder, field_name) in &sparse_fields {
+        if cancellation_requested(cancellation.as_deref()) {
+            return Err(crate::Error::IndexClosed);
+        }
         let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
         let quantization = sparse_config
             .as_ref()
@@ -1296,6 +1357,8 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 let ilabel = schema.index_label().to_owned();
                 let pool = rayon_pool.clone();
                 let scratch_path = scratch_path.clone();
+                let field_bp_budget = bp_budget;
+                let field_cancellation = cancellation.clone();
                 let (w, ft, converged) = super::merger::block_in_place_if_multithread(move || {
                     reorder_bmp_field(
                         &bmp_sources,
@@ -1308,7 +1371,8 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                         max_weight_scale,
                         total_vectors,
                         memory_budget,
-                        bp_budget,
+                        field_bp_budget,
+                        field_cancellation,
                         granularity,
                         scratch_path,
                         writer,
@@ -1389,6 +1453,7 @@ fn reorder_bmp_field_blockwise(
     total_vectors: u32,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
     scratch_path: PathBuf,
     source_pages: &crate::segment::reader::bmp::BmpScanPageGuard<'_>,
     mut writer: OffsetWriter,
@@ -1402,6 +1467,9 @@ fn reorder_bmp_field_blockwise(
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
     let bmp_refs: Vec<&crate::segment::BmpIndex> = sources.iter().map(|(b, _)| b).collect();
+    if cancellation_requested(cancellation) {
+        return Err(crate::Error::IndexClosed);
+    }
     {
         use rayon::prelude::*;
         install_on_pool(rayon_pool.as_deref(), || {
@@ -1477,6 +1545,7 @@ fn reorder_bmp_field_blockwise(
                 sb,
                 20,
                 block_budget,
+                cancellation,
                 BpProgressLabel {
                     index: index_label,
                     field: field_name,
@@ -1495,6 +1564,9 @@ fn reorder_bmp_field_blockwise(
     } else {
         run_bp()
     };
+    if cancellation_requested(cancellation) {
+        return Err(crate::Error::IndexClosed);
+    }
     // Resolving a global block through source prefix sums is cheap once, but
     // catastrophic inside the `dims × blocks` grid rewrite below (billions
     // of calls on production-sized fields). Cache the compact source/local
@@ -1547,6 +1619,9 @@ fn reorder_bmp_field_blockwise(
     let mut run_files = GridScratchFiles::new(field_id, scratch_path);
 
     for (new_block, &(src, lb)) in permuted_blocks.iter().enumerate() {
+        if new_block.is_multiple_of(1024) && cancellation_requested(cancellation) {
+            return Err(crate::Error::IndexClosed);
+        }
         let bmp = bmp_refs[src as usize];
         let start = bmp.block_data_start(lb) as usize;
         let end = if lb + 1 < bmp.num_blocks {
@@ -1598,6 +1673,7 @@ fn reorder_bmp_field_blockwise(
         grid_bits,
         rayon_pool.as_deref(),
         &mut writer,
+        cancellation,
     )?;
     let sb_grid_offset = grid_offset + block_grid_bytes;
     let coarse_grid_offset = sb_grid_offset + superblock_grid_bytes;
@@ -1626,6 +1702,7 @@ fn reorder_bmp_field_blockwise(
         bs,
         &mut writer,
         rayon_pool.as_deref(),
+        cancellation,
     )?;
     let doc_maps_elapsed = doc_maps_start.elapsed();
 
@@ -1808,12 +1885,16 @@ pub(crate) fn reorder_bmp_field(
     total_vectors: u32,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     granularity: BpGranularity,
     scratch_path: PathBuf,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
+    if cancellation_requested(cancellation.as_deref()) {
+        return Err(crate::Error::IndexClosed);
+    }
     if !(1..=256).contains(&effective_block_size) {
         return Err(crate::Error::Internal(format!(
             "invalid BMP reorder block size {} (expected 1..=256)",
@@ -1924,6 +2005,7 @@ pub(crate) fn reorder_bmp_field(
             total_vectors,
             memory_budget,
             bp_budget,
+            cancellation.as_deref(),
             scratch_path,
             &source_pages,
             writer,
@@ -1971,6 +2053,7 @@ pub(crate) fn reorder_bmp_field(
             total_vectors,
             memory_budget,
             bp_budget,
+            cancellation.as_deref(),
             scratch_path,
             &source_pages,
             writer,
@@ -2102,6 +2185,7 @@ pub(crate) fn reorder_bmp_field(
                     effective_block_size,
                     20,
                     graph_budget,
+                    cancellation.as_deref(),
                     BpProgressLabel {
                         index: index_label,
                         field: field_name,
@@ -2128,6 +2212,10 @@ pub(crate) fn reorder_bmp_field(
             )
         }
     };
+
+    if cancellation_requested(cancellation.as_deref()) {
+        return Err(crate::Error::IndexClosed);
+    }
 
     let real_to_virtual: Vec<Vec<u32>> = vid_maps.into_iter().map(|(_, real)| real).collect();
 
@@ -2225,6 +2313,9 @@ pub(crate) fn reorder_bmp_field(
     let mut source_block_scans = 0u64;
     let mut window_start = 0usize;
     while window_start < new_num_blocks {
+        if cancellation_requested(cancellation.as_deref()) {
+            return Err(crate::Error::IndexClosed);
+        }
         let initial_end = window_start
             .saturating_add(max_parallel_window)
             .min(new_num_blocks);
@@ -2369,6 +2460,9 @@ pub(crate) fn reorder_bmp_field(
     let block_data_elapsed = rewrite_start.elapsed();
 
     // Sections D+E+H: block, superblock, and coarse-superblock grids.
+    if cancellation_requested(cancellation.as_deref()) {
+        return Err(crate::Error::IndexClosed);
+    }
     let grids_start = std::time::Instant::now();
     let grid_offset = writer.offset() - blob_start;
     let (packed_bytes, sb_bytes, _coarse_bytes) = write_reorder_grids(
@@ -2380,6 +2474,7 @@ pub(crate) fn reorder_bmp_field(
         grid_bits,
         rayon_pool.as_deref(),
         &mut writer,
+        cancellation.as_deref(),
     )?;
     let sb_grid_offset = grid_offset + packed_bytes;
     let coarse_grid_offset = sb_grid_offset + sb_bytes;
@@ -2389,6 +2484,9 @@ pub(crate) fn reorder_bmp_field(
     let grids_elapsed = grids_start.elapsed();
 
     // Sections F+G: doc_map [new_num_virtual_docs each]
+    if cancellation_requested(cancellation.as_deref()) {
+        return Err(crate::Error::IndexClosed);
+    }
     let doc_maps_start = std::time::Instant::now();
     let doc_map_offset = writer.offset() - blob_start;
 
@@ -2400,6 +2498,7 @@ pub(crate) fn reorder_bmp_field(
         new_num_virtual_docs,
         &mut writer,
         rayon_pool.as_deref(),
+        cancellation.as_deref(),
     )?;
     let doc_maps_elapsed = doc_maps_start.elapsed();
 
@@ -2458,12 +2557,12 @@ mod grid_run_prefix_tests {
         let missing = std::path::Path::new("missing");
         let output = std::path::Path::new("output");
 
-        super::clone_segment_file(&dir, missing, output, false)
+        super::clone_segment_file(&dir, missing, output, false, None)
             .await
             .unwrap();
         assert!(!dir.exists(output).await.unwrap());
 
-        let error = super::clone_segment_file(&dir, missing, output, true)
+        let error = super::clone_segment_file(&dir, missing, output, true, None)
             .await
             .unwrap_err();
         assert!(matches!(error, crate::Error::Corruption(_)));
@@ -2477,7 +2576,7 @@ mod grid_run_prefix_tests {
         let data = vec![0x5a; 4 * 1024 * 1024 + 17];
         dir.write(source, &data).await.unwrap();
 
-        super::clone_segment_file(&dir, source, output, true)
+        super::clone_segment_file(&dir, source, output, true, None)
             .await
             .unwrap();
 
