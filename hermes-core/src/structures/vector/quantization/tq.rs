@@ -579,7 +579,9 @@ pub fn tq_pack_block(rows: &[&[u8]], gammas: &[f32], padded_dim: usize, output: 
 }
 
 mod lut16 {
-    use super::{TQ_ACCUMULATE_CHUNK_DIMS, TQ_BLOCK_LANES};
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    use super::TQ_ACCUMULATE_CHUNK_DIMS;
+    use super::TQ_BLOCK_LANES;
 
     /// Accumulate both LUT sums for 16 lanes over all dimensions.
     /// `nibble_bytes` is dimension-major: 8 bytes per dimension, byte `j`
