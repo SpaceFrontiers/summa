@@ -104,7 +104,8 @@ struct Args {
 
     /// Maximum simultaneous whole-segment BP passes across optimizer,
     /// merge-time, and manual reorders. Clamped to 1..=2 because each pass can
-    /// use all optimizer threads and up to the full BP memory budget.
+    /// use all optimizer threads and up to the full BP memory budget. With two
+    /// slots, automatic merges use at most one so optimizer work cannot starve.
     #[arg(long, default_value = "2")]
     optimizer_concurrent_passes: usize,
 

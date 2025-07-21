@@ -207,7 +207,7 @@ impl SegmentMerger {
             bp_budget: crate::segment::BpBudget::full(),
             bp_memory_budget: crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
             reorder_permits: None,
-            reorder_priority: ReorderPriority::Background,
+            reorder_priority: ReorderPriority::AutomaticMerge,
         }
     }
 

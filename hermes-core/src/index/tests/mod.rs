@@ -63,22 +63,62 @@ fn reorder_gate_clamps_oversubscription() {
 
 #[cfg(feature = "native")]
 #[tokio::test]
-async fn foreground_reorder_pauses_new_background_passes() {
+async fn automatic_merge_reorder_leaves_capacity_for_optimizer() {
     use super::ReorderPriority;
     use std::sync::Arc;
     use std::time::Duration;
 
     let gate = Arc::new(super::ReorderConcurrencyGate::new(2));
-    let existing = gate.acquire(ReorderPriority::Background).await.unwrap();
+    let first_merge = gate.acquire(ReorderPriority::AutomaticMerge).await.unwrap();
+
+    // A second automatic merge must wait even though one total slot remains.
+    let second_merge = tokio::time::timeout(
+        Duration::from_millis(25),
+        gate.acquire(ReorderPriority::AutomaticMerge),
+    )
+    .await;
+    assert!(second_merge.is_err());
+
+    // The remaining slot is deliberately available to the optimizer so short
+    // fresh-segment passes cannot queue behind minutes-long merge BP work.
+    let optimizer = tokio::time::timeout(
+        Duration::from_millis(100),
+        gate.acquire(ReorderPriority::Optimizer),
+    )
+    .await
+    .expect("optimizer should retain one whole-pass slot")
+    .unwrap();
+
+    drop(optimizer);
+    drop(first_merge);
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        gate.acquire(ReorderPriority::AutomaticMerge),
+    )
+    .await
+    .expect("automatic merges should resume when their slot is released")
+    .unwrap();
+}
+
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn foreground_reorder_pauses_new_optimizer_passes() {
+    use super::ReorderPriority;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let gate = Arc::new(super::ReorderConcurrencyGate::new(2));
+    let existing = gate.acquire(ReorderPriority::Optimizer).await.unwrap();
     let foreground = gate.begin_foreground().await.unwrap();
 
-    // Free the one non-reserved slot. A background waiter must still remain
+    // Free the one non-reserved slot. An optimizer waiter must still remain
     // paused while a force merge is active, whereas foreground BP can use it.
     drop(existing);
     assert!(
         tokio::time::timeout(
             Duration::from_millis(25),
-            gate.acquire(ReorderPriority::Background),
+            gate.acquire(ReorderPriority::Optimizer),
         )
         .await
         .is_err()
@@ -95,23 +135,23 @@ async fn foreground_reorder_pauses_new_background_passes() {
 
     let _resumed = tokio::time::timeout(
         Duration::from_millis(100),
-        gate.acquire(ReorderPriority::Background),
+        gate.acquire(ReorderPriority::Optimizer),
     )
     .await
-    .expect("background BP should resume when force merge finishes")
+    .expect("optimizer BP should resume when force merge finishes")
     .unwrap();
 }
 
 #[cfg(feature = "native")]
 #[tokio::test]
-async fn cancelled_foreground_wait_resumes_background_passes() {
+async fn cancelled_foreground_wait_resumes_optimizer_passes() {
     use super::ReorderPriority;
     use std::sync::Arc;
     use std::time::Duration;
 
     let gate = Arc::new(super::ReorderConcurrencyGate::new(2));
-    let first = gate.acquire(ReorderPriority::Background).await.unwrap();
-    let second = gate.acquire(ReorderPriority::Background).await.unwrap();
+    let first = gate.acquire(ReorderPriority::Optimizer).await.unwrap();
+    let second = gate.acquire(ReorderPriority::Optimizer).await.unwrap();
 
     // begin_foreground marks the gate active before waiting for its reserved
     // permit. Cancelling that wait must not leave background admission paused.
@@ -123,10 +163,10 @@ async fn cancelled_foreground_wait_resumes_background_passes() {
     drop(first);
     let resumed = tokio::time::timeout(
         Duration::from_millis(100),
-        gate.acquire(ReorderPriority::Background),
+        gate.acquire(ReorderPriority::Optimizer),
     )
     .await
-    .expect("cancelled foreground reservation must release background waiters")
+    .expect("cancelled foreground reservation must release optimizer waiters")
     .unwrap();
     drop(resumed);
     drop(second);

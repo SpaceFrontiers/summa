@@ -56,9 +56,9 @@ cold-IO writer, so at least they no longer evict the cache.
   merge-time BP pass, and resets after convergence or a non-reordered merge.
   `0` disables optimizer follow-up deepening; it does not disable explicitly
   configured merge-time reorder.
-- Merge-time reorder uses its own finite `--merge-bp-budget-secs` deadline. A
-  server value of `0` falls back to 600 seconds instead of making a giant
-  merge unbounded. A truncated output joins the same paced deepening ladder.
+- Merge-time reorder uses its own `--merge-bp-budget-secs` deadline. A server
+  value of `0` explicitly selects an unbudgeted pass. A truncated output joins
+  the same paced deepening ladder.
 
 Observability: `converged` in reorder logs, `bp_converged` in metadata, and
 the Grafana superblock/block skip-ratio panels are the quality metric — a

@@ -92,14 +92,14 @@ These are deliberately separate controls:
 | Option                                   |   Default | Meaning                                                                                                                                  |
 | ---------------------------------------- | --------: | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `--optimizer-threads`                    |       `0` | Threads in the shared BP pool. `0` disables periodic optimizer scans; merge-time and manual BP still use the process-wide fallback pool. |
-| `--optimizer-concurrent-passes`          |       `2` | Maximum simultaneous whole-segment BP passes across background, merge-time, and manual reorder. Values are clamped to `1..=2`.          |
+| `--optimizer-concurrent-passes`          |       `2` | Maximum simultaneous whole-segment BP passes across optimizer, merge-time, and manual reorder. Values are clamped to `1..=2`; automatic merges use at most one slot so fresh-segment optimization retains capacity. |
 | `--optimizer-scan-interval-secs`         |      `60` | Interval between background scans.                                                                                                       |
 | `--optimizer-large-segment-docs`         | `5000000` | Document threshold for partial/budgeted first passes.                                                                                    |
 | `--optimizer-time-budget-secs`           |     `600` | Wall-clock budget for an optimizer pass on a large segment.                                                                              |
 | `--optimizer-partial-min-partition-docs` |     `256` | Initial depth floor for large segments (one default LSP superblock).                                                                     |
 | `--optimizer-unconverged-cooldown-secs`  |     `600` | Delay after a rewrite finishes before another deepening pass.                                                                            |
 | `--optimizer-max-unconverged-passes`     |       `3` | Optimizer follow-up eligibility limit per truncated lineage, including the initial partial pass. `0` disables follow-up deepening.       |
-| `--merge-bp-budget-secs`                 |     `600` | Finite wall-clock budget for BP performed inside a merge; `0` falls back to `600` rather than making giant merges unbounded.             |
+| `--merge-bp-budget-secs`                 |     `600` | Wall-clock budget for BP performed inside a merge; `0` explicitly selects an unbudgeted pass.                                           |
 | `--bp-memory-budget-mb`                  |   `24576` | Per-pass algorithmic working-set bound; not a reservation or a total-process RSS limit.                                                  |
 
 An active BP pass is CPU-bound and is expected to occupy up to
@@ -107,9 +107,11 @@ An active BP pass is CPU-bound and is expected to occupy up to
 second pass primarily raises simultaneous working sets and outstanding IO; it
 does not create another pool per pass or per index. Explicit force merges pause
 new background BP admission and reserve foreground capacity after existing
-merges drain. For predictable service
-latency, start with one pass and a CPU width that leaves capacity for query and
-indexing work.
+merges drain. With two-pass admission, automatic merge BP uses at most one
+slot; the other remains available to retire short fresh-segment optimizer
+passes instead of queueing them behind multi-minute merges. For predictable
+service latency, start with one pass and a CPU width that leaves capacity for
+query and indexing work.
 
 The dominant graph representation is roughly `4 bytes/posting + 32
 bytes/document`. The limit also accounts for record maps, vocabulary-sized
