@@ -1,7 +1,13 @@
 # Unified Dense IVF Architecture
 
-Status: implemented (2026-07-22). The serialized ANN format is version 3 and
-requires rebuilding older vector artifacts.
+Status: implemented (2026-07-22); **partially superseded (2026-07-23)**. The
+residual-PQ/OPQ leaf codec described below was removed after IVF-TQ
+(`docs/turboquant-quantization.md`) beat it on recall, latency, and training
+cost at the same probe budget. The router architecture in this document (one
+global coarse codebook, `auto/flat/two_level/hnsw` routing, SOAR, shared
+per-query probe plans, exact re-rank) remains current and now serves IVF-TQ
+leaves. PQ-specific sections are retained for historical context; `ivf_pq`
+indexes must be recreated with `ivf_tq`.
 
 ## One global router
 
@@ -23,10 +29,10 @@ former alternative production paths.
 
 The global router is metric-agnostic, but leaf scanning is deliberately not:
 
-| Field | Coarse metric | Segment payload | Leaf score | Rerank |
-| --- | --- | --- | --- | --- |
-| float dense | squared L2 | residual PQ bytes | asymmetric distance tables | exact, bounded to 3×k distinct docs |
-| binary dense | Hamming | packed source bits | XOR + popcount | unnecessary; leaf scores are exact |
+| Field        | Coarse metric | Segment payload    | Leaf score                 | Rerank                              |
+| ------------ | ------------- | ------------------ | -------------------------- | ----------------------------------- |
+| float dense  | squared L2    | residual PQ bytes  | asymmetric distance tables | exact, bounded to 3×k distinct docs |
+| binary dense | Hamming       | packed source bits | XOR + popcount             | unnecessary; leaf scores are exact  |
 
 Treating an already-binary embedding as float PQ would add conversion and
 approximation without information. Conversely, storing full float vectors in

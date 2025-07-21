@@ -64,6 +64,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
         Self::reject_primary_key_schema(&schema)?;
+        crate::dsl::reject_removed_vector_index_types(&schema)
+            .map_err(crate::error::Error::Schema)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
         let metadata = IndexMetadata::new((*schema).clone());

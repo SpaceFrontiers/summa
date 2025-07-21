@@ -327,24 +327,6 @@ impl SegmentMerger {
                     }
                     AnnWriteMode::Rebuild => {
                         if let Some((index, num_clusters)) = self
-                            .rebuild_float_ivf(field, config, segments, &doc_offs, trained)
-                            .await?
-                        {
-                            let data_offset = writer.offset();
-                            super::block_in_place_if_multithread(|| {
-                                crate::segment::ann_disk::write_built_ivf_pq(
-                                    &index,
-                                    num_clusters,
-                                    &mut writer,
-                                )
-                            })
-                            .map_err(crate::Error::Io)?;
-                            Some((
-                                crate::segment::ann_build::IVF_PQ_TYPE,
-                                data_offset,
-                                writer.offset() - data_offset,
-                            ))
-                        } else if let Some((index, num_clusters)) = self
                             .rebuild_ivf_tq(field, config, segments, &doc_offs, trained)
                             .await?
                         {
@@ -462,82 +444,18 @@ impl SegmentMerger {
         let mut sources = Vec::new();
         let index_type = match entry.field_type {
             FieldType::DenseVector => {
-                let Some(config) = entry
-                    .dense_vector_config
-                    .as_ref()
-                    .filter(|config| config.index_type == VectorIndexType::IvfPq)
-                else {
-                    if has_source_ann {
-                        return Err(crate::Error::Corruption(format!(
-                            "flat dense field {} unexpectedly contains ANN payloads",
-                            field.0,
-                        )));
-                    }
-                    return Ok(None);
-                };
-                let Some(centroids) = trained.centroids.get(&field.0) else {
-                    if has_source_ann {
-                        return Err(crate::Error::Corruption(format!(
-                            "IVF-PQ field {} has payloads but no global centroids",
-                            field.0,
-                        )));
-                    }
-                    return Ok(None);
-                };
-                let Some(codebook) = trained.codebooks.get(&field.0) else {
-                    if has_source_ann {
-                        return Err(crate::Error::Corruption(format!(
-                            "IVF-PQ field {} has payloads but no global codebook",
-                            field.0,
-                        )));
-                    }
-                    return Ok(None);
-                };
-                let max_assignments = centroids
-                    .soar_config
-                    .as_ref()
-                    .map_or(1, |soar| 1usize.saturating_add(soar.num_secondary));
-                for (segment_index, segment) in segments.iter().enumerate() {
-                    let Some(flat) = segment.flat_vectors().get(&field.0) else {
-                        continue;
-                    };
-                    let Some(crate::segment::VectorIndex::IvfPq(index)) =
-                        segment.vector_indexes().get(&field.0)
-                    else {
-                        return Err(crate::Error::Corruption(format!(
-                            "ordinary merge source {:032x} field {} is missing its IVF-PQ payload",
-                            segment.meta().id,
-                            field.0,
-                        )));
-                    };
-                    let disk = index.get();
-                    let header = disk.header();
-                    let max_vectors =
-                        flat.num_vectors
-                            .checked_mul(max_assignments)
-                            .ok_or_else(|| {
-                                crate::Error::Corruption(format!(
-                                    "IVF-PQ assignment count overflows for field {}",
-                                    field.0,
-                                ))
-                            })?;
-                    if header.dim != config.dim
-                        || header.code_size != codebook.config.num_subspaces
-                        || header.num_clusters != centroids.num_clusters
-                        || header.quantizer_version != centroids.version
-                        || header.codebook_version != codebook.version
-                        || header.routing != config.ivf_routing
-                        || !(flat.num_vectors..=max_vectors).contains(&header.vector_count)
-                    {
-                        return Err(crate::Error::Corruption(format!(
-                            "ordinary merge source {:032x} field {} uses an incompatible IVF-PQ generation",
-                            segment.meta().id,
-                            field.0,
-                        )));
-                    }
-                    sources.push((disk, doc_offs[segment_index]));
+                // IVF-TQ was intercepted above; every other dense index type
+                // (flat, tq handled separately, removed ivf_pq) must not
+                // reach the trained-copy path with ANN payloads attached.
+                if has_source_ann {
+                    return Err(crate::Error::Corruption(format!(
+                        "dense field {} unexpectedly contains trained ANN payloads \
+                         (was it created as ivf_pq? that format was removed — \
+                         recreate the index with ivf_tq)",
+                        field.0,
+                    )));
                 }
-                crate::segment::ann_build::IVF_PQ_TYPE
+                return Ok(None);
             }
             FieldType::BinaryDenseVector => {
                 let Some(config) = entry
@@ -635,7 +553,7 @@ impl SegmentMerger {
             crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
         let mut sources = Vec::new();
         let mut segments_with_vectors = 0usize;
-        let mut missing_payloads = 0usize;
+        let mut missing_segments = Vec::new();
         for (segment_index, segment) in segments.iter().enumerate() {
             let Some(flat) = segment.flat_vectors().get(&field.0) else {
                 continue;
@@ -671,14 +589,14 @@ impl SegmentMerger {
                         field.0,
                     )));
                 }
-                None => missing_payloads += 1,
+                None => missing_segments.push(segment_index),
             }
         }
         if segments_with_vectors == 0 {
             return Ok(None);
         }
 
-        if missing_payloads == 0 {
+        if missing_segments.is_empty() {
             let data_offset = writer.offset();
             super::block_in_place_if_multithread(|| {
                 crate::segment::ann_disk::write_merged_ann(&sources, writer)
@@ -698,20 +616,21 @@ impl SegmentMerger {
             )));
         }
 
+        // Payload-less sources (pre-TQ builds or a schema switch to `tq`)
+        // are re-encoded; every compatible source is still byte-copied.
         log::info!(
-            "[merge_vectors] field {}: {}/{} TQ source(s) have no payload; re-encoding from \
-             flat vectors (training-free)",
+            "[merge_vectors] field {}: {}/{} TQ source(s) have no payload; re-encoding only \
+             those from flat vectors (training-free), byte-copying the rest",
             field.0,
-            missing_payloads,
+            missing_segments.len(),
             segments_with_vectors,
         );
-        drop(sources);
-        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(config.dim));
+        let codec = crate::structures::vector::quantization::tq_shared_codec(config.dim);
         let mut builder = crate::structures::TqFlatBuilder::new(codec);
         let encode_start = std::time::Instant::now();
-        for (segment_index, segment) in segments.iter().enumerate() {
+        for &segment_index in &missing_segments {
             feed_segment(
-                segment,
+                &segments[segment_index],
                 field,
                 doc_offs[segment_index],
                 |labels, vectors| {
@@ -733,7 +652,9 @@ impl SegmentMerger {
             )
             .await?;
         }
-        if builder.is_empty() {
+        builder.finish();
+        let vector_count = builder.len();
+        if sources.is_empty() && vector_count == 0 {
             log::warn!(
                 "[merge_vectors] field {}: TQ re-encode found no vectors in any source; \
                  the merged segment will carry no TQ payload and fall back to exact scan",
@@ -741,18 +662,30 @@ impl SegmentMerger {
             );
             return Ok(None);
         }
-        builder.finish();
-        let vector_count = builder.len();
         let data_offset = writer.offset();
-        super::block_in_place_if_multithread(|| {
-            crate::segment::ann_disk::write_built_tq_flat(&builder, writer)
-        })
-        .map_err(crate::Error::Io)?;
+        if sources.is_empty() {
+            super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_built_tq_flat(&builder, writer)
+            })
+            .map_err(crate::Error::Io)?;
+        } else {
+            let extra = crate::segment::ann_disk::tq_builder_extra_run(&builder);
+            let extra_runs: &[_] = if vector_count == 0 {
+                &[]
+            } else {
+                std::slice::from_ref(&extra)
+            };
+            super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_merged_ann_with_extra(&sources, extra_runs, writer)
+            })
+            .map_err(crate::Error::Io)?;
+        }
         log::info!(
-            "[merge_vectors] field {}: TQ re-encoded {} vectors in {:.1}s",
+            "[merge_vectors] field {}: TQ re-encoded {} vectors in {:.1}s ({} sources copied)",
             field.0,
             vector_count,
             encode_start.elapsed().as_secs_f64(),
+            sources.len(),
         );
         Ok(Some((
             crate::segment::ann_build::TQ_FLAT_TYPE,
@@ -872,7 +805,7 @@ impl SegmentMerger {
             return Ok(None);
         };
 
-        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(config.dim));
+        let codec = crate::structures::vector::quantization::tq_shared_codec(config.dim);
         let mut index = crate::structures::IvfTqIndex::new(
             config.dim,
             config.ivf_routing,
@@ -1008,80 +941,6 @@ impl SegmentMerger {
         );
         Ok(Some(index))
     }
-
-    async fn rebuild_float_ivf(
-        &self,
-        field: crate::dsl::Field,
-        config: Option<&crate::dsl::DenseVectorConfig>,
-        segments: &[SegmentReader],
-        doc_offs: &[u32],
-        trained: Option<&TrainedVectorStructures>,
-    ) -> Result<Option<(crate::structures::IVFPQIndex, u32)>> {
-        let Some(config) = config.filter(|config| config.index_type == VectorIndexType::IvfPq)
-        else {
-            return Ok(None);
-        };
-        let Some(trained) = trained else {
-            return Ok(None);
-        };
-        let Some(centroids) = trained.centroids.get(&field.0) else {
-            return Ok(None);
-        };
-        let Some(codebook) = trained.codebooks.get(&field.0) else {
-            return Ok(None);
-        };
-
-        let mut total_fed = 0usize;
-        let ann_start = std::time::Instant::now();
-        let mut index = crate::segment::ann_build::new_ivf_pq(
-            config.dim,
-            config.ivf_routing,
-            centroids,
-            codebook,
-        );
-
-        for (segment_index, segment) in segments.iter().enumerate() {
-            let offset = doc_offs[segment_index];
-            let fed = feed_segment(segment, field, offset, |labels, vectors| {
-                super::block_in_place_if_multithread(|| {
-                    let mut add =
-                        || index.add_vectors_parallel(centroids, codebook, labels, vectors);
-                    if let Some(pool) = &self.background_pool {
-                        pool.install(add)
-                    } else {
-                        add()
-                    }
-                })
-                .map_err(|error| {
-                    crate::Error::Internal(format!(
-                        "parallel IVF-PQ rebuild failed for field {}: {error}",
-                        field.0,
-                    ))
-                })
-            })
-            .await?;
-            total_fed = total_fed.checked_add(fed).ok_or_else(|| {
-                crate::Error::Corruption(format!(
-                    "IVF-PQ rebuild vector count overflows for field {}",
-                    field.0,
-                ))
-            })?;
-        }
-
-        if total_fed == 0 {
-            return Ok(None);
-        }
-
-        log::info!(
-            "[dense_vector_merge] field {} IVF-PQ rebuilt from {} vectors into {} assignments (estimated {}, {:.1}s)",
-            field.0,
-            total_fed,
-            index.len(),
-            crate::format_bytes(index.estimated_memory_bytes() as u64),
-            ann_start.elapsed().as_secs_f64()
-        );
-        Ok(Some((index, centroids.num_clusters)))
-    }
 }
 
 #[cfg(test)]
@@ -1130,7 +989,7 @@ mod tests {
             "embedding",
             true,
             true,
-            DenseVectorConfig::with_ivf_pq(dim, Some(1), 1),
+            DenseVectorConfig::ivf_tq(dim, Some(1), 1),
         );
         let schema = sb.build();
 
@@ -1201,7 +1060,7 @@ mod tests {
         }
         assert!(matches!(
             readers[0].get_vector_index(embedding),
-            Some(crate::segment::VectorIndex::IvfPq(_))
+            Some(crate::segment::VectorIndex::IvfTq { .. })
         ));
         assert!(
             readers[1].get_vector_index(embedding).is_none(),
@@ -1209,7 +1068,7 @@ mod tests {
         );
         assert!(matches!(
             readers[2].get_vector_index(embedding),
-            Some(crate::segment::VectorIndex::IvfPq(_))
+            Some(crate::segment::VectorIndex::IvfTq { .. })
         ));
 
         let merged_id = SegmentId::new();

@@ -208,7 +208,7 @@ impl IvfTqIndex {
     }
 
     /// Add one contiguous vector batch in parallel while preserving input
-    /// order inside every leaf (mirrors `IVFPQIndex::add_vectors_parallel`).
+    /// order inside every leaf.
     #[cfg(feature = "native")]
     pub fn add_vectors_parallel(
         &mut self,

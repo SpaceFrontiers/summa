@@ -25,13 +25,11 @@ pub struct TrainedVectorStructures {
     pub centroids: FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
     /// Global Hamming coarse quantizers per binary dense field.
     pub binary_quantizers: FxHashMap<u32, Arc<crate::structures::BinaryCoarseQuantizer>>,
-    /// Index-global PQ codebooks per field ID.
-    pub codebooks: FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
 }
 
 impl TrainedVectorStructures {
     /// Lock the immutable index-global structures touched by ANN routing once
-    /// per artifact generation. Segment payloads (PQ/exact codes, doc IDs) and
+    /// per artifact generation. Segment payloads (TQ/exact codes, doc IDs) and
     /// raw rerank vectors are deliberately excluded: those scale with the
     /// corpus and are data, not lightweight routing metadata.
     #[cfg(feature = "native")]
@@ -46,9 +44,6 @@ impl TrainedVectorStructures {
         float_fields.sort_unstable();
         let mut binary_fields: Vec<_> = self.binary_quantizers.keys().copied().collect();
         binary_fields.sort_unstable();
-        let mut codebook_fields: Vec<_> = self.codebooks.keys().copied().collect();
-        codebook_fields.sort_unstable();
-
         // Priority 1: graph/topology and two-level parent data for every field.
         for field_id in &float_fields {
             pins.retain_owner(Arc::clone(&self.centroids[field_id]));
@@ -73,20 +68,7 @@ impl TrainedVectorStructures {
             });
         }
 
-        // Priority 2: PQ/OPQ tables used for every float query plan.
-        for field_id in &codebook_fields {
-            pins.retain_owner(Arc::clone(&self.codebooks[field_id]));
-            self.codebooks[field_id].visit_resident_regions(&mut |label, bytes| {
-                pins.pin_slice(
-                    bytes,
-                    &format!("field {field_id} {label}"),
-                    policy.mode,
-                    &mut remaining,
-                );
-            });
-        }
-
-        // Priority 3: leaf centroids. These can be much larger at billion
+        // Priority 2: leaf centroids. These can be much larger at billion
         // scale, so they consume the budget only after all control structures.
         for field_id in &float_fields {
             self.centroids[field_id].visit_leaf_centroid_region(&mut |label, bytes| {

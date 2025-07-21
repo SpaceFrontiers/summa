@@ -2303,9 +2303,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 {
                     matches!(ann, Some(crate::segment::VectorIndex::IvfTq { .. }))
                 }
-                crate::dsl::FieldType::DenseVector => {
-                    matches!(ann, Some(crate::segment::VectorIndex::IvfPq(_)))
-                }
+                // Only ivf_tq dense fields are trainable; other dense
+                // index types never reach a vector-generation rewrite.
+                crate::dsl::FieldType::DenseVector => false,
                 crate::dsl::FieldType::BinaryDenseVector => {
                     matches!(ann, Some(crate::segment::VectorIndex::BinaryIvf(_)))
                 }
@@ -3166,7 +3166,6 @@ mod tests {
             .store(Some(Arc::new(TrainedVectorStructures {
                 centroids: rustc_hash::FxHashMap::default(),
                 binary_quantizers: rustc_hash::FxHashMap::default(),
-                codebooks: rustc_hash::FxHashMap::default(),
                 ..Default::default()
             })));
 

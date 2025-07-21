@@ -4,7 +4,9 @@
 //! Builder/serialization functions are native-only.
 
 /// Index type discriminants stored in the vectors file TOC.
-pub const IVF_PQ_TYPE: u8 = 2;
+/// Type 2 was IVF-PQ, removed after IVF-TQ superseded it; the loader still
+/// recognizes it to fail with an actionable message. Never reuse it.
+pub const LEGACY_IVF_PQ_TYPE: u8 = 2;
 pub const FLAT_TYPE: u8 = 4;
 /// Binary IVF payload backed by an index-level global quantizer.
 pub const BINARY_IVF_TYPE: u8 = 6;
@@ -16,28 +18,7 @@ pub const IVF_TQ_TYPE: u8 = 8;
 // --- Native-only builder/serialization functions ---
 
 #[cfg(feature = "native")]
-use crate::structures::{CoarseCentroids, IVFPQConfig, IVFPQIndex, PQCodebook};
-
-/// Create a fresh IVF-PQ index ready for vector insertion.
-#[cfg(feature = "native")]
-pub fn new_ivf_pq(
-    dim: usize,
-    routing: crate::dsl::IvfRoutingMode,
-    centroids: &CoarseCentroids,
-    codebook: &PQCodebook,
-) -> IVFPQIndex {
-    let config = IVFPQConfig::new(dim, codebook.config.num_subspaces).with_routing(routing);
-    IVFPQIndex::new(config, centroids.version, codebook.version)
-}
-
-/// Encode a populated IVF-PQ build into the merge-native segment format.
-#[cfg(feature = "native")]
-pub fn serialize_ivf_pq(index: IVFPQIndex, num_clusters: u32) -> crate::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    crate::segment::ann_disk::write_built_ivf_pq(&index, num_clusters, &mut bytes)
-        .map_err(crate::Error::Io)?;
-    Ok(bytes)
-}
+use crate::structures::CoarseCentroids;
 
 /// Encode one segment's vectors into IVF-TQ leaves against the trained
 /// global coarse centroids.
@@ -49,7 +30,7 @@ pub fn build_ivf_tq(
     doc_id_ordinals: &[(u32, u16)],
     vectors: &[f32],
 ) -> crate::Result<Vec<u8>> {
-    let codec = std::sync::Arc::new(crate::structures::TqCodec::new(dim));
+    let codec = crate::structures::vector::quantization::tq_shared_codec(dim);
     let mut index = crate::structures::IvfTqIndex::new(dim, routing, centroids.version, codec);
     index
         .add_vectors_parallel(centroids, doc_id_ordinals, vectors)
@@ -67,7 +48,7 @@ pub fn build_tq_flat(
     doc_id_ordinals: &[(u32, u16)],
     vectors: &[f32],
 ) -> crate::Result<Vec<u8>> {
-    let codec = std::sync::Arc::new(crate::structures::TqCodec::new(dim));
+    let codec = crate::structures::vector::quantization::tq_shared_codec(dim);
     let mut builder = crate::structures::TqFlatBuilder::new(codec);
     builder
         .add_batch(doc_id_ordinals, vectors)

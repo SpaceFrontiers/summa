@@ -21,10 +21,10 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::directories::OwnedBytes;
 use crate::dsl::IvfRoutingMode;
-use crate::structures::IvfPqQueryPlan;
-use crate::structures::vector::index::BoundedAnnCollector;
+
 #[cfg(feature = "native")]
-use crate::structures::{BinaryIvfIndex, IVFPQIndex};
+use crate::structures::BinaryIvfIndex;
+use crate::structures::vector::index::BoundedAnnCollector;
 
 const ANN_HEADER_MAGIC: u32 = 0x3152_4e41; // "ANR1"
 const ANN_FOOTER_MAGIC: u32 = 0x3146_4e41; // "ANF1"
@@ -37,10 +37,22 @@ const COPY_CHUNK: usize = 8 * 1024 * 1024;
 #[cfg(feature = "native")]
 const PREFETCH_COALESCE_GAP: usize = 4 * 1024;
 const BINARY_SCORE_BATCH: usize = 8_192;
+/// Upper bound on the TQ leaf estimate `est⟨q̂,r̂⟩` for a unit residual
+/// direction: `base ≤ ‖recon‖ ≈ 1` plus the QJL term `≤ √(π/2)·γ ≤ 1.26·γ`
+/// with `γ < 1`, kept with slack so pruning can never drop a candidate the
+/// unpruned scan would have kept (pinned by a test).
+const TQ_PRUNE_ESTIMATE_BOUND: f32 = 1.3;
+/// Flat TQ scans fan out across Rayon above this vector count; the merge of
+/// per-task collectors costs ~k per task, so small segments stay sequential.
+#[cfg(feature = "native")]
+const TQ_PARALLEL_SCAN_MIN_VECTORS: usize = 65_536;
+#[cfg(feature = "native")]
+const TQ_PARALLEL_SCAN_CHUNK_BLOCKS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnnKind {
-    IvfPq = 1,
+    // Discriminant 1 was IVF-PQ, removed after IVF-TQ superseded it
+    // (docs/turboquant-quantization.md). Never reuse it.
     BinaryIvf = 2,
     /// TurboQuant flat scan: single logical cluster, block-packed codes.
     TqFlat = 3,
@@ -51,7 +63,10 @@ pub(crate) enum AnnKind {
 impl AnnKind {
     fn from_u8(value: u8) -> io::Result<Self> {
         match value {
-            1 => Ok(Self::IvfPq),
+            1 => Err(invalid_data(
+                "ANN kind 1 (IVF-PQ) is no longer supported; recreate the index \
+                 with `ivf_tq` and reindex",
+            )),
             2 => Ok(Self::BinaryIvf),
             3 => Ok(Self::TqFlat),
             4 => Ok(Self::IvfTq),
@@ -65,7 +80,7 @@ impl AnnKind {
 /// rather than `count * code_size`.
 fn expected_codes_column_len(kind: AnnKind, count: usize, code_size: usize) -> io::Result<usize> {
     match kind {
-        AnnKind::IvfPq | AnnKind::BinaryIvf => count
+        AnnKind::BinaryIvf => count
             .checked_mul(code_size)
             .ok_or_else(|| invalid_data("ANN code column size overflows usize")),
         // Single source of truth for the block-packed layouts lives in tq.rs.
@@ -349,33 +364,6 @@ impl AnnDiskIndex {
             self.raw.madvise_range(range, libc::MADV_WILLNEED);
         }
     }
-
-    pub(crate) fn search_ivf_pq_distinct(
-        &self,
-        k: usize,
-        plan: &IvfPqQueryPlan,
-    ) -> io::Result<Vec<(u32, u16, f32)>> {
-        let mut collector = BoundedAnnCollector::<true, false>::new(k);
-        #[cfg(feature = "native")]
-        self.prefetch_cluster_runs(&plan.cluster_ids);
-        let bytes = self.raw.as_slice();
-        for (cluster_id, distance_table) in plan.cluster_distance_tables() {
-            for run in self.cluster_runs(cluster_id) {
-                for index in 0..run.count {
-                    let code_start = run.codes.start + index * self.header.code_size;
-                    let code = &bytes[code_start..code_start + self.header.code_size];
-                    let distance = distance_table.compute_distance(code);
-                    collector.insert(
-                        run_doc_id(bytes, run, index)?,
-                        read_u16(bytes, run.ordinals.start + index * 2),
-                        distance,
-                    );
-                }
-            }
-        }
-        Ok(collector.into_sorted_results())
-    }
-
     /// Score every TQ block against the query plan and keep the top `k`
     /// distinct documents by estimated similarity.
     pub(crate) fn search_tq_distinct(
@@ -393,6 +381,58 @@ impl AnnDiskIndex {
         }
         let block_bytes = tq_block_bytes(self.header.code_size);
         let bytes = self.raw.as_slice();
+
+        // Large flat scans are CPU-bound on the LUT16 kernel; fan blocks out
+        // across the Rayon pool with per-task collectors and merge. Small
+        // segments stay sequential — the fan-out overhead would dominate.
+        #[cfg(feature = "native")]
+        if self.header.vector_count >= TQ_PARALLEL_SCAN_MIN_VECTORS {
+            use rayon::prelude::*;
+            let partials: Vec<io::Result<Vec<(u32, u16, f32)>>> = self
+                .runs
+                .par_iter()
+                .flat_map_iter(|run| {
+                    let codes = &bytes[run.codes.clone()];
+                    let blocks = codes.len() / block_bytes;
+                    (0..blocks.div_ceil(TQ_PARALLEL_SCAN_CHUNK_BLOCKS))
+                        .map(move |chunk| (run, chunk * TQ_PARALLEL_SCAN_CHUNK_BLOCKS, blocks))
+                })
+                .map(|(run, first_block, total_blocks)| {
+                    let codes = &bytes[run.codes.clone()];
+                    let last_block =
+                        (first_block + TQ_PARALLEL_SCAN_CHUNK_BLOCKS).min(total_blocks);
+                    let mut collector = BoundedAnnCollector::<true, true>::new(k);
+                    let mut scores = [0.0f32; TQ_BLOCK_LANES];
+                    for block_index in first_block..last_block {
+                        let block = &codes[block_index * block_bytes..][..block_bytes];
+                        crate::structures::vector::quantization::tq_score_block(
+                            plan,
+                            block,
+                            &mut scores,
+                        );
+                        let lane_base = block_index * TQ_BLOCK_LANES;
+                        let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                        for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                            let index = lane_base + lane;
+                            collector.insert(
+                                run_doc_id(bytes, run, index)?,
+                                read_u16(bytes, run.ordinals.start + index * 2),
+                                score,
+                            );
+                        }
+                    }
+                    Ok(collector.into_sorted_results())
+                })
+                .collect();
+            let mut collector = BoundedAnnCollector::<true, true>::new(k);
+            for partial in partials {
+                for (doc_id, ordinal, score) in partial? {
+                    collector.insert(doc_id, ordinal, score);
+                }
+            }
+            return Ok(collector.into_sorted_results());
+        }
+
         let mut collector = BoundedAnnCollector::<true, true>::new(k);
         let mut scores = [0.0f32; TQ_BLOCK_LANES];
         for run in &self.runs {
@@ -416,6 +456,10 @@ impl AnnDiskIndex {
 
     /// Score the probed IVF-TQ leaves and keep the top `k` distinct
     /// documents by estimated similarity (`⟨q̂,c⟩ + scale·⟨q̂,r̂⟩`).
+    ///
+    /// Blocks whose best possible estimate cannot beat the running k-th
+    /// score are skipped; clusters are serialized in descending residual
+    /// scale, so the first losing block ends its run.
     pub(crate) fn search_ivf_tq_distinct(
         &self,
         k: usize,
@@ -438,10 +482,29 @@ impl AnnDiskIndex {
         let bytes = self.raw.as_slice();
         let mut collector = BoundedAnnCollector::<true, true>::new(k);
         let mut scores = [0.0f32; TQ_BLOCK_LANES];
+        let mut pruned_blocks = 0usize;
+        let mut scored_blocks = 0usize;
         for (cluster_id, cluster_dot) in plan.cluster_dots() {
             for run in self.cluster_runs(cluster_id) {
                 let codes = &bytes[run.codes.clone()];
+                let total_blocks = codes.len() / block_bytes;
                 for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                    // Clusters are written in descending residual-scale
+                    // order, so once this block's best possible score cannot
+                    // beat the running k-th, no later block in the run can.
+                    if let Some(threshold) = collector.pruning_threshold() {
+                        let max_scale = block[..TQ_BLOCK_LANES * size_of::<f32>()]
+                            .chunks_exact(4)
+                            .map(|lane| {
+                                f32::from_le_bytes(lane.try_into().expect("scale is 4 bytes"))
+                            })
+                            .fold(0.0f32, f32::max);
+                        if cluster_dot + max_scale * TQ_PRUNE_ESTIMATE_BOUND <= threshold {
+                            pruned_blocks += total_blocks - block_index;
+                            break;
+                        }
+                    }
+                    scored_blocks += 1;
                     tq_score_ivf_block(tq_plan, block, cluster_dot, &mut scores);
                     let lane_base = block_index * TQ_BLOCK_LANES;
                     let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
@@ -455,6 +518,12 @@ impl AnnDiskIndex {
                     }
                 }
             }
+        }
+        if pruned_blocks > 0 {
+            log::debug!(
+                "[search_ivf_tq] pruned {pruned_blocks} of {} blocks via scale bounds",
+                pruned_blocks + scored_blocks,
+            );
         }
         Ok(collector.into_sorted_results())
     }
@@ -547,39 +616,6 @@ fn score_binary_run<const BY_DOCUMENT: bool>(
 }
 
 #[cfg(feature = "native")]
-pub(crate) fn write_built_ivf_pq(
-    index: &IVFPQIndex,
-    num_clusters: u32,
-    writer: &mut (impl Write + ?Sized),
-) -> io::Result<u64> {
-    let mut clusters: Vec<_> = index.clusters.iter().collect();
-    clusters.sort_unstable_by_key(|(cluster_id, _)| **cluster_id);
-    let runs: Vec<_> = clusters
-        .into_iter()
-        .map(|(&cluster_id, cluster)| BuildRun {
-            cluster_id,
-            doc_ids: &cluster.doc_ids,
-            ordinals: &cluster.ordinals,
-            codes: &cluster.codes,
-        })
-        .collect();
-    write_built_runs(
-        AnnDiskHeader {
-            kind: AnnKind::IvfPq,
-            routing: index.config.routing,
-            dim: index.config.dim,
-            code_size: index.config.code_size,
-            num_clusters,
-            quantizer_version: index.centroids_version,
-            codebook_version: index.codebook_version,
-            vector_count: index.len(),
-        },
-        &runs,
-        writer,
-    )
-}
-
-#[cfg(feature = "native")]
 pub(crate) fn write_built_binary_ivf(
     index: &BinaryIvfIndex,
     routing: IvfRoutingMode,
@@ -625,46 +661,65 @@ pub(crate) fn write_built_ivf_tq(
     let padded_dim = codec.padded_dim();
     let mut clusters: Vec<_> = index.clusters.iter().collect();
     clusters.sort_unstable_by_key(|(cluster_id, _)| **cluster_id);
-    let packed: Vec<(u32, Vec<u8>)> = clusters
+    // Emit every cluster in descending residual-scale order: block maxima
+    // then decrease monotonically, so the scan's per-block score bound can
+    // stop a run at the first block that cannot beat the running k-th score.
+    struct PackedCluster {
+        cluster_id: u32,
+        doc_ids: Vec<u32>,
+        ordinals: Vec<u16>,
+        codes: Vec<u8>,
+    }
+    let packed: Vec<PackedCluster> = clusters
         .iter()
         .map(|&(&cluster_id, cluster)| {
+            let count = cluster.doc_ids.len();
+            let mut order: Vec<usize> = (0..count).collect();
+            order.sort_by(|&a, &b| {
+                cluster.scales[b]
+                    .total_cmp(&cluster.scales[a])
+                    .then_with(|| a.cmp(&b))
+            });
+            let doc_ids: Vec<u32> = order.iter().map(|&i| cluster.doc_ids[i]).collect();
+            let ordinals: Vec<u16> = order.iter().map(|&i| cluster.ordinals[i]).collect();
+            let scales: Vec<f32> = order.iter().map(|&i| cluster.scales[i]).collect();
+            let gammas: Vec<f32> = order.iter().map(|&i| cluster.gammas[i]).collect();
             let mut codes = Vec::with_capacity(
                 crate::structures::vector::quantization::tq_ivf_codes_column_len_checked(
-                    cluster.doc_ids.len(),
+                    count,
                     codec.code_size(),
                 )
                 .unwrap_or_default(),
             );
-            for block_start in (0..cluster.doc_ids.len()).step_by(TQ_BLOCK_LANES) {
-                let lanes = TQ_BLOCK_LANES.min(cluster.doc_ids.len() - block_start);
-                let rows: Vec<&[u8]> = (0..lanes)
-                    .map(|lane| {
-                        let row = block_start + lane;
-                        &cluster.rows[row * padded_dim..(row + 1) * padded_dim]
-                    })
+            for block_start in (0..count).step_by(TQ_BLOCK_LANES) {
+                let lanes = TQ_BLOCK_LANES.min(count - block_start);
+                let rows: Vec<&[u8]> = order[block_start..block_start + lanes]
+                    .iter()
+                    .map(|&row| &cluster.rows[row * padded_dim..(row + 1) * padded_dim])
                     .collect();
                 tq_pack_ivf_block(
                     &rows,
-                    &cluster.scales[block_start..block_start + lanes],
-                    &cluster.gammas[block_start..block_start + lanes],
+                    &scales[block_start..block_start + lanes],
+                    &gammas[block_start..block_start + lanes],
                     padded_dim,
                     &mut codes,
                 );
             }
-            (cluster_id, codes)
-        })
-        .collect();
-    let runs: Vec<_> = clusters
-        .iter()
-        .zip(&packed)
-        .map(|(&(&cluster_id, cluster), (packed_id, codes))| {
-            debug_assert_eq!(cluster_id, *packed_id);
-            BuildRun {
+            PackedCluster {
                 cluster_id,
-                doc_ids: &cluster.doc_ids,
-                ordinals: &cluster.ordinals,
+                doc_ids,
+                ordinals,
                 codes,
             }
+        })
+        .collect();
+    let runs: Vec<_> = packed
+        .iter()
+        .map(|cluster| BuildRun {
+            cluster_id: cluster.cluster_id,
+            doc_ids: &cluster.doc_ids,
+            ordinals: &cluster.ordinals,
+            codes: &cluster.codes,
         })
         .collect();
     write_built_runs(
@@ -681,6 +736,17 @@ pub(crate) fn write_built_ivf_tq(
         &runs,
         writer,
     )
+}
+
+/// View a populated TQ builder as a single extra merge run (cluster 0).
+#[cfg(feature = "native")]
+pub(crate) fn tq_builder_extra_run(builder: &crate::structures::TqFlatBuilder) -> BuildRun<'_> {
+    BuildRun {
+        cluster_id: 0,
+        doc_ids: &builder.doc_ids,
+        ordinals: &builder.ordinals,
+        codes: &builder.codes,
+    }
 }
 
 /// Serialize a populated TQ builder as a single-run payload.
@@ -713,7 +779,7 @@ pub(crate) fn write_built_tq_flat(
 }
 
 #[cfg(feature = "native")]
-struct BuildRun<'a> {
+pub(crate) struct BuildRun<'a> {
     cluster_id: u32,
     doc_ids: &'a [u32],
     ordinals: &'a [u16],
@@ -818,6 +884,18 @@ pub(crate) fn write_merged_ann(
     sources: &[(&AnnDiskIndex, u32)],
     writer: &mut (impl Write + ?Sized),
 ) -> io::Result<u64> {
+    write_merged_ann_with_extra(sources, &[], writer)
+}
+
+/// [`write_merged_ann`] plus freshly built runs appended to the payload —
+/// used when some merge sources predate the field's current format and were
+/// re-encoded while every compatible source is still byte-copied.
+#[cfg(feature = "native")]
+pub(crate) fn write_merged_ann_with_extra(
+    sources: &[(&AnnDiskIndex, u32)],
+    extra: &[BuildRun<'_>],
+    writer: &mut (impl Write + ?Sized),
+) -> io::Result<u64> {
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot merge an empty ANN source list"));
     };
@@ -834,10 +912,24 @@ pub(crate) fn write_merged_ann(
             .checked_add(source.header.vector_count)
             .ok_or_else(|| invalid_data("merged ANN vector count overflows usize"))?;
     }
+    for run in extra {
+        if run.doc_ids.is_empty()
+            || run.cluster_id >= header.num_clusters
+            || run.ordinals.len() != run.doc_ids.len()
+            || run.codes.len()
+                != expected_codes_column_len(header.kind, run.doc_ids.len(), header.code_size)?
+        {
+            return Err(invalid_data("extra ANN merge run columns are inconsistent"));
+        }
+        header.vector_count = header
+            .vector_count
+            .checked_add(run.doc_ids.len())
+            .ok_or_else(|| invalid_data("merged ANN vector count overflows usize"))?;
+    }
     validate_header(&header)?;
     write_header(writer, &header)?;
     let mut offset = ANN_HEADER_SIZE as u64;
-    let run_capacity = sources.iter().try_fold(0usize, |count, (source, _)| {
+    let run_capacity = sources.iter().try_fold(extra.len(), |count, (source, _)| {
         count
             .checked_add(source.runs.len())
             .ok_or_else(|| invalid_data("merged ANN run count overflows usize"))
@@ -856,16 +948,58 @@ pub(crate) fn write_merged_ann(
         offset = checked_advance(offset, payload_end - ANN_HEADER_SIZE)?;
     }
 
+    // Extra runs' columns are appended after the copied extents so the
+    // payload region stays contiguous for open()'s coverage validation.
+    let mut extra_records = Vec::with_capacity(extra.len());
+    let mut scratch = Vec::new();
+    for run in extra {
+        let count = run.doc_ids.len();
+        let doc_ids_offset = offset;
+        write_u32_column(writer, run.doc_ids, &mut scratch)?;
+        offset = checked_advance(offset, count * 4)?;
+        let ordinals_offset = offset;
+        write_u16_column(writer, run.ordinals, &mut scratch)?;
+        offset = checked_advance(offset, count * 2)?;
+        let codes_offset = offset;
+        writer.write_all(run.codes)?;
+        offset = checked_advance(offset, run.codes.len())?;
+        extra_records.push(RunRecord {
+            cluster_id: run.cluster_id,
+            doc_base: 0,
+            count: u32::try_from(count)
+                .map_err(|_| invalid_data("extra ANN run exceeds u32 vectors"))?,
+            max_doc_id: run.doc_ids.iter().copied().max().unwrap_or(0),
+            doc_ids_offset,
+            ordinals_offset,
+            codes_offset,
+            codes_len: u64::try_from(run.codes.len())
+                .map_err(|_| invalid_data("extra ANN code length exceeds u64"))?,
+        });
+    }
+
     // Every source directory is already cluster-sorted. Merge those compact
-    // directories directly into the output with O(source count) heap memory;
-    // the corpus payload extents above remain untouched and source-contiguous.
+    // directories (plus the extra records) directly into the output with
+    // O(source count) heap memory; the corpus payload extents above remain
+    // untouched and source-contiguous. Extra records use pseudo source index
+    // `sources.len()` so ties stay deterministic.
     let directory_offset = offset;
-    let mut pending = BinaryHeap::with_capacity(sources.len());
+    let mut pending = BinaryHeap::with_capacity(sources.len() + 1);
     for (source_index, (source, _)) in sources.iter().enumerate() {
         pending.push(Reverse((source.runs[0].cluster_id, source_index, 0usize)));
     }
+    if let Some(first_extra) = extra_records.first() {
+        pending.push(Reverse((first_extra.cluster_id, sources.len(), 0usize)));
+    }
     let mut written_runs = 0usize;
     while let Some(Reverse((_, source_index, run_index))) = pending.pop() {
+        if source_index == sources.len() {
+            write_run_record(writer, &extra_records[run_index])?;
+            written_runs += 1;
+            if let Some(next) = extra_records.get(run_index + 1) {
+                pending.push(Reverse((next.cluster_id, source_index, run_index + 1)));
+            }
+            continue;
+        }
         let (source, segment_base) = sources[source_index];
         let run = &source.runs[run_index];
         write_run_record(
@@ -1080,7 +1214,6 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
         || header.num_clusters == 0
         || header.quantizer_version == 0
         || header.vector_count == 0
-        || (header.kind == AnnKind::IvfPq && header.codebook_version == 0)
         || (header.kind == AnnKind::BinaryIvf
             && (header.codebook_version != 0
                 || !header.dim.is_multiple_of(8)
@@ -1350,6 +1483,100 @@ mod tests {
     }
 
     #[test]
+    fn ivf_tq_scale_pruning_matches_the_unpruned_scan() {
+        use crate::structures::vector::ivf::{CoarseCentroids, CoarseConfig};
+        use crate::structures::vector::quantization::{
+            TQ_BLOCK_LANES, tq_ivf_block_bytes, tq_score_ivf_block,
+        };
+        use crate::structures::{IvfTqIndex, TqCodec, TqIvfEncodeScratch, TqIvfQueryPlan};
+
+        let dim = 32;
+        let count = 400usize;
+        let codec = std::sync::Arc::new(TqCodec::new(dim));
+        let mut state = 5u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let vectors: Vec<Vec<f32>> = (0..count)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| next()).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter_mut().for_each(|x| *x /= norm);
+                v
+            })
+            .collect();
+        let centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 8), &vectors);
+        let mut index = IvfTqIndex::new(
+            dim,
+            crate::dsl::IvfRoutingMode::Flat,
+            centroids.version,
+            std::sync::Arc::clone(&codec),
+        );
+        let mut scratch = TqIvfEncodeScratch::default();
+        for (i, vector) in vectors.iter().enumerate() {
+            index.add_vector(&centroids, i as u32, 0, vector, &mut scratch);
+        }
+        let mut bytes = Vec::new();
+        write_built_ivf_tq(&index, centroids.num_clusters, &mut bytes).unwrap();
+        let disk =
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::IvfTq, count as u32).unwrap();
+
+        let k = 10;
+        for query_seed in [1u64, 9, 42] {
+            let mut qstate = query_seed;
+            let mut qnext = move || {
+                qstate = qstate
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((qstate >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            };
+            let query: Vec<f32> = (0..dim).map(|_| qnext()).collect();
+            let plan = TqIvfQueryPlan::build(
+                &centroids,
+                &codec,
+                &query,
+                8,
+                crate::dsl::IvfRoutingMode::Flat,
+            );
+
+            // Unpruned reference: score every block of every probed run with
+            // the identical kernel and collector.
+            let mut reference = BoundedAnnCollector::<true, true>::new(k);
+            let block_bytes = tq_ivf_block_bytes(disk.header().code_size);
+            let raw = disk.raw.as_slice();
+            let mut scores = [0.0f32; TQ_BLOCK_LANES];
+            for (cluster_id, cluster_dot) in plan.cluster_dots() {
+                for run in disk.cluster_runs(cluster_id) {
+                    let codes = &raw[run.codes.clone()];
+                    for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                        tq_score_ivf_block(plan.tq_plan(), block, cluster_dot, &mut scores);
+                        let lane_base = block_index * TQ_BLOCK_LANES;
+                        let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                        for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                            let idx = lane_base + lane;
+                            reference.insert(
+                                run_doc_id(raw, run, idx).unwrap(),
+                                read_u16(raw, run.ordinals.start + idx * 2),
+                                score,
+                            );
+                        }
+                    }
+                }
+            }
+
+            let pruned = disk.search_ivf_tq_distinct(k, &plan).unwrap();
+            assert_eq!(
+                pruned,
+                reference.into_sorted_results(),
+                "scale-bound pruning must not change the estimated top-k (seed {query_seed})"
+            );
+        }
+    }
+
+    #[test]
     fn open_rejects_tq_payload_with_inconsistent_geometry() {
         let (bytes, _) = build_tq_payload(20, 4, 9);
         // code_size (header bytes 12..16) is P/2 = 16 for dim 20; corrupt to 15.
@@ -1360,13 +1587,26 @@ mod tests {
             "TQ header with code_size != padded_dim/2 must be refused"
         );
 
-        // A truncated codes column (not block-padded) must also be refused.
+        // A block-padded TQ column must not validate under another kind.
         let (short_bytes, _) = build_tq_payload(20, 4, 9);
         let mut wrong_kind = short_bytes.clone();
-        wrong_kind[4] = AnnKind::IvfPq as u8;
+        wrong_kind[4] = AnnKind::BinaryIvf as u8;
         assert!(
-            AnnDiskIndex::open(OwnedBytes::new(wrong_kind), AnnKind::IvfPq, 4).is_err(),
+            AnnDiskIndex::open(OwnedBytes::new(wrong_kind), AnnKind::BinaryIvf, 4).is_err(),
             "TQ block-padded columns must not validate under another kind"
+        );
+
+        // The retired IVF-PQ discriminant must be refused loudly.
+        let (legacy_bytes, _) = build_tq_payload(20, 4, 9);
+        let mut legacy_kind = legacy_bytes.clone();
+        legacy_kind[4] = 1;
+        let Err(error) = AnnDiskIndex::open(OwnedBytes::new(legacy_kind), AnnKind::TqFlat, 4)
+        else {
+            panic!("retired IVF-PQ payloads must not open");
+        };
+        assert!(
+            error.to_string().contains("IVF-PQ"),
+            "error must name the retired format: {error}"
         );
         assert!(AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, 4).is_ok());
     }

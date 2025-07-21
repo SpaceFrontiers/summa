@@ -144,14 +144,15 @@ fn validate_ann_schema(schema: &Schema, field_id: u32, index_type: u8) -> Result
         ))
     })?;
 
+    if index_type == ann_build::LEGACY_IVF_PQ_TYPE {
+        return Err(crate::Error::Corruption(format!(
+            "field {field_id} carries an IVF-PQ ANN payload, which is no longer \
+             supported; recreate the index with `ivf_tq` and reindex \
+             (docs/turboquant-quantization.md)"
+        )));
+    }
+
     let matches_schema = match index_type {
-        ann_build::IVF_PQ_TYPE => {
-            field.field_type == FieldType::DenseVector
-                && field
-                    .dense_vector_config
-                    .as_ref()
-                    .is_some_and(|config| config.index_type == VectorIndexType::IvfPq)
-        }
         ann_build::BINARY_IVF_TYPE => {
             field.field_type == FieldType::BinaryDenseVector
                 && field
@@ -215,7 +216,7 @@ fn is_ann_vector_type(index_type: u8) -> bool {
 
     matches!(
         index_type,
-        ann_build::IVF_PQ_TYPE
+        ann_build::LEGACY_IVF_PQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE
@@ -392,7 +393,7 @@ async fn load_vectors_file_impl<D: Directory>(
     for entry in &entries {
         let inserted = match entry.index_type {
             ann_build::FLAT_TYPE => flat_toc_fields.insert(entry.field_id),
-            ann_build::IVF_PQ_TYPE
+            ann_build::LEGACY_IVF_PQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE => ann_toc_fields.insert(entry.field_id),
@@ -493,7 +494,7 @@ async fn load_vectors_file_impl<D: Directory>(
                     )));
                 }
             }
-            ann_build::IVF_PQ_TYPE
+            ann_build::LEGACY_IVF_PQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE => {
@@ -505,18 +506,6 @@ async fn load_vectors_file_impl<D: Directory>(
                 // compact header/run directory without decoding payloads.
                 let data = handle.read_bytes_range(offset..end).await?;
                 let index = match index_type {
-                    ann_build::IVF_PQ_TYPE => VectorIndex::IvfPq(Arc::new(
-                        super::types::MmapAnnIndex::open(
-                            data,
-                            crate::segment::ann_disk::AnnKind::IvfPq,
-                            total_docs,
-                        )
-                        .map_err(|error| {
-                            crate::Error::Corruption(format!(
-                                "invalid IVF-PQ payload for field {field_id}: {error}"
-                            ))
-                        })?,
-                    )),
                     ann_build::BINARY_IVF_TYPE => VectorIndex::BinaryIvf(Arc::new(
                         super::types::MmapAnnIndex::open(
                             data,
@@ -559,7 +548,7 @@ async fn load_vectors_file_impl<D: Directory>(
                         }
                         VectorIndex::Tq {
                             index: Arc::new(index),
-                            codec: Arc::new(crate::structures::TqCodec::new(dim)),
+                            codec: crate::structures::vector::quantization::tq_shared_codec(dim),
                         }
                     }
                     ann_build::IVF_TQ_TYPE => {
@@ -592,7 +581,7 @@ async fn load_vectors_file_impl<D: Directory>(
                         }
                         VectorIndex::IvfTq {
                             index: Arc::new(index),
-                            codec: Arc::new(crate::structures::TqCodec::new(dim)),
+                            codec: crate::structures::vector::quantization::tq_shared_codec(dim),
                         }
                     }
                     _ => {
@@ -1222,7 +1211,7 @@ mod tests {
         .unwrap();
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, flat),
-            (1, ann_build::IVF_PQ_TYPE, vec![0]),
+            (1, ann_build::IVF_TQ_TYPE, vec![0]),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1243,7 +1232,7 @@ mod tests {
         let dir = RamDirectory::new();
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
-            (0, ann_build::IVF_PQ_TYPE, vec![0]),
+            (0, ann_build::IVF_TQ_TYPE, vec![0]),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1280,7 +1269,7 @@ mod tests {
         .unwrap();
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, flat),
-            (0, ann_build::IVF_PQ_TYPE, vec![0]),
+            (0, ann_build::IVF_TQ_TYPE, vec![0]),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1289,6 +1278,27 @@ mod tests {
             panic!("ANN storage that disagrees with the schema must be rejected");
         };
         assert!(message.contains("does not match schema"));
+    }
+
+    #[tokio::test]
+    async fn legacy_ivf_pq_payload_fails_with_actionable_error() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_dense_vector_field("dense", 2, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(19);
+        let dir = RamDirectory::new();
+        let bytes = vectors_file_with_payloads(vec![
+            (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
+            (0, ann_build::LEGACY_IVF_PQ_TYPE, vec![0]),
+        ]);
+        dir.write(&files.vectors, &bytes).await.unwrap();
+
+        let result = load_vectors_file(&dir, &files, &schema, 1).await;
+        let Err(crate::Error::Corruption(message)) = result else {
+            panic!("retired IVF-PQ payloads must be rejected loudly");
+        };
+        assert!(message.contains("no longer"), "{message}");
+        assert!(message.contains("ivf_tq"), "{message}");
     }
 
     #[tokio::test]
@@ -1329,7 +1339,7 @@ mod tests {
 
         let bytes = vectors_file_with_payloads(vec![
             (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
-            (0, ann_build::IVF_PQ_TYPE, Vec::new()),
+            (0, ann_build::IVF_TQ_TYPE, Vec::new()),
         ]);
         dir.write(&files.vectors, &bytes).await.unwrap();
 
@@ -1364,7 +1374,7 @@ mod tests {
                 },
                 DenseVectorTocEntry {
                     field_id: 0,
-                    index_type: ann_build::IVF_PQ_TYPE,
+                    index_type: ann_build::IVF_TQ_TYPE,
                     offset: ann_offset,
                     size: ann_size,
                 },

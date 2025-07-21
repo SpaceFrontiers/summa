@@ -1,8 +1,9 @@
 //! Vector index building for IndexWriter
 //!
 //! Training is **manual-only** — decoupled from commit.
-//! `build_vector_index()` creates missing codebooks; `retrain_vector_index()`
-//! replaces existing codebooks. Both finish every committed ANN segment.
+//! `build_vector_index()` trains missing coarse-centroid generations;
+//! `retrain_vector_index()` replaces them. Both finish every committed ANN
+//! segment. Leaf codecs (TurboQuant) are derived, never trained.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -24,6 +25,9 @@ const MAX_IVF_CLUSTERS: usize = 1_048_576;
 /// Faiss-style clustering quality floor: fewer points per centroid generally
 /// overfits the training sample and leaves unstable/empty cells.
 const MIN_TRAINING_POINTS_PER_CENTROID: usize = 39;
+/// Faiss-style clustering ceiling: more points per centroid multiply Lloyd
+/// cost without materially improving the codebook.
+const COARSE_TRAINING_POINTS_PER_CENTROID: usize = 256;
 /// Bound transient I/O/dequantization buffers independently of the configured
 /// total training sample budget.
 const MAX_SAMPLE_READ_BYTES: usize = 64 * 1024 * 1024;
@@ -42,11 +46,6 @@ struct TrainedFieldUpdate {
 }
 
 enum TrainedFieldArtifacts {
-    Float {
-        centroids: crate::structures::CoarseCentroids,
-        codebook: crate::structures::PQCodebook,
-        pq_sample_count: usize,
-    },
     /// IVF-TQ: only the coarse router is trained; the TQ leaf codec is
     /// derived from the dimension.
     FloatCentroids(crate::structures::CoarseCentroids),
@@ -259,7 +258,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Train vector index from accumulated Flat vectors (manual, not auto-triggered).
     ///
     /// 1. Acquires a stable segment snapshot.
-    /// 2. Trains missing global codebooks.
+    /// 2. Trains missing coarse-centroid generations.
     /// 3. Stages ANN replacements for every affected segment.
     /// 4. Publishes the complete segment/codebook generation atomically.
     pub async fn build_vector_index(&self) -> Result<()> {
@@ -298,7 +297,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         if snapshot.is_empty() {
             if mode == VectorGenerationMode::RetrainAll {
                 return Err(Error::Schema(
-                    "cannot retrain vector codebooks without committed segments".into(),
+                    "cannot retrain vector centroids without committed segments".into(),
                 ));
             }
             return Ok(());
@@ -435,7 +434,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
         if updates.is_empty() && !fields.is_empty() {
             return Err(Error::Schema(format!(
-                "cannot train vector codebooks: no committed vectors for field(s) {missing:?}"
+                "cannot train vector centroids: no committed vectors for field(s) {missing:?}"
             )));
         }
         if !missing.is_empty() {
@@ -446,7 +445,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(updates)
     }
 
-    /// Remove abandoned generation-qualified codebooks from cancelled or
+    /// Remove abandoned generation-qualified artifacts from cancelled or
     /// crash-interrupted attempts. The metadata references are the complete
     /// live set, and the exclusive update lease prevents another trainer from
     /// creating a candidate concurrently with this sweep.
@@ -803,28 +802,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         let centroids_filename =
             format!("{VECTOR_ARTIFACT_PREFIX}{artifact_generation}_field_{field_id}_centroids.bin");
-        let mut codebook_filename = None;
 
         let artifacts = match (config, sample) {
-            (IvfFieldConfig::Float(config), TrainingSample::Float(vectors))
-                if config.index_type == VectorIndexType::IvfPq =>
-            {
-                codebook_filename = Some(format!(
-                    "{VECTOR_ARTIFACT_PREFIX}{artifact_generation}_field_{field_id}_codebook.bin"
-                ));
-                let (centroids, codebook, pq_sample_count) = Self::train_ivf_pq_model(
-                    dim,
-                    num_clusters,
-                    config.ivf_routing,
-                    config.soar.clone(),
-                    vectors,
-                );
-                TrainedFieldArtifacts::Float {
-                    centroids,
-                    codebook,
-                    pq_sample_count,
-                }
-            }
             (IvfFieldConfig::Float(config), TrainingSample::Float(vectors))
                 if config.index_type == VectorIndexType::IvfTq =>
             {
@@ -833,9 +812,31 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 if let Some(soar) = config.soar.clone() {
                     coarse_config = coarse_config.with_soar(soar);
                 }
+                // Faiss-style clustering ceiling: past ~256 points per
+                // centroid, extra samples multiply every Lloyd iteration
+                // without materially moving the centroids. Stride-subsample
+                // the (already stratified) training set past that.
+                let ceiling = num_clusters.saturating_mul(COARSE_TRAINING_POINTS_PER_CENTROID);
+                let training_set: Vec<Vec<f32>> = if vectors.len() > ceiling && ceiling > 0 {
+                    log::info!(
+                        "Field {field_id}: capping coarse training at {ceiling} of {} samples \
+                         ({COARSE_TRAINING_POINTS_PER_CENTROID}/centroid)",
+                        vectors.len(),
+                    );
+                    (0..ceiling)
+                        .map(|index| vectors[index.saturating_mul(vectors.len()) / ceiling].clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let training_ref: &[Vec<f32>] = if training_set.is_empty() {
+                    vectors
+                } else {
+                    &training_set
+                };
                 TrainedFieldArtifacts::FloatCentroids(crate::structures::CoarseCentroids::train(
                     &coarse_config,
-                    vectors,
+                    training_ref,
                 ))
             }
             (IvfFieldConfig::Binary(config), TrainingSample::Binary(codes)) => {
@@ -859,7 +860,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         };
 
         let actual_num_clusters = match &artifacts {
-            TrainedFieldArtifacts::Float { centroids, .. } => centroids.num_clusters as usize,
             TrainedFieldArtifacts::FloatCentroids(centroids) => centroids.num_clusters as usize,
             TrainedFieldArtifacts::Binary(quantizer) => quantizer.num_clusters as usize,
         };
@@ -870,7 +870,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 vector_count: corpus_count,
                 num_clusters: actual_num_clusters,
                 centroids_file: centroids_filename,
-                codebook_file: codebook_filename,
+                codebook_file: None,
             },
             artifacts,
         })
@@ -879,28 +879,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     async fn save_trained_field(&self, model: TrainedFieldModel) -> Result<TrainedFieldUpdate> {
         let TrainedFieldModel { update, artifacts } = model;
         match artifacts {
-            TrainedFieldArtifacts::Float {
-                centroids,
-                codebook,
-                pq_sample_count,
-            } => {
-                let codebook_file = update.codebook_file.as_deref().ok_or_else(|| {
-                    Error::Internal(format!(
-                        "trained IVF-PQ field {} has no codebook filename",
-                        update.field_id,
-                    ))
-                })?;
-                tokio::try_join!(
-                    self.save_trained_artifact(&centroids, &update.centroids_file),
-                    self.save_trained_artifact(&codebook, codebook_file),
-                )?;
-                log::info!(
-                    "Saved IVF-PQ artifacts for field {} ({} clusters, {} PQ samples)",
-                    update.field_id,
-                    centroids.num_clusters,
-                    pq_sample_count,
-                );
-            }
             TrainedFieldArtifacts::FloatCentroids(centroids) => {
                 self.save_trained_artifact(&centroids, &update.centroids_file)
                     .await?;
@@ -962,55 +940,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.directory.sync().await?;
         Ok(())
     }
-
-    /// Train the global IVF-PQ centroids and residual codebook. The caller is
-    /// already running inside the bounded background Rayon pool.
-    fn train_ivf_pq_model(
-        dim: usize,
-        num_clusters: usize,
-        routing: crate::dsl::IvfRoutingMode,
-        soar: Option<crate::structures::SoarConfig>,
-        vectors: &[Vec<f32>],
-    ) -> (
-        crate::structures::CoarseCentroids,
-        crate::structures::PQCodebook,
-        usize,
-    ) {
-        let mut coarse_config =
-            crate::structures::CoarseConfig::new(dim, num_clusters).with_routing(routing);
-        if let Some(soar) = soar {
-            coarse_config = coarse_config.with_soar(soar);
-        }
-        let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
-
-        // Faiss' established PQ training ceiling is 256 samples per one-byte
-        // subquantizer centroid. More points multiply every subspace's Lloyd
-        // work without improving the 256-way codebook materially. Train on
-        // residuals, because segment encoding also quantizes x - coarse(x).
-        const PQ_CENTROIDS: usize = 256;
-        const PQ_TRAINING_POINTS_PER_CENTROID: usize = 256;
-        let pq_sample_count = vectors
-            .len()
-            .min(PQ_CENTROIDS * PQ_TRAINING_POINTS_PER_CENTROID);
-        use rayon::prelude::*;
-        let pq_residuals = (0..pq_sample_count)
-            .into_par_iter()
-            .map(|sample_index| {
-                let vector_index = sample_index.saturating_mul(vectors.len()) / pq_sample_count;
-                let vector = &vectors[vector_index];
-                let cluster = centroids
-                    .probe(vector, 1, routing)
-                    .cluster_ids
-                    .first()
-                    .copied()
-                    .unwrap_or(0);
-                centroids.compute_residual(vector, cluster)
-            })
-            .collect::<Vec<_>>();
-        let pq_config = crate::structures::PQConfig::new(dim);
-        let codebook = crate::structures::PQCodebook::train(pq_config, &pq_residuals, 10);
-        (centroids, codebook, pq_sample_count)
-    }
 }
 
 #[cfg(test)]
@@ -1018,7 +947,7 @@ mod tests {
     use super::*;
 
     fn ivf_config(num_clusters: Option<usize>) -> DenseVectorConfig {
-        DenseVectorConfig::with_ivf_pq(8, num_clusters, 4)
+        DenseVectorConfig::ivf_tq(8, num_clusters, 4)
     }
 
     #[test]
@@ -1204,7 +1133,7 @@ mod tests {
             "embedding",
             true,
             true,
-            DenseVectorConfig::with_ivf_pq(READ_FAIL_DIM, Some(1), 1),
+            DenseVectorConfig::ivf_tq(READ_FAIL_DIM, Some(1), 1),
         );
         let schema = sb.build();
 
@@ -1254,7 +1183,7 @@ mod tests {
             "embedding",
             true,
             true,
-            DenseVectorConfig::with_ivf_pq(READ_FAIL_DIM, Some(1), 1),
+            DenseVectorConfig::ivf_tq(READ_FAIL_DIM, Some(1), 1),
         );
         let schema = sb.build();
         let dir = VectorReadFailDirectory::default();
@@ -1280,7 +1209,7 @@ mod tests {
             .read_metadata(|metadata| metadata.get_field_meta(embedding.0).cloned())
             .await
             .unwrap();
-        let old_version = writer.segment_manager.trained().unwrap().codebooks[&embedding.0].version;
+        let old_version = writer.segment_manager.trained().unwrap().centroids[&embedding.0].version;
 
         dir.fail_all_vector_reads.store(true, Ordering::SeqCst);
         let error = writer
@@ -1303,7 +1232,7 @@ mod tests {
             Some((old_meta.centroids_file, old_meta.codebook_file)),
         );
         assert_eq!(
-            writer.segment_manager.trained().unwrap().codebooks[&embedding.0].version,
+            writer.segment_manager.trained().unwrap().centroids[&embedding.0].version,
             old_version,
         );
     }

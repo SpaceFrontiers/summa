@@ -268,30 +268,33 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4�
 
 ### Index Types and Routing
 
-Float fields have two ANN formats. `ivf_pq` is the corpus-trained global
-IVF-PQ: every segment shares the index's centroid router and residual-PQ
-codebook; segments store only mmap-backed cluster runs and PQ codes. `tq`
-(TurboQuant, `docs/turboquant-quantization.md`) is training-free: each segment
-carries a 4-bit compressed payload built at commit with no global artifacts,
-scanned exhaustively with SIMD lookup tables and exact-reranked. Ordinary
-segment merges copy both formats' immutable run columns byte-for-byte and
-rewrite only their compact document-base directory. `flat` remains available
-for exact brute-force search and as the accumulation format before an
-`ivf_pq` build.
+Float fields have two ANN formats, both built on the TurboQuant codec
+(`docs/turboquant-quantization.md`). `ivf_tq` (the default) combines the
+corpus-trained coarse centroid router with training-free TQ leaf codes of
+each vector's centroid residual — only centroids are trained, never a
+codebook. `tq` is fully training-free: each segment carries a 4-bit
+compressed payload built at commit with no global artifacts, scanned
+exhaustively with SIMD lookup tables and exact-reranked. Ordinary segment
+merges copy both formats' immutable run columns byte-for-byte and rewrite
+only their compact document-base directory. `flat` remains available for
+exact brute-force search and as the accumulation format before an `ivf_tq`
+build.
+
+`ivf_pq` (residual product quantization) was removed after IVF-TQ superseded
+it on recall, latency, and training cost; indexes created with it must be
+recreated with `ivf_tq` and reindexed.
 
 ```
-field e: dense_vector<768, f16> [indexed]                                      # global IVF-PQ
-field e: dense_vector<768, f16> [indexed<ivf_pq, routing: hnsw, nprobe: 64>]
+field e: dense_vector<768, f16> [indexed]                                      # global IVF-TQ
+field e: dense_vector<768, f16> [indexed<ivf_tq, routing: hnsw, nprobe: 64>]
 field e: dense_vector<768, f16> [indexed<tq>]                                  # training-free TQ
-field e: dense_vector<768, f16> [indexed<ivf_tq, nprobe: 64>]                  # trained router, TQ leaves
 field e: dense_vector<768, f16> [indexed<flat>]                                # exact full scan
 field e: dense_vector<768> [stored]                                            # stored, not indexed
 ```
 
 `tq` ignores `num_clusters`, `nprobe`, `routing`, and `soar` (it scans every
 code) and warns when they are set; `rerank_factor` applies unchanged.
-`ivf_tq` combines the trained coarse router (all IVF knobs apply) with the
-training-free TQ leaf codec — only centroids are trained, never a codebook.
+`ivf_tq` accepts all IVF knobs.
 
 When `num_clusters` is omitted, training chooses a corpus-sized leaf count
 using an 8×sqrt(N) target bounded by sample quality and artifact memory. Routing
@@ -304,16 +307,16 @@ documents through fixed-size buffers.
 
 ### SOAR (higher recall for IVF indexes)
 
-IVF-PQ supports SOAR — spilling each vector
+IVF-TQ supports SOAR — spilling each vector
 into a secondary cluster with an orthogonality-amplified residual. This
 improves recall at the same `nprobe` in exchange for larger cluster storage
 (~1.2-2x assignments):
 
 ```
-field e: dense_vector<768, f16> [indexed<ivf_pq, soar: selective>]  # spill boundary vectors
-field e: dense_vector<768, f16> [indexed<ivf_pq, soar: full>]       # spill every vector once
-field e: dense_vector<768, f16> [indexed<ivf_pq, soar: aggressive>] # spill every vector twice
-field e: dense_vector<768, f16> [indexed<ivf_pq, soar: off>]        # no spilling (default)
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: selective>]  # spill boundary vectors
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: full>]       # spill every vector once
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: aggressive>] # spill every vector twice
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: off>]        # no spilling (default)
 ```
 
 ### Example
@@ -321,7 +324,7 @@ field e: dense_vector<768, f16> [indexed<ivf_pq, soar: off>]        # no spillin
 ```
 index documents {
     field title: text<en_stem> [indexed, stored]
-    field embedding: dense_vector<768, f16> [indexed<ivf_pq>, stored<multi>]
+    field embedding: dense_vector<768, f16> [indexed<ivf_tq>, stored<multi>]
     field span: json [stored<multi>]
 }
 ```
