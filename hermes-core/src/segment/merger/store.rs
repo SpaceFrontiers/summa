@@ -48,15 +48,21 @@ impl SegmentMerger {
 
         let mut store_merger = StoreMerger::new(store_writer);
         for segment in segments {
+            self.ensure_not_cancelled()?;
             if segment.store_has_dict() {
-                store_merger
-                    .append_store_recompressing(segment.store())
-                    .await
-                    .map_err(crate::Error::Io)?;
+                let result = store_merger
+                    .append_store_recompressing(segment.store(), self.cancellation.as_deref())
+                    .await;
+                self.ensure_not_cancelled()?;
+                result.map_err(crate::Error::Io)?;
             } else {
                 let raw_blocks = segment.store_raw_blocks();
                 let data_slice = segment.store_data_slice();
-                store_merger.append_store(data_slice, &raw_blocks).await?;
+                let result = store_merger
+                    .append_store(data_slice, &raw_blocks, self.cancellation.as_deref())
+                    .await;
+                self.ensure_not_cancelled()?;
+                result.map_err(crate::Error::Io)?;
             }
         }
         let store_num_docs = store_merger.finish()?;

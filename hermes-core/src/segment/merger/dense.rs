@@ -58,6 +58,7 @@ async fn feed_segment(
     field: crate::dsl::Field,
     doc_id_offset: u32,
     mut add_batch: impl FnMut(&[(u32, u16)], &[f32]) -> Result<()>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> crate::Result<usize> {
     let lazy_flat = match segment.flat_vectors().get(&field.0) {
         Some(f) => f,
@@ -76,6 +77,11 @@ async fn feed_segment(
     let mut labels = Vec::with_capacity(VECTOR_BATCH_SIZE);
 
     for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
+        if cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(crate::Error::IndexClosed);
+        }
         let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
         let batch_bytes = lazy_flat
             .read_vectors_batch(batch_start, batch_count)
@@ -118,6 +124,7 @@ async fn feed_segment(
 ///
 /// Doc_id map is streamed in DOC_ID_CHUNK entries (384 KB) instead of
 /// buffering all at once (was 60 MB for 10M vectors).
+#[allow(clippy::too_many_arguments)]
 async fn write_flat_entry(
     field_id: u32,
     dim: usize,
@@ -126,6 +133,7 @@ async fn write_flat_entry(
     segments: &[SegmentReader],
     doc_offs: &[u32],
     writer: &mut OffsetWriter,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     FlatVectorData::write_binary_header(dim, total_vectors, quantization, writer)?;
 
@@ -136,6 +144,11 @@ async fn write_flat_entry(
             let base_offset = lazy_flat.vectors_byte_offset();
             let handle = lazy_flat.handle();
             for chunk_start in (0..total_bytes).step_by(FLAT_VECTOR_CHUNK as usize) {
+                if cancellation
+                    .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return Err(crate::Error::IndexClosed);
+                }
                 let chunk_end = chunk_start
                     .saturating_add(FLAT_VECTOR_CHUNK)
                     .min(total_bytes);
@@ -170,6 +183,11 @@ async fn write_flat_entry(
             let offset = doc_offs[seg_idx];
             let count = lazy_flat.num_vectors;
             for chunk_start in (0..count).step_by(DOC_ID_CHUNK) {
+                if cancellation
+                    .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return Err(crate::Error::IndexClosed);
+                }
                 buf.clear();
                 let chunk_end = (chunk_start + DOC_ID_CHUNK).min(count);
                 for i in chunk_start..chunk_end {
@@ -213,6 +231,7 @@ impl SegmentMerger {
         let mut fields_to_write: Vec<FieldInfo> = Vec::new();
 
         for (field, entry) in self.schema.fields() {
+            self.ensure_not_cancelled()?;
             if !matches!(
                 entry.field_type,
                 FieldType::DenseVector | FieldType::BinaryDenseVector
@@ -276,6 +295,7 @@ impl SegmentMerger {
         let mut toc: Vec<DenseVectorTocEntry> = Vec::new();
 
         for fi in &fields_to_write {
+            self.ensure_not_cancelled()?;
             let field = fi.field;
             let entry = self.schema.get_field_entry(field).unwrap();
             let config = entry.dense_vector_config.as_ref();
@@ -375,6 +395,7 @@ impl SegmentMerger {
                 segments,
                 &doc_offs,
                 &mut writer,
+                self.cancellation.as_deref(),
             )
             .await?;
             let data_size = writer.offset() - data_offset;
@@ -520,10 +541,15 @@ impl SegmentMerger {
             return Ok(None);
         }
         let data_offset = writer.offset();
-        super::block_in_place_if_multithread(|| {
-            crate::segment::ann_disk::write_merged_ann(&sources, writer)
-        })
-        .map_err(crate::Error::Io)?;
+        let result = super::block_in_place_if_multithread(|| {
+            crate::segment::ann_disk::write_merged_ann_cancellable(
+                &sources,
+                writer,
+                self.cancellation.as_deref(),
+            )
+        });
+        self.ensure_not_cancelled()?;
+        result.map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
         log::debug!(
             "[dense_vector_merge] field {}: copied {} compatible ANN run source(s), {}",
@@ -598,10 +624,15 @@ impl SegmentMerger {
 
         if missing_segments.is_empty() {
             let data_offset = writer.offset();
-            super::block_in_place_if_multithread(|| {
-                crate::segment::ann_disk::write_merged_ann(&sources, writer)
-            })
-            .map_err(crate::Error::Io)?;
+            let result = super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_merged_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            });
+            self.ensure_not_cancelled()?;
+            result.map_err(crate::Error::Io)?;
             let data_size = writer.offset() - data_offset;
             log::debug!(
                 "[merge_vectors] field {}: copied {} compatible TQ run source(s), {} bytes",
@@ -649,6 +680,7 @@ impl SegmentMerger {
                         ))
                     })
                 },
+                self.cancellation.as_deref(),
             )
             .await?;
         }
@@ -675,10 +707,16 @@ impl SegmentMerger {
             } else {
                 std::slice::from_ref(&extra)
             };
-            super::block_in_place_if_multithread(|| {
-                crate::segment::ann_disk::write_merged_ann_with_extra(&sources, extra_runs, writer)
-            })
-            .map_err(crate::Error::Io)?;
+            let result = super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_merged_ann_with_extra(
+                    &sources,
+                    extra_runs,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            });
+            self.ensure_not_cancelled()?;
+            result.map_err(crate::Error::Io)?;
         }
         log::info!(
             "[merge_vectors] field {}: TQ re-encoded {} vectors in {:.1}s ({} sources copied)",
@@ -768,10 +806,15 @@ impl SegmentMerger {
             return Ok(None);
         }
         let data_offset = writer.offset();
-        super::block_in_place_if_multithread(|| {
-            crate::segment::ann_disk::write_merged_ann(&sources, writer)
-        })
-        .map_err(crate::Error::Io)?;
+        let result = super::block_in_place_if_multithread(|| {
+            crate::segment::ann_disk::write_merged_ann_cancellable(
+                &sources,
+                writer,
+                self.cancellation.as_deref(),
+            )
+        });
+        self.ensure_not_cancelled()?;
+        result.map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
         log::debug!(
             "[merge_vectors] field {}: copied {} compatible IVF-TQ run source(s), {} bytes",
@@ -835,6 +878,7 @@ impl SegmentMerger {
                         ))
                     })
                 },
+                self.cancellation.as_deref(),
             )
             .await?;
             total_fed = total_fed.checked_add(fed).ok_or_else(|| {

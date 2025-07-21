@@ -68,6 +68,7 @@ impl SegmentMerger {
         let mut current_offset = 0u64;
 
         for &(field_id, ref field_type) in &sorted_fields {
+            self.ensure_not_cancelled()?;
             let is_multi = self
                 .schema
                 .get_field_entry(crate::dsl::Field(field_id))

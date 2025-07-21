@@ -1300,8 +1300,17 @@ impl<'a, W: Write> StoreMerger<'a, W> {
         &mut self,
         data_slice: &FileHandle,
         blocks: &[RawStoreBlock],
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> io::Result<()> {
         for block in blocks {
+            if cancellation
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "store merge cancelled",
+                ));
+            }
             // Read raw compressed block data
             let start = block.offset;
             let end = start.checked_add(block.length as u64).ok_or_else(|| {
@@ -1347,12 +1356,24 @@ impl<'a, W: Write> StoreMerger<'a, W> {
     /// directly because the decompressor needs the original dictionary.
     /// This method decompresses each block with the source dict, then
     /// recompresses without a dictionary so the merged output is self-contained.
-    pub async fn append_store_recompressing(&mut self, store: &AsyncStoreReader) -> io::Result<()> {
+    pub async fn append_store_recompressing(
+        &mut self,
+        store: &AsyncStoreReader,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> io::Result<()> {
         let dict = store.dict();
         let data_slice = store.data_slice();
         let blocks = store.block_index();
 
         for block in blocks {
+            if cancellation
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "store merge cancelled",
+                ));
+            }
             let start = block.offset;
             let end = start.checked_add(block.length as u64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "store block range overflow")

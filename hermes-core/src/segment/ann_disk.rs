@@ -879,12 +879,21 @@ fn write_built_runs(
 
 /// Pure-copy normal merge. Corpus-sized source columns are never decoded or
 /// rewritten; only this compact directory is regenerated with adjusted bases.
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", test))]
 pub(crate) fn write_merged_ann(
     sources: &[(&AnnDiskIndex, u32)],
     writer: &mut (impl Write + ?Sized),
 ) -> io::Result<u64> {
-    write_merged_ann_with_extra(sources, &[], writer)
+    write_merged_ann_impl(sources, &[], writer, None)
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn write_merged_ann_cancellable(
+    sources: &[(&AnnDiskIndex, u32)],
+    writer: &mut (impl Write + ?Sized),
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<u64> {
+    write_merged_ann_impl(sources, &[], writer, cancellation)
 }
 
 /// [`write_merged_ann`] plus freshly built runs appended to the payload —
@@ -895,6 +904,17 @@ pub(crate) fn write_merged_ann_with_extra(
     sources: &[(&AnnDiskIndex, u32)],
     extra: &[BuildRun<'_>],
     writer: &mut (impl Write + ?Sized),
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<u64> {
+    write_merged_ann_impl(sources, extra, writer, cancellation)
+}
+
+#[cfg(feature = "native")]
+fn write_merged_ann_impl(
+    sources: &[(&AnnDiskIndex, u32)],
+    extra: &[BuildRun<'_>],
+    writer: &mut (impl Write + ?Sized),
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<u64> {
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot merge an empty ANN source list"));
@@ -944,7 +964,12 @@ pub(crate) fn write_merged_ann_with_extra(
             .ok_or_else(|| invalid_data("ANN source has no payload runs"))?;
         let output_payload_start = offset;
         output_payload_starts.push(output_payload_start);
-        copy_range(writer, &source.raw, ANN_HEADER_SIZE..payload_end)?;
+        copy_range(
+            writer,
+            &source.raw,
+            ANN_HEADER_SIZE..payload_end,
+            cancellation,
+        )?;
         offset = checked_advance(offset, payload_end - ANN_HEADER_SIZE)?;
     }
 
@@ -1177,6 +1202,7 @@ fn copy_range(
     writer: &mut (impl Write + ?Sized),
     bytes: &OwnedBytes,
     range: Range<usize>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     if range.is_empty() {
         return Ok(());
@@ -1186,6 +1212,14 @@ fn copy_range(
     let first_end = chunk_start.saturating_add(COPY_CHUNK).min(range_end);
     bytes.madvise_range(chunk_start..first_end, libc::MADV_WILLNEED);
     while chunk_start < range_end {
+        if cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "ANN merge copy cancelled",
+            ));
+        }
         let chunk_end = chunk_start.saturating_add(COPY_CHUNK).min(range_end);
         let next_end = chunk_end.saturating_add(COPY_CHUNK).min(range_end);
         if chunk_end < next_end {

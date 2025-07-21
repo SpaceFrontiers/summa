@@ -488,8 +488,14 @@ pub(crate) fn build_bmp_blob(
     // Sections D+E+H: block, superblock, and coarse-superblock grids.
     // `dims` rows (not num_dims)
     let grid_offset = bytes_written;
-    let (packed_bytes, sb_bytes, coarse_bytes) =
-        stream_write_grids(&grid_entries, dims as usize, num_blocks, grid_bits, writer)?;
+    let (packed_bytes, sb_bytes, coarse_bytes) = stream_write_grids(
+        &grid_entries,
+        dims as usize,
+        num_blocks,
+        grid_bits,
+        writer,
+        None,
+    )?;
     let sb_grid_offset = bytes_written + packed_bytes;
     let coarse_grid_offset = sb_grid_offset + sb_bytes;
     bytes_written += packed_bytes + sb_bytes + coarse_bytes;
@@ -715,6 +721,7 @@ fn write_compressed_grid_section(
     num_blocks: usize,
     projection: GridProjection,
     writer: &mut dyn Write,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<u64> {
     let cells = projection.cells(num_blocks);
     let layout = CompressedGridLayout::new(num_dims, cells);
@@ -723,6 +730,14 @@ fn write_compressed_grid_section(
 
     let mut entry = 0usize;
     for dim in 0..num_dims as u32 {
+        if cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "BMP grid write cancelled",
+            ));
+        }
         let start = entry;
         while entry < grid_entries.len() && grid_entries[entry].0 == dim {
             entry += 1;
@@ -747,6 +762,14 @@ fn write_compressed_grid_section(
     let table_bytes = layout.write_row_offsets(&row_sizes, writer)?;
     entry = 0;
     for dim in 0..num_dims as u32 {
+        if cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "BMP grid write cancelled",
+            ));
+        }
         let start = entry;
         while entry < grid_entries.len() && grid_entries[entry].0 == dim {
             entry += 1;
@@ -776,6 +799,7 @@ pub(crate) fn stream_write_grids(
     num_blocks: usize,
     grid_bits: u8,
     writer: &mut dyn Write,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<(u64, u64, u64)> {
     let block_bytes = write_compressed_grid_section(
         grid_entries,
@@ -783,6 +807,7 @@ pub(crate) fn stream_write_grids(
         num_blocks,
         GridProjection::Block { bits: grid_bits },
         writer,
+        cancellation,
     )?;
     let superblock_bytes = write_compressed_grid_section(
         grid_entries,
@@ -790,6 +815,7 @@ pub(crate) fn stream_write_grids(
         num_blocks,
         GridProjection::Superblock,
         writer,
+        cancellation,
     )?;
     let coarse_bytes = write_compressed_grid_section(
         grid_entries,
@@ -797,6 +823,7 @@ pub(crate) fn stream_write_grids(
         num_blocks,
         GridProjection::CoarseSuperblock,
         writer,
+        cancellation,
     )?;
     Ok((block_bytes, superblock_bytes, coarse_bytes))
 }
@@ -1239,6 +1266,7 @@ fn copy_grid_spool(
     path: &std::path::Path,
     expected_bytes: u64,
     writer: &mut dyn Write,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     use std::io::Read;
 
@@ -1256,6 +1284,14 @@ fn copy_grid_spool(
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut copied = 0u64;
     loop {
+        if cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "BMP grid spool copy cancelled",
+            ));
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -1286,6 +1322,7 @@ fn copy_grid_spool(
 /// temporarily spooled because their offset tables follow the complete D
 /// section. Encoding buffers at most one compressed row per projection.
 #[cfg(feature = "native")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_write_grids_merged(
     run_readers: &mut [GridRunReader],
     num_dims: usize,
@@ -1294,6 +1331,7 @@ pub(crate) fn stream_write_grids_merged(
     superblock_spool: &std::path::Path,
     coarse_spool: &std::path::Path,
     writer: &mut dyn Write,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<(u64, u64, u64)> {
     let num_dims_u32 = u32::try_from(num_dims).map_err(|_| {
         std::io::Error::new(
@@ -1314,6 +1352,14 @@ pub(crate) fn stream_write_grids_merged(
     {
         let mut merged = MergedGridCursor::new(run_readers);
         for dimension in 0..num_dims_u32 {
+            if cancellation
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "BMP grid sizing cancelled",
+                ));
+            }
             merged.visit_dimension(dimension, |block, impact| {
                 for plan in &mut plans {
                     plan.observe(block, impact)?;
@@ -1345,6 +1391,14 @@ pub(crate) fn stream_write_grids_merged(
     {
         let mut merged = MergedGridCursor::new(run_readers);
         for dimension in 0..num_dims_u32 {
+            if cancellation
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "BMP grid encoding cancelled",
+                ));
+            }
             let dimension_index = dimension as usize;
             merged.visit_dimension(dimension, |block, impact| {
                 for row in &mut rows {
@@ -1369,11 +1423,16 @@ pub(crate) fn stream_write_grids_merged(
     let superblock_table_bytes = plans[1]
         .layout
         .write_row_offsets(&plans[1].row_sizes, writer)?;
-    copy_grid_spool(superblock_spool, superblock_rows_bytes, writer)?;
+    copy_grid_spool(
+        superblock_spool,
+        superblock_rows_bytes,
+        writer,
+        cancellation,
+    )?;
     let coarse_table_bytes = plans[2]
         .layout
         .write_row_offsets(&plans[2].row_sizes, writer)?;
-    copy_grid_spool(coarse_spool, coarse_rows_bytes, writer)?;
+    copy_grid_spool(coarse_spool, coarse_rows_bytes, writer, cancellation)?;
 
     let block_bytes = block_table_bytes
         .checked_add(block_rows_bytes)
@@ -1425,6 +1484,16 @@ mod tests {
     }
 
     #[test]
+    fn compressed_grid_write_honors_shutdown_cancellation() {
+        let cancellation = std::sync::atomic::AtomicBool::new(true);
+        let mut encoded = Vec::new();
+        let error = stream_write_grids(&[(0, 0, 1)], 1, 1, 4, &mut encoded, Some(&cancellation))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
     fn coarse_grid_is_exact_max_projection_of_superblock_grid() {
         use crate::directories::OwnedBytes;
         use crate::segment::bmp_grid::{CompressedGrid, GRID_GROUP_CELLS};
@@ -1437,7 +1506,7 @@ mod tests {
         ];
         let mut encoded = Vec::new();
         let (block_bytes, superblock_bytes, coarse_bytes) =
-            stream_write_grids(&entries, 2, num_blocks, 4, &mut encoded).unwrap();
+            stream_write_grids(&entries, 2, num_blocks, 4, &mut encoded, None).unwrap();
         assert_eq!(
             encoded.len() as u64,
             block_bytes + superblock_bytes + coarse_bytes
@@ -1664,7 +1733,7 @@ mod tests {
         for grid_bits in [2, 4] {
             let mut expected = Vec::new();
             let expected_sizes =
-                stream_write_grids(&entries, 4, 16_385, grid_bits, &mut expected).unwrap();
+                stream_write_grids(&entries, 4, 16_385, grid_bits, &mut expected, None).unwrap();
             let mut readers: Vec<_> = run_paths
                 .iter()
                 .map(|path| GridRunReader::open(path).unwrap())
@@ -1680,6 +1749,7 @@ mod tests {
                 &superblock_spool,
                 &coarse_spool,
                 &mut actual,
+                None,
             )
             .unwrap();
 

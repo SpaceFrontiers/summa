@@ -1012,11 +1012,18 @@ fn build_term_degrees(
     mid: usize,
     fwd: &ForwardIndex,
     workspaces: &mut [TermDegrees],
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) {
     debug_assert!(!workspaces.is_empty());
     let build_range = |degrees: &mut TermDegrees, start: usize, chunk: &[u32]| {
         degrees.reset();
         for (offset, &doc) in chunk.iter().enumerate() {
+            if offset.is_multiple_of(1024)
+                && cancellation
+                    .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                break;
+            }
             let side = usize::from(start + offset >= mid);
             for &term in fwd.doc_terms(doc as usize) {
                 degrees.entry_mut(term as usize)[side] += 1;
@@ -1616,7 +1623,13 @@ impl<'a> BpProgress<'a> {
         );
     }
 
-    fn finish(&self, converged: bool, memory_limited: bool, deadline_exhausted: bool) {
+    fn finish(
+        &self,
+        converged: bool,
+        memory_limited: bool,
+        deadline_exhausted: bool,
+        cancelled: bool,
+    ) {
         let elapsed = self.start.elapsed().as_secs_f64();
         let partitions = self
             .partitions_completed
@@ -1632,7 +1645,9 @@ impl<'a> BpProgress<'a> {
         let objective_stops = self
             .objective_stops
             .load(std::sync::atomic::Ordering::Relaxed);
-        let stop_reason = if memory_limited {
+        let stop_reason = if cancelled {
+            "shutdown"
+        } else if memory_limited {
             "memory_budget"
         } else if deadline_exhausted {
             "time_budget"
@@ -1709,7 +1724,7 @@ impl BpProgress<'_> {
     fn partition_finished(&self) {}
     fn iteration(&self, _: usize, _: usize, _: f64, _: f64) {}
     fn objective_stop(&self) {}
-    fn finish(&self, _: bool, _: bool, _: bool) {}
+    fn finish(&self, _: bool, _: bool, _: bool, _: bool) {}
 }
 
 /// Recursive graph bisection. Returns `(perm, converged)` where
@@ -1734,6 +1749,7 @@ pub(crate) fn graph_bisection(
         min_partition_size,
         max_iters,
         budget,
+        None,
         BpProgressLabel::anonymous(),
     )
 }
@@ -1743,6 +1759,7 @@ pub(crate) fn graph_bisection_with_progress(
     min_partition_size: usize,
     max_iters: usize,
     budget: BpBudget,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
     progress_label: BpProgressLabel<'_>,
 ) -> (Vec<u32>, bool) {
     let n = fwd.num_docs();
@@ -1794,6 +1811,7 @@ pub(crate) fn graph_bisection_with_progress(
         #[cfg(not(feature = "native"))]
         deadline,
         exhausted: &exhausted,
+        cancellation,
         progress: &progress,
     };
     let immediately_exhausted = {
@@ -1806,7 +1824,9 @@ pub(crate) fn graph_bisection_with_progress(
             false
         }
     };
-    if immediately_exhausted {
+    let initially_cancelled =
+        cancellation.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire));
+    if immediately_exhausted || initially_cancelled {
         exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
     } else if n > effective_min_partition {
         // Entity scratch is allocated once for the pass and carved into
@@ -1833,15 +1853,19 @@ pub(crate) fn graph_bisection_with_progress(
         );
     }
 
-    let deadline_exhausted = exhausted.load(std::sync::atomic::Ordering::Relaxed);
-    let converged = !fwd.budget_limited && !deadline_exhausted;
-    progress.finish(converged, fwd.budget_limited, deadline_exhausted);
+    let stopped_early = exhausted.load(std::sync::atomic::Ordering::Relaxed);
+    let cancelled =
+        cancellation.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire));
+    let deadline_exhausted = stopped_early && !cancelled;
+    let converged = !fwd.budget_limited && !stopped_early && !cancelled;
+    progress.finish(converged, fwd.budget_limited, deadline_exhausted, cancelled);
     if !converged {
         log::info!(
-            "BP graph_bisection: budget incomplete at n={} (time={:?}, memory_limited={}) — emitting partial (still valid) permutation",
+            "BP graph_bisection: pass incomplete at n={} (time={:?}, memory_limited={}, cancelled={}) — emitting partial (still valid) permutation",
             n,
             budget.time_budget,
             fwd.budget_limited,
+            cancelled,
         );
     }
     (docs, converged)
@@ -1865,6 +1889,7 @@ struct BisectContext<'a> {
     #[cfg(not(feature = "native"))]
     deadline: Option<()>,
     exhausted: &'a std::sync::atomic::AtomicBool,
+    cancellation: Option<&'a std::sync::atomic::AtomicBool>,
     progress: &'a BpProgress<'a>,
 }
 
@@ -1887,7 +1912,14 @@ fn bisect(
         return;
     }
     // Anytime cutoff: leave this subtree in its current (valid) order.
-    if context.exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+    if context.exhausted.load(std::sync::atomic::Ordering::Relaxed)
+        || context
+            .cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        context
+            .exhausted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     #[cfg(feature = "native")]
@@ -1918,7 +1950,22 @@ fn bisect(
     // deep partitions touch only their active terms. Coarse partitions use
     // multiple preallocated lanes; recursion splits the exact same workspace
     // set between children.
-    build_term_degrees(docs, mid, context.fwd, degree_workspaces);
+    build_term_degrees(
+        docs,
+        mid,
+        context.fwd,
+        degree_workspaces,
+        context.cancellation,
+    );
+    if context
+        .cancellation
+        .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        context
+            .exhausted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     // A full-vocabulary objective scan pays off only on coarse partitions,
     // where one avoided refinement skips millions of postings. At fine levels
     // it cost more than the work it could save, so retain the cheap gain
@@ -1940,6 +1987,15 @@ fn bisect(
 
     for iter in 0..effective_iters {
         // Anytime cutoff between refinement passes: keep the current split.
+        if context
+            .cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            context
+                .exhausted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
         #[cfg(feature = "native")]
         if let Some(dl) = context.deadline
             && std::time::Instant::now() >= dl
@@ -1959,6 +2015,15 @@ fn bisect(
             context.log_table,
             gains,
         );
+        if context
+            .cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            context
+                .exhausted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
 
         // Exact median selection and stable partition. The old path allocated
         // `Vec<usize>` (8 bytes/entity) and selected/applied it serially; the
@@ -2449,11 +2514,11 @@ mod tests {
         );
 
         let mut updated_workspaces: Vec<_> = (0..4).map(|_| TermDegrees::new(TERMS)).collect();
-        build_term_degrees(&docs, mid, &fwd, &mut updated_workspaces);
+        build_term_degrees(&docs, mid, &fwd, &mut updated_workspaces, None);
         movement_workspaces[0].apply_moves_to(&mut updated_workspaces[0]);
 
         let mut rebuilt_workspaces: Vec<_> = (0..4).map(|_| TermDegrees::new(TERMS)).collect();
-        build_term_degrees(&output, mid, &fwd, &mut rebuilt_workspaces);
+        build_term_degrees(&output, mid, &fwd, &mut rebuilt_workspaces, None);
         for term in 0..TERMS {
             assert_eq!(
                 updated_workspaces[0].get(term),
@@ -2635,6 +2700,30 @@ mod tests {
         let mut sorted = perm.clone();
         sorted.sort();
         assert_eq!(sorted, (0..64).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn test_bp_shutdown_cancellation_emits_valid_partial_permutation() {
+        let docs: Vec<Vec<u32>> = (0..64).map(|i| vec![i % 4]).collect();
+        let doc_refs: Vec<&[u32]> = docs.iter().map(Vec::as_slice).collect();
+        let fwd = make_fwd(&doc_refs, 4);
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let budget = BpBudget {
+            min_partition_docs: None,
+            time_budget: None,
+        };
+
+        let (perm, converged) = graph_bisection_with_progress(
+            &fwd,
+            4,
+            20,
+            budget,
+            Some(cancellation.as_ref()),
+            BpProgressLabel::anonymous(),
+        );
+
+        assert!(!converged, "cancelled BP must report unconverged");
+        assert_eq!(perm, (0..64).collect::<Vec<u32>>());
     }
 
     #[test]

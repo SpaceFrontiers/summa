@@ -9,6 +9,7 @@ mod store;
 pub(crate) use dense::AnnWriteMode;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_hash::FxHashMap;
 
@@ -187,6 +188,9 @@ pub struct SegmentMerger {
     /// a merge slot for the full BP depth — a truncated pass is marked
     /// `bp_converged = false` and the background optimizer deepens it.
     bp_budget: crate::segment::BpBudget,
+    /// Process-shutdown cancellation, kept separate from the public BP budget
+    /// so low-level callers retain the existing budget API.
+    cancellation: Option<Arc<AtomicBool>>,
     /// Memory budget for the BP forward index during merge-time reorder.
     bp_memory_budget: usize,
     /// Shared whole-pass concurrency limit. Tests and low-level callers may
@@ -205,6 +209,7 @@ impl SegmentMerger {
             background_pool: None,
             granularity: crate::segment::reorder::BpGranularity::Auto,
             bp_budget: crate::segment::BpBudget::full(),
+            cancellation: None,
             bp_memory_budget: crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
             reorder_permits: None,
             reorder_priority: ReorderPriority::AutomaticMerge,
@@ -235,6 +240,11 @@ impl SegmentMerger {
         self
     }
 
+    pub(crate) fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
     /// Memory budget for the BP forward index (see `bp_memory_budget`).
     pub fn with_bp_memory_budget(mut self, bytes: usize) -> Self {
         self.bp_memory_budget = bytes;
@@ -250,6 +260,18 @@ impl SegmentMerger {
     pub(crate) fn with_reorder_priority(mut self, priority: ReorderPriority) -> Self {
         self.reorder_priority = priority;
         self
+    }
+
+    pub(super) fn ensure_not_cancelled(&self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            Err(crate::Error::IndexClosed)
+        } else {
+            Ok(())
+        }
     }
 
     /// Reject additive per-field counts that the on-disk formats cannot
@@ -399,6 +421,7 @@ impl SegmentMerger {
         new_segment_id: SegmentId,
         trained: Option<&TrainedVectorStructures>,
     ) -> Result<(SegmentMeta, MergeStats)> {
+        self.ensure_not_cancelled()?;
         // Reject an unrepresentable merge before creating any output files.
         // The previous late check left a complete orphan output behind after
         // doing all expensive phases.
@@ -489,6 +512,7 @@ impl SegmentMerger {
 
         let (postings_result, store_result, fast_bytes) =
             tokio::try_join!(postings_fut, store_fut, fast_fut)?;
+        self.ensure_not_cancelled()?;
 
         log::info!(
             "[merge] stage 1 done in {:.1}s (postings + store + fast)",
@@ -515,6 +539,7 @@ impl SegmentMerger {
         } else {
             tokio::try_join!(sparse_fut, dense_fut)?
         };
+        self.ensure_not_cancelled()?;
         let (store_bytes, store_num_docs) = store_result;
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
@@ -531,6 +556,7 @@ impl SegmentMerger {
         );
 
         // === Mandatory: merge field stats + write meta ===
+        self.ensure_not_cancelled()?;
         let mut merged_field_stats: FxHashMap<u32, FieldStats> = FxHashMap::default();
         for segment in segments {
             for (&field_id, field_stats) in &segment.meta().field_stats {

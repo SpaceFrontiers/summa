@@ -279,6 +279,7 @@ struct ActiveSegmentOperations {
     inner: parking_lot::Mutex<ActiveOperationState>,
     idle: Notify,
     shutdown: Notify,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl ActiveSegmentOperations {
@@ -294,6 +295,7 @@ impl ActiveSegmentOperations {
             }),
             idle: Notify::new(),
             shutdown: Notify::new(),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -398,6 +400,7 @@ impl ActiveSegmentOperations {
     /// Atomically prevent new lifecycle work from starting. Existing guards
     /// remain valid and can be drained with [`Self::wait_until_idle`].
     fn stop_accepting(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
         let mut inner = self.inner.lock();
         inner.accepting = false;
         self.shutdown.notify_waiters();
@@ -417,6 +420,10 @@ impl ActiveSegmentOperations {
 
     fn is_accepting(&self) -> bool {
         self.inner.lock().accepting
+    }
+
+    fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_requested)
     }
 
     /// Wait until every operation that started before shutdown has released
@@ -1802,6 +1809,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     reevaluate = true;
                 }
                 Err(MergeTaskError {
+                    error: Error::IndexClosed,
+                    ..
+                }) => {
+                    log::debug!(
+                        "[merge] background merge for segments {:?} cancelled during shutdown",
+                        ids,
+                    );
+                }
+                Err(MergeTaskError {
                     error,
                     unavailable_segments,
                 }) => {
@@ -1874,6 +1890,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.bp_memory_budget_bytes,
             Arc::clone(&self.reorder_permits),
             priority,
+            self.active_operations.cancellation_flag(),
             Some(self.background_cpu_pool()),
         )
         .await;
@@ -2098,6 +2115,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         bp_memory_budget_bytes: usize,
         reorder_permits: Arc<ReorderConcurrencyGate>,
         reorder_priority: ReorderPriority,
+        cancellation: Arc<AtomicBool>,
         bg_cpu_pool: Option<Arc<rayon::ThreadPool>>,
     ) -> MergeTaskResult<(String, u32, bool)> {
         let output_hex = output_segment_id.to_hex();
@@ -2213,6 +2231,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 min_partition_docs: None,
                 time_budget: merge_bp_time_budget,
             })
+            .with_cancellation(cancellation)
             .with_bp_memory_budget(bp_memory_budget_bytes)
             .with_reorder_permits(reorder_permits)
             .with_reorder_priority(reorder_priority)
@@ -3366,6 +3385,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             bp_budget,
             granularity,
             rayon_pool,
+            Some(self.active_operations.cancellation_flag()),
         )
         .await;
         let (new_id, total_docs, bp_converged) = match reorder_result {
@@ -3975,7 +3995,9 @@ mod tests {
     async fn shutdown_rejects_new_work_and_waits_for_existing_guard() {
         let active = Arc::new(ActiveSegmentOperations::new());
         let guard = active.try_register(vec!["live".into()]).unwrap();
+        let cancellation = active.cancellation_flag();
         active.stop_accepting();
+        assert!(cancellation.load(Ordering::Acquire));
         assert!(active.try_register(vec!["new".into()]).is_none());
 
         let waiter = {
