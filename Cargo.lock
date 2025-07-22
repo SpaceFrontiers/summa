@@ -2233,9 +2233,9 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
 name = "either"
-version = "1.16.0"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "embassy-futures"
@@ -3029,7 +3029,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3074,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "anyhow",
  "axum",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "anyhow",
  "pest",
@@ -3120,7 +3120,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "anyhow",
  "clap",
@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3172,7 +3172,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.92"
+version = "1.8.93"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
