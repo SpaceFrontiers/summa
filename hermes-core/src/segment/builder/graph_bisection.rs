@@ -1084,6 +1084,9 @@ fn select_gain_threshold(
     left_count: usize,
     allow_inner_parallelism: bool,
 ) -> (u32, usize) {
+    #[cfg(not(feature = "native"))]
+    let _ = allow_inner_parallelism;
+
     debug_assert!(left_count > 0 && left_count <= gains.len());
     let mut rank_within_prefix = left_count - 1;
     let mut strictly_lower = 0usize;
@@ -2448,6 +2451,9 @@ fn compute_gains(
     gains: &mut [f32],
     allow_inner_parallelism: bool,
 ) {
+    #[cfg(not(feature = "native"))]
+    let _ = allow_inner_parallelism;
+
     // Single coherent key: HIGH = belongs in the RIGHT half.
     // Left docs get +approx_one(from=left, to=right) — a misplaced left doc
     // (terms concentrated right) scores high. Right docs get
