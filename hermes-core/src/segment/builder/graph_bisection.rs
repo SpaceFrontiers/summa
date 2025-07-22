@@ -1,4 +1,4 @@
-//! Recursive Graph Bisection (BP) for BMP document ordering.
+//! Level-synchronized Graph Bisection (BP) for BMP document ordering.
 //!
 //! Based on Dhulipala et al. (KDD 2016) and Mackenzie et al. — the same
 //! algorithm used in Lucene and PISA for document reordering.
@@ -6,9 +6,11 @@
 //! Directly optimizes log-gap cost: docs sharing dimensions end up in the
 //! same BMP blocks, producing tight upper bounds and effective pruning.
 //!
+//! Scheduling follows Mackenzie et al.'s level-synchronized iterative variant:
+//! all partitions at one depth finish before the next depth begins.
+//!
 //! Memory is budgeted: CSR terms plus roughly 32 bytes/document of graph
 //! scratch, with lazily initialized direct-index term-degree arrays.
-
 #[cfg(feature = "native")]
 use rayon::prelude::*;
 const TERM_DEGREE_VALUE_BYTES: usize = std::mem::size_of::<[u32; 2]>();
@@ -362,7 +364,6 @@ impl TermDegrees {
 }
 
 // ── Forward index (CSR) ──────────────────────────────────────────────────
-
 /// Forward index in CSR format: doc `d`'s terms are `terms[offsets[d]..offsets[d+1]]`.
 ///
 /// Term IDs are remapped to compact range `0..num_terms` for flat-array degree tracking.
@@ -975,7 +976,6 @@ pub(crate) fn build_forward_index_from_blocks(
 }
 
 // ── Recursive Graph Bisection ────────────────────────────────────────────
-
 /// CPU/depth budget for a BP pass. BP is an anytime algorithm: stopping at
 /// any depth or deadline still yields a valid permutation, and because the
 /// output layout becomes the next pass's input order, repeated budgeted
@@ -1079,7 +1079,11 @@ fn gain_order_key(gain: f32) -> u32 {
 /// Find the gain key of the last entity admitted to the left half and the
 /// number of strictly lower keys. Four byte-histogram passes replace the old
 /// serial `select_nth_unstable_by` over an 8-byte index per entity.
-fn select_gain_threshold(gains: &[f32], left_count: usize) -> (u32, usize) {
+fn select_gain_threshold(
+    gains: &[f32],
+    left_count: usize,
+    allow_inner_parallelism: bool,
+) -> (u32, usize) {
     debug_assert!(left_count > 0 && left_count <= gains.len());
     let mut rank_within_prefix = left_count - 1;
     let mut strictly_lower = 0usize;
@@ -1090,7 +1094,7 @@ fn select_gain_threshold(gains: &[f32], left_count: usize) -> (u32, usize) {
         let histogram = {
             #[cfg(feature = "native")]
             {
-                if gains.len() >= PARALLEL_BP_MIN_ENTITIES {
+                if allow_inner_parallelism && gains.len() >= PARALLEL_BP_MIN_ENTITIES {
                     gains
                         .par_iter()
                         .fold(
@@ -1206,6 +1210,7 @@ fn select_left(key: u32, threshold_key: u32, equal_seen: &mut usize, ties_left: 
 /// Small partitions retain the old unstable selector in their preallocated
 /// rank slice: it is faster than four radix scans, and its within-half
 /// permutation supplies the graph algorithm's established symmetry breaking.
+#[allow(clippy::too_many_arguments)]
 fn partition_by_gain(
     docs: &[u32],
     gains: &[f32],
@@ -1214,13 +1219,18 @@ fn partition_by_gain(
     movement_workspaces: &mut [TermDegrees],
     output: &mut [u32],
     ranked_scratch: &mut [usize],
+    allow_inner_parallelism: bool,
 ) -> PartitionOutcome {
     #[cfg(not(feature = "native"))]
     let _ = (fwd, &movement_workspaces);
 
     #[cfg(feature = "native")]
-    if !movement_workspaces.is_empty() && docs.len() >= PARALLEL_BP_MIN_ENTITIES {
-        let (threshold_key, strictly_lower) = select_gain_threshold(gains, mid);
+    if allow_inner_parallelism
+        && !movement_workspaces.is_empty()
+        && docs.len() >= PARALLEL_BP_MIN_ENTITIES
+    {
+        let (threshold_key, strictly_lower) =
+            select_gain_threshold(gains, mid, allow_inner_parallelism);
         let ties_left = mid - strictly_lower;
 
         // `degrees` remains live while these deltas are built. Reserving one
@@ -1355,7 +1365,8 @@ fn partition_by_gain(
         };
     }
 
-    let (threshold_key, strictly_lower) = select_gain_threshold(gains, mid);
+    let (threshold_key, strictly_lower) =
+        select_gain_threshold(gains, mid, allow_inner_parallelism);
     let ties_left = mid - strictly_lower;
     let mut equal_seen = 0usize;
     let mut left_cursor = 0usize;
@@ -1488,12 +1499,14 @@ impl<'a> BpProgress<'a> {
         total_entities: usize,
         total_postings: u64,
         expected_depth: usize,
+        degree_lanes: usize,
     ) -> Self {
         log::info!(
-            "[reorder][bp] started: index={} field={} entity_kind={} entities={} postings={} expected_depth={} objective_stall_threshold={:.1e}x{} min_objective_iterations={}",
+            "[reorder][bp] started: index={} field={} entity_kind={} scheduler=level_synchronized degree_lanes={} entities={} postings={} expected_depth={} objective_stall_threshold={:.1e}x{} min_objective_iterations={}",
             label.index,
             label.field,
             label.entity_kind,
+            degree_lanes,
             total_entities,
             total_postings,
             expected_depth,
@@ -1717,7 +1730,7 @@ struct BpProgress<'a>(std::marker::PhantomData<&'a ()>);
 
 #[cfg(not(feature = "native"))]
 impl BpProgress<'_> {
-    fn new(_: BpProgressLabel<'_>, _: usize, _: u64, _: usize) -> Self {
+    fn new(_: BpProgressLabel<'_>, _: usize, _: u64, _: usize, _: usize) -> Self {
         Self(std::marker::PhantomData)
     }
     fn partition_started(&self, _: usize) {}
@@ -1727,7 +1740,7 @@ impl BpProgress<'_> {
     fn finish(&self, _: bool, _: bool, _: bool, _: bool) {}
 }
 
-/// Recursive graph bisection. Returns `(perm, converged)` where
+/// Level-synchronized graph bisection. Returns `(perm, converged)` where
 /// `perm[new_pos] = old_index`. Convergence is false when the wall-clock or
 /// memory budget prevents the requested work from finishing; a configured
 /// depth cap is a chosen target and reports converged.
@@ -1770,7 +1783,12 @@ pub(crate) fn graph_bisection_with_progress(
     let effective_min_partition = budget
         .min_partition_docs
         .unwrap_or(0)
-        .max(min_partition_size);
+        .max(min_partition_size)
+        // A singleton cannot be bisected. The public callers use a positive
+        // BMP block size, but enforcing the structural minimum here also
+        // prevents an accidental zero configuration from walking empty tree
+        // levels until the partition counter overflows.
+        .max(1);
 
     let mut docs: Vec<u32> = (0..n as u32).collect();
     let depth = if effective_min_partition > 0 {
@@ -1780,8 +1798,12 @@ pub(crate) fn graph_bisection_with_progress(
     } else {
         0
     };
+    #[cfg(feature = "native")]
+    let degree_lanes = fwd.parallel_bisect_lanes.max(1);
+    #[cfg(not(feature = "native"))]
+    let degree_lanes = 1usize;
     let log_table = build_log_table(4096);
-    let progress = BpProgress::new(progress_label, n, fwd.total_postings(), depth);
+    let progress = BpProgress::new(progress_label, n, fwd.total_postings(), depth, degree_lanes);
 
     log::debug!(
         "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}, time_budget={:?}",
@@ -1829,26 +1851,21 @@ pub(crate) fn graph_bisection_with_progress(
     if immediately_exhausted || initially_cancelled {
         exhausted.store(true, std::sync::atomic::Ordering::Relaxed);
     } else if n > effective_min_partition {
-        // Entity scratch is allocated once for the pass and carved into
-        // disjoint slices down the recursion tree. Degree lanes are likewise
-        // allocated exactly once from the memory-budgeted lane count.
+        // Entity scratch and vocabulary-sized degree lanes are allocated
+        // exactly once. At each depth, workers dynamically claim disjoint
+        // partitions and reuse their lane for the whole level.
         let mut gains = vec![0.0f32; n];
         let mut partitioned = vec![0u32; n];
         let mut ranked = vec![0usize; n];
-        #[cfg(feature = "native")]
-        let degree_lanes = fwd.parallel_bisect_lanes.max(1);
-        #[cfg(not(feature = "native"))]
-        let degree_lanes = 1usize;
         let mut degree_workspaces: Vec<TermDegrees> = (0..degree_lanes)
             .map(|_| TermDegrees::new(fwd.num_terms))
             .collect();
-        bisect(
+        bisect_level_synchronized(
             &mut docs,
             &mut gains,
             &mut partitioned,
             &mut ranked,
             &mut degree_workspaces,
-            0,
             &context,
         );
     }
@@ -1871,14 +1888,11 @@ pub(crate) fn graph_bisection_with_progress(
     (docs, converged)
 }
 
-/// Recursive bisection of a document slice.
+/// Context shared by all partitions in a level-synchronized BP pass.
 ///
 /// Uses flat `Vec<u32>` degree arrays indexed by compact term_id for cache-friendly
 /// O(1) lookups (vs FxHashMap which has poor cache locality at scale).
 ///
-/// Gain computation is parallelized via rayon for large partitions (n > 4096).
-/// Adaptive iteration count reduces work at top levels where coarse splits
-/// converge faster and dominate total runtime.
 struct BisectContext<'a> {
     fwd: &'a ForwardIndex,
     min_partition_size: usize,
@@ -1893,14 +1907,290 @@ struct BisectContext<'a> {
     progress: &'a BpProgress<'a>,
 }
 
+/// Return the range of partition `partition_id` at a fixed recursion `level`.
+///
+/// Replaying the path bits produces exactly the same floor-left/ceil-right
+/// boundaries as recursive `split_at_mut(len / 2)`, including for non-power
+/// of-two collection sizes.
+fn partition_range(total: usize, level: usize, partition_id: usize) -> std::ops::Range<usize> {
+    debug_assert!(level < usize::BITS as usize);
+    debug_assert!(partition_id < (1usize << level));
+    let mut start = 0usize;
+    let mut len = total;
+    for bit in (0..level).rev() {
+        let left_len = len / 2;
+        if partition_id & (1usize << bit) == 0 {
+            len = left_len;
+        } else {
+            start += left_len;
+            len -= left_len;
+        }
+    }
+    start..start + len
+}
+
+/// Collect all active partitions when they fit in `limit` lanes. Returning
+/// `None` means there are more active partitions than lanes, so the caller
+/// should use dynamic claiming instead of assigning multiple lanes per node.
+fn small_active_partition_set(
+    total: usize,
+    level: usize,
+    min_partition_size: usize,
+    limit: usize,
+) -> Option<Vec<usize>> {
+    let partition_count = 1usize.checked_shl(level as u32)?;
+    let mut active = Vec::with_capacity(partition_count.min(limit));
+    for partition_id in 0..partition_count {
+        if partition_range(total, level, partition_id).len() <= min_partition_size {
+            continue;
+        }
+        active.push(partition_id);
+        if active.len() > limit {
+            return None;
+        }
+    }
+    Some(active)
+}
+
+/// Mutable pass buffers shared by native level workers.
+///
+/// The scheduler hands each claimed partition ID to exactly one worker, and
+/// `partition_range` yields non-overlapping ranges at a fixed level. The level
+/// barrier completes before any buffer is accessed again or the next level is
+/// started. Those invariants make concurrent slice construction sound.
+#[cfg(feature = "native")]
+#[derive(Clone, Copy)]
+struct LevelBuffers {
+    docs: *mut u32,
+    gains: *mut f32,
+    partitioned: *mut u32,
+    ranked: *mut usize,
+    len: usize,
+}
+
+#[cfg(feature = "native")]
+unsafe impl Send for LevelBuffers {}
+#[cfg(feature = "native")]
+unsafe impl Sync for LevelBuffers {}
+
+#[cfg(feature = "native")]
+impl LevelBuffers {
+    fn new(
+        docs: &mut [u32],
+        gains: &mut [f32],
+        partitioned: &mut [u32],
+        ranked: &mut [usize],
+    ) -> Self {
+        debug_assert_eq!(docs.len(), gains.len());
+        debug_assert_eq!(docs.len(), partitioned.len());
+        debug_assert_eq!(docs.len(), ranked.len());
+        Self {
+            docs: docs.as_mut_ptr(),
+            gains: gains.as_mut_ptr(),
+            partitioned: partitioned.as_mut_ptr(),
+            ranked: ranked.as_mut_ptr(),
+            len: docs.len(),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// During one level, every requested range must be in bounds and disjoint
+    /// from every range concurrently handed out from this `LevelBuffers`.
+    unsafe fn with_slices<R>(
+        &self,
+        range: std::ops::Range<usize>,
+        use_slices: impl for<'a> FnOnce(
+            &'a mut [u32],
+            &'a mut [f32],
+            &'a mut [u32],
+            &'a mut [usize],
+        ) -> R,
+    ) -> R {
+        debug_assert!(range.start <= range.end && range.end <= self.len);
+        let len = range.len();
+        // SAFETY: upheld by the caller as documented above. All four backing
+        // allocations remain live and immovable until the level barrier.
+        unsafe {
+            use_slices(
+                std::slice::from_raw_parts_mut(self.docs.add(range.start), len),
+                std::slice::from_raw_parts_mut(self.gains.add(range.start), len),
+                std::slice::from_raw_parts_mut(self.partitioned.add(range.start), len),
+                std::slice::from_raw_parts_mut(self.ranked.add(range.start), len),
+            )
+        }
+    }
+}
+
+/// Process the recursion tree breadth-first. Same-depth partitions have
+/// similar sizes and dynamically claim bounded degree lanes, avoiding the
+/// inter-level contention and permanently imbalanced descendant ownership of
+/// recursive fork-join BP.
+fn bisect_level_synchronized(
+    docs: &mut [u32],
+    gains: &mut [f32],
+    partitioned: &mut [u32],
+    ranked_scratch: &mut [usize],
+    degree_workspaces: &mut [TermDegrees],
+    context: &BisectContext<'_>,
+) {
+    debug_assert_eq!(docs.len(), gains.len());
+    debug_assert_eq!(docs.len(), partitioned.len());
+    debug_assert_eq!(docs.len(), ranked_scratch.len());
+    debug_assert!(!degree_workspaces.is_empty());
+
+    #[cfg(feature = "native")]
+    {
+        let buffers = LevelBuffers::new(docs, gains, partitioned, ranked_scratch);
+        let mut level = 0usize;
+        while let Some(partition_count) = 1usize.checked_shl(level as u32) {
+            let small_set = small_active_partition_set(
+                docs.len(),
+                level,
+                context.min_partition_size,
+                degree_workspaces.len(),
+            );
+
+            match small_set {
+                Some(active) if active.is_empty() => break,
+                Some(active) => {
+                    // With fewer partitions than degree lanes, give each node
+                    // a lane group so its frequency/gain work can still use
+                    // the whole pool during BP's startup levels.
+                    let active_count = active.len();
+                    let allow_inner_parallelism =
+                        active_count < rayon::current_num_threads().max(1);
+                    let mut rest: &mut [TermDegrees] = &mut *degree_workspaces;
+                    let mut groups = Vec::with_capacity(active_count);
+                    for remaining_groups in (1..=active_count).rev() {
+                        let group_len = rest.len().div_ceil(remaining_groups);
+                        let (group, tail) = rest.split_at_mut(group_len);
+                        groups.push(group);
+                        rest = tail;
+                    }
+                    debug_assert!(rest.is_empty());
+                    groups.into_par_iter().zip(active.into_par_iter()).for_each(
+                        |(workspaces, partition_id)| {
+                            let range = partition_range(docs.len(), level, partition_id);
+                            // SAFETY: active IDs are unique at one fixed level,
+                            // hence their ranges are disjoint. `for_each` is
+                            // the barrier before buffers are reused.
+                            unsafe {
+                                buffers.with_slices(
+                                    range,
+                                    |part_docs, part_gains, part_output, part_ranked| {
+                                        bisect_partition(
+                                            part_docs,
+                                            part_gains,
+                                            part_output,
+                                            part_ranked,
+                                            workspaces,
+                                            level,
+                                            allow_inner_parallelism,
+                                            context,
+                                        );
+                                    },
+                                );
+                            }
+                        },
+                    );
+                }
+                None => {
+                    // More partitions than degree lanes: one long-lived worker
+                    // per admitted lane repeatedly claims the next partition.
+                    // This preserves the memory bound and lets short/deep work
+                    // steal naturally instead of pinning a whole subtree to a
+                    // lane for the remainder of the pass.
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    let allow_inner_parallelism =
+                        degree_workspaces.len() < rayon::current_num_threads().max(1);
+                    degree_workspaces.par_iter_mut().for_each(|workspace| {
+                        loop {
+                            let partition_id =
+                                next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if partition_id >= partition_count {
+                                break;
+                            }
+                            let range = partition_range(docs.len(), level, partition_id);
+                            if range.len() <= context.min_partition_size {
+                                continue;
+                            }
+                            // SAFETY: `fetch_add` assigns every partition ID
+                            // once, and fixed-level partition ranges are
+                            // pairwise disjoint.
+                            unsafe {
+                                buffers.with_slices(
+                                    range,
+                                    |part_docs, part_gains, part_output, part_ranked| {
+                                        bisect_partition(
+                                            part_docs,
+                                            part_gains,
+                                            part_output,
+                                            part_ranked,
+                                            std::slice::from_mut(workspace),
+                                            level,
+                                            allow_inner_parallelism,
+                                            context,
+                                        );
+                                    },
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+
+            if context.exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            level += 1;
+        }
+    }
+
+    #[cfg(not(feature = "native"))]
+    {
+        let mut level = 0usize;
+        while let Some(partition_count) = 1usize.checked_shl(level as u32) {
+            let mut active = false;
+            for partition_id in 0..partition_count {
+                let range = partition_range(docs.len(), level, partition_id);
+                if range.len() <= context.min_partition_size {
+                    continue;
+                }
+                active = true;
+                bisect_partition(
+                    &mut docs[range.clone()],
+                    &mut gains[range.clone()],
+                    &mut partitioned[range.clone()],
+                    &mut ranked_scratch[range],
+                    degree_workspaces,
+                    level,
+                    false,
+                    context,
+                );
+            }
+            if !active || context.exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            level += 1;
+        }
+    }
+}
+
+/// Bisection of one document slice, without scheduling its children.
+///
+/// Uses flat `Vec<u32>` degree arrays indexed by compact term_id for
+/// cache-friendly O(1) lookups. Adaptive iteration count reduces work at top
+/// levels where coarse splits converge faster and dominate total runtime.
 #[allow(clippy::too_many_arguments)]
-fn bisect(
+fn bisect_partition(
     docs: &mut [u32],
     gains: &mut [f32],
     partitioned: &mut [u32],
     ranked_scratch: &mut [usize],
     degree_workspaces: &mut [TermDegrees],
     level: usize,
+    allow_inner_parallelism: bool,
     context: &BisectContext<'_>,
 ) {
     let n = docs.len();
@@ -1948,8 +2238,8 @@ fn bisect(
 
     // Compact term IDs permit direct indexing. Slots are initialized lazily so
     // deep partitions touch only their active terms. Coarse partitions use
-    // multiple preallocated lanes; recursion splits the exact same workspace
-    // set between children.
+    // multiple preallocated lanes; fine levels dynamically reuse one lane per
+    // active partition.
     build_term_degrees(
         docs,
         mid,
@@ -1964,6 +2254,7 @@ fn bisect(
         context
             .exhausted
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        context.progress.partition_finished();
         return;
     }
     // A full-vocabulary objective scan pays off only on coarse partitions,
@@ -2014,6 +2305,7 @@ fn bisect(
             &degree_workspaces[0],
             context.log_table,
             gains,
+            allow_inner_parallelism,
         );
         if context
             .cancellation
@@ -2037,11 +2329,12 @@ fn bisect(
             &mut degree_workspaces[1..],
             partitioned,
             ranked_scratch,
+            allow_inner_parallelism,
         );
 
         if partition.swap_count == 0 {
             context.progress.iteration(n, 0, 0.0, 0.0);
-            // Preserve the selector's within-half order before recursing.
+            // Preserve the selector's within-half order for the next level.
             // Small partitions intentionally retain quickselect's established
             // symmetry-breaking permutation.
             docs.copy_from_slice(partitioned);
@@ -2138,83 +2431,6 @@ fn bisect(
     }
 
     context.progress.partition_finished();
-
-    let (left, right) = docs.split_at_mut(mid);
-    let (left_gains, right_gains) = gains.split_at_mut(mid);
-    let (left_partitioned, right_partitioned) = partitioned.split_at_mut(mid);
-    let (left_ranked, right_ranked) = ranked_scratch.split_at_mut(mid);
-    #[cfg(feature = "native")]
-    if degree_workspaces.len() > 1 {
-        let left_lanes = degree_workspaces.len() / 2;
-        let (left_workspaces, right_workspaces) = degree_workspaces.split_at_mut(left_lanes);
-        rayon::join(
-            || {
-                bisect(
-                    left,
-                    left_gains,
-                    left_partitioned,
-                    left_ranked,
-                    left_workspaces,
-                    level + 1,
-                    context,
-                )
-            },
-            || {
-                bisect(
-                    right,
-                    right_gains,
-                    right_partitioned,
-                    right_ranked,
-                    right_workspaces,
-                    level + 1,
-                    context,
-                )
-            },
-        );
-    } else {
-        // Gain computation inside each node remains parallel, so serializing
-        // recursion here bounds vocabulary-sized degree arrays without leaving
-        // the Rayon pool idle.
-        bisect(
-            left,
-            left_gains,
-            left_partitioned,
-            left_ranked,
-            degree_workspaces,
-            level + 1,
-            context,
-        );
-        bisect(
-            right,
-            right_gains,
-            right_partitioned,
-            right_ranked,
-            degree_workspaces,
-            level + 1,
-            context,
-        );
-    }
-    #[cfg(not(feature = "native"))]
-    {
-        bisect(
-            left,
-            left_gains,
-            left_partitioned,
-            left_ranked,
-            degree_workspaces,
-            level + 1,
-            context,
-        );
-        bisect(
-            right,
-            right_gains,
-            right_partitioned,
-            right_ranked,
-            degree_workspaces,
-            level + 1,
-            context,
-        );
-    }
 }
 
 /// Compute gains for all documents, parallelized via rayon for large partitions.
@@ -2230,6 +2446,7 @@ fn compute_gains(
     degrees: &TermDegrees,
     log_table: &[f32],
     gains: &mut [f32],
+    allow_inner_parallelism: bool,
 ) {
     // Single coherent key: HIGH = belongs in the RIGHT half.
     // Left docs get +approx_one(from=left, to=right) — a misplaced left doc
@@ -2260,7 +2477,7 @@ fn compute_gains(
 
     #[cfg(feature = "native")]
     {
-        if docs.len() > 4096 {
+        if allow_inner_parallelism && docs.len() > 4096 {
             gains
                 .par_iter_mut()
                 .enumerate()
@@ -2280,7 +2497,6 @@ fn compute_gains(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
 /// Build precomputed log2 table for values 0..size.
 fn build_log_table(size: usize) -> Vec<f32> {
     let mut table = vec![0.0f32; size];
@@ -2435,7 +2651,7 @@ mod tests {
         sorted.sort_unstable();
 
         for left_count in 1..=gains.len() {
-            let (threshold, lower) = select_gain_threshold(&gains, left_count);
+            let (threshold, lower) = select_gain_threshold(&gains, left_count, true);
             assert_eq!(threshold, sorted[left_count - 1].0);
             assert_eq!(lower, sorted.partition_point(|&(key, _)| key < threshold),);
         }
@@ -2506,6 +2722,7 @@ mod tests {
             &mut movement_workspaces,
             &mut output,
             &mut ranked_scratch,
+            true,
         );
         assert_eq!(output, expected);
         assert!(
@@ -2559,6 +2776,57 @@ mod tests {
             parallel_bisect_lanes: 1,
             budget_limited: false,
         }
+    }
+
+    #[test]
+    fn level_partition_ranges_match_recursive_halving() {
+        for total in 1..=129 {
+            let mut expected: Vec<std::ops::Range<usize>> = std::iter::once(0..total).collect();
+            for level in 0..8 {
+                let actual: Vec<_> = (0..(1usize << level))
+                    .map(|partition_id| partition_range(total, level, partition_id))
+                    .collect();
+                assert_eq!(actual, expected, "total={total}, level={level}");
+
+                expected = expected
+                    .into_iter()
+                    .flat_map(|range| {
+                        let mid = range.start + range.len() / 2;
+                        [range.start..mid, mid..range.end]
+                    })
+                    .collect();
+            }
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn level_synchronized_scheduler_is_thread_count_deterministic() {
+        let docs: Vec<Vec<u32>> = (0..1_027)
+            .map(|doc| {
+                vec![
+                    (doc % 31) as u32,
+                    ((doc / 5) % 53) as u32,
+                    ((doc * 29 + 3) % 97) as u32,
+                ]
+            })
+            .collect();
+        let doc_refs: Vec<_> = docs.iter().map(Vec::as_slice).collect();
+        let mut fwd = make_fwd(&doc_refs, 97);
+        fwd.parallel_bisect_lanes = 8;
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let eight_threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+
+        let one = one_thread.install(|| graph_bisection(&fwd, 8, 12, BpBudget::full()).0);
+        let eight = eight_threads.install(|| graph_bisection(&fwd, 8, 12, BpBudget::full()).0);
+
+        assert_eq!(eight, one);
     }
 
     #[test]
