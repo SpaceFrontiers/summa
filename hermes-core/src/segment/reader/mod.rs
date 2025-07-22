@@ -938,6 +938,7 @@ async fn exact_score_binary_candidate_documents(
 
 async fn exact_score_binary_candidate_document_ids(
     candidate_doc_ids: Vec<DocId>,
+    probed_ordinal_scores: &[(u32, u16, f32)],
     flat: &LazyFlatVectorData,
     query: &[u8],
     dim_bits: usize,
@@ -945,7 +946,9 @@ async fn exact_score_binary_candidate_document_ids(
     limit: usize,
 ) -> Result<Vec<VectorSearchResult>> {
     let documents = ann_candidate_document_ranges_from_ids(candidate_doc_ids, flat)?;
-    let probe_scores = FxHashMap::default();
+    // Binary leaves hold the original packed codes, so probed ordinals already
+    // have exact scores; only ordinals outside the probed leaves are read back.
+    let probe_scores = binary_probe_score_map(probed_ordinal_scores);
     exact_score_binary_resolved_documents(
         documents,
         &probe_scores,
@@ -956,6 +959,15 @@ async fn exact_score_binary_candidate_document_ids(
         limit,
     )
     .await
+}
+
+fn binary_probe_score_map(
+    probed_ordinal_scores: &[(u32, u16, f32)],
+) -> FxHashMap<(DocId, u16), f32> {
+    probed_ordinal_scores
+        .iter()
+        .map(|&(doc_id, ordinal, score)| ((doc_id, ordinal), score))
+        .collect()
 }
 
 async fn exact_score_binary_resolved_documents(
@@ -1048,6 +1060,7 @@ fn exact_score_binary_candidate_documents_sync(
 #[cfg(feature = "sync")]
 fn exact_score_binary_candidate_document_ids_sync(
     candidate_doc_ids: Vec<DocId>,
+    probed_ordinal_scores: &[(u32, u16, f32)],
     flat: &LazyFlatVectorData,
     query: &[u8],
     dim_bits: usize,
@@ -1055,7 +1068,7 @@ fn exact_score_binary_candidate_document_ids_sync(
     limit: usize,
 ) -> Result<Vec<VectorSearchResult>> {
     let documents = ann_candidate_document_ranges_from_ids(candidate_doc_ids, flat)?;
-    let probe_scores = FxHashMap::default();
+    let probe_scores = binary_probe_score_map(probed_ordinal_scores);
     exact_score_binary_resolved_documents_sync(
         documents,
         &probe_scores,
@@ -2679,7 +2692,7 @@ impl SegmentReader {
             {
                 let candidate_limit =
                     checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
-                let candidate_documents = ivf
+                let (candidate_documents, probed_ordinal_scores) = ivf
                     .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
                     .map_err(|error| {
                         Error::Corruption(format!(
@@ -2692,6 +2705,7 @@ impl SegmentReader {
                         .into_iter()
                         .map(|candidate| candidate.doc_id)
                         .collect(),
+                    &probed_ordinal_scores,
                     flat,
                     query,
                     schema_dim,
@@ -3289,7 +3303,7 @@ impl SegmentReader {
             {
                 let candidate_limit =
                     checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
-                let candidate_documents = ivf
+                let (candidate_documents, probed_ordinal_scores) = ivf
                     .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
                     .map_err(|error| {
                         Error::Corruption(format!(
@@ -3302,6 +3316,7 @@ impl SegmentReader {
                         .into_iter()
                         .map(|candidate| candidate.doc_id)
                         .collect(),
+                    &probed_ordinal_scores,
                     flat,
                     query,
                     schema_dim,

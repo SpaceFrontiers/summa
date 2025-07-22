@@ -346,6 +346,49 @@ mod neon {
         total
     }
 
+    /// Four-row NEON Hamming distance.
+    ///
+    /// The query chunk load and the horizontal reduction are shared across the
+    /// rows, and the four accumulator chains overlap instead of serialising on
+    /// `vcntq_u8`/`vaddq_u8` latency.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn hamming_distance_x4(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
+        let len = query.len();
+        let chunks16 = len / 16;
+        let mut total = [0u32; 4];
+
+        let mut i = 0;
+        while i < chunks16 {
+            let batch_end = (i + 31).min(chunks16);
+            let mut acc = [vdupq_n_u8(0); 4];
+            for j in i..batch_end {
+                let off = j * 16;
+                let vq = vld1q_u8(query.as_ptr().add(off));
+                for r in 0..4 {
+                    let vr = vld1q_u8(rows[r].as_ptr().add(off));
+                    acc[r] = vaddq_u8(acc[r], vcntq_u8(veorq_u8(vq, vr)));
+                }
+            }
+            for r in 0..4 {
+                let sum64 = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(acc[r])));
+                total[r] += vgetq_lane_u64(sum64, 0) as u32 + vgetq_lane_u64(sum64, 1) as u32;
+            }
+            i = batch_end;
+        }
+
+        // Remainder through the u64 scalar path: a per-byte tail would dominate
+        // for code widths narrower than one vector (e.g. 64-bit fields).
+        let base = chunks16 * 16;
+        if base < len {
+            let tail = &query[base..];
+            for r in 0..4 {
+                total[r] += super::hamming_distance_scalar(tail, &rows[r][base..]);
+            }
+        }
+
+        total
+    }
+
     /// Check if NEON is available (always true on aarch64)
     #[inline]
     pub fn is_available() -> bool {
@@ -949,6 +992,71 @@ mod avx2 {
         }
 
         total as u32
+    }
+
+    /// Four-row AVX2 Hamming distance.
+    ///
+    /// The query chunk load, the nibble lookup table and the horizontal
+    /// reduction are shared across the rows, and the four accumulator chains
+    /// overlap instead of serialising on popcount latency.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn hamming_distance_x4(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
+        let len = query.len();
+        let chunks32 = len / 32;
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let lookup = _mm256_setr_epi8(
+            0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2,
+            3, 3, 4,
+        );
+        let mut total = [0u64; 4];
+
+        let mut i = 0;
+        while i < chunks32 {
+            let batch_end = (i + 31).min(chunks32);
+            let mut acc = [_mm256_setzero_si256(); 4];
+            for j in i..batch_end {
+                let off = j * 32;
+                let vq = _mm256_loadu_si256(query.as_ptr().add(off) as *const __m256i);
+                for r in 0..4 {
+                    let vr = _mm256_loadu_si256(rows[r].as_ptr().add(off) as *const __m256i);
+                    let xored = _mm256_xor_si256(vq, vr);
+                    let lo = _mm256_and_si256(xored, low_mask);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(xored, 4), low_mask);
+                    acc[r] = _mm256_add_epi8(
+                        acc[r],
+                        _mm256_add_epi8(
+                            _mm256_shuffle_epi8(lookup, lo),
+                            _mm256_shuffle_epi8(lookup, hi),
+                        ),
+                    );
+                }
+            }
+            for r in 0..4 {
+                let sad = _mm256_sad_epu8(acc[r], _mm256_setzero_si256());
+                total[r] += _mm256_extract_epi64(sad, 0) as u64
+                    + _mm256_extract_epi64(sad, 1) as u64
+                    + _mm256_extract_epi64(sad, 2) as u64
+                    + _mm256_extract_epi64(sad, 3) as u64;
+            }
+            i = batch_end;
+        }
+
+        // Remainder through the u64 scalar path: a per-byte tail would dominate
+        // for code widths narrower than one vector (e.g. 64-bit fields).
+        let base = chunks32 * 32;
+        if base < len {
+            let tail = &query[base..];
+            for r in 0..4 {
+                total[r] += u64::from(super::hamming_distance_scalar(tail, &rows[r][base..]));
+            }
+        }
+
+        [
+            total[0] as u32,
+            total[1] as u32,
+            total[2] as u32,
+            total[3] as u32,
+        ]
     }
 
     /// Check if AVX2 is available at runtime
@@ -3391,29 +3499,243 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Hamming distance for binary dense vectors
 // ============================================================================
 
+/// AVX-512 Hamming distance using `VPOPCNTDQ`.
+///
+/// Processes 64 bytes per iteration with a single hardware popcount per lane
+/// group, which removes the nibble-lookup shuffles the AVX2 path needs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn hamming_distance_avx512(a: &[u8], b: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks64 = len / 64;
+    let mut acc = _mm512_setzero_si512();
+
+    for c in 0..chunks64 {
+        let off = c * 64;
+        let va = _mm512_loadu_si512(a.as_ptr().add(off) as *const __m512i);
+        let vb = _mm512_loadu_si512(b.as_ptr().add(off) as *const __m512i);
+        acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(_mm512_xor_si512(va, vb)));
+    }
+
+    let base = chunks64 * 64;
+    _mm512_reduce_add_epi64(acc) as u32 + hamming_distance_scalar(&a[base..], &b[base..])
+}
+
+/// Four-row AVX-512 Hamming distance sharing the query load across rows.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn hamming_distance_x4_avx512(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
+    use std::arch::x86_64::*;
+
+    let len = query.len();
+    let chunks64 = len / 64;
+    let mut acc = [_mm512_setzero_si512(); 4];
+
+    for c in 0..chunks64 {
+        let off = c * 64;
+        let vq = _mm512_loadu_si512(query.as_ptr().add(off) as *const __m512i);
+        for r in 0..4 {
+            let vr = _mm512_loadu_si512(rows[r].as_ptr().add(off) as *const __m512i);
+            acc[r] = _mm512_add_epi64(acc[r], _mm512_popcnt_epi64(_mm512_xor_si512(vq, vr)));
+        }
+    }
+
+    let base = chunks64 * 64;
+    let tail = &query[base..];
+    [
+        _mm512_reduce_add_epi64(acc[0]) as u32 + hamming_distance_scalar(tail, &rows[0][base..]),
+        _mm512_reduce_add_epi64(acc[1]) as u32 + hamming_distance_scalar(tail, &rows[1][base..]),
+        _mm512_reduce_add_epi64(acc[2]) as u32 + hamming_distance_scalar(tail, &rows[2][base..]),
+        _mm512_reduce_add_epi64(acc[3]) as u32 + hamming_distance_scalar(tail, &rows[3][base..]),
+    ]
+}
+
+/// Four-row scalar Hamming distance sharing the query load across rows.
+#[inline]
+fn hamming_distance_x4_scalar(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
+    let len = query.len();
+    let chunks = len / 8;
+    let mut total = [0u32; 4];
+
+    for i in 0..chunks {
+        let off = i * 8;
+        let vq = unsafe { std::ptr::read_unaligned(query.as_ptr().add(off) as *const u64) };
+        for r in 0..4 {
+            let vr = unsafe { std::ptr::read_unaligned(rows[r].as_ptr().add(off) as *const u64) };
+            total[r] += (vq ^ vr).count_ones();
+        }
+    }
+
+    let base = chunks * 8;
+    for k in base..len {
+        let q = query[k];
+        for r in 0..4 {
+            total[r] += (q ^ rows[r][k]).count_ones();
+        }
+    }
+
+    total
+}
+
+/// Rows scored per kernel invocation. Sharing the query load, the AVX2 nibble
+/// lookup table and the horizontal reduction across four rows amortises the
+/// non-inlinable `#[target_feature]` call and overlaps the popcount chains.
+const HAMMING_ROWS_PER_KERNEL: usize = 4;
+
+/// Architecture kernel resolved once for a whole scan.
+///
+/// Hot binary paths — HNSW centroid routing, k-majority assignment, leaf
+/// scanning — score millions of code pairs against one query. Resolving the
+/// kernel up front keeps runtime feature detection out of the inner loop, and
+/// the row-batched entry points let one dispatch cover a whole neighbour list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HammingKernel {
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    Scalar,
+}
+
+impl HammingKernel {
+    /// Detect the widest kernel this CPU supports.
+    #[inline]
+    pub fn resolve() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vpopcntdq") {
+                return Self::Avx512;
+            }
+            if avx2::is_available() {
+                return Self::Avx2;
+            }
+            Self::Scalar
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::Neon
+        }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            Self::Scalar
+        }
+    }
+
+    /// Hamming distance between two equal-length packed-bit vectors.
+    #[inline]
+    pub fn distance(self, a: &[u8], b: &[u8]) -> u32 {
+        debug_assert_eq!(a.len(), b.len(), "Hamming vector byte length mismatch");
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => unsafe { hamming_distance_avx512(a, b) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => unsafe { avx2::hamming_distance(a, b) },
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { neon::hamming_distance(a, b) },
+            Self::Scalar => hamming_distance_scalar(a, b),
+        }
+    }
+
+    /// `out[i]` receives the distance from `query` to row `i` of `db`.
+    pub fn distances(self, query: &[u8], db: &[u8], byte_len: usize, out: &mut [u32]) {
+        self.score_rows(query, db, byte_len, out, |index| index);
+    }
+
+    /// `out[i]` receives the distance from `query` to row `ids[i]` of `db`.
+    ///
+    /// Graph routing visits scattered centroid rows; gathering them through one
+    /// dispatch keeps the batched kernel usable there.
+    pub fn gather_distances(
+        self,
+        query: &[u8],
+        db: &[u8],
+        byte_len: usize,
+        ids: &[u32],
+        out: &mut [u32],
+    ) {
+        assert_eq!(
+            ids.len(),
+            out.len(),
+            "Hamming gather needs one output slot per row id"
+        );
+        self.score_rows(query, db, byte_len, out, |index| ids[index] as usize);
+    }
+
+    #[inline]
+    fn score_rows(
+        self,
+        query: &[u8],
+        db: &[u8],
+        byte_len: usize,
+        out: &mut [u32],
+        index_of: impl Fn(usize) -> usize,
+    ) {
+        assert_eq!(query.len(), byte_len, "Hamming query byte length mismatch");
+        if byte_len == 0 || out.is_empty() {
+            return;
+        }
+        let row = |index: usize| -> &[u8] {
+            let start = index * byte_len;
+            &db[start..start + byte_len]
+        };
+        macro_rules! score_with {
+            ($one:expr, $four:expr) => {{
+                let mut i = 0;
+                while i + HAMMING_ROWS_PER_KERNEL <= out.len() {
+                    let quad = [
+                        row(index_of(i)),
+                        row(index_of(i + 1)),
+                        row(index_of(i + 2)),
+                        row(index_of(i + 3)),
+                    ];
+                    out[i..i + HAMMING_ROWS_PER_KERNEL].copy_from_slice(&$four(query, quad));
+                    i += HAMMING_ROWS_PER_KERNEL;
+                }
+                while i < out.len() {
+                    out[i] = $one(query, row(index_of(i)));
+                    i += 1;
+                }
+            }};
+        }
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => score_with!(
+                |query, row| unsafe { hamming_distance_avx512(query, row) },
+                |query, rows| unsafe { hamming_distance_x4_avx512(query, rows) }
+            ),
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => score_with!(
+                |query, row| unsafe { avx2::hamming_distance(query, row) },
+                |query, rows| unsafe { avx2::hamming_distance_x4(query, rows) }
+            ),
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => score_with!(
+                |query, row| unsafe { neon::hamming_distance(query, row) },
+                |query, rows| unsafe { neon::hamming_distance_x4(query, rows) }
+            ),
+            Self::Scalar => score_with!(hamming_distance_scalar, hamming_distance_x4_scalar),
+        }
+    }
+}
+
 /// Compute Hamming distance between two packed-bit vectors.
 /// Returns the number of differing bits.
 ///
-/// Uses NEON intrinsics on aarch64, POPCNT on x86_64, scalar fallback otherwise.
+/// Uses NEON on aarch64 and VPOPCNTDQ/AVX2 on x86_64, with a scalar fallback.
+/// Loops over many pairs should resolve a [`HammingKernel`] once instead of
+/// paying feature detection here per pair.
 #[inline]
 pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
     assert_eq!(a.len(), b.len(), "Hamming vector byte length mismatch");
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        neon::hamming_distance(a, b)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2::is_available() {
-            return unsafe { avx2::hamming_distance(a, b) };
-        }
-        hamming_distance_scalar(a, b)
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    hamming_distance_scalar(a, b)
+    HammingKernel::resolve().distance(a, b)
 }
 
 /// Scalar Hamming distance using u64 chunks + count_ones().
@@ -3468,45 +3790,58 @@ pub fn batch_hamming_scores(
         return;
     }
 
+    scores_from_hamming(
+        HammingKernel::resolve(),
+        query,
+        db,
+        byte_len,
+        dim_bits,
+        scores,
+    );
+}
+
+/// Batch Hamming scoring with a caller-resolved kernel.
+///
+/// Scans that already hold a [`HammingKernel`] (leaf scanning, Lloyd
+/// assignment) use this to keep feature detection out of the loop entirely.
+pub fn scores_from_hamming(
+    kernel: HammingKernel,
+    query: &[u8],
+    db: &[u8],
+    byte_len: usize,
+    dim_bits: usize,
+    scores: &mut [f32],
+) {
+    if byte_len == 0 || scores.is_empty() || dim_bits == 0 {
+        return;
+    }
     let inv_dim = 1.0 / dim_bits as f32;
-
-    // Select the architecture kernel once for the whole batch. Calling
-    // `hamming_distance` here used to repeat runtime feature detection for
-    // every database vector in the hottest binary-scan loop.
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2::is_available() {
-            for (i, score) in scores.iter_mut().enumerate() {
-                let vector = &db[i * byte_len..(i + 1) * byte_len];
-                let distance = unsafe { avx2::hamming_distance(query, vector) };
-                *score = 1.0 - distance as f32 * inv_dim;
-            }
-        } else {
-            for (i, score) in scores.iter_mut().enumerate() {
-                let vector = &db[i * byte_len..(i + 1) * byte_len];
-                let distance = hamming_distance_scalar(query, vector);
-                *score = 1.0 - distance as f32 * inv_dim;
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        for (i, score) in scores.iter_mut().enumerate() {
-            let vector = &db[i * byte_len..(i + 1) * byte_len];
-            let distance = unsafe { neon::hamming_distance(query, vector) };
+    // Distances stay integral until the very last step; the stack block keeps
+    // the row-batched kernel reachable without a per-scan allocation.
+    let mut distances = [0u32; HAMMING_DISTANCE_BLOCK];
+    for (block_index, block) in scores.chunks_mut(HAMMING_DISTANCE_BLOCK).enumerate() {
+        let rows = &mut distances[..block.len()];
+        kernel.distances(
+            query,
+            &db[block_index * HAMMING_DISTANCE_BLOCK * byte_len..],
+            byte_len,
+            rows,
+        );
+        for (score, &distance) in block.iter_mut().zip(rows.iter()) {
             *score = 1.0 - distance as f32 * inv_dim;
         }
     }
+}
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        for (i, score) in scores.iter_mut().enumerate() {
-            let vector = &db[i * byte_len..(i + 1) * byte_len];
-            let distance = hamming_distance_scalar(query, vector);
-            *score = 1.0 - distance as f32 * inv_dim;
-        }
-    }
+/// Rows per stack block when converting batched distances into scores.
+const HAMMING_DISTANCE_BLOCK: usize = 64;
+
+/// Batch Hamming distances (exact bit counts) for `out.len()` rows of `db`.
+///
+/// Callers that rank by distance — coarse assignment, routing — avoid the
+/// float round-trip entirely.
+pub fn batch_hamming_distances(query: &[u8], db: &[u8], byte_len: usize, out: &mut [u32]) {
+    HammingKernel::resolve().distances(query, db, byte_len, out);
 }
 
 #[cfg(test)]
@@ -4240,6 +4575,97 @@ mod tests {
         batch_hamming_scores(&query, &db, 0, 0, &mut scores);
         // Should return early without modifying scores
         assert_eq!(scores[0], 0.0);
+    }
+
+    // ================================================================
+    // Resolved-kernel and row-batched Hamming tests
+    // ================================================================
+
+    fn hamming_matrix(rows: usize, byte_len: usize) -> (Vec<u8>, Vec<u8>) {
+        let query: Vec<u8> = (0..byte_len).map(|i| (i * 31 + 5) as u8).collect();
+        let db: Vec<u8> = (0..rows * byte_len)
+            .map(|i| (i * 97 + i / byte_len * 11 + 3) as u8)
+            .collect();
+        (query, db)
+    }
+
+    /// The row-batched kernels share query loads and accumulators across four
+    /// rows; every width must still agree bit-for-bit with the scalar loop.
+    #[test]
+    fn batched_hamming_distances_match_scalar_for_every_row_count() {
+        let kernel = HammingKernel::resolve();
+        // Cover both multiples of the quad width and every tail remainder, and
+        // byte lengths that exercise 16/32/64-byte chunking plus odd tails.
+        for byte_len in [1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 128, 320] {
+            for rows in [1, 2, 3, 4, 5, 7, 8, 9, 64, 70] {
+                let (query, db) = hamming_matrix(rows, byte_len);
+                let mut got = vec![0u32; rows];
+                kernel.distances(&query, &db, byte_len, &mut got);
+                for (row, &distance) in got.iter().enumerate() {
+                    let expected =
+                        hamming_distance_scalar(&query, &db[row * byte_len..(row + 1) * byte_len]);
+                    assert_eq!(
+                        distance, expected,
+                        "row {row} of {rows} at byte_len {byte_len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gathered_hamming_distances_follow_row_ids() {
+        let kernel = HammingKernel::resolve();
+        let byte_len = 320;
+        let rows = 37;
+        let (query, db) = hamming_matrix(rows, byte_len);
+        // Scattered, repeated and reversed ids: routing visits rows in graph
+        // order, not storage order.
+        let ids: Vec<u32> = [36, 0, 17, 17, 5, 31, 2, 9, 9, 36, 1].into_iter().collect();
+        let mut got = vec![0u32; ids.len()];
+        kernel.gather_distances(&query, &db, byte_len, &ids, &mut got);
+        for (slot, &id) in ids.iter().enumerate() {
+            let start = id as usize * byte_len;
+            let expected = hamming_distance_scalar(&query, &db[start..start + byte_len]);
+            assert_eq!(got[slot], expected, "slot {slot} for row {id}");
+        }
+    }
+
+    #[test]
+    fn resolved_kernel_matches_scalar_pairwise() {
+        let kernel = HammingKernel::resolve();
+        for byte_len in [1, 8, 32, 64, 65, 320, 4096] {
+            let (query, db) = hamming_matrix(1, byte_len);
+            assert_eq!(
+                kernel.distance(&query, &db),
+                hamming_distance_scalar(&query, &db),
+                "byte_len {byte_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn scores_from_hamming_matches_batch_scores_across_blocks() {
+        let kernel = HammingKernel::resolve();
+        let byte_len = 320;
+        let dim_bits = byte_len * 8;
+        // More rows than one stack block so the block seam is covered.
+        let rows = HAMMING_DISTANCE_BLOCK * 2 + 3;
+        let (query, db) = hamming_matrix(rows, byte_len);
+        let mut expected = vec![0f32; rows];
+        for (row, score) in expected.iter_mut().enumerate() {
+            let distance =
+                hamming_distance_scalar(&query, &db[row * byte_len..(row + 1) * byte_len]);
+            *score = 1.0 - distance as f32 / dim_bits as f32;
+        }
+        let mut got = vec![0f32; rows];
+        scores_from_hamming(kernel, &query, &db, byte_len, dim_bits, &mut got);
+        for (row, (&got, &want)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-6, "row {row}: {got} vs {want}");
+        }
+        let mut public = vec![0f32; rows];
+        batch_hamming_scores(&query, &db, byte_len, dim_bits, &mut public);
+        assert_eq!(got, public);
     }
 }
 

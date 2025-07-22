@@ -26,6 +26,10 @@ use crate::dsl::IvfRoutingMode;
 use crate::structures::BinaryIvfIndex;
 use crate::structures::vector::index::{BoundedAnnCollector, BoundedUniqueAnnCollector};
 
+/// Combined binary candidates: the retained documents, plus the exact
+/// per-ordinal `(doc_id, ordinal, score)` scores behind them.
+type CombinedBinaryCandidates = (Vec<AnnDocumentCandidate>, Vec<(u32, u16, f32)>);
+
 const ANN_HEADER_MAGIC: u32 = 0x3152_4e41; // "ANR1"
 const ANN_FOOTER_MAGIC: u32 = 0x3146_4e41; // "ANF1"
 const ANN_DISK_VERSION: u16 = 1;
@@ -514,13 +518,18 @@ impl AnnDiskIndex {
     /// Score packed codes in the selected binary-IVF leaves, deduplicate
     /// repeated `(doc_id, ordinal)` assignments, combine per document, and
     /// retain at most `k` approximate document candidates.
+    ///
+    /// The second return value carries the per-ordinal scores behind the
+    /// retained documents. Binary leaves store the original packed codes, so
+    /// those scores are *exact*, and reranking can reuse them instead of
+    /// re-reading the same codes from flat storage.
     pub(crate) fn search_binary_combined_documents(
         &self,
         k: usize,
         query: &[u8],
         cluster_ids: &[u32],
         combiner: crate::query::MultiValueCombiner,
-    ) -> io::Result<Vec<AnnDocumentCandidate>> {
+    ) -> io::Result<CombinedBinaryCandidates> {
         validate_combined_search(combiner)?;
         if query.len() != self.header.code_size {
             return Err(io::Error::new(
@@ -529,7 +538,7 @@ impl AnnDiskIndex {
             ));
         }
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         #[cfg(feature = "native")]
         self.prefetch_cluster_runs(cluster_ids);
@@ -548,7 +557,11 @@ impl AnnDiskIndex {
             &mut score_batch,
             &mut ordinal_scores,
         )?;
-        Ok(combine_scored_ordinals(ordinal_scores, k, combiner))
+        Ok(combine_scored_ordinals_retaining(
+            ordinal_scores,
+            k,
+            combiner,
+        ))
     }
 
     /// Score every TQ block against the query plan and keep the top `k`
@@ -918,12 +931,25 @@ fn validate_combined_search(combiner: crate::query::MultiValueCombiner) -> io::R
 /// tuple per probed posting and never expands to unprobed leaves or raw
 /// vectors; final retained state is O(k).
 fn combine_scored_ordinals(
-    mut scores: Vec<(u32, u16, f32)>,
+    scores: Vec<(u32, u16, f32)>,
     k: usize,
     combiner: crate::query::MultiValueCombiner,
 ) -> Vec<AnnDocumentCandidate> {
+    combine_scored_ordinals_retaining(scores, k, combiner).0
+}
+
+/// As [`combine_scored_ordinals`], additionally returning the deduplicated
+/// per-ordinal scores of the retained documents, sorted by `(doc_id, ordinal)`.
+///
+/// Only callers whose leaf scores are exact may reuse those numbers; TQ block
+/// scores are estimates and must still be reranked against raw vectors.
+fn combine_scored_ordinals_retaining(
+    mut scores: Vec<(u32, u16, f32)>,
+    k: usize,
+    combiner: crate::query::MultiValueCombiner,
+) -> CombinedBinaryCandidates {
     if k == 0 || scores.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     scores.retain(|entry| entry.2.is_finite());
     scores.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
@@ -952,7 +978,7 @@ fn combine_scored_ordinals(
     let mut top_documents = BoundedAnnCollector::<true, true>::new(k);
     let mut current_doc = None;
     let mut ordinal_scores = Vec::new();
-    for (doc_id, ordinal, score) in scores {
+    for &(doc_id, ordinal, score) in &scores {
         if current_doc.is_some_and(|current| current != doc_id) {
             retain_combined_document(
                 &mut top_documents,
@@ -969,11 +995,31 @@ fn combine_scored_ordinals(
         retain_combined_document(&mut top_documents, doc_id, &ordinal_scores, combiner);
     }
 
-    top_documents
+    let candidates: Vec<AnnDocumentCandidate> = top_documents
         .into_sorted_results()
         .into_iter()
         .map(|(doc_id, _, score)| AnnDocumentCandidate { doc_id, score })
-        .collect()
+        .collect();
+
+    // Narrow the per-ordinal scores to the retained documents. `scores` is
+    // already sorted by document, so this is one pass over a sorted ID set
+    // rather than a hash lookup per posting.
+    let mut retained_ids: Vec<u32> = candidates
+        .iter()
+        .map(|candidate| candidate.doc_id)
+        .collect();
+    retained_ids.sort_unstable();
+    let mut retained = Vec::with_capacity(scores.len().min(retained_ids.len().saturating_mul(4)));
+    let mut cursor = 0usize;
+    for entry in scores {
+        while cursor < retained_ids.len() && retained_ids[cursor] < entry.0 {
+            cursor += 1;
+        }
+        if retained_ids.get(cursor) == Some(&entry.0) {
+            retained.push(entry);
+        }
+    }
+    (candidates, retained)
 }
 
 #[cfg(feature = "native")]
@@ -1897,7 +1943,7 @@ mod tests {
             crate::query::MultiValueCombiner::Sum,
             crate::query::MultiValueCombiner::default(),
         ] {
-            let result = disk
+            let (result, probed) = disk
                 .search_binary_combined_documents(1, &[0], &[0, 1], combiner)
                 .unwrap();
             assert_eq!(result.len(), 1, "combined search must honor k");
@@ -1905,9 +1951,19 @@ mod tests {
                 result[0].doc_id, 1,
                 "SOAR duplicate changed {combiner:?} ranking: {result:?}",
             );
+            // Exact leaf scores are handed back only for the retained document,
+            // deduplicated and sorted, so reranking can skip re-reading them.
+            assert_eq!(
+                probed
+                    .iter()
+                    .map(|&(doc_id, ordinal, _)| (doc_id, ordinal))
+                    .collect::<Vec<_>>(),
+                vec![(1, 0), (1, 1)],
+                "{combiner:?}",
+            );
         }
 
-        let top_two = disk
+        let (top_two, probed) = disk
             .search_binary_combined_documents(
                 2,
                 &[0],
@@ -1923,6 +1979,15 @@ mod tests {
             vec![1, 0],
         );
         assert_eq!(top_two.len(), 2, "full probing must still return at most k");
+        // doc 0 ordinal 0 was probed twice (a SOAR duplicate) and must appear
+        // once, with the two retained documents in ascending order.
+        assert_eq!(
+            probed
+                .iter()
+                .map(|&(doc_id, ordinal, _)| (doc_id, ordinal))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+        );
     }
 
     #[test]

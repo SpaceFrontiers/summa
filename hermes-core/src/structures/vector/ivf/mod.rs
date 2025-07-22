@@ -11,5 +11,7 @@ pub(crate) mod routing;
 mod soar;
 
 pub use coarse::{CoarseCentroids, CoarseConfig};
-pub use routing::{HNSW_AUTO_THRESHOLD, IvfProbePlan};
+pub use routing::{
+    BINARY_HNSW_AUTO_THRESHOLD, HIERARCHICAL_TRAINING_THRESHOLD, HNSW_AUTO_THRESHOLD, IvfProbePlan,
+};
 pub use soar::{MultiAssignment, SoarConfig};

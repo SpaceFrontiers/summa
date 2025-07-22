@@ -1282,6 +1282,125 @@ async fn test_binary_ivf_end_to_end() {
     );
 }
 
+/// Partial probing with a non-`Max` combiner: reusing the probe's exact scores
+/// must not lose the ordinals that live *outside* the probed leaves.
+///
+/// With `nprobe < num_clusters` a retained document usually has some ordinals in
+/// probed leaves (scored during the scan) and some elsewhere (which still have
+/// to be read from flat storage). Dropping the latter would silently shrink an
+/// additive combiner's score, so the returned score is checked against the exact
+/// combination over *every* ordinal of that document.
+#[tokio::test]
+async fn test_binary_ivf_partial_probe_combines_unprobed_ordinals() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::query::{BinaryDenseVectorQuery, MultiValueCombiner};
+
+    let dim_bits = 64;
+    let byte_len = dim_bits / 8;
+
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    // 8 leaves, probe only one of them.
+    let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 1);
+    let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
+    sb.set_multi(bvec, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Every document pairs a vector near one "corner" of the space with a
+    // vector near a different corner, so a single probed leaf can only ever
+    // hold part of a document.
+    let corner = |index: usize| -> Vec<u8> {
+        let mut vector = vec![0u8; byte_len];
+        vector[index % byte_len] = 0xFF;
+        vector[(index * 3 + 1) % byte_len] = 0x0F;
+        vector
+    };
+    let mut vectors_by_title = std::collections::HashMap::new();
+    for doc_index in 0usize..40 {
+        let ordinals = vec![corner(doc_index), corner(doc_index + 17)];
+        let name = format!("doc {doc_index}");
+        let mut doc = Document::new();
+        doc.add_text(title, name.clone());
+        for vector in &ordinals {
+            doc.add_binary_dense_vector(bvec, vector.clone());
+        }
+        writer.add_document(doc).unwrap();
+        vectors_by_title.insert(name, ordinals);
+    }
+    writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let mut merge_trigger = Document::new();
+    merge_trigger.add_text(title, "merge trigger");
+    merge_trigger.add_binary_dense_vector(bvec, vec![0; byte_len]);
+    writer.add_document(merge_trigger).unwrap();
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert!(
+        matches!(
+            segments[0].get_vector_index(bvec),
+            Some(crate::segment::VectorIndex::BinaryIvf(_))
+        ),
+        "binary IVF payload expected for a partial-probe test"
+    );
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let query_vector = corner(3);
+    for combiner in [
+        MultiValueCombiner::Sum,
+        MultiValueCombiner::Avg,
+        MultiValueCombiner::default(),
+    ] {
+        let results = searcher
+            .search(
+                &BinaryDenseVectorQuery::new(bvec, query_vector.clone()).with_combiner(combiner),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "{combiner:?} returned nothing");
+        for result in &results {
+            let document = searcher
+                .doc(result.segment_id, result.doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let name = document
+                .get_first(title)
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .to_string();
+            let Some(ordinals) = vectors_by_title.get(&name) else {
+                continue; // the merge trigger has a single ordinal
+            };
+            let exact: Vec<(u32, f32)> = ordinals
+                .iter()
+                .enumerate()
+                .map(|(ordinal, vector)| {
+                    let distance = crate::structures::simd::hamming_distance(&query_vector, vector);
+                    (ordinal as u32, 1.0 - distance as f32 / dim_bits as f32)
+                })
+                .collect();
+            let expected = combiner.combine(&exact);
+            assert!(
+                (result.score - expected).abs() < 1e-6,
+                "{combiner:?} score for {name} dropped an unprobed ordinal: got {}, exact {expected}",
+                result.score,
+            );
+        }
+    }
+}
+
 /// Multi-valued binary IVF: the IVF probe's exact Hamming scores are reused
 /// for the ordinals it returned, remaining ordinals are exact-scored from
 /// flat storage, and the document combiner sees every ordinal exactly once —
