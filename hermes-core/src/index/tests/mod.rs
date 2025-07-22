@@ -103,6 +103,51 @@ async fn automatic_merge_reorder_leaves_capacity_for_optimizer() {
 
 #[cfg(feature = "native")]
 #[tokio::test]
+async fn standalone_optimizer_reorders_are_serialized() {
+    use super::ReorderPriority;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let gate = Arc::new(super::ReorderConcurrencyGate::new(2));
+    let first_optimizer = gate.acquire(ReorderPriority::Optimizer).await.unwrap();
+
+    // A second optimizer pass would duplicate the full per-pass memory and
+    // sparse-blob IO working set, even though both passes share one Rayon
+    // pool. It must wait rather than occupying the second whole-pass slot.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            gate.acquire(ReorderPriority::Optimizer),
+        )
+        .await
+        .is_err()
+    );
+
+    // The remaining common slot is still useful: merge-time BP has its own
+    // class permit and may make compaction progress alongside the optimizer.
+    let merge = tokio::time::timeout(
+        Duration::from_millis(100),
+        gate.acquire(ReorderPriority::AutomaticMerge),
+    )
+    .await
+    .expect("merge-time BP should retain its independent slot")
+    .unwrap();
+
+    drop(first_optimizer);
+    let second_optimizer = tokio::time::timeout(
+        Duration::from_millis(100),
+        gate.acquire(ReorderPriority::Optimizer),
+    )
+    .await
+    .expect("next optimizer should start when the active pass finishes")
+    .unwrap();
+
+    drop(second_optimizer);
+    drop(merge);
+}
+
+#[cfg(feature = "native")]
+#[tokio::test]
 async fn foreground_reorder_pauses_new_optimizer_passes() {
     use super::ReorderPriority;
     use std::sync::Arc;
@@ -151,7 +196,7 @@ async fn cancelled_foreground_wait_resumes_optimizer_passes() {
 
     let gate = Arc::new(super::ReorderConcurrencyGate::new(2));
     let first = gate.acquire(ReorderPriority::Optimizer).await.unwrap();
-    let second = gate.acquire(ReorderPriority::Optimizer).await.unwrap();
+    let second = gate.acquire(ReorderPriority::AutomaticMerge).await.unwrap();
 
     // begin_foreground marks the gate active before waiting for its reserved
     // permit. Cancelling that wait must not leave background admission paused.

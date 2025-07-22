@@ -19,6 +19,12 @@
 //!   runs on dedicated threads, never blocking the tokio async runtime.
 //!   Async I/O (segment file writes) is bridged via `Handle::block_on()`.
 //! - **Fixed per-worker memory budget**: `max_indexing_memory_bytes / num_workers`.
+//!   Workers use deterministic, staggered soft flush thresholds within that
+//!   budget so equal-size builders do not all stop draining at once.
+//! - **Build concurrency reserve**: while input is open, at most `N - 1`
+//!   workers build segments concurrently. A worker that cannot get a slot
+//!   keeps draining up to the former 80% flush boundary. Once input closes,
+//!   all `N` tail builds may finish concurrently because no drainer is needed.
 //! - **Two-phase commit**:
 //!   1. `prepare_commit()` — closes queue, workers flush builders to disk.
 //!      Returns a `PreparedCommit` guard. No new documents accepted until resolved.
@@ -46,8 +52,366 @@ use super::IndexConfig;
 /// Total pipeline capacity (in documents).
 const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
+/// Builder memory percentage at which the first worker starts trying to flush.
+///
+/// The last worker starts at [`SOFT_FLUSH_MAX_PERCENT`], preserving the former
+/// 20% segment-build headroom. Intermediate workers are evenly staggered
+/// between the two bounds.
+const SOFT_FLUSH_MIN_PERCENT: usize = 70;
+const SOFT_FLUSH_MAX_PERCENT: usize = 80;
+
 /// File name of the advisory single-writer lock inside the index directory.
 pub const WRITER_LOCK_FILENAME: &str = ".hermes_writer.lock";
+
+/// Return a deterministic per-worker soft flush threshold.
+///
+/// All thresholds remain at or below the former uniform 80% trigger, so their
+/// sum cannot increase builder memory. The 70–80% spread prevents identical
+/// workers consuming the shared queue at the same rate from entering segment
+/// builds in lockstep.
+fn soft_flush_threshold(memory_budget: usize, worker_id: usize, num_workers: usize) -> usize {
+    if num_workers <= 1 {
+        return hard_flush_threshold(memory_budget);
+    }
+
+    let worker_id = worker_id.min(num_workers - 1);
+    let span = SOFT_FLUSH_MAX_PERCENT - SOFT_FLUSH_MIN_PERCENT;
+    let denominator = 100u128 * (num_workers - 1) as u128;
+    let numerator = (SOFT_FLUSH_MIN_PERCENT * (num_workers - 1) + span * worker_id) as u128;
+    ((memory_budget as u128 * numerator) / denominator) as usize
+}
+
+/// Preserve the historical 20% allowance for allocations created while a
+/// segment is finalized. Workers may stagger below this boundary, but no
+/// queued builder consumes the scratch reserve while waiting for a build slot.
+fn hard_flush_threshold(memory_budget: usize) -> usize {
+    memory_budget.saturating_mul(SOFT_FLUSH_MAX_PERCENT) / 100
+}
+
+/// Derive the builder defaults used by the standard writer constructors.
+///
+/// `IndexConfig::num_compression_threads` is the public per-index setting; it
+/// must reach segment builders instead of being replaced by the machine-wide
+/// `SegmentBuilderConfig` default. Explicit `*_with_config` constructors bypass
+/// this helper and continue honoring every supplied builder option.
+fn default_builder_config(index_config: &IndexConfig) -> SegmentBuilderConfig {
+    SegmentBuilderConfig {
+        num_compression_threads: index_config.num_compression_threads,
+        ..SegmentBuilderConfig::default()
+    }
+}
+
+/// Bounds simultaneous segment finalization while reserving an indexing
+/// worker to drain the shared document queue.
+///
+/// A soft-threshold worker first tries to acquire without waiting. If every
+/// slot is occupied it may continue indexing until its hard per-worker memory
+/// flush boundary. At that hard limit it waits, preserving the remaining 20%
+/// of every worker share for finalization scratch.
+struct SegmentBuildLimiter {
+    live_max_active: usize,
+    flush_max_active: usize,
+    active: AtomicUsize,
+    flushing: AtomicBool,
+    wait_mutex: parking_lot::Mutex<()>,
+    available: parking_lot::Condvar,
+}
+
+impl SegmentBuildLimiter {
+    fn new(num_workers: usize) -> Self {
+        Self {
+            // A single-worker writer must still be able to build. With two or
+            // more workers, reserve one worker from concurrent finalization.
+            live_max_active: num_workers.saturating_sub(1).max(1),
+            // Once the input queue closes there is no ingestion to reserve;
+            // flush every tail concurrently as the old writer did.
+            flush_max_active: num_workers.max(1),
+            active: AtomicUsize::new(0),
+            flushing: AtomicBool::new(false),
+            wait_mutex: parking_lot::Mutex::new(()),
+            available: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<SegmentBuildPermit<'_>> {
+        self.try_acquire_up_to(self.live_max_active)
+    }
+
+    fn try_acquire_up_to(&self, limit: usize) -> Option<SegmentBuildPermit<'_>> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(SegmentBuildPermit { limiter: self }),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+
+    fn acquire(&self) -> SegmentBuildPermit<'_> {
+        let mut wait = self.wait_mutex.lock();
+        loop {
+            let limit = if self.flushing.load(Ordering::Acquire) {
+                self.flush_max_active
+            } else {
+                self.live_max_active
+            };
+            if let Some(permit) = self.try_acquire_up_to(limit) {
+                return permit;
+            }
+            self.available.wait(&mut wait);
+        }
+    }
+
+    fn acquire_flush(&self) -> SegmentBuildPermit<'_> {
+        self.acquire_up_to(self.flush_max_active)
+    }
+
+    fn acquire_up_to(&self, limit: usize) -> SegmentBuildPermit<'_> {
+        let mut wait = self.wait_mutex.lock();
+        loop {
+            if let Some(permit) = self.try_acquire_up_to(limit) {
+                return permit;
+            }
+            self.available.wait(&mut wait);
+        }
+    }
+
+    /// Promote existing live waiters when input closes. Store the phase before
+    /// taking the condvar mutex; a waiter either observes it directly or
+    /// releases the mutex in `wait`, after which this notification reaches it.
+    fn begin_flush(&self) {
+        self.flushing.store(true, Ordering::Release);
+        let _wait = self.wait_mutex.lock();
+        self.available.notify_all();
+    }
+
+    fn end_flush(&self) {
+        self.flushing.store(false, Ordering::Release);
+    }
+
+    /// Reserve a build slot once `builder_memory` reaches its soft threshold.
+    ///
+    /// When all slots are busy, `None` below `hard_budget` means "keep
+    /// draining". At the hard budget this waits for a slot rather than
+    /// exceeding the configured per-worker memory share.
+    fn reserve_if_due(
+        &self,
+        builder_memory: usize,
+        soft_threshold: usize,
+        hard_budget: usize,
+    ) -> Option<SegmentBuildPermit<'_>> {
+        if builder_memory < soft_threshold {
+            return None;
+        }
+        if let Some(permit) = self.try_acquire() {
+            return Some(permit);
+        }
+        if builder_memory < hard_budget {
+            return None;
+        }
+        Some(self.acquire())
+    }
+}
+
+struct SegmentBuildPermit<'a> {
+    limiter: &'a SegmentBuildLimiter,
+}
+
+impl Drop for SegmentBuildPermit<'_> {
+    fn drop(&mut self) {
+        let previous = self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        // Synchronize notification with acquire's condvar wait so a permit
+        // becoming free cannot be missed between its check and sleeping.
+        let _wait = self.limiter.wait_mutex.lock();
+        // Live-ingestion and closed-queue flush waiters have different limits;
+        // wake both classes so the reserved flush slot cannot be stranded.
+        self.limiter.available.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod indexing_pipeline_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        SOFT_FLUSH_MAX_PERCENT, SOFT_FLUSH_MIN_PERCENT, SegmentBuildLimiter,
+        default_builder_config, hard_flush_threshold, soft_flush_threshold,
+    };
+
+    #[test]
+    fn standard_builder_config_honors_index_compression_width() {
+        let index_config = crate::index::IndexConfig {
+            num_compression_threads: 7,
+            ..Default::default()
+        };
+
+        let builder_config = default_builder_config(&index_config);
+
+        assert_eq!(builder_config.num_compression_threads, 7);
+    }
+
+    #[test]
+    fn flush_thresholds_are_staggered_without_increasing_memory_budget() {
+        const WORKERS: usize = 12;
+        const PER_WORKER_BUDGET: usize = 1024 * 1024 * 1024;
+
+        let thresholds: Vec<_> = (0..WORKERS)
+            .map(|worker| soft_flush_threshold(PER_WORKER_BUDGET, worker, WORKERS))
+            .collect();
+
+        assert_eq!(
+            thresholds[0],
+            PER_WORKER_BUDGET * SOFT_FLUSH_MIN_PERCENT / 100
+        );
+        assert_eq!(
+            thresholds[WORKERS - 1],
+            PER_WORKER_BUDGET * SOFT_FLUSH_MAX_PERCENT / 100
+        );
+        assert!(
+            thresholds.windows(2).all(|pair| pair[0] < pair[1]),
+            "production-width workers must not reach identical flush thresholds: {thresholds:?}"
+        );
+
+        let staggered_total: usize = thresholds.iter().sum();
+        let former_uniform_total = WORKERS * (PER_WORKER_BUDGET * SOFT_FLUSH_MAX_PERCENT / 100);
+        assert!(
+            staggered_total <= former_uniform_total,
+            "staggering must not increase aggregate builder memory"
+        );
+
+        assert_eq!(
+            soft_flush_threshold(PER_WORKER_BUDGET, 0, 1),
+            PER_WORKER_BUDGET * SOFT_FLUSH_MAX_PERCENT / 100,
+            "single-worker behavior retains the former 80% build headroom"
+        );
+
+        let hard_threshold = hard_flush_threshold(PER_WORKER_BUDGET);
+        let build_scratch = PER_WORKER_BUDGET - hard_threshold;
+        let steady_state_peak = (WORKERS - 1) * (hard_threshold + build_scratch) + hard_threshold;
+        assert!(
+            steady_state_peak <= WORKERS * PER_WORKER_BUDGET,
+            "rotated hard-threshold builds must retain aggregate scratch headroom"
+        );
+    }
+
+    #[test]
+    fn full_build_gate_leaves_soft_threshold_worker_draining() {
+        const WORKERS: usize = 12;
+        let limiter = SegmentBuildLimiter::new(WORKERS);
+        let mut active_builds: Vec<_> = (0..WORKERS - 1)
+            .map(|_| {
+                limiter
+                    .try_acquire()
+                    .expect("N - 1 builds should be admitted")
+            })
+            .collect();
+
+        assert!(
+            limiter.try_acquire().is_none(),
+            "the final worker must be reserved from concurrent segment builds"
+        );
+        assert!(
+            limiter.reserve_if_due(750, 700, 800).is_none(),
+            "a worker below its hard budget must keep draining when builds are saturated"
+        );
+
+        drop(active_builds.pop());
+        let replacement = limiter
+            .reserve_if_due(750, 700, 800)
+            .expect("a completed build must immediately rotate draining capacity");
+        assert!(limiter.try_acquire().is_none());
+        drop(replacement);
+        drop(active_builds);
+    }
+
+    #[test]
+    fn closed_queue_flush_uses_the_reserved_build_slot() {
+        let limiter = SegmentBuildLimiter::new(2);
+        let live_build = limiter
+            .try_acquire()
+            .expect("one live build should be admitted");
+        assert!(limiter.try_acquire().is_none());
+
+        let tail_build = limiter.acquire_flush();
+        assert!(
+            limiter
+                .try_acquire_up_to(limiter.flush_max_active)
+                .is_none(),
+            "closed-queue flushes must remain bounded by the worker count"
+        );
+
+        drop(tail_build);
+        drop(live_build);
+    }
+
+    #[test]
+    fn closing_input_promotes_an_existing_live_waiter() {
+        let limiter = Arc::new(SegmentBuildLimiter::new(2));
+        let live_build = limiter.try_acquire().unwrap();
+        let waiter_limiter = Arc::clone(&limiter);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _permit = waiter_limiter
+                .reserve_if_due(800, 700, 800)
+                .expect("closed input must promote a hard-boundary waiter");
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        limiter.begin_flush();
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("live waiter did not adopt the closed-queue build limit");
+        waiter.join().unwrap();
+        limiter.end_flush();
+        drop(live_build);
+    }
+
+    #[test]
+    fn hard_budget_waiter_resumes_when_a_build_finishes() {
+        let limiter = Arc::new(SegmentBuildLimiter::new(3));
+        let first = limiter.try_acquire().unwrap();
+        let second = limiter.try_acquire().unwrap();
+        let waiter_limiter = Arc::clone(&limiter);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _permit = waiter_limiter
+                .reserve_if_due(800, 700, 800)
+                .expect("hard-budget worker must eventually acquire a build slot");
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "hard-budget worker must not over-subscribe segment builds"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("hard-budget worker did not wake after a build completed");
+        waiter.join().unwrap();
+        drop(second);
+    }
+}
 
 /// Advisory single-writer lock state.
 ///
@@ -208,6 +572,9 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     tokenizers: parking_lot::RwLock<FxHashMap<Field, BoxedTokenizer>>,
     /// Fixed per-worker memory budget (bytes). When a builder exceeds this, segment is built.
     memory_budget_per_worker: usize,
+    /// Limits live segment finalization to N - 1 workers, reserving
+    /// queue-draining capacity; closed-queue tail flushes may use all N.
+    segment_build_limiter: SegmentBuildLimiter,
     /// Segment manager — workers read trained structures from its ArcSwap (lock-free).
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Segments built by workers, collected by `prepare_commit()`. Their RAII
@@ -301,7 +668,8 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedSegment<D> {
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
-        Self::create_with_config(directory, schema, config, SegmentBuilderConfig::default()).await
+        let builder_config = default_builder_config(&config);
+        Self::create_with_config(directory, schema, config, builder_config).await
     }
 
     /// Create a new index with custom builder config
@@ -373,7 +741,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// workers. Use [`Index::writer`](super::Index::writer) to share lifecycle
     /// state with an already-open search index.
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
-        Self::open_with_config(directory, config, SegmentBuilderConfig::default()).await
+        let builder_config = default_builder_config(&config);
+        Self::open_with_config(directory, config, builder_config).await
     }
 
     /// Open an existing index with custom builder config
@@ -444,11 +813,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         if let WriterLock::Unavailable { reason } = &writer_lock {
             log::error!("[writer_lock] {reason}");
         }
+        let builder_config = default_builder_config(&index.config);
         Self::new_with_parts(
             Arc::clone(&index.directory),
             Arc::clone(&index.schema),
             index.config.clone(),
-            SegmentBuilderConfig::default(),
+            builder_config,
             Arc::clone(&index.segment_manager),
             writer_lock,
         )
@@ -486,6 +856,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             builder_config,
             tokenizers: parking_lot::RwLock::new(tokenizers),
             memory_budget_per_worker: config.max_indexing_memory_bytes / num_workers,
+            segment_build_limiter: SegmentBuildLimiter::new(num_workers),
             segment_manager: Arc::clone(&segment_manager),
             built_segments: parking_lot::Mutex::new(Vec::new()),
             cycle_error: parking_lot::Mutex::new(None),
@@ -594,7 +965,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("index-worker-{}", i))
-                    .spawn(move || Self::worker_loop(state, rx, rt))
+                    .spawn(move || Self::worker_loop(state, rx, rt, i))
                     .expect("failed to spawn index worker thread"),
             );
         }
@@ -890,9 +1261,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         state: Arc<WorkerState<D>>,
         initial_receiver: async_channel::Receiver<Document>,
         handle: tokio::runtime::Handle,
+        worker_id: usize,
     ) {
         let mut receiver = initial_receiver;
         let mut my_epoch = 0usize;
+        let soft_flush_threshold =
+            soft_flush_threshold(state.memory_budget_per_worker, worker_id, state.num_workers);
+        let hard_flush_threshold = hard_flush_threshold(state.memory_budget_per_worker);
 
         loop {
             // Wrap the recv+build phase in catch_unwind so a panic doesn't
@@ -955,18 +1330,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     // Require minimum 100 docs before flushing to avoid tiny segments
                     const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
 
-                    // Reserve 20% headroom for segment build overhead (vid_set,
-                    // VidLookup, postings_flat, grid_entries). These temporary
-                    // allocations exist alongside the builder's data during build.
-                    let effective_budget = state.memory_budget_per_worker * 4 / 5;
-
-                    if builder_memory >= effective_budget && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH {
+                    if b.num_docs() >= MIN_DOCS_BEFORE_FLUSH
+                        && let Some(_build_permit) = state.segment_build_limiter.reserve_if_due(
+                            builder_memory,
+                            soft_flush_threshold,
+                            hard_flush_threshold,
+                        )
+                    {
                         log::info!(
                             "[indexing] memory budget reached, building segment: \
-                             docs={}, memory={}, budget={}",
+                             worker={}, docs={}, memory={}, soft_budget={}, hard_budget={}",
+                            worker_id,
                             b.num_docs(),
                             crate::format_bytes(builder_memory as u64),
-                            crate::format_bytes(state.memory_budget_per_worker as u64),
+                            crate::format_bytes(soft_flush_threshold as u64),
+                            crate::format_bytes(hard_flush_threshold as u64),
                         );
                         let full_builder = builder.take().unwrap();
                         Self::build_segment_inline(&state, full_builder, &handle);
@@ -978,6 +1356,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     && let Some(b) = builder.take()
                     && b.num_docs() > 0
                 {
+                    let _build_permit = state.segment_build_limiter.acquire_flush();
                     Self::build_segment_inline(&state, b, &handle);
                 }
             }));
@@ -1227,6 +1606,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
         // 1. Close channel → workers drain remaining docs and flush builders
         self.doc_sender.read().close();
+        self.worker_state.segment_build_limiter.begin_flush();
 
         // Wake any workers still waiting on resume_cvar from previous cycle.
         // They'll clone the stale receiver, enter recv_blocking, get Err
@@ -1402,6 +1782,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         // Reset flush count for next cycle
+        worker_state.segment_build_limiter.end_flush();
         worker_state.flush_count.store(0, Ordering::Release);
         *worker_state.cycle_error.lock() = None;
         worker_state.cycle_failed.store(false, Ordering::Release);
@@ -1422,6 +1803,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     fn signal_worker_shutdown(&self) {
         self.worker_state.shutdown.store(true, Ordering::Release);
         self.doc_sender.read().close();
+        self.worker_state.segment_build_limiter.begin_flush();
         self.worker_state.resume_cvar.notify_all();
     }
 
