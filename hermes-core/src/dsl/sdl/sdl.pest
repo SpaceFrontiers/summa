@@ -182,8 +182,8 @@ doc_mass_kwarg = { "doc_mass" ~ ":" ~ pruning_spec }
 // SOAR spilled secondary cluster assignments for IVF-based dense indexes:
 //   soar: selective  # spill only vectors near cluster boundaries (recommended)
 //   soar: full       # spill every vector to 1 secondary cluster
-//   soar: aggressive # spill every vector to 2 secondary clusters
-//   soar: off        # no spilling (default)
+//   soar: aggressive # compatibility alias for full one-secondary spilling
+//   soar: off        # explicitly disable default selective spilling
 soar_kwarg = { "soar" ~ ":" ~ soar_spec }
 soar_spec = { "selective" | "full" | "aggressive" | "off" }
 nprobe_spec = @{ ASCII_DIGIT+ }

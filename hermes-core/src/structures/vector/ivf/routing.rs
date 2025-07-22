@@ -22,11 +22,20 @@ pub const HNSW_AUTO_THRESHOLD: usize = 4_096;
 /// the minimum parent count avoids the recall cliff of greedy one-parent
 /// hierarchical routing while keeping parent/leaf scoring sublinear.
 const PARENT_BEAM_OVERSAMPLE: usize = 4;
+/// Construction assignments become permanent, so inspect multiple populated
+/// parent cells even when the query-time leaf budget fits under one parent.
+const MIN_BUILD_PARENT_BEAM: usize = 4;
 
 const HNSW_M: usize = 32;
 const HNSW_EF_CONSTRUCTION: usize = 200;
 const HNSW_QUERY_OVERSAMPLE: usize = 4;
 const HNSW_MIN_EF_SEARCH: usize = 128;
+/// Index construction happens once per vector generation and can afford a
+/// wider centroid search than latency-sensitive queries. Keeping the budgets
+/// separate prevents an approximate query-router miss from permanently
+/// assigning a vector to a needlessly distant leaf.
+const HNSW_BUILD_OVERSAMPLE: usize = 8;
+const HNSW_MIN_EF_BUILD: usize = 512;
 
 #[derive(Clone, Copy, Debug)]
 struct GraphCandidate {
@@ -279,14 +288,40 @@ impl HnswRoutingGraph {
         if take == 0 {
             return Vec::new();
         }
-        let mut entry = self.entry_point;
-        for level in (1..=self.max_level as usize).rev() {
-            entry = greedy_search_compact(self, entry, level, &query_distance);
-        }
         let ef_search = take
             .saturating_mul(HNSW_QUERY_OVERSAMPLE)
             .max(HNSW_MIN_EF_SEARCH)
             .min(self.node_levels.len());
+        self.search_with_budget(query_distance, take, ef_search)
+    }
+
+    /// Higher-recall centroid search used only while constructing postings.
+    pub(crate) fn search_for_build(
+        &self,
+        query_distance: impl Fn(u32) -> f32,
+        take: usize,
+    ) -> Vec<u32> {
+        let take = take.min(self.node_levels.len());
+        if take == 0 {
+            return Vec::new();
+        }
+        let ef_search = take
+            .saturating_mul(HNSW_BUILD_OVERSAMPLE)
+            .max(HNSW_MIN_EF_BUILD)
+            .min(self.node_levels.len());
+        self.search_with_budget(query_distance, take, ef_search)
+    }
+
+    fn search_with_budget(
+        &self,
+        query_distance: impl Fn(u32) -> f32,
+        take: usize,
+        ef_search: usize,
+    ) -> Vec<u32> {
+        let mut entry = self.entry_point;
+        for level in (1..=self.max_level as usize).rev() {
+            entry = greedy_search_compact(self, entry, level, &query_distance);
+        }
         HNSW_QUERY_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             search_compact_layer_reusing(self, entry, ef_search, &query_distance, &mut scratch);
@@ -296,22 +331,6 @@ impl HnswRoutingGraph {
                 .take(take)
                 .map(|candidate| candidate.node)
                 .collect()
-        })
-    }
-
-    pub fn search_one(&self, query_distance: impl Fn(u32) -> f32) -> u32 {
-        let mut entry = self.entry_point;
-        for level in (1..=self.max_level as usize).rev() {
-            entry = greedy_search_compact(self, entry, level, &query_distance);
-        }
-        let ef_search = HNSW_MIN_EF_SEARCH.min(self.node_levels.len());
-        HNSW_QUERY_SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            search_compact_layer_reusing(self, entry, ef_search, &query_distance, &mut scratch);
-            scratch
-                .ordered
-                .first()
-                .map_or(entry, |candidate| candidate.node)
         })
     }
 
@@ -655,40 +674,101 @@ pub fn routing_parent_count(num_leaves: usize) -> usize {
         .min(num_leaves)
 }
 
-/// Allocate exactly `total_clusters` child cells proportionally to populated
-/// parent groups, without assigning more cells than training points.
+/// Allocate `total_clusters` child cells proportionally to populated parent
+/// groups, or one per training point when fewer points are available.
 pub fn allocate_child_clusters(group_sizes: &[usize], total_clusters: usize) -> Vec<usize> {
-    let mut allocated: Vec<usize> = group_sizes
-        .iter()
-        .map(|&size| usize::from(size > 0))
-        .collect();
-    let mut remaining = total_clusters.saturating_sub(allocated.iter().sum());
-    let total_points: usize = group_sizes.iter().sum();
-    if remaining == 0 || total_points == 0 {
+    let total_points: u128 = group_sizes.iter().map(|&size| size as u128).sum();
+    let target = (total_clusters as u128).min(total_points) as usize;
+    if target == 0 {
+        return vec![0; group_sizes.len()];
+    }
+
+    let populated = group_sizes.iter().filter(|&&size| size > 0).count();
+    let guarantee_populated = target >= populated;
+    let mut allocated = vec![0usize; group_sizes.len()];
+    let mut fixed = vec![false; group_sizes.len()];
+    let mut fixed_cells = 0usize;
+
+    if guarantee_populated {
+        // Solve the lower-bounded proportional allocation
+        //
+        //     allocation_i = max(1, lambda * group_size_i)
+        //
+        // by successively fixing cells whose unconstrained quota is at most
+        // one. This avoids letting the one-per-parent guarantee distort a
+        // 90/10 population into an 80/20 child split.
+        loop {
+            let active_weight: u128 = group_sizes
+                .iter()
+                .enumerate()
+                .filter(|(index, size)| **size > 0 && !fixed[*index])
+                .map(|(_, &size)| size as u128)
+                .sum();
+            let active_target = target - fixed_cells;
+            if active_weight == 0 || active_target == 0 {
+                break;
+            }
+            let newly_fixed = group_sizes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &size)| {
+                    (size > 0
+                        && !fixed[index]
+                        && (size as u128) * (active_target as u128) <= active_weight)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if newly_fixed.is_empty() {
+                break;
+            }
+            for index in newly_fixed {
+                fixed[index] = true;
+                allocated[index] = 1;
+                fixed_cells += 1;
+            }
+        }
+    }
+
+    let remaining = target - fixed_cells;
+    if remaining == 0 {
         return allocated;
     }
-    for (allocation, &size) in allocated.iter_mut().zip(group_sizes) {
-        let capacity = size.saturating_sub(*allocation);
-        let share = remaining
-            .saturating_mul(size)
-            .checked_div(total_points)
-            .unwrap_or(0)
-            .min(capacity);
-        *allocation += share;
+    let active_weight: u128 = group_sizes
+        .iter()
+        .enumerate()
+        .filter(|(index, size)| **size > 0 && !fixed[*index])
+        .map(|(_, &size)| size as u128)
+        .sum();
+    debug_assert!(active_weight > 0);
+
+    let mut remainders = Vec::with_capacity(group_sizes.len());
+    for (index, &size) in group_sizes.iter().enumerate() {
+        if size == 0 || fixed[index] {
+            continue;
+        }
+        let numerator = (remaining as u128) * (size as u128);
+        let whole = (numerator / active_weight) as usize;
+        allocated[index] = whole;
+        if whole < size {
+            remainders.push((index, numerator % active_weight));
+        }
     }
-    remaining = total_clusters.saturating_sub(allocated.iter().sum());
-    while remaining > 0 {
-        let Some((index, _)) = group_sizes
-            .iter()
-            .enumerate()
-            .filter(|(index, size)| allocated[*index] < **size)
-            .max_by_key(|(index, size)| (**size, std::cmp::Reverse(allocated[*index])))
-        else {
-            break;
-        };
+
+    let remainder_cells = target - allocated.iter().sum::<usize>();
+    remainders.sort_unstable_by(|(left_index, left), (right_index, right)| {
+        right.cmp(left).then_with(|| left_index.cmp(right_index))
+    });
+    debug_assert!(remainder_cells <= remainders.len());
+    for (index, _) in remainders.into_iter().take(remainder_cells) {
         allocated[index] += 1;
-        remaining -= 1;
     }
+    debug_assert_eq!(allocated.iter().sum::<usize>(), target);
+    debug_assert!(
+        allocated
+            .iter()
+            .zip(group_sizes)
+            .all(|(&cells, &size)| cells <= size)
+    );
     allocated
 }
 
@@ -746,6 +826,38 @@ pub fn float_probe_fingerprint(query: &[f32], nprobe: usize, mode: IvfRoutingMod
     )
 }
 
+pub(crate) fn normalize_cosine_in_place(vector: &mut [f32]) {
+    let norm = crate::structures::simd::dot_product_f32(vector, vector, vector.len()).sqrt();
+    let inverse_norm = if norm.is_finite() && norm > 0.0 {
+        1.0 / norm
+    } else {
+        0.0
+    };
+    vector.iter_mut().for_each(|value| *value *= inverse_norm);
+}
+
+pub(crate) fn normalized_cosine_query(query: &[f32]) -> Vec<f32> {
+    let mut normalized = query.to_vec();
+    normalize_cosine_in_place(&mut normalized);
+    normalized
+}
+
+pub(crate) fn cosine_probe_fingerprint(query: &[f32], nprobe: usize, mode: IvfRoutingMode) -> u64 {
+    let norm = crate::structures::simd::dot_product_f32(query, query, query.len()).sqrt();
+    let inverse_norm = if norm.is_finite() && norm > 0.0 {
+        1.0 / norm
+    } else {
+        0.0
+    };
+    fingerprint_words(
+        mode,
+        nprobe,
+        query
+            .iter()
+            .map(|value| (value * inverse_norm).to_bits() as u64),
+    )
+}
+
 pub fn binary_probe_fingerprint(query: &[u8], nprobe: usize, mode: IvfRoutingMode) -> u64 {
     fingerprint_words(mode, nprobe, query.iter().map(|&value| value as u64))
 }
@@ -769,6 +881,82 @@ pub fn parent_probe_count(nprobe: usize, num_leaves: usize, num_parents: usize) 
         .saturating_mul(PARENT_BEAM_OVERSAMPLE)
         .div_ceil(leaves_per_parent)
         .clamp(1, num_parents)
+}
+
+/// Select the closest parent beam while guaranteeing enough child leaves to
+/// satisfy the requested leaf budget. The usual oversubscribed beam remains
+/// the fast path; only an uneven topology that underfills the budget pays for
+/// ranking additional parents.
+pub fn select_parent_beam<const HIGHER_IS_BETTER: bool>(
+    scores: &[f32],
+    topology: &IvfRoutingTopology,
+    requested_leaves: usize,
+) -> Vec<u32> {
+    let parent_count = scores.len().min(topology.parent_count());
+    let leaf_count = topology.leaf_ids.len();
+    let requested_leaves = requested_leaves.min(leaf_count);
+    if parent_count == 0 || requested_leaves == 0 {
+        return Vec::new();
+    }
+
+    let initial_take =
+        parent_probe_count(requested_leaves, leaf_count, parent_count).min(parent_count);
+    let scores = &scores[..parent_count];
+    let initial = select_best::<HIGHER_IS_BETTER>(scores, initial_take);
+    let initial_coverage: usize = initial
+        .iter()
+        .map(|&parent| topology.children(parent as usize).len())
+        .sum();
+    if initial_coverage >= requested_leaves || initial_take == parent_count {
+        return initial;
+    }
+
+    let mut ranked = select_best::<HIGHER_IS_BETTER>(scores, parent_count);
+    let mut coverage = 0usize;
+    let mut take = parent_count;
+    for (index, &parent) in ranked.iter().enumerate() {
+        coverage = coverage.saturating_add(topology.children(parent as usize).len());
+        if index + 1 >= initial_take && coverage >= requested_leaves {
+            take = index + 1;
+            break;
+        }
+    }
+    ranked.truncate(take);
+    ranked
+}
+
+/// Select a construction-time parent beam without narrowing query routing.
+///
+/// The query beam remains the lower bound for leaf coverage, while offline
+/// construction inspects at least four populated parents when available. Empty
+/// parents are removed because they contribute no leaf candidates.
+pub fn select_parent_beam_for_build<const HIGHER_IS_BETTER: bool>(
+    scores: &[f32],
+    topology: &IvfRoutingTopology,
+    requested_leaves: usize,
+) -> Vec<u32> {
+    if requested_leaves == 0 {
+        return Vec::new();
+    }
+    let parent_count = scores.len().min(topology.parent_count());
+    if parent_count == 0 {
+        return Vec::new();
+    }
+
+    let query_parents = select_parent_beam::<HIGHER_IS_BETTER>(scores, topology, requested_leaves);
+    let query_populated = query_parents
+        .iter()
+        .filter(|&&parent| !topology.children(parent as usize).is_empty())
+        .count();
+
+    let scores = &scores[..parent_count];
+    let mut ranked = select_best::<HIGHER_IS_BETTER>(scores, parent_count);
+    ranked.retain(|&parent| !topology.children(parent as usize).is_empty());
+    let take = query_populated
+        .max(MIN_BUILD_PARENT_BEAM.min(ranked.len()))
+        .min(ranked.len());
+    ranked.truncate(take);
+    ranked
 }
 
 /// Deterministically select the best score indexes without fully sorting the
@@ -846,6 +1034,111 @@ mod tests {
     }
 
     #[test]
+    fn two_level_beam_expands_until_skewed_parents_cover_leaf_budget() {
+        let mut children: Vec<Vec<u32>> = (0..9).map(|leaf| vec![leaf]).collect();
+        children.push((9..100).collect());
+        let topology = IvfRoutingTopology::from_children(&children);
+
+        // The average-size heuristic initially chooses two parents. The four
+        // closest parents contain only one leaf each, so the beam must expand
+        // to four to honor nprobe=4.
+        let lower_is_better: Vec<f32> = (0..10).map(|score| score as f32).collect();
+        assert_eq!(
+            select_parent_beam::<false>(&lower_is_better, &topology, 4),
+            vec![0, 1, 2, 3]
+        );
+
+        let higher_is_better: Vec<f32> = (0..10).rev().map(|score| score as f32).collect();
+        assert_eq!(
+            select_parent_beam::<true>(&higher_is_better, &topology, 4),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn build_parent_beam_uses_four_populated_parents_when_query_uses_one() {
+        let children: Vec<Vec<u32>> = (0..4)
+            .map(|parent| {
+                let first = parent * 512;
+                (first..first + 512).map(|leaf| leaf as u32).collect()
+            })
+            .collect();
+        let topology = IvfRoutingTopology::from_children(&children);
+
+        let lower_is_better = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(
+            select_parent_beam::<false>(&lower_is_better, &topology, 128),
+            vec![0]
+        );
+        assert_eq!(
+            select_parent_beam_for_build::<false>(&lower_is_better, &topology, 128),
+            vec![0, 1, 2, 3]
+        );
+
+        let higher_is_better = [4.0, 3.0, 2.0, 1.0];
+        assert_eq!(
+            select_parent_beam::<true>(&higher_is_better, &topology, 128),
+            vec![0]
+        );
+        assert_eq!(
+            select_parent_beam_for_build::<true>(&higher_is_better, &topology, 128),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn build_parent_beam_uses_every_available_populated_parent() {
+        let children = vec![vec![0], vec![], vec![1], vec![], vec![2]];
+        let topology = IvfRoutingTopology::from_children(&children);
+        let scores = [1.0, 0.0, 2.0, -1.0, 3.0];
+
+        assert_eq!(
+            select_parent_beam_for_build::<false>(&scores, &topology, 1),
+            vec![0, 2, 4]
+        );
+    }
+
+    #[test]
+    fn child_allocation_uses_largest_remainders_instead_of_largest_parent() {
+        assert_eq!(allocate_child_clusters(&[100, 90], 4), vec![2, 2]);
+        assert_eq!(allocate_child_clusters(&[5, 5, 5], 5), vec![2, 2, 1]);
+        assert_eq!(allocate_child_clusters(&[90, 10], 10), vec![9, 1]);
+    }
+
+    #[test]
+    fn child_allocation_is_exact_capacity_bounded_and_deterministic() {
+        assert_eq!(
+            allocate_child_clusters(&[1, 100, 7, 0], 100),
+            vec![1, 93, 6, 0]
+        );
+        assert_eq!(allocate_child_clusters(&[1, 2, 0], 10), vec![1, 2, 0]);
+        assert_eq!(allocate_child_clusters(&[10, 9, 8], 2), vec![1, 1, 0]);
+
+        for target in 0..=140 {
+            let sizes = [100, 30, 0, 7];
+            let allocation = allocate_child_clusters(&sizes, target);
+            assert_eq!(
+                allocation.iter().sum::<usize>(),
+                target.min(sizes.iter().sum())
+            );
+            assert!(
+                allocation
+                    .iter()
+                    .zip(sizes)
+                    .all(|(&cells, size)| cells <= size)
+            );
+            if target >= sizes.iter().filter(|&&size| size > 0).count() {
+                assert!(
+                    allocation
+                        .iter()
+                        .zip(sizes)
+                        .all(|(&cells, size)| size == 0 || cells > 0)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compact_hnsw_routes_without_copying_points() {
         let points: Vec<[f32; 2]> = (0..512)
             .map(|index| {
@@ -863,8 +1156,10 @@ mod tests {
         assert!(graph.size_bytes() < points.len() * 512);
 
         let query = [0.37f32, -0.91];
+        let query_distance_calls = std::cell::Cell::new(0usize);
         let routed = graph.search(
             |node| {
+                query_distance_calls.set(query_distance_calls.get() + 1);
                 let [x, y] = points[node as usize];
                 (x - query[0]).powi(2) + (y - query[1]).powi(2)
             },
@@ -881,6 +1176,21 @@ mod tests {
                 .then_with(|| left.cmp(&right))
         });
         assert_eq!(routed, exact[..10]);
+
+        let build_distance_calls = std::cell::Cell::new(0usize);
+        let build_routed = graph.search_for_build(
+            |node| {
+                build_distance_calls.set(build_distance_calls.get() + 1);
+                let [x, y] = points[node as usize];
+                (x - query[0]).powi(2) + (y - query[1]).powi(2)
+            },
+            10,
+        );
+        assert_eq!(build_routed, exact[..10]);
+        assert!(
+            build_distance_calls.get() > query_distance_calls.get(),
+            "offline construction should spend its wider search budget"
+        );
 
         let bytes = bincode::serde::encode_to_vec(&graph, bincode::config::standard()).unwrap();
         let (decoded, consumed): (HnswRoutingGraph, usize) =

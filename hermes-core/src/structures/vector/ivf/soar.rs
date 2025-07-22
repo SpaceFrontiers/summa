@@ -10,14 +10,21 @@
 
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_SELECTIVE_SPILL_FRACTION: f32 = 0.30;
+
 /// Configuration for SOAR (Spilling with Orthogonality-Amplified Residuals)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoarConfig {
-    /// Number of secondary cluster assignments (typically 1-2)
+    /// Number of secondary cluster assignments. Current trained generations
+    /// use the published two-assignment objective, so builders clamp this to
+    /// one secondary.
     pub num_secondary: usize,
     /// Use selective spilling (only spill vectors near cluster boundaries)
     pub selective: bool,
-    /// Threshold for selective spilling (residual norm must exceed this)
+    /// Positive values are calibrated residual-norm thresholds. A negative
+    /// value requests build-time calibration to the corresponding spill
+    /// fraction; trained artifacts always persist a positive threshold. This
+    /// tagged representation preserves the serialized structure layout.
     pub spill_threshold: f32,
 }
 
@@ -26,7 +33,7 @@ impl Default for SoarConfig {
         Self {
             num_secondary: 1,
             selective: true,
-            spill_threshold: 0.5,
+            spill_threshold: -DEFAULT_SELECTIVE_SPILL_FRACTION,
         }
     }
 }
@@ -40,7 +47,7 @@ impl SoarConfig {
     /// Create SOAR config with specified number of secondary assignments
     pub fn with_secondary(num_secondary: usize) -> Self {
         Self {
-            num_secondary,
+            num_secondary: num_secondary.min(1),
             ..Default::default()
         }
     }
@@ -53,7 +60,15 @@ impl SoarConfig {
 
     /// Set spill threshold for selective spilling
     pub fn threshold(mut self, threshold: f32) -> Self {
-        self.spill_threshold = threshold;
+        self.spill_threshold = threshold.max(0.0);
+        self
+    }
+
+    /// Calibrate selective spilling during training to at most a target
+    /// fraction of vectors receiving one secondary assignment.
+    pub fn target_spill_fraction(mut self, fraction: f32) -> Self {
+        self.selective = true;
+        self.spill_threshold = -fraction.clamp(0.0, 1.0);
         self
     }
 
@@ -66,13 +81,20 @@ impl SoarConfig {
         }
     }
 
-    /// Aggressive spilling with 2 secondary clusters
+    /// Compatibility alias for full one-secondary spilling. The generalized
+    /// multi-secondary objective is intentionally not exposed until it is
+    /// implemented and validated.
     pub fn aggressive() -> Self {
         Self {
-            num_secondary: 2,
+            num_secondary: 1,
             selective: false,
             spill_threshold: 0.0,
         }
+    }
+
+    pub(crate) fn calibration_target(&self) -> Option<f32> {
+        (self.selective && self.spill_threshold.is_sign_negative())
+            .then(|| (-self.spill_threshold).clamp(0.0, 1.0))
     }
 }
 
@@ -170,6 +192,17 @@ mod tests {
         let config = SoarConfig::default();
         assert_eq!(config.num_secondary, 1);
         assert!(config.selective);
+        assert_eq!(config.calibration_target(), Some(0.30));
+    }
+
+    #[test]
+    fn explicit_threshold_and_target_budget_have_distinct_tags() {
+        let threshold = SoarConfig::new().threshold(0.42);
+        assert_eq!(threshold.calibration_target(), None);
+        assert_eq!(threshold.spill_threshold, 0.42);
+
+        let target = SoarConfig::new().target_spill_fraction(0.25);
+        assert_eq!(target.calibration_target(), Some(0.25));
     }
 
     #[test]

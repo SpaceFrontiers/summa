@@ -27,6 +27,9 @@ pub mod ivf;
 mod kmeans;
 pub mod quantization;
 
+#[cfg(feature = "native")]
+pub(crate) use kmeans::estimated_euclidean_kmeans_distance_multiplier;
+
 // IVF core
 pub use ivf::{CoarseCentroids, CoarseConfig, IvfProbePlan, MultiAssignment, SoarConfig};
 
@@ -38,5 +41,5 @@ pub use quantization::{TqCodec, TqQueryPlan};
 // Indexes
 pub use index::{
     BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, IvfTqIndex, TqIvfEncodeScratch,
-    TqIvfQueryPlan,
+    TqIvfQueryPlan, is_ivf_tq_cosine_generation, mark_ivf_tq_cosine_generation,
 };

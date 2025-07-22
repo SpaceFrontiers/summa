@@ -3470,10 +3470,42 @@ pub fn batch_hamming_scores(
 
     let inv_dim = 1.0 / dim_bits as f32;
 
-    for i in 0..n {
-        let vec = &db[i * byte_len..(i + 1) * byte_len];
-        let dist = hamming_distance(query, vec);
-        scores[i] = 1.0 - dist as f32 * inv_dim;
+    // Select the architecture kernel once for the whole batch. Calling
+    // `hamming_distance` here used to repeat runtime feature detection for
+    // every database vector in the hottest binary-scan loop.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2::is_available() {
+            for (i, score) in scores.iter_mut().enumerate() {
+                let vector = &db[i * byte_len..(i + 1) * byte_len];
+                let distance = unsafe { avx2::hamming_distance(query, vector) };
+                *score = 1.0 - distance as f32 * inv_dim;
+            }
+        } else {
+            for (i, score) in scores.iter_mut().enumerate() {
+                let vector = &db[i * byte_len..(i + 1) * byte_len];
+                let distance = hamming_distance_scalar(query, vector);
+                *score = 1.0 - distance as f32 * inv_dim;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (i, score) in scores.iter_mut().enumerate() {
+            let vector = &db[i * byte_len..(i + 1) * byte_len];
+            let distance = unsafe { neon::hamming_distance(query, vector) };
+            *score = 1.0 - distance as f32 * inv_dim;
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        for (i, score) in scores.iter_mut().enumerate() {
+            let vector = &db[i * byte_len..(i + 1) * byte_len];
+            let distance = hamming_distance_scalar(query, vector);
+            *score = 1.0 - distance as f32 * inv_dim;
+        }
     }
 }
 

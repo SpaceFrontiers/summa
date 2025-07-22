@@ -31,7 +31,22 @@ const COARSE_TRAINING_POINTS_PER_CENTROID: usize = 256;
 /// Bound transient I/O/dequantization buffers independently of the configured
 /// total training sample budget.
 const MAX_SAMPLE_READ_BYTES: usize = 64 * 1024 * 1024;
-const SAMPLE_BLOCK: usize = 256;
+/// Coalesce nearby point-sample reads only while the extra I/O remains bounded.
+/// This keeps point-level sampling statistically useful without turning a dense
+/// sample into one range read per vector.
+const MAX_SAMPLE_READ_AMPLIFICATION: usize = 4;
+/// A held-out sample is large enough to expose routing/occupancy tails but stays
+/// bounded when codebooks are trained from millions of points.
+const VALIDATION_SAMPLE_DENOMINATOR: usize = 10;
+const MAX_VALIDATION_SAMPLES: usize = 65_536;
+/// Bound the exact centroid scan used to measure router recall. Even for very
+/// large codebooks, retain at least one held-out row when the sample permits.
+const MAX_VALIDATION_COORDINATE_WORK: usize = 512_000_000;
+/// A second deterministic initialization is useful on modest training jobs.
+/// Large jobs retain the same quality-report scaffold without silently doubling
+/// their already substantial Lloyd cost.
+const MODEL_SELECTION_SEEDS: [u64; 2] = [42, 0x9e37_79b9_7f4a_7c15];
+const MAX_MULTI_SEED_COORDINATE_WORK: usize = 4_000_000_000;
 /// Generation-qualified filenames make retraining crash-safe: the currently
 /// published metadata never points at a file being overwritten in place.
 const VECTOR_ARTIFACT_PREFIX: &str = "vector_artifact_";
@@ -94,8 +109,31 @@ impl IvfFieldConfig {
 }
 
 enum TrainingSample {
-    Float(Vec<Vec<f32>>),
+    /// Contiguous row-major matrix, retained in this form through training.
+    Float(Vec<f32>),
     Binary(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OccupancyQuality {
+    p95: usize,
+    p99: usize,
+    max: usize,
+    empty: usize,
+    penalty: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FloatBuildQuality {
+    objective: f64,
+    mean_exact_distortion: f64,
+    mean_routed_distortion: f64,
+    router_recall_at_1: f64,
+    mean_construction_assignments: f64,
+    residual_p50: f32,
+    residual_p95: f32,
+    residual_p99: f32,
+    occupancy: OccupancyQuality,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,7 +145,7 @@ enum VectorGenerationMode {
 impl TrainingSample {
     fn len(&self, dim: usize) -> usize {
         match self {
-            Self::Float(vectors) => vectors.len(),
+            Self::Float(values) => values.len() / dim,
             Self::Binary(codes) => codes.len() / dim.div_ceil(8),
         }
     }
@@ -227,6 +265,283 @@ fn training_sample_limit(
         )));
     }
     Ok(max_samples.min(memory_limited))
+}
+
+/// Resolve the codebook size against the complete configured sample budget,
+/// then select that final training sample directly. In particular, callers no
+/// longer collect a larger block-correlated sample and stride-thin it later.
+fn final_training_sample_count(
+    config: &IvfFieldConfig,
+    corpus_count: usize,
+    sample_limit: usize,
+) -> Result<usize> {
+    let available = corpus_count.min(sample_limit);
+    if available == 0 {
+        return Ok(0);
+    }
+    let clusters = effective_field_num_clusters(config, corpus_count, available)?;
+    Ok(available.min(clusters.saturating_mul(COARSE_TRAINING_POINTS_PER_CENTROID)))
+}
+
+/// Uniform point sample without replacement, sorted only after selection so
+/// storage reads remain monotonic. `rand::seq::index::sample` uses bounded
+/// memory proportional to the selected set rather than materializing a corpus
+/// permutation.
+fn deterministic_sample_ordinals(total: usize, take: usize, seed: u64) -> Vec<usize> {
+    debug_assert!(take <= total);
+    if take == 0 {
+        return Vec::new();
+    }
+    if take == total {
+        return (0..total).collect();
+    }
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
+    let mut ordinals = rand::seq::index::sample(&mut rng, total, take).into_vec();
+    ordinals.sort_unstable();
+    ordinals
+}
+
+fn validation_sample_count(
+    sample_count: usize,
+    num_clusters: usize,
+    values_per_vector: usize,
+) -> usize {
+    if sample_count <= num_clusters {
+        return 0;
+    }
+    let quality_floor = num_clusters.saturating_mul(MIN_TRAINING_POINTS_PER_CENTROID);
+    let minimum_training = if sample_count >= quality_floor {
+        quality_floor
+    } else {
+        num_clusters
+    };
+    let exact_scan_limit = MAX_VALIDATION_COORDINATE_WORK
+        .checked_div(num_clusters.saturating_mul(values_per_vector).max(1))
+        .unwrap_or(0)
+        .max(1);
+    sample_count
+        .div_ceil(VALIDATION_SAMPLE_DENOMINATOR)
+        .clamp(1, MAX_VALIDATION_SAMPLES)
+        .min(exact_scan_limit)
+        .min(sample_count - minimum_training)
+}
+
+fn model_selection_seeds(
+    training_count: usize,
+    num_clusters: usize,
+    dim: usize,
+    has_validation: bool,
+) -> &'static [u64] {
+    if !has_validation {
+        return &MODEL_SELECTION_SEEDS[..1];
+    }
+    let distance_passes = crate::structures::vector::estimated_euclidean_kmeans_distance_multiplier(
+        training_count,
+        num_clusters,
+        25,
+    );
+    let work = training_count
+        .saturating_mul(num_clusters)
+        .saturating_mul(dim)
+        .saturating_mul(distance_passes)
+        .saturating_mul(MODEL_SELECTION_SEEDS.len());
+    if work <= MAX_MULTI_SEED_COORDINATE_WORK {
+        &MODEL_SELECTION_SEEDS
+    } else {
+        &MODEL_SELECTION_SEEDS[..1]
+    }
+}
+
+fn percentile_index(len: usize, percentile: usize) -> usize {
+    debug_assert!(len > 0 && percentile <= 100);
+    (len - 1).saturating_mul(percentile).div_ceil(100)
+}
+
+fn occupancy_quality(mut counts: Vec<usize>, observations: usize) -> OccupancyQuality {
+    if counts.is_empty() {
+        return OccupancyQuality {
+            p95: 0,
+            p99: 0,
+            max: 0,
+            empty: 0,
+            penalty: 0.0,
+        };
+    }
+    counts.sort_unstable();
+    let p95 = counts[percentile_index(counts.len(), 95)];
+    let p99 = counts[percentile_index(counts.len(), 99)];
+    let max = counts.last().copied().unwrap_or(0);
+    let empty = counts.partition_point(|&count| count == 0);
+    let expected = observations as f64 / counts.len() as f64;
+    let denominator = expected.max(1.0);
+    let p99_excess = (p99 as f64 / denominator - 1.0).max(0.0);
+    let max_excess = (max as f64 / denominator - 1.0).max(0.0);
+    let empty_fraction = empty as f64 / counts.len() as f64;
+    // Distortion remains the dominant selection signal. These terms only
+    // reject seeds with materially worse posting-list tails at similar error.
+    let penalty = 0.02 * p99_excess + 0.005 * max_excess + 0.05 * empty_fraction;
+    OccupancyQuality {
+        p95,
+        p99,
+        max,
+        empty,
+        penalty,
+    }
+}
+
+fn float_model_selection_objective(
+    mean_exact_distortion: f64,
+    mean_routed_distortion: f64,
+    occupancy_penalty: f64,
+) -> f64 {
+    let scale = mean_exact_distortion.max(f64::from(f32::EPSILON));
+    let routed_distortion_excess = (mean_routed_distortion - mean_exact_distortion).max(0.0);
+    mean_exact_distortion + scale * occupancy_penalty + routed_distortion_excess
+}
+
+/// Move a deterministic uniform holdout into the matrix suffix and return the
+/// element offset separating training and validation rows. Row swaps avoid a
+/// second vector allocation and keep the original sample capacity available to
+/// the trainer.
+fn partition_contiguous_holdout_suffix<T>(
+    values: &mut [T],
+    values_per_vector: usize,
+    validation_count: usize,
+    seed: u64,
+) -> usize {
+    assert!(values_per_vector > 0);
+    assert_eq!(values.len() % values_per_vector, 0);
+    let sample_count = values.len() / values_per_vector;
+    assert!(validation_count <= sample_count);
+    if validation_count == 0 {
+        return values.len();
+    }
+    let validation_indices =
+        deterministic_sample_ordinals(sample_count, validation_count, seed ^ 0x5641_4c49_4441_5445);
+    let split_row = sample_count - validation_count;
+    let prefix_validation_count = validation_indices.partition_point(|&index| index < split_row);
+    let mut right = sample_count;
+    for &left in &validation_indices[..prefix_validation_count] {
+        loop {
+            right -= 1;
+            if validation_indices.binary_search(&right).is_err() {
+                break;
+            }
+        }
+        debug_assert!(right >= split_row);
+        for component in 0..values_per_vector {
+            values.swap(
+                left * values_per_vector + component,
+                right * values_per_vector + component,
+            );
+        }
+    }
+    split_row * values_per_vector
+}
+
+fn evaluate_float_build_quality(
+    centroids: &crate::structures::CoarseCentroids,
+    validation: &[f32],
+    routing: crate::dsl::IvfRoutingMode,
+) -> Option<FloatBuildQuality> {
+    let dim = centroids.dim;
+    let validation_count = validation.len() / dim;
+    if validation_count == 0 {
+        return None;
+    }
+    let mut occupancy = vec![0usize; centroids.num_clusters as usize];
+    let mut residual_scales = Vec::with_capacity(validation_count);
+    let mut exact_distortion_sum = 0.0f64;
+    let mut routed_distortion_sum = 0.0f64;
+    let mut router_hits = 0usize;
+    let mut construction_assignments = 0usize;
+    let effective_routing = crate::structures::vector::ivf::routing::effective_routing_mode(
+        routing,
+        centroids.num_clusters as usize,
+    );
+    let exact_routing = effective_routing == crate::dsl::IvfRoutingMode::Flat;
+    for vector in validation.chunks_exact(dim) {
+        let (exact_cluster_id, routed_cluster_id) = if exact_routing {
+            if centroids.soar_config.is_some() {
+                // Flat SOAR already performs the exact all-centroid pass needed
+                // for its primary and secondary assignments. Its primary is
+                // therefore both the exact and query-routed nearest centroid.
+                let construction_assignment = centroids.assign_with_routing(vector, routing);
+                let exact_cluster_id = construction_assignment.primary_cluster;
+                for cluster_id in construction_assignment.all_clusters() {
+                    occupancy[cluster_id as usize] += 1;
+                    construction_assignments += 1;
+                }
+                (exact_cluster_id, exact_cluster_id)
+            } else {
+                // With neither an approximate router nor SOAR, one exact pass
+                // supplies exact quality, query routing, and construction
+                // occupancy.
+                let exact_cluster_id = centroids.find_nearest(vector);
+                occupancy[exact_cluster_id as usize] += 1;
+                construction_assignments += 1;
+                (exact_cluster_id, exact_cluster_id)
+            }
+        } else {
+            let exact_cluster_id = centroids.find_nearest(vector);
+            let routed_cluster_id = centroids.probe(vector, 1, routing).cluster_ids[0];
+            let construction_assignment = centroids.assign_with_routing(vector, routing);
+            for cluster_id in construction_assignment.all_clusters() {
+                occupancy[cluster_id as usize] += 1;
+                construction_assignments += 1;
+            }
+            (exact_cluster_id, routed_cluster_id)
+        };
+        router_hits += usize::from(routed_cluster_id == exact_cluster_id);
+        let exact_distance = vector
+            .iter()
+            .zip(centroids.get_centroid(exact_cluster_id))
+            .map(|(&value, &center)| {
+                let delta = value - center;
+                delta * delta
+            })
+            .sum::<f32>();
+        let routed_distance = if routed_cluster_id == exact_cluster_id {
+            exact_distance
+        } else {
+            vector
+                .iter()
+                .zip(centroids.get_centroid(routed_cluster_id))
+                .map(|(&value, &center)| {
+                    let delta = value - center;
+                    delta * delta
+                })
+                .sum::<f32>()
+        };
+        exact_distortion_sum += f64::from(exact_distance);
+        routed_distortion_sum += f64::from(routed_distance);
+        residual_scales.push(exact_distance.max(0.0).sqrt());
+    }
+    residual_scales.sort_unstable_by(f32::total_cmp);
+    let occupancy = occupancy_quality(occupancy, construction_assignments);
+    let mean_exact_distortion = exact_distortion_sum / validation_count as f64;
+    let mean_routed_distortion = routed_distortion_sum / validation_count as f64;
+    let router_recall_at_1 = router_hits as f64 / validation_count as f64;
+    let mean_construction_assignments = construction_assignments as f64 / validation_count as f64;
+    // Keep exact codebook distortion as the primary signal. Price approximate
+    // routing by its measured excess distortion rather than treating all
+    // misses equally; retain recall@1 as a separately reported diagnostic.
+    let objective = float_model_selection_objective(
+        mean_exact_distortion,
+        mean_routed_distortion,
+        occupancy.penalty,
+    );
+    Some(FloatBuildQuality {
+        objective,
+        mean_exact_distortion,
+        mean_routed_distortion,
+        router_recall_at_1,
+        mean_construction_assignments,
+        residual_p50: residual_scales[percentile_index(validation_count, 50)],
+        residual_p95: residual_scales[percentile_index(validation_count, 95)],
+        residual_p99: residual_scales[percentile_index(validation_count, 99)],
+        occupancy,
+    })
 }
 
 /// Validate the configured centroid count and cap it to the training sample.
@@ -409,7 +724,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // one bounded sample, one field's clustering scratch, and one
             // generated artifact set can coexist.
             let corpus_count = total_vectors.get(&field.0).copied().unwrap_or(0);
-            let Some(sample) = self
+            let Some(mut sample) = self
                 .collect_training_sample(segment_ids, *field, config, corpus_count)
                 .await?
             else {
@@ -421,7 +736,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     Self::train_field_model(
                         *field,
                         config,
-                        &sample,
+                        &mut sample,
                         corpus_count,
                         artifact_generation,
                     )
@@ -651,31 +966,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             self.config.vector_training_memory_bytes,
             bytes_per_sample,
         )?;
-        let take = total.min(limit);
-        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
-            0x4845_524d_4553_4956 ^ field.0 as u64 ^ total as u64,
-        );
-        let mut ordinals = Vec::with_capacity(take);
-        if take == total {
-            ordinals.extend(0..total);
-        } else {
-            let blocks = take.div_ceil(SAMPLE_BLOCK);
-            for block in 0..blocks {
-                let block_len = SAMPLE_BLOCK.min(take - ordinals.len());
-                let stratum_start = block.saturating_mul(total) / blocks;
-                let stratum_end = (block + 1).saturating_mul(total) / blocks;
-                let latest_start = stratum_end.saturating_sub(block_len);
-                let start = if latest_start > stratum_start {
-                    rand::Rng::random_range(&mut rng, stratum_start..=latest_start)
-                } else {
-                    stratum_start
-                };
-                ordinals.extend(start..start + block_len);
-            }
-        }
+        let take = final_training_sample_count(config, total, limit)?;
+        let sample_seed = 0x4845_524d_4553_4956 ^ field.0 as u64 ^ total as u64;
+        let ordinals = deterministic_sample_ordinals(total, take, sample_seed);
 
         let mut sample = match config {
-            IvfFieldConfig::Float(_) => TrainingSample::Float(Vec::with_capacity(take)),
+            IvfFieldConfig::Float(config) => TrainingSample::Float(Vec::with_capacity(
+                take.checked_mul(config.dim)
+                    .ok_or_else(|| Error::Schema("float training sample size overflows".into()))?,
+            )),
             IvfFieldConfig::Binary(_) => TrainingSample::Binary(Vec::with_capacity(
                 take.checked_mul(bytes_per_sample)
                     .ok_or_else(|| Error::Schema("binary training sample size overflows".into()))?,
@@ -707,21 +1006,25 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             let mut run_start = 0;
             while run_start < selected.len() {
                 let mut run_end = run_start + 1;
-                while run_end < selected.len()
-                    && run_end - run_start < max_read_vectors
-                    && selected[run_end] == selected[run_end - 1] + 1
-                {
+                while run_end < selected.len() {
+                    let selected_count = run_end - run_start + 1;
+                    let span = selected[run_end] - selected[run_start] + 1;
+                    if span > max_read_vectors
+                        || span > selected_count.saturating_mul(MAX_SAMPLE_READ_AMPLIFICATION)
+                    {
+                        break;
+                    }
                     run_end += 1;
                 }
                 let local_start = selected[run_start] - base;
-                let run_len = run_end - run_start;
+                let read_len = selected[run_end - 1] - selected[run_start] + 1;
                 let bytes = lazy_flat
-                    .read_vectors_batch(local_start, run_len)
+                    .read_vectors_batch(local_start, read_len)
                     .await
                     .map_err(crate::Error::Io)?;
                 match &mut sample {
                     TrainingSample::Binary(codes) => {
-                        let expected = run_len.checked_mul(bytes_per_sample).ok_or_else(|| {
+                        let expected = read_len.checked_mul(bytes_per_sample).ok_or_else(|| {
                             Error::Corruption("binary sample read size overflows".into())
                         })?;
                         if bytes.len() != expected {
@@ -730,11 +1033,17 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                                 bytes.len(),
                             )));
                         }
-                        codes.extend_from_slice(bytes.as_slice());
+                        for &ordinal in &selected[run_start..run_end] {
+                            let relative = ordinal - selected[run_start];
+                            let offset = relative * bytes_per_sample;
+                            codes.extend_from_slice(
+                                &bytes.as_slice()[offset..offset + bytes_per_sample],
+                            );
+                        }
                     }
-                    TrainingSample::Float(vectors) => {
+                    TrainingSample::Float(values) => {
                         let dim = lazy_flat.dim;
-                        let float_count = run_len.checked_mul(dim).ok_or_else(|| {
+                        let float_count = read_len.checked_mul(dim).ok_or_else(|| {
                             Error::Corruption("float sample read size overflows".into())
                         })?;
                         let mut decoded = vec![0.0; float_count];
@@ -745,7 +1054,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             &mut decoded,
                         )
                         .map_err(crate::Error::Io)?;
-                        vectors.extend(decoded.chunks_exact(dim).map(<[f32]>::to_vec));
+                        for &ordinal in &selected[run_start..run_end] {
+                            let relative = ordinal - selected[run_start];
+                            let offset = relative * dim;
+                            values.extend_from_slice(&decoded[offset..offset + dim]);
+                        }
                     }
                 }
                 run_start = run_end;
@@ -777,7 +1090,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     fn train_field_model(
         field: Field,
         config: &IvfFieldConfig,
-        sample: &TrainingSample,
+        sample: &mut TrainingSample,
         corpus_count: usize,
         artifact_generation: &str,
     ) -> Result<TrainedFieldModel> {
@@ -804,53 +1117,138 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             format!("{VECTOR_ARTIFACT_PREFIX}{artifact_generation}_field_{field_id}_centroids.bin");
 
         let artifacts = match (config, sample) {
-            (IvfFieldConfig::Float(config), TrainingSample::Float(vectors))
+            (IvfFieldConfig::Float(config), TrainingSample::Float(values))
                 if config.index_type == VectorIndexType::IvfTq =>
             {
-                let mut coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters)
+                values
+                    .chunks_exact_mut(dim)
+                    .for_each(crate::structures::vector::ivf::routing::normalize_cosine_in_place);
+                let candidate_validation_count =
+                    validation_sample_count(sample_count, num_clusters, dim);
+                let candidate_training_count = sample_count - candidate_validation_count;
+                let seeds = model_selection_seeds(
+                    candidate_training_count,
+                    num_clusters,
+                    dim,
+                    candidate_validation_count > 0,
+                );
+                let split_seed =
+                    MODEL_SELECTION_SEEDS[0] ^ u64::from(field_id) ^ corpus_count as u64;
+                let split = if seeds.len() > 1 {
+                    partition_contiguous_holdout_suffix(
+                        values.as_mut_slice(),
+                        dim,
+                        candidate_validation_count,
+                        split_seed,
+                    )
+                } else {
+                    values.len()
+                };
+                let (training_values, validation) = values.as_slice().split_at(split);
+                let training_count = training_values.len() / dim;
+                let validation_count = validation.len() / dim;
+                if seeds.len() > 1 {
+                    log::info!(
+                        "Field {field_id}: {} training + {} held-out vectors; evaluating {} deterministic centroid seed(s)",
+                        training_count,
+                        validation_count,
+                        seeds.len(),
+                    );
+                } else {
+                    log::info!(
+                        "Field {field_id}: training all {} sampled vectors with one deterministic \
+                         centroid seed; model-selection holdout disabled",
+                        training_count,
+                    );
+                }
+
+                let mut base_config = crate::structures::CoarseConfig::new(dim, num_clusters)
                     .with_routing(config.ivf_routing);
                 if let Some(soar) = config.soar.clone() {
-                    coarse_config = coarse_config.with_soar(soar);
+                    base_config = base_config.with_soar(soar);
                 }
-                // Faiss-style clustering ceiling: past ~256 points per
-                // centroid, extra samples multiply every Lloyd iteration
-                // without materially moving the centroids. Stride-subsample
-                // the (already stratified) training set past that.
-                let ceiling = num_clusters.saturating_mul(COARSE_TRAINING_POINTS_PER_CENTROID);
-                let training_set: Vec<Vec<f32>> = if vectors.len() > ceiling && ceiling > 0 {
-                    log::info!(
-                        "Field {field_id}: capping coarse training at {ceiling} of {} samples \
-                         ({COARSE_TRAINING_POINTS_PER_CENTROID}/centroid)",
-                        vectors.len(),
+
+                let mut selected: Option<(
+                    crate::structures::CoarseCentroids,
+                    Option<FloatBuildQuality>,
+                    u64,
+                )> = None;
+                for &seed in seeds {
+                    let candidate = crate::structures::CoarseCentroids::train_contiguous(
+                        &base_config.clone().with_seed(seed),
+                        training_values,
+                        training_count,
                     );
-                    (0..ceiling)
-                        .map(|index| vectors[index.saturating_mul(vectors.len()) / ceiling].clone())
-                        .collect()
+                    let quality =
+                        evaluate_float_build_quality(&candidate, validation, config.ivf_routing);
+                    if let Some(quality) = quality {
+                        log::info!(
+                            "Field {field_id} IVF candidate seed={seed}: objective={:.6}, \
+                             exact/routed_mean_distortion={:.6}/{:.6}, router_recall@1={:.4}, \
+                             construction_postings/vector={:.3}, \
+                             residual_scale[p50/p95/p99]={:.4}/{:.4}/{:.4}, \
+                             construction_occupancy[p95/p99/max/empty]={}/{}/{}/{}",
+                            quality.objective,
+                            quality.mean_exact_distortion,
+                            quality.mean_routed_distortion,
+                            quality.router_recall_at_1,
+                            quality.mean_construction_assignments,
+                            quality.residual_p50,
+                            quality.residual_p95,
+                            quality.residual_p99,
+                            quality.occupancy.p95,
+                            quality.occupancy.p99,
+                            quality.occupancy.max,
+                            quality.occupancy.empty,
+                        );
+                    }
+                    let replace = selected.as_ref().is_none_or(|(_, best, _)| {
+                        quality
+                            .map(|quality| quality.objective)
+                            .unwrap_or(f64::INFINITY)
+                            .total_cmp(
+                                &best
+                                    .map(|quality| quality.objective)
+                                    .unwrap_or(f64::INFINITY),
+                            )
+                            .is_lt()
+                    });
+                    if replace {
+                        selected = Some((candidate, quality, seed));
+                    }
+                }
+                let (mut centroids, quality, seed) =
+                    selected.expect("the fixed centroid seed bank is non-empty");
+                if let Some(quality) = quality {
+                    log::info!(
+                        "Field {field_id}: selected IVF seed {seed} with held-out objective {:.6} \
+                         (occupancy penalty {:.4})",
+                        quality.objective,
+                        quality.occupancy.penalty,
+                    );
                 } else {
-                    Vec::new()
-                };
-                let training_ref: &[Vec<f32>] = if training_set.is_empty() {
-                    vectors
-                } else {
-                    &training_set
-                };
-                TrainedFieldArtifacts::FloatCentroids(crate::structures::CoarseCentroids::train(
-                    &coarse_config,
-                    training_ref,
-                ))
+                    log::info!(
+                        "Field {field_id}: selected IVF seed {seed} without a model-selection \
+                         holdout",
+                    );
+                }
+                centroids.version =
+                    crate::structures::mark_ivf_tq_cosine_generation(centroids.version);
+                TrainedFieldArtifacts::FloatCentroids(centroids)
             }
             (IvfFieldConfig::Binary(config), TrainingSample::Binary(codes)) => {
+                let byte_len = dim.div_ceil(8);
+                let training_count = codes.len() / byte_len;
                 let mut binary_config = crate::structures::BinaryIvfConfig::new(dim, num_clusters);
-                binary_config.max_train_samples = sample_count;
+                binary_config.max_train_samples = training_count;
                 binary_config.routing = config.ivf_routing;
-                TrainedFieldArtifacts::Binary(
-                    crate::structures::BinaryCoarseQuantizer::train(
-                        binary_config,
-                        codes,
-                        sample_count,
-                    )
-                    .map_err(Error::Io)?,
+                let quantizer = crate::structures::BinaryCoarseQuantizer::train(
+                    binary_config,
+                    codes,
+                    training_count,
                 )
+                .map_err(Error::Io)?;
+                TrainedFieldArtifacts::Binary(quantizer)
             }
             _ => {
                 return Err(Error::Internal(format!(
@@ -1004,6 +1402,139 @@ mod tests {
     }
 
     #[test]
+    fn final_sample_is_selected_at_the_points_per_centroid_ceiling() {
+        let config = IvfFieldConfig::Float(DenseVectorConfig::ivf_tq(8, Some(4), 1));
+        assert_eq!(
+            final_training_sample_count(&config, 10_000, 10_000).unwrap(),
+            4 * COARSE_TRAINING_POINTS_PER_CENTROID,
+        );
+        assert_eq!(
+            final_training_sample_count(&config, 10_000, 512).unwrap(),
+            512,
+        );
+    }
+
+    #[test]
+    fn holdout_preserves_the_training_points_per_centroid_floor() {
+        assert_eq!(validation_sample_count(390, 10, 8), 0);
+        assert_eq!(validation_sample_count(391, 10, 8), 1);
+
+        let config = IvfFieldConfig::Float(ivf_config(None));
+        let sample_count = 1_000;
+        let clusters = effective_field_num_clusters(&config, 10_000, sample_count).unwrap();
+        let held_out = validation_sample_count(sample_count, clusters, config.dim());
+        assert!(
+            sample_count - held_out >= clusters.saturating_mul(MIN_TRAINING_POINTS_PER_CENTROID)
+        );
+    }
+
+    #[test]
+    fn deterministic_point_sample_is_sorted_unique_and_repeatable() {
+        let first = deterministic_sample_ordinals(10_000, 1_000, 7);
+        let repeated = deterministic_sample_ordinals(10_000, 1_000, 7);
+        let other_seed = deterministic_sample_ordinals(10_000, 1_000, 8);
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_seed);
+        assert_eq!(first.len(), 1_000);
+        assert!(first.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(first.iter().all(|&ordinal| ordinal < 10_000));
+    }
+
+    #[test]
+    fn model_selection_accounts_for_initialization_and_all_lloyd_passes() {
+        assert_eq!(model_selection_seeds(1_000, 16, 8, true).len(), 2);
+        assert_eq!(model_selection_seeds(1_000, 16, 8, false).len(), 1);
+        // A single assignment pass is only 180M coordinate comparisons, but
+        // two complete initialization/refinement candidates exceed the budget.
+        assert_eq!(model_selection_seeds(1_800, 1_000, 100, true).len(), 1);
+        assert_eq!(
+            model_selection_seeds(MAX_MULTI_SEED_COORDINATE_WORK, 2, 1, true).len(),
+            1,
+        );
+    }
+
+    #[test]
+    fn flat_float_sample_partitions_a_deterministic_holdout_suffix() {
+        let original: Vec<f32> = (0..20).map(|value| value as f32).collect();
+        let mut first = original.clone();
+        let mut repeated = original.clone();
+        let validation_count = validation_sample_count(10, 2, 2);
+        let first_split = partition_contiguous_holdout_suffix(&mut first, 2, validation_count, 11);
+        let repeated_split =
+            partition_contiguous_holdout_suffix(&mut repeated, 2, validation_count, 11);
+
+        assert_eq!(first, repeated);
+        assert_eq!(first_split, repeated_split);
+        assert_eq!(first_split, 18);
+        assert_eq!(first.len(), original.len());
+        assert_eq!(first[first_split..].len(), 2);
+
+        let mut first_components: Vec<u32> =
+            first.chunks_exact(2).map(|row| row[0] as u32).collect();
+        first_components.sort_unstable();
+        assert_eq!(first_components, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+        assert!(first.chunks_exact(2).all(|row| row[1] == row[0] + 1.0));
+    }
+
+    #[test]
+    fn occupancy_report_exposes_tail_and_empty_cells() {
+        let report = occupancy_quality(vec![0, 1, 2, 7], 10);
+        assert_eq!(report.p95, 7);
+        assert_eq!(report.p99, 7);
+        assert_eq!(report.max, 7);
+        assert_eq!(report.empty, 1);
+        assert!(report.penalty > 0.0);
+    }
+
+    #[test]
+    fn model_selection_objective_prices_routed_distortion_excess() {
+        let objective = float_model_selection_objective(2.0, 3.0, 0.1);
+        assert!((objective - 3.2).abs() < f64::EPSILON);
+        assert_eq!(float_model_selection_objective(2.0, 1.5, 0.0), 2.0);
+    }
+
+    #[test]
+    fn float_quality_reports_exact_query_router_recall() {
+        let training = [0.0, 0.0, 0.1, 0.0, 10.0, 10.0, 10.1, 10.0];
+        let config = crate::structures::CoarseConfig::new(2, 2);
+        let centroids = crate::structures::CoarseCentroids::train_contiguous(&config, &training, 4);
+        for routing in [
+            crate::dsl::IvfRoutingMode::Flat,
+            crate::dsl::IvfRoutingMode::Auto,
+        ] {
+            let quality =
+                evaluate_float_build_quality(&centroids, &[0.05, 0.0, 10.05, 10.0], routing)
+                    .unwrap();
+
+            assert_eq!(quality.router_recall_at_1, 1.0);
+            assert!(
+                (quality.mean_exact_distortion - quality.mean_routed_distortion).abs()
+                    < f64::EPSILON
+            );
+            assert_eq!(quality.mean_construction_assignments, 1.0);
+            assert_eq!(quality.occupancy.empty, 0);
+        }
+    }
+
+    #[test]
+    fn float_quality_counts_soar_secondary_postings_in_occupancy() {
+        let training = [0.0, 0.0, 0.1, 0.0, 10.0, 10.0, 10.1, 10.0];
+        let config = crate::structures::CoarseConfig::new(2, 2)
+            .with_routing(crate::dsl::IvfRoutingMode::Flat)
+            .with_soar(crate::structures::SoarConfig::full());
+        let centroids = crate::structures::CoarseCentroids::train_contiguous(&config, &training, 4);
+        let quality = evaluate_float_build_quality(
+            &centroids,
+            &[0.05, 0.0, 10.05, 10.0],
+            crate::dsl::IvfRoutingMode::Flat,
+        )
+        .unwrap();
+
+        assert_eq!(quality.mean_construction_assignments, 2.0);
+        assert_eq!(quality.occupancy.empty, 0);
+    }
+
+    #[test]
     fn artifact_writer_enforces_limit_without_writing_past_it() {
         let mut output = Vec::new();
         let mut writer = SizeLimitedWriter::new(&mut output, 3);
@@ -1011,6 +1542,59 @@ mod tests {
         let error = writer.write_all(&[3, 4]).unwrap_err().to_string();
         assert!(error.contains("3-byte safety limit"), "{error}");
         assert_eq!(output, vec![1, 2]);
+    }
+
+    #[test]
+    fn ivf_tq_training_marks_generation_normalizes_and_calibrates_default_soar() {
+        let config = IvfFieldConfig::Float(DenseVectorConfig::ivf_tq(2, Some(1), 1));
+        let mut sample = TrainingSample::Float(vec![3.0, 4.0, 30.0, 40.0, 300.0, 400.0]);
+        let model = IndexWriter::<crate::directories::RamDirectory>::train_field_model(
+            Field(3),
+            &config,
+            &mut sample,
+            3,
+            "test",
+        )
+        .unwrap();
+        let TrainedFieldArtifacts::FloatCentroids(centroids) = model.artifacts else {
+            panic!("expected float IVF-TQ centroids");
+        };
+
+        assert!(crate::structures::is_ivf_tq_cosine_generation(
+            centroids.version
+        ));
+        assert!((centroids.centroids[0] - 0.6).abs() < 1e-6);
+        assert!((centroids.centroids[1] - 0.8).abs() < 1e-6);
+        let soar = centroids
+            .soar_config
+            .as_ref()
+            .expect("default SOAR should propagate into the trained router");
+        assert_eq!(soar.num_secondary, 1);
+        assert!(soar.selective);
+        assert!(
+            soar.spill_threshold > 0.0,
+            "the negative 30% target tag should be replaced by a calibrated threshold"
+        );
+        assert_eq!(soar.calibration_target(), None);
+    }
+
+    #[test]
+    fn explicitly_disabled_soar_stays_off_during_ivf_tq_training() {
+        let config = IvfFieldConfig::Float(DenseVectorConfig::ivf_tq(2, Some(1), 1).without_soar());
+        let mut sample = TrainingSample::Float(vec![3.0, 4.0, 30.0, 40.0, 300.0, 400.0]);
+        let model = IndexWriter::<crate::directories::RamDirectory>::train_field_model(
+            Field(3),
+            &config,
+            &mut sample,
+            3,
+            "test-no-soar",
+        )
+        .unwrap();
+        let TrainedFieldArtifacts::FloatCentroids(centroids) = model.artifacts else {
+            panic!("expected float IVF-TQ centroids");
+        };
+
+        assert!(centroids.soar_config.is_none());
     }
 
     // ===== rebuild destructive-downgrade regression tests =====

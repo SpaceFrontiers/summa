@@ -9,7 +9,10 @@ mod ivf_tq;
 #[cfg(feature = "native")]
 pub(crate) use binary_ivf::BinaryIvfBuilder;
 pub use binary_ivf::{BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex};
-pub use ivf_tq::{IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan};
+pub use ivf_tq::{
+    IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan, is_ivf_tq_cosine_generation,
+    mark_ivf_tq_cosine_generation,
+};
 
 #[derive(Clone, Copy)]
 struct RankedEntry {
@@ -54,6 +57,73 @@ pub(crate) struct BoundedAnnCollector<const BY_DOCUMENT: bool, const HIGHER_IS_B
     k: usize,
     heap: std::collections::BinaryHeap<RankedEntry>,
     best: rustc_hash::FxHashMap<u64, RankedEntry>,
+}
+
+/// Heap-only top-k collector for streams whose `(doc_id, ordinal)` keys are
+/// guaranteed unique by construction.
+///
+/// Unlike `BoundedAnnCollector`, this deliberately performs no deduplication
+/// and therefore avoids an O(k) hash map plus a hash-table lookup on every
+/// competitive insertion.
+pub(crate) struct BoundedUniqueAnnCollector<const HIGHER_IS_BETTER: bool> {
+    k: usize,
+    heap: std::collections::BinaryHeap<RankedEntry>,
+}
+
+impl<const HIGHER_IS_BETTER: bool> BoundedUniqueAnnCollector<HIGHER_IS_BETTER> {
+    pub(crate) fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: std::collections::BinaryHeap::with_capacity(k.min(8_192)),
+        }
+    }
+
+    #[inline]
+    fn rank(value: f32) -> f32 {
+        if HIGHER_IS_BETTER { -value } else { value }
+    }
+
+    #[inline]
+    fn value(rank: f32) -> f32 {
+        if HIGHER_IS_BETTER { -rank } else { rank }
+    }
+
+    #[inline]
+    pub(crate) fn insert(&mut self, doc_id: u32, ordinal: u16, value: f32) {
+        if self.k == 0 || !value.is_finite() {
+            return;
+        }
+        let candidate = RankedEntry {
+            doc_id,
+            ordinal,
+            rank: Self::rank(value),
+        };
+        if self.heap.len() < self.k {
+            self.heap.push(candidate);
+        } else if self.heap.peek().is_some_and(|worst| candidate < *worst) {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    pub(crate) fn into_sorted_results(self) -> Vec<(u32, u16, f32)> {
+        let mut results: Vec<_> = self
+            .heap
+            .into_iter()
+            .map(|entry| (entry.doc_id, entry.ordinal, Self::value(entry.rank)))
+            .collect();
+        results.sort_unstable_by(|a, b| {
+            let order = if HIGHER_IS_BETTER {
+                b.2.total_cmp(&a.2)
+            } else {
+                a.2.total_cmp(&b.2)
+            };
+            order
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        results
+    }
 }
 
 impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
@@ -159,6 +229,16 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
         self.heap.peek().map(|entry| Self::value(entry.rank))
     }
 
+    /// Merge another bounded collector without sorting or materializing its
+    /// retained entries. This is used by parallel scans to reduce worker-local
+    /// top-k state while keeping temporary memory bounded by the workers.
+    #[cfg(any(feature = "native", test))]
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        for entry in other.best.into_values() {
+            self.insert(entry.doc_id, entry.ordinal, Self::value(entry.rank));
+        }
+    }
+
     pub(crate) fn into_sorted_results(self) -> Vec<(u32, u16, f32)> {
         let mut results: Vec<_> = self
             .best
@@ -181,7 +261,7 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
 
 #[cfg(test)]
 mod tests {
-    use super::BoundedAnnCollector;
+    use super::{BoundedAnnCollector, BoundedUniqueAnnCollector};
     use rand::{Rng, SeedableRng};
 
     type BoundedDistanceCollector = BoundedAnnCollector<false, false>;
@@ -255,6 +335,37 @@ mod tests {
             collector.into_sorted_results(),
             vec![(3, 0, 0.75), (4, 0, 0.75)]
         );
+    }
+
+    #[test]
+    fn bounded_collectors_merge_without_changing_top_k() {
+        let mut left = BoundedDocumentScoreCollector::new(3);
+        left.insert(1, 0, 0.5);
+        left.insert(2, 0, 0.8);
+        left.insert(3, 0, 0.6);
+
+        let mut right = BoundedDocumentScoreCollector::new(3);
+        right.insert(1, 1, 0.9);
+        right.insert(4, 0, 0.7);
+        right.insert(5, 0, 0.4);
+
+        left.merge_from(right);
+        assert_eq!(
+            left.into_sorted_results(),
+            vec![(1, 1, 0.9), (2, 0, 0.8), (4, 0, 0.7)]
+        );
+    }
+
+    #[test]
+    fn heap_only_collector_matches_deduplicating_collector_for_unique_keys() {
+        let mut bounded = BoundedDocumentScoreCollector::new(17);
+        let mut unique = BoundedUniqueAnnCollector::<true>::new(17);
+        for doc_id in 0..1_000 {
+            let score = ((doc_id * 37) % 211) as f32 / 211.0;
+            bounded.insert(doc_id, 0, score);
+            unique.insert(doc_id, 0, score);
+        }
+        assert_eq!(unique.into_sorted_results(), bounded.into_sorted_results(),);
     }
 
     #[test]

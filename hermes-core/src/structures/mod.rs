@@ -139,6 +139,8 @@ pub use vector::{
     TqIvfEncodeScratch,
     TqIvfQueryPlan,
     TqQueryPlan,
+    is_ivf_tq_cosine_generation,
+    mark_ivf_tq_cosine_generation,
 };
 
 // Re-export simd

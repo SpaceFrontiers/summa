@@ -511,6 +511,12 @@ impl IndexMetadata {
                             "trained centroids for field {field_id} do not match metadata/schema"
                         )));
                     }
+                    if !crate::structures::is_ivf_tq_cosine_generation(c.version) {
+                        return Err(Error::Corruption(format!(
+                            "trained IVF-TQ centroids for field {field_id} use an \
+                             unsupported legacy generation; rebuild the index"
+                        )));
+                    }
                     c.validate_routing(schema_config.ivf_routing)
                         .map_err(|error| {
                             Error::Corruption(format!(
@@ -766,7 +772,7 @@ mod tests {
             num_clusters: 1,
             dim: 2,
             centroids: vec![0.25, 0.75],
-            version: 7,
+            version: crate::structures::mark_ivf_tq_cosine_generation(7),
             soar_config: None,
             routing_index: None,
         }
@@ -916,6 +922,30 @@ mod tests {
         .expect("IVF-TQ Built state with a codebook file must fail")
         .to_string();
         assert!(error.contains("codebook"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn legacy_ivf_tq_centroid_generation_is_rejected_while_loading() {
+        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
+        let directory = crate::directories::RamDirectory::new();
+        let mut metadata = IndexMetadata::new(schema.clone());
+        metadata.init_field(field.0, VectorIndexType::IvfTq);
+        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
+        let mut legacy = test_centroids();
+        legacy.version = 7;
+        write_bincode(&directory, "field_0_centroids.bin", &legacy).await;
+
+        let error = IndexMetadata::try_load_trained_from_fields(
+            &metadata.vector_fields,
+            &schema,
+            &directory,
+        )
+        .await
+        .err()
+        .expect("legacy IVF-TQ centroid state must fail while loading")
+        .to_string();
+        assert!(error.contains("unsupported legacy generation"), "{error}");
+        assert!(error.contains("rebuild the index"), "{error}");
     }
 
     #[tokio::test]
