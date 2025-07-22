@@ -38,11 +38,12 @@
 //! - **Early termination**: stop when superblock/block UB < top-k threshold
 
 use super::scoring::{ScoreCollector, ScoredDoc, SharedThreshold};
+use crate::segment::bmp_adaptive::{AdaptiveBlock, AdaptivePostings};
 use crate::segment::bmp_grid::{
     CompressedGrid, GRID_GROUP_CELLS, LSP_SUPERBLOCK_GRID_BITS, accumulate_packed_u4,
     accumulate_u8, block_grid_scale,
 };
-use crate::segment::{BMP_SUPERBLOCK_SIZE, BmpIndex, block_term_postings, find_dim_in_block_data};
+use crate::segment::{BMP_SUPERBLOCK_SIZE, BmpIndex};
 
 // dim_id is used directly as grid row index. No dim_idx indirection.
 
@@ -1057,6 +1058,19 @@ fn zero_touched_acc(acc: &mut [u32], touched: &[u64; 4]) {
     }
 }
 
+/// Dense rows deliberately mark their whole block. At the density crossover
+/// at least half of those slots already contain postings, and a full-word mask
+/// lets the accumulation loop remain branch-free and vectorizable.
+#[inline(always)]
+fn touch_dense_block(touched: &mut [u64; 4], block_size: usize) {
+    let full_words = block_size / 64;
+    touched[..full_words].fill(u64::MAX);
+    let remainder = block_size % 64;
+    if remainder != 0 {
+        touched[full_words] |= (1u64 << remainder) - 1;
+    }
+}
+
 /// Score a block using integer arithmetic (u32 accumulators, u16 weights).
 ///
 /// Uses one per-query-dimension block-presence bitset before binary search.
@@ -1075,10 +1089,7 @@ fn zero_touched_acc(acc: &mut [u32], touched: &[u64; 4]) {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn score_block_bsearch_int(
-    num_terms: u32,
-    dim_ptr: *const u8,
-    ps_ptr: *const u8,
-    post_ptr: *const u8,
+    block: AdaptiveBlock<'_>,
     query_by_dim_u16: &[(u32, u16)],
     query_mask: u64,
     candidate_mask: u64,
@@ -1087,8 +1098,13 @@ fn score_block_bsearch_int(
     acc: &mut [u32],
     touched: &mut [u64; 4],
     block_size: usize,
-    total_block_postings: u32,
 ) {
+    let valid_query_bits = if query_by_dim_u16.len() == u64::BITS as usize {
+        u64::MAX
+    } else {
+        (1u64 << query_by_dim_u16.len()) - 1
+    };
+    let narrow_query = (query_mask & valid_query_bits).count_ones() <= 8;
     for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
         // The fused grid decoder produces one block-presence bitset per query
         // dimension. Avoid transposing those bits into 64 per-block masks.
@@ -1098,17 +1114,38 @@ fn score_block_bsearch_int(
         {
             continue;
         }
-        // find_dim_in_block_data always uses u32 dim_ids
-        if let Some(local_term) = find_dim_in_block_data(dim_ptr, num_terms, dim_id) {
-            let postings =
-                unsafe { block_term_postings(ps_ptr, post_ptr, local_term, total_block_postings) };
-            for p in postings {
-                let slot = p.local_slot as usize;
-                if slot >= block_size {
-                    continue;
+        let local_term = if narrow_query {
+            block.find_dimension_branching(dim_id)
+        } else {
+            block.find_dimension(dim_id)
+        };
+        if let Some(local_term) = local_term
+            && let Some(postings) = block.postings(local_term)
+        {
+            match postings {
+                AdaptivePostings::Sparse(postings) => {
+                    for p in postings {
+                        let slot = p.local_slot as usize;
+                        if slot >= block_size {
+                            continue;
+                        }
+                        // At most MAX_QUERY_TERMS=64 distinct u16×u8
+                        // contributions reach one slot, whose worst-case sum
+                        // is below u32::MAX. Plain addition keeps this loop
+                        // vector/scalar friendly without changing overflow
+                        // semantics for any valid query.
+                        acc[slot] += w as u32 * p.impact as u32;
+                        touched[slot / 64] |= 1u64 << (slot % 64);
+                    }
                 }
-                acc[slot] = acc[slot].saturating_add(w as u32 * p.impact as u32);
-                touched[slot / 64] |= 1u64 << (slot % 64);
+                AdaptivePostings::Dense(impacts) => {
+                    let weight = w as u32;
+                    for (score, &impact) in acc[..block_size].iter_mut().zip(impacts) {
+                        // Same bounded-sum invariant as the sparse loop.
+                        *score += weight * impact as u32;
+                    }
+                    touch_dense_block(touched, block_size);
+                }
             }
         }
     }
@@ -1195,17 +1232,12 @@ fn score_superblock_blocks(
             }
         }
 
-        let (num_terms, dim_ptr, ps_ptr, _, post_ptr, total_block_postings) =
-            index.parse_block(block_id);
         let mut touched = [0u64; 4];
-        if num_terms > 0 {
+        if let Some(block) = index.parse_block(block_id) {
             if two_phase && collector.len() >= k {
                 // Phase 1: Score only the heaviest dims
                 score_block_bsearch_int(
-                    num_terms,
-                    dim_ptr,
-                    ps_ptr,
-                    post_ptr,
+                    block,
                     query_by_dim_u16,
                     phase1_mask,
                     candidate_mask,
@@ -1214,7 +1246,6 @@ fn score_superblock_blocks(
                     acc,
                     &mut touched,
                     block_size,
-                    total_block_postings,
                 );
 
                 // Keep the subtraction and addition in integer accumulator
@@ -1235,10 +1266,7 @@ fn score_superblock_blocks(
 
                 // Phase 2: Score remaining dims
                 score_block_bsearch_int(
-                    num_terms,
-                    dim_ptr,
-                    ps_ptr,
-                    post_ptr,
+                    block,
                     query_by_dim_u16,
                     !phase1_mask,
                     candidate_mask,
@@ -1247,15 +1275,11 @@ fn score_superblock_blocks(
                     acc,
                     &mut touched,
                     block_size,
-                    total_block_postings,
                 );
             } else {
                 // Single-phase: score all dims at once
                 score_block_bsearch_int(
-                    num_terms,
-                    dim_ptr,
-                    ps_ptr,
-                    post_ptr,
+                    block,
                     query_by_dim_u16,
                     u64::MAX,
                     candidate_mask,
@@ -1264,7 +1288,6 @@ fn score_superblock_blocks(
                     acc,
                     &mut touched,
                     block_size,
-                    total_block_postings,
                 );
             }
         }

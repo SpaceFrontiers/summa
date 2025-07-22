@@ -1,5 +1,6 @@
 pub(crate) mod ann_build;
 mod ann_disk;
+pub(crate) mod bmp_adaptive;
 pub(crate) mod bmp_grid;
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod builder;
@@ -27,7 +28,6 @@ pub(crate) use merger::block_in_place_if_multithread;
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub(crate) use reader::BmpIndex;
 pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
-pub(crate) use reader::bmp::{block_term_postings, find_dim_in_block_data};
 pub(crate) use reader::combine_ordinal_results;
 #[cfg(feature = "native")]
 pub mod pin;

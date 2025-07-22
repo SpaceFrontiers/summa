@@ -1,6 +1,6 @@
 # BMP LSP/0 and Maximum-Grid Compression
 
-Status: implemented in the BMP V18 format (2026-07-23).
+Status: implemented in the BMP V19 format (2026-07-24).
 
 The production field shape is:
 
@@ -14,7 +14,7 @@ field embedding: sparse_vector<u32> [indexed<
 >]
 ```
 
-V18 is the only supported BMP representation. There is no compatibility
+V19 is the only supported BMP representation. There is no compatibility
 reader or migration path; rebuild the index after upgrading.
 
 ## Space anatomy
@@ -36,17 +36,32 @@ H bytes     = d × ceil(coarse / 2)       # ceil-u4 256-superblock maxima
 
 For `d = 105,879`:
 
-| vectors | blocks | superblocks | coarse | dense D | dense E | dense H | dense total |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 18M | 562,500 | 70,313 | 275 | 29.78 GB | 3.72 GB | 14.61 MB | **33.52 GB** |
-| 100M | 3,125,000 | 390,625 | 1,526 | 165.44 GB | 20.68 GB | 80.79 MB | **186.20 GB** |
-| 1B | 31,250,000 | 3,906,250 | 15,259 | 1.654 TB | 206.79 GB | 807.86 MB | **1.862 TB** |
+| vectors |     blocks | superblocks | coarse |   dense D |   dense E |   dense H |   dense total |
+| ------: | ---------: | ----------: | -----: | --------: | --------: | --------: | ------------: |
+|     18M |    562,500 |      70,313 |    275 |  29.78 GB |   3.72 GB |  14.61 MB |  **33.52 GB** |
+|    100M |  3,125,000 |     390,625 |  1,526 | 165.44 GB |  20.68 GB |  80.79 MB | **186.20 GB** |
+|      1B | 31,250,000 |   3,906,250 | 15,259 |  1.654 TB | 206.79 GB | 807.86 MB |  **1.862 TB** |
 
-Those are dense-reference sizes, not the V18 on-disk sizes. V18 omits
+Those are dense-reference sizes, not the V19 on-disk sizes. V19 omits
 all-zero payload groups and uses each group’s actual local width. The encoded
 size depends on term density and BP ordering, so projections captured for the
-old 64-block/exact-u8 hierarchy are not valid for V18. The segment load log’s
+old 64-block/exact-u8 hierarchy are not valid for V19. The segment load log’s
 separate D/E/H byte counts are authoritative after a rebuild.
+
+At fixed vocabulary and similar sparsity/locality, encoded grid bytes scale
+approximately linearly with vector count:
+
+```text
+projected_1B_grid_bytes =
+    observed_encoded_D_E_H_bytes × 1,000,000,000 / observed_vectors
+```
+
+For block 32, the 1B dense reference is 1.693 TiB. A 10%, 20%, 25%, 33%, or
+50% observed encoded/dense ratio projects to approximately 173, 347, 433,
+572, or 867 GiB resident respectively. A machine intended to keep the whole
+grid resident should leave another 15–25% for the process, payload working
+set, document map, and OS. Hermes normally pins H and row-offset tables only;
+D and E remain pageable.
 
 The other persistent sections are:
 
@@ -54,21 +69,52 @@ The other persistent sections are:
 T = total non-empty (block, dimension) pairs
 P = total document-term postings
 B = total blocks
+K = total non-empty blocks
 N = padded vector/ordinal count
+A_i = adaptive payload bytes in non-empty block i
+t_i = terms in non-empty block i
+w_i = 2 when A_i <= 32,767, otherwise 4
 
-Section B, Flat-Inv payload = 8 × non-empty_blocks + 9T + 2P
+Section B, adaptive Flat-Inv
+  = Σ_i [4 + 4t_i + w_i(t_i + 1) + ceil(t_i / 2) + A_i]
 Section A, block offsets    = 8 × (B + 1)
 Sections F+G, document map  = 6N
 ```
 
-The `9T` term-header component is four bytes for the dimension, four bytes for
-its posting start, and one byte for its exact block maximum. The final posting
-start contributes the other four bytes per non-empty block. Retaining the
-exact maximum costs `T` bytes, but lets a D2 BP/reorder regenerate a tight
-ceil-u4 E grid without rereading `2P` posting bytes. Empty blocks have no
-Section B payload.
+Each term chooses the smaller of sparse `(slot, impact)` pairs and one
+`b`-byte dense impact row, so `A_i <= 2P_i`. Dense encoding is used only when
+slots are unique; duplicate slots remain sparse to preserve additive scoring.
+The high bit of a term’s start offset records that choice. The high bit of
+`num_terms` selects 32-bit offsets for unusually large payloads; ordinary
+blocks use 16-bit offsets.
 
-## V18 grid representation
+In the narrow case the formula reduces to
+`6K + 6T + Σ ceil(t_i / 2) + Σ A_i`. Maxima are packed u4 rather than exact
+u8. The reconstructed `17 × ceil(exact / 17)` representative regenerates
+exactly the same u4 and u2 pruning cells, so BP/reorder does not need to scan
+payloads. Even a wide-offset block is never larger than V18’s
+`8K + 9T + 2P` Flat-Inv representation.
+
+### Block size 16 versus 32
+
+On the production-shaped fixture used by `bmp_payload_layout`—65,536 vectors,
+approximately 96 terms/vector, and the same vectors at both widths—V19
+Section B measured:
+
+| locality            |     block 32 |     block 16 | block-16 increase |
+| ------------------- | -----------: | -----------: | ----------------: |
+| diffuse topics      | 40,907,020 B | 46,030,796 B |         **12.5%** |
+| BP-clustered topics | 22,092,013 B | 23,636,520 B |          **7.0%** |
+
+The document map is unchanged. Section A doubles but grows by only `N/4`
+bytes relative to block 32. D has twice as many logical cells. With the
+current fixed eight blocks/superblock, E, H, and per-thread superblock scratch
+also double. A future block-16 experiment should first use 16
+blocks/superblock to preserve LSP’s 256-vector footprint; then E/H and query
+scratch stay unchanged, although dense-reference D still doubles. This is why
+V19 keeps block size 32 for production.
+
+## V19 grid representation
 
 D, E, and H are independent dimension-major grids partitioned into 256-cell
 codec groups. H has one logical cell per 256 E superblocks. Each exact
@@ -117,7 +163,7 @@ Codec groups do not pad the logical BMP block or superblock counts.
 
 ## LSP/0 execution
 
-V18 implements LSP/0 as a query-level operation:
+V19 implements LSP/0 as a query-level operation:
 
 1. Use all bounded query dimensions for candidate generation by default.
    An explicit `query<pruning: beta>` can retain only the strongest fraction,
@@ -141,12 +187,12 @@ The global selection is important: 50 immutable segments still visit at most
 
 Automatic gamma follows the paper’s zero-shot depths:
 
-| requested candidate depth | gamma |
-| ---: | ---: |
-| `1..=10` | 250 |
-| `11..=100` | 500 |
-| `101..=1000` | 1,000 |
-| `> 1000` | `max(2000, depth)` |
+| requested candidate depth |              gamma |
+| ------------------------: | -----------------: |
+|                  `1..=10` |                250 |
+|                `11..=100` |                500 |
+|              `101..=1000` |              1,000 |
+|                  `> 1000` | `max(2000, depth)` |
 
 Set query `lsp_gamma: 0` for exhaustive traversal, or a positive value for an
 explicit cap. `heap_factor: 1.0` and ceiling bounds are rank-safe when query
@@ -161,10 +207,11 @@ floating-point rounding difference from lowering an unpruned bound.
 
 ## Build, merge, and BP reorder
 
-Initial build and BP/reorder write grids from sorted
-`(dimension, block, exact_u8_maximum)` entries. Exact maxima are retained in
-each block header, so D, E, and H can be regenerated without scanning or
-reserializing postings.
+Initial build writes grids from sorted
+`(dimension, block, exact_u8_maximum)` entries. Each block header retains the
+ceil-u4 maximum. BP/reorder reconstructs its conservative u8 representative,
+which regenerates identical D, E, and H cells without scanning or
+reserializing payloads.
 
 Ordinary merge remains a streaming block-copy operation:
 
@@ -178,8 +225,8 @@ Ordinary merge remains a streaming block-copy operation:
   postings are never decoded or reserialized.
 - Document maps are chunked copies with document-ID offset patching.
 
-A later BP pass rebuilds tight E/H values from exact block headers. Reordering
-changes block coordinates first and then projects exact maxima into
+A later BP pass rebuilds tight E/H values from packed block headers. Reordering
+changes block coordinates first and then projects their representatives into
 `floor(new_block / 8)`, so ceil quantization composes correctly with any
 permutation.
 
@@ -199,7 +246,7 @@ and block payload remain pageable with random-access advice.
 
 ## Match to the LSP paper
 
-V18 follows the core design in
+V19 follows the core design in
 [Carlson et al., “Efficiency Optimizations for Superblock-based Sparse Retrieval”](https://arxiv.org/html/2602.02883v1):
 
 - 256 independently decodable maximum cells per compressed group;
@@ -227,24 +274,23 @@ space/build-time tradeoff rather than a claim that 32 is the paper optimum.
 ## Flat-Inv versus the paper’s Fwd layout
 
 Hermes does **not** use the paper’s document-major Fwd payload for persistent
-BMP scoring. Section B is a block-local Flat-Inv layout:
+BMP scoring. Section B is an adaptive block-local Flat-Inv layout:
 
 ```text
 sorted term IDs
-term offsets
-(local_slot: u8, impact: u8) postings
+u16/u32 byte offsets + packed-u4 maxima
+per-term sparse (local_slot, impact) pairs or dense impact rows
 ```
 
 The paper finds Fwd faster for small blocks, including `b = 32`, but its
 Compact-Inv format explicitly assumes a vocabulary that fits two-byte term
 IDs. Hermes production fields use roughly 105,879 dimensions, so a direct
 Hermes Fwd layout requires four-byte IDs. At minimum, separate u32 term IDs
-and u8 weights cost `5P` bytes plus document offsets, while current Section B
-costs `2P + 9T + block headers`. Which representation is smaller therefore
-depends on the measured `T/P` ratio; vocabulary size alone does not settle it.
-Ignoring the small offset/header terms, Fwd becomes smaller only when
-`T/P > 1/3`; repeated dimensions within a 32-vector block push that ratio
-down and favor Flat-Inv.
+and u8 weights cost `5P` bytes plus document offsets. V19 adaptive Flat-Inv
+usually uses approximately `2P + 6.5T + block headers`, and dense terms lower
+the `2P` component. Which representation is smaller therefore depends on the
+measured `T/P` ratio and density; vocabulary size alone does not settle it.
+Repeated dimensions within a 32-vector block lower `T/P` and favor Flat-Inv.
 Flat-Inv also lets the scorer fetch only postings for query-present terms,
 whereas Fwd streams every term in every candidate document.
 
@@ -260,9 +306,11 @@ The test suite pins:
 - every local width round trip and malformed metadata rejection;
 - SSE4.1/NEON/scalar-equivalent u4 and u8 accumulation tails;
 - exact BMP-versus-MaxScore top-k parity in exhaustive mode;
+- narrow sparse, dense-row, duplicate-slot, and wide-offset round trips;
+- score parity through dense rows and blocks above the 15-bit payload range;
 - u2-versus-u4 rank-safe parity;
 - a single global gamma across multiple segments;
 - non-aligned D merge and overlapping E/H-bound propagation;
 - record and blockwise BP reorder;
-- E regeneration from exact block-header maxima;
+- E regeneration from packed block-header maxima;
 - bounded external-run construction.

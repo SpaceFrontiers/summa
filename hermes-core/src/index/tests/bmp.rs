@@ -3070,8 +3070,9 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
 #[tokio::test]
 async fn test_bmp_block_posting_overflow_256() {
     // 256 docs × 301 dims each → 77,056 postings in block 0 (> u16::MAX).
-    // Needle dims (50_000 + d) sort after the shared mass, so their prefix
-    // offsets exceed 65,535 — exactly where the u16 wrap corrupted reads.
+    // The V19 adaptive payload exceeds its 15-bit narrow-offset range, forcing
+    // the u32-wide fallback. Needle dims sort after the shared dense mass and
+    // exercise terms near the end of that wide payload.
     let config = SparseVectorConfig {
         format: SparseFormat::Bmp,
         weight_quantization: WeightQuantization::UInt8,
@@ -3114,7 +3115,7 @@ async fn test_bmp_block_posting_overflow_256() {
     for d in [0u32, 100, 255] {
         let query = SparseVectorQuery::new(sparse, vec![(50_000 + d, 1.0)]);
         let r = searcher.search(&query, 5).await.unwrap();
-        assert_eq!(r.len(), 1, "needle {d} lost past the 65,535th posting");
+        assert_eq!(r.len(), 1, "needle {d} lost in a wide-offset block");
         assert_eq!(r[0].doc_id, d);
     }
     // Shared dims still score correctly across the whole block.
@@ -3123,13 +3124,13 @@ async fn test_bmp_block_posting_overflow_256() {
     assert_eq!(r.len(), 10);
 
     // BP forward-index build over the oversized block must not read wild
-    // slices (this is the exact prod crash path).
+    // slices while decoding dense and sparse terms from a wide-offset block.
     let fwd =
         crate::segment::build_forward_index_from_bmps(&[bmp], 2, 1_000_000, 2 * 1024 * 1024 * 1024)
             .unwrap();
     // Needle dims have df=1 and are correctly filtered by min_doc_freq=2;
     // the 300 shared dims × 256 docs must all survive — reading them walks
-    // every posting slice past the old u16 wrap point.
+    // every shared dense row in the block.
     assert_eq!(fwd.total_postings(), 300 * 256);
 }
 

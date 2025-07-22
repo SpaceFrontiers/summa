@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V18 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V19 zero-copy**.
 //!
-//! V18 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! V19 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -20,6 +20,7 @@
 //! Based on Mallia, Suel & Tonellotto (SIGIR 2024).
 
 use crate::directories::{FileHandle, OwnedBytes};
+use crate::segment::bmp_adaptive::{AdaptiveBlock, AdaptivePostings};
 use crate::segment::bmp_grid::CompressedGrid;
 
 /// Number of BMP blocks grouped into one LSP/0 superblock.
@@ -36,16 +37,6 @@ pub const BMP_SUPERBLOCK_SIZE: u32 = 8;
 /// one promising coarse cell therefore reads one independently addressable
 /// 256-superblock group from E for each query dimension.
 pub const BMP_COARSE_SUPERBLOCKS: u32 = 256;
-
-/// A single posting in BMP's block-local flat inverted index.
-///
-/// Exactly 2 bytes: `[local_slot: u8, impact: u8]`.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BmpPosting {
-    pub local_slot: u8,
-    pub impact: u8,
-}
 
 // ── u32 read helpers ─────────────────────────────────────────────────────────
 
@@ -79,9 +70,9 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// BMP V18 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V19 index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V18 format with Recursive Graph Bisection (BP) document ordering.
+/// V19 format with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -165,12 +156,12 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V18 blob from the given file handle.
+    /// Parse a BMP V19 blob from the given file handle.
     ///
     /// Reads the footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V18 data-first layout: Section B (per-block interleaved data) first,
+    /// V19 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
     pub fn parse(
         handle: FileHandle,
@@ -183,7 +174,7 @@ impl BmpIndex {
 
         if blob_len < BMP_BLOB_FOOTER_SIZE as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V18 footer".into(),
+                "BMP blob too small for V19 footer".into(),
             ));
         }
 
@@ -214,7 +205,7 @@ impl BmpIndex {
 
         if magic != BMP_BLOB_MAGIC {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP8 {:#x}); rebuild \
+                "Invalid BMP blob magic: {:#x} (expected BMP9 {:#x}); rebuild \
                  the index with this version.",
                 magic, BMP_BLOB_MAGIC
             )));
@@ -457,7 +448,7 @@ impl BmpIndex {
         }
 
         log::debug!(
-            "BMP V18 index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
+            "BMP V19 index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
              block_grid={}, superblock_grid={}, coarse_grid={}, single_valued={}, block_data={}, doc_map={}",
             num_blocks,
@@ -506,7 +497,7 @@ impl BmpIndex {
         })
     }
 
-    /// Read the entire raw V18 blob (including footer) from the source file.
+    /// Read the entire raw V19 blob (including footer) from the source file.
     ///
     /// Used by reorder paths (native-only) to copy a field byte-identically
     /// when its `reorder` schema attribute is unset.
@@ -703,95 +694,21 @@ impl BmpIndex {
         }
     }
 
-    /// Parse a block header: returns
-    /// (num_terms, dim_ptr, ps_ptr, max_ptr, post_ptr, total_block_postings).
-    /// All pointers are within block_data_bytes — guaranteed contiguous.
-    ///
-    /// Always 4-byte (u32) dim IDs.
-    ///
-    /// Returns zero terms and null section pointers for empty blocks.
+    /// Parse one adaptive block. Malformed and empty blocks degrade to `None`
+    /// in the availability-oriented query path.
     #[inline(always)]
-    pub(crate) fn parse_block(
-        &self,
-        block_id: u32,
-    ) -> (u32, *const u8, *const u8, *const u8, *const u8, u32) {
+    pub(crate) fn parse_block(&self, block_id: u32) -> Option<AdaptiveBlock<'_>> {
         if block_id >= self.num_blocks {
-            return (
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-            );
+            return None;
         }
         let (start, end) = self.block_data_range(block_id);
         if start == end {
-            return (
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-            );
+            return None;
         }
-        let invalid = || {
-            (
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-            )
-        };
-        let Ok(block_len) = usize::try_from(end - start) else {
-            return invalid();
-        };
-        if block_len < 8 {
-            return invalid();
-        }
-        let base = unsafe {
-            self.block_data_bytes
-                .as_slice()
-                .as_ptr()
-                .add(start as usize)
-        };
-        let num_terms = unsafe { u32::from_le((base as *const u32).read_unaligned()) };
-        let Some(header_len) = (num_terms as usize)
-            .checked_mul(9)
-            .and_then(|bytes| bytes.checked_add(8))
-        else {
-            return invalid();
-        };
-        if header_len > block_len || !(block_len - header_len).is_multiple_of(2) {
-            return invalid();
-        }
-        let total_block_postings = (block_len - header_len) / 2;
-        let Ok(total_block_postings_u32) = u32::try_from(total_block_postings) else {
-            return invalid();
-        };
-        let dim_ptr = unsafe { base.add(4) };
-        // Always u32 dim IDs (4 bytes each)
-        let ps_ptr = unsafe { dim_ptr.add(num_terms as usize * 4) };
-        let max_ptr = unsafe { ps_ptr.add((num_terms as usize + 1) * 4) };
-        let post_ptr = unsafe { max_ptr.add(num_terms as usize) };
-        let first = unsafe { u32::from_le((ps_ptr as *const u32).read_unaligned()) };
-        let last = unsafe {
-            u32::from_le((ps_ptr.add(num_terms as usize * 4) as *const u32).read_unaligned())
-        };
-        if first != 0 || last != total_block_postings_u32 {
-            return invalid();
-        }
-        (
-            num_terms,
-            dim_ptr,
-            ps_ptr,
-            max_ptr,
-            post_ptr,
-            total_block_postings_u32,
-        )
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
+        let bytes = self.block_data_bytes.as_slice().get(start..end)?;
+        AdaptiveBlock::parse(bytes, self.bmp_block_size as usize)
     }
 
     /// Get a raw pointer to block_data_starts at the given block.
@@ -807,22 +724,14 @@ impl BmpIndex {
         }
     }
 
-    /// Iterate terms in a block (for merger). Returns (dim_id, &[BmpPosting]) per term.
-    ///
-    /// Reads u32 dim_id directly from block data (no dim_idx→dim_id lookup).
-    pub fn iter_block_terms(&self, block_id: u32) -> BlockTermIter<'_> {
-        let (num_terms, dim_ptr, ps_ptr, max_ptr, post_ptr, total_postings) =
-            self.parse_block(block_id);
-        BlockTermIter {
-            dim_ptr,
-            ps_ptr,
-            max_ptr,
-            post_ptr,
-            num_terms,
-            total_postings,
-            current: 0,
-            _marker: std::marker::PhantomData,
-        }
+    /// Iterate `(dimension, conservative maximum, postings)` for one block.
+    pub(crate) fn iter_block_terms(
+        &self,
+        block_id: u32,
+    ) -> impl Iterator<Item = (u32, u8, AdaptivePostings<'_>)> + '_ {
+        self.parse_block(block_id)
+            .into_iter()
+            .flat_map(AdaptiveBlock::terms)
     }
 
     // ── Non-hot-path accessors ───────────────────────────────────────
@@ -956,85 +865,15 @@ impl BmpIndex {
         if block.is_empty() {
             return Ok(());
         }
-        if block.len() < 8 {
-            return Err(crate::Error::Corruption(format!(
-                "BMP block {block_id} is too short: {} bytes",
-                block.len(),
-            )));
-        }
-
-        let num_terms = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
-        let header_len = num_terms
-            .checked_mul(9)
-            .and_then(|bytes| bytes.checked_add(8))
-            .ok_or_else(|| {
+        let parsed =
+            AdaptiveBlock::parse(block, self.bmp_block_size as usize).ok_or_else(|| {
                 crate::Error::Corruption(format!(
-                    "BMP block {block_id} header length overflows usize",
+                    "BMP block {block_id} has an invalid adaptive envelope"
                 ))
             })?;
-        if header_len > block.len() || !(block.len() - header_len).is_multiple_of(2) {
-            return Err(crate::Error::Corruption(format!(
-                "BMP block {block_id} has invalid header/data lengths: header={header_len}, total={}",
-                block.len(),
-            )));
-        }
-
-        let dims_start = 4;
-        let prefixes_start = dims_start + num_terms * 4;
-        let maxima_start = prefixes_start + (num_terms + 1) * 4;
-        let postings_start = maxima_start + num_terms;
-        debug_assert_eq!(postings_start, header_len);
-        let total_postings = (block.len() - postings_start) / 2;
-        let read_prefix = |index: usize| {
-            let offset = prefixes_start + index * 4;
-            u32::from_le_bytes(block[offset..offset + 4].try_into().unwrap()) as usize
-        };
-        if read_prefix(0) != 0 || read_prefix(num_terms) != total_postings {
-            return Err(crate::Error::Corruption(format!(
-                "BMP block {block_id} posting prefixes do not span 0..{total_postings}",
-            )));
-        }
-
-        let mut previous_dim = None;
-        for term in 0..num_terms {
-            let dim_offset = dims_start + term * 4;
-            let dimension =
-                u32::from_le_bytes(block[dim_offset..dim_offset + 4].try_into().unwrap());
-            if dimension >= self.dims || previous_dim.is_some_and(|previous| dimension <= previous)
-            {
-                return Err(crate::Error::Corruption(format!(
-                    "BMP block {block_id} has invalid/non-increasing dimension {dimension} at term {term}",
-                )));
-            }
-            previous_dim = Some(dimension);
-
-            let posting_start = read_prefix(term);
-            let posting_end = read_prefix(term + 1);
-            if posting_start >= posting_end || posting_end > total_postings {
-                return Err(crate::Error::Corruption(format!(
-                    "BMP block {block_id} term {term} has invalid posting range {posting_start}..{posting_end}",
-                )));
-            }
-            let postings =
-                &block[postings_start + posting_start * 2..postings_start + posting_end * 2];
-            let mut observed_max = 0u8;
-            for posting in postings.chunks_exact(2) {
-                if u32::from(posting[0]) >= self.bmp_block_size {
-                    return Err(crate::Error::Corruption(format!(
-                        "BMP block {block_id} term {term} has local slot {} outside block size {}",
-                        posting[0], self.bmp_block_size,
-                    )));
-                }
-                observed_max = observed_max.max(posting[1]);
-            }
-            let stored_max = block[maxima_start + term];
-            if stored_max != observed_max {
-                return Err(crate::Error::Corruption(format!(
-                    "BMP block {block_id} term {term} maximum {stored_max} != observed {observed_max}",
-                )));
-            }
-        }
-        Ok(())
+        parsed.validate(self.dims).map_err(|reason| {
+            crate::Error::Corruption(format!("BMP block {block_id} is invalid: {reason}"))
+        })
     }
 
     /// Total number of terms (unique dim×block pairs) stored in the index.
@@ -1281,121 +1120,6 @@ impl Drop for BmpScanPageGuard<'_> {
     }
 }
 
-/// Iterator over terms in a block. Returns `(dim_id, &[BmpPosting])` per term.
-///
-/// Reads u32 dim_id directly from block data (no dim_idx→dim_id lookup).
-pub struct BlockTermIter<'a> {
-    dim_ptr: *const u8,
-    ps_ptr: *const u8,
-    max_ptr: *const u8,
-    post_ptr: *const u8,
-    num_terms: u32,
-    total_postings: u32,
-    current: u32,
-    // lifetime marker for the underlying BmpIndex data
-    _marker: std::marker::PhantomData<&'a ()>,
-}
-
-// Manually implement Send+Sync. The raw pointers are derived from OwnedBytes
-// (which is Send+Sync) and are never mutated. The iterator borrows &BmpIndex.
-unsafe impl<'a> Send for BlockTermIter<'a> {}
-unsafe impl<'a> Sync for BlockTermIter<'a> {}
-
-impl<'a> Iterator for BlockTermIter<'a> {
-    type Item = (u32, u8, &'a [BmpPosting]);
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.num_terms {
-            return None;
-        }
-        let i = self.current;
-        self.current += 1;
-
-        // Read u32 dim_id directly from block data
-        let dim_id = unsafe { read_u32_unchecked(self.dim_ptr, i as usize) };
-        let max_impact = unsafe { *self.max_ptr.add(i as usize) };
-
-        // Get postings from block-local ps_ptr/post_ptr
-        let postings =
-            unsafe { block_term_postings(self.ps_ptr, self.post_ptr, i, self.total_postings) };
-        Some((dim_id, max_impact, postings))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = (self.num_terms - self.current) as usize;
-        (rem, Some(rem))
-    }
-}
-
-impl<'a> ExactSizeIterator for BlockTermIter<'a> {}
-
-// ============================================================================
-// Block-data free functions (used by query and merger)
-// ============================================================================
-
-/// Binary search for a dimension ID in a block's term_dim_ids.
-///
-/// Always u32 dim_ids. `dim_ptr` points to the block's term_dim_ids array.
-/// Returns the local term index (0..num_terms) if found.
-///
-/// # Safety
-/// `dim_ptr` must be valid for `num_terms * 4` bytes.
-#[inline(always)]
-pub(crate) fn find_dim_in_block_data(
-    dim_ptr: *const u8,
-    num_terms: u32,
-    dim_id: u32,
-) -> Option<u32> {
-    let count = num_terms as usize;
-    if count == 0 {
-        return None;
-    }
-
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let val = unsafe { read_u32_unchecked(dim_ptr, mid) };
-        match val.cmp(&dim_id) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Equal => return Some(mid as u32),
-            std::cmp::Ordering::Greater => hi = mid,
-        }
-    }
-    None
-}
-
-/// Get postings for a local term index within a parsed block.
-///
-/// `ps_ptr` points to the block's posting_starts array [u32 × (num_terms + 1)].
-/// `post_ptr` points to the block's postings array [(u8, u8) × total].
-///
-/// # Safety
-/// Pointers must be valid and derived from a BmpIndex's block_data_bytes.
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-pub(crate) unsafe fn block_term_postings<'a>(
-    ps_ptr: *const u8,
-    post_ptr: *const u8,
-    local_term: u32,
-    total_block_postings: u32,
-) -> &'a [BmpPosting] {
-    let start_p = ps_ptr.add(local_term as usize * 4);
-    let end_p = ps_ptr.add((local_term as usize + 1) * 4);
-    let start = u32::from_le((start_p as *const u32).read_unaligned()) as usize;
-    let end = u32::from_le((end_p as *const u32).read_unaligned()) as usize;
-    // Prefix sums are cumulative — a non-monotonic pair means the block is
-    // corrupt. Never build a wild slice from it (`end - start` can underflow).
-    if end <= start || end > total_block_postings as usize {
-        return &[];
-    }
-    let count = end - start;
-    // SAFETY: BmpPosting is #[repr(C)] with align=1 (two u8 fields).
-    let ptr = post_ptr.add(start * 2) as *const BmpPosting;
-    std::slice::from_raw_parts(ptr, count)
-}
-
 #[cfg(test)]
 mod safety_tests {
     use super::BmpIndex;
@@ -1459,8 +1183,8 @@ mod safety_tests {
     #[test]
     fn rewrite_validation_rejects_out_of_range_local_slot() {
         let mut blob = test_blob();
-        // One-term block header is 8 + 9 bytes; postings follow immediately.
-        blob[17] = 64;
+        // One-term narrow V19 header: count(4) + dim(4) + offsets(4) + max(1).
+        blob[13] = 64;
         let index = parse(blob).unwrap();
         let error = index.validate_block_for_rewrite(0).unwrap_err();
         assert!(matches!(error, crate::Error::Corruption(_)));
@@ -1477,7 +1201,7 @@ mod safety_tests {
         ));
 
         let mut bad_maximum = test_blob();
-        bad_maximum[16] = 0;
+        bad_maximum[12] = 0;
         let index = parse(bad_maximum).unwrap();
         assert!(matches!(
             index.validate_block_for_rewrite(0),
