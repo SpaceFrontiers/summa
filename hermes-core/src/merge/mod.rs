@@ -36,6 +36,17 @@ pub trait MergePolicy: Send + Sync + Debug {
     /// Multiple candidates can run concurrently as long as they don't share segments.
     fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate>;
 
+    /// Whether segment topology is far enough over its target that compaction
+    /// latency should take precedence over optional merge-time optimization.
+    ///
+    /// The segment manager uses this signal only when `reorder_on_merge` is
+    /// enabled: urgent merges block-copy BMP data and leave the merged output
+    /// for the standalone optimizer. This avoids many long BP passes holding
+    /// every merge slot while an ingestion burst keeps publishing segments.
+    fn has_severe_backlog(&self, _segments: &[SegmentInfo]) -> bool {
+        false
+    }
+
     /// Clone the policy into a boxed trait object
     fn clone_box(&self) -> Box<dyn MergePolicy>;
 
@@ -238,6 +249,15 @@ impl TieredMergePolicy {
         num_tiers * self.segments_per_tier
     }
 
+    fn eligible_segments<'a>(&self, segments: &'a [SegmentInfo]) -> Vec<&'a SegmentInfo> {
+        let effective_max = self.effective_max_docs();
+        let oversized_limit = (effective_max as f64 * self.oversized_threshold) as u64;
+        segments
+            .iter()
+            .filter(|segment| (segment.num_docs as u64) <= oversized_limit || oversized_limit == 0)
+            .collect()
+    }
+
     /// Score a merge group. Lower score = better (more balanced) merge.
     /// Uses Lucene-style skew scoring: `skew * size_factor`.
     /// - skew = largest_floored / total_floored (1/N for perfectly balanced, 1.0 for singleton)
@@ -398,12 +418,7 @@ impl MergePolicy for TieredMergePolicy {
         }
 
         // Phase 1: Filter oversized segments
-        let effective_max = self.effective_max_docs();
-        let oversized_limit = (effective_max as f64 * self.oversized_threshold) as u64;
-        let eligible: Vec<&SegmentInfo> = segments
-            .iter()
-            .filter(|s| (s.num_docs as u64) <= oversized_limit || oversized_limit == 0)
-            .collect();
+        let eligible = self.eligible_segments(segments);
 
         if eligible.len() < 2 {
             return Vec::new();
@@ -428,6 +443,22 @@ impl MergePolicy for TieredMergePolicy {
         } else {
             self.find_merges_greedy(&sorted)
         }
+    }
+
+    fn has_severe_backlog(&self, segments: &[SegmentInfo]) -> bool {
+        if !self.budget_trigger {
+            return false;
+        }
+        let eligible = self.eligible_segments(segments);
+        if eligible.len() < 2 {
+            return false;
+        }
+        let total_docs: u64 = segments
+            .iter()
+            .map(|segment| u64::from(segment.num_docs))
+            .sum();
+        let ideal = self.compute_ideal_segment_count(total_docs);
+        eligible.len() > ideal.saturating_mul(2)
     }
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
@@ -828,6 +859,37 @@ mod tests {
 
         let candidates = policy.find_merges(&segments);
         assert!(!candidates.is_empty(), "should merge when over budget");
+    }
+
+    #[test]
+    fn test_severe_backlog_requires_more_than_twice_the_budget() {
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            tier_factor: 10.0,
+            tier_floor: 1000,
+            floor_segment_docs: 1000,
+            budget_trigger: true,
+            ..Default::default()
+        };
+
+        // Every segment is at the floor, so 3 segments is the ideal budget.
+        // Ordinary pressure still uses reorder-on-merge.
+        let six: Vec<_> = (0..6)
+            .map(|i| SegmentInfo {
+                id: format!("seg_{i}"),
+                num_docs: 1000,
+            })
+            .collect();
+        assert!(!policy.has_severe_backlog(&six));
+
+        // Once the eligible population exceeds 2x budget, topology reduction
+        // becomes urgent and merge-time BP should be deferred.
+        let mut seven = six;
+        seven.push(SegmentInfo {
+            id: "seg_6".into(),
+            num_docs: 1000,
+        });
+        assert!(policy.has_severe_backlog(&seven));
     }
 
     #[test]

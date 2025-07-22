@@ -580,6 +580,25 @@ pub trait StreamingWriter: io::Write + Send {
 
     /// Bytes written so far.
     fn bytes_written(&self) -> u64;
+
+    /// Copy one local-file range at the current output position without
+    /// routing bytes through a userspace buffer.
+    ///
+    /// Filesystem writers implement this with Linux `copy_file_range`.
+    /// Other backends return `Unsupported`, allowing merge code to fall back
+    /// to its portable mmap/read + write path before any bytes are copied.
+    #[cfg(feature = "native")]
+    fn copy_from_file_range(
+        &mut self,
+        _source: &std::fs::File,
+        _source_offset: &mut u64,
+        _len: usize,
+    ) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "streaming writer does not support kernel-assisted range copies",
+        ))
+    }
 }
 
 /// StreamingWriter backed by Vec<u8>, finalized via DirectoryWriter::write.
@@ -660,6 +679,73 @@ impl StreamingWriter for FileStreamingWriter {
 
     fn bytes_written(&self) -> u64 {
         self.written
+    }
+
+    fn copy_from_file_range(
+        &mut self,
+        source: &std::fs::File,
+        source_offset: &mut u64,
+        len: usize,
+    ) -> io::Result<usize> {
+        io::Write::flush(&mut self.file)?;
+        let copied = copy_file_range_once(source, source_offset, self.file.get_ref(), len)?;
+        self.written = self
+            .written
+            .checked_add(copied as u64)
+            .ok_or_else(|| io::Error::other("streaming-writer byte count overflow"))?;
+        Ok(copied)
+    }
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn copy_file_range_once(
+    source: &std::fs::File,
+    source_offset: &mut u64,
+    destination: &std::fs::File,
+    len: usize,
+) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mut offset = libc::loff_t::try_from(*source_offset).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source offset exceeds i64")
+        })?;
+        let copied = unsafe {
+            libc::copy_file_range(
+                source.as_raw_fd(),
+                &mut offset,
+                destination.as_raw_fd(),
+                std::ptr::null_mut(),
+                len,
+                0,
+            )
+        };
+        if copied < 0 {
+            let error = io::Error::last_os_error();
+            let unsupported = error.raw_os_error().is_some_and(|code| {
+                code == libc::ENOSYS
+                    || code == libc::EXDEV
+                    || code == libc::EOPNOTSUPP
+                    || code == libc::EINVAL
+            });
+            return if unsupported {
+                Err(io::Error::new(io::ErrorKind::Unsupported, error))
+            } else {
+                Err(error)
+            };
+        }
+        *source_offset = u64::try_from(offset)
+            .map_err(|_| io::Error::other("copy_file_range returned a negative source offset"))?;
+        Ok(copied as usize)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, source_offset, destination, len);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel-assisted range copies are only available on Linux",
+        ))
     }
 }
 

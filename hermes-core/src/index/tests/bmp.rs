@@ -1582,6 +1582,90 @@ async fn test_bmp_merge_with_reorder_on_merge() {
     );
 }
 
+/// A severe segment backlog must compact before running merge-time BP.
+/// Otherwise every merge slot can hold dozens of source segments for the
+/// duration of a serialized BP pass, allowing instant indexing to grow the
+/// searchable topology without bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_bmp_severe_backlog_defers_reorder_until_after_compaction() {
+    use crate::directories::MmapDirectory;
+
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, bmp_config());
+    sb.set_reorder(sparse, true);
+    sb.set_reorder_on_merge(true);
+    let schema = sb.build();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = MmapDirectory::new(temp.path());
+
+    // Hold the process-wide merge slot while publishing the burst so the
+    // scheduler observes the complete six-segment topology at once.
+    let global_merge_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let merge_blocker = std::sync::Arc::clone(&global_merge_permits)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let policy = crate::merge::TieredMergePolicy {
+        segments_per_tier: 2,
+        max_merge_at_once: 6,
+        tier_floor: 1000,
+        floor_segment_docs: 1000,
+        budget_trigger: true,
+        scored_selection: true,
+        ..Default::default()
+    };
+    let config = IndexConfig {
+        num_indexing_threads: 1,
+        max_concurrent_merges: 1,
+        background_merge_permits: global_merge_permits,
+        merge_policy: Box::new(policy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config)
+        .await
+        .unwrap();
+
+    for segment in 0..6 {
+        for doc_id in 0..4 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("segment-{segment}-doc-{doc_id}"));
+            doc.add_sparse_vector(
+                sparse,
+                vec![((segment * 10 + doc_id) as u32, 1.0), (9999, 0.1)],
+            );
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    assert_eq!(writer.segment_manager.get_segment_ids().await.len(), 6);
+
+    drop(merge_blocker);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            // A capacity wakeup may race this explicit trigger. Repeating is
+            // harmless and avoids making the test depend on task scheduling.
+            writer.maybe_merge().await;
+            writer.wait_for_all_merges().await;
+            if writer.segment_manager.get_segment_ids().await.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("severe-backlog compaction did not finish");
+
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(metadata.segment_metas.len(), 1);
+    let output = metadata.segment_metas.values().next().unwrap();
+    assert!(
+        !output.reordered,
+        "severe backlog should block-copy first and leave one final optimizer pass"
+    );
+    assert_eq!(output.num_docs, 24);
+}
+
 /// Per-field reorder gate: a BMP field WITHOUT the `reorder` schema attribute
 /// must come out of writer.reorder() byte-identical (insertion order
 /// preserved), while a field WITH the attribute gets BP-reordered. Both must
