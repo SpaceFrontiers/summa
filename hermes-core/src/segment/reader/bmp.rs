@@ -152,6 +152,11 @@ pub struct BmpIndex {
     blob_offset: u64,
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     blob_len: u64,
+    /// Offset of Section F within the blob. Retained so local block-copy
+    /// merges can pass byte-identical document-map ranges directly to
+    /// `copy_file_range` without faulting their mmap pages into userspace.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    doc_map_offset: u64,
 }
 
 // SAFETY: All raw pointer access is derived from OwnedBytes which are Send+Sync
@@ -258,6 +263,7 @@ impl BmpIndex {
                 source: handle,
                 blob_offset,
                 blob_len,
+                doc_map_offset,
             });
         }
 
@@ -496,6 +502,7 @@ impl BmpIndex {
             source: handle,
             blob_offset,
             blob_len,
+            doc_map_offset,
         })
     }
 
@@ -881,6 +888,7 @@ impl BmpIndex {
     ///
     /// All rewrite paths share this scan so block-copy cannot offset corrupt
     /// source IDs into another segment while record reorder rejects them.
+    #[cfg(any(feature = "native", feature = "wasm", test))]
     pub(crate) fn visit_real_slots_for_rewrite(
         &self,
         mut visitor: impl FnMut(usize),
@@ -1148,6 +1156,26 @@ impl BmpIndex {
     #[inline]
     pub fn doc_map_ordinals_slice(&self) -> &[u8] {
         self.doc_map_ordinals_bytes.as_slice()
+    }
+
+    /// Native source-file range containing Section B (block payload).
+    #[cfg(feature = "native")]
+    pub(crate) fn block_data_file_range(&self) -> std::ops::Range<u64> {
+        self.blob_offset..self.blob_offset + self.block_data_sentinel()
+    }
+
+    /// Native source-file range containing Section F (document IDs).
+    #[cfg(feature = "native")]
+    pub(crate) fn doc_map_ids_file_range(&self) -> std::ops::Range<u64> {
+        let start = self.blob_offset + self.doc_map_offset;
+        start..start + u64::from(self.num_virtual_docs) * 4
+    }
+
+    /// Native source-file range containing Section G (ordinals).
+    #[cfg(feature = "native")]
+    pub(crate) fn doc_map_ordinals_file_range(&self) -> std::ops::Range<u64> {
+        let start = self.blob_offset + self.doc_map_offset + u64::from(self.num_virtual_docs) * 4;
+        start..start + u64::from(self.num_virtual_docs) * 2
     }
 
     /// Advise the kernel about sequential access patterns for merge.

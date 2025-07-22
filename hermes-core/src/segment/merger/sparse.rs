@@ -48,6 +48,14 @@ impl SegmentMerger {
         files: &SegmentFiles,
     ) -> Result<(usize, bool)> {
         let doc_offs = doc_offsets(segments)?;
+        // Local backends expose source paths so the byte-identical portions
+        // of BMP block-copy merges can stay inside the kernel. Remote and
+        // in-memory directories leave these as `None` and use mmap/read +
+        // streaming-write fallback.
+        let source_sparse_paths: Vec<Option<std::path::PathBuf>> = segments
+            .iter()
+            .map(|segment| dir.local_path(&SegmentFiles::new(segment.meta().id).sparse))
+            .collect();
         // False iff any merge-time BP pass hit its wall-clock budget.
         let mut all_converged = true;
 
@@ -175,6 +183,7 @@ impl SegmentMerger {
                         let bp_memory_budget = self.bp_memory_budget;
                         let out_grid_bits = grid_bits;
                         let scratch_path = scratch_path.clone();
+                        let permit_wait_start = std::time::Instant::now();
                         let _reorder_permit = match &self.reorder_permits {
                             Some(permits) => {
                                 let gate = Arc::clone(permits);
@@ -186,6 +195,14 @@ impl SegmentMerger {
                             }
                             None => None,
                         };
+                        let permit_wait = permit_wait_start.elapsed();
+                        if permit_wait >= std::time::Duration::from_secs(1) {
+                            log::info!(
+                                "[merge_bmp] field {}: waited {:.1}s for the BP scheduler",
+                                fid,
+                                permit_wait.as_secs_f64(),
+                            );
+                        }
                         // `spawn_blocking` detaches its closure when the
                         // awaiting RPC is cancelled. That used to release the
                         // segment operation guard while this writer was still
@@ -232,6 +249,7 @@ impl SegmentMerger {
                         merge_bmp_field(
                             &bmp_indexes,
                             &doc_offs,
+                            &source_sparse_paths,
                             field.0,
                             dims,
                             bmp_block_size,
@@ -595,6 +613,7 @@ fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawDa
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
     doc_offs: &[u32],
+    source_sparse_paths: &[Option<std::path::PathBuf>],
     field_id: u32,
     dims: u32,
     bmp_block_size: u32,
@@ -616,10 +635,16 @@ fn merge_bmp_field(
         .zip(doc_offs.iter().copied())
         .filter_map(|(opt, doc_off)| opt.map(|bmp| (bmp, doc_off)))
         .collect();
+    let source_paths: Vec<Option<&std::path::Path>> = bmp_indexes
+        .iter()
+        .zip(source_sparse_paths)
+        .filter_map(|(bmp, path)| bmp.as_ref().map(|_| path.as_deref()))
+        .collect();
 
     if sources.is_empty() {
         return Ok(());
     }
+    debug_assert_eq!(sources.len(), source_paths.len());
     // Validation and every following phase are exhaustive sequential scans.
     // Apply scan advice before touching multi-GB doc maps, not only before
     // block-data copying.
@@ -691,8 +716,6 @@ fn merge_bmp_field(
 
     let blob_start = writer.offset();
 
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB
-
     // ═══ Sequential block-copy merge ════════════════════════════════════
     // Blocks are self-contained — copy directly from sources in order.
     // BP reorder is a separate post-merge step (see segment::reorder).
@@ -701,16 +724,18 @@ fn merge_bmp_field(
     let mut source_byte_offsets: Vec<u64> = Vec::with_capacity(sources.len());
     let mut cumulative_bytes: u64 = 0;
 
-    for &(bmp, _) in &sources {
+    for (source_index, &(bmp, _)) in sources.iter().enumerate() {
         source_byte_offsets.push(cumulative_bytes);
         let sentinel = bmp.block_data_sentinel() as usize;
         let src_data = &bmp.block_data_slice()[..sentinel];
-        for chunk in src_data.chunks(CHUNK_SIZE) {
-            if cancellation_requested(cancellation) {
-                return Err(crate::Error::IndexClosed);
-            }
-            writer.write_all(chunk).map_err(crate::Error::Io)?;
-        }
+        super::copy_local_range_or_bytes(
+            writer,
+            source_paths[source_index],
+            bmp.block_data_file_range(),
+            src_data,
+            cancellation,
+            "BMP block data",
+        )?;
         cumulative_bytes += sentinel as u64;
     }
 
@@ -797,17 +822,19 @@ fn merge_bmp_field(
     const DOC_MAP_CHUNK: usize = 64 * 1024;
     let mut id_buf = vec![0u8; DOC_MAP_CHUNK * 4];
 
-    for &(bmp, doc_offset) in &sources {
+    for (source_index, &(bmp, doc_offset)) in sources.iter().enumerate() {
         let src_ids = bmp.doc_map_ids_slice();
         let n = bmp.num_virtual_docs as usize;
 
         if doc_offset == 0 {
-            for chunk in src_ids[..n * 4].chunks(CHUNK_SIZE) {
-                if cancellation_requested(cancellation) {
-                    return Err(crate::Error::IndexClosed);
-                }
-                writer.write_all(chunk).map_err(crate::Error::Io)?;
-            }
+            super::copy_local_range_or_bytes(
+                writer,
+                source_paths[source_index],
+                bmp.doc_map_ids_file_range(),
+                &src_ids[..n * 4],
+                cancellation,
+                "BMP document IDs",
+            )?;
         } else {
             for chunk_start in (0..n).step_by(DOC_MAP_CHUNK) {
                 if cancellation_requested(cancellation) {
@@ -838,15 +865,17 @@ fn merge_bmp_field(
     }
     drop(id_buf);
 
-    for &(bmp, _) in &sources {
+    for (source_index, &(bmp, _)) in sources.iter().enumerate() {
         let src_ords = bmp.doc_map_ordinals_slice();
         let n = bmp.num_virtual_docs as usize;
-        for chunk in src_ords[..n * 2].chunks(CHUNK_SIZE) {
-            if cancellation_requested(cancellation) {
-                return Err(crate::Error::IndexClosed);
-            }
-            writer.write_all(chunk).map_err(crate::Error::Io)?;
-        }
+        super::copy_local_range_or_bytes(
+            writer,
+            source_paths[source_index],
+            bmp.doc_map_ordinals_file_range(),
+            &src_ords[..n * 2],
+            cancellation,
+            "BMP ordinals",
+        )?;
     }
 
     // ── Phase 6: Write V18 footer ───────────────────────────────────────

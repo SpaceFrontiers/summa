@@ -13,6 +13,7 @@
 //! without walking earlier payload. All-zero groups have width zero and no
 //! payload. Row offsets are a small, separately pinnable `u64` table.
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 use std::io::Write;
 #[cfg(feature = "native")]
 use std::ops::Range;
@@ -52,6 +53,7 @@ pub(crate) fn block_grid_scale(grid_bits: u8) -> u32 {
 }
 
 /// Ceiling-quantize an exact u8 maximum without underestimating it.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 #[inline]
 pub(crate) fn quantize_block_maximum(value: u8, grid_bits: u8) -> u8 {
     if value == 0 {
@@ -103,6 +105,7 @@ impl CompressedGridLayout {
             + usize::from(remainder != 0) * (std::mem::size_of::<u32>() + selector_bytes(remainder))
     }
 
+    #[cfg(any(feature = "native", feature = "wasm", test))]
     pub(crate) fn row_bytes(self, widths: &[u8]) -> crate::Result<u64> {
         if widths.len() != self.groups {
             return Err(crate::Error::Internal(format!(
@@ -129,6 +132,7 @@ impl CompressedGridLayout {
     }
 
     /// Write the row-offset table. Offsets are relative to the first row byte.
+    #[cfg(any(feature = "native", feature = "wasm", test))]
     pub(crate) fn write_row_offsets(
         self,
         row_sizes: &[u64],
@@ -150,6 +154,7 @@ impl CompressedGridLayout {
     }
 
     /// Write the fixed-size metadata header for one row.
+    #[cfg(any(feature = "native", feature = "wasm", test))]
     pub(crate) fn write_row_header(
         self,
         widths: &[u8],
@@ -1313,6 +1318,7 @@ impl CompressedGrid {
 }
 
 #[inline]
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) fn bit_width(value: u8) -> u8 {
     (u8::BITS - value.leading_zeros()) as u8
 }
@@ -1321,6 +1327,7 @@ pub(crate) fn bit_width(value: u8) -> u8 {
 ///
 /// Callers zero-pad the unused tail of the last logical group. The returned
 /// payload always occupies `width * 32` bytes.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) fn pack_group(
     values: &[u8; GRID_GROUP_CELLS],
     width: u8,

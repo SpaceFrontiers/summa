@@ -43,6 +43,7 @@ pub const DENSE_TOC_ENTRY_SIZE: u64 = 4 + 1 + 8 + 8; // 21
 ///
 /// Called after all field data has been written. `toc_offset` is the
 /// current file position (byte offset where the TOC starts).
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub fn write_dense_toc_and_footer(
     writer: &mut (impl std::io::Write + ?Sized),
     toc_offset: u64,
@@ -112,6 +113,7 @@ pub const BMP_BLOB_FOOTER_SIZE: usize = 80;
 pub const SPARSE_FOOTER_SIZE: u64 = 24;
 
 /// Per-dim TOC entry accumulated during V3 sparse build/merge.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub struct SparseDimTocEntry {
     pub dim_id: u32,
     /// Absolute byte offset in file where block data starts for this dim
@@ -127,6 +129,7 @@ pub struct SparseDimTocEntry {
 }
 
 /// Per-field TOC entry accumulated during V3 sparse build/merge.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub struct SparseFieldToc {
     pub field_id: u32,
     pub quantization: u8,
@@ -136,6 +139,7 @@ pub struct SparseFieldToc {
     pub dims: Vec<SparseDimTocEntry>,
 }
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 impl SparseFieldToc {
     /// Build the sentinel TOC entry used by the self-contained BMP blob.
     pub(crate) fn bmp(field_id: u32, total_vectors: u32, blob_offset: u64, blob_len: u64) -> Self {
@@ -174,6 +178,7 @@ impl SparseFieldToc {
 /// [TOC: per-field header(13B) + per-dim entries(28B each)]
 /// [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)]
 /// ```
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub fn write_sparse_toc_and_footer(
     writer: &mut (impl std::io::Write + ?Sized),
     skip_offset: u64,

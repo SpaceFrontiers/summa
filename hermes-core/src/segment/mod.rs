@@ -63,6 +63,25 @@ impl OffsetWriter {
     pub(crate) fn finish(self) -> std::io::Result<()> {
         self.inner.finish()
     }
+
+    /// Copy a local source range at the current output position using the
+    /// writer backend's kernel-assisted path when available.
+    #[cfg(feature = "native")]
+    pub(crate) fn copy_from_file_range(
+        &mut self,
+        source: &std::fs::File,
+        source_offset: &mut u64,
+        len: usize,
+    ) -> std::io::Result<usize> {
+        let copied = self
+            .inner
+            .copy_from_file_range(source, source_offset, len)?;
+        self.offset = self
+            .offset
+            .checked_add(copied as u64)
+            .ok_or_else(|| std::io::Error::other("offset-writer byte count overflow"))?;
+        Ok(copied)
+    }
 }
 
 #[cfg(any(feature = "native", feature = "wasm"))]

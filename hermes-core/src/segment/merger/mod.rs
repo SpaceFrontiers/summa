@@ -8,6 +8,7 @@ mod store;
 
 pub(crate) use dense::AnnWriteMode;
 
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -127,6 +128,100 @@ pub(crate) fn block_in_place_if_multithread<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Attempt a byte-identical local range copy through the streaming writer's
+/// kernel-assisted path. Returns `Ok(false)` without emitting bytes when the
+/// backend/filesystem does not support it.
+fn try_copy_local_file_range(
+    writer: &mut OffsetWriter,
+    source_path: &std::path::Path,
+    source_range: std::ops::Range<u64>,
+    cancellation: Option<&AtomicBool>,
+    context: &str,
+) -> Result<bool> {
+    const COPY_CHUNK: usize = 16 * 1024 * 1024;
+
+    let source = std::fs::File::open(source_path).map_err(crate::Error::Io)?;
+    let expected = source_range
+        .end
+        .checked_sub(source_range.start)
+        .ok_or_else(|| crate::Error::Corruption(format!("{context} source range is inverted")))?;
+    let mut source_offset = source_range.start;
+    let mut copied = 0u64;
+    while copied < expected {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(crate::Error::IndexClosed);
+        }
+        let requested = usize::try_from((expected - copied).min(COPY_CHUNK as u64))
+            .expect("bounded copy chunk fits usize");
+        match writer.copy_from_file_range(&source, &mut source_offset, requested) {
+            Ok(0) => {
+                return Err(crate::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "kernel {context} copy stopped after {copied} of {expected} bytes from \
+                         {source_path:?}",
+                    ),
+                )));
+            }
+            Ok(count) => {
+                copied = copied.checked_add(count as u64).ok_or_else(|| {
+                    crate::Error::Internal(format!("{context} copied-byte count exceeds u64"))
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported && copied == 0 => {
+                return Ok(false);
+            }
+            Err(error) => return Err(crate::Error::Io(error)),
+        }
+    }
+
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log::info!("[merge] byte-identical local ranges use kernel-assisted file copies");
+    }
+    Ok(true)
+}
+
+/// Copy a byte-identical range, falling back to already-mapped bytes for
+/// abstract directories and filesystems without range-copy support.
+pub(super) fn copy_local_range_or_bytes(
+    writer: &mut OffsetWriter,
+    source_path: Option<&std::path::Path>,
+    source_range: std::ops::Range<u64>,
+    bytes: &[u8],
+    cancellation: Option<&AtomicBool>,
+    context: &str,
+) -> Result<()> {
+    let range_len = source_range
+        .end
+        .checked_sub(source_range.start)
+        .ok_or_else(|| crate::Error::Corruption(format!("{context} source range is inverted")))?;
+    if range_len != bytes.len() as u64 {
+        return Err(crate::Error::Corruption(format!(
+            "{context} source range is {range_len} bytes but mapped section is {} bytes",
+            bytes.len(),
+        )));
+    }
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(path) = source_path
+        && try_copy_local_file_range(writer, path, source_range, cancellation, context)?
+    {
+        return Ok(());
+    }
+
+    for chunk in bytes.chunks(4 * 1024 * 1024) {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(crate::Error::IndexClosed);
+        }
+        writer.write_all(chunk).map_err(crate::Error::Io)?;
+    }
+    Ok(())
+}
+
 /// Append an exact-length temporary directory file to a segment output and
 /// remove it. Used by sparse skip tables so neither merge nor BP rewrite
 /// buffers a corpus-sized metadata section on heap.
@@ -146,14 +241,29 @@ pub(crate) async fn append_and_delete_temp<D: DirectoryWriter>(
             path, actual_bytes, expected_bytes,
         )));
     }
-    let mut offset = 0u64;
-    while offset < expected_bytes {
-        let end = (offset + COPY_CHUNK).min(expected_bytes);
-        let chunk = directory.read_range(path, offset..end).await?;
-        writer
-            .write_all(chunk.as_slice())
-            .map_err(crate::Error::Io)?;
-        offset = end;
+    let copied_in_kernel = if let Some(local_path) = directory.local_path(path) {
+        block_in_place_if_multithread(|| {
+            try_copy_local_file_range(
+                writer,
+                &local_path,
+                0..expected_bytes,
+                None,
+                "sparse scratch",
+            )
+        })?
+    } else {
+        false
+    };
+    if !copied_in_kernel {
+        let mut offset = 0u64;
+        while offset < expected_bytes {
+            let end = (offset + COPY_CHUNK).min(expected_bytes);
+            let chunk = directory.read_range(path, offset..end).await?;
+            writer
+                .write_all(chunk.as_slice())
+                .map_err(crate::Error::Io)?;
+            offset = end;
+        }
     }
     if let Err(error) = directory.delete(path).await {
         // The section is already complete in the output. This output-scoped
@@ -620,12 +730,11 @@ impl SegmentMerger {
         // only copy of the merged documents across a power failure.
         dir.write_durable(&files.meta, &meta.serialize()?).await?;
 
-        let label = if trained.is_some() {
-            "ANN merge"
-        } else {
-            "Merge"
-        };
-        log::info!("{} complete: {} docs, {}", label, total_docs, stats);
+        // Dense ANN payloads are byte-copied during an ordinary merge; the
+        // wall-clock timer also includes postings, store, sparse BP and any BP
+        // scheduler wait. Calling this an "ANN merge" made long sparse waits
+        // look like ANN construction in production logs.
+        log::info!("[merge] complete: {} docs, {}", total_docs, stats);
 
         Ok((meta, stats))
     }

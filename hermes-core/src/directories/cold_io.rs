@@ -193,6 +193,23 @@ impl StreamingWriter for ColdStreamingWriter {
     fn bytes_written(&self) -> u64 {
         self.written + self.buf.len() as u64
     }
+
+    fn copy_from_file_range(
+        &mut self,
+        source: &std::fs::File,
+        source_offset: &mut u64,
+        len: usize,
+    ) -> io::Result<usize> {
+        self.flush_buf()?;
+        let copied =
+            super::directory::copy_file_range_once(source, source_offset, &self.file, len)?;
+        self.written = self
+            .written
+            .checked_add(copied as u64)
+            .ok_or_else(|| io::Error::other("cold-writer byte count overflow"))?;
+        self.maybe_drop(false);
+        Ok(copied)
+    }
 }
 
 #[cfg(test)]
@@ -234,5 +251,41 @@ mod tests {
         let got = std::fs::read(&path).unwrap();
         assert_eq!(got.len(), expected.len());
         assert_eq!(got, expected, "cold writer corrupted the byte stream");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_cold_streaming_writer_kernel_range_copy_is_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.bin");
+        let output_path = tmp.path().join("output.bin");
+        let source_bytes: Vec<u8> = (0..256u16)
+            .cycle()
+            .take(2 * 1024 * 1024 + 37)
+            .map(|value| value as u8)
+            .collect();
+        std::fs::write(&source_path, &source_bytes).unwrap();
+
+        let source = std::fs::File::open(&source_path).unwrap();
+        let output = std::fs::File::create(&output_path).unwrap();
+        let mut writer: Box<dyn StreamingWriter> = Box::new(ColdStreamingWriter::new(
+            output,
+            std::sync::Arc::from("test"),
+        ));
+        writer.write_all(b"prefix").unwrap();
+        let mut source_offset = 13u64;
+        let length = source_bytes.len() - 31;
+        let copied = writer
+            .copy_from_file_range(&source, &mut source_offset, length)
+            .unwrap();
+        assert_eq!(copied, length);
+        assert_eq!(source_offset, 13 + length as u64);
+        writer.write_all(b"suffix").unwrap();
+        writer.finish().unwrap();
+
+        let mut expected = b"prefix".to_vec();
+        expected.extend_from_slice(&source_bytes[13..13 + length]);
+        expected.extend_from_slice(b"suffix");
+        assert_eq!(std::fs::read(output_path).unwrap(), expected);
     }
 }

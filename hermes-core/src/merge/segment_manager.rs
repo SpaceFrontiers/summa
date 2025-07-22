@@ -1684,21 +1684,30 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let quarantined = self.quarantined_segments.lock().clone();
             let active_ids = self.active_operations.snapshot();
 
-            // Exclude segments owned by another operation, pending retirement,
-            // or quarantined after a persistent open/validation failure.
-            let segments: Vec<SegmentInfo> = st
+            // Backlog pressure is based on every metadata-live segment, not
+            // only currently available inputs. Otherwise a wave of in-flight
+            // merges hides most of the topology and makes later candidates
+            // look healthy while the original backlog still exists.
+            let live_segments: Vec<SegmentInfo> = st
                 .metadata
                 .segment_metas
                 .iter()
                 .filter(|(id, _)| {
-                    !self.tracker.is_pending_deletion(id)
-                        && !active_ids.contains(*id)
-                        && !quarantined.contains(*id)
+                    !self.tracker.is_pending_deletion(id) && !quarantined.contains(*id)
                 })
                 .map(|(id, info)| SegmentInfo {
                     id: id.clone(),
                     num_docs: info.num_docs,
                 })
+                .collect();
+            let severe_backlog = st.merge_policy.has_severe_backlog(&live_segments);
+
+            // Exclude segments owned by another operation. Pending retirement
+            // and quarantined segments were already removed above.
+            let segments: Vec<SegmentInfo> = live_segments
+                .iter()
+                .filter(|segment| !active_ids.contains(&segment.id))
+                .cloned()
                 .collect();
 
             log::debug!("[maybe_merge] {} eligible segments", segments.len());
@@ -1731,11 +1740,25 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if handles.len() >= slots_available {
                     break;
                 }
-                if let Some(h) = self.spawn_merge(c.segment_ids) {
+                // Under severe topology pressure, retire segments first. BP
+                // remains optional for correctness and the block-copy output
+                // is explicitly marked unreordered, so the optimizer performs
+                // one pass after the compaction wave instead of every merge
+                // task serializing behind the whole-pass gate.
+                let reorder_bmp = self.reorder_on_merge && !severe_backlog;
+                if let Some(h) = self.spawn_merge(c.segment_ids, reorder_bmp) {
                     handles.push(h);
                 }
             }
             if !handles.is_empty() {
+                if severe_backlog && self.reorder_on_merge {
+                    log::info!(
+                        "[maybe_merge] severe backlog: {} live segments; started {} fast \
+                         block-copy merge(s), deferring BP to the optimizer",
+                        live_segments.len(),
+                        handles.len(),
+                    );
+                }
                 // Publish handles before releasing `state`. A force merge
                 // raises its admission barrier under the same lock, then
                 // drains this list, so no spawned merge can fall into the
@@ -1753,7 +1776,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ///
     /// On completion, the task auto-triggers `maybe_merge` to evaluate cascading merges.
     /// Returns the JoinHandle if the merge was spawned, None if it was skipped.
-    fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) -> Option<JoinHandle<()>> {
+    fn spawn_merge(
+        self: &Arc<Self>,
+        segment_ids_to_merge: Vec<String>,
+        reorder_bmp: bool,
+    ) -> Option<JoinHandle<()>> {
         if self.force_merge_active.load(Ordering::Acquire) > 0 {
             log::debug!("[spawn_merge] skipped: explicit force merge has priority");
             return None;
@@ -1798,7 +1825,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .merge_and_replace_registered(
                     &ids,
                     output_id,
-                    sm.reorder_on_merge,
+                    reorder_bmp,
                     ReorderPriority::AutomaticMerge,
                 )
                 .await;
@@ -2406,6 +2433,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         // Wait for all in-flight background merges (including cascading)
         // before starting forced merges to avoid try_register conflicts.
+        let background_merges = self
+            .merge_handles
+            .lock()
+            .iter()
+            .filter(|handle| !handle.is_finished())
+            .count();
+        if background_merges > 0 {
+            log::info!(
+                "[force_merge] waiting for {} in-flight background merge(s) before planning",
+                background_merges,
+            );
+        }
         let drain_start = std::time::Instant::now();
         self.wait_for_all_merges().await;
         if drain_start.elapsed() >= std::time::Duration::from_secs(1) {
