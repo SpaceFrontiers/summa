@@ -24,7 +24,7 @@ use crate::dsl::IvfRoutingMode;
 
 #[cfg(feature = "native")]
 use crate::structures::BinaryIvfIndex;
-use crate::structures::vector::index::BoundedAnnCollector;
+use crate::structures::vector::index::{BoundedAnnCollector, BoundedUniqueAnnCollector};
 
 const ANN_HEADER_MAGIC: u32 = 0x3152_4e41; // "ANR1"
 const ANN_FOOTER_MAGIC: u32 = 0x3146_4e41; // "ANF1"
@@ -42,8 +42,11 @@ const BINARY_SCORE_BATCH: usize = 8_192;
 /// with `γ < 1`, kept with slack so pruning can never drop a candidate the
 /// unpruned scan would have kept (pinned by a test).
 const TQ_PRUNE_ESTIMATE_BOUND: f32 = 1.3;
-/// Flat TQ scans fan out across Rayon above this vector count; the merge of
-/// per-task collectors costs ~k per task, so small segments stay sequential.
+/// Flat TQ scans fan out across Rayon above this vector count. Rayon folds
+/// chunks into one collector per worker before reducing those collectors, so
+/// temporary top-k memory is bounded by the active worker count rather than
+/// the number of chunks. Small segments stay sequential because fan-out
+/// overhead would dominate.
 #[cfg(feature = "native")]
 const TQ_PARALLEL_SCAN_MIN_VECTORS: usize = 65_536;
 #[cfg(feature = "native")]
@@ -127,6 +130,17 @@ pub(crate) struct AnnDiskIndex {
     raw: OwnedBytes,
     header: AnnDiskHeader,
     runs: Vec<AnnRun>,
+}
+
+/// A document selected by a combiner-aware compressed scan.
+///
+/// This intentionally has no ordinal: `score` combines every value belonging
+/// to the document and must never be reused as an individual vector score by
+/// an exact reranker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AnnDocumentCandidate {
+    pub(crate) doc_id: u32,
+    pub(crate) score: f32,
 }
 
 impl AnnDiskIndex {
@@ -364,6 +378,179 @@ impl AnnDiskIndex {
             self.raw.madvise_range(range, libc::MADV_WILLNEED);
         }
     }
+
+    /// Score a flat TQ payload while every value of a document is still in
+    /// hand, combine those approximate scores, and retain document-level
+    /// top-k. TQ build runs preserve `(doc_id, ordinal)` input order, so the
+    /// scratch space is bounded by one document plus the retained heap.
+    pub(crate) fn search_tq_combined_documents(
+        &self,
+        k: usize,
+        plan: &crate::structures::TqQueryPlan,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> io::Result<Vec<AnnDocumentCandidate>> {
+        use crate::structures::vector::quantization::{TQ_BLOCK_LANES, tq_block_bytes};
+
+        combiner
+            .validate()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        if plan.padded_dim() != self.header.code_size * 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TQ query plan does not match the payload dimension",
+            ));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let block_bytes = tq_block_bytes(self.header.code_size);
+        let bytes = self.raw.as_slice();
+        let mut top_documents = BoundedAnnCollector::<true, true>::new(k);
+        let mut ordinal_scores = Vec::new();
+        let mut scores = [0.0f32; TQ_BLOCK_LANES];
+
+        for run in &self.runs {
+            let mut current_doc = None;
+            let codes = &bytes[run.codes.clone()];
+            for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                crate::structures::vector::quantization::tq_score_block(plan, block, &mut scores);
+                let lane_base = block_index * TQ_BLOCK_LANES;
+                let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                    let index = lane_base + lane;
+                    let doc_id = run_doc_id(bytes, run, index)?;
+                    if current_doc.is_some_and(|previous| doc_id < previous) {
+                        return Err(invalid_data("flat TQ run is not grouped by document ID"));
+                    }
+                    if current_doc.is_some_and(|previous| doc_id != previous) {
+                        retain_combined_document(
+                            &mut top_documents,
+                            current_doc.expect("current document is present"),
+                            &ordinal_scores,
+                            combiner,
+                        );
+                        ordinal_scores.clear();
+                    }
+                    current_doc = Some(doc_id);
+                    if score.is_finite() {
+                        ordinal_scores.push((
+                            u32::from(read_u16(bytes, run.ordinals.start + index * 2)),
+                            score,
+                        ));
+                    }
+                }
+            }
+            if let Some(doc_id) = current_doc {
+                retain_combined_document(&mut top_documents, doc_id, &ordinal_scores, combiner);
+                ordinal_scores.clear();
+            }
+        }
+
+        Ok(top_documents
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, _, score)| AnnDocumentCandidate { doc_id, score })
+            .collect())
+    }
+
+    /// Score every posting in the probed IVF-TQ leaves, deduplicate SOAR
+    /// assignments by `(doc_id, ordinal)`, combine every approximate ordinal
+    /// present in the probed leaves, and retain at most `k` documents.
+    ///
+    /// Unlike the Max path, this deliberately performs no individual-score
+    /// pruning: an ordinal that cannot enter vector top-k may still change a
+    /// Sum, Avg, LogSumExp, or WeightedTopK document score.
+    pub(crate) fn search_ivf_tq_combined_documents(
+        &self,
+        k: usize,
+        plan: &crate::structures::TqIvfQueryPlan,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> io::Result<Vec<AnnDocumentCandidate>> {
+        use crate::structures::vector::quantization::{
+            TQ_BLOCK_LANES, tq_ivf_block_bytes, tq_score_ivf_block,
+        };
+
+        validate_combined_search(combiner)?;
+        let tq_plan = plan.tq_plan();
+        self.validate_ivf_tq_query_plan(plan)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(&plan.cluster_ids);
+
+        let block_bytes = tq_ivf_block_bytes(self.header.code_size);
+        let bytes = self.raw.as_slice();
+        let mut ordinal_scores = Vec::new();
+        ordinal_scores
+            .try_reserve_exact(probed_posting_count(self, &plan.cluster_ids)?)
+            .map_err(|_| invalid_data("IVF-TQ combined score buffer allocation failed"))?;
+        let mut scores = [0.0f32; TQ_BLOCK_LANES];
+        for (cluster_id, cluster_dot) in plan.cluster_dots() {
+            for run in self.cluster_runs(cluster_id) {
+                let codes = &bytes[run.codes.clone()];
+                for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                    tq_score_ivf_block(tq_plan, block, cluster_dot, &mut scores);
+                    let lane_base = block_index * TQ_BLOCK_LANES;
+                    let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                    for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                        if !score.is_finite() {
+                            continue;
+                        }
+                        let index = lane_base + lane;
+                        ordinal_scores.push((
+                            run_doc_id(bytes, run, index)?,
+                            read_u16(bytes, run.ordinals.start + index * 2),
+                            score,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(combine_scored_ordinals(ordinal_scores, k, combiner))
+    }
+
+    /// Score packed codes in the selected binary-IVF leaves, deduplicate
+    /// repeated `(doc_id, ordinal)` assignments, combine per document, and
+    /// retain at most `k` approximate document candidates.
+    pub(crate) fn search_binary_combined_documents(
+        &self,
+        k: usize,
+        query: &[u8],
+        cluster_ids: &[u32],
+        combiner: crate::query::MultiValueCombiner,
+    ) -> io::Result<Vec<AnnDocumentCandidate>> {
+        validate_combined_search(combiner)?;
+        if query.len() != self.header.code_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary ANN query has the wrong byte length",
+            ));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(cluster_ids);
+
+        let bytes = self.raw.as_slice();
+        let mut score_batch = vec![0.0f32; BINARY_SCORE_BATCH.min(self.header.vector_count)];
+        let mut ordinal_scores = Vec::new();
+        ordinal_scores
+            .try_reserve_exact(probed_posting_count(self, cluster_ids)?)
+            .map_err(|_| invalid_data("binary combined score buffer allocation failed"))?;
+        score_binary_cluster_runs(
+            self,
+            bytes,
+            query,
+            cluster_ids,
+            &mut score_batch,
+            &mut ordinal_scores,
+        )?;
+        Ok(combine_scored_ordinals(ordinal_scores, k, combiner))
+    }
+
     /// Score every TQ block against the query plan and keep the top `k`
     /// distinct documents by estimated similarity.
     pub(crate) fn search_tq_distinct(
@@ -382,54 +569,58 @@ impl AnnDiskIndex {
         let block_bytes = tq_block_bytes(self.header.code_size);
         let bytes = self.raw.as_slice();
 
-        // Large flat scans are CPU-bound on the LUT16 kernel; fan blocks out
-        // across the Rayon pool with per-task collectors and merge. Small
-        // segments stay sequential — the fan-out overhead would dominate.
+        // Large flat scans are CPU-bound on the LUT16 kernel. Fold chunks into
+        // worker-local collectors and reduce them directly: materializing one
+        // top-k Vec per chunk would make temporary memory O(chunks * k) on
+        // large segments instead of O(workers * k).
         #[cfg(feature = "native")]
         if self.header.vector_count >= TQ_PARALLEL_SCAN_MIN_VECTORS {
             use rayon::prelude::*;
-            let partials: Vec<io::Result<Vec<(u32, u16, f32)>>> = self
+            let collector = self
                 .runs
                 .par_iter()
-                .flat_map_iter(|run| {
+                .flat_map(|run| {
                     let codes = &bytes[run.codes.clone()];
                     let blocks = codes.len() / block_bytes;
                     (0..blocks.div_ceil(TQ_PARALLEL_SCAN_CHUNK_BLOCKS))
+                        .into_par_iter()
                         .map(move |chunk| (run, chunk * TQ_PARALLEL_SCAN_CHUNK_BLOCKS, blocks))
                 })
-                .map(|(run, first_block, total_blocks)| {
-                    let codes = &bytes[run.codes.clone()];
-                    let last_block =
-                        (first_block + TQ_PARALLEL_SCAN_CHUNK_BLOCKS).min(total_blocks);
-                    let mut collector = BoundedAnnCollector::<true, true>::new(k);
-                    let mut scores = [0.0f32; TQ_BLOCK_LANES];
-                    for block_index in first_block..last_block {
-                        let block = &codes[block_index * block_bytes..][..block_bytes];
-                        crate::structures::vector::quantization::tq_score_block(
-                            plan,
-                            block,
-                            &mut scores,
-                        );
-                        let lane_base = block_index * TQ_BLOCK_LANES;
-                        let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
-                        for (lane, &score) in scores.iter().enumerate().take(lanes) {
-                            let index = lane_base + lane;
-                            collector.insert(
-                                run_doc_id(bytes, run, index)?,
-                                read_u16(bytes, run.ordinals.start + index * 2),
-                                score,
+                .try_fold(
+                    || BoundedAnnCollector::<true, true>::new(k),
+                    |mut collector, (run, first_block, total_blocks)| {
+                        let codes = &bytes[run.codes.clone()];
+                        let last_block =
+                            (first_block + TQ_PARALLEL_SCAN_CHUNK_BLOCKS).min(total_blocks);
+                        let mut scores = [0.0f32; TQ_BLOCK_LANES];
+                        for block_index in first_block..last_block {
+                            let block = &codes[block_index * block_bytes..][..block_bytes];
+                            crate::structures::vector::quantization::tq_score_block(
+                                plan,
+                                block,
+                                &mut scores,
                             );
+                            let lane_base = block_index * TQ_BLOCK_LANES;
+                            let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                            for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                                let index = lane_base + lane;
+                                collector.insert(
+                                    run_doc_id(bytes, run, index)?,
+                                    read_u16(bytes, run.ordinals.start + index * 2),
+                                    score,
+                                );
+                            }
                         }
-                    }
-                    Ok(collector.into_sorted_results())
-                })
-                .collect();
-            let mut collector = BoundedAnnCollector::<true, true>::new(k);
-            for partial in partials {
-                for (doc_id, ordinal, score) in partial? {
-                    collector.insert(doc_id, ordinal, score);
-                }
-            }
+                        Ok::<_, io::Error>(collector)
+                    },
+                )
+                .try_reduce(
+                    || BoundedAnnCollector::<true, true>::new(k),
+                    |mut collector, partial| {
+                        collector.merge_from(partial);
+                        Ok(collector)
+                    },
+                )?;
             return Ok(collector.into_sorted_results());
         }
 
@@ -455,11 +646,12 @@ impl AnnDiskIndex {
     }
 
     /// Score the probed IVF-TQ leaves and keep the top `k` distinct
-    /// documents by estimated similarity (`⟨q̂,c⟩ + scale·⟨q̂,r̂⟩`).
+    /// documents by estimated cosine similarity
+    /// (`⟨q̂,c⟩ + scale·⟨q̂,r̂⟩`).
     ///
-    /// Blocks whose best possible estimate cannot beat the running k-th
-    /// score are skipped; clusters are serialized in descending residual
-    /// scale, so the first losing block ends its run.
+    /// Blocks whose best possible estimate cannot beat the running k-th score
+    /// terminate their run. The supported cosine generation guarantees that
+    /// residual scales are stored in descending order.
     pub(crate) fn search_ivf_tq_distinct(
         &self,
         k: usize,
@@ -470,12 +662,7 @@ impl AnnDiskIndex {
         };
 
         let tq_plan = plan.tq_plan();
-        if tq_plan.padded_dim() != self.header.code_size * 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IVF-TQ query plan does not match the payload dimension",
-            ));
-        }
+        self.validate_ivf_tq_query_plan(plan)?;
         #[cfg(feature = "native")]
         self.prefetch_cluster_runs(&plan.cluster_ids);
         let block_bytes = tq_ivf_block_bytes(self.header.code_size);
@@ -487,20 +674,12 @@ impl AnnDiskIndex {
         for (cluster_id, cluster_dot) in plan.cluster_dots() {
             for run in self.cluster_runs(cluster_id) {
                 let codes = &bytes[run.codes.clone()];
-                let total_blocks = codes.len() / block_bytes;
+                let block_count = codes.len() / block_bytes;
                 for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
-                    // Clusters are written in descending residual-scale
-                    // order, so once this block's best possible score cannot
-                    // beat the running k-th, no later block in the run can.
                     if let Some(threshold) = collector.pruning_threshold() {
-                        let max_scale = block[..TQ_BLOCK_LANES * size_of::<f32>()]
-                            .chunks_exact(4)
-                            .map(|lane| {
-                                f32::from_le_bytes(lane.try_into().expect("scale is 4 bytes"))
-                            })
-                            .fold(0.0f32, f32::max);
+                        let max_scale = tq_ivf_block_max_scale(block);
                         if cluster_dot + max_scale * TQ_PRUNE_ESTIMATE_BOUND <= threshold {
-                            pruned_blocks += total_blocks - block_index;
+                            pruned_blocks += block_count - block_index;
                             break;
                         }
                     }
@@ -528,13 +707,35 @@ impl AnnDiskIndex {
         Ok(collector.into_sorted_results())
     }
 
+    fn validate_ivf_tq_query_plan(
+        &self,
+        plan: &crate::structures::TqIvfQueryPlan,
+    ) -> io::Result<()> {
+        if self.header.kind != AnnKind::IvfTq
+            || !crate::structures::is_ivf_tq_cosine_generation(self.header.quantizer_version)
+        {
+            return Err(invalid_data(
+                "legacy raw IVF-TQ payloads cannot be searched; rebuild the index",
+            ));
+        }
+        if plan.tq_plan().padded_dim() != self.header.code_size * 2
+            || plan.quantizer_version != self.header.quantizer_version
+            || plan.fingerprint != self.header.codebook_version
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IVF-TQ query plan does not match the payload generation",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn search_binary_clusters<const BY_DOCUMENT: bool>(
         &self,
         query: &[u8],
         k: usize,
         cluster_ids: &[u32],
     ) -> io::Result<Vec<(u32, u16, f32)>> {
-        let mut collector = BoundedAnnCollector::<BY_DOCUMENT, true>::new(k);
         if query.len() != self.header.code_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -545,19 +746,33 @@ impl AnnDiskIndex {
         self.prefetch_cluster_runs(cluster_ids);
         let bytes = self.raw.as_slice();
         let mut scores = vec![0.0f32; BINARY_SCORE_BATCH.min(self.header.vector_count)];
-        for &cluster_id in cluster_ids {
-            for run in self.cluster_runs(cluster_id) {
-                score_binary_run(
-                    bytes,
-                    run,
-                    query,
-                    self.header.dim,
-                    self.header.code_size,
-                    &mut scores,
-                    &mut collector,
-                )?;
-            }
+        if BY_DOCUMENT {
+            let mut collector = BoundedAnnCollector::<true, true>::new(k);
+            score_binary_cluster_runs(
+                self,
+                bytes,
+                query,
+                cluster_ids,
+                &mut scores,
+                &mut collector,
+            )?;
+            return Ok(collector.into_sorted_results());
         }
+
+        // A probe plan returns each leaf once and every indexed vector belongs
+        // to exactly one leaf, so `(doc_id, ordinal)` keys are unique here.
+        // Avoid the deduplication hash map in the common single-value path.
+        debug_assert!(
+            {
+                let mut seen = rustc_hash::FxHashSet::default();
+                cluster_ids
+                    .iter()
+                    .all(|cluster_id| seen.insert(*cluster_id))
+            },
+            "an IVF probe plan must not repeat a cluster",
+        );
+        let mut collector = BoundedUniqueAnnCollector::<true>::new(k);
+        score_binary_cluster_runs(self, bytes, query, cluster_ids, &mut scores, &mut collector)?;
         Ok(collector.into_sorted_results())
     }
 }
@@ -583,14 +798,78 @@ fn coalesce_prefetch_ranges(ranges: &mut Vec<Range<usize>>) {
     ranges.truncate(output_len);
 }
 
-fn score_binary_run<const BY_DOCUMENT: bool>(
+trait AnnScoreSink {
+    fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32);
+}
+
+impl<const BY_DOCUMENT: bool> AnnScoreSink for BoundedAnnCollector<BY_DOCUMENT, true> {
+    #[inline]
+    fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32) {
+        self.insert(doc_id, ordinal, score);
+    }
+}
+
+impl AnnScoreSink for BoundedUniqueAnnCollector<true> {
+    #[inline]
+    fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32) {
+        self.insert(doc_id, ordinal, score);
+    }
+}
+
+impl AnnScoreSink for Vec<(u32, u16, f32)> {
+    #[inline]
+    fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32) {
+        if score.is_finite() {
+            self.push((doc_id, ordinal, score));
+        }
+    }
+}
+
+fn probed_posting_count(index: &AnnDiskIndex, cluster_ids: &[u32]) -> io::Result<usize> {
+    cluster_ids.iter().try_fold(0usize, |count, &cluster_id| {
+        index
+            .cluster_runs(cluster_id)
+            .iter()
+            .try_fold(count, |count, run| {
+                count
+                    .checked_add(run.count)
+                    .ok_or_else(|| invalid_data("ANN probed posting count overflows usize"))
+            })
+    })
+}
+
+fn score_binary_cluster_runs(
+    index: &AnnDiskIndex,
+    bytes: &[u8],
+    query: &[u8],
+    cluster_ids: &[u32],
+    scores: &mut [f32],
+    collector: &mut impl AnnScoreSink,
+) -> io::Result<()> {
+    for &cluster_id in cluster_ids {
+        for run in index.cluster_runs(cluster_id) {
+            score_binary_run(
+                bytes,
+                run,
+                query,
+                index.header.dim,
+                index.header.code_size,
+                scores,
+                collector,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn score_binary_run(
     bytes: &[u8],
     run: &AnnRun,
     query: &[u8],
     dim_bits: usize,
     code_size: usize,
     scores: &mut [f32],
-    collector: &mut BoundedAnnCollector<BY_DOCUMENT, true>,
+    collector: &mut impl AnnScoreSink,
 ) -> io::Result<()> {
     for batch_start in (0..run.count).step_by(BINARY_SCORE_BATCH) {
         let batch_count = BINARY_SCORE_BATCH.min(run.count - batch_start);
@@ -605,7 +884,7 @@ fn score_binary_run<const BY_DOCUMENT: bool>(
         );
         for (batch_index, &score) in scores.iter().enumerate().take(batch_count) {
             let index = batch_start + batch_index;
-            collector.insert(
+            collector.insert_score(
                 run_doc_id(bytes, run, index)?,
                 read_u16(bytes, run.ordinals.start + index * 2),
                 score,
@@ -613,6 +892,88 @@ fn score_binary_run<const BY_DOCUMENT: bool>(
         }
     }
     Ok(())
+}
+
+#[inline]
+fn retain_combined_document(
+    collector: &mut BoundedAnnCollector<true, true>,
+    doc_id: u32,
+    ordinal_scores: &[(u32, f32)],
+    combiner: crate::query::MultiValueCombiner,
+) {
+    if !ordinal_scores.is_empty() {
+        collector.insert(doc_id, 0, combiner.combine(ordinal_scores));
+    }
+}
+
+fn validate_combined_search(combiner: crate::query::MultiValueCombiner) -> io::Result<()> {
+    combiner
+        .validate()
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
+}
+
+/// Sort arbitrary probed-run output into complete documents, retain the best
+/// estimate for every duplicated `(doc_id, ordinal)` SOAR assignment, then
+/// apply the requested combiner. The corpus-dependent scratch is one compact
+/// tuple per probed posting and never expands to unprobed leaves or raw
+/// vectors; final retained state is O(k).
+fn combine_scored_ordinals(
+    mut scores: Vec<(u32, u16, f32)>,
+    k: usize,
+    combiner: crate::query::MultiValueCombiner,
+) -> Vec<AnnDocumentCandidate> {
+    if k == 0 || scores.is_empty() {
+        return Vec::new();
+    }
+    scores.retain(|entry| entry.2.is_finite());
+    scores.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    // Compact duplicates in place. IVF-TQ SOAR copies can have slightly
+    // different residual estimates; preserving the highest one matches the
+    // legacy Max collector's duplicate semantics without double-counting it
+    // for additive combiners.
+    let mut unique_len = 0usize;
+    for read_index in 0..scores.len() {
+        let candidate = scores[read_index];
+        if unique_len > 0
+            && scores[unique_len - 1].0 == candidate.0
+            && scores[unique_len - 1].1 == candidate.1
+        {
+            if candidate.2.total_cmp(&scores[unique_len - 1].2).is_gt() {
+                scores[unique_len - 1].2 = candidate.2;
+            }
+        } else {
+            scores[unique_len] = candidate;
+            unique_len += 1;
+        }
+    }
+    scores.truncate(unique_len);
+
+    let mut top_documents = BoundedAnnCollector::<true, true>::new(k);
+    let mut current_doc = None;
+    let mut ordinal_scores = Vec::new();
+    for (doc_id, ordinal, score) in scores {
+        if current_doc.is_some_and(|current| current != doc_id) {
+            retain_combined_document(
+                &mut top_documents,
+                current_doc.expect("current document is present"),
+                &ordinal_scores,
+                combiner,
+            );
+            ordinal_scores.clear();
+        }
+        current_doc = Some(doc_id);
+        ordinal_scores.push((u32::from(ordinal), score));
+    }
+    if let Some(doc_id) = current_doc {
+        retain_combined_document(&mut top_documents, doc_id, &ordinal_scores, combiner);
+    }
+
+    top_documents
+        .into_sorted_results()
+        .into_iter()
+        .map(|(doc_id, _, score)| AnnDocumentCandidate { doc_id, score })
+        .collect()
 }
 
 #[cfg(feature = "native")]
@@ -657,6 +1018,11 @@ pub(crate) fn write_built_ivf_tq(
 ) -> io::Result<u64> {
     use crate::structures::vector::quantization::{TQ_BLOCK_LANES, tq_pack_ivf_block};
 
+    if !crate::structures::is_ivf_tq_cosine_generation(index.centroids_version) {
+        return Err(invalid_data(
+            "legacy raw IVF-TQ generations cannot be serialized; rebuild the index",
+        ));
+    }
     let codec = index.codec();
     let padded_dim = codec.padded_dim();
     let mut clusters: Vec<_> = index.clusters.iter().collect();
@@ -919,6 +1285,13 @@ fn write_merged_ann_impl(
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot merge an empty ANN source list"));
     };
+    if first.header.kind == AnnKind::IvfTq
+        && !crate::structures::is_ivf_tq_cosine_generation(first.header.quantizer_version)
+    {
+        return Err(invalid_data(
+            "legacy raw IVF-TQ generations cannot be merged; rebuild the index",
+        ));
+    }
     let mut header = first.header.clone();
     header.vector_count = 0;
     for &(source, _) in sources {
@@ -1243,6 +1616,13 @@ fn checked_advance(offset: u64, length: usize) -> io::Result<u64> {
 }
 
 fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
+    if header.kind == AnnKind::IvfTq
+        && !crate::structures::is_ivf_tq_cosine_generation(header.quantizer_version)
+    {
+        return Err(invalid_data(
+            "IVF-TQ payload uses an unsupported legacy generation; rebuild the index",
+        ));
+    }
     if header.dim == 0
         || header.code_size == 0
         || header.num_clusters == 0
@@ -1276,6 +1656,18 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
+#[inline]
+fn tq_ivf_block_max_scale(block: &[u8]) -> f32 {
+    // Supported cosine-generation writers sort the complete run by descending
+    // residual scale, so lane zero is both this block's maximum and an upper
+    // bound for every following block.
+    f32::from_le_bytes(
+        block[..size_of::<f32>()]
+            .try_into()
+            .expect("scale is one f32"),
+    )
 }
 
 fn run_doc_id(bytes: &[u8], run: &AnnRun, index: usize) -> io::Result<u32> {
@@ -1442,6 +1834,134 @@ mod tests {
         assert_eq!(docs, [0, 1, 2, 3, 4, 5]);
     }
 
+    #[test]
+    fn legacy_ivf_tq_payload_is_rejected_while_opening() {
+        let dim = 8;
+        let marked_version = crate::structures::mark_ivf_tq_cosine_generation(7);
+        let centroids = crate::structures::CoarseCentroids {
+            num_clusters: 1,
+            dim,
+            centroids: vec![0.0; dim],
+            version: marked_version,
+            soar_config: None,
+            routing_index: None,
+        };
+        let mut bytes = crate::segment::ann_build::build_ivf_tq(
+            dim,
+            IvfRoutingMode::Flat,
+            &centroids,
+            &[(0, 0)],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap();
+
+        // The fixed header stores quantizer_version at bytes 24..32.
+        bytes[24..32].copy_from_slice(&7u64.to_le_bytes());
+        let error = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::IvfTq, 1)
+            .err()
+            .expect("legacy IVF-TQ payload must fail while opening")
+            .to_string();
+        assert!(error.contains("unsupported legacy generation"), "{error}");
+    }
+
+    #[test]
+    fn binary_combined_search_deduplicates_soar_and_bounds_document_results() {
+        // doc 0 / ordinal 0 occurs in both leaves, as it can under SOAR.
+        // Without `(doc, ordinal)` dedup it would beat doc 1 for both Sum and
+        // default LogSumExp; with correct dedup doc 1's two distinct values win.
+        let cluster_0_docs = [0u32, 0, 1];
+        let cluster_0_ordinals = [0u16, 1, 0];
+        let cluster_0_codes = [0x00u8, 0xff, 0x03];
+        let cluster_1_docs = [0u32, 1, 2];
+        let cluster_1_ordinals = [0u16, 1, 0];
+        let cluster_1_codes = [0x00u8, 0x0c, 0xf0];
+        let runs = [
+            BuildRun {
+                cluster_id: 0,
+                doc_ids: &cluster_0_docs,
+                ordinals: &cluster_0_ordinals,
+                codes: &cluster_0_codes,
+            },
+            BuildRun {
+                cluster_id: 1,
+                doc_ids: &cluster_1_docs,
+                ordinals: &cluster_1_ordinals,
+                codes: &cluster_1_codes,
+            },
+        ];
+        let mut bytes = Vec::new();
+        write_built_runs(binary_header(6), &runs, &mut bytes).unwrap();
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 3).unwrap();
+
+        for combiner in [
+            crate::query::MultiValueCombiner::Sum,
+            crate::query::MultiValueCombiner::default(),
+        ] {
+            let result = disk
+                .search_binary_combined_documents(1, &[0], &[0, 1], combiner)
+                .unwrap();
+            assert_eq!(result.len(), 1, "combined search must honor k");
+            assert_eq!(
+                result[0].doc_id, 1,
+                "SOAR duplicate changed {combiner:?} ranking: {result:?}",
+            );
+        }
+
+        let top_two = disk
+            .search_binary_combined_documents(
+                2,
+                &[0],
+                &[0, 1],
+                crate::query::MultiValueCombiner::Sum,
+            )
+            .unwrap();
+        assert_eq!(
+            top_two
+                .iter()
+                .map(|candidate| candidate.doc_id)
+                .collect::<Vec<_>>(),
+            vec![1, 0],
+        );
+        assert_eq!(top_two.len(), 2, "full probing must still return at most k");
+    }
+
+    #[test]
+    fn combined_ordinal_reduction_handles_out_of_order_runs_for_every_combiner() {
+        let out_of_order_with_duplicate = vec![
+            (7, 1, 0.4),
+            (3, 0, 0.8),
+            (7, 0, 0.6),
+            (3, 1, 0.2),
+            (7, 1, 0.5), // higher SOAR estimate replaces 0.4, never adds to it
+        ];
+        for combiner in [
+            crate::query::MultiValueCombiner::Max,
+            crate::query::MultiValueCombiner::Sum,
+            crate::query::MultiValueCombiner::Avg,
+            crate::query::MultiValueCombiner::default(),
+            crate::query::MultiValueCombiner::WeightedTopK { k: 2, decay: 0.7 },
+        ] {
+            let actual = combine_scored_ordinals(out_of_order_with_duplicate.clone(), 2, combiner);
+            let mut expected = vec![
+                AnnDocumentCandidate {
+                    doc_id: 3,
+                    score: combiner.combine(&[(0, 0.8), (1, 0.2)]),
+                },
+                AnnDocumentCandidate {
+                    doc_id: 7,
+                    score: combiner.combine(&[(0, 0.6), (1, 0.5)]),
+                },
+            ];
+            expected.sort_unstable_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.doc_id.cmp(&right.doc_id))
+            });
+            assert_eq!(actual, expected, "combiner {combiner:?}");
+        }
+    }
+
     fn build_tq_payload(dim: usize, count: usize, seed: u64) -> (Vec<u8>, Vec<Vec<f32>>) {
         let codec = std::sync::Arc::new(crate::structures::TqCodec::new(dim));
         let mut builder = crate::structures::TqFlatBuilder::new(std::sync::Arc::clone(&codec));
@@ -1466,6 +1986,57 @@ mod tests {
         let mut bytes = Vec::new();
         write_built_tq_flat(&builder, &mut bytes).unwrap();
         (bytes, vectors)
+    }
+
+    #[test]
+    fn tq_combined_scan_ranks_complete_documents_instead_of_individual_values() {
+        let dim = 8;
+        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(dim));
+        let mut builder = crate::structures::TqFlatBuilder::new(std::sync::Arc::clone(&codec));
+        let labels = [(0u32, 0u16), (1, 0), (1, 1)];
+        let vectors = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // doc 0: best single value
+            0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // doc 1: two good values
+            0.8, -0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        builder.add_batch(&labels, &vectors).unwrap();
+        builder.finish();
+        let mut bytes = Vec::new();
+        write_built_tq_flat(&builder, &mut bytes).unwrap();
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, 2).unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let plan = crate::structures::TqQueryPlan::build(&codec, &query);
+
+        let max = disk.search_tq_distinct(1, &plan).unwrap();
+        let sum = disk
+            .search_tq_combined_documents(1, &plan, crate::query::MultiValueCombiner::Sum)
+            .unwrap();
+        let default_combiner = disk
+            .search_tq_combined_documents(1, &plan, crate::query::MultiValueCombiner::default())
+            .unwrap();
+        assert_eq!(max[0].0, 0, "fixture must favor doc 0 by Max: {max:?}");
+        assert_eq!(
+            sum[0].doc_id, 1,
+            "two complete values must make doc 1 win by Sum: {sum:?}"
+        );
+        assert_eq!(
+            default_combiner[0].doc_id, 1,
+            "default LogSumExp must aggregate complete documents: {default_combiner:?}"
+        );
+        assert!(sum[0].score > max[0].2);
+
+        // Pure-copy upgrade merges may append a re-encoded older segment
+        // after copied runs, so global run order need not follow doc IDs.
+        // Documents remain complete within each run and must still combine.
+        let (single_bytes, _) = build_tq_payload(dim, 1, 91);
+        let single = AnnDiskIndex::open(OwnedBytes::new(single_bytes), AnnKind::TqFlat, 1).unwrap();
+        let mut merged_bytes = Vec::new();
+        write_merged_ann(&[(&disk, 1), (&single, 0)], &mut merged_bytes).unwrap();
+        let merged = AnnDiskIndex::open(OwnedBytes::new(merged_bytes), AnnKind::TqFlat, 3).unwrap();
+        let merged_sum = merged
+            .search_tq_combined_documents(1, &plan, crate::query::MultiValueCombiner::Sum)
+            .unwrap();
+        assert_eq!(merged_sum[0].doc_id, 2);
     }
 
     #[test]
@@ -1517,6 +2088,59 @@ mod tests {
     }
 
     #[test]
+    fn tq_parallel_fold_matches_a_sequential_scan() {
+        use crate::structures::vector::quantization::{
+            TQ_BLOCK_LANES, tq_block_bytes, tq_score_block,
+        };
+
+        // Exactly the production fan-out threshold exercises the parallel
+        // fold/reduce path without relying on a test-only configuration.
+        let dim = 8;
+        let count = TQ_PARALLEL_SCAN_MIN_VECTORS;
+        let (bytes, vectors) = build_tq_payload(dim, count, 87);
+        let disk =
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, count as u32).unwrap();
+        let codec = crate::structures::TqCodec::new(dim);
+        let plan = crate::structures::TqQueryPlan::build(&codec, &vectors[count / 3]);
+        let k = 31;
+
+        let block_bytes = tq_block_bytes(disk.header().code_size);
+        assert_eq!(
+            disk.runs.len(),
+            1,
+            "the regression must parallelize chunks inside one run"
+        );
+        assert!(
+            disk.runs[0].codes.len() / block_bytes > TQ_PARALLEL_SCAN_CHUNK_BLOCKS,
+            "the single run must span multiple parallel chunks"
+        );
+        let raw = disk.raw.as_slice();
+        let mut reference = BoundedAnnCollector::<true, true>::new(k);
+        let mut scores = [0.0f32; TQ_BLOCK_LANES];
+        for run in &disk.runs {
+            let codes = &raw[run.codes.clone()];
+            for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                tq_score_block(&plan, block, &mut scores);
+                let lane_base = block_index * TQ_BLOCK_LANES;
+                let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                for (lane, &score) in scores.iter().enumerate().take(lanes) {
+                    let index = lane_base + lane;
+                    reference.insert(
+                        run_doc_id(raw, run, index).unwrap(),
+                        read_u16(raw, run.ordinals.start + index * 2),
+                        score,
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            disk.search_tq_distinct(k, &plan).unwrap(),
+            reference.into_sorted_results(),
+        );
+    }
+
+    #[test]
     fn ivf_tq_scale_pruning_matches_the_unpruned_scan() {
         use crate::structures::vector::ivf::{CoarseCentroids, CoarseConfig};
         use crate::structures::vector::quantization::{
@@ -1542,7 +2166,8 @@ mod tests {
                 v
             })
             .collect();
-        let centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 8), &vectors);
+        let mut centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 8), &vectors);
+        centroids.version = crate::structures::mark_ivf_tq_cosine_generation(centroids.version);
         let mut index = IvfTqIndex::new(
             dim,
             crate::dsl::IvfRoutingMode::Flat,
@@ -1551,13 +2176,43 @@ mod tests {
         );
         let mut scratch = TqIvfEncodeScratch::default();
         for (i, vector) in vectors.iter().enumerate() {
-            index.add_vector(&centroids, i as u32, 0, vector, &mut scratch);
+            index.add_vector(
+                &centroids,
+                (i / 2) as u32,
+                (i % 2) as u16,
+                vector,
+                &mut scratch,
+            );
         }
         let mut bytes = Vec::new();
         write_built_ivf_tq(&index, centroids.num_clusters, &mut bytes).unwrap();
         let disk =
             AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::IvfTq, count as u32).unwrap();
 
+        // The supported cosine generation promises descending residual scales,
+        // enabling the reader to terminate the run at the first losing block.
+        let block_bytes = tq_ivf_block_bytes(disk.header().code_size);
+        let raw = disk.raw.as_slice();
+        for run in &disk.runs {
+            let codes = &raw[run.codes.clone()];
+            let mut previous_scale = f32::INFINITY;
+            for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
+                let lane_base = block_index * TQ_BLOCK_LANES;
+                let lanes = TQ_BLOCK_LANES.min(run.count.saturating_sub(lane_base));
+                let mut block_scales = block[..TQ_BLOCK_LANES * size_of::<f32>()]
+                    .chunks_exact(size_of::<f32>())
+                    .take(lanes)
+                    .map(|lane| f32::from_le_bytes(lane.try_into().unwrap()));
+                let first_scale = block_scales.next().unwrap();
+                assert_eq!(tq_ivf_block_max_scale(block), first_scale);
+                assert!(first_scale <= previous_scale);
+                previous_scale = first_scale;
+                for scale in block_scales {
+                    assert!(scale <= previous_scale);
+                    previous_scale = scale;
+                }
+            }
+        }
         let k = 10;
         for query_seed in [1u64, 9, 42] {
             let mut qstate = query_seed;
@@ -1575,12 +2230,10 @@ mod tests {
                 8,
                 crate::dsl::IvfRoutingMode::Flat,
             );
-
             // Unpruned reference: score every block of every probed run with
             // the identical kernel and collector.
             let mut reference = BoundedAnnCollector::<true, true>::new(k);
-            let block_bytes = tq_ivf_block_bytes(disk.header().code_size);
-            let raw = disk.raw.as_slice();
+            let mut unpruned_scores = Vec::new();
             let mut scores = [0.0f32; TQ_BLOCK_LANES];
             for (cluster_id, cluster_dot) in plan.cluster_dots() {
                 for run in disk.cluster_runs(cluster_id) {
@@ -1596,17 +2249,40 @@ mod tests {
                                 read_u16(raw, run.ordinals.start + idx * 2),
                                 score,
                             );
+                            unpruned_scores.push((
+                                run_doc_id(raw, run, idx).unwrap(),
+                                read_u16(raw, run.ordinals.start + idx * 2),
+                                score,
+                            ));
                         }
                     }
                 }
             }
 
             let pruned = disk.search_ivf_tq_distinct(k, &plan).unwrap();
+            let reference = reference.into_sorted_results();
             assert_eq!(
-                pruned,
-                reference.into_sorted_results(),
+                pruned, reference,
                 "scale-bound pruning must not change the estimated top-k (seed {query_seed})"
             );
+            for combiner in [
+                crate::query::MultiValueCombiner::Max,
+                crate::query::MultiValueCombiner::Sum,
+                crate::query::MultiValueCombiner::Avg,
+                crate::query::MultiValueCombiner::default(),
+                crate::query::MultiValueCombiner::WeightedTopK { k: 3, decay: 0.7 },
+            ] {
+                let expected = combine_scored_ordinals(unpruned_scores.clone(), k, combiner);
+                let combined = disk
+                    .search_ivf_tq_combined_documents(k, &plan, combiner)
+                    .unwrap();
+                assert_eq!(
+                    combined, expected,
+                    "combined IVF-TQ scan diverged from the unpruned reference \
+                     for {combiner:?} (seed {query_seed})",
+                );
+                assert!(combined.len() <= k);
+            }
         }
     }
 

@@ -254,14 +254,23 @@ pub struct DenseVectorConfig {
     /// Whether stored vectors are pre-normalized to unit L2 norm.
     /// When true, scoring skips per-vector norm computation (cosine = dot / ||q||),
     /// reducing compute by ~40%. Common for embedding models (e.g. OpenAI, Cohere).
+    /// New IVF-TQ generations index a normalized ANN-only copy while retaining
+    /// the original values for exact reranking. Legacy unnormalized IVF-TQ
+    /// generations must be rebuilt before they can be searched.
     /// Default: true (most embedding models produce L2-normalized vectors).
     #[serde(default = "default_unit_norm")]
     pub unit_norm: bool,
-    /// SOAR spilled cluster assignments for IVF-PQ.
+    /// SOAR spilled cluster assignments for IVF-TQ.
     /// Assigns vectors to a secondary cluster with an orthogonality-amplified
     /// residual, improving recall at the same nprobe for ~1.2-2x assignment storage.
-    /// Default: None (disabled). Ignored while a field remains flat.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Default: selective spilling calibrated to at most 30% of vectors for
+    /// IVF-TQ. Set this to `None` to disable SOAR. Ignored by non-IVF formats.
+    ///
+    /// Unlike optional fields whose `None` value is omitted on serialization,
+    /// this field serializes `None` as `null`: omission means "use the new
+    /// selective default", while an explicit `null` must continue to mean off
+    /// across a schema round trip.
+    #[serde(default = "default_soar")]
     pub soar: Option<crate::structures::SoarConfig>,
 }
 
@@ -271,6 +280,10 @@ fn default_nprobe() -> usize {
 
 fn default_unit_norm() -> bool {
     true
+}
+
+fn default_soar() -> Option<crate::structures::SoarConfig> {
+    Some(crate::structures::SoarConfig::default())
 }
 
 impl DenseVectorConfig {
@@ -283,7 +296,7 @@ impl DenseVectorConfig {
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: 64,
             unit_norm: true,
-            soar: None,
+            soar: Some(crate::structures::SoarConfig::default()),
         }
     }
 
@@ -325,7 +338,7 @@ impl DenseVectorConfig {
             ivf_routing: IvfRoutingMode::Auto,
             nprobe,
             unit_norm: true,
-            soar: None,
+            soar: Some(crate::structures::SoarConfig::default()),
         }
     }
 
@@ -355,6 +368,12 @@ impl DenseVectorConfig {
     /// Enable SOAR spilled secondary cluster assignments (IVF-based indexes only)
     pub fn with_soar(mut self, soar: crate::structures::SoarConfig) -> Self {
         self.soar = Some(soar);
+        self
+    }
+
+    /// Explicitly disable SOAR secondary assignments.
+    pub fn without_soar(mut self) -> Self {
+        self.soar = None;
         self
     }
 
@@ -1272,6 +1291,54 @@ mod tests {
         assert_eq!(schema.get_field("body"), Some(body));
         assert_eq!(schema.get_field("count"), Some(count));
         assert_eq!(schema.get_field("nonexistent"), None);
+    }
+
+    #[test]
+    fn ivf_tq_defaults_to_selective_soar() {
+        for config in [
+            DenseVectorConfig::new(8),
+            DenseVectorConfig::ivf_tq(8, Some(4), 2),
+        ] {
+            let soar = config.soar.expect("IVF-TQ should enable SOAR by default");
+            assert_eq!(soar.num_secondary, 1);
+            assert!(soar.selective);
+            assert_eq!(soar.calibration_target(), Some(0.30));
+        }
+
+        assert!(DenseVectorConfig::flat(8).soar.is_none());
+        assert!(DenseVectorConfig::tq(8).soar.is_none());
+    }
+
+    #[test]
+    fn omitted_and_explicitly_disabled_soar_are_distinct_in_serde() {
+        let omitted: DenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 8,
+            "index_type": "ivf_tq"
+        }))
+        .unwrap();
+        let default_soar = omitted
+            .soar
+            .as_ref()
+            .expect("an omitted SOAR setting should enable the selective default");
+        assert_eq!(default_soar.num_secondary, 1);
+        assert!(default_soar.selective);
+        assert_eq!(default_soar.calibration_target(), Some(0.30));
+
+        let disabled: DenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 8,
+            "index_type": "ivf_tq",
+            "soar": null
+        }))
+        .unwrap();
+        assert!(disabled.soar.is_none());
+
+        let encoded = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(encoded.get("soar"), Some(&serde_json::Value::Null));
+        let round_trip: DenseVectorConfig = serde_json::from_value(encoded).unwrap();
+        assert!(
+            round_trip.soar.is_none(),
+            "explicit off must survive a schema round trip"
+        );
     }
 
     #[test]

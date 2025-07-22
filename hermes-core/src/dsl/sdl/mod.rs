@@ -253,12 +253,24 @@ fn parse_field_type(type_str: &str) -> Result<FieldType> {
 
 /// Index configuration parsed from indexed<...> attribute
 #[derive(Debug, Clone, Default)]
+enum SoarDirective {
+    /// No `soar:` keyword was present. IVF-TQ resolves this to its selective
+    /// default after the final index type is known.
+    #[default]
+    Unspecified,
+    /// `soar: off` was explicitly requested.
+    Disabled,
+    /// An explicit selective/full/aggressive preset.
+    Enabled(crate::structures::SoarConfig),
+}
+
+#[derive(Debug, Clone, Default)]
 struct IndexConfig {
     index_type: Option<super::schema::VectorIndexType>,
     num_clusters: Option<usize>,
     nprobe: Option<usize>,
     ivf_routing: Option<super::schema::IvfRoutingMode>,
-    soar: Option<crate::structures::SoarConfig>,
+    soar: SoarDirective,
     binary_index_type: Option<super::schema::BinaryIndexType>,
     // Sparse vector index params
     sparse_format: Option<SparseFormat>,
@@ -435,10 +447,10 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             if let Some(s) = p.into_inner().next() {
                 use crate::structures::SoarConfig;
                 config.soar = match s.as_str() {
-                    "selective" => Some(SoarConfig::new()),
-                    "full" => Some(SoarConfig::full()),
-                    "aggressive" => Some(SoarConfig::aggressive()),
-                    _ => None, // "off"
+                    "selective" => SoarDirective::Enabled(SoarConfig::new()),
+                    "full" => SoarDirective::Enabled(SoarConfig::full()),
+                    "aggressive" => SoarDirective::Enabled(SoarConfig::aggressive()),
+                    _ => SoarDirective::Disabled, // "off"
                 };
             }
         }
@@ -868,15 +880,26 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
 
 /// Apply SOAR spilling if specified (IVF-based indexes only)
 fn apply_soar_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) {
-    if idx_cfg.soar.is_some() {
-        if config.uses_ivf() {
-            config.soar = idx_cfg.soar;
-        } else {
-            log::warn!(
-                "'soar' requires the IVF-PQ index; \
-                 ignoring for index type {:?}",
-                config.index_type
-            );
+    match idx_cfg.soar {
+        SoarDirective::Unspecified => {
+            config.soar = config
+                .uses_ivf()
+                .then(crate::structures::SoarConfig::default);
+        }
+        SoarDirective::Disabled => {
+            config.soar = None;
+        }
+        SoarDirective::Enabled(soar) => {
+            if config.uses_ivf() {
+                config.soar = Some(soar);
+            } else {
+                config.soar = None;
+                log::warn!(
+                    "'soar' requires the IVF-TQ index; \
+                     ignoring for index type {:?}",
+                    config.index_type
+                );
+            }
         }
     }
 }
@@ -1824,6 +1847,23 @@ mod tests {
 
     #[test]
     fn test_dense_vector_with_soar() {
+        // Omission resolves to the selective one-secondary default.
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed<ivf_tq>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        let soar = config
+            .soar
+            .as_ref()
+            .expect("omitted SOAR should enable selective spilling");
+        assert_eq!(soar.num_secondary, 1);
+        assert!(soar.selective);
+        assert_eq!(soar.calibration_target(), Some(0.30));
+
+        // The explicit selective preset resolves to the same policy.
         let sdl = r#"
             index documents {
                 field embedding: dense_vector<768> [indexed<ivf_tq, num_clusters: 256, soar: selective>, stored]
@@ -1837,7 +1877,7 @@ mod tests {
         assert_eq!(soar.num_secondary, 1);
         assert!(soar.selective);
 
-        // aggressive preset: 2 secondary clusters, no selectivity
+        // aggressive is a compatibility alias for full one-secondary spilling
         let sdl = r#"
             index documents {
                 field embedding: dense_vector<768> [indexed<ivf_tq, soar: aggressive>]
@@ -1846,7 +1886,7 @@ mod tests {
         let indexes = parse_sdl(sdl).unwrap();
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
         let soar = config.soar.as_ref().expect("soar should be enabled");
-        assert_eq!(soar.num_secondary, 2);
+        assert_eq!(soar.num_secondary, 1);
         assert!(!soar.selective);
 
         // off keeps soar disabled
@@ -1858,6 +1898,29 @@ mod tests {
         let indexes = parse_sdl(sdl).unwrap();
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
         assert!(config.soar.is_none());
+    }
+
+    #[test]
+    fn omitted_soar_is_canonicalized_off_for_non_ivf_formats() {
+        let sdl = r#"
+            index documents {
+                field tq: dense_vector<768> [indexed<tq>]
+                field flat: dense_vector<768> [indexed<flat>]
+            }
+        "#;
+        let indexes = parse_sdl(sdl).unwrap();
+        for field in &indexes[0].fields {
+            assert!(
+                field
+                    .dense_vector_config
+                    .as_ref()
+                    .expect("dense config")
+                    .soar
+                    .is_none(),
+                "{} should not retain an ignored SOAR default",
+                field.name,
+            );
+        }
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //!
 //! Two-level index (design: `docs/turboquant-quantization.md`):
 //! - Level 1: the trained global coarse quantizer (same router as IVF-PQ).
-//! - Level 2: per-leaf TQ codes of `vector − centroid` residuals plus a
-//!   per-vector residual scale, so `⟨q̂, x⟩ = ⟨q̂, c⟩ + scale · ⟨q̂, r̂⟩`.
+//! - Level 2: per-leaf TQ codes of `normalized(vector) − centroid` residuals
+//!   plus a per-vector residual scale, so
+//!   `⟨q̂, x̂⟩ = ⟨q̂, c⟩ + scale · ⟨q̂, r̂⟩`.
 //!
 //! Unlike IVF-PQ, the leaf codec is training-free and the residual estimate
 //! uses one query-wide LUT: probed clusters differ only by the scalar
@@ -12,8 +13,38 @@
 //! `segment::ann_disk`; this type is build-only.
 
 use crate::dsl::IvfRoutingMode;
+use crate::structures::vector::ivf::routing::{
+    cosine_probe_fingerprint, normalize_cosine_in_place, normalized_cosine_query,
+};
 use crate::structures::vector::ivf::{CoarseCentroids, IvfProbePlan};
 use crate::structures::vector::quantization::{TqCodec, TqEncodeScratch, TqQueryPlan};
+
+// Preserve the serialized centroid and ANN-header layouts by carrying the
+// cosine-generation format in the existing u64 version. Timestamp-generated
+// legacy versions cannot reach this prefix for centuries; the mixed 52-bit
+// payload retains ample generation entropy without exposing timestamp bits.
+const IVF_TQ_COSINE_VERSION_MASK: u64 = 0xfff0_0000_0000_0000;
+const IVF_TQ_COSINE_VERSION_TAG: u64 = 0xc050_0000_0000_0000;
+
+/// Mark an IVF-TQ centroid version whose centroids and residuals use normalized
+/// cosine-space vectors. The transformation is idempotent.
+pub fn mark_ivf_tq_cosine_generation(version: u64) -> u64 {
+    if is_ivf_tq_cosine_generation(version) {
+        return version;
+    }
+    let mut mixed = version;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    IVF_TQ_COSINE_VERSION_TAG | (mixed & !IVF_TQ_COSINE_VERSION_MASK)
+}
+
+/// Whether a persisted IVF-TQ generation was trained and encoded in normalized
+/// cosine space. Readers use this marker to reject incompatible artifacts.
+#[inline]
+pub fn is_ivf_tq_cosine_generation(version: u64) -> bool {
+    version & IVF_TQ_COSINE_VERSION_MASK == IVF_TQ_COSINE_VERSION_TAG
+}
 
 /// Struct-of-arrays payload for one non-empty IVF-TQ leaf. `rows` holds one
 /// unpacked nibble value (0..=15) per padded coordinate per vector; blocks
@@ -69,30 +100,53 @@ impl TqIvfQueryPlan {
         nprobe: usize,
         routing: IvfRoutingMode,
     ) -> Self {
-        let route: IvfProbePlan = coarse_centroids.probe(query, nprobe, routing);
-        let norm = crate::structures::simd::dot_product_f32(query, query, query.len()).sqrt();
-        let inverse_norm = if norm.is_finite() && norm > 0.0 {
-            1.0 / norm
-        } else {
-            0.0
-        };
+        assert!(
+            is_ivf_tq_cosine_generation(coarse_centroids.version),
+            "legacy raw IVF-TQ generations cannot build a query plan; rebuild the index"
+        );
+        let normalized_query = normalized_cosine_query(query);
+        let route: IvfProbePlan = coarse_centroids.probe(&normalized_query, nprobe, routing);
+        let effective_nprobe = nprobe.clamp(1, coarse_centroids.num_clusters as usize);
         let cluster_dots = route
             .cluster_ids
             .iter()
             .map(|&cluster_id| {
                 let centroid = coarse_centroids.get_centroid(cluster_id);
-                crate::structures::simd::dot_product_f32(query, centroid, query.len())
-                    * inverse_norm
+                crate::structures::simd::dot_product_f32(
+                    &normalized_query,
+                    centroid,
+                    normalized_query.len(),
+                )
             })
             .collect();
         Self {
             quantizer_version: route.quantizer_version,
             fingerprint: codec.fingerprint(),
-            request_fingerprint: route.request_fingerprint,
+            request_fingerprint: Self::request_fingerprint_for(
+                coarse_centroids,
+                query,
+                effective_nprobe,
+                routing,
+            ),
             cluster_ids: route.cluster_ids,
             cluster_dots,
-            tq: TqQueryPlan::build(codec, query),
+            tq: TqQueryPlan::build(codec, &normalized_query),
         }
+    }
+
+    /// Cache identity matching normalized cosine routing geometry.
+    pub fn request_fingerprint_for(
+        coarse_centroids: &CoarseCentroids,
+        query: &[f32],
+        nprobe: usize,
+        routing: IvfRoutingMode,
+    ) -> u64 {
+        assert!(
+            is_ivf_tq_cosine_generation(coarse_centroids.version),
+            "legacy raw IVF-TQ generations cannot build a query fingerprint; rebuild the index"
+        );
+        let effective_nprobe = nprobe.clamp(1, coarse_centroids.num_clusters as usize);
+        cosine_probe_fingerprint(query, effective_nprobe, routing)
     }
 
     #[inline]
@@ -128,6 +182,10 @@ impl IvfTqIndex {
         codec: std::sync::Arc<TqCodec>,
     ) -> Self {
         assert_eq!(codec.dim(), dim, "IVF-TQ codec/config dimension mismatch");
+        assert!(
+            is_ivf_tq_cosine_generation(centroids_version),
+            "legacy raw IVF-TQ generations cannot encode vectors; rebuild the index"
+        );
         Self {
             dim,
             routing,
@@ -146,6 +204,26 @@ impl IvfTqIndex {
     /// Add a single vector: assign to the trained router (with SOAR when
     /// configured) and TQ-encode the residual against every assigned leaf.
     pub fn add_vector(
+        &mut self,
+        coarse_centroids: &CoarseCentroids,
+        doc_id: u32,
+        ordinal: u16,
+        vector: &[f32],
+        scratch: &mut TqIvfEncodeScratch,
+    ) {
+        assert_eq!(
+            coarse_centroids.version, self.centroids_version,
+            "IVF-TQ centroid generation mismatch"
+        );
+        let mut normalized = std::mem::take(&mut scratch.normalized);
+        normalized.clear();
+        normalized.extend_from_slice(vector);
+        normalize_cosine_in_place(&mut normalized);
+        self.add_prepared_vector(coarse_centroids, doc_id, ordinal, &normalized, scratch);
+        scratch.normalized = normalized;
+    }
+
+    fn add_prepared_vector(
         &mut self,
         coarse_centroids: &CoarseCentroids,
         doc_id: u32,
@@ -224,6 +302,9 @@ impl IvfTqIndex {
             .ok_or("IVF-TQ input size overflow")?;
         if vectors.len() != expected {
             return Err("IVF-TQ vector and label matrices are inconsistent");
+        }
+        if coarse_centroids.version != self.centroids_version {
+            return Err("IVF-TQ centroid generation mismatch");
         }
         if vector_count == 0 {
             return Ok(());
@@ -313,6 +394,7 @@ impl IvfTqIndex {
 /// Reusable per-thread IVF-TQ encode buffers.
 #[derive(Debug, Default)]
 pub struct TqIvfEncodeScratch {
+    normalized: Vec<f32>,
     residual: Vec<f32>,
     nibbles: Vec<u8>,
     tq: TqEncodeScratch,
@@ -344,13 +426,14 @@ mod tests {
     }
 
     /// The scaled residual estimator must approximate the true inner product
-    /// of the raw (unnormalized-residual) decomposition.
+    /// of the normalized-vector residual decomposition.
     #[test]
     fn scaled_residual_estimator_tracks_true_dot() {
         let dim = 64;
         let codec = std::sync::Arc::new(TqCodec::new(dim));
         let vectors: Vec<Vec<f32>> = (0..64).map(|i| seeded_unit_vector(dim, 100 + i)).collect();
-        let centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 4), &vectors);
+        let mut centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 4), &vectors);
+        centroids.version = mark_ivf_tq_cosine_generation(centroids.version);
 
         let mut index = IvfTqIndex::new(
             dim,
@@ -403,5 +486,99 @@ mod tests {
         assert!(checked >= vectors.len(), "every vector must be scored");
         let rmse = (squared_error / checked as f64).sqrt();
         assert!(rmse < 0.08, "IVF-TQ estimator RMSE too large: {rmse}");
+    }
+
+    #[test]
+    fn query_plans_are_scale_invariant() {
+        let dim = 2;
+        let codec = TqCodec::new(dim);
+        let query = vec![1.0, 0.0];
+        let scaled_query: Vec<f32> = query.iter().map(|value| value * 100.0).collect();
+        for routing in [IvfRoutingMode::Auto, IvfRoutingMode::Flat] {
+            let centroids = CoarseCentroids {
+                num_clusters: 2,
+                dim,
+                // An intentionally non-unit fixture makes accidental raw-L2
+                // routing select a different leaf for the scaled query.
+                centroids: vec![1.0, 0.0, 10.0, 0.0],
+                version: mark_ivf_tq_cosine_generation(7),
+                soar_config: None,
+                routing_index: None,
+            };
+            let plan = TqIvfQueryPlan::build(&centroids, &codec, &query, 1, routing);
+            let scaled_plan = TqIvfQueryPlan::build(&centroids, &codec, &scaled_query, 1, routing);
+
+            assert_eq!(&*plan.cluster_ids, &[0]);
+            assert_eq!(plan.cluster_ids, scaled_plan.cluster_ids);
+            assert_eq!(plan.request_fingerprint, scaled_plan.request_fingerprint);
+            assert_eq!(plan.cluster_dots, scaled_plan.cluster_dots);
+        }
+    }
+
+    #[test]
+    fn vector_encoding_always_normalizes_input() {
+        let codec = std::sync::Arc::new(TqCodec::new(2));
+        let centroids = CoarseCentroids {
+            num_clusters: 1,
+            dim: 2,
+            centroids: vec![1.0, 0.0],
+            version: mark_ivf_tq_cosine_generation(7),
+            soar_config: None,
+            routing_index: None,
+        };
+        let mut index = IvfTqIndex::new(
+            2,
+            IvfRoutingMode::Flat,
+            centroids.version,
+            std::sync::Arc::clone(&codec),
+        );
+        let mut scratch = TqIvfEncodeScratch::default();
+
+        index.add_vector(&centroids, 0, 0, &[2.0, 0.0], &mut scratch);
+        index.add_vector(&centroids, 1, 0, &[128.0, 0.0], &mut scratch);
+
+        let cluster = &index.clusters[&0];
+        assert_eq!(cluster.doc_ids, [0, 1]);
+        assert_eq!(cluster.scales, [0.0, 0.0]);
+        assert_eq!(cluster.gammas[0], cluster.gammas[1]);
+        assert_eq!(
+            &cluster.rows[..index.codec.padded_dim()],
+            &cluster.rows[index.codec.padded_dim()..]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "legacy raw IVF-TQ generations cannot build a query plan")]
+    fn query_plan_rejects_legacy_generation() {
+        let centroids = CoarseCentroids {
+            num_clusters: 1,
+            dim: 2,
+            centroids: vec![1.0, 0.0],
+            version: 7,
+            soar_config: None,
+            routing_index: None,
+        };
+        let codec = TqCodec::new(2);
+        let _ = TqIvfQueryPlan::build(&centroids, &codec, &[1.0, 0.0], 1, IvfRoutingMode::Flat);
+    }
+
+    #[test]
+    #[should_panic(expected = "legacy raw IVF-TQ generations cannot encode vectors")]
+    fn index_builder_rejects_legacy_generation() {
+        let _ = IvfTqIndex::new(
+            2,
+            IvfRoutingMode::Flat,
+            7,
+            std::sync::Arc::new(TqCodec::new(2)),
+        );
+    }
+
+    #[test]
+    fn cosine_generation_marker_is_stable_and_distinct_from_unmarked() {
+        let marked = mark_ivf_tq_cosine_generation(7);
+        assert!(!is_ivf_tq_cosine_generation(7));
+        assert!(is_ivf_tq_cosine_generation(marked));
+        assert_eq!(mark_ivf_tq_cosine_generation(marked), marked);
+        assert_ne!(marked, mark_ivf_tq_cosine_generation(8));
     }
 }

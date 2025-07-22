@@ -7,11 +7,28 @@ use serde::{Deserialize, Serialize};
 
 use super::routing::{
     HNSW_AUTO_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
-    allocate_child_clusters, effective_routing_mode, float_probe_fingerprint, parent_probe_count,
-    routing_parent_count, select_best, select_best_candidates,
+    allocate_child_clusters, effective_routing_mode, float_probe_fingerprint, routing_parent_count,
+    select_best_candidates, select_parent_beam, select_parent_beam_for_build,
 };
 use super::soar::{MultiAssignment, SoarConfig};
 use crate::dsl::IvfRoutingMode;
+
+// The SOAR paper evaluates lambda = 1. Keep it private until a different
+// value has recall/latency evidence and can be added without changing the
+// serialized public configuration.
+const SOAR_LAMBDA: f32 = 1.0;
+/// Selective spilling is intended for boundary vectors, whose primary and
+/// secondary residuals have comparable distortion. Encoding a residual to a
+/// much farther secondary centroid both wastes a posting and amplifies TQ
+/// estimation error enough to crowd better exact-rerank candidates out.
+///
+/// Compare squared distances, so `4` permits a secondary residual up to twice
+/// the primary residual norm. Full spilling remains unconditional.
+const MAX_SELECTIVE_SECONDARY_TO_PRIMARY_DISTANCE_RATIO_SQ: f32 = 4.0;
+/// Construction is offline, so expand more of a hierarchical router than a
+/// latency-sensitive one-leaf query. This reduces permanent misassignment
+/// without returning to an O(K) centroid scan for large codebooks.
+const BUILD_ASSIGNMENT_CANDIDATES: usize = 128;
 
 /// Configuration for coarse quantizer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,28 +106,59 @@ pub(crate) enum FloatCentroidRouter {
     Hnsw(HnswRoutingGraph),
 }
 
+struct FlatClusterMemberships {
+    offsets: Vec<usize>,
+    members: Vec<usize>,
+}
+
+impl FlatClusterMemberships {
+    fn cluster(&self, cluster: usize) -> &[usize] {
+        &self.members[self.offsets[cluster]..self.offsets[cluster + 1]]
+    }
+}
+
 impl CoarseCentroids {
     /// Train coarse centroids using k-means algorithm
     ///
-    /// Uses deterministic k-means++ seeding and Lloyd refinement.
+    /// Uses deterministic adaptive D² seeding and Lloyd refinement.
     pub fn train(config: &CoarseConfig, vectors: &[Vec<f32>]) -> Self {
         assert!(!vectors.is_empty(), "Cannot train on empty vector set");
         assert!(config.num_clusters > 0, "Need at least 1 cluster");
         assert!(vectors.iter().all(|vector| vector.len() == config.dim));
 
-        let actual_clusters = config.num_clusters.min(vectors.len());
+        // Keep the public row-oriented API for callers and tests, but funnel
+        // production training through one contiguous matrix so the build path
+        // does not allocate one heap object per sampled vector.
+        let flat = vectors
+            .iter()
+            .flat_map(|vector| vector.iter().copied())
+            .collect::<Vec<_>>();
+        Self::train_contiguous(config, &flat, vectors.len())
+    }
+
+    /// Train directly from a contiguous row-major matrix.
+    pub(crate) fn train_contiguous(
+        config: &CoarseConfig,
+        vectors: &[f32],
+        vector_count: usize,
+    ) -> Self {
+        assert!(vector_count > 0, "Cannot train on empty vector set");
+        assert!(config.num_clusters > 0, "Need at least 1 cluster");
+        assert_eq!(vectors.len(), vector_count.saturating_mul(config.dim));
+
+        let actual_clusters = config.num_clusters.min(vector_count);
         let (centroids, routing_index) =
             match effective_routing_mode(config.routing, actual_clusters) {
                 IvfRoutingMode::TwoLevel => {
                     let (leaves, router) =
-                        Self::train_hierarchical(config, vectors, actual_clusters);
+                        Self::train_hierarchical(config, vectors, vector_count, actual_clusters);
                     (leaves, Some(router))
                 }
                 IvfRoutingMode::Hnsw => {
                     let leaves = if actual_clusters >= HNSW_AUTO_THRESHOLD {
-                        Self::train_hierarchical(config, vectors, actual_clusters).0
+                        Self::train_hierarchical(config, vectors, vector_count, actual_clusters).0
                     } else {
-                        Self::train_flat(config, vectors, actual_clusters).0
+                        Self::train_flat(config, vectors, vector_count, actual_clusters)
                     };
                     let graph = HnswRoutingGraph::build(
                         actual_clusters,
@@ -126,9 +174,10 @@ impl CoarseCentroids {
                     );
                     (leaves, Some(FloatCentroidRouter::Hnsw(graph)))
                 }
-                IvfRoutingMode::Flat | IvfRoutingMode::Auto => {
-                    (Self::train_flat(config, vectors, actual_clusters).0, None)
-                }
+                IvfRoutingMode::Flat | IvfRoutingMode::Auto => (
+                    Self::train_flat(config, vectors, vector_count, actual_clusters),
+                    None,
+                ),
             };
 
         let version = std::time::SystemTime::now()
@@ -136,68 +185,186 @@ impl CoarseCentroids {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        Self {
+        let mut soar_config = config.soar.clone();
+        if let Some(soar) = &mut soar_config
+            && soar.num_secondary > 1
+        {
+            log::warn!(
+                "SOAR currently implements the published primary + one-secondary objective; \
+                 clamping {} requested secondary assignments to one",
+                soar.num_secondary,
+            );
+            soar.num_secondary = 1;
+        }
+        let calibration_target = soar_config
+            .as_ref()
+            .and_then(SoarConfig::calibration_target);
+        let mut trained = Self {
             num_clusters: actual_clusters as u32,
             dim: config.dim,
             centroids,
             version,
-            soar_config: config.soar.clone(),
+            // Install the SOAR policy after calibration so primary assignment
+            // below cannot recursively request secondary leaves.
+            soar_config: None,
             routing_index,
+        };
+        if let Some(target) = calibration_target {
+            let threshold = trained.calibrate_selective_spill_threshold(
+                vectors,
+                vector_count,
+                config.routing,
+                target,
+            );
+            if let Some(soar) = &mut soar_config {
+                soar.spill_threshold = threshold;
+            }
+            log::info!(
+                "Calibrated SOAR selective spilling to at most {:.1}% of the training sample \
+                 (residual threshold {:.6})",
+                target * 100.0,
+                threshold,
+            );
+        }
+        trained.soar_config = soar_config;
+        trained
+    }
+
+    fn calibrate_selective_spill_threshold(
+        &self,
+        vectors: &[f32],
+        vector_count: usize,
+        routing: IvfRoutingMode,
+        target_fraction: f32,
+    ) -> f32 {
+        // Bound calibration independently of the caller's raw training
+        // sample. Flat routing pays O(KD) per selected vector; hierarchical
+        // routers can afford a larger validation slice.
+        let routing = effective_routing_mode(routing, self.num_clusters as usize);
+        let sample_limit = match routing {
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => {
+                let work_per_vector = (self.num_clusters as usize).saturating_mul(self.dim).max(1);
+                (64_000_000usize / work_per_vector).clamp(32, 4_096)
+            }
+            IvfRoutingMode::TwoLevel | IvfRoutingMode::Hnsw => 8_192,
+        }
+        .min(vector_count);
+        let mut residual_norms = Vec::with_capacity(sample_limit);
+        for sample in 0..sample_limit {
+            let vector_index = sample.saturating_mul(vector_count) / sample_limit;
+            let offset = vector_index * self.dim;
+            let vector = &vectors[offset..offset + self.dim];
+            let primary = self.assign_with_routing(vector, routing).primary_cluster;
+            residual_norms.push(squared_l2(vector, self.get_centroid(primary)).sqrt());
+        }
+        residual_norms.sort_unstable_by(f32::total_cmp);
+        if residual_norms.is_empty() {
+            return 0.0;
+        }
+        let spill_count = ((residual_norms.len() as f32 * target_fraction.clamp(0.0, 1.0)).round()
+            as usize)
+            .min(residual_norms.len());
+        if spill_count == 0 {
+            let largest = residual_norms.last().copied().unwrap_or(0.0);
+            return threshold_strictly_above(largest);
+        }
+        let boundary = residual_norms[residual_norms.len() - spill_count];
+        let at_or_above =
+            residual_norms.len() - residual_norms.partition_point(|&norm| norm < boundary);
+        if at_or_above > spill_count {
+            // Equality spills, so a quantile that lands in a tie could exceed
+            // the configured storage budget—up to 100% for identical
+            // residuals. Move strictly above the tied value; underfilling is
+            // preferable to an unbounded posting expansion.
+            threshold_strictly_above(boundary)
+        } else {
+            boundary
         }
     }
 
     fn train_flat(
         config: &CoarseConfig,
-        vectors: &[Vec<f32>],
+        vectors: &[f32],
+        vector_count: usize,
         clusters: usize,
-    ) -> (Vec<f32>, Vec<Vec<usize>>) {
-        let dim = config.dim;
-        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
-        let trained = crate::structures::vector::kmeans::train_euclidean_kmeans(
-            &flat,
-            vectors.len(),
-            dim,
+    ) -> Vec<f32> {
+        Self::run_kmeans(config, vectors, vector_count, clusters).centroids
+    }
+
+    fn train_flat_with_memberships(
+        config: &CoarseConfig,
+        vectors: &[f32],
+        vector_count: usize,
+        clusters: usize,
+    ) -> (Vec<f32>, FlatClusterMemberships) {
+        let trained = Self::run_kmeans(config, vectors, vector_count, clusters);
+        (
+            trained.centroids,
+            FlatClusterMemberships {
+                offsets: trained.member_offsets,
+                members: trained.members,
+            },
+        )
+    }
+
+    fn run_kmeans(
+        config: &CoarseConfig,
+        vectors: &[f32],
+        vector_count: usize,
+        clusters: usize,
+    ) -> crate::structures::vector::kmeans::EuclideanKMeans {
+        crate::structures::vector::kmeans::train_euclidean_kmeans(
+            vectors,
+            vector_count,
+            config.dim,
             clusters,
             config.max_iters,
             config.seed,
-        );
-        let mut groups = vec![Vec::new(); clusters];
-        for (point, cluster) in trained.assignments.into_iter().enumerate() {
-            groups[cluster].push(point);
-        }
-        (trained.centroids, groups)
+        )
     }
 
     fn train_hierarchical(
         config: &CoarseConfig,
-        vectors: &[Vec<f32>],
+        vectors: &[f32],
+        vector_count: usize,
         leaf_count: usize,
     ) -> (Vec<f32>, FloatCentroidRouter) {
-        let parent_count = routing_parent_count(leaf_count).min(vectors.len());
+        let parent_count = routing_parent_count(leaf_count).min(vector_count);
         let mut parent_config = config.clone();
         parent_config.routing = IvfRoutingMode::Flat;
         parent_config.num_clusters = parent_count;
-        let (parent_centroids, groups) = Self::train_flat(&parent_config, vectors, parent_count);
-        let group_sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+        let (parent_centroids, groups) =
+            Self::train_flat_with_memberships(&parent_config, vectors, vector_count, parent_count);
+        let group_sizes: Vec<usize> = (0..parent_count)
+            .map(|parent| groups.cluster(parent).len())
+            .collect();
         let child_counts = allocate_child_clusters(&group_sizes, leaf_count);
         let mut leaves = Vec::with_capacity(leaf_count.saturating_mul(config.dim));
         let mut children = vec![Vec::new(); parent_count];
+        let mut group_vectors = Vec::new();
 
-        for (parent, (indices, &child_count)) in groups.iter().zip(&child_counts).enumerate() {
+        for (parent, &child_count) in child_counts.iter().enumerate() {
             if child_count == 0 {
                 continue;
             }
-            let group_vectors: Vec<Vec<f32>> = indices
-                .iter()
-                .map(|&index| vectors[index].clone())
-                .collect();
+            let indices = groups.cluster(parent);
+            group_vectors.clear();
+            group_vectors.reserve(indices.len().saturating_mul(config.dim));
+            for &index in indices {
+                let offset = index * config.dim;
+                group_vectors.extend_from_slice(&vectors[offset..offset + config.dim]);
+            }
             let mut child_config = config.clone();
             child_config.routing = IvfRoutingMode::Flat;
             child_config.num_clusters = child_count;
             child_config.seed = config.seed ^ (parent as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let first_leaf = leaves.len() / config.dim;
-            leaves
-                .extend_from_slice(&Self::train_flat(&child_config, &group_vectors, child_count).0);
+            leaves.extend_from_slice(&Self::train_flat(
+                &child_config,
+                &group_vectors,
+                indices.len(),
+                child_count,
+            ));
             children[parent].extend((first_leaf..first_leaf + child_count).map(|leaf| leaf as u32));
         }
         debug_assert_eq!(leaves.len(), leaf_count * config.dim);
@@ -320,6 +487,18 @@ impl CoarseCentroids {
     }
 
     fn find_k_nearest_two_level(&self, vector: &[f32], k: usize) -> Vec<u32> {
+        self.find_k_nearest_two_level_impl::<false>(vector, k)
+    }
+
+    fn find_k_nearest_two_level_for_build(&self, vector: &[f32], k: usize) -> Vec<u32> {
+        self.find_k_nearest_two_level_impl::<true>(vector, k)
+    }
+
+    fn find_k_nearest_two_level_impl<const FOR_BUILD: bool>(
+        &self,
+        vector: &[f32],
+        k: usize,
+    ) -> Vec<u32> {
         let Some(FloatCentroidRouter::TwoLevel {
             parent_centroids,
             topology,
@@ -336,9 +515,11 @@ impl CoarseCentroids {
             let offset = parent_id * self.dim;
             *score = squared_l2(vector, &parent_centroids[offset..offset + self.dim]);
         }
-        let parent_take =
-            parent_probe_count(k, self.num_clusters as usize, topology.parent_count());
-        let parents = select_best::<false>(&parent_scores, parent_take);
+        let parents = if FOR_BUILD {
+            select_parent_beam_for_build::<false>(&parent_scores, topology, k)
+        } else {
+            select_parent_beam::<false>(&parent_scores, topology, k)
+        };
         let candidate_capacity = parents
             .iter()
             .map(|&parent| topology.children(parent as usize).len())
@@ -357,13 +538,6 @@ impl CoarseCentroids {
             return self.find_k_nearest(vector, k);
         };
         graph.search(|leaf| squared_l2(vector, self.get_centroid(leaf)), k)
-    }
-
-    fn find_nearest_hnsw(&self, vector: &[f32]) -> u32 {
-        let Some(FloatCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
-            return self.find_nearest(vector);
-        };
-        graph.search_one(|leaf| squared_l2(vector, self.get_centroid(leaf)))
     }
 
     /// Find k nearest clusters with their distances
@@ -403,8 +577,15 @@ impl CoarseCentroids {
         } else {
             let primary_cluster = match effective_routing_mode(routing, self.num_clusters as usize)
             {
-                IvfRoutingMode::Hnsw => self.find_nearest_hnsw(vector),
-                IvfRoutingMode::TwoLevel => self.find_k_nearest_two_level(vector, 1)[0],
+                IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw_for_build(vector, 1)[0],
+                IvfRoutingMode::TwoLevel => self
+                    .find_k_nearest_two_level_for_build(
+                        vector,
+                        BUILD_ASSIGNMENT_CANDIDATES.min(self.num_clusters as usize),
+                    )
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
                 IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_nearest(vector),
             };
             MultiAssignment {
@@ -414,7 +595,7 @@ impl CoarseCentroids {
         }
     }
 
-    /// SOAR-style assignment: find secondary clusters with orthogonal residuals
+    /// SOAR-style assignment: balance secondary distortion and residual orthogonality
     pub fn assign_with_soar(&self, vector: &[f32], config: &SoarConfig) -> MultiAssignment {
         self.assign_with_soar_and_routing(vector, config, IvfRoutingMode::Flat)
     }
@@ -425,27 +606,33 @@ impl CoarseCentroids {
         config: &SoarConfig,
         routing: IvfRoutingMode,
     ) -> MultiAssignment {
+        // The implemented SOAR loss is the published primary + one-secondary
+        // objective. Treat larger manually constructed values the same as the
+        // trained/config-parsed path instead of pretending repeated independent
+        // minimization implements the generalized multi-spill objective.
+        let num_secondary = config.num_secondary.min(1);
+        // Secondary assignment needs a meaningfully larger candidate pool
+        // than the number of requested spills; otherwise a skewed two-level
+        // topology can leave the SOAR loss no alternatives to rank.
+        let candidate_budget =
+            soar_build_candidate_budget(num_secondary, self.num_clusters as usize);
         let leaf_ids: Vec<u32> = match effective_routing_mode(routing, self.num_clusters as usize) {
             IvfRoutingMode::TwoLevel => {
-                self.two_level_candidate_leaves(vector, config.num_secondary + 1)
+                self.two_level_candidate_leaves_for_build(vector, candidate_budget)
             }
-            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(
-                vector,
-                (config.num_secondary + 1)
-                    .saturating_mul(16)
-                    .max(32)
-                    .min(self.num_clusters as usize),
-            ),
+            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw_for_build(vector, candidate_budget),
             IvfRoutingMode::Flat | IvfRoutingMode::Auto => (0..self.num_clusters).collect(),
         };
-        let primary = leaf_ids
+        // Compute every candidate distance once. Reuse it both for primary
+        // selection and as the distortion term in the secondary SOAR loss.
+        let leaf_distances: Vec<(u32, f32)> = leaf_ids
+            .into_iter()
+            .map(|cluster| (cluster, squared_l2(vector, self.get_centroid(cluster))))
+            .collect();
+        let primary = leaf_distances
             .iter()
-            .copied()
-            .min_by(|&left, &right| {
-                squared_l2(vector, self.get_centroid(left))
-                    .total_cmp(&squared_l2(vector, self.get_centroid(right)))
-                    .then_with(|| left.cmp(&right))
-            })
+            .min_by(|left, right| scored_cluster_order(left, right))
+            .map(|&(cluster, _)| cluster)
             .unwrap_or(0);
         let primary_centroid = self.get_centroid(primary);
 
@@ -466,42 +653,56 @@ impl CoarseCentroids {
             };
         }
 
-        // 4. Find secondary clusters that MINIMIZE |⟨r, r'⟩| (orthogonal residuals)
-        let mut candidates: Vec<(u32, f32)> = leaf_ids
+        // 4. Minimize the published lambda=1 SOAR objective:
+        //
+        //      ||r'||² + lambda * ||proj_r(r')||²
+        //
+        // This retains ordinary secondary quantization quality while penalizing
+        // correlation with the primary residual. Optimizing only the projection
+        // term can otherwise select an arbitrarily distant orthogonal centroid.
+        let mut candidates: Vec<(u32, f32)> = leaf_distances
             .into_iter()
-            .filter(|&c| c != primary)
-            .map(|c| {
-                let centroid = self.get_centroid(c);
-                // Compute r' = x - c'
-                // Then compute |⟨r, r'⟩| - we want this SMALL (orthogonal)
-                let dot: f32 = vector
-                    .iter()
-                    .zip(centroid)
-                    .zip(&residual)
-                    .map(|((v, c), r)| (v - c) * r)
-                    .sum();
-                (c, dot.abs())
+            .filter(|&(cluster, secondary_residual_norm_sq)| {
+                cluster != primary
+                    && (!config.selective
+                        || secondary_residual_norm_sq
+                            <= MAX_SELECTIVE_SECONDARY_TO_PRIMARY_DISTANCE_RATIO_SQ
+                                * residual_norm_sq)
+            })
+            .map(|(cluster, secondary_residual_norm_sq)| {
+                (
+                    cluster,
+                    soar_secondary_loss(
+                        vector,
+                        self.get_centroid(cluster),
+                        &residual,
+                        residual_norm_sq,
+                        secondary_residual_norm_sq,
+                    ),
+                )
             })
             .collect();
 
-        // Partial sort by orthogonality (smallest dot product first)
-        let take = config.num_secondary.min(candidates.len());
+        // Select by loss, then sort the retained prefix so ties and assignment
+        // order are deterministic across platforms and repeated builds.
+        let take = num_secondary.min(candidates.len());
         if candidates.len() > take {
-            candidates.select_nth_unstable_by(take, |a, b| a.1.total_cmp(&b.1));
+            candidates.select_nth_unstable_by(take, scored_cluster_order);
             candidates.truncate(take);
         }
+        candidates.sort_unstable_by(scored_cluster_order);
 
         MultiAssignment {
             primary_cluster: primary,
             secondary_clusters: candidates
                 .iter()
-                .take(config.num_secondary)
+                .take(num_secondary)
                 .map(|(c, _)| *c)
                 .collect(),
         }
     }
 
-    fn two_level_candidate_leaves(&self, vector: &[f32], k: usize) -> Vec<u32> {
+    fn two_level_candidate_leaves_for_build(&self, vector: &[f32], k: usize) -> Vec<u32> {
         let Some(FloatCentroidRouter::TwoLevel {
             parent_centroids,
             topology,
@@ -514,10 +715,7 @@ impl CoarseCentroids {
             let offset = parent_id * self.dim;
             *score = squared_l2(vector, &parent_centroids[offset..offset + self.dim]);
         }
-        let parents = select_best::<false>(
-            &parent_scores,
-            parent_probe_count(k, self.num_clusters as usize, topology.parent_count()),
-        );
+        let parents = select_parent_beam_for_build::<false>(&parent_scores, topology, k);
         let capacity = parents
             .iter()
             .map(|&parent| topology.children(parent as usize).len())
@@ -527,6 +725,13 @@ impl CoarseCentroids {
             leaves.extend_from_slice(topology.children(parent as usize));
         }
         leaves
+    }
+
+    fn find_k_nearest_hnsw_for_build(&self, vector: &[f32], k: usize) -> Vec<u32> {
+        let Some(FloatCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
+            return self.find_k_nearest(vector, k);
+        };
+        graph.search_for_build(|leaf| squared_l2(vector, self.get_centroid(leaf)), k)
     }
 
     /// Get centroid for a cluster
@@ -607,6 +812,60 @@ fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
         .sum()
 }
 
+#[inline]
+fn threshold_strictly_above(value: f32) -> f32 {
+    if !value.is_finite() {
+        return f32::INFINITY;
+    }
+    // A single ULP is not sufficient near zero because the assignment path
+    // compares squared norms and a subnormal threshold can square back to
+    // zero. A small relative-or-absolute margin remains negligible for
+    // normalized vectors while guaranteeing a strictly larger squared bound.
+    let next = value + value.abs().max(1.0) * (4.0 * f32::EPSILON);
+    if next > value { next } else { f32::INFINITY }
+}
+
+#[inline]
+fn soar_build_candidate_budget(num_secondary: usize, num_clusters: usize) -> usize {
+    num_secondary
+        .saturating_add(1)
+        .saturating_mul(64)
+        .max(BUILD_ASSIGNMENT_CANDIDATES)
+        .min(num_clusters)
+}
+
+#[inline]
+fn soar_secondary_loss(
+    vector: &[f32],
+    secondary_centroid: &[f32],
+    primary_residual: &[f32],
+    primary_residual_norm_sq: f32,
+    secondary_residual_norm_sq: f32,
+) -> f32 {
+    let residual_dot = vector
+        .iter()
+        .zip(secondary_centroid)
+        .zip(primary_residual)
+        .map(|((&value, &centroid), &primary)| primary * (value - centroid))
+        .sum::<f32>();
+
+    // A zero primary residual already has no correlated score error. Define
+    // its projection penalty as zero rather than producing 0/0.
+    let projection_norm_sq = if primary_residual_norm_sq > 0.0 {
+        residual_dot * residual_dot / primary_residual_norm_sq
+    } else {
+        0.0
+    };
+    secondary_residual_norm_sq + SOAR_LAMBDA * projection_norm_sq
+}
+
+#[inline]
+fn scored_cluster_order(left: &(u32, f32), right: &(u32, f32)) -> std::cmp::Ordering {
+    left.1
+        .total_cmp(&right.1)
+        .then_with(|| left.0.cmp(&right.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +890,33 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_training_matches_row_wrapper() {
+        let dim = 8;
+        let vectors: Vec<Vec<f32>> = (0..128)
+            .map(|row| {
+                (0..dim)
+                    .map(|column| ((row * 31 + column * 17) % 101) as f32 / 101.0)
+                    .collect()
+            })
+            .collect();
+        let flat = vectors.iter().flatten().copied().collect::<Vec<_>>();
+        let config = CoarseConfig::new(dim, 12)
+            .with_seed(91)
+            .with_routing(IvfRoutingMode::TwoLevel);
+
+        let rows = CoarseCentroids::train(&config, &vectors);
+        let contiguous = CoarseCentroids::train_contiguous(&config, &flat, vectors.len());
+
+        assert_eq!(rows.centroids, contiguous.centroids);
+        assert_eq!(
+            bincode::serde::encode_to_vec(&rows.routing_index, bincode::config::standard())
+                .unwrap(),
+            bincode::serde::encode_to_vec(&contiguous.routing_index, bincode::config::standard())
+                .unwrap(),
+        );
+    }
+
+    #[test]
     fn test_find_nearest() {
         let dim = 32;
         let n = 500;
@@ -649,6 +935,25 @@ mod tests {
             let cluster = centroids.find_nearest(v);
             assert!(cluster < centroids.num_clusters);
         }
+    }
+
+    #[test]
+    fn scaled_l2_probes_keep_distinct_cache_identities() {
+        let centroids = CoarseCentroids {
+            num_clusters: 2,
+            dim: 2,
+            centroids: vec![1.0, 0.0, 10.0, 0.0],
+            version: 7,
+            soar_config: None,
+            routing_index: None,
+        };
+
+        let near = centroids.probe(&[1.0, 0.0], 1, IvfRoutingMode::Flat);
+        let scaled = centroids.probe(&[100.0, 0.0], 1, IvfRoutingMode::Flat);
+
+        assert_eq!(&*near.cluster_ids, &[0]);
+        assert_eq!(&*scaled.cluster_ids, &[1]);
+        assert_ne!(near.request_fingerprint, scaled.request_fingerprint);
     }
 
     #[test]
@@ -673,12 +978,400 @@ mod tests {
         // Test SOAR assignment
         let assignment = centroids.assign(&vectors[0]);
         assert!(assignment.primary_cluster < centroids.num_clusters);
-        assert_eq!(assignment.secondary_clusters.len(), 2);
+        assert_eq!(centroids.soar_config.as_ref().unwrap().num_secondary, 1);
+        assert_eq!(assignment.secondary_clusters.len(), 1);
 
         // Secondary clusters should be different from primary
         for &sec in &assignment.secondary_clusters {
             assert_ne!(sec, assignment.primary_cluster);
         }
+    }
+
+    #[test]
+    fn soar_loss_includes_distortion_and_normalized_projection() {
+        let vector = [0.0, 0.0];
+        let primary_residual = [2.0, 0.0];
+        let secondary_centroid = [-3.0, -4.0];
+
+        // r' = [3, 4], so ||r'||² = 25 and
+        // ||proj_r(r')||² = <r,r'>² / ||r||² = 36 / 4 = 9.
+        let loss = soar_secondary_loss(&vector, &secondary_centroid, &primary_residual, 4.0, 25.0);
+        assert!((loss - 34.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn soar_routing_keeps_an_oversampled_secondary_candidate_pool() {
+        assert_eq!(soar_build_candidate_budget(1, 1_000), 128);
+        assert_eq!(soar_build_candidate_budget(2, 1_000), 192);
+        assert_eq!(soar_build_candidate_budget(8, 64), 64);
+    }
+
+    #[test]
+    fn two_level_build_assignment_checks_four_parents_for_primary_and_soar() {
+        let leaves_per_parent = 512;
+        let children: Vec<Vec<u32>> = (0..4)
+            .map(|parent| {
+                let first = parent * leaves_per_parent;
+                (first..first + leaves_per_parent)
+                    .map(|leaf| leaf as u32)
+                    .collect()
+            })
+            .collect();
+        let mut leaf_centroids = vec![1.0; 4 * leaves_per_parent];
+        let best_leaf = 3 * leaves_per_parent;
+        leaf_centroids[best_leaf] = 0.0;
+        let centroids = CoarseCentroids {
+            num_clusters: leaf_centroids.len() as u32,
+            dim: 1,
+            centroids: leaf_centroids,
+            version: 1,
+            soar_config: None,
+            routing_index: Some(FloatCentroidRouter::TwoLevel {
+                parent_centroids: vec![0.0, 10.0, 20.0, 30.0],
+                topology: IvfRoutingTopology::from_children(&children),
+            }),
+        };
+
+        let query = [0.0];
+        assert_eq!(
+            &*centroids
+                .probe(&query, 1, IvfRoutingMode::TwoLevel)
+                .cluster_ids,
+            &[0]
+        );
+        assert_eq!(
+            centroids
+                .assign_with_routing(&query, IvfRoutingMode::TwoLevel)
+                .primary_cluster,
+            best_leaf as u32
+        );
+        assert_eq!(
+            centroids
+                .assign_with_soar_and_routing(
+                    &query,
+                    &SoarConfig::full(),
+                    IvfRoutingMode::TwoLevel,
+                )
+                .primary_cluster,
+            best_leaf as u32
+        );
+    }
+
+    #[test]
+    fn selective_soar_calibrates_to_a_storage_budget() {
+        let centroids = CoarseCentroids {
+            num_clusters: 2,
+            dim: 2,
+            centroids: vec![0.0, 0.0, 10.0, 0.0],
+            version: 1,
+            soar_config: None,
+            routing_index: None,
+        };
+        let vectors: Vec<Vec<f32>> = (0..100)
+            .map(|index| vec![index as f32 / 100.0, 0.0])
+            .collect();
+        let flat = vectors.iter().flatten().copied().collect::<Vec<_>>();
+        let threshold = centroids.calibrate_selective_spill_threshold(
+            &flat,
+            vectors.len(),
+            IvfRoutingMode::Flat,
+            0.30,
+        );
+        let spilled = vectors
+            .iter()
+            .filter(|vector| squared_l2(vector, centroids.get_centroid(0)).sqrt() >= threshold)
+            .count();
+        assert!((29..=31).contains(&spilled), "{spilled}");
+    }
+
+    #[test]
+    fn selective_soar_never_exceeds_budget_when_residuals_tie() {
+        let centroids = CoarseCentroids {
+            num_clusters: 2,
+            dim: 2,
+            centroids: vec![0.0, 0.0, 10.0, 0.0],
+            version: 1,
+            soar_config: None,
+            routing_index: None,
+        };
+        let vectors = [1.0f32, 0.0].repeat(100);
+        let threshold = centroids.calibrate_selective_spill_threshold(
+            &vectors,
+            100,
+            IvfRoutingMode::Flat,
+            0.30,
+        );
+        let config = SoarConfig::new().threshold(threshold);
+        let spilled = vectors
+            .chunks_exact(2)
+            .filter(|vector| centroids.assign_with_soar(vector, &config).is_spilled())
+            .count();
+
+        assert!(threshold > 1.0);
+        assert!(spilled <= 30, "{spilled}");
+    }
+
+    #[test]
+    fn selective_soar_preserves_boundary_query_candidate_recall_with_bounded_postings() {
+        const DIM: usize = 16;
+        const CLUSTERS: usize = 16;
+        const MEMBERS_PER_CLUSTER: usize = 128;
+        const TOP_K: usize = 20;
+        const TARGET_SPILL: f32 = 0.30;
+
+        fn normalize(values: &mut [f32]) {
+            let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+            for value in values {
+                *value /= norm;
+            }
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x50a4_5eed);
+        let source_centers: Vec<Vec<f32>> = (0..CLUSTERS)
+            .map(|_| {
+                let mut center: Vec<f32> = (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect();
+                normalize(&mut center);
+                center
+            })
+            .collect();
+        let corpus: Vec<Vec<f32>> = source_centers
+            .iter()
+            .flat_map(|center| {
+                (0..MEMBERS_PER_CLUSTER)
+                    .map(|_| {
+                        let mut noise: Vec<f32> =
+                            (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect();
+                        normalize(&mut noise);
+                        let mut vector: Vec<f32> = center
+                            .iter()
+                            .zip(noise)
+                            .map(|(&value, noise)| value + 0.75 * noise)
+                            .collect();
+                        normalize(&mut vector);
+                        vector
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let selective = CoarseCentroids::train(
+            &CoarseConfig::new(DIM, CLUSTERS)
+                .with_seed(0x1f4)
+                .with_routing(IvfRoutingMode::Flat)
+                .with_soar(SoarConfig::new().target_spill_fraction(TARGET_SPILL)),
+            &corpus,
+        );
+        // Share the exact trained codebook so the only variable is whether
+        // documents receive selective secondary postings.
+        let mut primary_only = selective.clone();
+        primary_only.soar_config = None;
+
+        let primary_assignments: Vec<MultiAssignment> = corpus
+            .iter()
+            .map(|vector| primary_only.assign(vector))
+            .collect();
+        let selective_assignments: Vec<MultiAssignment> = corpus
+            .iter()
+            .map(|vector| selective.assign(vector))
+            .collect();
+        for (primary, spilled) in primary_assignments.iter().zip(&selective_assignments) {
+            assert_eq!(
+                primary.primary_cluster, spilled.primary_cluster,
+                "SOAR policy must not change the primary posting"
+            );
+        }
+
+        let spilled = selective_assignments
+            .iter()
+            .filter(|assignment| assignment.is_spilled())
+            .count();
+        let posting_factor = selective_assignments
+            .iter()
+            .map(MultiAssignment::num_assignments)
+            .sum::<usize>() as f32
+            / corpus.len() as f32;
+        let spill_budget = (corpus.len() as f32 * TARGET_SPILL).round() as usize;
+        assert!(
+            spilled > 0,
+            "the smoke corpus must exercise selective spilling"
+        );
+        assert!(
+            spilled <= spill_budget,
+            "{spilled} spilled vectors exceeded the calibrated budget of {spill_budget}"
+        );
+        assert!(
+            posting_factor <= 1.0 + TARGET_SPILL + f32::EPSILON,
+            "posting amplification {posting_factor:.4} exceeded the 1.30 calibration target"
+        );
+
+        // Midpoints between each learned centroid and its nearest peer stress
+        // the exact partition boundaries where a single probe loses the most
+        // candidates and selective secondary postings should help.
+        let queries: Vec<Vec<f32>> = (0..selective.num_clusters)
+            .map(|left| {
+                let left_centroid = selective.get_centroid(left);
+                let right = (0..selective.num_clusters)
+                    .filter(|&candidate| candidate != left)
+                    .min_by(|&a, &b| {
+                        squared_l2(left_centroid, selective.get_centroid(a))
+                            .total_cmp(&squared_l2(left_centroid, selective.get_centroid(b)))
+                            .then_with(|| a.cmp(&b))
+                    })
+                    .unwrap();
+                let mut query: Vec<f32> = left_centroid
+                    .iter()
+                    .zip(selective.get_centroid(right))
+                    .map(|(&a, &b)| 0.51 * a + 0.49 * b)
+                    .collect();
+                normalize(&mut query);
+                query
+            })
+            .collect();
+
+        let mut gained_queries = 0usize;
+        for nprobe in [1, 2] {
+            let mut primary_hits = 0usize;
+            let mut selective_hits = 0usize;
+            for query in &queries {
+                let primary_plan = primary_only.probe(query, nprobe, IvfRoutingMode::Flat);
+                let selective_plan = selective.probe(query, nprobe, IvfRoutingMode::Flat);
+                assert_eq!(
+                    primary_plan.cluster_ids, selective_plan.cluster_ids,
+                    "SOAR must not alter query routing"
+                );
+
+                let mut truth: Vec<(usize, f32)> = corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(document, vector)| (document, squared_l2(query, vector)))
+                    .collect();
+                truth.select_nth_unstable_by(TOP_K, |left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                truth.truncate(TOP_K);
+
+                let query_primary_hits = truth
+                    .iter()
+                    .filter(|&&(document, _)| {
+                        primary_assignments[document]
+                            .all_clusters()
+                            .any(|cluster| primary_plan.cluster_ids.contains(&cluster))
+                    })
+                    .count();
+                let query_selective_hits = truth
+                    .iter()
+                    .filter(|&&(document, _)| {
+                        selective_assignments[document]
+                            .all_clusters()
+                            .any(|cluster| selective_plan.cluster_ids.contains(&cluster))
+                    })
+                    .count();
+                primary_hits += query_primary_hits;
+                selective_hits += query_selective_hits;
+                gained_queries += usize::from(query_selective_hits > query_primary_hits);
+            }
+
+            let denominator = (queries.len() * TOP_K) as f32;
+            let primary_recall = primary_hits as f32 / denominator;
+            let selective_recall = selective_hits as f32 / denominator;
+            assert!(
+                selective_recall + 0.005 >= primary_recall,
+                "selective SOAR candidate recall regressed at nprobe={nprobe}: \
+                 {selective_recall:.4} vs {primary_recall:.4}"
+            );
+            if nprobe == 1 {
+                assert!(
+                    selective_recall >= primary_recall + 0.01,
+                    "selective SOAR must recover boundary candidates at nprobe=1: \
+                     {selective_recall:.4} vs {primary_recall:.4}"
+                );
+            }
+        }
+        assert!(
+            gained_queries > 0,
+            "boundary-query smoke did not exercise a selective SOAR recall gain"
+        );
+    }
+
+    #[test]
+    fn soar_does_not_choose_an_arbitrarily_distant_orthogonal_centroid() {
+        let centroids = CoarseCentroids {
+            num_clusters: 3,
+            dim: 2,
+            // For x=[0,0], cluster 0 is primary with r=[1,0].
+            // Cluster 1 is perfectly orthogonal but extremely distant.
+            // Cluster 2 is slightly farther than the primary and parallel:
+            // its complete SOAR loss is 1.21 + 1.21 = 2.42.
+            centroids: vec![-1.0, 0.0, 0.0, -100.0, 1.1, 0.0],
+            version: 1,
+            soar_config: None,
+            routing_index: None,
+        };
+
+        let assignment = centroids.assign_with_soar(&[0.0, 0.0], &SoarConfig::full());
+        assert_eq!(assignment.primary_cluster, 0);
+        assert_eq!(assignment.secondary_clusters, vec![2]);
+    }
+
+    #[test]
+    fn selective_soar_rejects_a_far_secondary_residual() {
+        let centroids = CoarseCentroids {
+            num_clusters: 2,
+            dim: 2,
+            centroids: vec![0.0, 0.0, 10.0, 0.0],
+            version: 1,
+            soar_config: None,
+            routing_index: None,
+        };
+        let config = SoarConfig::new().threshold(0.0);
+
+        // Primary squared distance is 1; the only secondary is 81 away.
+        // Selective SOAR must not create a low-quality far-leaf posting.
+        let assignment = centroids.assign_with_soar(&[1.0, 0.0], &config);
+        assert_eq!(assignment.primary_cluster, 0);
+        assert!(assignment.secondary_clusters.is_empty());
+    }
+
+    #[test]
+    fn selective_soar_keeps_a_comparable_boundary_secondary() {
+        let centroids = CoarseCentroids {
+            num_clusters: 2,
+            dim: 2,
+            centroids: vec![0.0, 0.0, 2.0, 0.0],
+            version: 1,
+            soar_config: None,
+            routing_index: None,
+        };
+        let config = SoarConfig::new().threshold(0.0);
+
+        // The point is close to the Voronoi boundary: primary and secondary
+        // squared distances are 0.82 and 1.22, comfortably within the gate.
+        let assignment = centroids.assign_with_soar(&[0.9, 0.1], &config);
+        assert_eq!(assignment.primary_cluster, 0);
+        assert_eq!(assignment.secondary_clusters, vec![1]);
+    }
+
+    #[test]
+    fn soar_secondary_ties_are_ordered_by_cluster_id_and_capped_to_one() {
+        let centroids = CoarseCentroids {
+            num_clusters: 3,
+            dim: 2,
+            centroids: vec![0.0, 0.0, 1.0, 0.0, -1.0, 0.0],
+            version: 1,
+            soar_config: None,
+            routing_index: None,
+        };
+        let config = SoarConfig {
+            num_secondary: 2,
+            selective: false,
+            spill_threshold: 0.0,
+        };
+
+        let assignment = centroids.assign_with_soar(&[0.0, 0.0], &config);
+        assert_eq!(assignment.primary_cluster, 0);
+        assert_eq!(assignment.secondary_clusters, vec![1]);
     }
 
     #[test]

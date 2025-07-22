@@ -2753,6 +2753,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         &self,
         reader: &SegmentReader,
         field_ids: &[u32],
+        trained: &TrainedVectorStructures,
         rewrite_existing: bool,
     ) -> Result<bool> {
         for &field_id in field_ids {
@@ -2797,7 +2798,31 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         config.index_type == crate::dsl::VectorIndexType::IvfTq
                     }) =>
                 {
-                    matches!(ann, Some(crate::segment::VectorIndex::IvfTq { .. }))
+                    let config = entry
+                        .dense_vector_config
+                        .as_ref()
+                        .expect("matched IVF-TQ configuration");
+                    match (ann, trained.centroids.get(&field_id)) {
+                        (
+                            Some(crate::segment::VectorIndex::IvfTq { index, .. }),
+                            Some(centroids),
+                        ) => {
+                            let header = index.get().header();
+                            crate::structures::is_ivf_tq_cosine_generation(centroids.version)
+                                && crate::structures::is_ivf_tq_cosine_generation(
+                                    header.quantizer_version,
+                                )
+                                && header.dim == config.dim
+                                && header.num_clusters == centroids.num_clusters
+                                && header.quantizer_version == centroids.version
+                                && header.codebook_version
+                                    == crate::structures::vector::quantization::tq_expected_fingerprint(
+                                        config.dim,
+                                    )
+                                && header.routing == config.ivf_routing
+                        }
+                        _ => false,
+                    }
                 }
                 // Only ivf_tq dense fields are trainable; other dense
                 // index types never reach a vector-generation rewrite.
@@ -2939,7 +2964,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 self.term_cache_blocks,
             )
             .await?;
-            if !self.segment_needs_vector_rewrite(&reader, field_ids, rewrite_existing)? {
+            if !self.segment_needs_vector_rewrite(
+                &reader,
+                field_ids,
+                trained.as_ref(),
+                rewrite_existing,
+            )? {
                 continue;
             }
             drop(reader);
@@ -2961,7 +2991,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 self.term_cache_blocks,
             )
             .await?;
-            if self.segment_needs_vector_rewrite(&output_reader, field_ids, false)? {
+            if self.segment_needs_vector_rewrite(
+                &output_reader,
+                field_ids,
+                trained.as_ref(),
+                false,
+            )? {
                 return Err(Error::Corruption(format!(
                     "staged vector segment {new_id} does not match its candidate codebook generation"
                 )));
@@ -3025,7 +3060,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.term_cache_blocks,
         )
         .await?;
-        if !self.segment_needs_vector_rewrite(&reader, field_ids, false)? {
+        if !self.segment_needs_vector_rewrite(&reader, field_ids, trained.as_ref(), false)? {
             return Ok(VectorSegmentRewriteOutcome::AlreadyCurrent);
         }
         drop(reader);

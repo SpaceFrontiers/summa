@@ -756,6 +756,13 @@ impl SegmentMerger {
             }
             return Ok(None);
         };
+        if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
+            return Err(crate::Error::Corruption(format!(
+                "IVF-TQ field {} uses the removed legacy raw generation; \
+                 rebuild the index with a current Hermes version",
+                field.0,
+            )));
+        }
         let expected_fingerprint =
             crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
         let max_assignments = centroids
@@ -830,8 +837,8 @@ impl SegmentMerger {
     }
 
     /// Rebuild the IVF-TQ index for a vector-generation rewrite: re-assign
-    /// every flat vector against the supplied centroid generation and
-    /// re-encode residuals with the derived codec.
+    /// every raw flat vector against the supplied centroid generation and
+    /// re-encode normalized residuals with the derived codec.
     async fn rebuild_ivf_tq(
         &self,
         field: crate::dsl::Field,
@@ -847,6 +854,13 @@ impl SegmentMerger {
         let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field.0)) else {
             return Ok(None);
         };
+        if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
+            return Err(crate::Error::Corruption(format!(
+                "IVF-TQ field {} uses the removed legacy raw generation; \
+                 rebuild the index with a current Hermes version",
+                field.0,
+            )));
+        }
 
         let codec = crate::structures::vector::quantization::tq_shared_codec(config.dim);
         let mut index = crate::structures::IvfTqIndex::new(

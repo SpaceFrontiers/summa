@@ -1,17 +1,17 @@
 # Hermes
 
-A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and dense vectors (global IVF-PQ with HNSW coarse routing) in a single embeddable Rust library. Runs natively, over gRPC, in browsers via WASM, and over IPFS.
+A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and dense vectors (global IVF-TQ with HNSW coarse routing) in a single embeddable Rust library. Runs natively, over gRPC, in browsers via WASM, and over IPFS.
 
 ## Why Hermes?
 
-| Feature                 | Hermes                 | Tantivy | Qdrant  | Elasticsearch |
-| ----------------------- | ---------------------- | ------- | ------- | ------------- |
-| BM25 Full-text search   | Yes                    | Yes     | No      | Yes           |
-| Dense vectors (ANN)     | Yes (IVF-PQ + HNSW)    | No      | Yes     | Plugin        |
-| Sparse vectors (SPLADE) | Yes (native)           | No      | Partial | No            |
-| WASM / Browser          | Yes                    | No      | No      | No            |
-| IPFS storage            | Yes                    | No      | No      | No            |
-| Embeddable library      | Yes                    | Yes     | No      | No            |
+| Feature                 | Hermes              | Tantivy | Qdrant  | Elasticsearch |
+| ----------------------- | ------------------- | ------- | ------- | ------------- |
+| BM25 Full-text search   | Yes                 | Yes     | No      | Yes           |
+| Dense vectors (ANN)     | Yes (IVF-TQ + HNSW) | No      | Yes     | Plugin        |
+| Sparse vectors (SPLADE) | Yes (native)        | No      | Partial | No            |
+| WASM / Browser          | Yes                 | No      | No      | No            |
+| IPFS storage            | Yes                 | No      | No      | No            |
+| Embeddable library      | Yes                 | Yes     | No      | No            |
 
 ## Packages
 
@@ -210,7 +210,7 @@ await index.save_cache_to_idb();
 
 ## Key Features
 
-**Unified hybrid search** -- BM25 text ranking, SPLADE sparse vectors, and global IVF-PQ dense vectors share the same index, segments, and query pipeline. No sidecar services required.
+**Unified hybrid search** -- BM25 text ranking, SPLADE sparse vectors, and global IVF-TQ dense vectors share the same index, segments, and query pipeline. No sidecar services required.
 
 **6 posting list formats** -- Adaptive format selection per list: HorizontalBP128, VerticalBP128, Elias-Fano, Partitioned Elias-Fano, Roaring bitmaps, and OptP4D. The engine picks the best format based on list density and length.
 
@@ -220,7 +220,7 @@ await index.save_cache_to_idb();
 
 **Matryoshka reranking** -- L2 reranker supports Matryoshka dimensionality reduction: scores candidates on leading dimensions first, then full-dimension exact scoring on survivors only. Skips 50-70% of cosine computations.
 
-**SOAR multi-probe** -- IVF indexes use Google's SOAR (Spilling with Orthogonality-Amplified Residuals) for 5-15% recall improvement by assigning vectors to multiple clusters with orthogonal residuals.
+**SOAR multi-probe** -- IVF-TQ indexes default to Google's SOAR (Spilling with Orthogonality-Amplified Residuals) in selective mode, calibrating one secondary assignment for at most 30% of vectors; `soar: off` disables it explicitly.
 
 **SimHash dedup pipeline** -- Stream-oriented CLI tools for near-duplicate detection: pipe through `simhash`, `sort`, then `index` to deduplicate million-document corpora before indexing.
 

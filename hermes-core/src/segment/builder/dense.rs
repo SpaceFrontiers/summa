@@ -1,12 +1,11 @@
 //! Dense vector streaming build (footer-based format).
 //!
 //! Streams each field's flat data directly to disk, then writes TOC + footer.
-//! Supports parallel segment-level IVF index building.
+//! ANN payloads are built and written one field at a time so large fields do
+//! not retain every packed index alongside every raw builder.
 
 use std::io::Write;
 
-#[cfg(feature = "native")]
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::Result;
@@ -91,6 +90,55 @@ impl BinaryDenseVectorBuilder {
     pub fn len(&self) -> usize {
         self.doc_ids.len()
     }
+}
+
+#[cfg(feature = "native")]
+fn build_dense_ann_blob(
+    field_id: u32,
+    builder: &DenseVectorBuilder,
+    schema: &Schema,
+    trained: Option<&super::super::TrainedVectorStructures>,
+) -> Result<Option<(u8, Vec<u8>)>> {
+    let Some(config) = schema
+        .get_field_entry(Field(field_id))
+        .and_then(|entry| entry.dense_vector_config.as_ref())
+    else {
+        return Ok(None);
+    };
+
+    let dim = builder.dim;
+    let blob = match config.index_type {
+        VectorIndexType::Tq => {
+            super::super::ann_build::build_tq_flat(dim, &builder.doc_ids, &builder.vectors)
+                .map(|bytes| (super::super::ann_build::TQ_FLAT_TYPE, bytes))
+        }
+        VectorIndexType::IvfTq => {
+            // Only the coarse router is trained; segments stay flat until a
+            // compatible generation exists.
+            let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field_id))
+            else {
+                return Ok(None);
+            };
+            super::super::ann_build::build_ivf_tq(
+                dim,
+                config.ivf_routing,
+                centroids,
+                &builder.doc_ids,
+                &builder.vectors,
+            )
+            .map(|bytes| (super::super::ann_build::IVF_TQ_TYPE, bytes))
+        }
+        _ => return Ok(None),
+    };
+    let (index_type, bytes) = blob?;
+    log::info!(
+        "[dense_vector_build] built ANN(type={}) for field {} ({} vectors, {})",
+        index_type,
+        field_id,
+        builder.doc_ids.len(),
+        crate::format_bytes(bytes.len() as u64)
+    );
+    Ok(Some((index_type, bytes)))
 }
 
 /// Stream dense and binary dense vectors directly to disk (zero-buffer for vector data).
@@ -206,74 +254,12 @@ pub(super) fn build_vectors_streaming(
     let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(toc_capacity);
     let mut current_offset = 0u64;
 
-    // Pre-build ANN indexes across fields (native only). IVF-TQ requires
-    // trained coarse centroids; TQ is training-free and always builds.
-    #[cfg(feature = "native")]
-    let ann_blobs: Vec<(u32, u8, Vec<u8>)> = {
-        let ann_blob_fn = |(field_id, builder): &(u32, DenseVectorBuilder)|
-         -> Result<Option<(u32, u8, Vec<u8>)>> {
-                let Some(config) = schema
-                    .get_field_entry(Field(*field_id))
-                    .and_then(|e| e.dense_vector_config.as_ref())
-                else {
-                    return Ok(None);
-                };
-
-                let dim = builder.dim;
-                let blob = match config.index_type {
-                    VectorIndexType::Tq => super::super::ann_build::build_tq_flat(
-                        dim,
-                        &builder.doc_ids,
-                        &builder.vectors,
-                    )
-                    .map(|b| (super::super::ann_build::TQ_FLAT_TYPE, b)),
-                    VectorIndexType::IvfTq => {
-                        // Only the coarse router is trained; segments stay
-                        // flat until a generation exists (same as IVF-PQ).
-                        let Some(centroids) =
-                            trained.and_then(|trained| trained.centroids.get(field_id))
-                        else {
-                            return Ok(None);
-                        };
-                        super::super::ann_build::build_ivf_tq(
-                            dim,
-                            config.ivf_routing,
-                            centroids,
-                            &builder.doc_ids,
-                            &builder.vectors,
-                        )
-                        .map(|b| (super::super::ann_build::IVF_TQ_TYPE, b))
-                    }
-                    _ => return Ok(None),
-                };
-                let (index_type, bytes) = blob?;
-                log::info!(
-                    "[dense_vector_build] built ANN(type={}) for field {} ({} vectors, {})",
-                    index_type,
-                    field_id,
-                    builder.doc_ids.len(),
-                    crate::format_bytes(bytes.len() as u64)
-                );
-                Ok(Some((*field_id, index_type, bytes)))
-            };
-
-        fields
-            .par_iter()
-            .map(ann_blob_fn)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
-    };
-    // WASM: no ANN index building (requires trained structures from SegmentManager)
     #[cfg(not(feature = "native"))]
-    let ann_blobs: Vec<(u32, u8, Vec<u8>)> = {
-        let _ = trained; // suppress unused warning
-        Vec::new()
-    };
+    let _ = trained;
 
-    // Stream each field's flat data directly (builder → disk, no intermediate buffer)
-    for (i, (_field_id, builder)) in fields.into_iter().enumerate() {
+    // Stream each field's flat data, then build and immediately write its ANN
+    // payload. At most one final ANN blob is retained at a time.
+    for (i, (field_id, builder)) in fields.into_iter().enumerate() {
         let data_offset = current_offset;
         FlatVectorData::serialize_binary_from_flat_streaming(
             builder.dim,
@@ -289,7 +275,7 @@ pub(super) fn build_vectors_streaming(
             .checked_add(field_size)
             .ok_or_else(|| crate::Error::Internal("vector output offset exceeds u64".into()))?;
         toc.push(DenseVectorTocEntry {
-            field_id: _field_id,
+            field_id,
             index_type: super::super::ann_build::FLAT_TYPE,
             offset: data_offset,
             size: field_size,
@@ -302,31 +288,32 @@ pub(super) fn build_vectors_streaming(
                 crate::Error::Internal("vector output padding exceeds u64".into())
             })?;
         }
-        // builder dropped here, freeing vector memory before next field
-    }
 
-    // Write ANN blob entries after flat entries
-    for (field_id, index_type, blob) in ann_blobs {
-        let data_offset = current_offset;
-        let blob_len = u64::try_from(blob.len())
-            .map_err(|_| crate::Error::Internal("ANN blob size exceeds u64".into()))?;
-        writer.write_all(&blob)?;
-        current_offset = current_offset
-            .checked_add(blob_len)
-            .ok_or_else(|| crate::Error::Internal("vector output offset exceeds u64".into()))?;
-        toc.push(DenseVectorTocEntry {
-            field_id,
-            index_type,
-            offset: data_offset,
-            size: blob_len,
-        });
-        let pad = (8 - (current_offset % 8)) % 8;
-        if pad > 0 {
-            writer.write_all(&[0u8; 8][..pad as usize])?;
-            current_offset = current_offset.checked_add(pad).ok_or_else(|| {
-                crate::Error::Internal("vector output padding exceeds u64".into())
-            })?;
+        #[cfg(feature = "native")]
+        if let Some((index_type, blob)) = build_dense_ann_blob(field_id, &builder, schema, trained)?
+        {
+            let data_offset = current_offset;
+            let blob_len = u64::try_from(blob.len())
+                .map_err(|_| crate::Error::Internal("ANN blob size exceeds u64".into()))?;
+            writer.write_all(&blob)?;
+            current_offset = current_offset
+                .checked_add(blob_len)
+                .ok_or_else(|| crate::Error::Internal("vector output offset exceeds u64".into()))?;
+            toc.push(DenseVectorTocEntry {
+                field_id,
+                index_type,
+                offset: data_offset,
+                size: blob_len,
+            });
+            let pad = (8 - (current_offset % 8)) % 8;
+            if pad > 0 {
+                writer.write_all(&[0u8; 8][..pad as usize])?;
+                current_offset = current_offset.checked_add(pad).ok_or_else(|| {
+                    crate::Error::Internal("vector output padding exceeds u64".into())
+                })?;
+            }
         }
+        // Builder and its ANN blob are both dropped before the next field.
     }
 
     // Stream binary dense vector fields (packed bits, Hamming distance)

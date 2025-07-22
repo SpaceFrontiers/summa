@@ -19,8 +19,9 @@ use crate::dsl::IvfRoutingMode;
 use crate::structures::simd::{batch_hamming_scores, hamming_distance};
 use crate::structures::vector::ivf::routing::{
     HNSW_AUTO_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
-    allocate_child_clusters, binary_probe_fingerprint, effective_routing_mode, parent_probe_count,
-    routing_parent_count, select_best, select_best_candidates,
+    allocate_child_clusters, binary_probe_fingerprint, effective_routing_mode,
+    routing_parent_count, select_best, select_best_candidates, select_parent_beam,
+    select_parent_beam_for_build,
 };
 
 fn argmax_score_lowest_index(scores: &[f32]) -> usize {
@@ -50,8 +51,25 @@ fn nearest_binary_centroid(
     argmax_score_lowest_index(scores) as u32
 }
 
+#[inline]
+fn nearest_binary_centroid_with_distance(
+    code: &[u8],
+    centroids: &[u8],
+    byte_len: usize,
+    dim_bits: usize,
+    scores: &mut [f32],
+) -> (u32, u32) {
+    let centroid = nearest_binary_centroid(code, centroids, byte_len, dim_bits, scores);
+    let offset = centroid as usize * byte_len;
+    (
+        centroid,
+        hamming_distance(code, &centroids[offset..offset + byte_len]),
+    )
+}
+
 const MAX_BINARY_IVF_CLUSTERS: usize = 1_048_576;
 const BINARY_IVF_SCORE_BATCH: usize = 8_192;
+const BUILD_ASSIGNMENT_CANDIDATES: usize = 128;
 
 /// Global Hamming coarse quantizer shared by every segment of a field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,8 +260,19 @@ impl BinaryCoarseQuantizer {
 
     pub fn assign(&self, code: &[u8], mode: IvfRoutingMode) -> u32 {
         match effective_routing_mode(mode, self.num_clusters as usize) {
-            IvfRoutingMode::Hnsw => self.find_nearest_hnsw(code),
-            IvfRoutingMode::TwoLevel => self.find_k_nearest_two_level(code, 1)[0],
+            IvfRoutingMode::Hnsw => self
+                .find_k_nearest_hnsw_for_build(code, 1)
+                .first()
+                .copied()
+                .unwrap_or(0),
+            IvfRoutingMode::TwoLevel => self
+                .find_k_nearest_two_level_for_build(
+                    code,
+                    BUILD_ASSIGNMENT_CANDIDATES.min(self.num_clusters as usize),
+                )
+                .first()
+                .copied()
+                .unwrap_or(0),
             IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_nearest(code),
         }
     }
@@ -273,6 +302,18 @@ impl BinaryCoarseQuantizer {
     }
 
     fn find_k_nearest_two_level(&self, query: &[u8], k: usize) -> Vec<u32> {
+        self.find_k_nearest_two_level_impl::<false>(query, k)
+    }
+
+    fn find_k_nearest_two_level_for_build(&self, query: &[u8], k: usize) -> Vec<u32> {
+        self.find_k_nearest_two_level_impl::<true>(query, k)
+    }
+
+    fn find_k_nearest_two_level_impl<const FOR_BUILD: bool>(
+        &self,
+        query: &[u8],
+        k: usize,
+    ) -> Vec<u32> {
         let Some(BinaryCentroidRouter::TwoLevel {
             parent_centroids,
             topology,
@@ -291,9 +332,11 @@ impl BinaryCoarseQuantizer {
             self.dim_bits,
             &mut parent_scores,
         );
-        let parent_take =
-            parent_probe_count(k, self.num_clusters as usize, topology.parent_count());
-        let parents = select_best::<true>(&parent_scores, parent_take);
+        let parents = if FOR_BUILD {
+            select_parent_beam_for_build::<true>(&parent_scores, topology, k)
+        } else {
+            select_parent_beam::<true>(&parent_scores, topology, k)
+        };
         let candidate_count = parents
             .iter()
             .map(|&parent| topology.children(parent as usize).len())
@@ -332,17 +375,20 @@ impl BinaryCoarseQuantizer {
         )
     }
 
-    fn find_nearest_hnsw(&self, query: &[u8]) -> u32 {
+    fn find_k_nearest_hnsw_for_build(&self, query: &[u8], k: usize) -> Vec<u32> {
         let Some(BinaryCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
-            return self.find_nearest(query);
+            return self.find_k_nearest(query, k);
         };
         let byte_len = self.byte_len();
-        graph.search_one(|leaf| {
-            hamming_distance(
-                query,
-                &self.centroids[leaf as usize * byte_len..(leaf as usize + 1) * byte_len],
-            ) as f32
-        })
+        graph.search_for_build(
+            |leaf| {
+                hamming_distance(
+                    query,
+                    &self.centroids[leaf as usize * byte_len..(leaf as usize + 1) * byte_len],
+                ) as f32
+            },
+            k,
+        )
     }
 }
 
@@ -686,28 +732,30 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     // to duplicate/near-duplicate cells on skewed embedding distributions.
     let first = rng.random_range(0..n);
     centroids[..byte_len].copy_from_slice(vec_at(first));
-    let mut min_dist_sq = vec![f64::INFINITY; n];
+    let mut minimum_weights = vec![f64::INFINITY; n];
     for centroid_id in 1..k {
         let previous = &centroids[(centroid_id - 1) * byte_len..centroid_id * byte_len];
         #[cfg(feature = "native")]
         {
             use rayon::prelude::*;
-            min_dist_sq
+            minimum_weights
                 .par_iter_mut()
                 .enumerate()
-                .for_each(|(index, min_distance)| {
+                .for_each(|(index, minimum_weight)| {
                     let distance = hamming_distance(vec_at(index), previous);
-                    *min_distance = min_distance.min((distance as f64) * (distance as f64));
+                    // Hamming distance is already squared Euclidean distance
+                    // for vectors in {0,1}^d, so D² sampling uses it directly.
+                    *minimum_weight = minimum_weight.min(distance as f64);
                 });
         }
         #[cfg(not(feature = "native"))]
-        for (index, min_distance) in min_dist_sq.iter_mut().enumerate() {
+        for (index, minimum_weight) in minimum_weights.iter_mut().enumerate() {
             let distance = hamming_distance(vec_at(index), previous);
-            *min_distance = min_distance.min((distance as f64) * (distance as f64));
+            *minimum_weight = minimum_weight.min(distance as f64);
         }
 
         let chosen = if let Some(chosen) = crate::structures::vector::kmeans::weighted_sample_index(
-            &min_dist_sq,
+            &minimum_weights,
             rng.random::<f64>(),
         ) {
             chosen
@@ -719,6 +767,7 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     }
 
     let mut assignment = vec![u32::MAX; n];
+    let mut assignment_distances = vec![u32::MAX; n];
     let mut members: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
 
     for _iter in 0..config.train_iters {
@@ -730,17 +779,19 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
             use rayon::prelude::*;
             assignment
                 .par_iter_mut()
+                .zip(assignment_distances.par_iter_mut())
                 .enumerate()
                 .map_init(
                     || vec![0f32; k],
-                    |scores, (i, slot)| {
-                        let best = nearest_binary_centroid(
+                    |scores, (i, (slot, assignment_distance))| {
+                        let (best, distance) = nearest_binary_centroid_with_distance(
                             vec_at(i),
                             &centroids,
                             byte_len,
                             dim_bits,
                             scores,
                         );
+                        *assignment_distance = distance;
                         usize::from(std::mem::replace(slot, best) != best)
                     },
                 )
@@ -751,15 +802,17 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
             let mut scores = vec![0f32; k];
             assignment
                 .iter_mut()
+                .zip(&mut assignment_distances)
                 .enumerate()
-                .map(|(i, slot)| {
-                    let best = nearest_binary_centroid(
+                .map(|(i, (slot, assignment_distance))| {
+                    let (best, distance) = nearest_binary_centroid_with_distance(
                         vec_at(i),
                         &centroids,
                         byte_len,
                         dim_bits,
                         &mut scores,
                     );
+                    *assignment_distance = distance;
                     usize::from(std::mem::replace(slot, best) != best)
                 })
                 .sum()
@@ -777,6 +830,16 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
         for (i, &slot) in assignment.iter().enumerate().take(n) {
             members[slot as usize].push(i);
         }
+
+        reseed_empty_binary_centroids(
+            &mut centroids,
+            &mut members,
+            &mut assignment,
+            &mut assignment_distances,
+            sample.as_deref(),
+            codes,
+            byte_len,
+        );
 
         #[cfg(feature = "native")]
         {
@@ -807,19 +870,82 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
                 );
             }
         }
-
-        // Re-seed empty clusters serially so RNG consumption and the resulting
-        // model remain deterministic across thread counts.
-        for (c, cluster_members) in members.iter().enumerate() {
-            if cluster_members.is_empty() {
-                // Re-seed empty cluster with a random sampled vector
-                let sample_index = rng.random_range(0..n);
-                centroids[c * byte_len..(c + 1) * byte_len].copy_from_slice(vec_at(sample_index));
-            }
-        }
     }
 
     centroids
+}
+
+/// Re-seed empty cells from the represented points with the largest assignment
+/// error. One closest point is retained in every donor cell, so each selected
+/// point is unique and re-assignment cannot create a new empty cell. Empty IDs
+/// and equal-distance candidates are resolved in ascending order.
+fn reseed_empty_binary_centroids(
+    centroids: &mut [u8],
+    members: &mut [Vec<usize>],
+    assignment: &mut [u32],
+    assignment_distances: &mut [u32],
+    sample: Option<&[usize]>,
+    codes: &[u8],
+    byte_len: usize,
+) {
+    let empty_clusters: Vec<usize> = members
+        .iter()
+        .enumerate()
+        .filter_map(|(cluster, cluster_members)| cluster_members.is_empty().then_some(cluster))
+        .collect();
+    if empty_clusters.is_empty() {
+        return;
+    }
+
+    // Retain the closest (then lowest-index) represented point in each donor
+    // cell. Every other point is safe to move without emptying its donor.
+    let mut candidates = Vec::with_capacity(
+        assignment
+            .len()
+            .saturating_sub(members.len() - empty_clusters.len()),
+    );
+    for cluster_members in members.iter().filter(|members| !members.is_empty()) {
+        let keeper = *cluster_members
+            .iter()
+            .min_by_key(|&&point| (assignment_distances[point], point))
+            .expect("non-empty binary cluster must have a represented point");
+        candidates.extend(
+            cluster_members
+                .iter()
+                .copied()
+                .filter(|&point| point != keeper),
+        );
+    }
+    debug_assert!(candidates.len() >= empty_clusters.len());
+
+    let farthest_first = |left: &usize, right: &usize| {
+        assignment_distances[*right]
+            .cmp(&assignment_distances[*left])
+            .then_with(|| left.cmp(right))
+    };
+    if empty_clusters.len() < candidates.len() {
+        candidates.select_nth_unstable_by(empty_clusters.len(), farthest_first);
+        candidates.truncate(empty_clusters.len());
+    }
+    candidates.sort_unstable_by(farthest_first);
+
+    for (empty_cluster, point) in empty_clusters.into_iter().zip(candidates) {
+        assignment[point] = empty_cluster as u32;
+        assignment_distances[point] = 0;
+        let vector_index = sample.map_or(point, |sample| sample[point]);
+        centroids[empty_cluster * byte_len..(empty_cluster + 1) * byte_len]
+            .copy_from_slice(&codes[vector_index * byte_len..(vector_index + 1) * byte_len]);
+    }
+
+    // Keep the membership view consistent with the assignments before the
+    // centroid-update phase. In particular, donor modes must not retain points
+    // that were moved into newly seeded cells.
+    for cluster_members in members.iter_mut() {
+        cluster_members.clear();
+    }
+    for (point, &cluster) in assignment.iter().enumerate() {
+        members[cluster as usize].push(point);
+    }
 }
 
 /// Compute one Hamming-space centroid using a per-byte bit histogram. Member
@@ -843,13 +969,18 @@ fn update_binary_centroid(
         }
     }
 
-    let half = members.len() / 2;
     for (byte, counts) in centroid.iter_mut().zip(bit_counts) {
+        let previous = *byte;
         *byte = counts
             .into_iter()
             .enumerate()
             .fold(0u8, |packed, (bit, count)| {
-                packed | (u8::from(count > half) << bit)
+                let value = match count.cmp(&(members.len() - count)) {
+                    std::cmp::Ordering::Greater => 1,
+                    std::cmp::Ordering::Less => 0,
+                    std::cmp::Ordering::Equal => (previous >> bit) & 1,
+                };
+                packed | (value << bit)
             });
     }
 }
@@ -1019,6 +1150,84 @@ mod tests {
     }
 
     #[test]
+    fn k_majority_seeding_uses_raw_hamming_d2_weights() {
+        let codes = [0x00, 0x01, 0x03, 0x0f, 0x3f, 0x7f, 0xff];
+        let (seed, first, raw_choice, squared_choice) = (0u64..10_000)
+            .find_map(|seed| {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let first = rng.random_range(0..codes.len());
+                let draw = rng.random::<f64>();
+                let raw_weights: Vec<f64> = codes
+                    .iter()
+                    .map(|code| {
+                        f64::from(hamming_distance(
+                            std::slice::from_ref(code),
+                            std::slice::from_ref(&codes[first]),
+                        ))
+                    })
+                    .collect();
+                let squared_weights: Vec<f64> =
+                    raw_weights.iter().map(|weight| weight * weight).collect();
+                let raw_choice =
+                    crate::structures::vector::kmeans::weighted_sample_index(&raw_weights, draw)?;
+                let squared_choice = crate::structures::vector::kmeans::weighted_sample_index(
+                    &squared_weights,
+                    draw,
+                )?;
+                (raw_choice != squared_choice).then_some((seed, first, raw_choice, squared_choice))
+            })
+            .expect("test data must distinguish Hamming from Hamming-squared sampling");
+
+        let mut config = BinaryIvfConfig::new(8, 2);
+        config.seed = seed;
+        config.train_iters = 0;
+        config.max_train_samples = codes.len();
+        let centroids = train_k_majority(&config, &codes, codes.len());
+
+        assert_eq!(centroids[0], codes[first]);
+        assert_eq!(centroids[1], codes[raw_choice]);
+        assert_ne!(centroids[1], codes[squared_choice]);
+    }
+
+    #[test]
+    fn empty_binary_centroids_take_farthest_movable_points_deterministically() {
+        let codes = [0x0f, 0x01, 0xf0, 0xf1, 0xfe];
+        let mut centroids = vec![0x00, 0xff, 0x55, 0xaa];
+        let mut members = vec![vec![0, 1], vec![2, 3, 4], vec![], vec![]];
+        let mut assignment = vec![0, 0, 1, 1, 1];
+        let mut assignment_distances = vec![4, 1, 4, 3, 1];
+
+        reseed_empty_binary_centroids(
+            &mut centroids,
+            &mut members,
+            &mut assignment,
+            &mut assignment_distances,
+            None,
+            &codes,
+            1,
+        );
+
+        // Points 0 and 2 have the largest movable distance. The equal-distance
+        // tie and empty cluster IDs are both resolved from lowest to highest.
+        assert_eq!(centroids, vec![0x00, 0xff, 0x0f, 0xf0]);
+        assert_eq!(assignment, vec![2, 0, 3, 1, 1]);
+        assert_eq!(assignment_distances, vec![0, 1, 0, 3, 1]);
+        assert_eq!(members, vec![vec![1], vec![3, 4], vec![0], vec![2]]);
+    }
+
+    #[test]
+    fn binary_centroid_majority_ties_keep_previous_bits() {
+        let codes = [0b1010_1010, 0b0101_0101];
+        let mut centroid = [0b1100_0011];
+        update_binary_centroid(&mut centroid, &[0, 1], None, &codes, 1);
+        assert_eq!(centroid, [0b1100_0011]);
+
+        let decisive_codes = [0b1111_0000, 0b1111_0000, 0b0000_1111];
+        update_binary_centroid(&mut centroid, &[0, 1, 2], None, &decisive_codes, 1);
+        assert_eq!(centroid, [0b1111_0000]);
+    }
+
+    #[test]
     fn streaming_builder_appends_batches_without_retaining_inputs() {
         let codes = [0x00, 0x01, 0x02, 0xf0, 0xf1, 0xf2];
         let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
@@ -1061,6 +1270,43 @@ mod tests {
                 .all(|(&cells, size)| cells <= size)
         );
         assert_eq!(allocation[2], 0);
+    }
+
+    #[test]
+    fn binary_two_level_build_assignment_checks_four_parents() {
+        let leaves_per_parent = 512;
+        let children: Vec<Vec<u32>> = (0..4)
+            .map(|parent| {
+                let first = parent * leaves_per_parent;
+                (first..first + leaves_per_parent)
+                    .map(|leaf| leaf as u32)
+                    .collect()
+            })
+            .collect();
+        let mut leaf_centroids = vec![0x01; 4 * leaves_per_parent];
+        let best_leaf = 3 * leaves_per_parent;
+        leaf_centroids[best_leaf] = 0x00;
+        let quantizer = BinaryCoarseQuantizer {
+            dim_bits: 8,
+            num_clusters: leaf_centroids.len() as u32,
+            centroids: leaf_centroids,
+            version: 1,
+            routing_index: Some(BinaryCentroidRouter::TwoLevel {
+                parent_centroids: vec![0x00, 0xff, 0xff, 0xff],
+                topology: IvfRoutingTopology::from_children(&children),
+            }),
+        };
+
+        assert_eq!(
+            &*quantizer
+                .probe(&[0x00], 1, IvfRoutingMode::TwoLevel)
+                .cluster_ids,
+            &[0]
+        );
+        assert_eq!(
+            quantizer.assign(&[0x00], IvfRoutingMode::TwoLevel),
+            best_leaf as u32
+        );
     }
 
     #[test]

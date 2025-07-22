@@ -113,9 +113,11 @@ Since codec v2 non-power-of-two dims pay no padding: a 768-dim vector costs
 
 Sub-linear probing with the training-free leaf codec: the trained global
 coarse router (same `build_vector_index()` machinery, HNSW/SOAR supported)
-plus TQ codes of the centroid residual `r = x − c` per leaf. Residual norms
-carry ranking information, so each vector stores `scale = ‖r‖` next to
-`gamma`, and the leaf estimate is
+plus TQ codes of the centroid residual `r = x̂ − c` per leaf. Training
+samples, indexed ANN copies, and queries are always normalized before
+routing and residual encoding; original stored vectors remain unchanged for
+exact reranking. Residual norms carry ranking information, so each vector
+stores `scale = ‖r‖` next to `gamma`, and the leaf estimate is
 
 ```
 ⟨q̂, x⟩ = ⟨q̂, c⟩ + scale · est⟨q̂, r̂⟩
@@ -127,8 +129,31 @@ probed cluster — plan build is `O(P·16 + nprobe·dim)` instead of IVF-PQ's
 `nprobe` ADC tables (which dominated its measured per-query cost). Blocks are
 `[16 scales][16 gammas][nibbles]`; runs are per-leaf, merges byte-copy.
 On disk `quantizer_version` is the trained centroid generation and
-`codebook_version` carries the codec fingerprint; only centroids are stored
-as trained artifacts (`codebook_file` must be absent).
+also carries the cosine-format marker; `codebook_version` carries the codec
+fingerprint. Only centroids are stored as trained artifacts
+(`codebook_file` must be absent).
+
+Unmarked, pre-cosine IVF-TQ artifacts are unsupported and rejected while the
+trained generation or ANN payload is opened. Rebuild the index with a current
+Hermes version; the current reader and writer do not load or migrate the legacy
+format.
+
+Coarse training draws a deterministic uniform point sample directly at the
+256-points-per-centroid ceiling and keeps it as one contiguous matrix. Small
+codebooks use k-means++ initialization; large codebooks use bounded k-means||
+rounds with at most `2K` candidates total. When a second seed is affordable, an
+in-buffer held-out suffix selects by exact distortion, routed distortion, and
+posting-list balance. Hierarchical child counts are proportional to parent
+population.
+
+Construction routing is intentionally wider than query routing: HNSW uses a
+larger build search budget and two-level routing inspects at least four
+populated parents when available. This improves permanent posting assignment
+without changing the bounded production query path. Selective SOAR calibrates
+to at most its target spill fraction on the calibration sample; a tied quantile
+underfills rather than exceeding the posting-storage budget. IVF-TQ enables
+this one-secondary, at-most-30% selective preset when `soar` is omitted;
+`soar: off` explicitly disables secondary assignments.
 
 ```sdl
 field e: dense_vector<768, f16> [indexed<ivf_tq, num_clusters: 1024, nprobe: 64>]

@@ -1326,6 +1326,15 @@ async fn binary_ivf_multi_value_exact_scores() {
     near.add_binary_dense_vector(bvec, near_vec);
     writer.add_document(near).unwrap();
 
+    // Aggregate doc: neither ordinal is individually competitive with the
+    // exact match, but their Sum must win at document level.
+    let aggregate_vec = vec![0xFE_u8; byte_len];
+    let mut aggregate = Document::new();
+    aggregate.add_text(title, "aggregate");
+    aggregate.add_binary_dense_vector(bvec, aggregate_vec.clone());
+    aggregate.add_binary_dense_vector(bvec, aggregate_vec);
+    writer.add_document(aggregate).unwrap();
+
     // Hay: two vectors per doc, at most half the bits set (score <= ~0.75).
     for i in 0u32..30 {
         let mut doc = Document::new();
@@ -1354,7 +1363,7 @@ async fn binary_ivf_multi_value_exact_scores() {
             segments[0].get_vector_index(bvec),
             Some(crate::segment::VectorIndex::BinaryIvf(_))
         ),
-        "binary IVF index should be built at commit (63 vectors >= threshold 50)"
+        "binary IVF index should be built at commit (65 vectors >= threshold 50)"
     );
 
     let reader = index.reader().await.unwrap();
@@ -1388,6 +1397,31 @@ async fn binary_ivf_multi_value_exact_scores() {
         (results[1].score - expected_near).abs() < 1e-6,
         "near doc must keep its exact Hamming score {expected_near}, got {}",
         results[1].score
+    );
+
+    let summed = searcher
+        .search(
+            &BinaryDenseVectorQuery::new(bvec, vec![0xFF_u8; byte_len])
+                .with_combiner(crate::query::MultiValueCombiner::Sum),
+            1,
+        )
+        .await
+        .unwrap();
+    let summed_top = searcher
+        .doc(summed[0].segment_id, summed[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        summed_top.get_first(title).unwrap().as_text().unwrap(),
+        "aggregate",
+        "non-Max combiners must rank documents after aggregating all ordinals"
+    );
+    let expected_sum = 2.0 * (1.0 - byte_len as f32 / dim_bits as f32);
+    assert!(
+        (summed[0].score - expected_sum).abs() < 1e-6,
+        "aggregate document must retain its exact Sum score {expected_sum}, got {}",
+        summed[0].score
     );
 }
 
@@ -1909,4 +1943,138 @@ async fn test_ivf_tq_end_to_end_with_merge() {
         target_title.as_str(),
         "doc bases must survive the merge"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ivf_tq_non_unit_vectors_preserve_cosine_ranking() {
+    use crate::dsl::DenseVectorConfig;
+    use crate::query::DenseVectorQuery;
+
+    let dim = 8;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let mut dense_config = DenseVectorConfig::ivf_tq(dim, Some(2), 2);
+    dense_config.unit_norm = false;
+    let embedding = sb.add_dense_vector_field_with_config("embedding", true, true, dense_config);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    let mut exact = Document::new();
+    exact.add_text(title, "exact angle");
+    exact.add_dense_vector(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(exact).unwrap();
+
+    // These vectors dominate an inner-product candidate stage by magnitude,
+    // while all have a worse cosine angle than the unit vector above.
+    for i in 0..12 {
+        let mut large = Document::new();
+        large.add_text(title, format!("large magnitude {i}"));
+        large.add_dense_vector(
+            embedding,
+            vec![100.0 + i as f32, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        writer.add_document(large).unwrap();
+    }
+    for i in 0..52 {
+        let mut hay = Document::new();
+        hay.add_text(title, format!("orthogonal {i}"));
+        hay.add_dense_vector(
+            embedding,
+            vec![0.0, 1.0 + i as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        writer.add_document(hay).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert!(matches!(
+        index.segment_readers().await.unwrap()[0].get_vector_index(embedding),
+        Some(crate::segment::VectorIndex::IvfTq { .. })
+    ));
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let query = DenseVectorQuery::new(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        .with_nprobe(2);
+    let results = searcher.search(&query, 1).await.unwrap();
+    let top = searcher
+        .doc(results[0].segment_id, results[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        top.get_first(title).unwrap().as_text().unwrap(),
+        "exact angle"
+    );
+    assert!(
+        (results[0].score - 1.0).abs() < 1e-4,
+        "exact cosine score should remain approximately one, got {}",
+        results[0].score
+    );
+}
+
+#[tokio::test]
+async fn test_tq_multi_value_sum_aggregates_before_candidate_cut() {
+    use crate::dsl::DenseVectorConfig;
+    use crate::query::{DenseVectorQuery, MultiValueCombiner};
+
+    let dim = 8;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let embedding =
+        sb.add_dense_vector_field_with_config("embedding", true, true, DenseVectorConfig::tq(dim));
+    sb.set_multi(embedding, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    let mut exact = Document::new();
+    exact.add_text(title, "best ordinal");
+    exact.add_dense_vector(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    writer.add_document(exact).unwrap();
+
+    let mut aggregate = Document::new();
+    aggregate.add_text(title, "best document sum");
+    for second in [0.6, -0.6] {
+        aggregate.add_dense_vector(embedding, vec![0.8, second, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+    writer.add_document(aggregate).unwrap();
+
+    for i in 0..60 {
+        let mut hay = Document::new();
+        hay.add_text(title, format!("hay {i}"));
+        hay.add_dense_vector(embedding, vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        writer.add_document(hay).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert!(matches!(
+        index.segment_readers().await.unwrap()[0].get_vector_index(embedding),
+        Some(crate::segment::VectorIndex::Tq { .. })
+    ));
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let query = DenseVectorQuery::new(embedding, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        .with_combiner(MultiValueCombiner::Sum);
+    let results = searcher.search(&query, 1).await.unwrap();
+    let top = searcher
+        .doc(results[0].segment_id, results[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        top.get_first(title).unwrap().as_text().unwrap(),
+        "best document sum"
+    );
+    assert!((results[0].score - 1.6).abs() < 1e-5);
 }

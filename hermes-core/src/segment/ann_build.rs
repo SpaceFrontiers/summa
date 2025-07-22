@@ -20,8 +20,8 @@ pub const IVF_TQ_TYPE: u8 = 8;
 #[cfg(feature = "native")]
 use crate::structures::CoarseCentroids;
 
-/// Encode one segment's vectors into IVF-TQ leaves against the trained
-/// global coarse centroids.
+/// Encode one segment's vectors into IVF-TQ leaves against the trained global
+/// cosine-space centroids.
 #[cfg(feature = "native")]
 pub fn build_ivf_tq(
     dim: usize,
@@ -30,6 +30,13 @@ pub fn build_ivf_tq(
     doc_id_ordinals: &[(u32, u16)],
     vectors: &[f32],
 ) -> crate::Result<Vec<u8>> {
+    if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
+        return Err(crate::Error::Corruption(
+            "legacy raw IVF-TQ centroids cannot encode a correct cosine index; \
+             rebuild the index with a current Hermes version"
+                .into(),
+        ));
+    }
     let codec = crate::structures::vector::quantization::tq_shared_codec(dim);
     let mut index = crate::structures::IvfTqIndex::new(dim, routing, centroids.version, codec);
     index
@@ -58,4 +65,56 @@ pub fn build_tq_flat(
     crate::segment::ann_disk::write_built_tq_flat(&builder, &mut bytes)
         .map_err(crate::Error::Io)?;
     Ok(bytes)
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::directories::OwnedBytes;
+    use crate::dsl::IvfRoutingMode;
+    use crate::segment::ann_disk::{AnnDiskIndex, AnnKind};
+
+    #[test]
+    fn ivf_tq_header_preserves_cosine_generation_marker() {
+        let marked = crate::structures::mark_ivf_tq_cosine_generation(7);
+        let centroids = CoarseCentroids {
+            num_clusters: 1,
+            dim: 2,
+            centroids: vec![1.0, 0.0],
+            version: marked,
+            soar_config: None,
+            routing_index: None,
+        };
+        let bytes = build_ivf_tq(
+            2,
+            IvfRoutingMode::Flat,
+            &centroids,
+            &[(0, 0)],
+            &[100.0, 0.0],
+        )
+        .unwrap();
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::IvfTq, 1).unwrap();
+
+        assert_eq!(disk.header().quantizer_version, marked);
+        assert!(crate::structures::is_ivf_tq_cosine_generation(
+            disk.header().quantizer_version
+        ));
+    }
+
+    #[test]
+    fn ivf_tq_build_rejects_legacy_raw_generation() {
+        let centroids = CoarseCentroids {
+            num_clusters: 1,
+            dim: 2,
+            centroids: vec![1.0, 0.0],
+            version: 7,
+            soar_config: None,
+            routing_index: None,
+        };
+        let error = build_ivf_tq(2, IvfRoutingMode::Flat, &centroids, &[(0, 0)], &[1.0, 0.0])
+            .expect_err("legacy IVF-TQ generation must not encode new segments")
+            .to_string();
+        assert!(error.contains("legacy raw IVF-TQ"), "{error}");
+        assert!(error.contains("rebuild the index"), "{error}");
+    }
 }

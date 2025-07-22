@@ -515,6 +515,13 @@ fn tq_fingerprint(dim: usize, padded_dim: usize) -> u64 {
 pub struct TqQueryPlan {
     padded_dim: usize,
     fingerprint: u64,
+    /// Exact query identity used to validate query-global plan caches.
+    ///
+    /// Keep the IEEE-754 bits rather than a hash: a `DenseVectorQuery` is
+    /// cloneable and its public vector may be mutated while clones continue
+    /// sharing the same cache. Exact bits make stale LUT reuse impossible,
+    /// including for distinct NaN payloads and signed zero.
+    query_bits: Box<[u32]>,
     base_lut_i8: Vec<i8>,
     qjl_lut_i8: Vec<i8>,
     base_dequant: f32,
@@ -530,6 +537,7 @@ impl std::fmt::Debug for TqQueryPlan {
             .debug_struct("TqQueryPlan")
             .field("padded_dim", &self.padded_dim)
             .field("fingerprint", &self.fingerprint)
+            .field("query_dim", &self.query_bits.len())
             .finish()
     }
 }
@@ -570,6 +578,11 @@ impl TqQueryPlan {
         Self {
             padded_dim,
             fingerprint: codec.fingerprint,
+            query_bits: query
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             base_lut_i8,
             qjl_lut_i8,
             base_dequant,
@@ -587,6 +600,17 @@ impl TqQueryPlan {
     #[inline]
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
+    }
+
+    /// Whether these LUTs were built for this exact query.
+    #[inline]
+    pub(crate) fn matches_query(&self, query: &[f32]) -> bool {
+        self.query_bits.len() == query.len()
+            && self
+                .query_bits
+                .iter()
+                .zip(query)
+                .all(|(&bits, value)| bits == value.to_bits())
     }
 
     /// Reference f32 estimator over one unpacked nibble row (test oracle for
@@ -1400,6 +1424,24 @@ mod tests {
             "TQ fingerprint for dim 768 changed; existing segments would be \
              rejected. Bump TQ_CODEC_VERSION deliberately instead."
         );
+    }
+
+    #[test]
+    fn query_plan_identity_uses_exact_float_bits() {
+        let codec = TqCodec::new(4);
+        let query = [0.0, -0.0, 1.0, f32::from_bits(0x7fc0_0001)];
+        let plan = TqQueryPlan::build(&codec, &query);
+
+        assert!(plan.matches_query(&query));
+        assert!(!plan.matches_query(&query[..3]));
+
+        let mut different_zero = query;
+        different_zero[1] = 0.0;
+        assert!(!plan.matches_query(&different_zero));
+
+        let mut different_nan = query;
+        different_nan[3] = f32::from_bits(0x7fc0_0002);
+        assert!(!plan.matches_query(&different_nan));
     }
 
     const GOLDEN_FINGERPRINT_768: u64 = 7026088428300072418;

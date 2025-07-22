@@ -271,14 +271,20 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4�
 Float fields have two ANN formats, both built on the TurboQuant codec
 (`docs/turboquant-quantization.md`). `ivf_tq` (the default) combines the
 corpus-trained coarse centroid router with training-free TQ leaf codes of
-each vector's centroid residual — only centroids are trained, never a
-codebook. `tq` is fully training-free: each segment carries a 4-bit
+each normalized vector's centroid residual — only centroids are trained,
+never a codebook. Training samples, ANN copies, and queries are normalized
+for cosine routing while original stored values remain available for exact
+reranking. `tq` is fully training-free: each segment carries a 4-bit
 compressed payload built at commit with no global artifacts, scanned
 exhaustively with SIMD lookup tables and exact-reranked. Ordinary segment
 merges copy both formats' immutable run columns byte-for-byte and rewrite
 only their compact document-base directory. `flat` remains available for
 exact brute-force search and as the accumulation format before an `ivf_tq`
 build.
+
+Only the cosine-normalized IVF-TQ generation is supported. Older unmarked
+trained generations and ANN payloads are rejected while opening the index;
+rebuild the index with a current Hermes version.
 
 `ivf_pq` (residual product quantization) was removed after IVF-TQ superseded
 it on recall, latency, and training cost; indexes created with it must be
@@ -310,13 +316,17 @@ documents through fixed-size buffers.
 IVF-TQ supports SOAR — spilling each vector
 into a secondary cluster with an orthogonality-amplified residual. This
 improves recall at the same `nprobe` in exchange for larger cluster storage
-(~1.2-2x assignments):
+(~1.3× assignments for the build-calibrated selective preset, 2× for full).
+Omitting `soar` enables the selective preset by default: training calibrates
+one secondary assignment for at most 30% of the calibration sample. Use
+`soar: off` to disable secondary assignments explicitly:
 
 ```
-field e: dense_vector<768, f16> [indexed<ivf_tq, soar: selective>]  # spill boundary vectors
+field e: dense_vector<768, f16> [indexed<ivf_tq>]                   # default: selective, at most 30% spill
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: selective>]  # calibrate to at most a 30% spill budget
 field e: dense_vector<768, f16> [indexed<ivf_tq, soar: full>]       # spill every vector once
-field e: dense_vector<768, f16> [indexed<ivf_tq, soar: aggressive>] # spill every vector twice
-field e: dense_vector<768, f16> [indexed<ivf_tq, soar: off>]        # no spilling (default)
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: aggressive>] # full one-secondary spill
+field e: dense_vector<768, f16> [indexed<ivf_tq, soar: off>]        # explicitly disable spilling
 ```
 
 ### Example
@@ -405,10 +415,10 @@ merge/reorder invariants, and the Flat-Inv versus Fwd design choice.
 
 Sparse posting lists support configurable weight quantization and pruning via `SparseVectorConfig`:
 
-| Preset         | Quantization | Destructive pruning |
-| -------------- | ------------ | ------------------- |
-| `conservative` | Float16      | disabled            |
-| `splade`       | UInt8        | disabled            |
+| Preset         | Quantization | Destructive pruning                   |
+| -------------- | ------------ | ------------------------------------- |
+| `conservative` | Float16      | disabled                              |
+| `splade`       | UInt8        | disabled                              |
 
 These are configured programmatically, not in SDL.
 
