@@ -13,8 +13,14 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+#[cfg(feature = "native")]
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
+#[cfg(feature = "native")]
+use std::sync::mpsc::{Receiver, SyncSender};
+#[cfg(feature = "native")]
+use std::thread::JoinHandle;
 
 use crate::DocId;
 use crate::compression::CompressionDict;
@@ -223,84 +229,253 @@ struct CompressedBlock {
     compressed: Vec<u8>,
 }
 
+#[cfg(feature = "native")]
+struct CompressionJob {
+    seq: usize,
+    first_doc_id: DocId,
+    num_docs: u32,
+    data: Vec<u8>,
+}
+
+/// Fixed-width compression pool used by [`EagerParallelStoreWriter`].
+///
+/// The producer separately limits the number of submitted-but-not-written
+/// blocks. The bounded job channel provides backpressure as a second line of
+/// defence and prevents a fast store-file scan from creating an unbounded task
+/// queue.
+#[cfg(feature = "native")]
+struct StoreCompressionPool {
+    jobs: Option<SyncSender<CompressionJob>>,
+    results: Receiver<io::Result<CompressedBlock>>,
+    workers: Vec<JoinHandle<()>>,
+    num_threads: usize,
+}
+
+#[cfg(feature = "native")]
+impl StoreCompressionPool {
+    fn new(
+        num_threads: usize,
+        dict: Option<Arc<CompressionDict>>,
+        compression_level: CompressionLevel,
+    ) -> Self {
+        // A zero-width pool can never make progress. Treat zero as the
+        // conservative single-worker setting; the public configuration did
+        // not historically reject zero.
+        let num_threads = num_threads.max(1);
+        let (job_sender, job_receiver) =
+            std::sync::mpsc::sync_channel::<CompressionJob>(num_threads);
+        let job_receiver = Arc::new(std::sync::Mutex::new(job_receiver));
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let mut workers = Vec::with_capacity(num_threads);
+
+        for worker_id in 0..num_threads {
+            let jobs = Arc::clone(&job_receiver);
+            let results = result_sender.clone();
+            let dict = dict.clone();
+            let worker = std::thread::Builder::new()
+                .name(format!("hermes-store-compress-{worker_id}"))
+                .spawn(move || {
+                    loop {
+                        // std::sync::mpsc::Receiver is single-consumer, so the
+                        // short receive operation is mutex-protected. The lock
+                        // is released before compression and all workers can
+                        // then run concurrently.
+                        let job = {
+                            let receiver = jobs
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+
+                        // Always produce exactly one result for every accepted
+                        // job. Without catch_unwind, one unexpected codec panic
+                        // would leave the ordered producer waiting forever for
+                        // the missing sequence number.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let compressed = if let Some(ref dict) = dict {
+                                crate::compression::compress_with_dict(
+                                    &job.data,
+                                    compression_level,
+                                    dict,
+                                )
+                            } else {
+                                crate::compression::compress(&job.data, compression_level)
+                            }?;
+                            Ok(CompressedBlock {
+                                seq: job.seq,
+                                first_doc_id: job.first_doc_id,
+                                num_docs: job.num_docs,
+                                compressed,
+                            })
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(io::Error::other(
+                                "document-store compression worker panicked",
+                            ))
+                        });
+
+                        if results.send(result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("failed to spawn document-store compression worker");
+            workers.push(worker);
+        }
+        drop(result_sender);
+
+        Self {
+            jobs: Some(job_sender),
+            results: result_receiver,
+            workers,
+            num_threads,
+        }
+    }
+
+    #[inline]
+    fn num_threads(&self) -> usize {
+        self.num_threads
+    }
+
+    fn submit(&self, job: CompressionJob) -> io::Result<()> {
+        self.jobs
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "compression pool is closed"))?
+            .send(job)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "document-store compression workers stopped",
+                )
+            })
+    }
+
+    fn receive(&self) -> io::Result<CompressedBlock> {
+        self.results.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "document-store compression result channel closed",
+            )
+        })?
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        // Closing the only producer wakes idle workers. All submitted jobs have
+        // already yielded results before the normal finish path reaches here.
+        self.jobs.take();
+        let mut panicked = false;
+        for worker in self.workers.drain(..) {
+            panicked |= worker.join().is_err();
+        }
+        if panicked {
+            Err(io::Error::other(
+                "document-store compression worker panicked",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for StoreCompressionPool {
+    fn drop(&mut self) {
+        // Also clean up on an early write/compression error. The result channel
+        // is unbounded, so workers can finish the small bounded tail without
+        // deadlocking while this thread joins them.
+        self.jobs.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Parallel document store writer - compresses blocks immediately when queued
 ///
-/// Spawns compression tasks as soon as blocks are ready, overlapping document
-/// ingestion with compression to reduce total indexing time.
-///
-/// Uses background threads to compress blocks while the main thread continues
-/// accepting documents.
+/// A fixed number of workers compress blocks while the caller continues
+/// accepting documents. Submitted blocks and out-of-order results are bounded,
+/// and completed blocks are written continuously in sequence order.
 #[cfg(feature = "native")]
 pub struct EagerParallelStoreWriter<'a> {
     writer: &'a mut dyn Write,
     block_buffer: Vec<u8>,
     /// Reusable buffer for document serialization (avoids per-doc allocation)
     serialize_buf: Vec<u8>,
-    /// Compressed blocks ready to be written (may arrive out of order)
-    compressed_blocks: Vec<CompressedBlock>,
-    /// Handles for in-flight compression tasks
-    pending_handles: Vec<std::thread::JoinHandle<CompressedBlock>>,
+    workers: StoreCompressionPool,
+    /// Completed blocks waiting for an earlier sequence number.
+    ready_blocks: BTreeMap<usize, CompressedBlock>,
+    /// Number of submitted jobs whose result has not yet been received.
+    pending_results: usize,
+    /// Maximum submitted-but-not-written blocks.
+    max_in_flight: usize,
     next_seq: usize,
+    next_write_seq: usize,
     next_doc_id: DocId,
     block_first_doc: DocId,
+    index: Vec<StoreBlockIndex>,
+    current_offset: u64,
     dict: Option<Arc<CompressionDict>>,
-    compression_level: CompressionLevel,
 }
 
 #[cfg(feature = "native")]
 impl<'a> EagerParallelStoreWriter<'a> {
     /// Create a new eager parallel store writer
-    pub fn new(writer: &'a mut dyn Write, _num_threads: usize) -> Self {
-        Self::with_compression_level(writer, _num_threads, DEFAULT_COMPRESSION_LEVEL)
+    pub fn new(writer: &'a mut dyn Write, num_threads: usize) -> Self {
+        Self::with_compression_level(writer, num_threads, DEFAULT_COMPRESSION_LEVEL)
     }
 
     /// Create with specific compression level
     pub fn with_compression_level(
         writer: &'a mut dyn Write,
-        _num_threads: usize,
+        num_threads: usize,
         compression_level: CompressionLevel,
     ) -> Self {
-        Self {
-            writer,
-            block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
-            serialize_buf: Vec::with_capacity(512),
-            compressed_blocks: Vec::new(),
-            pending_handles: Vec::new(),
-            next_seq: 0,
-            next_doc_id: 0,
-            block_first_doc: 0,
-            dict: None,
-            compression_level,
-        }
+        Self::with_optional_dict(writer, None, num_threads, compression_level)
     }
 
     /// Create with dictionary
-    pub fn with_dict(
-        writer: &'a mut dyn Write,
-        dict: CompressionDict,
-        _num_threads: usize,
-    ) -> Self {
-        Self::with_dict_and_level(writer, dict, _num_threads, DEFAULT_COMPRESSION_LEVEL)
+    pub fn with_dict(writer: &'a mut dyn Write, dict: CompressionDict, num_threads: usize) -> Self {
+        Self::with_dict_and_level(writer, dict, num_threads, DEFAULT_COMPRESSION_LEVEL)
     }
 
     /// Create with dictionary and specific compression level
     pub fn with_dict_and_level(
         writer: &'a mut dyn Write,
         dict: CompressionDict,
-        _num_threads: usize,
+        num_threads: usize,
         compression_level: CompressionLevel,
     ) -> Self {
+        Self::with_optional_dict(writer, Some(Arc::new(dict)), num_threads, compression_level)
+    }
+
+    fn with_optional_dict(
+        writer: &'a mut dyn Write,
+        dict: Option<Arc<CompressionDict>>,
+        num_threads: usize,
+        compression_level: CompressionLevel,
+    ) -> Self {
+        let workers = StoreCompressionPool::new(num_threads, dict.clone(), compression_level);
+        // One active block plus one queued block per worker keeps the pool
+        // saturated without retaining the complete compressed store.
+        let max_in_flight = workers.num_threads().saturating_mul(2).max(1);
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
             serialize_buf: Vec::with_capacity(512),
-            compressed_blocks: Vec::new(),
-            pending_handles: Vec::new(),
+            workers,
+            ready_blocks: BTreeMap::new(),
+            pending_results: 0,
+            max_in_flight,
             next_seq: 0,
+            next_write_seq: 0,
             next_doc_id: 0,
             block_first_doc: 0,
-            dict: Some(Arc::new(dict)),
-            compression_level,
+            index: Vec::new(),
+            current_offset: 0,
+            dict,
         }
     }
 
@@ -321,7 +496,7 @@ impl<'a> EagerParallelStoreWriter<'a> {
             .write_u32::<LittleEndian>(self.serialize_buf.len() as u32)?;
         self.block_buffer.extend_from_slice(&self.serialize_buf);
         if self.block_buffer.len() >= STORE_BLOCK_SIZE {
-            self.spawn_compression();
+            self.queue_compression()?;
         }
         Ok(doc_id)
     }
@@ -345,114 +520,110 @@ impl<'a> EagerParallelStoreWriter<'a> {
         self.block_buffer.extend_from_slice(doc_bytes);
 
         if self.block_buffer.len() >= STORE_BLOCK_SIZE {
-            self.spawn_compression();
+            self.queue_compression()?;
         }
 
         Ok(doc_id)
     }
 
-    /// Spawn compression for the current block immediately
-    fn spawn_compression(&mut self) {
+    /// Queue the current block and apply ordered backpressure when the bounded
+    /// in-flight window is full.
+    fn queue_compression(&mut self) -> io::Result<()> {
         if self.block_buffer.is_empty() {
-            return;
+            return Ok(());
         }
 
         let num_docs = self.next_doc_id - self.block_first_doc;
         let data = std::mem::replace(&mut self.block_buffer, Vec::with_capacity(STORE_BLOCK_SIZE));
         let seq = self.next_seq;
         let first_doc_id = self.block_first_doc;
-        let dict = self.dict.clone();
 
-        self.next_seq += 1;
+        self.workers.submit(CompressionJob {
+            seq,
+            first_doc_id,
+            num_docs,
+            data,
+        })?;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "store block overflow"))?;
+        self.pending_results += 1;
         self.block_first_doc = self.next_doc_id;
 
-        // Spawn compression task using thread
-        let level = self.compression_level;
-        let handle = std::thread::spawn(move || {
-            let compressed = if let Some(ref d) = dict {
-                crate::compression::compress_with_dict(&data, level, d).expect("compression failed")
-            } else {
-                crate::compression::compress(&data, level).expect("compression failed")
-            };
+        while self.outstanding_blocks() >= self.max_in_flight {
+            self.receive_and_write_ready()?;
+        }
 
-            CompressedBlock {
-                seq,
-                first_doc_id,
-                num_docs,
-                compressed,
-            }
-        });
-
-        self.pending_handles.push(handle);
+        Ok(())
     }
 
-    /// Collect any completed compression tasks
-    fn collect_completed(&mut self) {
-        let mut remaining = Vec::new();
-        for handle in self.pending_handles.drain(..) {
-            if handle.is_finished() {
-                match handle.join() {
-                    Ok(block) => self.compressed_blocks.push(block),
-                    Err(payload) => std::panic::resume_unwind(payload),
-                }
-            } else {
-                remaining.push(handle);
-            }
+    #[inline]
+    fn outstanding_blocks(&self) -> usize {
+        self.next_seq - self.next_write_seq
+    }
+
+    fn receive_and_write_ready(&mut self) -> io::Result<()> {
+        if self.pending_results == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "missing document-store compression result",
+            ));
         }
-        self.pending_handles = remaining;
+        let block = self.workers.receive()?;
+        self.pending_results -= 1;
+        if block.seq < self.next_write_seq || self.ready_blocks.insert(block.seq, block).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate document-store compression result",
+            ));
+        }
+        self.write_ready_blocks()
+    }
+
+    fn write_ready_blocks(&mut self) -> io::Result<()> {
+        while let Some(block) = self.ready_blocks.remove(&self.next_write_seq) {
+            let length = u32::try_from(block.compressed.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed store block too large",
+                )
+            })?;
+            self.writer.write_all(&block.compressed)?;
+            self.index.push(StoreBlockIndex {
+                first_doc_id: block.first_doc_id,
+                offset: self.current_offset,
+                length,
+                num_docs: block.num_docs,
+            });
+            self.current_offset = self
+                .current_offset
+                .checked_add(u64::from(length))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "store size overflow"))?;
+            self.next_write_seq += 1;
+        }
+        Ok(())
     }
 
     pub fn finish(mut self) -> io::Result<u32> {
-        // Spawn compression for any remaining data
-        self.spawn_compression();
-
-        // Collect any already-completed tasks
-        self.collect_completed();
-
-        // Wait for all remaining compression tasks
-        for handle in self.pending_handles.drain(..) {
-            match handle.join() {
-                Ok(block) => self.compressed_blocks.push(block),
-                Err(payload) => std::panic::resume_unwind(payload),
-            }
+        // Queue any remaining data, then receive and stream every bounded
+        // out-of-order result before writing the footer.
+        self.queue_compression()?;
+        while self.next_write_seq < self.next_seq {
+            self.receive_and_write_ready()?;
         }
+        debug_assert_eq!(self.pending_results, 0);
+        debug_assert!(self.ready_blocks.is_empty());
+        self.workers.shutdown()?;
 
-        if self.compressed_blocks.is_empty() {
+        if self.index.is_empty() {
             write_store_index_and_footer(&mut self.writer, &[], 0, 0, 0, false)?;
             return Ok(0);
         }
 
-        // Sort by sequence to maintain order
-        self.compressed_blocks.sort_by_key(|b| b.seq);
-
-        // Write blocks in order and build index
-        let mut index = Vec::with_capacity(self.compressed_blocks.len());
-        let mut current_offset = 0u64;
-
-        for block in &self.compressed_blocks {
-            index.push(StoreBlockIndex {
-                first_doc_id: block.first_doc_id,
-                offset: current_offset,
-                length: u32::try_from(block.compressed.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "compressed store block too large",
-                    )
-                })?,
-                num_docs: block.num_docs,
-            });
-
-            self.writer.write_all(&block.compressed)?;
-            current_offset = current_offset
-                .checked_add(block.compressed.len() as u64)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "store size overflow"))?;
-        }
-
-        let data_end_offset = current_offset;
-
         // Write dictionary if present
         let dict_offset = if let Some(ref dict) = self.dict {
-            let offset = current_offset;
+            let offset = self.current_offset;
             let dict_bytes = dict.as_bytes();
             self.writer
                 .write_u32::<LittleEndian>(dict_bytes.len() as u32)?;
@@ -465,8 +636,8 @@ impl<'a> EagerParallelStoreWriter<'a> {
         // Write index + footer
         write_store_index_and_footer(
             &mut self.writer,
-            &index,
-            data_end_offset,
+            &self.index,
+            self.current_offset,
             dict_offset.unwrap_or(0),
             self.next_doc_id,
             self.dict.is_some(),
@@ -1495,8 +1666,93 @@ impl AsyncStoreReader {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native")]
+    fn raw_store_bytes(num_threads: usize, documents: &[Vec<u8>]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut store = EagerParallelStoreWriter::with_compression_level(
+            &mut output,
+            num_threads,
+            CompressionLevel::FAST,
+        );
+        for document in documents {
+            store.store_raw(document).unwrap();
+        }
+        assert_eq!(store.finish().unwrap() as usize, documents.len());
+        output
+    }
+
     fn cached_test_block(byte: u8) -> Arc<CachedBlock> {
         Arc::new(CachedBlock::build(vec![4, 0, 0, 0, byte, byte, byte, byte], 1).unwrap())
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn parallel_store_is_byte_identical_across_worker_counts() {
+        // Variable-sized, non-uniform blocks make completion order differ
+        // readily without changing block boundaries or encoded bytes.
+        let documents: Vec<Vec<u8>> = (0..64usize)
+            .map(|doc| {
+                let len = 1_000 + (doc * 7_919 % 40_000);
+                (0..len)
+                    .map(|offset| ((doc * 17 + offset * 31 + offset / 7) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+
+        let single_worker = raw_store_bytes(1, &documents);
+        let four_workers = raw_store_bytes(4, &documents);
+        assert_eq!(four_workers, single_worker);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn parallel_store_bounds_in_flight_blocks_and_streams_before_finish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWriter(Arc<AtomicUsize>);
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.fetch_add(bytes.len(), Ordering::Relaxed);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes_written = Arc::new(AtomicUsize::new(0));
+        let mut output = CountingWriter(Arc::clone(&bytes_written));
+        let mut store = EagerParallelStoreWriter::new(&mut output, 3);
+        assert_eq!(store.workers.num_threads(), 3);
+        assert_eq!(store.max_in_flight, 6);
+
+        let document = vec![7u8; STORE_BLOCK_SIZE];
+        for _ in 0..24 {
+            store.store_raw(&document).unwrap();
+            assert!(store.outstanding_blocks() < store.max_in_flight);
+            assert_eq!(
+                store.outstanding_blocks(),
+                store.pending_results + store.ready_blocks.len()
+            );
+        }
+
+        // Hitting the in-flight bound drains sequence-ready results directly
+        // to the destination instead of retaining the complete store.
+        assert!(bytes_written.load(Ordering::Relaxed) > 0);
+        assert_eq!(store.finish().unwrap(), 24);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn parallel_store_zero_threads_falls_back_to_one_worker() {
+        let mut output = Vec::new();
+        let store = EagerParallelStoreWriter::new(&mut output, 0);
+        assert_eq!(store.workers.num_threads(), 1);
+        assert_eq!(store.max_in_flight, 2);
+        assert_eq!(store.finish().unwrap(), 0);
+        // Empty block index (u32 count) plus the 32-byte footer.
+        assert_eq!(output.len(), 36);
     }
 
     #[test]

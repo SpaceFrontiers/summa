@@ -128,25 +128,25 @@ impl SearchResult {
     /// For text fields: ordinal = position >> 20 (from encoded position)
     /// For vector fields: position IS the ordinal directly
     pub fn extract_ordinals(&self) -> Vec<MatchedField> {
-        use rustc_hash::FxHashSet;
-
         self.positions
             .iter()
             .map(|(field_id, scored_positions)| {
-                let mut ordinals: FxHashSet<u32> = FxHashSet::default();
-                for sp in scored_positions {
-                    // For text fields with encoded positions, extract ordinal
-                    // For vector fields, position IS the ordinal
-                    // We use a heuristic: if position > 0xFFFFF (20 bits), it's encoded
-                    let ordinal = if sp.position > 0xFFFFF {
+                // Position lists are typically short. Collecting into one
+                // compact buffer and deduplicating in place avoids both the
+                // hash-table allocation and the second allocation needed to
+                // turn that table back into a sorted response vector.
+                let mut ordinals = Vec::with_capacity(scored_positions.len());
+                ordinals.extend(scored_positions.iter().map(|sp| {
+                    // For text fields with encoded positions, extract ordinal.
+                    // For vector fields, position IS the ordinal.
+                    if sp.position > 0xFFFFF {
                         sp.position >> 20
                     } else {
                         sp.position
-                    };
-                    ordinals.insert(ordinal);
-                }
-                let mut ordinals: Vec<u32> = ordinals.into_iter().collect();
+                    }
+                }));
                 ordinals.sort_unstable();
+                ordinals.dedup();
                 MatchedField {
                     field_id: *field_id,
                     ordinals,
@@ -237,11 +237,88 @@ pub trait Collector {
     }
 }
 
+/// Compact score-only heap entry.
+///
+/// A segment-local collector does not know its segment ID yet and ordinary
+/// searches do not retain positions. Keeping only these two words while the
+/// scorer runs makes the common heap 8 bytes per hit instead of storing a
+/// full `SearchResult` (including an empty `Vec` and a zero `u128`).
+#[derive(Debug, Clone, Copy)]
+struct ScoreOnlyResult {
+    doc_id: DocId,
+    score: Score,
+}
+
+impl PartialEq for ScoreOnlyResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.doc_id == other.doc_id
+    }
+}
+
+impl Eq for ScoreOnlyResult {}
+
+impl PartialOrd for ScoreOnlyResult {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoreOnlyResult {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+/// Position-aware heap entry. The segment ID is stamped after collection, so
+/// omitting it here also keeps this variant smaller than `SearchResult`.
+#[derive(Debug, Clone)]
+struct PositionedResult {
+    doc_id: DocId,
+    score: Score,
+    positions: super::MatchedPositions,
+}
+
+impl PartialEq for PositionedResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.doc_id == other.doc_id
+    }
+}
+
+impl Eq for PositionedResult {}
+
+impl PartialOrd for PositionedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PositionedResult {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+enum TopKHeap {
+    Scores(BinaryHeap<ScoreOnlyResult>),
+    Positions(BinaryHeap<PositionedResult>),
+}
+
+#[inline(always)]
+fn ranks_ahead(doc_id: DocId, score: Score, worst_doc_id: DocId, worst_score: Score) -> bool {
+    let order = score.total_cmp(&worst_score);
+    order.is_gt() || (order.is_eq() && doc_id < worst_doc_id)
+}
+
 /// Collector for top-k results
 pub struct TopKCollector {
-    heap: BinaryHeap<SearchResult>,
+    heap: TopKHeap,
     k: usize,
-    collect_positions: bool,
     /// Total documents seen by this collector
     total_seen: u32,
 }
@@ -255,9 +332,8 @@ const MAX_INITIAL_TOP_K_CAPACITY: usize = 8 * 1024;
 impl TopKCollector {
     pub fn new(k: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_TOP_K_CAPACITY)),
+            heap: TopKHeap::Scores(BinaryHeap::with_capacity(k.min(MAX_INITIAL_TOP_K_CAPACITY))),
             k,
-            collect_positions: false,
             total_seen: 0,
         }
     }
@@ -265,9 +341,8 @@ impl TopKCollector {
     /// Create a collector that also collects positions
     pub fn with_positions(k: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_TOP_K_CAPACITY)),
+            heap: TopKHeap::Positions(BinaryHeap::with_capacity(k.min(MAX_INITIAL_TOP_K_CAPACITY))),
             k,
-            collect_positions: true,
             total_seen: 0,
         }
     }
@@ -278,9 +353,42 @@ impl TopKCollector {
     }
 
     pub fn into_sorted_results(self) -> Vec<SearchResult> {
-        let mut results: Vec<_> = self.heap.into_vec();
-        results.sort_unstable_by(compare_search_results_desc);
-        results
+        match self.heap {
+            TopKHeap::Scores(heap) => {
+                let mut compact = heap.into_vec();
+                compact.sort_unstable_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.doc_id.cmp(&b.doc_id))
+                });
+                compact
+                    .into_iter()
+                    .map(|result| SearchResult {
+                        doc_id: result.doc_id,
+                        score: result.score,
+                        segment_id: 0,
+                        positions: Vec::new(),
+                    })
+                    .collect()
+            }
+            TopKHeap::Positions(heap) => {
+                let mut positioned = heap.into_vec();
+                positioned.sort_unstable_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.doc_id.cmp(&b.doc_id))
+                });
+                positioned
+                    .into_iter()
+                    .map(|result| SearchResult {
+                        doc_id: result.doc_id,
+                        score: result.score,
+                        segment_id: 0,
+                        positions: result.positions,
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// Consume collector and return (sorted_results, total_seen)
@@ -291,66 +399,114 @@ impl TopKCollector {
 }
 
 impl Collector for TopKCollector {
+    #[inline]
     fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
         self.total_seen = self.total_seen.saturating_add(1);
-
-        // Only clone positions when the document will actually be kept in the heap.
-        // This avoids deep-cloning Vec<ScoredPosition> for documents that are
-        // immediately discarded (the common case for large result sets).
-        if !self.would_collect(doc_id, score) {
+        if self.k == 0 {
             return;
         }
 
-        let positions = if self.collect_positions {
-            positions.to_vec()
-        } else {
-            Vec::new()
-        };
-
-        if self.heap.len() >= self.k {
-            self.heap.pop();
+        match &mut self.heap {
+            TopKHeap::Scores(heap) => {
+                let result = ScoreOnlyResult { doc_id, score };
+                if heap.len() < self.k {
+                    heap.push(result);
+                } else if heap
+                    .peek()
+                    .is_some_and(|worst| ranks_ahead(doc_id, score, worst.doc_id, worst.score))
+                {
+                    *heap.peek_mut().expect("full top-k heap") = result;
+                }
+            }
+            TopKHeap::Positions(heap) => {
+                if heap.len() >= self.k
+                    && !heap
+                        .peek()
+                        .is_some_and(|worst| ranks_ahead(doc_id, score, worst.doc_id, worst.score))
+                {
+                    return;
+                }
+                let result = PositionedResult {
+                    doc_id,
+                    score,
+                    // Only clone positions after the hit is known to be
+                    // competitive. Replacing the root drops its old positions.
+                    positions: positions.to_vec(),
+                };
+                if heap.len() < self.k {
+                    heap.push(result);
+                } else {
+                    *heap.peek_mut().expect("full top-k heap") = result;
+                }
+            }
         }
-        self.heap.push(SearchResult {
-            doc_id,
-            score,
-            segment_id: 0,
-            positions,
-        });
     }
 
+    #[inline]
     fn would_collect(&self, doc_id: DocId, score: Score) -> bool {
-        self.k > 0
-            && (self.heap.len() < self.k
-                || self.heap.peek().is_some_and(|min| {
-                    score.total_cmp(&min.score).is_gt()
-                        || (score.total_cmp(&min.score).is_eq() && doc_id < min.doc_id)
-                }))
+        if self.k == 0 {
+            return false;
+        }
+        match &self.heap {
+            TopKHeap::Scores(heap) => {
+                heap.len() < self.k
+                    || heap
+                        .peek()
+                        .is_some_and(|min| ranks_ahead(doc_id, score, min.doc_id, min.score))
+            }
+            TopKHeap::Positions(heap) => {
+                heap.len() < self.k
+                    || heap
+                        .peek()
+                        .is_some_and(|min| ranks_ahead(doc_id, score, min.doc_id, min.score))
+            }
+        }
     }
 
+    #[inline]
     fn collect_owned(&mut self, doc_id: DocId, score: Score, positions: super::MatchedPositions) {
         self.total_seen = self.total_seen.saturating_add(1);
-
-        if !self.would_collect(doc_id, score) {
+        if self.k == 0 {
             return;
         }
 
-        if self.heap.len() >= self.k {
-            self.heap.pop();
+        match &mut self.heap {
+            TopKHeap::Scores(heap) => {
+                let result = ScoreOnlyResult { doc_id, score };
+                if heap.len() < self.k {
+                    heap.push(result);
+                } else if heap
+                    .peek()
+                    .is_some_and(|worst| ranks_ahead(doc_id, score, worst.doc_id, worst.score))
+                {
+                    *heap.peek_mut().expect("full top-k heap") = result;
+                }
+            }
+            TopKHeap::Positions(heap) => {
+                if heap.len() >= self.k
+                    && !heap
+                        .peek()
+                        .is_some_and(|worst| ranks_ahead(doc_id, score, worst.doc_id, worst.score))
+                {
+                    return;
+                }
+                let result = PositionedResult {
+                    doc_id,
+                    score,
+                    positions,
+                };
+                if heap.len() < self.k {
+                    heap.push(result);
+                } else {
+                    *heap.peek_mut().expect("full top-k heap") = result;
+                }
+            }
         }
-        self.heap.push(SearchResult {
-            doc_id,
-            score,
-            segment_id: 0,
-            positions: if self.collect_positions {
-                positions
-            } else {
-                Vec::new()
-            },
-        });
     }
 
+    #[inline]
     fn needs_positions(&self) -> bool {
-        self.collect_positions
+        matches!(&self.heap, TopKHeap::Positions(_))
     }
 }
 
@@ -926,7 +1082,64 @@ mod tests {
     fn huge_top_k_does_not_trigger_a_huge_initial_allocation() {
         let collector = TopKCollector::new(usize::MAX);
 
-        assert!(collector.heap.capacity() <= MAX_INITIAL_TOP_K_CAPACITY);
+        let TopKHeap::Scores(heap) = collector.heap else {
+            panic!("score-only constructor selected the position heap");
+        };
+        assert!(heap.capacity() <= MAX_INITIAL_TOP_K_CAPACITY);
+    }
+
+    #[test]
+    fn score_only_heap_entry_stays_compact() {
+        assert_eq!(std::mem::size_of::<ScoreOnlyResult>(), 8);
+        assert!(std::mem::size_of::<SearchResult>() >= 4 * std::mem::size_of::<ScoreOnlyResult>());
+    }
+
+    #[test]
+    fn top_k_replacement_preserves_score_and_doc_ties() {
+        let mut collector = TopKCollector::new(3);
+        for (doc_id, score) in [(9, 2.0), (8, 2.0), (7, 2.0), (6, 2.0), (1, 1.0)] {
+            collector.collect(doc_id, score, &[]);
+        }
+
+        let results = collector.into_sorted_results();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.doc_id, result.score))
+                .collect::<Vec<_>>(),
+            vec![(6, 2.0), (7, 2.0), (8, 2.0)]
+        );
+    }
+
+    #[test]
+    fn extract_ordinals_sorts_and_deduplicates_without_hashing() {
+        let result = SearchResult {
+            doc_id: 1,
+            score: 1.0,
+            segment_id: 0,
+            positions: vec![
+                (
+                    3,
+                    vec![
+                        ScoredPosition::new(5 << 20, 1.0),
+                        ScoredPosition::new(2 << 20, 1.0),
+                        ScoredPosition::new(5 << 20, 2.0),
+                    ],
+                ),
+                (
+                    7,
+                    vec![
+                        ScoredPosition::new(4, 1.0),
+                        ScoredPosition::new(1, 1.0),
+                        ScoredPosition::new(4, 2.0),
+                    ],
+                ),
+            ],
+        };
+
+        let fields = result.extract_ordinals();
+        assert_eq!(fields[0].ordinals, vec![2, 5]);
+        assert_eq!(fields[1].ordinals, vec![1, 4]);
     }
 
     #[test]

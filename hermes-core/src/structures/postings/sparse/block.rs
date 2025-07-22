@@ -89,49 +89,50 @@ impl SparseBlock {
         let count = postings.len();
         let first_doc_id = postings[0].0;
 
-        // Delta encode doc IDs
-        let mut deltas = Vec::with_capacity(count);
+        // Blocks are hard-bounded at 256 entries. Keep the transient columns
+        // on the stack so building each block allocates only its three encoded
+        // output buffers.
+        let mut deltas = [0u32; MAX_BLOCK_SIZE];
+        let mut ordinals = [0u32; MAX_BLOCK_SIZE];
+        let mut weights = [0.0f32; MAX_BLOCK_SIZE];
         let mut prev = first_doc_id;
-        for &(doc_id, _, _) in postings {
-            deltas.push(doc_id.saturating_sub(prev));
+        let mut max_ordinal = 0u16;
+        let mut max_weight = 0.0f32;
+        for (index, &(doc_id, ordinal, weight)) in postings.iter().enumerate() {
+            deltas[index] = doc_id.saturating_sub(prev);
+            ordinals[index] = u32::from(ordinal);
+            weights[index] = weight;
+            max_ordinal = max_ordinal.max(ordinal);
+            max_weight = max_weight.max(weight.abs());
             prev = doc_id;
         }
         deltas[0] = 0;
 
-        let doc_id_bits = simd::round_bit_width(find_optimal_bit_width(&deltas[1..]));
-        let ordinals: Vec<u16> = postings.iter().map(|(_, o, _)| *o).collect();
-        let max_ordinal = ordinals.iter().copied().max().unwrap_or(0);
+        let doc_id_bits = simd::round_bit_width(find_optimal_bit_width(&deltas[1..count]));
         let ordinal_bits = if max_ordinal == 0 {
             0
         } else {
             simd::round_bit_width(bits_needed_u16(max_ordinal))
         };
 
-        let weights: Vec<f32> = postings.iter().map(|(_, _, w)| *w).collect();
-        let max_weight = weights
-            .iter()
-            .copied()
-            .fold(0.0f32, |acc, w| acc.max(w.abs()));
-
         let doc_ids_data = OwnedBytes::new({
             let rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
             let num_deltas = count - 1;
             let byte_count = num_deltas * rounded.bytes_per_value();
             let mut data = vec![0u8; byte_count];
-            simd::pack_rounded(&deltas[1..], rounded, &mut data);
+            simd::pack_rounded(&deltas[1..count], rounded, &mut data);
             data
         });
         let ordinals_data = OwnedBytes::new(if ordinal_bits > 0 {
             let rounded = simd::RoundedBitWidth::from_u8(ordinal_bits);
             let byte_count = count * rounded.bytes_per_value();
             let mut data = vec![0u8; byte_count];
-            let ord_u32: Vec<u32> = ordinals.iter().map(|&o| o as u32).collect();
-            simd::pack_rounded(&ord_u32, rounded, &mut data);
+            simd::pack_rounded(&ordinals[..count], rounded, &mut data);
             data
         } else {
             Vec::new()
         });
-        let weights_data = OwnedBytes::new(encode_weights(&weights, weight_quant)?);
+        let weights_data = OwnedBytes::new(encode_weights(&weights[..count], weight_quant)?);
 
         let last_doc_id = postings.last().unwrap().0;
 
@@ -646,15 +647,31 @@ impl BlockSparsePostingList {
     /// The caller writes block data first, accumulates skip entries, then
     /// writes all skip entries in a contiguous section at the file tail.
     pub fn serialize(&self) -> io::Result<(Vec<u8>, Vec<super::SparseSkipEntry>)> {
-        // Serialize all blocks to get their sizes
-        let mut block_data = Vec::new();
+        let serialized_bytes = self.blocks.iter().try_fold(0usize, |total, block| {
+            total
+                .checked_add(
+                    BlockHeader::SIZE
+                        + 8
+                        + block.doc_ids_data.len()
+                        + block.ordinals_data.len()
+                        + block.weights_data.len(),
+                )
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "sparse posting size overflow")
+                })
+        })?;
+        let mut block_data = Vec::with_capacity(serialized_bytes);
         let mut skip_entries = Vec::with_capacity(self.blocks.len());
-        let mut offset = 0u64;
 
         for block in &self.blocks {
-            let mut buf = Vec::new();
-            block.write(&mut buf)?;
-            let length = buf.len() as u32;
+            let offset = block_data.len();
+            block.write(&mut block_data)?;
+            let length = u32::try_from(block_data.len() - offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "serialized sparse block is too large",
+                )
+            })?;
 
             let first_doc = block.header.first_doc_id;
             let last_doc = block.last_doc_id;
@@ -662,13 +679,10 @@ impl BlockSparsePostingList {
             skip_entries.push(super::SparseSkipEntry::new(
                 first_doc,
                 last_doc,
-                offset,
+                offset as u64,
                 length,
                 block.header.max_weight,
             ));
-
-            block_data.extend_from_slice(&buf);
-            offset += length as u64;
         }
 
         Ok((block_data, skip_entries))
@@ -985,7 +999,13 @@ fn bits_needed_u16(val: u16) -> u8 {
 // ============================================================================
 
 fn encode_weights(weights: &[f32], quant: WeightQuantization) -> io::Result<Vec<u8>> {
-    let mut data = Vec::new();
+    let encoded_len = match quant {
+        WeightQuantization::Float32 => weights.len().saturating_mul(4),
+        WeightQuantization::Float16 => weights.len().saturating_mul(2),
+        WeightQuantization::UInt8 => 8usize.saturating_add(weights.len()),
+        WeightQuantization::UInt4 => 8usize.saturating_add(weights.len().div_ceil(2)),
+    };
+    let mut data = Vec::with_capacity(encoded_len);
     match quant {
         WeightQuantization::Float32 => {
             for &w in weights {
@@ -1055,13 +1075,13 @@ fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out
             use half::slice::HalfFloatSliceExt;
             let byte_count = count * 2;
             let src = &data[..byte_count];
-            let mut f16_buf: Vec<f16> = Vec::with_capacity(count);
-            for chunk in src.as_chunks::<2>().0 {
-                f16_buf.push(f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])));
+            let mut f16_buf = [f16::ZERO; MAX_BLOCK_SIZE];
+            for (value, chunk) in f16_buf[..count].iter_mut().zip(src.as_chunks::<2>().0) {
+                *value = f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
             }
             let start = out.len();
             out.resize(start + count, 0.0);
-            f16_buf.convert_to_f32_slice(&mut out[start..start + count]);
+            f16_buf[..count].convert_to_f32_slice(&mut out[start..start + count]);
         }
         WeightQuantization::UInt8 => {
             let mut cursor = Cursor::new(data);
@@ -1177,6 +1197,51 @@ mod tests {
                 .unwrap();
 
         assert_eq!(list.doc_count(), list2.doc_count());
+    }
+
+    #[test]
+    fn streaming_serialization_is_byte_identical_to_per_block_buffers() {
+        let postings: Vec<(DocId, u16, f32)> = (0..1_000)
+            .map(|index| {
+                (
+                    index / 2,
+                    (index % 2) as u16,
+                    (index * 17 % 101) as f32 / 101.0,
+                )
+            })
+            .collect();
+        let list = BlockSparsePostingList::from_postings_with_block_size(
+            &postings,
+            WeightQuantization::Float16,
+            64,
+        )
+        .unwrap();
+
+        let mut reference_data = Vec::new();
+        let mut reference_skip = Vec::new();
+        for block in &list.blocks {
+            let mut buffered = Vec::new();
+            block.write(&mut buffered).unwrap();
+            reference_skip.push(super::super::SparseSkipEntry::new(
+                block.header.first_doc_id,
+                block.last_doc_id,
+                reference_data.len() as u64,
+                buffered.len() as u32,
+                block.header.max_weight,
+            ));
+            reference_data.extend_from_slice(&buffered);
+        }
+
+        let (data, skip) = list.serialize().unwrap();
+        assert_eq!(data, reference_data);
+        assert_eq!(skip.len(), reference_skip.len());
+        for (actual, expected) in skip.iter().zip(&reference_skip) {
+            assert_eq!(actual.first_doc, expected.first_doc);
+            assert_eq!(actual.last_doc, expected.last_doc);
+            assert_eq!(actual.offset, expected.offset);
+            assert_eq!(actual.length, expected.length);
+            assert_eq!(actual.max_weight.to_bits(), expected.max_weight.to_bits());
+        }
     }
 
     #[test]

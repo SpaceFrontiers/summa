@@ -494,61 +494,139 @@ pub fn linear_read(data: &[u8], index: usize) -> u64 {
 ///
 /// Header: codec_id(1) + num_values(4) + num_blocks(4)
 /// Per block: first(8) + last(8) + offset(8) + bpv(1) + packed_len(4) + packed_data
+#[derive(Clone, Copy)]
+struct BlockwiseLinearBlockEstimate {
+    min_residual: i64,
+    bits_per_value: u8,
+    serialized_size: u64,
+}
+
 #[derive(Default)]
 pub struct BlockwiseLinearEstimator {
-    values: Vec<u64>,
+    count: usize,
+    completed_size: u64,
+    current_block: Vec<u64>,
+    completed_blocks: Vec<BlockwiseLinearBlockEstimate>,
+    tail_estimate: Option<BlockwiseLinearBlockEstimate>,
+    overflow: bool,
+}
+
+impl BlockwiseLinearEstimator {
+    /// Collect a complete column without retaining it.
+    ///
+    /// `serialize_auto` already owns the input slice, so full blocks can be
+    /// estimated in place. Keeping this pass separate from the other
+    /// per-value estimators also leaves their hot loop branch-free.
+    fn collect_values(&mut self, values: &[u64]) {
+        debug_assert_eq!(self.count, 0);
+        debug_assert!(self.current_block.is_empty());
+
+        self.count = values.len();
+        let mut blocks = values.chunks_exact(BLOCKWISE_LINEAR_BLOCK_SIZE);
+        for block in &mut blocks {
+            match estimate_blockwise_linear_block(block) {
+                Some(estimate) => {
+                    self.completed_size += estimate.serialized_size;
+                    self.completed_blocks.push(estimate);
+                }
+                None => {
+                    self.overflow = true;
+                    return;
+                }
+            }
+        }
+        self.current_block.extend_from_slice(blocks.remainder());
+    }
+}
+
+/// Return the serialized size of one block, excluding the global header.
+///
+/// A block is buffered until its final value is known because that value is
+/// part of the interpolation line. Keeping only this bounded scratch block
+/// avoids retaining a second copy of the entire column during auto-selection.
+fn estimate_blockwise_linear_block(block: &[u64]) -> Option<BlockwiseLinearBlockEstimate> {
+    debug_assert!(!block.is_empty());
+    let block_len = block.len();
+    if block_len < 2 {
+        return Some(BlockwiseLinearBlockEstimate {
+            min_residual: 0,
+            bits_per_value: 0,
+            serialized_size: 29,
+        });
+    }
+
+    let first = block[0];
+    let last = block[block_len - 1];
+    let mut min_res = i128::MAX;
+    let mut max_res = i128::MIN;
+    for (i, &val) in block.iter().enumerate() {
+        let pred = interpolate(first, last, block_len, i);
+        let res = val as i128 - pred as i128;
+        min_res = min_res.min(res);
+        max_res = max_res.max(res);
+    }
+
+    // Per-block offset is stored as i64. If either residual bound cannot be
+    // represented, the codec cannot encode this column.
+    if min_res < i64::MIN as i128 || max_res > i64::MAX as i128 {
+        return None;
+    }
+
+    let bits_per_value = bits_needed_u64((max_res - min_res) as u64);
+    let data_bytes = (block_len as u64 * u64::from(bits_per_value)).div_ceil(8);
+    Some(BlockwiseLinearBlockEstimate {
+        min_residual: min_res as i64,
+        bits_per_value,
+        serialized_size: 29 + data_bytes,
+    })
 }
 
 impl CodecEstimator for BlockwiseLinearEstimator {
     fn collect(&mut self, value: u64) {
-        self.values.push(value);
+        self.count += 1;
+        self.tail_estimate = None;
+        if self.overflow {
+            return;
+        }
+
+        self.current_block.push(value);
+        if self.current_block.len() == BLOCKWISE_LINEAR_BLOCK_SIZE {
+            match estimate_blockwise_linear_block(&self.current_block) {
+                Some(estimate) => {
+                    self.completed_size += estimate.serialized_size;
+                    self.completed_blocks.push(estimate);
+                }
+                None => self.overflow = true,
+            }
+            self.current_block.clear();
+        }
+    }
+
+    fn finalize(&mut self) {
+        self.tail_estimate = if self.current_block.is_empty() || self.overflow {
+            None
+        } else {
+            estimate_blockwise_linear_block(&self.current_block)
+        };
+        if !self.current_block.is_empty() && self.tail_estimate.is_none() {
+            self.overflow = true;
+        }
     }
 
     fn estimate(&self) -> Option<u64> {
-        let n = self.values.len();
-        if n < 2 * BLOCKWISE_LINEAR_BLOCK_SIZE {
+        if self.count < 2 * BLOCKWISE_LINEAR_BLOCK_SIZE || self.overflow {
             // Only useful when there are enough values to amortize the per-block headers
             return None;
         }
 
-        let num_blocks = n.div_ceil(BLOCKWISE_LINEAR_BLOCK_SIZE);
-        // Global header
-        let mut total = 9u64; // codec_id(1) + num_values(4) + num_blocks(4)
-
-        for b in 0..num_blocks {
-            let start = b * BLOCKWISE_LINEAR_BLOCK_SIZE;
-            let end = (start + BLOCKWISE_LINEAR_BLOCK_SIZE).min(n);
-            let block = &self.values[start..end];
-            let block_len = block.len();
-
-            if block_len < 2 {
-                // Block header + 0 data
-                total += 29; // first(8)+last(8)+offset(8)+bpv(1)+packed_len(4)
-                continue;
-            }
-
-            let first = block[0];
-            let last = block[block_len - 1];
-            let mut min_res = i128::MAX;
-            let mut max_res = i128::MIN;
-            for (i, &val) in block.iter().enumerate() {
-                let pred = interpolate(first, last, block_len, i);
-                let res = val as i128 - pred as i128;
-                min_res = min_res.min(res);
-                max_res = max_res.max(res);
-            }
-            // Per-block offset is stored as i64 — if any block's residuals
-            // exceed i64 range, this codec cannot represent the data.
-            if min_res < i64::MIN as i128 || max_res > i64::MAX as i128 {
-                return None;
-            }
-            let range = (max_res - min_res) as u64;
-            let bpv = bits_needed_u64(range) as u64;
-            let data_bits = block_len as u64 * bpv;
-            let data_bytes = data_bits.div_ceil(8);
-            total += 29 + data_bytes;
+        // codec_id(1) + num_values(4) + num_blocks(4)
+        let mut total = 9 + self.completed_size;
+        if !self.current_block.is_empty() {
+            total += self
+                .tail_estimate
+                .or_else(|| estimate_blockwise_linear_block(&self.current_block))?
+                .serialized_size;
         }
-
         Some(total)
     }
 
@@ -560,6 +638,14 @@ impl CodecEstimator for BlockwiseLinearEstimator {
         writer.write_u32::<LittleEndian>(n as u32)?;
         writer.write_u32::<LittleEndian>(num_blocks as u32)?;
         let mut bytes_written = 9u64;
+
+        // Both scratch buffers are bounded by one block and reused across all
+        // blocks, avoiding one allocation pair per block.
+        let mut shifted = Vec::new();
+        let mut packed = Vec::new();
+        let estimates_match = self.count == n
+            && self.completed_blocks.len() == n / BLOCKWISE_LINEAR_BLOCK_SIZE
+            && (n.is_multiple_of(BLOCKWISE_LINEAR_BLOCK_SIZE) || self.tail_estimate.is_some());
 
         for b in 0..num_blocks {
             let start = b * BLOCKWISE_LINEAR_BLOCK_SIZE;
@@ -574,49 +660,40 @@ impl CodecEstimator for BlockwiseLinearEstimator {
                 first
             };
 
-            // Compute residuals using i128 to avoid overflow
-            let mut min_residual = i128::MAX;
-            if block_len >= 2 {
-                for (i, &val) in block.iter().enumerate() {
-                    let pred = interpolate(first, last, block_len, i);
-                    let res = val as i128 - pred as i128;
-                    min_residual = min_residual.min(res);
-                }
+            let estimate = if estimates_match {
+                self.completed_blocks.get(b).copied().or(self.tail_estimate)
             } else {
-                min_residual = 0;
-            }
+                None
+            };
+            let estimate = match estimate {
+                Some(estimate) => estimate,
+                None => estimate_blockwise_linear_block(block).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "blockwise linear codec: per-block residual offset exceeds i64 range",
+                    )
+                })?,
+            };
+            let min_residual = i128::from(estimate.min_residual);
 
-            let shifted: Vec<u64> = block
-                .iter()
-                .enumerate()
-                .map(|(i, &val)| {
-                    if block_len < 2 {
-                        return 0;
-                    }
+            shifted.clear();
+            shifted.extend(block.iter().enumerate().map(|(i, &val)| {
+                if block_len < 2 {
+                    0
+                } else {
                     let pred = interpolate(first, last, block_len, i);
                     let res = val as i128 - pred as i128;
                     (res - min_residual) as u64
-                })
-                .collect();
-            let max_shifted = shifted.iter().copied().max().unwrap_or(0);
-            let bpv = bits_needed_u64(max_shifted);
-
-            // Per-block offset is stored as i64 — reject data that doesn't fit.
-            if min_residual < i64::MIN as i128 || min_residual > i64::MAX as i128 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "blockwise linear codec: per-block residual offset exceeds i64 range",
-                ));
-            }
-            let min_res_i64 = min_residual as i64;
+                }
+            }));
             writer.write_u64::<LittleEndian>(first)?;
             writer.write_u64::<LittleEndian>(last)?;
-            writer.write_i64::<LittleEndian>(min_res_i64)?;
-            writer.write_u8(bpv)?;
+            writer.write_i64::<LittleEndian>(estimate.min_residual)?;
+            writer.write_u8(estimate.bits_per_value)?;
 
-            let mut packed = Vec::new();
-            if bpv > 0 {
-                bitpack_write(&shifted, bpv, &mut packed);
+            packed.clear();
+            if estimate.bits_per_value > 0 {
+                bitpack_write(&shifted, estimate.bits_per_value, &mut packed);
             }
             writer.write_u32::<LittleEndian>(packed.len() as u32)?;
             writer.write_all(&packed)?;
@@ -666,6 +743,69 @@ pub fn blockwise_linear_read(data: &[u8], index: usize) -> u64 {
     0 // Should not reach here
 }
 
+/// Batch-read consecutive values from a blockwise-linear column.
+///
+/// Variable-length block records are scanned once to reach `start_index`, then
+/// consumed in order. This avoids re-scanning every preceding block header for
+/// each value in the batch.
+pub fn blockwise_linear_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
+    if out.is_empty() {
+        return;
+    }
+
+    let num_values = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let num_blocks = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let valid_len = out.len().min(num_values.saturating_sub(start_index));
+    out[valid_len..].fill(0);
+    if valid_len == 0 {
+        return;
+    }
+
+    let target_block = start_index / BLOCKWISE_LINEAR_BLOCK_SIZE;
+    let mut pos = 8usize;
+    let mut written = 0usize;
+
+    for block_idx in 0..num_blocks {
+        let packed_len = u32::from_le_bytes(data[pos + 25..pos + 29].try_into().unwrap()) as usize;
+        if block_idx < target_block {
+            pos += 29 + packed_len;
+            continue;
+        }
+
+        let first = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let last = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+        let offset = i64::from_le_bytes(data[pos + 16..pos + 24].try_into().unwrap());
+        let bpv = data[pos + 24];
+        let packed = &data[pos + 29..pos + 29 + packed_len];
+
+        let block_start = block_idx * BLOCKWISE_LINEAR_BLOCK_SIZE;
+        let block_len = (num_values - block_start).min(BLOCKWISE_LINEAR_BLOCK_SIZE);
+        let index_in_block = if block_idx == target_block {
+            start_index - block_start
+        } else {
+            0
+        };
+        let take = (block_len - index_in_block).min(valid_len - written);
+
+        for (i, value) in out[written..written + take].iter_mut().enumerate() {
+            let block_index = index_in_block + i;
+            let predicted = interpolate(first, last, block_len, block_index);
+            let residual = if bpv == 0 {
+                0
+            } else {
+                bitpack_read(packed, bpv, block_index)
+            };
+            *value = (predicted as i128 + offset as i128 + residual as i128) as u64;
+        }
+
+        written += take;
+        if written == valid_len {
+            break;
+        }
+        pos += 29 + packed_len;
+    }
+}
+
 // ── Auto-selection ───────────────────────────────────────────────────────
 
 /// Serialize values using the codec that produces the smallest output.
@@ -682,8 +822,8 @@ pub fn serialize_auto(values: &[u64], writer: &mut dyn Write) -> io::Result<u64>
         constant.collect(v);
         bitpacked.collect(v);
         linear.collect(v);
-        blockwise.collect(v);
     }
+    blockwise.collect_values(values);
 
     // Finalize
     constant.finalize();
@@ -789,11 +929,7 @@ pub fn auto_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
                 *v = linear_read(rest, start_index + i);
             }
         }
-        Some(CodecType::BlockwiseLinear) => {
-            for (i, v) in out.iter_mut().enumerate() {
-                *v = blockwise_linear_read(rest, start_index + i);
-            }
-        }
+        Some(CodecType::BlockwiseLinear) => blockwise_linear_read_batch(rest, start_index, out),
         None => out.iter_mut().for_each(|v| *v = 0),
     }
 }
@@ -830,6 +966,76 @@ mod tests {
         let mut buf = Vec::new();
         serialize_auto(values, &mut buf).unwrap();
         (0..values.len()).map(|i| auto_read(&buf, i)).collect()
+    }
+
+    fn blockwise_values(len: usize) -> Vec<u64> {
+        (0..len)
+            .map(|i| {
+                let block = i / BLOCKWISE_LINEAR_BLOCK_SIZE;
+                let index = i % BLOCKWISE_LINEAR_BLOCK_SIZE;
+                block as u64 * 1_000_000
+                    + index as u64 * (block as u64 + 3)
+                    + ((i * 17 + block * 11) % 23) as u64
+            })
+            .collect()
+    }
+
+    /// Reference implementation matching the original allocation-per-block
+    /// serializer. This guards the on-disk representation while the production
+    /// implementation reuses bounded scratch buffers.
+    fn serialize_blockwise_reference(values: &[u64]) -> Vec<u8> {
+        let n = values.len();
+        let num_blocks = n.div_ceil(BLOCKWISE_LINEAR_BLOCK_SIZE);
+        let mut encoded = Vec::new();
+        encoded.push(CodecType::BlockwiseLinear as u8);
+        encoded.extend_from_slice(&(n as u32).to_le_bytes());
+        encoded.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+        for block in values.chunks(BLOCKWISE_LINEAR_BLOCK_SIZE) {
+            let block_len = block.len();
+            let first = block[0];
+            let last = if block_len > 1 {
+                block[block_len - 1]
+            } else {
+                first
+            };
+            let min_residual = if block_len < 2 {
+                0
+            } else {
+                block
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &value)| {
+                        value as i128 - interpolate(first, last, block_len, i) as i128
+                    })
+                    .min()
+                    .unwrap()
+            };
+            let shifted: Vec<u64> = block
+                .iter()
+                .enumerate()
+                .map(|(i, &value)| {
+                    if block_len < 2 {
+                        0
+                    } else {
+                        let predicted = interpolate(first, last, block_len, i);
+                        (value as i128 - predicted as i128 - min_residual) as u64
+                    }
+                })
+                .collect();
+            let bpv = bits_needed_u64(shifted.iter().copied().max().unwrap_or(0));
+            let mut packed = Vec::new();
+            bitpack_write(&shifted, bpv, &mut packed);
+
+            encoded.extend_from_slice(&first.to_le_bytes());
+            encoded.extend_from_slice(&last.to_le_bytes());
+            encoded.extend_from_slice(&(min_residual as i64).to_le_bytes());
+            encoded.push(bpv);
+            encoded.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(&packed);
+        }
+
+        encoded
     }
 
     #[test]
@@ -872,6 +1078,36 @@ mod tests {
         }
         let result = roundtrip(&values);
         assert_eq!(result, values);
+    }
+
+    #[test]
+    fn test_blockwise_estimate_is_bounded_and_serialization_is_byte_compatible() {
+        for len in [1024, 1025, 1536, 1537, 4097] {
+            let values = blockwise_values(len);
+            let reference = serialize_blockwise_reference(&values);
+            let mut estimator = BlockwiseLinearEstimator::default();
+            for &value in &values {
+                estimator.collect(value);
+            }
+            estimator.finalize();
+
+            assert_eq!(estimator.estimate(), Some(reference.len() as u64));
+            assert!(
+                estimator.current_block.len() < BLOCKWISE_LINEAR_BLOCK_SIZE,
+                "estimator retained more than one partial block"
+            );
+            assert!(
+                estimator.current_block.capacity() <= BLOCKWISE_LINEAR_BLOCK_SIZE,
+                "estimator scratch grew beyond one block"
+            );
+
+            let mut encoded = Vec::new();
+            estimator.serialize(&values, &mut encoded).unwrap();
+            assert_eq!(
+                encoded, reference,
+                "serialized bytes changed for {len} values"
+            );
+        }
     }
 
     #[test]
@@ -997,6 +1233,36 @@ mod tests {
             });
         }
         roundtrip_batch(&values);
+    }
+
+    #[test]
+    fn test_blockwise_batch_read_across_block_boundaries() {
+        let values = blockwise_values(2053);
+        let estimator = BlockwiseLinearEstimator::default();
+        let mut encoded = Vec::new();
+        estimator.serialize(&values, &mut encoded).unwrap();
+        assert_eq!(encoded[0], CodecType::BlockwiseLinear as u8);
+
+        for (start, len) in [
+            (0, values.len()),
+            (510, 5),
+            (511, 3),
+            (512, 513),
+            (777, 900),
+            (1023, 514),
+            (1535, 518),
+            (2048, 5),
+        ] {
+            let expected = &values[start..start + len];
+
+            let mut direct = vec![u64::MAX; len];
+            blockwise_linear_read_batch(&encoded[1..], start, &mut direct);
+            assert_eq!(direct, expected, "direct batch mismatch at {start}");
+
+            let mut auto = vec![u64::MAX; len];
+            auto_read_batch(&encoded, start, &mut auto);
+            assert_eq!(auto, expected, "auto batch mismatch at {start}");
+        }
     }
 
     /// Regression: zigzag-encoded i64 timestamps mixed with FAST_FIELD_MISSING (u64::MAX).

@@ -1318,9 +1318,7 @@ fn score_superblock_blocks(
                     continue;
                 }
 
-                if collector.would_enter_candidate(doc_id, score, ordinal) {
-                    collector.insert_with_ordinal(doc_id, score, ordinal);
-                }
+                collector.insert_with_ordinal(doc_id, score, ordinal);
             }
         }
         *docmap_secs += docmap_start.secs();
