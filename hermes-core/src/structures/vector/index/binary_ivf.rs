@@ -13,61 +13,133 @@
 
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io;
 
 use crate::dsl::IvfRoutingMode;
+use crate::structures::simd::{HammingKernel, scores_from_hamming};
+#[cfg(test)]
 use crate::structures::simd::{batch_hamming_scores, hamming_distance};
 use crate::structures::vector::ivf::routing::{
-    HNSW_AUTO_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
-    allocate_child_clusters, binary_probe_fingerprint, effective_routing_mode,
-    routing_parent_count, select_best, select_best_candidates, select_parent_beam,
-    select_parent_beam_for_build,
+    HIERARCHICAL_TRAINING_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
+    PairDistance, QueryDistance, allocate_child_clusters, binary_probe_fingerprint,
+    effective_binary_routing_mode, routing_parent_count, select_best, select_best_candidates,
+    select_parent_beam, select_parent_beam_for_build,
 };
 
-fn argmax_score_lowest_index(scores: &[f32]) -> usize {
-    scores
-        .iter()
-        .enumerate()
-        .max_by(|(left_index, left), (right_index, right)| {
-            left.total_cmp(right)
-                // `max_by` keeps the greater element; reverse the index
-                // comparison so equal scores consistently prefer the lowest
-                // cluster ID, matching query-time centroid ordering.
-                .then_with(|| right_index.cmp(left_index))
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0)
-}
-
-#[inline]
-fn nearest_binary_centroid(
-    code: &[u8],
-    centroids: &[u8],
+/// Hamming distance from one query code to graph nodes backed by a packed
+/// centroid matrix.
+///
+/// Routing visits scattered centroid rows, so the batched form gathers a whole
+/// neighbour list through one SIMD dispatch instead of one call per node.
+struct BinaryCentroidDistance<'a> {
+    query: &'a [u8],
+    centroids: &'a [u8],
     byte_len: usize,
-    dim_bits: usize,
-    scores: &mut [f32],
-) -> u32 {
-    batch_hamming_scores(code, centroids, byte_len, dim_bits, scores);
-    argmax_score_lowest_index(scores) as u32
+    kernel: HammingKernel,
 }
 
+impl<'a> BinaryCentroidDistance<'a> {
+    #[inline]
+    fn new(query: &'a [u8], centroids: &'a [u8], byte_len: usize) -> Self {
+        Self {
+            query,
+            centroids,
+            byte_len,
+            kernel: HammingKernel::resolve(),
+        }
+    }
+}
+
+impl QueryDistance for BinaryCentroidDistance<'_> {
+    #[inline]
+    fn distance(&self, node: u32) -> f32 {
+        let offset = node as usize * self.byte_len;
+        self.kernel
+            .distance(self.query, &self.centroids[offset..offset + self.byte_len]) as f32
+    }
+
+    fn distances(&self, nodes: &[u32], out: &mut [f32]) {
+        let mut distances = [0u32; ROUTING_GATHER_BLOCK];
+        for (block, scores) in nodes
+            .chunks(ROUTING_GATHER_BLOCK)
+            .zip(out.chunks_mut(ROUTING_GATHER_BLOCK))
+        {
+            let gathered = &mut distances[..block.len()];
+            self.kernel.gather_distances(
+                self.query,
+                self.centroids,
+                self.byte_len,
+                block,
+                gathered,
+            );
+            for (slot, &distance) in scores.iter_mut().zip(gathered.iter()) {
+                *slot = distance as f32;
+            }
+        }
+    }
+}
+
+/// Pairwise centroid distance used while building the routing graph.
+struct BinaryCentroidPairDistance<'a> {
+    centroids: &'a [u8],
+    byte_len: usize,
+    kernel: HammingKernel,
+}
+
+impl PairDistance for BinaryCentroidPairDistance<'_> {
+    #[inline]
+    fn distance(&self, left: u32, right: u32) -> f32 {
+        let left_offset = left as usize * self.byte_len;
+        let right_offset = right as usize * self.byte_len;
+        self.kernel.distance(
+            &self.centroids[left_offset..left_offset + self.byte_len],
+            &self.centroids[right_offset..right_offset + self.byte_len],
+        ) as f32
+    }
+
+    fn distances_from(&self, left: u32, rights: &[u32], out: &mut [f32]) {
+        let offset = left as usize * self.byte_len;
+        BinaryCentroidDistance {
+            query: &self.centroids[offset..offset + self.byte_len],
+            centroids: self.centroids,
+            byte_len: self.byte_len,
+            kernel: self.kernel,
+        }
+        .distances(rights, out);
+    }
+}
+
+/// Rows gathered per kernel dispatch while routing. Covers a full level-0
+/// neighbour list (`2 * HNSW_M`) without touching the allocator.
+const ROUTING_GATHER_BLOCK: usize = 128;
+
+/// Nearest centroid and its exact Hamming distance.
+///
+/// Ranking stays integral: the winner's distance falls out of the same scan
+/// rather than costing a second full-width distance, and equal distances keep
+/// the lowest cluster ID to match query-time centroid ordering.
 #[inline]
 fn nearest_binary_centroid_with_distance(
+    kernel: HammingKernel,
     code: &[u8],
     centroids: &[u8],
     byte_len: usize,
-    dim_bits: usize,
-    scores: &mut [f32],
+    distances: &mut [u32],
 ) -> (u32, u32) {
-    let centroid = nearest_binary_centroid(code, centroids, byte_len, dim_bits, scores);
-    let offset = centroid as usize * byte_len;
-    (
-        centroid,
-        hamming_distance(code, &centroids[offset..offset + byte_len]),
-    )
+    kernel.distances(code, centroids, byte_len, distances);
+    let mut best = (u32::MAX, 0u32);
+    for (cluster, &distance) in distances.iter().enumerate() {
+        if distance < best.0 {
+            best = (distance, cluster as u32);
+        }
+    }
+    (best.1, best.0)
 }
 
 const MAX_BINARY_IVF_CLUSTERS: usize = 1_048_576;
+#[cfg(test)]
 const BINARY_IVF_SCORE_BATCH: usize = 8_192;
 const BUILD_ASSIGNMENT_CANDIDATES: usize = 128;
 
@@ -111,14 +183,14 @@ impl BinaryCoarseQuantizer {
         }
         config.num_clusters = config.num_clusters.clamp(1, num_vectors);
         let (centroids, routing_index) =
-            match effective_routing_mode(config.routing, config.num_clusters) {
+            match effective_binary_routing_mode(config.routing, config.num_clusters) {
                 IvfRoutingMode::TwoLevel => {
                     let (leaves, router) =
                         train_k_majority_hierarchical(&config, codes, num_vectors);
                     (leaves, Some(router))
                 }
                 IvfRoutingMode::Hnsw => {
-                    let leaves = if config.num_clusters >= HNSW_AUTO_THRESHOLD {
+                    let leaves = if config.num_clusters >= HIERARCHICAL_TRAINING_THRESHOLD {
                         train_k_majority_hierarchical(&config, codes, num_vectors).0
                     } else {
                         train_k_majority(&config, codes, num_vectors)
@@ -126,11 +198,10 @@ impl BinaryCoarseQuantizer {
                     let byte_len = config.byte_len();
                     let graph = HnswRoutingGraph::build(
                         config.num_clusters,
-                        |left, right| {
-                            hamming_distance(
-                                &leaves[left as usize * byte_len..(left as usize + 1) * byte_len],
-                                &leaves[right as usize * byte_len..(right as usize + 1) * byte_len],
-                            ) as f32
+                        BinaryCentroidPairDistance {
+                            centroids: &leaves,
+                            byte_len,
+                            kernel: HammingKernel::resolve(),
                         },
                         config.seed,
                     );
@@ -195,7 +266,7 @@ impl BinaryCoarseQuantizer {
     }
 
     pub fn validate_routing(&self, mode: IvfRoutingMode) -> Result<(), String> {
-        match effective_routing_mode(mode, self.num_clusters as usize) {
+        match effective_binary_routing_mode(mode, self.num_clusters as usize) {
             IvfRoutingMode::Flat | IvfRoutingMode::Auto => {}
             IvfRoutingMode::TwoLevel
                 if !matches!(
@@ -246,7 +317,7 @@ impl BinaryCoarseQuantizer {
 
     pub fn probe(&self, query: &[u8], k: usize, mode: IvfRoutingMode) -> IvfProbePlan {
         let take = k.clamp(1, self.num_clusters as usize);
-        let cluster_ids = match effective_routing_mode(mode, self.num_clusters as usize) {
+        let cluster_ids = match effective_binary_routing_mode(mode, self.num_clusters as usize) {
             IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_k_nearest(query, take),
             IvfRoutingMode::TwoLevel => self.find_k_nearest_two_level(query, take),
             IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(query, take),
@@ -258,13 +329,13 @@ impl BinaryCoarseQuantizer {
         )
     }
 
+    /// Assign one code to its leaf.
+    ///
+    /// Segment construction routes every vector through here, so this path must
+    /// stay allocation-free.
     pub fn assign(&self, code: &[u8], mode: IvfRoutingMode) -> u32 {
-        match effective_routing_mode(mode, self.num_clusters as usize) {
-            IvfRoutingMode::Hnsw => self
-                .find_k_nearest_hnsw_for_build(code, 1)
-                .first()
-                .copied()
-                .unwrap_or(0),
+        match effective_binary_routing_mode(mode, self.num_clusters as usize) {
+            IvfRoutingMode::Hnsw => self.find_nearest_hnsw_for_build(code).unwrap_or(0),
             IvfRoutingMode::TwoLevel => self
                 .find_k_nearest_two_level_for_build(
                     code,
@@ -278,27 +349,51 @@ impl BinaryCoarseQuantizer {
     }
 
     fn find_nearest(&self, query: &[u8]) -> u32 {
-        (0..self.num_clusters)
-            .min_by_key(|&cluster| {
-                let offset = cluster as usize * self.byte_len();
-                hamming_distance(query, &self.centroids[offset..offset + self.byte_len()])
-            })
-            .unwrap_or(0)
+        let byte_len = self.byte_len();
+        if query.len() != byte_len {
+            return 0;
+        }
+        let kernel = HammingKernel::resolve();
+        let mut distances = [0u32; BINARY_CENTROID_SCAN_BLOCK];
+        let mut best = (u32::MAX, 0u32);
+        for (block_index, block) in self
+            .centroids
+            .chunks(BINARY_CENTROID_SCAN_BLOCK * byte_len)
+            .enumerate()
+        {
+            let rows = block.len() / byte_len;
+            let scored = &mut distances[..rows];
+            kernel.distances(query, block, byte_len, scored);
+            for (row, &distance) in scored.iter().enumerate() {
+                // Ties keep the lowest cluster ID, matching query-time ordering.
+                if distance < best.0 {
+                    best = (
+                        distance,
+                        (block_index * BINARY_CENTROID_SCAN_BLOCK + row) as u32,
+                    );
+                }
+            }
+        }
+        best.1
     }
 
     fn find_k_nearest(&self, query: &[u8], k: usize) -> Vec<u32> {
         if query.len() != self.byte_len() {
             return Vec::new();
         }
-        let mut scores = vec![0.0; self.num_clusters as usize];
-        batch_hamming_scores(
-            query,
-            &self.centroids,
-            self.byte_len(),
-            self.dim_bits,
-            &mut scores,
-        );
-        select_best::<true>(&scores, k)
+        // A flat probe scores every centroid; at production cluster counts the
+        // score buffer is hundreds of KiB, so it comes from reusable scratch.
+        with_centroid_score_scratch(self.num_clusters as usize, |scores| {
+            scores_from_hamming(
+                HammingKernel::resolve(),
+                query,
+                &self.centroids,
+                self.byte_len(),
+                self.dim_bits,
+                scores,
+            );
+            select_best::<true>(scores, k)
+        })
     }
 
     fn find_k_nearest_two_level(&self, query: &[u8], k: usize) -> Vec<u32> {
@@ -324,11 +419,14 @@ impl BinaryCoarseQuantizer {
         if topology.parent_count() <= 1 {
             return self.find_k_nearest(query, k);
         }
+        let byte_len = self.byte_len();
+        let kernel = HammingKernel::resolve();
         let mut parent_scores = vec![0.0; topology.parent_count()];
-        batch_hamming_scores(
+        scores_from_hamming(
+            kernel,
             query,
             parent_centroids,
-            self.byte_len(),
+            byte_len,
             self.dim_bits,
             &mut parent_scores,
         );
@@ -342,18 +440,37 @@ impl BinaryCoarseQuantizer {
             .map(|&parent| topology.children(parent as usize).len())
             .sum();
         let mut candidates = Vec::with_capacity(candidate_count);
-        let mut score = [0.0];
+        // Each parent owns a contiguous leaf run, so its children are one
+        // batched pass over the centroid matrix rather than one kernel call
+        // (and one runtime feature detection) per leaf.
+        let mut leaf_scores = vec![0.0f32; 0];
         for parent in parents {
-            for &leaf in topology.children(parent as usize) {
-                let offset = leaf as usize * self.byte_len();
-                batch_hamming_scores(
-                    query,
-                    &self.centroids[offset..offset + self.byte_len()],
-                    self.byte_len(),
-                    self.dim_bits,
-                    &mut score,
-                );
-                candidates.push((leaf, score[0]));
+            let children = topology.children(parent as usize);
+            match topology.children_run(parent as usize) {
+                Some((first_leaf, count)) => {
+                    leaf_scores.clear();
+                    leaf_scores.resize(count, 0.0);
+                    let start = first_leaf as usize * byte_len;
+                    scores_from_hamming(
+                        kernel,
+                        query,
+                        &self.centroids[start..start + count * byte_len],
+                        byte_len,
+                        self.dim_bits,
+                        &mut leaf_scores,
+                    );
+                    candidates.extend(
+                        (first_leaf..first_leaf + count as u32).zip(leaf_scores.iter().copied()),
+                    );
+                }
+                None => {
+                    for &leaf in children {
+                        let offset = leaf as usize * byte_len;
+                        let distance =
+                            kernel.distance(query, &self.centroids[offset..offset + byte_len]);
+                        candidates.push((leaf, 1.0 - distance as f32 / self.dim_bits as f32));
+                    }
+                }
             }
         }
         select_best_candidates::<true>(&mut candidates, k)
@@ -363,33 +480,41 @@ impl BinaryCoarseQuantizer {
         let Some(BinaryCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
             return self.find_k_nearest(query, k);
         };
-        let byte_len = self.byte_len();
         graph.search(
-            |leaf| {
-                hamming_distance(
-                    query,
-                    &self.centroids[leaf as usize * byte_len..(leaf as usize + 1) * byte_len],
-                ) as f32
-            },
+            BinaryCentroidDistance::new(query, &self.centroids, self.byte_len()),
             k,
         )
     }
 
-    fn find_k_nearest_hnsw_for_build(&self, query: &[u8], k: usize) -> Vec<u32> {
+    fn find_nearest_hnsw_for_build(&self, query: &[u8]) -> Option<u32> {
         let Some(BinaryCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
-            return self.find_k_nearest(query, k);
+            return Some(self.find_nearest(query));
         };
-        let byte_len = self.byte_len();
-        graph.search_for_build(
-            |leaf| {
-                hamming_distance(
-                    query,
-                    &self.centroids[leaf as usize * byte_len..(leaf as usize + 1) * byte_len],
-                ) as f32
-            },
-            k,
-        )
+        graph.search_best_for_build(BinaryCentroidDistance::new(
+            query,
+            &self.centroids,
+            self.byte_len(),
+        ))
     }
+}
+
+/// Centroid rows scored per stack block during a flat scan.
+const BINARY_CENTROID_SCAN_BLOCK: usize = 64;
+
+thread_local! {
+    /// Flat probing scores every centroid; at production cluster counts that
+    /// buffer is hundreds of KiB per query, so it is retained per thread.
+    static CENTROID_SCORE_SCRATCH: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_centroid_score_scratch<T>(len: usize, scope: impl FnOnce(&mut [f32]) -> T) -> T {
+    CENTROID_SCORE_SCRATCH.with(|scratch| {
+        let mut scores = scratch.borrow_mut();
+        scores.clear();
+        scores.resize(len, 0.0);
+        scope(&mut scores)
+    })
 }
 
 fn default_max_train_samples() -> usize {
@@ -464,6 +589,7 @@ pub(crate) struct BinaryCluster {
     pub(crate) codes: Vec<u8>,
 }
 
+#[cfg(test)]
 fn visit_binary_cluster(
     cluster: &BinaryCluster,
     dim_bits: usize,
@@ -575,13 +701,34 @@ impl BinaryIvfBuilder {
             .map(|code| quantizer.assign(code, self.routing))
             .collect();
 
-        for (index, &(doc_id, ordinal)) in doc_id_ordinals.iter().enumerate() {
-            let cluster = self.clusters.entry(assignments[index]).or_default();
-            cluster.doc_ids.push(doc_id);
-            cluster.ordinals.push(ordinal);
-            cluster
-                .codes
-                .extend_from_slice(&codes[index * byte_len..(index + 1) * byte_len]);
+        // Insert grouped by leaf: one map lookup and one reservation per
+        // distinct leaf in the batch instead of per code. Sorting by
+        // `(cluster, index)` keeps each leaf's entries in ascending batch order,
+        // so the serialized payload is byte-identical to per-code insertion.
+        let mut order: Vec<u32> = (0..assignments.len() as u32).collect();
+        order.sort_unstable_by_key(|&index| (assignments[index as usize], index));
+        let mut run_start = 0usize;
+        while run_start < order.len() {
+            let cluster_id = assignments[order[run_start] as usize];
+            let mut run_end = run_start + 1;
+            while run_end < order.len() && assignments[order[run_end] as usize] == cluster_id {
+                run_end += 1;
+            }
+            let run = &order[run_start..run_end];
+            let cluster = self.clusters.entry(cluster_id).or_default();
+            cluster.doc_ids.reserve(run.len());
+            cluster.ordinals.reserve(run.len());
+            cluster.codes.reserve(run.len() * byte_len);
+            for &index in run {
+                let index = index as usize;
+                let (doc_id, ordinal) = doc_id_ordinals[index];
+                cluster.doc_ids.push(doc_id);
+                cluster.ordinals.push(ordinal);
+                cluster
+                    .codes
+                    .extend_from_slice(&codes[index * byte_len..(index + 1) * byte_len]);
+            }
+            run_start = run_end;
         }
         self.len = self.len.checked_add(doc_id_ordinals.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "binary IVF count overflows")
@@ -646,31 +793,20 @@ impl BinaryIvfIndex {
         Ok(())
     }
 
+    /// Score the requested clusters of the in-memory build product.
+    ///
+    /// Queries never reach this: they scan the mmap-backed `AnnDiskIndex` this
+    /// structure serialises into. It exists so build-side tests can assert the
+    /// partitioning directly, and is therefore test-only — production scanning
+    /// lives in `ann_disk::score_binary_cluster_runs`.
+    #[cfg(test)]
     pub fn search_in_clusters(
         &self,
         query: &[u8],
         k: usize,
         cluster_ids: &[u32],
     ) -> Vec<(u32, u16, f32)> {
-        self.search_impl::<false>(query, k, cluster_ids)
-    }
-
-    pub fn search_distinct_documents_in_clusters(
-        &self,
-        query: &[u8],
-        k: usize,
-        cluster_ids: &[u32],
-    ) -> Vec<(u32, u16, f32)> {
-        self.search_impl::<true>(query, k, cluster_ids)
-    }
-
-    fn search_impl<const BY_DOCUMENT: bool>(
-        &self,
-        query: &[u8],
-        k: usize,
-        cluster_ids: &[u32],
-    ) -> Vec<(u32, u16, f32)> {
-        let mut collector = super::BoundedAnnCollector::<BY_DOCUMENT, true>::new(k);
+        let mut collector = super::BoundedAnnCollector::<false, true>::new(k);
         if query.len() == self.dim_bits.div_ceil(8) && self.len > 0 {
             let mut scores = vec![0.0; BINARY_IVF_SCORE_BATCH.min(self.len)];
             for &cluster_id in cluster_ids {
@@ -711,8 +847,11 @@ impl BinaryIvfIndex {
 fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8> {
     let byte_len = config.byte_len();
     let k = config.num_clusters;
-    let dim_bits = config.dim_bits;
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
+    // Seeding and Lloyd assignment together dominate training; resolve the
+    // architecture kernel once instead of re-detecting CPU features for every
+    // one of the O(N*K) code pairs.
+    let kernel = HammingKernel::resolve();
 
     // Bound training cost: iterate over a sample, assign everything later. Do
     // not materialize a random permutation when the complete input is used:
@@ -742,7 +881,7 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
                 .par_iter_mut()
                 .enumerate()
                 .for_each(|(index, minimum_weight)| {
-                    let distance = hamming_distance(vec_at(index), previous);
+                    let distance = kernel.distance(vec_at(index), previous);
                     // Hamming distance is already squared Euclidean distance
                     // for vectors in {0,1}^d, so D² sampling uses it directly.
                     *minimum_weight = minimum_weight.min(distance as f64);
@@ -750,7 +889,7 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
         }
         #[cfg(not(feature = "native"))]
         for (index, minimum_weight) in minimum_weights.iter_mut().enumerate() {
-            let distance = hamming_distance(vec_at(index), previous);
+            let distance = kernel.distance(vec_at(index), previous);
             *minimum_weight = minimum_weight.min(distance as f64);
         }
 
@@ -782,14 +921,14 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
                 .zip(assignment_distances.par_iter_mut())
                 .enumerate()
                 .map_init(
-                    || vec![0f32; k],
-                    |scores, (i, (slot, assignment_distance))| {
+                    || vec![0u32; k],
+                    |distances, (i, (slot, assignment_distance))| {
                         let (best, distance) = nearest_binary_centroid_with_distance(
+                            kernel,
                             vec_at(i),
                             &centroids,
                             byte_len,
-                            dim_bits,
-                            scores,
+                            distances,
                         );
                         *assignment_distance = distance;
                         usize::from(std::mem::replace(slot, best) != best)
@@ -799,18 +938,18 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
         };
         #[cfg(not(feature = "native"))]
         let changed: usize = {
-            let mut scores = vec![0f32; k];
+            let mut distances = vec![0u32; k];
             assignment
                 .iter_mut()
                 .zip(&mut assignment_distances)
                 .enumerate()
                 .map(|(i, (slot, assignment_distance))| {
                     let (best, distance) = nearest_binary_centroid_with_distance(
+                        kernel,
                         vec_at(i),
                         &centroids,
                         byte_len,
-                        dim_bits,
-                        &mut scores,
+                        &mut distances,
                     );
                     *assignment_distance = distance;
                     usize::from(std::mem::replace(slot, best) != best)
@@ -848,32 +987,43 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
                 .par_chunks_mut(byte_len)
                 .zip(members.par_iter())
                 .filter(|(_, cluster_members)| !cluster_members.is_empty())
-                .for_each(|(centroid, cluster_members)| {
+                .for_each_init(
+                    BinaryMajorityScratch::default,
+                    |scratch, (centroid, cluster_members)| {
+                        update_binary_centroid(
+                            centroid,
+                            cluster_members,
+                            sample.as_deref(),
+                            codes,
+                            byte_len,
+                            scratch,
+                        );
+                    },
+                );
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            let mut scratch = BinaryMajorityScratch::default();
+            for (centroid, cluster_members) in centroids.chunks_mut(byte_len).zip(&members) {
+                if !cluster_members.is_empty() {
                     update_binary_centroid(
                         centroid,
                         cluster_members,
                         sample.as_deref(),
                         codes,
                         byte_len,
+                        &mut scratch,
                     );
-                });
-        }
-        #[cfg(not(feature = "native"))]
-        for (centroid, cluster_members) in centroids.chunks_mut(byte_len).zip(&members) {
-            if !cluster_members.is_empty() {
-                update_binary_centroid(
-                    centroid,
-                    cluster_members,
-                    sample.as_deref(),
-                    codes,
-                    byte_len,
-                );
+                }
             }
         }
     }
 
     centroids
 }
+
+/// Re-seed preference: farthest assignment distance first, then lowest point ID.
+type ReseedPriority = (u32, Reverse<usize>);
 
 /// Re-seed empty cells from the represented points with the largest assignment
 /// error. One closest point is retained in every donor cell, so each selected
@@ -899,52 +1049,103 @@ fn reseed_empty_binary_centroids(
 
     // Retain the closest (then lowest-index) represented point in each donor
     // cell. Every other point is safe to move without emptying its donor.
-    let mut candidates = Vec::with_capacity(
-        assignment
-            .len()
-            .saturating_sub(members.len() - empty_clusters.len()),
-    );
+    //
+    // Only `empty_clusters.len()` of those points are ever used, so selection
+    // runs through a bounded heap: the previous full candidate list was an
+    // allocation proportional to the whole training sample, on every Lloyd
+    // iteration that had even one empty cell.
+    let wanted = empty_clusters.len();
+    let priority =
+        |point: usize| -> ReseedPriority { (assignment_distances[point], Reverse(point)) };
+    // The heap keeps the *least* preferred survivor on top, so a bounded push/pop
+    // retains exactly the `wanted` most preferred points.
+    let mut selected: BinaryHeap<Reverse<ReseedPriority>> = BinaryHeap::with_capacity(wanted + 1);
     for cluster_members in members.iter().filter(|members| !members.is_empty()) {
         let keeper = *cluster_members
             .iter()
             .min_by_key(|&&point| (assignment_distances[point], point))
             .expect("non-empty binary cluster must have a represented point");
-        candidates.extend(
-            cluster_members
-                .iter()
-                .copied()
-                .filter(|&point| point != keeper),
-        );
+        for &point in cluster_members.iter().filter(|&&point| point != keeper) {
+            selected.push(Reverse(priority(point)));
+            if selected.len() > wanted {
+                selected.pop();
+            }
+        }
     }
-    debug_assert!(candidates.len() >= empty_clusters.len());
+    debug_assert!(selected.len() >= wanted.min(selected.capacity()));
 
-    let farthest_first = |left: &usize, right: &usize| {
-        assignment_distances[*right]
-            .cmp(&assignment_distances[*left])
-            .then_with(|| left.cmp(right))
-    };
-    if empty_clusters.len() < candidates.len() {
-        candidates.select_nth_unstable_by(empty_clusters.len(), farthest_first);
-        candidates.truncate(empty_clusters.len());
-    }
-    candidates.sort_unstable_by(farthest_first);
+    let mut candidates: Vec<usize> = selected
+        .into_iter()
+        .map(|Reverse((_, Reverse(point)))| point)
+        .collect();
+    candidates.sort_unstable_by_key(|&point| Reverse(priority(point)));
 
-    for (empty_cluster, point) in empty_clusters.into_iter().zip(candidates) {
+    for (&empty_cluster, &point) in empty_clusters.iter().zip(candidates.iter()) {
+        let donor = assignment[point] as usize;
         assignment[point] = empty_cluster as u32;
         assignment_distances[point] = 0;
         let vector_index = sample.map_or(point, |sample| sample[point]);
         centroids[empty_cluster * byte_len..(empty_cluster + 1) * byte_len]
             .copy_from_slice(&codes[vector_index * byte_len..(vector_index + 1) * byte_len]);
+
+        // Keep the membership view consistent with the assignments before the
+        // centroid-update phase: a donor cell must not retain a point that
+        // moved into a newly seeded cell. Only moved points are touched, so
+        // this costs one donor scan each instead of rebuilding every cell.
+        if let Some(position) = members[donor].iter().position(|&member| member == point) {
+            members[donor].remove(position);
+        }
+        members[empty_cluster].push(point);
+    }
+}
+
+/// Per-worker counters for Hamming-majority centroid updates.
+///
+/// Counts live as eight bit-planes of one byte-counter per code byte, so the
+/// accumulation loop is a flat `u8` add over a contiguous plane and vectorises.
+/// The narrow planes are folded into wide counters before they can overflow,
+/// which keeps one 20 KiB-scale allocation per worker instead of one per
+/// centroid per Lloyd iteration.
+#[derive(Default)]
+struct BinaryMajorityScratch {
+    planes: Vec<u8>,
+    counts: Vec<u32>,
+}
+
+/// Members accumulated into `u8` planes before folding. A plane slot counts one
+/// bit per member, so 255 members is the overflow bound.
+const MAJORITY_PLANE_FLUSH: usize = 255;
+
+impl BinaryMajorityScratch {
+    fn reset(&mut self, byte_len: usize) {
+        let slots = byte_len * 8;
+        self.planes.clear();
+        self.planes.resize(slots, 0);
+        self.counts.clear();
+        self.counts.resize(slots, 0);
     }
 
-    // Keep the membership view consistent with the assignments before the
-    // centroid-update phase. In particular, donor modes must not retain points
-    // that were moved into newly seeded cells.
-    for cluster_members in members.iter_mut() {
-        cluster_members.clear();
+    #[inline]
+    fn accumulate(&mut self, vector: &[u8], byte_len: usize) {
+        for bit in 0..8 {
+            let plane = &mut self.planes[bit * byte_len..(bit + 1) * byte_len];
+            for (slot, &byte) in plane.iter_mut().zip(vector) {
+                *slot += (byte >> bit) & 1;
+            }
+        }
     }
-    for (point, &cluster) in assignment.iter().enumerate() {
-        members[cluster as usize].push(point);
+
+    #[inline]
+    fn fold(&mut self) {
+        for (count, plane) in self.counts.iter_mut().zip(self.planes.iter_mut()) {
+            *count += u32::from(*plane);
+            *plane = 0;
+        }
+    }
+
+    #[inline]
+    fn count(&self, bit: usize, byte_index: usize, byte_len: usize) -> u32 {
+        self.counts[bit * byte_len + byte_index]
     }
 }
 
@@ -957,31 +1158,34 @@ fn update_binary_centroid(
     sample: Option<&[usize]>,
     codes: &[u8],
     byte_len: usize,
+    scratch: &mut BinaryMajorityScratch,
 ) {
-    let mut bit_counts = vec![[0usize; 8]; centroid.len()];
-    for &member in members {
+    scratch.reset(byte_len);
+    for (position, &member) in members.iter().enumerate() {
         let vector_index = sample.map_or(member, |sample| sample[member]);
         let vector = &codes[vector_index * byte_len..(vector_index + 1) * byte_len];
-        for (&byte, counts) in vector.iter().zip(&mut bit_counts) {
-            for (bit, count) in counts.iter_mut().enumerate() {
-                *count += usize::from((byte >> bit) & 1);
-            }
+        scratch.accumulate(vector, byte_len);
+        if (position + 1).is_multiple_of(MAJORITY_PLANE_FLUSH) {
+            scratch.fold();
         }
     }
+    scratch.fold();
 
-    for (byte, counts) in centroid.iter_mut().zip(bit_counts) {
+    let total = members.len() as u32;
+    for (byte_index, byte) in centroid.iter_mut().enumerate() {
         let previous = *byte;
-        *byte = counts
-            .into_iter()
-            .enumerate()
-            .fold(0u8, |packed, (bit, count)| {
-                let value = match count.cmp(&(members.len() - count)) {
-                    std::cmp::Ordering::Greater => 1,
-                    std::cmp::Ordering::Less => 0,
-                    std::cmp::Ordering::Equal => (previous >> bit) & 1,
-                };
-                packed | (value << bit)
-            });
+        let mut packed = 0u8;
+        for bit in 0..8 {
+            let ones = scratch.count(bit, byte_index, byte_len);
+            let value = match ones.cmp(&(total - ones)) {
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Less => 0,
+                // Majority ties keep the previous bit rather than biasing to 0.
+                std::cmp::Ordering::Equal => (previous >> bit) & 1,
+            };
+            packed |= value << bit;
+        }
+        *byte = packed;
     }
 }
 
@@ -1003,33 +1207,36 @@ fn train_k_majority_hierarchical(
 
     let mut assignments = vec![0u32; n];
     let mut group_sizes = vec![0usize; parent_count];
+    let kernel = HammingKernel::resolve();
     #[cfg(feature = "native")]
     {
         use rayon::prelude::*;
         assignments.par_iter_mut().enumerate().for_each_init(
-            || vec![0.0; parent_count],
-            |scores, (index, assignment)| {
-                *assignment = nearest_binary_centroid(
+            || vec![0u32; parent_count],
+            |distances, (index, assignment)| {
+                *assignment = nearest_binary_centroid_with_distance(
+                    kernel,
                     &codes[index * byte_len..(index + 1) * byte_len],
                     &parents,
                     byte_len,
-                    config.dim_bits,
-                    scores,
-                );
+                    distances,
+                )
+                .0;
             },
         );
     }
     #[cfg(not(feature = "native"))]
     {
-        let mut scores = vec![0.0; parent_count];
+        let mut distances = vec![0u32; parent_count];
         for (index, assignment) in assignments.iter_mut().enumerate() {
-            *assignment = nearest_binary_centroid(
+            *assignment = nearest_binary_centroid_with_distance(
+                kernel,
                 &codes[index * byte_len..(index + 1) * byte_len],
                 &parents,
                 byte_len,
-                config.dim_bits,
-                &mut scores,
-            );
+                &mut distances,
+            )
+            .0;
         }
     }
     for &assignment in &assignments {
@@ -1120,6 +1327,137 @@ mod tests {
         });
         expected.truncate(20);
         assert_eq!(actual, expected);
+    }
+
+    /// Build a clustered binary corpus: `groups` random anchors, each with
+    /// `per_group` codes at a small Hamming radius. Real embedding corpora are
+    /// clustered, and uniform noise would make every routing budget look alike.
+    fn clustered_binary_codes(
+        byte_len: usize,
+        groups: usize,
+        per_group: usize,
+        flips: usize,
+        seed: u64,
+    ) -> Vec<u8> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut codes = Vec::with_capacity(groups * per_group * byte_len);
+        for _ in 0..groups {
+            let mut anchor = vec![0u8; byte_len];
+            rng.fill_bytes(&mut anchor);
+            for _ in 0..per_group {
+                let mut code = anchor.clone();
+                for _ in 0..flips {
+                    let bit = rng.random_range(0..byte_len * 8);
+                    code[bit / 8] ^= 1 << (bit % 8);
+                }
+                codes.extend_from_slice(&code);
+            }
+        }
+        codes
+    }
+
+    /// The construction beam is a *floor* paid by every assigned vector, so its
+    /// value has to be justified by assignment quality rather than by "build can
+    /// afford more". Assignment recall against exact centroid scan saturates
+    /// well below the floor: widening past it only multiplies the distance work
+    /// each rebuilt segment pays per vector.
+    ///
+    /// Referenced by `HNSW_MIN_EF_BUILD` in `ivf/routing.rs`.
+    #[cfg(feature = "native")]
+    #[test]
+    fn hnsw_build_beam_recall_saturates_before_the_floor() {
+        use crate::structures::vector::ivf::routing::HNSW_MIN_EF_BUILD;
+
+        let dim_bits = 256;
+        let byte_len = dim_bits / 8;
+        let codes = clustered_binary_codes(byte_len, 512, 24, 12, 0x5eed_1234);
+        let points = codes.len() / byte_len;
+
+        let mut config = BinaryIvfConfig::new(dim_bits, 4_096);
+        config.train_iters = 3;
+        config.max_train_samples = points;
+        config.routing = IvfRoutingMode::Hnsw;
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, points).unwrap();
+        let Some(BinaryCentroidRouter::Hnsw(graph)) = quantizer.routing_index.as_ref() else {
+            panic!("HNSW routing expected at 4096 clusters");
+        };
+
+        let probes = clustered_binary_codes(byte_len, 64, 4, 14, 0x9ab_cdef);
+        let exact: Vec<u32> = probes
+            .chunks_exact(byte_len)
+            .map(|code| quantizer.find_nearest(code))
+            .collect();
+
+        let recall_at = |ef: usize| -> f64 {
+            let hits = probes
+                .chunks_exact(byte_len)
+                .zip(exact.iter())
+                .filter(|&(code, &want)| {
+                    graph.search_best_with_ef(
+                        BinaryCentroidDistance::new(code, &quantizer.centroids, byte_len),
+                        ef,
+                    ) == Some(want)
+                })
+                .count();
+            hits as f64 / exact.len() as f64
+        };
+
+        let (narrow, floor, wide) = (recall_at(32), recall_at(HNSW_MIN_EF_BUILD), recall_at(512));
+
+        // Cost side of the same comparison: count centroid distance
+        // evaluations, which is deterministic where wall-clock is not.
+        struct CountingDistance<'a> {
+            inner: BinaryCentroidDistance<'a>,
+            calls: &'a std::cell::Cell<usize>,
+        }
+        impl QueryDistance for CountingDistance<'_> {
+            fn distance(&self, node: u32) -> f32 {
+                self.calls.set(self.calls.get() + 1);
+                self.inner.distance(node)
+            }
+
+            fn distances(&self, nodes: &[u32], out: &mut [f32]) {
+                self.calls.set(self.calls.get() + nodes.len());
+                self.inner.distances(nodes, out);
+            }
+        }
+        let work_at = |ef: usize| -> usize {
+            let calls = std::cell::Cell::new(0usize);
+            for code in probes.chunks_exact(byte_len) {
+                graph.search_best_with_ef(
+                    CountingDistance {
+                        inner: BinaryCentroidDistance::new(code, &quantizer.centroids, byte_len),
+                        calls: &calls,
+                    },
+                    ef,
+                );
+            }
+            calls.get()
+        };
+        let (floor_work, wide_work) = (work_at(HNSW_MIN_EF_BUILD), work_at(512));
+        println!(
+            "assignment recall@1: ef=32 {narrow:.4}, ef={HNSW_MIN_EF_BUILD} {floor:.4}, ef=512 {wide:.4}\n\
+             assignment distance evaluations: ef={HNSW_MIN_EF_BUILD} {floor_work}, ef=512 {wide_work} \
+             ({:.2}x)",
+            wide_work as f64 / floor_work as f64
+        );
+        assert!(
+            wide_work > floor_work,
+            "a wider beam must cost more work: {wide_work} vs {floor_work}"
+        );
+
+        // The floor must be worth paying for over a clearly narrow beam...
+        assert!(
+            floor >= narrow,
+            "floor beam {HNSW_MIN_EF_BUILD} must not route worse than ef=32: {floor:.4} vs {narrow:.4}"
+        );
+        // ...and 4x more work than the floor must not be buying recall, which is
+        // what makes the previous 512 floor pure overhead.
+        assert!(
+            wide - floor <= 0.005,
+            "ef=512 bought {:.4} recall over ef={HNSW_MIN_EF_BUILD}; the floor is too low",
+            wide - floor
+        );
     }
 
     #[cfg(feature = "native")]
@@ -1217,14 +1555,65 @@ mod tests {
 
     #[test]
     fn binary_centroid_majority_ties_keep_previous_bits() {
+        let mut scratch = BinaryMajorityScratch::default();
         let codes = [0b1010_1010, 0b0101_0101];
         let mut centroid = [0b1100_0011];
-        update_binary_centroid(&mut centroid, &[0, 1], None, &codes, 1);
+        update_binary_centroid(&mut centroid, &[0, 1], None, &codes, 1, &mut scratch);
         assert_eq!(centroid, [0b1100_0011]);
 
         let decisive_codes = [0b1111_0000, 0b1111_0000, 0b0000_1111];
-        update_binary_centroid(&mut centroid, &[0, 1, 2], None, &decisive_codes, 1);
+        update_binary_centroid(
+            &mut centroid,
+            &[0, 1, 2],
+            None,
+            &decisive_codes,
+            1,
+            &mut scratch,
+        );
         assert_eq!(centroid, [0b1111_0000]);
+    }
+
+    /// Bit counts accumulate in `u8` planes that must be folded into the wide
+    /// counters before 256 members can overflow them, and the scratch is reused
+    /// across centroids so it must not carry counts between calls.
+    #[test]
+    fn binary_centroid_majority_survives_plane_overflow_and_scratch_reuse() {
+        let byte_len = 3;
+        let members: Vec<usize> = (0..MAJORITY_PLANE_FLUSH * 2 + 7).collect();
+        // Every member is all-ones, so the majority must be all-ones however
+        // many times the planes were folded.
+        let ones = vec![0xffu8; members.len() * byte_len];
+        let mut scratch = BinaryMajorityScratch::default();
+        let mut centroid = vec![0x00u8; byte_len];
+        update_binary_centroid(&mut centroid, &members, None, &ones, byte_len, &mut scratch);
+        assert_eq!(centroid, vec![0xff; byte_len]);
+
+        // Reusing the same scratch for an all-zero cluster must yield zeros.
+        let zeros = vec![0x00u8; members.len() * byte_len];
+        let mut next = vec![0xffu8; byte_len];
+        update_binary_centroid(&mut next, &members, None, &zeros, byte_len, &mut scratch);
+        assert_eq!(next, vec![0x00; byte_len]);
+
+        // A per-bit split just past the fold boundary resolves by true majority.
+        let split_members: Vec<usize> = (0..MAJORITY_PLANE_FLUSH + 3).collect();
+        let mut split_codes = vec![0x00u8; split_members.len() * byte_len];
+        let ones_majority = MAJORITY_PLANE_FLUSH / 2 + 3;
+        for (position, chunk) in split_codes.chunks_mut(byte_len).enumerate() {
+            if position < ones_majority {
+                chunk.fill(0b0000_1111);
+            }
+        }
+        assert!(ones_majority * 2 > split_members.len());
+        let mut split = vec![0x00u8; byte_len];
+        update_binary_centroid(
+            &mut split,
+            &split_members,
+            None,
+            &split_codes,
+            byte_len,
+            &mut scratch,
+        );
+        assert_eq!(split, vec![0b0000_1111; byte_len]);
     }
 
     #[test]
@@ -1247,6 +1636,24 @@ mod tests {
             index.search_in_clusters(&[0xf0], 1, &plan.cluster_ids)[0].0,
             3
         );
+
+        // Batched inserts group by leaf, so pin the payload layout: one batch
+        // must produce the same columns as two, and each leaf must keep its
+        // entries in ascending input order.
+        let single =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        assert_eq!(index.clusters.len(), single.clusters.len());
+        for ((left_id, left), (right_id, right)) in index.clusters.iter().zip(&single.clusters) {
+            assert_eq!(left_id, right_id);
+            assert_eq!(left.doc_ids, right.doc_ids);
+            assert_eq!(left.ordinals, right.ordinals);
+            assert_eq!(left.codes, right.codes);
+            assert!(
+                left.doc_ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "leaf {left_id} lost input order: {:?}",
+                left.doc_ids
+            );
+        }
     }
 
     #[test]

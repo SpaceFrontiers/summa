@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::routing::{
-    HNSW_AUTO_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
+    HIERARCHICAL_TRAINING_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
     allocate_child_clusters, effective_routing_mode, float_probe_fingerprint, routing_parent_count,
     select_best_candidates, select_parent_beam, select_parent_beam_for_build,
 };
@@ -155,7 +155,7 @@ impl CoarseCentroids {
                     (leaves, Some(router))
                 }
                 IvfRoutingMode::Hnsw => {
-                    let leaves = if actual_clusters >= HNSW_AUTO_THRESHOLD {
+                    let leaves = if actual_clusters >= HIERARCHICAL_TRAINING_THRESHOLD {
                         Self::train_hierarchical(config, vectors, vector_count, actual_clusters).0
                     } else {
                         Self::train_flat(config, vectors, vector_count, actual_clusters)
@@ -577,7 +577,7 @@ impl CoarseCentroids {
         } else {
             let primary_cluster = match effective_routing_mode(routing, self.num_clusters as usize)
             {
-                IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw_for_build(vector, 1)[0],
+                IvfRoutingMode::Hnsw => self.find_nearest_hnsw_for_build(vector),
                 IvfRoutingMode::TwoLevel => self
                     .find_k_nearest_two_level_for_build(
                         vector,
@@ -732,6 +732,17 @@ impl CoarseCentroids {
             return self.find_k_nearest(vector, k);
         };
         graph.search_for_build(|leaf| squared_l2(vector, self.get_centroid(leaf)), k)
+    }
+
+    /// Single-leaf assignment. Construction routes every vector through here,
+    /// so it avoids the one-element result `Vec` the ranked form allocates.
+    fn find_nearest_hnsw_for_build(&self, vector: &[f32]) -> u32 {
+        let Some(FloatCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
+            return self.find_nearest(vector);
+        };
+        graph
+            .search_best_for_build(|leaf| squared_l2(vector, self.get_centroid(leaf)))
+            .unwrap_or(0)
     }
 
     /// Get centroid for a cluster

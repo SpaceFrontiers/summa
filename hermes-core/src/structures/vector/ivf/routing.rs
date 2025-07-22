@@ -13,10 +13,24 @@ use crate::dsl::IvfRoutingMode;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Automatic routing switches to a centroid index at this leaf count. Below
-/// it, a SIMD-friendly flat pass is normally cheaper than another level of
-/// indirection.
+/// Automatic routing switches to a centroid graph at this leaf count.
+///
+/// Float centroids are wide (a 768-dim leaf is 3 KiB), so a flat pass over them
+/// gets expensive at far fewer leaves than for packed binary codes. This value
+/// is the historical one and is *not* backed by a crossover measurement; see
+/// [`BINARY_HNSW_AUTO_THRESHOLD`] for the measured binary counterpart, and
+/// measure the float case the same way before changing this.
 pub const HNSW_AUTO_THRESHOLD: usize = 4_096;
+
+pub const BINARY_HNSW_AUTO_THRESHOLD: usize = 32_768;
+
+/// Codebook size past which coarse training becomes hierarchical.
+///
+/// Direct k-means/k-majority seeding costs one full pass over the sample per
+/// centroid; beyond a few thousand centroids that dominates training, so large
+/// codebooks train as `sqrt(K)` parents plus per-parent child codebooks
+/// regardless of which router is used at query time.
+pub const HIERARCHICAL_TRAINING_THRESHOLD: usize = 4_096;
 
 /// Extra leaf coverage requested from the parent level. A beam of four times
 /// the minimum parent count avoids the recall cliff of greedy one-parent
@@ -35,7 +49,85 @@ const HNSW_MIN_EF_SEARCH: usize = 128;
 /// separate prevents an approximate query-router miss from permanently
 /// assigning a vector to a needlessly distant leaf.
 const HNSW_BUILD_OVERSAMPLE: usize = 8;
-const HNSW_MIN_EF_BUILD: usize = 512;
+/// Floor for the construction beam.
+///
+/// This is a *floor*, so it is what single-candidate assignment actually pays:
+/// every vector in a rebuilt segment routes with `take = 1`. Recall@1 against
+/// exact centroid assignment saturates well before 512 at `M = 32` — see
+/// `hnsw_build_beam_recall_saturates_before_the_floor` — while the cost is
+/// linear in the beam, so a 512 floor spent ~4x the distance work of a 128 one
+/// for no measurable assignment gain. Multi-candidate build routing still
+/// widens through `HNSW_BUILD_OVERSAMPLE`.
+pub(crate) const HNSW_MIN_EF_BUILD: usize = 128;
+
+/// Neighbour lists are capped at `2 * HNSW_M`; one stack block therefore covers
+/// a whole expansion, letting the batched distance form run without touching
+/// the allocator.
+const NEIGHBOR_BLOCK: usize = HNSW_M * 4;
+
+/// Distance from one query to graph nodes.
+///
+/// Float centroids vectorise across the dimension, so the pairwise form is
+/// already efficient there. Binary centroids are single-row popcounts: scoring
+/// a whole neighbour list per call is what keeps the SIMD kernel fed and pays
+/// the `#[target_feature]` dispatch once per expansion instead of per node.
+pub trait QueryDistance {
+    fn distance(&self, node: u32) -> f32;
+
+    /// Score a whole neighbour list. Defaults to repeated pairwise calls.
+    fn distances(&self, nodes: &[u32], out: &mut [f32]) {
+        debug_assert_eq!(nodes.len(), out.len());
+        for (slot, &node) in out.iter_mut().zip(nodes) {
+            *slot = self.distance(node);
+        }
+    }
+}
+
+impl<F: Fn(u32) -> f32> QueryDistance for F {
+    #[inline]
+    fn distance(&self, node: u32) -> f32 {
+        self(node)
+    }
+}
+
+/// Distance between two graph nodes, used while constructing the graph.
+pub trait PairDistance {
+    fn distance(&self, left: u32, right: u32) -> f32;
+
+    /// Score `left` against a whole node list. Defaults to pairwise calls.
+    fn distances_from(&self, left: u32, rights: &[u32], out: &mut [f32]) {
+        debug_assert_eq!(rights.len(), out.len());
+        for (slot, &right) in out.iter_mut().zip(rights) {
+            *slot = self.distance(left, right);
+        }
+    }
+}
+
+impl<F: Fn(u32, u32) -> f32> PairDistance for F {
+    #[inline]
+    fn distance(&self, left: u32, right: u32) -> f32 {
+        self(left, right)
+    }
+}
+
+/// One inserted node's view of a [`PairDistance`], so construction reuses the
+/// same batched search as queries.
+struct PairQueryDistance<'a, P: ?Sized> {
+    pair: &'a P,
+    left: u32,
+}
+
+impl<P: PairDistance + ?Sized> QueryDistance for PairQueryDistance<'_, P> {
+    #[inline]
+    fn distance(&self, node: u32) -> f32 {
+        self.pair.distance(self.left, node)
+    }
+
+    #[inline]
+    fn distances(&self, nodes: &[u32], out: &mut [f32]) {
+        self.pair.distances_from(self.left, nodes, out);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct GraphCandidate {
@@ -108,6 +200,10 @@ struct HnswQueryScratch {
     candidates: BinaryHeap<Reverse<GraphCandidate>>,
     best: BinaryHeap<GraphCandidate>,
     ordered: Vec<GraphCandidate>,
+    /// Unvisited neighbours of the node being expanded, plus their distances,
+    /// so one expansion is one batched distance call.
+    pending: Vec<u32>,
+    pending_distances: Vec<f32>,
 }
 
 impl HnswQueryScratch {
@@ -117,6 +213,8 @@ impl HnswQueryScratch {
             candidates: BinaryHeap::new(),
             best: BinaryHeap::new(),
             ordered: Vec::new(),
+            pending: Vec::new(),
+            pending_distances: Vec::new(),
         }
     }
 }
@@ -147,7 +245,7 @@ pub struct HnswRoutingGraph {
 }
 
 impl HnswRoutingGraph {
-    pub fn build(node_count: usize, distance: impl Fn(u32, u32) -> f32, seed: u64) -> Self {
+    pub fn build(node_count: usize, distance: impl PairDistance, seed: u64) -> Self {
         assert!(node_count > 0 && node_count <= u32::MAX as usize);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let level_multiplier = 1.0 / (HNSW_M as f64).ln();
@@ -170,7 +268,10 @@ impl HnswRoutingGraph {
         for &node in insertion_order.iter().skip(1) {
             let node_level = node_levels[node as usize];
             let mut entry = entry_point;
-            let node_distance = |candidate| distance(node, candidate);
+            let node_distance = PairQueryDistance {
+                pair: &distance,
+                left: node,
+            };
 
             for level in ((node_level as usize + 1)..=max_level as usize).rev() {
                 entry = greedy_search_level(&links, entry, level, &node_distance);
@@ -203,7 +304,7 @@ impl HnswRoutingGraph {
                             .copied()
                             .map(|candidate| GraphCandidate {
                                 node: candidate,
-                                distance: distance(neighbor, candidate),
+                                distance: distance.distance(neighbor, candidate),
                             })
                             .collect();
                         *adjacency = select_diverse_neighbors(
@@ -283,7 +384,7 @@ impl HnswRoutingGraph {
         &self.neighbors[start..end]
     }
 
-    pub fn search(&self, query_distance: impl Fn(u32) -> f32, take: usize) -> Vec<u32> {
+    pub fn search(&self, query_distance: impl QueryDistance, take: usize) -> Vec<u32> {
         let take = take.min(self.node_levels.len());
         if take == 0 {
             return Vec::new();
@@ -298,23 +399,83 @@ impl HnswRoutingGraph {
     /// Higher-recall centroid search used only while constructing postings.
     pub(crate) fn search_for_build(
         &self,
-        query_distance: impl Fn(u32) -> f32,
+        query_distance: impl QueryDistance,
         take: usize,
     ) -> Vec<u32> {
         let take = take.min(self.node_levels.len());
         if take == 0 {
             return Vec::new();
         }
-        let ef_search = take
-            .saturating_mul(HNSW_BUILD_OVERSAMPLE)
+        self.search_with_budget(query_distance, take, self.build_budget(take))
+    }
+
+    /// Single nearest node, for the assignment of one vector to one leaf.
+    ///
+    /// Construction routes every vector in a segment through here, so it avoids
+    /// both the result `Vec` and the full ranking of the beam that
+    /// [`Self::search_for_build`] needs — the minimum of the bounded heap is
+    /// the same node the ranked list would have put first.
+    pub(crate) fn search_best_for_build(&self, query_distance: impl QueryDistance) -> Option<u32> {
+        if self.node_levels.is_empty() {
+            return None;
+        }
+        let ef_search = self.build_budget(1);
+        let mut entry = self.entry_point;
+        for level in (1..=self.max_level as usize).rev() {
+            entry = greedy_search_compact(self, entry, level, &query_distance);
+        }
+        HNSW_QUERY_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            search_compact_layer_reusing(self, entry, ef_search, &query_distance, &mut scratch);
+            Some(
+                scratch
+                    .best
+                    .iter()
+                    .min()
+                    .map_or(entry, |candidate| candidate.node),
+            )
+        })
+    }
+
+    #[inline]
+    fn build_budget(&self, take: usize) -> usize {
+        take.saturating_mul(HNSW_BUILD_OVERSAMPLE)
             .max(HNSW_MIN_EF_BUILD)
-            .min(self.node_levels.len());
-        self.search_with_budget(query_distance, take, ef_search)
+            .min(self.node_levels.len())
+    }
+
+    /// Nearest node under an explicit beam, so tests can measure how assignment
+    /// recall responds to the budget instead of asserting a constant.
+    #[cfg(test)]
+    pub(crate) fn search_best_with_ef(
+        &self,
+        query_distance: impl QueryDistance,
+        ef: usize,
+    ) -> Option<u32> {
+        if self.node_levels.is_empty() {
+            return None;
+        }
+        let ef_search = ef.clamp(1, self.node_levels.len());
+        let mut entry = self.entry_point;
+        for level in (1..=self.max_level as usize).rev() {
+            entry = greedy_search_compact(self, entry, level, &query_distance);
+        }
+        HNSW_QUERY_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            search_compact_layer_reusing(self, entry, ef_search, &query_distance, &mut scratch);
+            Some(
+                scratch
+                    .best
+                    .iter()
+                    .min()
+                    .map_or(entry, |candidate| candidate.node),
+            )
+        })
     }
 
     fn search_with_budget(
         &self,
-        query_distance: impl Fn(u32) -> f32,
+        query_distance: impl QueryDistance,
         take: usize,
         ef_search: usize,
     ) -> Vec<u32> {
@@ -325,6 +486,7 @@ impl HnswRoutingGraph {
         HNSW_QUERY_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             search_compact_layer_reusing(self, entry, ef_search, &query_distance, &mut scratch);
+            order_scratch_candidates(&mut scratch);
             scratch
                 .ordered
                 .iter()
@@ -402,18 +564,23 @@ fn greedy_search_level(
     links: &[Vec<Vec<u32>>],
     mut current: u32,
     level: usize,
-    query_distance: &impl Fn(u32) -> f32,
+    query_distance: &impl QueryDistance,
 ) -> u32 {
-    let mut current_distance = query_distance(current);
+    let mut current_distance = query_distance.distance(current);
+    let mut scores = [0f32; NEIGHBOR_BLOCK];
     loop {
         let mut changed = false;
-        for &candidate in &links[current as usize][level] {
-            let distance = query_distance(candidate);
-            if distance < current_distance || (distance == current_distance && candidate < current)
-            {
-                current = candidate;
-                current_distance = distance;
-                changed = true;
+        for chunk in links[current as usize][level].chunks(NEIGHBOR_BLOCK) {
+            let scored = &mut scores[..chunk.len()];
+            query_distance.distances(chunk, scored);
+            for (&candidate, &distance) in chunk.iter().zip(scored.iter()) {
+                if distance < current_distance
+                    || (distance == current_distance && candidate < current)
+                {
+                    current = candidate;
+                    current_distance = distance;
+                    changed = true;
+                }
             }
         }
         if !changed {
@@ -426,18 +593,23 @@ fn greedy_search_compact(
     graph: &HnswRoutingGraph,
     mut current: u32,
     level: usize,
-    query_distance: &impl Fn(u32) -> f32,
+    query_distance: &impl QueryDistance,
 ) -> u32 {
-    let mut current_distance = query_distance(current);
+    let mut current_distance = query_distance.distance(current);
+    let mut scores = [0f32; NEIGHBOR_BLOCK];
     loop {
         let mut changed = false;
-        for &candidate in graph.neighbors(current, level) {
-            let distance = query_distance(candidate);
-            if distance < current_distance || (distance == current_distance && candidate < current)
-            {
-                current = candidate;
-                current_distance = distance;
-                changed = true;
+        for chunk in graph.neighbors(current, level).chunks(NEIGHBOR_BLOCK) {
+            let scored = &mut scores[..chunk.len()];
+            query_distance.distances(chunk, scored);
+            for (&candidate, &distance) in chunk.iter().zip(scored.iter()) {
+                if distance < current_distance
+                    || (distance == current_distance && candidate < current)
+                {
+                    current = candidate;
+                    current_distance = distance;
+                    changed = true;
+                }
             }
         }
         if !changed {
@@ -451,7 +623,7 @@ fn search_graph_layer(
     entry: u32,
     level: usize,
     ef: usize,
-    query_distance: &impl Fn(u32) -> f32,
+    query_distance: &impl QueryDistance,
     visited: &mut VisitedNodes,
 ) -> Vec<GraphCandidate> {
     search_layer_impl(entry, ef, query_distance, visited, |node| {
@@ -459,11 +631,15 @@ fn search_graph_layer(
     })
 }
 
+/// Expand the base layer into `scratch.best`, leaving `scratch.ordered` empty.
+///
+/// Callers that need a ranked list finish with [`order_scratch_candidates`];
+/// single-candidate assignment skips that and scans the bounded heap instead.
 fn search_compact_layer_reusing(
     graph: &HnswRoutingGraph,
     entry: u32,
     ef: usize,
-    query_distance: &impl Fn(u32) -> f32,
+    query_distance: &impl QueryDistance,
     scratch: &mut HnswQueryScratch,
 ) {
     scratch.visited.ensure_nodes(graph.node_levels.len());
@@ -474,7 +650,7 @@ fn search_compact_layer_reusing(
     scratch.visited.insert(entry);
     let first = GraphCandidate {
         node: entry,
-        distance: query_distance(entry),
+        distance: query_distance.distance(entry),
     };
     scratch.candidates.push(Reverse(first));
     scratch.best.push(first);
@@ -488,14 +664,24 @@ fn search_compact_layer_reusing(
         {
             break;
         }
+        // Score the whole unvisited frontier of this node in one call. The
+        // accept test below still runs in adjacency order, so results are
+        // identical to scoring node by node.
+        scratch.pending.clear();
         for &neighbor in graph.neighbors(current.node, 0) {
-            if !scratch.visited.insert(neighbor) {
-                continue;
+            if scratch.visited.insert(neighbor) {
+                scratch.pending.push(neighbor);
             }
-            let candidate = GraphCandidate {
-                node: neighbor,
-                distance: query_distance(neighbor),
-            };
+        }
+        if scratch.pending.is_empty() {
+            continue;
+        }
+        scratch.pending_distances.clear();
+        scratch.pending_distances.resize(scratch.pending.len(), 0.0);
+        query_distance.distances(&scratch.pending, &mut scratch.pending_distances);
+
+        for (&node, &distance) in scratch.pending.iter().zip(scratch.pending_distances.iter()) {
+            let candidate = GraphCandidate { node, distance };
             if scratch.best.len() < ef
                 || scratch.best.peek().is_some_and(|worst| candidate < *worst)
             {
@@ -507,6 +693,9 @@ fn search_compact_layer_reusing(
             }
         }
     }
+}
+
+fn order_scratch_candidates(scratch: &mut HnswQueryScratch) {
     scratch.ordered.extend(scratch.best.drain());
     scratch.ordered.sort_unstable();
 }
@@ -514,7 +703,7 @@ fn search_compact_layer_reusing(
 fn search_layer_impl<'a>(
     entry: u32,
     ef: usize,
-    query_distance: &impl Fn(u32) -> f32,
+    query_distance: &impl QueryDistance,
     visited: &mut VisitedNodes,
     neighbors: impl Fn(u32) -> &'a [u32],
 ) -> Vec<GraphCandidate> {
@@ -522,12 +711,14 @@ fn search_layer_impl<'a>(
     visited.insert(entry);
     let first = GraphCandidate {
         node: entry,
-        distance: query_distance(entry),
+        distance: query_distance.distance(entry),
     };
     let mut candidates = BinaryHeap::new();
     let mut best = BinaryHeap::new();
     candidates.push(Reverse(first));
     best.push(first);
+    let mut pending: Vec<u32> = Vec::new();
+    let mut pending_distances: Vec<f32> = Vec::new();
 
     while let Some(Reverse(current)) = candidates.pop() {
         if best.len() >= ef
@@ -537,14 +728,21 @@ fn search_layer_impl<'a>(
         {
             break;
         }
+        pending.clear();
         for &neighbor in neighbors(current.node) {
-            if !visited.insert(neighbor) {
-                continue;
+            if visited.insert(neighbor) {
+                pending.push(neighbor);
             }
-            let candidate = GraphCandidate {
-                node: neighbor,
-                distance: query_distance(neighbor),
-            };
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        pending_distances.clear();
+        pending_distances.resize(pending.len(), 0.0);
+        query_distance.distances(&pending, &mut pending_distances);
+
+        for (&node, &distance) in pending.iter().zip(pending_distances.iter()) {
+            let candidate = GraphCandidate { node, distance };
             if best.len() < ef || best.peek().is_some_and(|worst| candidate < *worst) {
                 candidates.push(Reverse(candidate));
                 best.push(candidate);
@@ -561,7 +759,7 @@ fn select_diverse_neighbors(
     query_node: u32,
     mut candidates: Vec<GraphCandidate>,
     limit: usize,
-    distance: &impl Fn(u32, u32) -> f32,
+    distance: &impl PairDistance,
 ) -> Vec<u32> {
     candidates.sort_unstable();
     candidates.dedup_by_key(|candidate| candidate.node);
@@ -573,7 +771,7 @@ fn select_diverse_neighbors(
         }
         if selected
             .iter()
-            .all(|&neighbor| distance(candidate.node, neighbor) > candidate.distance)
+            .all(|&neighbor| distance.distance(candidate.node, neighbor) > candidate.distance)
         {
             selected.push(candidate.node);
             if selected.len() == limit {
@@ -590,6 +788,12 @@ fn select_diverse_neighbors(
         selected.push(candidate);
     }
     selected
+}
+
+fn contiguous_leaf_run(children: &[u32]) -> bool {
+    children
+        .windows(2)
+        .all(|pair| pair[1] == pair[0].saturating_add(1))
 }
 
 /// Compact parent-to-leaf adjacency shared by float and binary quantizers.
@@ -626,6 +830,19 @@ impl IvfRoutingTopology {
         &self.leaf_ids[start..end]
     }
 
+    /// Children of `parent` as a `(first_leaf, count)` run.
+    ///
+    /// Both trainers append each parent's leaves as one contiguous block, which
+    /// lets a caller score a whole parent with a single batched pass over the
+    /// centroid matrix instead of one kernel call per leaf. Returns `None` for
+    /// an empty parent, and — defensively — for any non-contiguous list, so the
+    /// scoring path stays correct even if the invariant is ever relaxed.
+    pub fn children_run(&self, parent: usize) -> Option<(u32, usize)> {
+        let children = self.children(parent);
+        let first = *children.first()?;
+        contiguous_leaf_run(children).then_some((first, children.len()))
+    }
+
     pub fn validate(&self, num_leaves: usize) -> bool {
         if self.parent_count() == 0 {
             return self.child_offsets.is_empty() && self.leaf_ids.is_empty();
@@ -635,6 +852,10 @@ impl IvfRoutingTopology {
             && self.child_offsets.windows(2).all(|pair| pair[0] <= pair[1])
             && self.leaf_ids.len() == num_leaves
             && self.leaf_ids.iter().all(|&leaf| leaf < num_leaves as u32)
+            // Contiguity is a build invariant of both trainers; a topology
+            // without it did not come from this codebase, so refuse it rather
+            // than silently routing through a slower path.
+            && (0..self.parent_count()).all(|parent| contiguous_leaf_run(self.children(parent)))
             && {
                 let mut leaves = self.leaf_ids.clone();
                 leaves.sort_unstable();
@@ -862,10 +1083,31 @@ pub fn binary_probe_fingerprint(query: &[u8], nprobe: usize, mode: IvfRoutingMod
     fingerprint_words(mode, nprobe, query.iter().map(|&value| value as u64))
 }
 
+/// Resolve `Auto` for float centroids.
 #[inline]
 pub fn effective_routing_mode(mode: IvfRoutingMode, num_leaves: usize) -> IvfRoutingMode {
+    resolve_auto_routing(mode, num_leaves, HNSW_AUTO_THRESHOLD)
+}
+
+/// Resolve `Auto` for packed binary centroids, whose flat pass stays cheap much
+/// further up the leaf-count range.
+///
+/// Every binary site — training, validation, probing and assignment — must use
+/// this, or a codebook trained without a graph would be asked to route through
+/// one.
+#[inline]
+pub fn effective_binary_routing_mode(mode: IvfRoutingMode, num_leaves: usize) -> IvfRoutingMode {
+    resolve_auto_routing(mode, num_leaves, BINARY_HNSW_AUTO_THRESHOLD)
+}
+
+#[inline]
+fn resolve_auto_routing(
+    mode: IvfRoutingMode,
+    num_leaves: usize,
+    auto_threshold: usize,
+) -> IvfRoutingMode {
     match mode {
-        IvfRoutingMode::Auto if num_leaves >= HNSW_AUTO_THRESHOLD => IvfRoutingMode::Hnsw,
+        IvfRoutingMode::Auto if num_leaves >= auto_threshold => IvfRoutingMode::Hnsw,
         IvfRoutingMode::Auto => IvfRoutingMode::Flat,
         explicit => explicit,
     }
@@ -1018,6 +1260,52 @@ pub fn select_best_candidates<const HIGHER_IS_BETTER: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// For binary centroids, `Auto` must not pick the graph where an exact flat
+    /// scan is both faster and more accurate; the switch point comes from the
+    /// measured crossover documented on `BINARY_HNSW_AUTO_THRESHOLD`. The float
+    /// threshold is separate because float leaves are ~10x wider per centroid.
+    #[test]
+    fn auto_routing_prefers_exact_flat_probing_below_the_measured_crossover() {
+        for leaves in [1usize, 4_096, 16_384, BINARY_HNSW_AUTO_THRESHOLD - 1] {
+            assert_eq!(
+                effective_binary_routing_mode(IvfRoutingMode::Auto, leaves),
+                IvfRoutingMode::Flat,
+                "{leaves} binary leaves"
+            );
+        }
+        for leaves in [BINARY_HNSW_AUTO_THRESHOLD, 114_309] {
+            assert_eq!(
+                effective_binary_routing_mode(IvfRoutingMode::Auto, leaves),
+                IvfRoutingMode::Hnsw,
+                "{leaves} binary leaves"
+            );
+        }
+        // Float routing keeps its own, lower threshold.
+        assert_eq!(
+            effective_routing_mode(IvfRoutingMode::Auto, HNSW_AUTO_THRESHOLD),
+            IvfRoutingMode::Hnsw
+        );
+        assert_eq!(
+            effective_routing_mode(IvfRoutingMode::Auto, HNSW_AUTO_THRESHOLD - 1),
+            IvfRoutingMode::Flat
+        );
+        // Explicit modes are honoured at any size, and large codebooks still
+        // train hierarchically even when routing stays flat.
+        for leaves in [64usize, 1_000_000] {
+            assert_eq!(
+                effective_binary_routing_mode(IvfRoutingMode::Hnsw, leaves),
+                IvfRoutingMode::Hnsw
+            );
+            assert_eq!(
+                effective_binary_routing_mode(IvfRoutingMode::TwoLevel, leaves),
+                IvfRoutingMode::TwoLevel
+            );
+        }
+        const {
+            assert!(HIERARCHICAL_TRAINING_THRESHOLD <= BINARY_HNSW_AUTO_THRESHOLD);
+        }
+    }
 
     #[test]
     fn deterministic_selection_supports_both_metric_directions() {
@@ -1187,10 +1475,43 @@ mod tests {
             10,
         );
         assert_eq!(build_routed, exact[..10]);
-        assert!(
-            build_distance_calls.get() > query_distance_calls.get(),
-            "offline construction should spend its wider search budget"
+        // Both budgets share the same floor, so a small take costs the same
+        // either way; construction only widens once its oversample exceeds the
+        // floor. The floor is what per-vector assignment pays, and it is set
+        // from measured recall (see
+        // `index::binary_ivf::tests::hnsw_build_beam_recall_saturates_before_the_floor`).
+        assert_eq!(build_distance_calls.get(), query_distance_calls.get());
+
+        let wide_query_calls = std::cell::Cell::new(0usize);
+        graph.search(
+            |node| {
+                wide_query_calls.set(wide_query_calls.get() + 1);
+                let [x, y] = points[node as usize];
+                (x - query[0]).powi(2) + (y - query[1]).powi(2)
+            },
+            64,
         );
+        let wide_build_calls = std::cell::Cell::new(0usize);
+        graph.search_for_build(
+            |node| {
+                wide_build_calls.set(wide_build_calls.get() + 1);
+                let [x, y] = points[node as usize];
+                (x - query[0]).powi(2) + (y - query[1]).powi(2)
+            },
+            64,
+        );
+        assert!(
+            wide_build_calls.get() > wide_query_calls.get(),
+            "multi-candidate construction should spend its wider search budget"
+        );
+
+        // Single-candidate assignment returns the same leaf the ranked search
+        // would have put first, without allocating a result list.
+        let assigned = graph.search_best_for_build(|node| {
+            let [x, y] = points[node as usize];
+            (x - query[0]).powi(2) + (y - query[1]).powi(2)
+        });
+        assert_eq!(assigned, Some(exact[0]));
 
         let bytes = bincode::serde::encode_to_vec(&graph, bincode::config::standard()).unwrap();
         let (decoded, consumed): (HnswRoutingGraph, usize) =
