@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.8.91"
+version = "1.8.92"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -28,10 +28,10 @@ categories = ["database", "text-processing"]
 
 [workspace.dependencies]
 # Internal crates
-hermes-core = { version = "1.8.91", path = "hermes-core", default-features = false }
+hermes-core = { version = "1.8.92", path = "hermes-core", default-features = false }
 hermes-mal = { version = "1.8.57", path = "hermes-mal" }
 hermes-llm = { version = "1.8.57", path = "hermes-llm", default-features = false }
-hermes-tokenizer = { version = "1.8.91", path = "hermes-tokenizer" }
+hermes-tokenizer = { version = "1.8.92", path = "hermes-tokenizer" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
