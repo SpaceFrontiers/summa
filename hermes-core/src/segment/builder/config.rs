@@ -51,7 +51,8 @@ pub struct SegmentBuilderConfig {
     pub temp_dir: PathBuf,
     /// Compression level for document store
     pub compression_level: CompressionLevel,
-    /// Number of threads for parallel compression
+    /// Width of the document-store compression pool. Concurrent builders with
+    /// the same width share one process-wide executor.
     pub num_compression_threads: usize,
     /// Initial capacity for term interner
     pub interner_capacity: usize,

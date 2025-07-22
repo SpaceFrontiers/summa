@@ -167,7 +167,7 @@ enum Commands {
         #[arg(short = 'j', long)]
         indexing_threads: Option<usize>,
 
-        /// Number of threads for parallel block compression (default: number of CPUs)
+        /// Shared document-store compression pool width (default: CPUs / 4)
         #[arg(short = 'c', long)]
         compression_threads: Option<usize>,
 

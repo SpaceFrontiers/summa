@@ -129,8 +129,8 @@ pub fn default_search_threads() -> usize {
     (num_cpus::get() / 4).max(1)
 }
 
-/// Default number of compression threads (cpu / 4, minimum 1).
-/// Centralized so all configs share one definition.
+/// Default width of the process-wide document-store compression pool
+/// (cpu / 4, minimum 1).
 #[cfg(feature = "native")]
 pub fn default_compression_threads() -> usize {
     (num_cpus::get() / 4).max(1)

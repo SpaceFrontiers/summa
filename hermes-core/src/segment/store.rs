@@ -14,11 +14,15 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 #[cfg(feature = "native")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::sync::Arc;
 #[cfg(feature = "native")]
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::OnceLock;
+#[cfg(feature = "native")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "native")]
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 #[cfg(feature = "native")]
 use std::thread::JoinHandle;
 
@@ -237,58 +241,63 @@ struct CompressionJob {
     data: Vec<u8>,
 }
 
-/// Fixed-width compression pool used by [`EagerParallelStoreWriter`].
-///
-/// The producer separately limits the number of submitted-but-not-written
-/// blocks. The bounded job channel provides backpressure as a second line of
-/// defence and prevents a fast store-file scan from creating an unbounded task
-/// queue.
 #[cfg(feature = "native")]
-struct StoreCompressionPool {
-    jobs: Option<SyncSender<CompressionJob>>,
-    results: Receiver<io::Result<CompressedBlock>>,
+struct CompressionRequest {
+    job: CompressionJob,
+    dict: Option<Arc<CompressionDict>>,
+    compression_level: CompressionLevel,
+    results: Sender<io::Result<CompressedBlock>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Process-wide fixed-width compression executor.
+///
+/// Segment builders with the same configured width share one executor. This
+/// keeps simultaneous flushes from multiplying `num_threads` by the number of
+/// indexing workers while retaining parallel compression across all stores.
+#[cfg(feature = "native")]
+struct StoreCompressionExecutor {
+    jobs: Option<SyncSender<CompressionRequest>>,
     workers: Vec<JoinHandle<()>>,
     num_threads: usize,
 }
 
 #[cfg(feature = "native")]
-impl StoreCompressionPool {
-    fn new(
-        num_threads: usize,
-        dict: Option<Arc<CompressionDict>>,
-        compression_level: CompressionLevel,
-    ) -> Self {
-        // A zero-width pool can never make progress. Treat zero as the
-        // conservative single-worker setting; the public configuration did
-        // not historically reject zero.
-        let num_threads = num_threads.max(1);
+impl StoreCompressionExecutor {
+    fn new(num_threads: usize) -> Self {
         let (job_sender, job_receiver) =
-            std::sync::mpsc::sync_channel::<CompressionJob>(num_threads);
+            std::sync::mpsc::sync_channel::<CompressionRequest>(num_threads);
         let job_receiver = Arc::new(std::sync::Mutex::new(job_receiver));
-        let (result_sender, result_receiver) = std::sync::mpsc::channel();
         let mut workers = Vec::with_capacity(num_threads);
 
         for worker_id in 0..num_threads {
             let jobs = Arc::clone(&job_receiver);
-            let results = result_sender.clone();
-            let dict = dict.clone();
             let worker = std::thread::Builder::new()
-                .name(format!("hermes-store-compress-{worker_id}"))
+                .name(format!("hermes-store-compress-{num_threads}-{worker_id}"))
                 .spawn(move || {
                     loop {
-                        // std::sync::mpsc::Receiver is single-consumer, so the
-                        // short receive operation is mutex-protected. The lock
-                        // is released before compression and all workers can
-                        // then run concurrently.
-                        let job = {
+                        // `std::sync::mpsc::Receiver` is single-consumer. Keep
+                        // only the receive operation under the mutex; workers
+                        // compress independently after taking a request.
+                        let request = {
                             let receiver = jobs
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             receiver.recv()
                         };
-                        let Ok(job) = job else {
+                        let Ok(request) = request else {
                             break;
                         };
+                        let CompressionRequest {
+                            job,
+                            dict,
+                            compression_level,
+                            results,
+                            cancelled,
+                        } = request;
+                        if cancelled.load(Ordering::Acquire) {
+                            continue;
+                        }
 
                         // Always produce exactly one result for every accepted
                         // job. Without catch_unwind, one unexpected codec panic
@@ -317,34 +326,119 @@ impl StoreCompressionPool {
                             ))
                         });
 
-                        if results.send(result).is_err() {
-                            break;
+                        // A writer can disappear after an earlier I/O error.
+                        // Its remaining bounded jobs should not stop the shared
+                        // executor from serving other segment builders.
+                        if !cancelled.load(Ordering::Acquire) {
+                            let _ = results.send(result);
                         }
                     }
                 })
                 .expect("failed to spawn document-store compression worker");
             workers.push(worker);
         }
-        drop(result_sender);
 
         Self {
             jobs: Some(job_sender),
-            results: result_receiver,
             workers,
             num_threads,
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for StoreCompressionExecutor {
+    fn drop(&mut self) {
+        self.jobs.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+static STORE_COMPRESSION_EXECUTORS: OnceLock<
+    parking_lot::Mutex<HashMap<usize, Arc<StoreCompressionExecutor>>>,
+> = OnceLock::new();
+
+#[cfg(feature = "native")]
+fn shared_store_compression_executor(num_threads: usize) -> Arc<StoreCompressionExecutor> {
+    let num_threads = num_threads.max(1);
+    let mut executors = STORE_COMPRESSION_EXECUTORS
+        .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+        .lock();
+    if let Some(executor) = executors.get(&num_threads) {
+        return Arc::clone(executor);
+    }
+
+    let executor = Arc::new(StoreCompressionExecutor::new(num_threads));
+    // Keep one process-lifetime owner. A weak-only registry could create a new
+    // width-N generation while the previous generation was still joining its
+    // N workers after an error, transiently multiplying the promised bound.
+    executors.insert(num_threads, Arc::clone(&executor));
+    log::info!(
+        "[store] process-wide compression pool: {} thread(s)",
+        num_threads
+    );
+    executor
+}
+
+/// Per-writer handle into the shared fixed-width compression executor.
+///
+/// The producer separately limits the number of submitted-but-not-written
+/// blocks. The bounded job channel provides backpressure as a second line of
+/// defence and prevents a fast store-file scan from creating an unbounded task
+/// queue.
+#[cfg(feature = "native")]
+struct StoreCompressionPool {
+    executor: Arc<StoreCompressionExecutor>,
+    results: Receiver<io::Result<CompressedBlock>>,
+    result_sender: Sender<io::Result<CompressedBlock>>,
+    dict: Option<Arc<CompressionDict>>,
+    compression_level: CompressionLevel,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "native")]
+impl StoreCompressionPool {
+    fn new(
+        num_threads: usize,
+        dict: Option<Arc<CompressionDict>>,
+        compression_level: CompressionLevel,
+    ) -> Self {
+        // A zero-width pool can never make progress. Treat zero as the
+        // conservative single-worker setting; the public configuration did
+        // not historically reject zero.
+        let num_threads = num_threads.max(1);
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+
+        Self {
+            executor: shared_store_compression_executor(num_threads),
+            results: result_receiver,
+            result_sender,
+            dict,
+            compression_level,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
     #[inline]
     fn num_threads(&self) -> usize {
-        self.num_threads
+        self.executor.num_threads
     }
 
     fn submit(&self, job: CompressionJob) -> io::Result<()> {
-        self.jobs
+        self.executor
+            .jobs
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "compression pool is closed"))?
-            .send(job)
+            .send(CompressionRequest {
+                job,
+                dict: self.dict.clone(),
+                compression_level: self.compression_level,
+                results: self.result_sender.clone(),
+                cancelled: Arc::clone(&self.cancelled),
+            })
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -363,33 +457,21 @@ impl StoreCompressionPool {
     }
 
     fn shutdown(&mut self) -> io::Result<()> {
-        // Closing the only producer wakes idle workers. All submitted jobs have
-        // already yielded results before the normal finish path reaches here.
-        self.jobs.take();
-        let mut panicked = false;
-        for worker in self.workers.drain(..) {
-            panicked |= worker.join().is_err();
-        }
-        if panicked {
-            Err(io::Error::other(
-                "document-store compression worker panicked",
-            ))
-        } else {
-            Ok(())
-        }
+        // All jobs for this writer have yielded results before the normal
+        // finish path reaches here. The process-wide executor stays available
+        // to other concurrent segment builders.
+        self.cancelled.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
 #[cfg(feature = "native")]
 impl Drop for StoreCompressionPool {
     fn drop(&mut self) {
-        // Also clean up on an early write/compression error. The result channel
-        // is unbounded, so workers can finish the small bounded tail without
-        // deadlocking while this thread joins them.
-        self.jobs.take();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        // Requests not yet started are skipped by shared workers. A block
+        // already inside Zstd completes, but it no longer publishes a result
+        // into the abandoned writer's channel.
+        self.cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -1667,12 +1749,16 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "native")]
-    fn raw_store_bytes(num_threads: usize, documents: &[Vec<u8>]) -> Vec<u8> {
+    fn raw_store_bytes(
+        num_threads: usize,
+        compression_level: CompressionLevel,
+        documents: &[Vec<u8>],
+    ) -> Vec<u8> {
         let mut output = Vec::new();
         let mut store = EagerParallelStoreWriter::with_compression_level(
             &mut output,
             num_threads,
-            CompressionLevel::FAST,
+            compression_level,
         );
         for document in documents {
             store.store_raw(document).unwrap();
@@ -1699,9 +1785,51 @@ mod tests {
             })
             .collect();
 
-        let single_worker = raw_store_bytes(1, &documents);
-        let four_workers = raw_store_bytes(4, &documents);
+        let single_worker = raw_store_bytes(1, CompressionLevel::FAST, &documents);
+        let four_workers = raw_store_bytes(4, CompressionLevel::FAST, &documents);
         assert_eq!(four_workers, single_worker);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn parallel_stores_share_same_width_compression_executor() {
+        let first_documents: Vec<Vec<u8>> = (0..12)
+            .map(|doc| vec![(doc * 17 + 3) as u8; STORE_BLOCK_SIZE + doc * 97])
+            .collect();
+        let second_documents: Vec<Vec<u8>> = (0..12)
+            .map(|doc| vec![(doc * 29 + 7) as u8; STORE_BLOCK_SIZE + doc * 131])
+            .collect();
+        let expected_first = raw_store_bytes(1, CompressionLevel::FAST, &first_documents);
+        let expected_second = raw_store_bytes(1, CompressionLevel::BETTER, &second_documents);
+
+        let mut first_output = Vec::new();
+        let mut second_output = Vec::new();
+        let mut first = EagerParallelStoreWriter::with_compression_level(
+            &mut first_output,
+            3,
+            CompressionLevel::FAST,
+        );
+        let mut second = EagerParallelStoreWriter::with_compression_level(
+            &mut second_output,
+            3,
+            CompressionLevel::BETTER,
+        );
+
+        assert!(Arc::ptr_eq(
+            &first.workers.executor,
+            &second.workers.executor
+        ));
+        assert_eq!(first.workers.num_threads(), 3);
+        assert_eq!(second.workers.num_threads(), 3);
+
+        for (first_document, second_document) in first_documents.iter().zip(&second_documents) {
+            first.store_raw(first_document).unwrap();
+            second.store_raw(second_document).unwrap();
+        }
+        assert_eq!(first.finish().unwrap(), first_documents.len() as u32);
+        assert_eq!(second.finish().unwrap(), second_documents.len() as u32);
+        assert_eq!(first_output, expected_first);
+        assert_eq!(second_output, expected_second);
     }
 
     #[cfg(feature = "native")]

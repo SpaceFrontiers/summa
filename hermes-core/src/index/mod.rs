@@ -84,6 +84,11 @@ pub(crate) enum ReorderPriority {
 #[derive(Debug)]
 pub struct ReorderConcurrencyGate {
     permits: Arc<tokio::sync::Semaphore>,
+    /// Standalone optimizer passes rewrite complete sparse blobs and can each
+    /// consume the full per-pass memory budget. Serializing this class avoids
+    /// multiplying disk traffic and retained source/output pages when a scan
+    /// discovers candidates in multiple indexes at once.
+    optimizer_permits: Arc<tokio::sync::Semaphore>,
     /// Automatic merges may consume all but one whole-pass slot. The reserved
     /// slot lets short optimizer passes continuously retire fresh segments.
     /// With a one-pass configuration both classes share the only slot.
@@ -167,6 +172,7 @@ impl ReorderConcurrencyGate {
         let automatic_merge_limit = limit.saturating_sub(1).max(1);
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            optimizer_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             automatic_merge_permits: Arc::new(tokio::sync::Semaphore::new(automatic_merge_limit)),
             limit,
             foreground_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -184,12 +190,15 @@ impl ReorderConcurrencyGate {
         priority: ReorderPriority,
     ) -> std::result::Result<ReorderPermit, tokio::sync::AcquireError> {
         match priority {
-            ReorderPriority::Optimizer => self.acquire_background(None).await,
+            ReorderPriority::Optimizer => {
+                let optimizer_permit = Arc::clone(&self.optimizer_permits).acquire_owned().await?;
+                self.acquire_background(Some(optimizer_permit), None).await
+            }
             ReorderPriority::AutomaticMerge => {
                 let merge_permit = Arc::clone(&self.automatic_merge_permits)
                     .acquire_owned()
                     .await?;
-                self.acquire_background(Some(merge_permit)).await
+                self.acquire_background(None, Some(merge_permit)).await
             }
             ReorderPriority::Foreground => self.acquire_foreground().await,
         }
@@ -198,6 +207,7 @@ impl ReorderConcurrencyGate {
     /// Acquire capacity for periodic optimizer or automatic merge work.
     async fn acquire_background(
         self: &Arc<Self>,
+        optimizer: Option<tokio::sync::OwnedSemaphorePermit>,
         automatic_merge: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> std::result::Result<ReorderPermit, tokio::sync::AcquireError> {
         loop {
@@ -222,6 +232,7 @@ impl ReorderConcurrencyGate {
             {
                 return Ok(ReorderPermit {
                     _permit: permit,
+                    _optimizer: optimizer,
                     _automatic_merge: automatic_merge,
                 });
             }
@@ -238,6 +249,7 @@ impl ReorderConcurrencyGate {
         let permit = Arc::clone(&self.permits).acquire_owned().await?;
         Ok(ReorderPermit {
             _permit: permit,
+            _optimizer: None,
             _automatic_merge: None,
         })
     }
@@ -276,6 +288,7 @@ impl ReorderConcurrencyGate {
 #[cfg(feature = "native")]
 pub(crate) struct ReorderPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _optimizer: Option<tokio::sync::OwnedSemaphorePermit>,
     _automatic_merge: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -314,7 +327,9 @@ pub struct IndexConfig {
     pub bmp_io_concurrency: usize,
     /// Number of parallel segment builders (documents distributed round-robin)
     pub num_indexing_threads: usize,
-    /// Number of threads for parallel block compression within each segment
+    /// Width of the document-store compression pool. Concurrent segment
+    /// builders requesting the same width share one process-wide pool, so
+    /// indexing-worker fan-out does not multiply this thread count.
     pub num_compression_threads: usize,
     /// Block cache size for term dictionary per segment
     pub term_cache_blocks: usize,
