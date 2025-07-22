@@ -38,14 +38,14 @@ An _approximate_ sparse index that abandons the document-space grid entirely:
 
 ## Why this matters for Hermes at 1B scale
 
-BMP's maximum grids are O(dims × vectors / block_size) before V18's local
+BMP's maximum grids are O(dims × vectors / `block_size`) before V19's local
 bit packing. At 1B vectors, `dims=105879`, `b=32`, and eight blocks per
-superblock, the dense D+E+H reference is 1.862 TB; actual V18 size is
+superblock, the dense D+E+H reference is 1.862 TB; actual V19 size is
 data-dependent because zero groups disappear and every 256-cell group uses
 its local width. H adds only 807.86 MB in that dense reference and avoids
 sweeping the 206.79 GB dense E reference at query time. Seismic's memory is
 O(kept postings): λ caps every list, so
-the index grows with _vocabulary_, not corpus × dims. That is a structurally
+the index grows with vocabulary, not corpus × dims. That is a structurally
 attractive shape for 1B vectors. The trade: approximate-only (no rank-safe
 mode), parameter-sensitive, and per-list clustering makes incremental
 merging awkward (blocks must be re-clustered per list — a rebuild-style
@@ -55,15 +55,15 @@ operation like our reorder, not a byte-stack merge).
 
 Most building blocks already exist:
 
-| Seismic component               | Hermes equivalent                                         |
-| ------------------------------- | --------------------------------------------------------- |
-| top-λ list pruning              | `pruning` (per-list fraction) — needs absolute-λ variant  |
-| α-mass summaries                | `doc_mass` logic (same cropping, applied to a max-vector) |
-| u8 quantization                 | `WeightQuantization::UInt8` + max_weight scale            |
-| shallow k-means                 | shared deterministic k-means++/Lloyd trainer             |
+| Seismic component               | Hermes equivalent                                                                                                                                            |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| top-λ list pruning              | `pruning` (per-list fraction) — needs absolute-λ variant                                                                                                     |
+| α-mass summaries                | `doc_mass` logic (same cropping, applied to a max-vector)                                                                                                    |
+| u8 quantization                 | `WeightQuantization::UInt8` + max_weight scale                                                                                                               |
+| shallow k-means                 | shared deterministic k-means++/Lloyd trainer                                                                                                                 |
 | forward index for exact scoring | BMP has the same values in block-local Flat-Inv form; a Seismic scorer would need a persistent document-major Fwd layout or an equivalent exact-vector store |
-| heap_factor pruning             | same knob/semantics as BMP/MaxScore                       |
-| kNN graph (Wave)                | could reuse the global dense IVF HNSW topology            |
+| heap_factor pruning             | same knob/semantics as BMP/MaxScore                                                                                                                          |
+| kNN graph (Wave)                | could reuse the global dense IVF HNSW topology                                                                                                               |
 
 Sketch: a third `SparseFormat::Seismic` with per-list blocked-cluster layout
 

@@ -1,10 +1,12 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V18 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V19 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
 //! table enables query-time recovery of the original coordinates.
 //!
-//! Postings are 2 bytes each: `(local_slot: u8, impact: u8)`.
+//! Per-term payloads adapt between 2-byte `(local_slot, impact)` postings and
+//! dense impact rows. Byte offsets use u16 unless a block payload exceeds the
+//! 15-bit inline range, and block maxima are packed u4.
 //!
 //! Based on Mallia, Suel & Tonellotto (SIGIR 2024).
 //!
@@ -18,7 +20,7 @@
 //!
 //! Peak memory: `input + grid_entries + O(num_blocks) block_data_starts`.
 //!
-//! ## BMP V18 Blob Layout (data-first, block-interleaved)
+//! ## BMP V19 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -31,13 +33,13 @@
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
 //!
 //! Per-block data layout (for non-empty blocks):
-//!   num_terms: u32                                    offset 0
+//!   raw_num_terms: u32                                high bit = u32 offsets
 //!   term_dim_ids: [u32-LE × num_terms]                offset 4
-//!   posting_starts: [u32-LE × (num_terms + 1)]        relative cumulative counts
-//!   term_max_impacts: [u8 × num_terms]                exact per-block maxima
-//!   postings: [(u8, u8) × total_block_postings]       BmpPosting pairs
+//!   payload_offsets: [u16/u32 × (num_terms + 1)]       byte offsets; high bit = dense
+//!   term_max_impacts: [packed-u4 × num_terms]          conservative maxima
+//!   payload: sparse [(u8, u8)] or dense [u8; block_size] per term
 //!
-//! BMP V18 Footer (80 bytes):
+//! BMP V19 Footer (80 bytes):
 //!   total_terms: u64              //  0- 7  (stats only)
 //!   total_postings: u64           //  8-15  (stats only)
 //!   grid_offset: u64              // 16-23  (byte offset of Section D)
@@ -51,7 +53,7 @@
 //!   doc_map_offset: u64           // 60-67  (byte offset of Section F)
 //!   num_real_docs: u32            // 68-71  (actual vector count before padding)
 //!   grid_bits: u32                // 72-75  (2 or 4)
-//!   magic: u32                    // 76-79  (BMP8 = 0x38504D42)
+//!   magic: u32                    // 76-79  (BMP9 = 0x39504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -89,6 +91,7 @@ impl VidLookup {
 }
 
 use crate::DocId;
+use crate::segment::bmp_adaptive::AdaptiveEncodeScratch;
 use crate::segment::bmp_grid::{
     CompressedGridLayout, GRID_GROUP_CELLS, LSP_SUPERBLOCK_GRID_BITS, bit_width, pack_group,
     quantize_block_maximum,
@@ -96,7 +99,7 @@ use crate::segment::bmp_grid::{
 use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V18 blob from per-dimension postings.
+/// Build a BMP V19 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -196,7 +199,7 @@ pub(crate) fn build_bmp_blob(
     if num_real_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP real document count exceeds the V18 u32 format limit",
+            "BMP real document count exceeds the V19 u32 format limit",
         ));
     }
 
@@ -221,7 +224,7 @@ pub(crate) fn build_bmp_blob(
     if num_virtual_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP padded document count exceeds the V18 u32 format limit",
+            "BMP padded document count exceeds the V19 u32 format limit",
         ));
     }
 
@@ -308,6 +311,9 @@ pub(crate) fn build_bmp_blob(
     let mut total_terms: u64 = 0;
     let mut total_postings: u64 = 0;
     let mut cumulative_bytes: u64 = 0;
+    let mut legacy_block_bytes: u64 = 0;
+    let mut dense_terms: u64 = 0;
+    let mut wide_blocks: u64 = 0;
     let mut last_block_filled: i64 = -1;
 
     // Per-block scratch (reused per block, bounded by one block's data ~4 KB)
@@ -316,6 +322,7 @@ pub(crate) fn build_bmp_blob(
     let mut blk_posting_counts: Vec<u32> = Vec::new();
     let mut blk_max_impacts: Vec<u8> = Vec::new();
     let mut blk_postings: Vec<u8> = Vec::new();
+    let mut adaptive_scratch = AdaptiveEncodeScratch::default();
 
     while let Some(&Reverse((block_id, _, _))) = heap.peek() {
         // Fill block_data_starts for empty blocks before this one
@@ -399,45 +406,21 @@ pub(crate) fn build_bmp_blob(
 
         // Serialize and write this block's data directly to writer
         if !blk_dim_ids.is_empty() {
-            blk_buf.clear();
-            let nt = blk_dim_ids.len();
-
-            // num_terms (u32)
-            let nt_u32 = u32::try_from(nt).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "BMP block term count exceeds the V18 u32 format limit",
-                )
-            })?;
-            blk_buf.extend_from_slice(&nt_u32.to_le_bytes());
-
-            // term_dim_ids [u32 × nt]
-            for &did in &blk_dim_ids {
-                blk_buf.extend_from_slice(&did.to_le_bytes());
-            }
-
-            // posting_starts [u32 × (nt + 1)] — relative cumulative.
-            // A 256-vector block with hundreds of dimensions can exceed
-            // 65,535 postings, so both counts and prefixes are u32.
-            let mut cum: u32 = 0;
-            for &count in &blk_posting_counts {
-                blk_buf.extend_from_slice(&cum.to_le_bytes());
-                cum = cum.checked_add(count).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "BMP block posting prefix exceeds u32::MAX",
-                    )
-                })?;
-            }
-            blk_buf.extend_from_slice(&cum.to_le_bytes());
-
-            // Exact per-term block maxima. The compressed D grid keeps its
-            // existing ceil-u4 semantics; these exact values let reorder
-            // rebuild tight ceil-u4 superblock maxima without rescanning postings.
-            blk_buf.extend_from_slice(&blk_max_impacts);
-
-            // postings [(u8, u8) × total_block_postings]
-            blk_buf.extend_from_slice(&blk_postings);
+            let encoding = adaptive_scratch.encode(
+                effective_block_size as usize,
+                true,
+                &blk_dim_ids,
+                &blk_posting_counts,
+                &blk_max_impacts,
+                &blk_postings,
+                &mut blk_buf,
+            )?;
+            dense_terms = dense_terms.saturating_add(encoding.dense_terms as u64);
+            wide_blocks += u64::from(encoding.wide_offsets);
+            legacy_block_bytes = legacy_block_bytes.saturating_add(
+                8u64.saturating_add((blk_dim_ids.len() as u64).saturating_mul(9))
+                    .saturating_add(blk_postings.len() as u64),
+            );
 
             writer.write_all(&blk_buf)?;
             cumulative_bytes += blk_buf.len() as u64;
@@ -455,8 +438,9 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V18 vectors={} padded={} blocks={} dims={} \
-         terms={} postings={} grid_entries={}",
+        "[bmp_build] V19 vectors={} padded={} blocks={} dims={} \
+         terms={} postings={} grid_entries={} section_b={} legacy_v18_section_b={} \
+         adaptive_ratio={:.3} dense_terms={} ({:.2}%) wide_blocks={}",
         num_real_docs,
         num_virtual_docs,
         num_blocks,
@@ -464,6 +448,12 @@ pub(crate) fn build_bmp_blob(
         total_terms,
         total_postings,
         grid_entries.len(),
+        crate::format_bytes(cumulative_bytes),
+        crate::format_bytes(legacy_block_bytes),
+        cumulative_bytes as f64 / legacy_block_bytes.max(1) as f64,
+        dense_terms,
+        dense_terms as f64 * 100.0 / total_terms.max(1) as f64,
+        wide_blocks,
     );
 
     // Free K-way merge inputs — reclaims per-dim posting Vecs and vid lookup.
@@ -525,7 +515,7 @@ pub(crate) fn build_bmp_blob(
 
     drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
 
-    // BMP V18 footer.
+    // BMP V19 footer.
     write_bmp_footer(
         writer,
         total_terms,
@@ -547,7 +537,7 @@ pub(crate) fn build_bmp_blob(
     Ok(bytes_written)
 }
 
-/// Write the BMP V18 footer.
+/// Write the BMP V19 footer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,

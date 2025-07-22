@@ -119,7 +119,7 @@ impl SegmentMerger {
                         .try_fold(0u32, |total, vectors| total.checked_add(vectors))
                         .ok_or_else(|| {
                             crate::Error::Internal(
-                                "merged BMP vector count exceeds the V18 u32 format limit".into(),
+                                "merged BMP vector count exceeds the V19 u32 format limit".into(),
                             )
                         })?;
                     let bmp_block_size = sparse_config
@@ -592,7 +592,7 @@ fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawDa
     Ok(())
 }
 
-/// Merge BMP fields with the **streaming block-copy V18 format**.
+/// Merge BMP fields with the **streaming block-copy V19 format**.
 ///
 /// Block-copy merge: all segments share the same `dims`, `bmp_block_size`,
 /// and `max_weight_scale`, so blocks are self-contained and can be copied directly.
@@ -605,7 +605,7 @@ fn validate_sparse_merge_source(dim_id: u32, source_index: usize, raw: &DimRawDa
 /// 4. Stream Sections E+H — ceil-u4 values decoded/repacked into the output
 ///    superblock and coarse-superblock coordinate systems
 /// 5. Stream Section F+G (doc_map) — bulk copy with offset patching
-/// 6. Write the V18 footer
+/// 6. Write the V19 footer
 ///
 /// Peak memory is one row's group descriptors/selectors, one superblock row,
 /// and fixed-size copy/decode buffers; it does not scale with postings.
@@ -671,14 +671,14 @@ fn merge_bmp_field(
             .checked_add(bmp.num_blocks)
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "merged BMP block count exceeds the V18 u32 format limit".into(),
+                    "merged BMP block count exceeds the V19 u32 format limit".into(),
                 )
             })?;
         num_real_docs_total = num_real_docs_total
             .checked_add(bmp.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "merged BMP real-document count exceeds the V18 u32 format limit".into(),
+                    "merged BMP real-document count exceeds the V19 u32 format limit".into(),
                 )
             })?;
     }
@@ -693,7 +693,7 @@ fn merge_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "merged BMP virtual-document count exceeds the V18 u32 format limit".into(),
+                "merged BMP virtual-document count exceeds the V19 u32 format limit".into(),
             )
         })?;
     // Pre-compute aggregate stats (needed for footer, independent of block order)
@@ -878,7 +878,7 @@ fn merge_bmp_field(
         )?;
     }
 
-    // ── Phase 6: Write V18 footer ───────────────────────────────────────
+    // ── Phase 6: Write V19 footer ───────────────────────────────────────
     write_bmp_footer(
         writer,
         total_terms,

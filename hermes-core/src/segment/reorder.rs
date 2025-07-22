@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{FieldType, Schema};
+use crate::segment::bmp_adaptive::{AdaptiveEncodeScratch, BmpPosting};
 use crate::segment::format::{SparseFieldToc, write_sparse_toc_and_footer};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::{SegmentFiles, SegmentId, SegmentMeta};
@@ -493,37 +494,26 @@ fn record_window_memory_bytes(
         .checked_add(routed_bytes)
 }
 
-fn push_rewrite_bytes(buffer: &mut Vec<u8>, bytes: &[u8], writer: &mut OffsetWriter) -> Result<()> {
-    if buffer.len() + bytes.len() > buffer.capacity() {
-        writer.write_all(buffer).map_err(crate::Error::Io)?;
-        buffer.clear();
-    }
-    if bytes.len() > buffer.capacity() {
-        writer.write_all(bytes).map_err(crate::Error::Io)
-    } else {
-        buffer.extend_from_slice(bytes);
-        Ok(())
-    }
-}
-
-fn flush_rewrite_bytes(buffer: &mut Vec<u8>, writer: &mut OffsetWriter) -> Result<()> {
-    if !buffer.is_empty() {
-        writer.write_all(buffer).map_err(crate::Error::Io)?;
-        buffer.clear();
-    }
-    Ok(())
+#[derive(Default)]
+struct RoutedBlockEncodeScratch {
+    dimensions: Vec<u32>,
+    posting_counts: Vec<u32>,
+    maxima: Vec<u8>,
+    codec: AdaptiveEncodeScratch,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_sorted_routed_block(
     out_block: u32,
     postings: &[RoutedPosting],
+    block_size: usize,
     grid_entries: &mut Vec<BmpGridEntry>,
     grid_run_entries: usize,
     run_files: &mut GridScratchFiles,
     field_id: u32,
     rayon_pool: Option<&rayon::ThreadPool>,
-    posting_buffer: &mut Vec<u8>,
+    scratch: &mut RoutedBlockEncodeScratch,
+    encoded_block: &mut Vec<u8>,
     writer: &mut OffsetWriter,
 ) -> Result<(u64, usize)> {
     if postings.is_empty() {
@@ -535,50 +525,16 @@ fn write_sorted_routed_block(
             .all(|posting| posting.out_local == postings[0].out_local)
     );
 
+    scratch.dimensions.clear();
+    scratch.posting_counts.clear();
+    scratch.maxima.clear();
     let num_terms = 1 + postings
         .windows(2)
         .filter(|pair| pair[0].dimension != pair[1].dimension)
         .count();
-    let start_offset = writer.offset();
-    posting_buffer.clear();
-    push_rewrite_bytes(
-        posting_buffer,
-        &u32::try_from(num_terms)
-            .map_err(|_| crate::Error::Internal("BMP block term count exceeds u32::MAX".into()))?
-            .to_le_bytes(),
-        writer,
-    )?;
-
-    push_rewrite_bytes(posting_buffer, &postings[0].dimension.to_le_bytes(), writer)?;
-    for pair in postings.windows(2) {
-        if pair[0].dimension != pair[1].dimension {
-            push_rewrite_bytes(posting_buffer, &pair[1].dimension.to_le_bytes(), writer)?;
-        }
-    }
-
-    push_rewrite_bytes(posting_buffer, &0u32.to_le_bytes(), writer)?;
-    for (index, pair) in postings.windows(2).enumerate() {
-        if pair[0].dimension != pair[1].dimension {
-            push_rewrite_bytes(
-                posting_buffer,
-                &u32::try_from(index + 1)
-                    .map_err(|_| {
-                        crate::Error::Internal("BMP block posting prefix exceeds u32::MAX".into())
-                    })?
-                    .to_le_bytes(),
-                writer,
-            )?;
-        }
-    }
-    push_rewrite_bytes(
-        posting_buffer,
-        &u32::try_from(postings.len())
-            .map_err(|_| {
-                crate::Error::Internal("BMP block posting prefix exceeds u32::MAX".into())
-            })?
-            .to_le_bytes(),
-        writer,
-    )?;
+    scratch.dimensions.reserve_exact(num_terms);
+    scratch.posting_counts.reserve_exact(num_terms);
+    scratch.maxima.reserve_exact(num_terms);
 
     let mut term_start = 0usize;
     while term_start < postings.len() {
@@ -589,7 +545,13 @@ fn write_sorted_routed_block(
             max_impact = max_impact.max(postings[term_end].impact);
             term_end += 1;
         }
-        push_rewrite_bytes(posting_buffer, &[max_impact], writer)?;
+        scratch.dimensions.push(dimension);
+        scratch
+            .posting_counts
+            .push(u32::try_from(term_end - term_start).map_err(|_| {
+                crate::Error::Internal("BMP block posting count exceeds u32::MAX".into())
+            })?);
+        scratch.maxima.push(max_impact);
         if grid_entries.len() == grid_run_entries {
             spill_grid_entries(grid_entries, run_files, field_id, rayon_pool)?;
         }
@@ -597,10 +559,25 @@ fn write_sorted_routed_block(
         term_start = term_end;
     }
 
-    for posting in postings {
-        push_rewrite_bytes(posting_buffer, &[posting.slot, posting.impact], writer)?;
-    }
-    flush_rewrite_bytes(posting_buffer, writer)?;
+    debug_assert_eq!(scratch.dimensions.len(), num_terms);
+    scratch
+        .codec
+        .encode_postings(
+            block_size,
+            true,
+            &scratch.dimensions,
+            &scratch.posting_counts,
+            &scratch.maxima,
+            postings.len(),
+            |index| BmpPosting {
+                local_slot: postings[index].slot,
+                impact: postings[index].impact,
+            },
+            encoded_block,
+        )
+        .map_err(crate::Error::Io)?;
+    let start_offset = writer.offset();
+    writer.write_all(encoded_block).map_err(crate::Error::Io)?;
     Ok((writer.offset() - start_offset, num_terms))
 }
 
@@ -1491,7 +1468,7 @@ fn reorder_bmp_field_blockwise(
     }
     if num_blocks_total > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V18 u32 format limit".into(),
+            "reordered BMP block count exceeds the V19 u32 format limit".into(),
         ));
     }
     let num_virtual_docs = num_blocks_total
@@ -1499,7 +1476,7 @@ fn reorder_bmp_field_blockwise(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V18 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the V19 u32 format limit".into(),
             )
         })?;
 
@@ -1692,7 +1669,7 @@ fn reorder_bmp_field_blockwise(
             .checked_add(b.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "reordered BMP real-document count exceeds the V18 u32 format limit".into(),
+                    "reordered BMP real-document count exceeds the V19 u32 format limit".into(),
                 )
             })?;
     }
@@ -2100,7 +2077,7 @@ pub(crate) fn reorder_bmp_field(
     }
     if num_real_docs > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP real-document count exceeds the V18 u32 format limit".into(),
+            "reordered BMP real-document count exceeds the V19 u32 format limit".into(),
         ));
     }
 
@@ -2230,7 +2207,7 @@ pub(crate) fn reorder_bmp_field(
     let new_num_blocks = num_real_docs.div_ceil(effective_block_size);
     if new_num_blocks > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V18 u32 format limit".into(),
+            "reordered BMP block count exceeds the V19 u32 format limit".into(),
         ));
     }
     let new_num_virtual_docs = new_num_blocks
@@ -2238,7 +2215,7 @@ pub(crate) fn reorder_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V18 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the V19 u32 format limit".into(),
             )
         })?;
 
@@ -2279,15 +2256,15 @@ pub(crate) fn reorder_bmp_field(
     let mut grid_entries: Vec<BmpGridEntry> = Vec::with_capacity(grid_run_entries);
     let mut run_files = GridScratchFiles::new(field_id, scratch_path);
 
-    // Transpose records through exact-counted flat tuples. Block encoding
-    // streams directly to the buffered output, so admission covers only the
-    // live routes/jobs/counts/partitions/tuples plus one reusable write buffer.
+    // Transpose records through exact-counted flat tuples. One block's
+    // adaptive header/payload and term metadata are reused across the window.
     let posting_buffer_bytes = (encode_window_budget / 16)
         .clamp(64 * 1024, REWRITE_IO_BUFFER_BYTES)
         .min(encode_window_budget.saturating_div(2))
         .max(2);
     let transpose_budget = encode_window_budget.saturating_sub(posting_buffer_bytes);
-    let mut posting_buffer = Vec::with_capacity(posting_buffer_bytes);
+    let mut encoded_block = Vec::with_capacity(posting_buffer_bytes);
+    let mut block_encode_scratch = RoutedBlockEncodeScratch::default();
     let total_source_postings = sources.iter().fold(0u64, |total, (source, _)| {
         total.saturating_add(source.total_postings())
     });
@@ -2420,12 +2397,14 @@ pub(crate) fn reorder_bmp_field(
             let (block_bytes, block_terms) = write_sorted_routed_block(
                 global_block,
                 block_postings,
+                effective_block_size,
                 &mut grid_entries,
                 grid_run_entries,
                 &mut run_files,
                 field_id,
                 rayon_pool.as_deref(),
-                &mut posting_buffer,
+                &mut block_encode_scratch,
+                &mut encoded_block,
                 &mut writer,
             )?;
             total_terms = total_terms.saturating_add(block_terms as u64);
@@ -2502,7 +2481,7 @@ pub(crate) fn reorder_bmp_field(
     )?;
     let doc_maps_elapsed = doc_maps_start.elapsed();
 
-    // V18 footer.
+    // V19 footer.
     write_bmp_footer(
         &mut writer,
         total_terms,
