@@ -28,8 +28,9 @@ const SLICE_CACHE_VERSION: u32 = 2;
 struct CachedSlice {
     /// Byte range in the file
     range: Range<u64>,
-    /// The cached data
-    data: Arc<Vec<u8>>,
+    /// Arc-backed cached data. Cache hits return cheap sub-slices instead of
+    /// allocating and copying the requested range.
+    data: OwnedBytes,
     /// Access counter for LRU eviction
     access_count: u64,
 }
@@ -61,13 +62,17 @@ impl FileSliceCache {
             buf.extend_from_slice(&slice.range.end.to_le_bytes());
             // Data length and data
             buf.extend_from_slice(&(slice.data.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&slice.data);
+            buf.extend_from_slice(slice.data.as_slice());
         }
         buf
     }
 
     /// Deserialize from bytes, returns (cache, bytes_consumed)
-    fn deserialize(data: &[u8], access_counter: u64) -> io::Result<(Self, usize)> {
+    fn deserialize(
+        data: &[u8],
+        access_counter: u64,
+        max_bytes: usize,
+    ) -> io::Result<(Self, usize)> {
         let mut pos = 0;
         if data.len() < 4 {
             return Err(io::Error::new(
@@ -93,24 +98,40 @@ impl FileSliceCache {
             let data_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
-            if pos + data_len > data.len() {
+            let data_end = pos.checked_add(data_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "slice data length overflow")
+            })?;
+            if data_end > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated slice data",
                 ));
             }
-            let slice_data = data[pos..pos + data_len].to_vec();
-            pos += data_len;
+            if range_end < range_start || range_end - range_start != data_len as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "slice range and data length are inconsistent",
+                ));
+            }
+            let slice_range = range_start..range_end;
+            pos = data_end;
 
-            cache.total_bytes += slice_data.len();
-            cache.slices.insert(
-                range_start,
-                CachedSlice {
-                    range: range_start..range_end,
-                    data: Arc::new(slice_data),
-                    access_count: access_counter,
-                },
-            );
+            // Do not duplicate an oversized serialized entry just to evict it
+            // after the complete cache has been reconstructed. Retain at most
+            // one cache budget while parsing each file.
+            if data_len <= max_bytes {
+                let bytes_to_free = cache
+                    .total_bytes
+                    .saturating_add(data_len)
+                    .saturating_sub(max_bytes);
+                cache.evict_lru(bytes_to_free);
+                cache.insert(
+                    slice_range,
+                    OwnedBytes::new(data[data_end - data_len..data_end].to_vec()),
+                    access_counter,
+                );
+                debug_assert!(cache.total_bytes <= max_bytes);
+            }
         }
         Ok((cache, pos))
     }
@@ -122,7 +143,7 @@ impl FileSliceCache {
     }
 
     /// Try to read from cache, returns None if not fully cached
-    fn try_read(&mut self, range: Range<u64>, access_counter: &mut u64) -> Option<Vec<u8>> {
+    fn try_read(&mut self, range: Range<u64>, access_counter: &mut u64) -> Option<OwnedBytes> {
         // Find slices that might contain our range
         let start = range.start;
         let end = range.end;
@@ -145,7 +166,7 @@ impl FileSliceCache {
             *access_counter += 1;
             if let Some(s) = self.slices.get_mut(&key) {
                 s.access_count = *access_counter;
-                return Some(s.data[offset..offset + len].to_vec());
+                return Some(s.data.slice(offset..offset + len));
             }
         }
 
@@ -154,7 +175,7 @@ impl FileSliceCache {
 
     /// Insert a slice, merging with overlapping slices
     /// Returns the net change in bytes (can be negative if merge reduces size, but typically positive)
-    fn insert(&mut self, range: Range<u64>, data: Vec<u8>, access_counter: u64) -> isize {
+    fn insert(&mut self, range: Range<u64>, data: OwnedBytes, access_counter: u64) -> isize {
         let start = range.start;
         let end = range.end;
         let data_len = data.len();
@@ -163,7 +184,7 @@ impl FileSliceCache {
         let mut to_remove = Vec::new();
         let mut merged_start = start;
         let mut merged_end = end;
-        let mut merged_data: Option<Vec<u8>> = None;
+        let mut merged_data: Option<OwnedBytes> = None;
         let mut bytes_removed: usize = 0;
 
         for (&slice_start, slice) in &self.slices {
@@ -186,7 +207,8 @@ impl FileSliceCache {
             for &slice_start in &to_remove {
                 if let Some(slice) = self.slices.get(&slice_start) {
                     let offset = (slice_start - merged_start) as usize;
-                    new_data[offset..offset + slice.data.len()].copy_from_slice(&slice.data);
+                    new_data[offset..offset + slice.data.len()]
+                        .copy_from_slice(slice.data.as_slice());
                     bytes_removed += slice.data.len();
                     self.total_bytes -= slice.data.len();
                 }
@@ -194,14 +216,14 @@ impl FileSliceCache {
 
             // Copy new data (overwrites any overlapping parts)
             let offset = (start - merged_start) as usize;
-            new_data[offset..offset + data_len].copy_from_slice(&data);
+            new_data[offset..offset + data_len].copy_from_slice(data.as_slice());
 
             // Remove old slices
             for slice_start in to_remove {
                 self.slices.remove(&slice_start);
             }
 
-            merged_data = Some(new_data);
+            merged_data = Some(OwnedBytes::new(new_data));
         }
 
         // Insert the (possibly merged) slice
@@ -218,7 +240,7 @@ impl FileSliceCache {
             final_start,
             CachedSlice {
                 range: final_start..final_start + bytes_added as u64,
-                data: Arc::new(final_data),
+                data: final_data,
                 access_count: access_counter,
             },
         );
@@ -251,6 +273,43 @@ impl FileSliceCache {
 
         freed
     }
+}
+
+fn evict_cached_slices(
+    caches: &mut std::collections::HashMap<PathBuf, FileSliceCache>,
+    current_bytes: &mut usize,
+    max_bytes: usize,
+    needed: usize,
+) {
+    let target = current_bytes
+        .saturating_add(needed)
+        .saturating_sub(max_bytes);
+    let mut freed = 0;
+
+    while freed < target {
+        let oldest_file = caches
+            .iter()
+            .filter(|(_, cache)| !cache.slices.is_empty())
+            .min_by_key(|(_, cache)| {
+                cache
+                    .slices
+                    .values()
+                    .map(|slice| slice.access_count)
+                    .min()
+                    .unwrap_or(u64::MAX)
+            })
+            .map(|(path, _)| path.clone());
+
+        let Some(path) = oldest_file else {
+            break;
+        };
+        let Some(file_cache) = caches.get_mut(&path) else {
+            break;
+        };
+        freed += file_cache.evict_lru(target - freed);
+    }
+
+    *current_bytes = current_bytes.saturating_sub(freed);
 }
 
 /// Slice-caching directory wrapper
@@ -296,7 +355,7 @@ impl<D: Directory> SliceCachingDirectory<D> {
     }
 
     /// Try to read from cache
-    fn try_cache_read(&self, path: &Path, range: Range<u64>) -> Option<Vec<u8>> {
+    fn try_cache_read(&self, path: &Path, range: Range<u64>) -> Option<OwnedBytes> {
         let mut caches = self.caches.write();
         let mut counter = self.access_counter.write();
 
@@ -308,71 +367,34 @@ impl<D: Directory> SliceCachingDirectory<D> {
     }
 
     /// Insert into cache, evicting if necessary
-    fn cache_insert(&self, path: &Path, range: Range<u64>, data: Vec<u8>) {
+    fn cache_insert(&self, path: &Path, range: Range<u64>, data: OwnedBytes) {
         let data_len = data.len();
-
-        // Check if we need to evict
-        {
-            let current = *self.current_bytes.read();
-            if current + data_len > self.max_bytes {
-                self.evict_to_fit(data_len);
-            }
+        // An individual entry larger than the entire cache can never fit.
+        // Bypass it instead of evicting useful data and exceeding the cap.
+        if data_len > self.max_bytes {
+            return;
         }
 
         let mut caches = self.caches.write();
+        let mut current = self.current_bytes.write();
         let counter = *self.access_counter.read();
 
+        // Free enough space before merging. Besides keeping the retained size
+        // bounded, this avoids constructing a large merged allocation only to
+        // evict it immediately afterward.
+        evict_cached_slices(&mut caches, &mut current, self.max_bytes, data_len);
         let file_cache = caches
             .entry(path.to_path_buf())
             .or_insert_with(FileSliceCache::new);
 
         let net_change = file_cache.insert(range, data, counter);
-        let mut current = self.current_bytes.write();
         if net_change >= 0 {
             *current += net_change as usize;
         } else {
             *current = current.saturating_sub((-net_change) as usize);
         }
-    }
-
-    /// Evict slices to make room for new data
-    fn evict_to_fit(&self, needed: usize) {
-        let mut caches = self.caches.write();
-        let mut current = self.current_bytes.write();
-
-        let target = if *current + needed > self.max_bytes {
-            (*current + needed) - self.max_bytes
-        } else {
-            return;
-        };
-
-        let mut freed = 0;
-
-        // Evict from all file caches until we have enough space
-        while freed < target {
-            // Find the file cache with the oldest access
-            let oldest_file = caches
-                .iter()
-                .filter(|(_, fc)| !fc.slices.is_empty())
-                .min_by_key(|(_, fc)| {
-                    fc.slices
-                        .values()
-                        .map(|s| s.access_count)
-                        .min()
-                        .unwrap_or(u64::MAX)
-                })
-                .map(|(p, _)| p.clone());
-
-            if let Some(path) = oldest_file {
-                if let Some(file_cache) = caches.get_mut(&path) {
-                    freed += file_cache.evict_lru(target - freed);
-                }
-            } else {
-                break;
-            }
-        }
-
-        *current = current.saturating_sub(freed);
+        evict_cached_slices(&mut caches, &mut current, self.max_bytes, 0);
+        debug_assert!(*current <= self.max_bytes);
     }
 
     /// Get cache statistics
@@ -513,13 +535,22 @@ impl<D: Directory> SliceCachingDirectory<D> {
             pos += path_len;
 
             // File cache
-            let (file_cache, consumed) = FileSliceCache::deserialize(&data[pos..], counter)?;
+            let (file_cache, consumed) =
+                FileSliceCache::deserialize(&data[pos..], counter, self.max_bytes)?;
             pos += consumed;
 
-            // Merge into existing cache
-            *current_bytes += file_cache.total_bytes;
-            caches.insert(path, file_cache);
+            let new_bytes = file_cache.total_bytes;
+            if let Some(previous) = caches.insert(path, file_cache) {
+                *current_bytes = current_bytes.saturating_sub(previous.total_bytes);
+            }
+            *current_bytes = current_bytes.saturating_add(new_bytes);
+            evict_cached_slices(&mut caches, &mut current_bytes, self.max_bytes, 0);
         }
+
+        // Recompute once after loading as a consistency check for serialized
+        // caches containing duplicate paths or overlapping ranges.
+        *current_bytes = caches.values().map(|cache| cache.total_bytes).sum();
+        evict_cached_slices(&mut caches, &mut current_bytes, self.max_bytes, 0);
 
         // Load file sizes
         if pos + 4 <= data.len() {
@@ -625,7 +656,7 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
 
         // Try cache first for full file
         if let Some(data) = self.try_cache_read(path, full_range.clone()) {
-            return Ok(FileHandle::from_bytes(OwnedBytes::new(data)));
+            return Ok(FileHandle::from_bytes(data));
         }
 
         // Read from inner
@@ -633,7 +664,7 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
         let bytes = handle.read_bytes().await?;
 
         // Cache the full file
-        self.cache_insert(path, full_range, bytes.as_slice().to_vec());
+        self.cache_insert(path, full_range, bytes.clone());
 
         Ok(FileHandle::from_bytes(bytes))
     }
@@ -641,14 +672,14 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
         // Try cache first
         if let Some(data) = self.try_cache_read(path, range.clone()) {
-            return Ok(OwnedBytes::new(data));
+            return Ok(data);
         }
 
         // Read from inner
         let data = self.inner.read_range(path, range.clone()).await?;
 
         // Cache the result
-        self.cache_insert(path, range, data.as_slice().to_vec());
+        self.cache_insert(path, range, data.clone());
 
         Ok(data)
     }
@@ -684,7 +715,7 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
                     if let Some(file_cache) = caches_guard.get_mut(&path)
                         && let Some(data) = file_cache.try_read(range.clone(), &mut counter)
                     {
-                        return Ok(OwnedBytes::new(data));
+                        return Ok(data);
                     }
                 }
 
@@ -694,30 +725,23 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
                 let data = inner.read_range(&path, range.clone()).await?;
 
                 // Cache the result
-                let data_len = data.as_slice().len();
-                {
-                    // Check if we need to evict
-                    let current = *current_bytes.read();
-                    if current + data_len > max_bytes {
-                        // Simple eviction: just skip caching if over limit
-                        // Full eviction would require more complex logic here
+                let data_len = data.len();
+                if data_len <= max_bytes {
+                    let mut caches_guard = caches.write();
+                    let mut current = current_bytes.write();
+                    let counter = *access_counter.read();
+                    evict_cached_slices(&mut caches_guard, &mut current, max_bytes, data_len);
+                    let file_cache = caches_guard
+                        .entry(path.clone())
+                        .or_insert_with(FileSliceCache::new);
+                    let net_change = file_cache.insert(range, data.clone(), counter);
+                    if net_change >= 0 {
+                        *current += net_change as usize;
                     } else {
-                        let mut caches_guard = caches.write();
-                        let counter = *access_counter.read();
-
-                        let file_cache = caches_guard
-                            .entry(path.clone())
-                            .or_insert_with(FileSliceCache::new);
-
-                        let net_change =
-                            file_cache.insert(range, data.as_slice().to_vec(), counter);
-                        let mut current = current_bytes.write();
-                        if net_change >= 0 {
-                            *current += net_change as usize;
-                        } else {
-                            *current = current.saturating_sub((-net_change) as usize);
-                        }
+                        *current = current.saturating_sub((-net_change) as usize);
                     }
+                    evict_cached_slices(&mut caches_guard, &mut current, max_bytes, 0);
+                    debug_assert!(*current <= max_bytes);
                 }
 
                 Ok(data)
@@ -862,6 +886,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slice_cache_hits_reuse_the_cached_backing_allocation() {
+        let ram = RamDirectory::new();
+        ram.write(Path::new("test.bin"), &[7; 64]).await.unwrap();
+        let cached = SliceCachingDirectory::new(ram, 64);
+
+        let miss = cached
+            .read_range(Path::new("test.bin"), 8..56)
+            .await
+            .unwrap();
+        let hit = cached
+            .read_range(Path::new("test.bin"), 8..56)
+            .await
+            .unwrap();
+
+        assert_eq!(miss.as_slice(), hit.as_slice());
+        assert_eq!(miss.as_slice().as_ptr(), hit.as_slice().as_ptr());
+    }
+
+    #[tokio::test]
+    async fn oversized_slice_bypasses_cache_instead_of_exceeding_limit() {
+        let ram = RamDirectory::new();
+        ram.write(Path::new("test.bin"), &[3; 32]).await.unwrap();
+        let cached = SliceCachingDirectory::new(ram, 8);
+
+        let data = cached
+            .read_range(Path::new("test.bin"), 0..32)
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 32);
+        assert_eq!(cached.stats().total_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn test_slice_cache_overlap_merge() {
         let ram = RamDirectory::new();
         ram.write(Path::new("test.bin"), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
@@ -986,5 +1043,20 @@ mod tests {
         let cached2 = SliceCachingDirectory::new(RamDirectory::new(), 1024);
         cached2.deserialize(&serialized).unwrap();
         assert!(cached2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deserialization_enforces_the_destination_cache_limit() {
+        let ram = RamDirectory::new();
+        ram.write(Path::new("test.bin"), &[1; 64]).await.unwrap();
+        let source = SliceCachingDirectory::new(ram.clone(), 64);
+        source
+            .read_range(Path::new("test.bin"), 0..64)
+            .await
+            .unwrap();
+
+        let destination = SliceCachingDirectory::new(ram, 8);
+        destination.deserialize(&source.serialize()).unwrap();
+        assert!(destination.stats().total_bytes <= 8);
     }
 }

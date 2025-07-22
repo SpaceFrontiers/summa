@@ -13,6 +13,11 @@ use log::{debug, warn};
 
 use crate::DocId;
 
+/// Avoid eagerly reserving an arbitrarily large top-k heap. Most searches
+/// return far fewer hits than a very large requested limit, so let the heap
+/// grow on demand beyond this point.
+const MAX_INITIAL_SCORE_COLLECTOR_CAPACITY: usize = 8 * 1024;
+
 /// Entry for top-k min-heap
 #[derive(Clone, Copy)]
 pub struct HeapEntry {
@@ -68,21 +73,20 @@ pub struct ScoreCollector {
     /// Cached threshold: avoids repeated heap.peek() in hot loops.
     /// Updated only when the heap changes (insert/pop).
     cached_threshold: f32,
-    /// Number of real entries in the heap. Threshold seeding fills unused
-    /// slots with sentinels, so `heap.len()` alone cannot answer this.
-    real_len: usize,
+    /// Score of the logical sentinel filling every unused top-k slot after
+    /// threshold seeding. Keeping one score here instead of `k - heap.len()`
+    /// entries makes filling those unused slots O(1) time and memory.
+    virtual_threshold: Option<f32>,
 }
 
 impl ScoreCollector {
     /// Create a new collector for top-k results
     pub fn new(k: usize) -> Self {
-        // Cap capacity to avoid allocation overflow for very large k
-        let capacity = k.saturating_add(1).min(1_000_000);
         Self {
-            heap: BinaryHeap::with_capacity(capacity),
+            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_SCORE_COLLECTOR_CAPACITY)),
             k,
             cached_threshold: 0.0,
-            real_len: 0,
+            virtual_threshold: None,
         }
     }
 
@@ -95,7 +99,9 @@ impl ScoreCollector {
     /// Recompute cached threshold from heap state
     #[inline]
     fn update_threshold(&mut self) {
-        self.cached_threshold = if self.heap.len() >= self.k {
+        self.cached_threshold = if let Some(threshold) = self.virtual_threshold {
+            threshold
+        } else if self.heap.len() >= self.k {
             self.heap.peek().map(|e| e.score).unwrap_or(0.0)
         } else {
             0.0
@@ -122,21 +128,28 @@ impl ScoreCollector {
             ordinal,
         };
         if self.heap.len() < self.k {
+            if let Some(threshold) = self.virtual_threshold {
+                let sentinel = HeapEntry {
+                    doc_id: u32::MAX,
+                    score: threshold,
+                    ordinal: 0,
+                };
+                if entry >= sentinel {
+                    return false;
+                }
+            }
+
             self.heap.push(entry);
-            self.real_len += 1;
-            // Only recompute threshold when heap just became full
+            // The final real entry displaces the last virtual sentinel.
             if self.heap.len() == self.k {
+                self.virtual_threshold = None;
                 self.update_threshold();
             }
             true
         } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
-            self.heap.push(entry);
-            if self
-                .heap
-                .pop()
-                .is_some_and(|evicted| evicted.doc_id == u32::MAX)
             {
-                self.real_len += 1;
+                let mut worst = self.heap.peek_mut().expect("full heap has a root");
+                *worst = entry;
             }
             self.update_threshold();
             true
@@ -148,7 +161,7 @@ impl ScoreCollector {
     /// Check if a score could potentially enter top-k
     #[inline]
     pub fn would_enter(&self, score: f32) -> bool {
-        self.heap.len() < self.k || score > self.cached_threshold
+        self.len() < self.k || score > self.cached_threshold
     }
 
     /// Check whether this fully identified candidate ranks ahead of the current
@@ -163,37 +176,50 @@ impl ScoreCollector {
             score,
             ordinal,
         };
-        self.heap.len() < self.k || self.heap.peek().is_some_and(|worst| entry < *worst)
+        if let Some(threshold) = self.virtual_threshold {
+            let sentinel = HeapEntry {
+                doc_id: u32::MAX,
+                score: threshold,
+                ordinal: 0,
+            };
+            entry < sentinel
+        } else {
+            self.heap.len() < self.k || self.heap.peek().is_some_and(|worst| entry < *worst)
+        }
     }
 
-    /// Get number of documents collected so far
+    /// Get the conceptual heap length, including virtual threshold sentinels.
     #[inline]
     pub fn len(&self) -> usize {
-        self.heap.len()
+        if self.virtual_threshold.is_some() {
+            self.k
+        } else {
+            self.heap.len()
+        }
     }
 
     /// Number of real results retained, excluding threshold sentinels.
     #[inline]
     pub fn real_len(&self) -> usize {
-        self.real_len
+        self.heap.len()
     }
 
     /// Check if collector is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.len() == 0
     }
 
     /// Seed the threshold from a cross-segment shared value.
     ///
-    /// Fills unused slots and replaces retained entries below the new floor
-    /// with dummy entries. This can be called repeatedly while another
-    /// segment raises the shared threshold; equal-scoring real candidates win
-    /// the deterministic doc-id tie break over sentinels.
+    /// Logically fills unused slots and replaces retained entries below the new
+    /// floor with virtual dummy entries. This can be called repeatedly while
+    /// another segment raises the shared threshold; equal-scoring real
+    /// candidates win the deterministic doc-id tie break over sentinels.
     pub fn seed_threshold(&mut self, initial_threshold: f32) {
         if initial_threshold <= 0.0
             || self.k == 0
-            || (self.heap.len() >= self.k && initial_threshold <= self.cached_threshold)
+            || (self.len() >= self.k && initial_threshold <= self.cached_threshold)
         {
             return;
         }
@@ -203,18 +229,28 @@ impl ScoreCollector {
             score: initial_threshold,
             ordinal: 0,
         };
-        while self.heap.len() < self.k {
-            self.heap.push(sentinel);
-        }
-        while self.heap.peek().is_some_and(|worst| sentinel < *worst) {
-            self.heap.push(sentinel);
-            if self
-                .heap
-                .pop()
-                .is_some_and(|evicted| evicted.doc_id != u32::MAX)
-            {
-                self.real_len -= 1;
+
+        // When unused slots are already represented by a virtual sentinel, a
+        // new seed only changes the heap if it outranks the old floor. With an
+        // all-real full heap, it must similarly outrank the current root.
+        if let Some(current_threshold) = self.virtual_threshold {
+            let current = HeapEntry {
+                doc_id: u32::MAX,
+                score: current_threshold,
+                ordinal: 0,
+            };
+            if sentinel >= current {
+                return;
             }
+        } else if self.heap.len() >= self.k
+            && !self.heap.peek().is_some_and(|worst| sentinel < *worst)
+        {
+            return;
+        }
+
+        self.virtual_threshold = Some(initial_threshold);
+        while self.heap.peek().is_some_and(|worst| sentinel < *worst) {
+            self.heap.pop();
         }
         self.update_threshold();
     }
@@ -1301,6 +1337,57 @@ mod tests {
         assert_eq!(collector.real_len(), 2);
         let results = collector.into_sorted_results();
         assert_eq!(results, vec![(1, 10.0, 0), (3, 6.0, 0)]);
+    }
+
+    #[test]
+    fn test_large_seed_uses_virtual_sentinels() {
+        let k = 1_000_000_000;
+        let mut collector = ScoreCollector::new(k);
+        assert!(collector.heap.capacity() <= MAX_INITIAL_SCORE_COLLECTOR_CAPACITY);
+
+        collector.seed_threshold(42.0);
+
+        // Seeding a huge top-k is constant-time and does not materialize any
+        // of its conceptual sentinel entries.
+        assert_eq!(collector.heap.len(), 0);
+        assert!(collector.heap.capacity() <= MAX_INITIAL_SCORE_COLLECTOR_CAPACITY);
+        assert_eq!(collector.len(), k);
+        assert_eq!(collector.real_len(), 0);
+        assert_eq!(collector.threshold(), 42.0);
+        assert!(!collector.is_empty());
+
+        // A real result tied with the floor beats the sentinel by doc-id, while
+        // a lower score remains below the conceptual threshold.
+        assert!(collector.insert_with_ordinal(9, 42.0, 7));
+        assert!(!collector.insert(10, 41.0));
+        assert!(collector.insert(11, 43.0));
+        assert_eq!(collector.len(), k);
+        assert_eq!(collector.real_len(), 2);
+        assert_eq!(
+            collector.into_sorted_results(),
+            vec![(11, 43.0, 0), (9, 42.0, 7)]
+        );
+    }
+
+    #[test]
+    fn test_virtual_sentinels_preserve_tie_order_when_filled() {
+        let mut collector = ScoreCollector::new(3);
+        collector.seed_threshold(5.0);
+
+        assert!(collector.insert_with_ordinal(3, 5.0, 2));
+        assert!(collector.insert_with_ordinal(2, 5.0, 8));
+        assert!(collector.insert_with_ordinal(1, 5.0, 4));
+        assert_eq!(collector.real_len(), 3);
+        assert!(collector.virtual_threshold.is_none());
+
+        // Once all virtual slots have been displaced, canonical doc/ordinal
+        // ordering still controls root replacement at an equal score.
+        assert!(collector.insert_with_ordinal(2, 5.0, 1));
+        assert!(!collector.insert_with_ordinal(4, 5.0, 0));
+        assert_eq!(
+            collector.into_sorted_results(),
+            vec![(1, 5.0, 4), (2, 5.0, 1), (2, 5.0, 8)]
+        );
     }
 
     #[test]
