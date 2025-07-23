@@ -4,7 +4,7 @@ pub(crate) mod bmp;
 pub(crate) mod loader;
 mod types;
 
-pub use bmp::BmpIndex;
+pub use bmp::{BmpDimStats, BmpIndex};
 #[cfg(feature = "native")]
 pub(crate) use types::DimRawData;
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
@@ -1615,7 +1615,38 @@ impl SegmentReader {
         #[cfg(feature = "native")]
         reader.apply_pin_policy(&crate::segment::pin::pin_policy().to_owned());
 
+        // Structural ANN health from the already-parsed run directories —
+        // O(runs) per field, no payload reads. This is the passive tier of
+        // `docs/diagnostics.md`: leaf collapse and extent fragmentation warn
+        // here instead of surfacing as unexplained latency.
+        for (&field_id, vector_index) in &reader.vector_indexes {
+            match vector_index {
+                VectorIndex::BinaryIvf(index) | VectorIndex::IvfTq { index, .. } => {
+                    index.get().report_health(
+                        reader.schema.index_label(),
+                        field_id,
+                        reader.meta.id,
+                    );
+                }
+                // TQ flat payloads have no cluster structure; skew and
+                // fragmentation metrics would be meaningless there.
+                VectorIndex::Tq { .. } => {}
+            }
+        }
+
         Ok(reader)
+    }
+
+    /// Structural health of one field's IVF payload, if it has one.
+    ///
+    /// Cheap (O(runs) over in-memory data); exposed for `hermes-tool diagnose`.
+    pub fn ann_health(&self, field: Field) -> Option<crate::segment::ann_disk::AnnHealth> {
+        match self.vector_indexes.get(&field.0)? {
+            VectorIndex::BinaryIvf(index) | VectorIndex::IvfTq { index, .. } => {
+                Some(index.get().health())
+            }
+            VectorIndex::Tq { .. } => None,
+        }
     }
 
     /// Pin per-query-mandatory metadata sections in priority order until the

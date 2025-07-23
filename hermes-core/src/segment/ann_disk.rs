@@ -136,6 +136,64 @@ pub(crate) struct AnnDiskIndex {
     runs: Vec<AnnRun>,
 }
 
+/// Cheap structural health of one ANN payload, computed from the in-memory
+/// run directory in O(runs) — payload bytes are never touched.
+///
+/// Two production failure modes motivated every field here (see
+/// `docs/diagnostics.md`): a 31%-of-vectors leaf built from degenerate
+/// embeddings, and probe read-amplification from byte-copy merges that leave
+/// one logical cluster scattered across many physical extents.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnHealth {
+    /// Vectors across all runs.
+    pub vectors: u64,
+    /// Distinct cluster IDs holding at least one posting.
+    pub clusters_nonempty: u32,
+    /// Codebook size (`num_clusters` from the header).
+    pub clusters_total: u32,
+    /// Run-directory entries; each is one physical extent on disk.
+    pub runs: u32,
+    /// Vectors in the most populated cluster, with its ID.
+    pub largest_cluster: u32,
+    pub largest_cluster_vectors: u64,
+    /// Faiss `imbalance_factor` over non-empty clusters:
+    /// `K · Σ nᵢ² / N²`. 1.0 is perfectly balanced; a value of γ means a
+    /// fixed-`nprobe` probe computes γ× the distances of the balanced
+    /// baseline in expectation.
+    pub imbalance: f64,
+    /// Bytes of the codes columns (what a probe of every leaf would read).
+    pub payload_bytes: u64,
+}
+
+impl AnnHealth {
+    /// Physical extents per non-empty cluster. 1.0 after a rebuild; each
+    /// byte-copy merge multiplies it, and every extent is a potential seek
+    /// when the index is cold.
+    pub fn fragmentation(&self) -> f64 {
+        if self.clusters_nonempty == 0 {
+            return 0.0;
+        }
+        f64::from(self.runs) / f64::from(self.clusters_nonempty)
+    }
+
+    /// Share of all vectors held by the single largest cluster.
+    pub fn largest_cluster_share(&self) -> f64 {
+        if self.vectors == 0 {
+            return 0.0;
+        }
+        self.largest_cluster_vectors as f64 / self.vectors as f64
+    }
+}
+
+/// `largest_cluster_share` above this, on at least [`ANN_SKEW_WARN_MIN_VECTORS`]
+/// vectors, is a scan cliff worth a warning: the production incident value was
+/// 0.31, and a healthy 100k+-cluster codebook sits orders of magnitude lower.
+const ANN_SKEW_WARN_SHARE: f64 = 0.05;
+const ANN_SKEW_WARN_MIN_VECTORS: u64 = 100_000;
+/// A rebuilt segment has fragmentation 1.0; a single 32-way byte-copy merge
+/// can reach 32. Warn once probes pay ~an order of magnitude extra seeks.
+const ANN_FRAGMENTATION_WARN: f64 = 8.0;
+
 /// A document selected by a combiner-aware compressed scan.
 ///
 /// This intentionally has no ordinal: `score` combines every value belonging
@@ -322,6 +380,97 @@ impl AnnDiskIndex {
             header,
             runs,
         })
+    }
+
+    /// Structural health from the run directory alone. O(runs), no payload
+    /// reads — safe to call at every open.
+    pub(crate) fn health(&self) -> AnnHealth {
+        let mut vectors = 0u64;
+        let mut clusters_nonempty = 0u32;
+        let mut payload_bytes = 0u64;
+        let mut largest = (0u32, 0u64);
+        let mut sum_squares = 0f64;
+        // Runs are sorted by cluster ID, so one pass groups them.
+        let mut index = 0usize;
+        while index < self.runs.len() {
+            let cluster_id = self.runs[index].cluster_id;
+            let mut cluster_vectors = 0u64;
+            while index < self.runs.len() && self.runs[index].cluster_id == cluster_id {
+                let run = &self.runs[index];
+                cluster_vectors += run.count as u64;
+                payload_bytes += (run.codes.end - run.codes.start) as u64;
+                index += 1;
+            }
+            vectors += cluster_vectors;
+            clusters_nonempty += 1;
+            sum_squares += (cluster_vectors as f64) * (cluster_vectors as f64);
+            if cluster_vectors > largest.1 {
+                largest = (cluster_id, cluster_vectors);
+            }
+        }
+        let imbalance = if vectors == 0 || clusters_nonempty == 0 {
+            0.0
+        } else {
+            f64::from(clusters_nonempty) * sum_squares / ((vectors as f64) * (vectors as f64))
+        };
+        AnnHealth {
+            vectors,
+            clusters_nonempty,
+            clusters_total: self.header.num_clusters,
+            runs: self.runs.len() as u32,
+            largest_cluster: largest.0,
+            largest_cluster_vectors: largest.1,
+            imbalance,
+            payload_bytes,
+        }
+    }
+
+    /// Log this payload's health, warning on the two known cliff shapes.
+    ///
+    /// Called once per segment open; the caller supplies identity because the
+    /// payload itself does not know its index or field.
+    pub(crate) fn report_health(&self, index_label: &str, field_id: u32, segment_id: u128) {
+        let health = self.health();
+        let share = health.largest_cluster_share();
+        let fragmentation = health.fragmentation();
+        log::info!(
+            "[ann_health] index={index_label} field={field_id} segment={segment_id:016x}: \
+             vectors={} clusters={}/{} runs={} fragmentation={fragmentation:.2} \
+             imbalance={:.2} largest_leaf={:.2}% payload={}",
+            health.vectors,
+            health.clusters_nonempty,
+            health.clusters_total,
+            health.runs,
+            health.imbalance,
+            100.0 * share,
+            crate::format_bytes(health.payload_bytes),
+        );
+        crate::observe::ann_health(
+            index_label,
+            field_id,
+            health.imbalance,
+            fragmentation,
+            share,
+        );
+        if share >= ANN_SKEW_WARN_SHARE && health.vectors >= ANN_SKEW_WARN_MIN_VECTORS {
+            log::warn!(
+                "[ann_health] index={index_label} field={field_id} segment={segment_id:016x}: \
+                 leaf {} holds {:.1}% of {} vectors — every query probing it scans that leaf \
+                 in full; degenerate embeddings collapse into one leaf exactly like this",
+                health.largest_cluster,
+                100.0 * share,
+                health.vectors,
+            );
+        }
+        if fragmentation >= ANN_FRAGMENTATION_WARN {
+            log::warn!(
+                "[ann_health] index={index_label} field={field_id} segment={segment_id:016x}: \
+                 {fragmentation:.1} extents per probed cluster ({} runs / {} clusters) — \
+                 cold probes pay that many seeks; a vector-generation rewrite compacts to 1.0",
+                health.runs,
+                health.clusters_nonempty,
+            );
+        }
     }
 
     pub(crate) fn header(&self) -> &AnnDiskHeader {
@@ -1755,6 +1904,107 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    /// Health math on a hand-built payload: two runs of one cluster (a
+    /// byte-copy merge shape) plus one dominant leaf, checked against the
+    /// Faiss imbalance definition computed by hand.
+    #[test]
+    fn ann_health_measures_skew_and_fragmentation() {
+        // Segment A: 6 vectors in cluster 0 and 2 in cluster 3; segment B: 2
+        // more in cluster 0. A byte-copy merge preserves each source extent,
+        // producing the fragmented shape (two physical runs for cluster 0)
+        // that build alone can never emit.
+        let a0_docs = [0u32, 1, 2, 3, 4, 5];
+        let a0_ords = [0u16; 6];
+        let a0_codes = [0xAAu8; 6];
+        let a3_docs = [6u32, 7];
+        let a3_ords = [0u16; 2];
+        let a3_codes = [0x0Fu8; 2];
+        let a_runs = [
+            BuildRun {
+                cluster_id: 0,
+                doc_ids: &a0_docs,
+                ordinals: &a0_ords,
+                codes: &a0_codes,
+            },
+            BuildRun {
+                cluster_id: 3,
+                doc_ids: &a3_docs,
+                ordinals: &a3_ords,
+                codes: &a3_codes,
+            },
+        ];
+        let mut header = binary_header(8);
+        header.num_clusters = 8;
+        let mut a_bytes = Vec::new();
+        write_built_runs(header, &a_runs, &mut a_bytes).unwrap();
+        let a = AnnDiskIndex::open(OwnedBytes::new(a_bytes), AnnKind::BinaryIvf, 8).unwrap();
+
+        let b0_docs = [0u32, 1];
+        let b0_ords = [0u16; 2];
+        let b0_codes = [0xBBu8; 2];
+        let b_runs = [BuildRun {
+            cluster_id: 0,
+            doc_ids: &b0_docs,
+            ordinals: &b0_ords,
+            codes: &b0_codes,
+        }];
+        let mut header_b = binary_header(2);
+        header_b.num_clusters = 8;
+        let mut b_bytes = Vec::new();
+        write_built_runs(header_b, &b_runs, &mut b_bytes).unwrap();
+        let b = AnnDiskIndex::open(OwnedBytes::new(b_bytes), AnnKind::BinaryIvf, 2).unwrap();
+
+        let mut merged_bytes = Vec::new();
+        write_merged_ann(&[(&a, 0), (&b, 8)], &mut merged_bytes).unwrap();
+        let disk =
+            AnnDiskIndex::open(OwnedBytes::new(merged_bytes), AnnKind::BinaryIvf, 10).unwrap();
+
+        let health = disk.health();
+        assert_eq!(health.vectors, 10);
+        assert_eq!(health.clusters_nonempty, 2);
+        assert_eq!(health.clusters_total, 8);
+        assert_eq!(health.runs, 3);
+        assert_eq!(health.largest_cluster, 0);
+        assert_eq!(health.largest_cluster_vectors, 8);
+        assert!((health.largest_cluster_share() - 0.8).abs() < 1e-9);
+        // 3 runs over 2 non-empty clusters.
+        assert!((health.fragmentation() - 1.5).abs() < 1e-9);
+        // Faiss: K * sum(n_i^2) / N^2 = 2 * (64 + 4) / 100 = 1.36
+        assert!(
+            (health.imbalance - 1.36).abs() < 1e-9,
+            "{}",
+            health.imbalance
+        );
+        // codes columns: 6 + 2 + 2 bytes at code_size 1.
+        assert_eq!(health.payload_bytes, 10);
+    }
+
+    #[test]
+    fn ann_health_is_balanced_at_one() {
+        let docs: Vec<Vec<u32>> = (0..4).map(|c| vec![c * 2, c * 2 + 1]).collect();
+        let ords = [0u16; 2];
+        let codes = [0x55u8; 2];
+        let runs: Vec<BuildRun<'_>> = docs
+            .iter()
+            .enumerate()
+            .map(|(cluster, doc_ids)| BuildRun {
+                cluster_id: cluster as u32,
+                doc_ids,
+                ordinals: &ords,
+                codes: &codes,
+            })
+            .collect();
+        let mut header = binary_header(8);
+        header.num_clusters = 4;
+        let mut bytes = Vec::new();
+        write_built_runs(header, &runs, &mut bytes).unwrap();
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 8).unwrap();
+        let health = disk.health();
+        assert!((health.imbalance - 1.0).abs() < 1e-9);
+        assert!((health.fragmentation() - 1.0).abs() < 1e-9);
+        assert!((health.largest_cluster_share() - 0.25).abs() < 1e-9);
+    }
 
     fn binary_header(vector_count: usize) -> AnnDiskHeader {
         AnnDiskHeader {

@@ -1,5 +1,6 @@
 pub(crate) mod ann_build;
 mod ann_disk;
+pub use ann_disk::AnnHealth;
 pub(crate) mod bmp_adaptive;
 pub(crate) mod bmp_grid;
 #[cfg(any(feature = "native", feature = "wasm"))]
@@ -31,7 +32,9 @@ pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
 pub(crate) use reader::combine_ordinal_results;
 #[cfg(feature = "native")]
 pub mod pin;
-pub use reader::{DensePlanCache, SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
+pub use reader::{
+    BmpDimStats, DensePlanCache, SegmentReader, SparseIndex, VectorIndex, VectorSearchResult,
+};
 pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{SegmentSnapshot, SegmentTracker};

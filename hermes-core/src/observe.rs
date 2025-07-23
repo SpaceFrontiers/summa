@@ -267,6 +267,27 @@ mod imp {
             .increment(total as u64);
     }
 
+    /// Structural ANN health gauges, refreshed at every segment open.
+    ///
+    /// Gauges rather than log-only: leaf collapse and fragmentation build up
+    /// over weeks, which is dashboard territory, not log-scraping territory.
+    pub fn ann_health(
+        index: &str,
+        field: u32,
+        imbalance: f64,
+        fragmentation: f64,
+        largest_leaf_share: f64,
+    ) {
+        let index = shared_label(index);
+        let field = field.to_string();
+        metrics::gauge!("hermes_ann_imbalance", "index" => index.clone(), "field" => field.clone())
+            .set(imbalance);
+        metrics::gauge!("hermes_ann_fragmentation", "index" => index.clone(), "field" => field.clone())
+            .set(fragmentation);
+        metrics::gauge!("hermes_ann_largest_leaf_share", "index" => index, "field" => field)
+            .set(largest_leaf_share);
+    }
+
     pub fn reorder_bp_started(index: &str, field: &str, entity_kind: &'static str) {
         metrics::gauge!("hermes_reorder_bp_active_passes", "index" => shared_label(index), "field" => shared_label(field), "entity_kind" => entity_kind)
             .increment(1.0);
@@ -371,6 +392,8 @@ mod imp {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn binary_zero_vectors(_: &str, _: u32, _: usize, _: usize) {}
+    #[inline(always)]
+    pub fn ann_health(_: &str, _: u32, _: f64, _: f64, _: f64) {}
     #[inline(always)]
     pub fn dense_rerank(_: &str, _: &str, _: f64, _: f64, _: f64, _: usize) {}
     #[inline(always)]
