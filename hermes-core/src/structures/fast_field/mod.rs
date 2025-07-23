@@ -733,6 +733,19 @@ struct TextState {
 }
 
 impl FastFieldReader {
+    /// Bytes of column data backing this reader (values, offsets, dicts).
+    pub fn disk_bytes(&self) -> u64 {
+        self.blocks
+            .iter()
+            .map(|block| {
+                (block.data.len()
+                    + block.offset_data.len()
+                    + block.value_data.len()
+                    + block.raw_dict.len()) as u64
+            })
+            .sum()
+    }
+
     /// Open a blocked column from an `OwnedBytes` file buffer using a TOC entry.
     ///
     /// For text-ordinal columns, dictionary scanning and global dict merging are

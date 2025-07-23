@@ -13,6 +13,8 @@
 //! - `commit` - Commit any pending changes to the index
 //! - `merge` - Force merge all segments into one
 //! - `info` - Display index information
+//! - `diagnose` - Index health: ANN leaf skew/fragmentation, per-field disk
+//!   usage, degenerate-vector scans, probe cost, page-cache residency
 //! - `warmup` - Warm up slice cache and save to file
 //!
 //! # Data Processing Commands
@@ -39,6 +41,7 @@
 //! ```
 
 mod data_processing;
+mod diagnose;
 mod index_ops;
 mod vector_ops;
 
@@ -205,6 +208,41 @@ enum Commands {
         /// Path to the index directory
         #[arg(short, long)]
         index: PathBuf,
+    },
+
+    /// Diagnose index health: ANN leaf skew/fragmentation, per-field disk
+    /// usage, degenerate-vector scans, probe cost, page-cache residency
+    Diagnose {
+        /// Path to the index directory
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Scan N evenly spaced flat vectors per field per segment for
+        /// all-zero / non-finite content (reads payload bytes)
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+
+        /// Estimate per-query bytes and extents touched at this nprobe
+        #[arg(long, value_name = "NPROBE")]
+        probe_cost: Option<usize>,
+
+        /// Report page-cache residency of every segment file (mincore)
+        #[arg(long)]
+        residency: bool,
+
+        /// Scan the whole term dictionary: doc-frequency distribution,
+        /// inline-term ratio, and the top-N terms
+        #[arg(long, value_name = "N")]
+        terms: Option<usize>,
+
+        /// Scan sparse BMP postings: per-dimension distribution and impact
+        /// saturation (reads payload bytes)
+        #[arg(long)]
+        sparse_stats: bool,
     },
 
     /// Visualize BMP grid as a terminal heatmap
@@ -433,6 +471,26 @@ async fn main() -> Result<()> {
         }
         Commands::Info { index } => {
             index_ops::show_info(index).await?;
+        }
+        Commands::Diagnose {
+            index,
+            json,
+            sample,
+            probe_cost,
+            residency,
+            terms,
+            sparse_stats,
+        } => {
+            diagnose::diagnose(diagnose::DiagnoseOptions {
+                index,
+                json,
+                sample,
+                probe_cost,
+                residency,
+                terms,
+                sparse_stats,
+            })
+            .await?;
         }
         Commands::Heatmap {
             index,

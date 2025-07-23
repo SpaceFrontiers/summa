@@ -468,6 +468,37 @@ impl<D: Directory + 'static> Searcher<D> {
             crate::format_bytes(rss_bytes),
         );
 
+        // One ANN-health line per dense field across the whole index, so an
+        // operator reads leaf skew and extent fragmentation from N_fields
+        // lines instead of N_segments × N_fields open-time lines.
+        let mut ann_per_field: std::collections::BTreeMap<u32, (u64, u64, u32, u32, u64)> =
+            std::collections::BTreeMap::new();
+        for segment in segments.iter() {
+            for &field_id in segment.vector_indexes().keys() {
+                if let Some(health) = segment.ann_health(crate::Field(field_id)) {
+                    let entry = ann_per_field.entry(field_id).or_default();
+                    entry.0 += health.vectors;
+                    entry.1 += health.payload_bytes;
+                    entry.2 += health.runs;
+                    entry.3 += health.clusters_nonempty;
+                    entry.4 = entry.4.max(health.largest_cluster_vectors);
+                }
+            }
+        }
+        for (field_id, (vectors, payload, runs, clusters, largest)) in ann_per_field {
+            log::info!(
+                "[ann_health] index={} field={field_id} aggregate: vectors={vectors} \
+                 payload={} runs={runs} fragmentation={:.2} worst_leaf_vectors={largest}",
+                schema.index_label(),
+                crate::format_bytes(payload),
+                if clusters == 0 {
+                    0.0
+                } else {
+                    f64::from(runs) / f64::from(clusters)
+                },
+            );
+        }
+
         Ok(segments)
     }
 

@@ -108,6 +108,7 @@ Single `main.rs` with clap-based subcommands:
 - `merge` - Merge segments
 - `commit` - Commit pending changes
 - `info` - Show index statistics
+- `diagnose` - Index health report (ANN leaf skew/fragmentation, per-field disk usage; `--sample`/`--probe-cost`/`--residency`/`--terms`/`--sparse-stats` opt-ins) — see docs/diagnostics.md
 - `simhash` - Calculate SimHash for near-duplicate detection
 - `sort` - Sort documents by field
 

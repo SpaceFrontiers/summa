@@ -70,6 +70,22 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
+/// Result of [`BmpIndex::dim_stats`] — see its docs for meaning.
+#[derive(Debug, Clone)]
+pub struct BmpDimStats {
+    pub nonzero_dims: u32,
+    pub declared_dims: u32,
+    pub total_postings: u64,
+    pub p50_postings_per_dim: u64,
+    pub p99_postings_per_dim: u64,
+    pub max_postings_per_dim: u64,
+    /// Share of all postings held by the hottest 1% of dimensions.
+    pub top_1pct_share: f64,
+    /// Postings whose quantized impact is the u8 maximum (weight clipping).
+    pub saturated_impacts: u64,
+    pub top_dims: Vec<(u32, u64)>,
+}
+
 /// BMP V19 index for a single sparse field — fully zero-copy mmap-backed.
 ///
 /// V19 format with Recursive Graph Bisection (BP) document ordering.
@@ -83,6 +99,7 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
 ///    superblocks, used to find the exact global top-gamma without sweeping E
 /// 2. **Superblock grid**: upper bounds over `BMP_SUPERBLOCK_SIZE` blocks
 /// 3. **Block grid**: fine-grained upper bounds per individual block
+
 #[derive(Clone)]
 pub struct BmpIndex {
     /// BMP block size (number of consecutive virtual_ids per block)
@@ -912,6 +929,64 @@ impl BmpIndex {
     /// Bits per block-grid cell (4 or 2).
     pub fn grid_bits(&self) -> u8 {
         self.grid_bits
+    }
+
+    /// Per-dimension posting distribution and impact saturation, from one
+    /// full O(postings) pass over every block.
+    ///
+    /// This is diagnostics-tier ("expensive opt-in"): SPLADE-style vocabularies
+    /// are Zipfian, and a handful of hot dimensions holding most postings is
+    /// what makes block upper bounds loose and pruning ineffective. Impact
+    /// saturation (quantized weight == 255) means the u8 quantization is
+    /// clipping the model's weight range.
+    pub fn dim_stats(&self, top: usize) -> BmpDimStats {
+        let mut per_dim: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
+        let mut total_postings = 0u64;
+        let mut saturated = 0u64;
+        for block_id in 0..self.num_blocks {
+            for (dim, _, postings) in self.iter_block_terms(block_id) {
+                let mut count = 0u64;
+                for posting in postings {
+                    count += 1;
+                    if posting.impact == u8::MAX {
+                        saturated += 1;
+                    }
+                }
+                *per_dim.entry(dim).or_default() += count;
+                total_postings += count;
+            }
+        }
+        let mut counts: Vec<u64> = per_dim.values().copied().collect();
+        counts.sort_unstable();
+        let percentile = |fraction: f64| -> u64 {
+            if counts.is_empty() {
+                0
+            } else {
+                counts[((counts.len() - 1) as f64 * fraction) as usize]
+            }
+        };
+        let mut top_dims: Vec<(u32, u64)> = per_dim.into_iter().collect();
+        top_dims.sort_unstable_by_key(|&(dim, count)| (std::cmp::Reverse(count), dim));
+        top_dims.truncate(top);
+        // Postings concentration: how much of the corpus the hottest 1% of
+        // dimensions hold. High values mean stopword-like dimensions dominate.
+        let hot = counts.len().div_ceil(100);
+        let top_1pct_postings: u64 = counts.iter().rev().take(hot).sum();
+        BmpDimStats {
+            nonzero_dims: counts.len() as u32,
+            declared_dims: self.dims(),
+            total_postings,
+            p50_postings_per_dim: percentile(0.50),
+            p99_postings_per_dim: percentile(0.99),
+            max_postings_per_dim: counts.last().copied().unwrap_or(0),
+            top_1pct_share: if total_postings == 0 {
+                0.0
+            } else {
+                top_1pct_postings as f64 / total_postings as f64
+            },
+            saturated_impacts: saturated,
+            top_dims,
+        }
     }
 
     /// Direct random-group access to the compressed block grid.

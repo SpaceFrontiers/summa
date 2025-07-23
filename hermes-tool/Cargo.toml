@@ -20,6 +20,7 @@ hermes-core = { workspace = true, features = ["native"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+libc = "0.2"
 sonic-rs = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -33,3 +34,6 @@ crossbeam-channel = "0.5"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["stats", "background_threads"] }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
