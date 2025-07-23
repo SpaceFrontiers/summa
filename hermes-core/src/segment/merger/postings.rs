@@ -74,12 +74,18 @@ impl SegmentMerger {
         let results = futures::future::join_all(futs).await;
         for (i, res) in results.into_iter().enumerate() {
             res.map_err(|e| {
-                log::error!("Prefetch failed for segment {}: {}", i, e);
+                log::error!(
+                    "[merge] index={} prefetch failed for segment {}: {}",
+                    self.schema.index_label(),
+                    i,
+                    e
+                );
                 e
             })?;
         }
         log::debug!(
-            "Prefetched {} term dicts in {:.1}s",
+            "[merge] index={} prefetched {} term dicts in {:.1}s",
+            self.schema.index_label(),
             segments.len(),
             prefetch_start.elapsed().as_secs_f64()
         );
@@ -174,7 +180,11 @@ impl SegmentMerger {
 
             // Log progress every 100k terms
             if terms_processed.is_multiple_of(100_000) {
-                log::debug!("Merge progress: {} terms processed", terms_processed);
+                log::debug!(
+                    "[merge] index={} progress: {} terms processed",
+                    self.schema.index_label(),
+                    terms_processed
+                );
             }
         }
 

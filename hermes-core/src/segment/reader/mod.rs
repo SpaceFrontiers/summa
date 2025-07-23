@@ -1681,8 +1681,9 @@ impl SegmentReader {
         };
         if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
             log::warn!(
-                "[pin] segment {:016x}: pinned {}/{} (budget skipped {}, mlock failed {}) — \
+                "[pin] index={} segment {:016x}: pinned {}/{} (budget skipped {}, mlock failed {}) — \
                  raise HERMES_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
+                self.schema.index_label(),
                 self.meta.id,
                 crate::format_bytes(report.pinned_bytes),
                 crate::format_bytes(report.intended_bytes),
@@ -1691,7 +1692,8 @@ impl SegmentReader {
             );
         } else if report.pinned_bytes > 0 {
             log::info!(
-                "[pin] segment {:016x}: pinned {} of hot metadata ({:?})",
+                "[pin] index={} segment {:016x}: pinned {} of hot metadata ({:?})",
+                self.schema.index_label(),
                 self.meta.id,
                 crate::format_bytes(report.pinned_bytes),
                 policy.mode,
@@ -2271,6 +2273,17 @@ impl SegmentReader {
                 config.byte_len()
             )));
         }
+        if query.iter().all(|&byte| byte == 0) {
+            // Hamming distance from an all-zero query is `popcount(candidate)`
+            // for every candidate, so the ranking it produces is "fewest bits
+            // set" — not similarity. Almost always a caller that failed to
+            // embed and sent a zero-filled buffer.
+            return Err(Error::Query(format!(
+                "binary query for field '{}' is all-zero: it carries no information and would \
+                 rank candidates by bit count rather than similarity",
+                entry.name,
+            )));
+        }
         Ok(config.dim)
     }
 
@@ -2520,7 +2533,8 @@ impl SegmentReader {
             // Combine every value of a document before document-level top-k;
             // vector-level top-k loses documents on multi-valued fields.
             log::debug!(
-                "[dense_vector_search] field {}: brute-force on {} vectors (dim={}, quant={:?})",
+                "[dense_vector_search] index={} field {}: brute-force on {} vectors (dim={}, quant={:?})",
+                self.schema.index_label(),
                 field.0,
                 lazy_flat.num_vectors,
                 lazy_flat.dim,
@@ -2573,7 +2587,8 @@ impl SegmentReader {
             );
         }
         log::debug!(
-            "[dense_vector_search] field {}: L1 returned {} candidates in {:.1}ms",
+            "[dense_vector_search] index={} field {}: L1 returned {} candidates in {:.1}ms",
+            self.schema.index_label(),
             field.0,
             flat_results.as_ref().map_or(results.len(), Vec::len),
             l1_elapsed.as_secs_f64() * 1000.0
@@ -2610,7 +2625,8 @@ impl SegmentReader {
                 stats.vector_count,
             );
             log::debug!(
-                "[dense_vector_search] field {}: rerank {} vectors (dim={}, quant={:?}, bytes_per_vector={}): resolve={:.1}ms read={:.1}ms score={:.1}ms",
+                "[dense_vector_search] index={} field {}: rerank {} vectors (dim={}, quant={:?}, bytes_per_vector={}): resolve={:.1}ms read={:.1}ms score={:.1}ms",
+                self.schema.index_label(),
                 field.0,
                 stats.vector_count,
                 lazy_flat.dim,
@@ -2622,7 +2638,8 @@ impl SegmentReader {
             );
 
             log::debug!(
-                "[dense_vector_search] field {}: rerank total={:.1}ms",
+                "[dense_vector_search] index={} field {}: rerank total={:.1}ms",
+                self.schema.index_label(),
                 field.0,
                 t_rerank.elapsed().as_secs_f64() * 1000.0
             );

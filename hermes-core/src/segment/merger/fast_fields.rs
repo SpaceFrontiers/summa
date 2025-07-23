@@ -143,7 +143,8 @@ impl SegmentMerger {
         let total_bytes = toc_offset as usize + toc_entries.len() * 38 + 16;
 
         log::info!(
-            "[merge] fast-fields: {} columns, {} docs, {} (raw block stacking)",
+            "[merge] index={} fast-fields: {} columns, {} docs, {} (raw block stacking)",
+            self.schema.index_label(),
             toc_entries.len(),
             total_docs,
             crate::format_bytes(total_bytes as u64)

@@ -912,8 +912,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         match try_acquire_writer_lock(self.directory.as_ref())? {
             acquired @ (WriterLock::Held { .. } | WriterLock::NotApplicable) => {
                 log::info!(
-                    "[writer_lock] single-writer lock acquired after retry; \
-                     the previous holder has released it — resuming writes"
+                    "[writer_lock] index={} single-writer lock acquired after retry; \
+                     the previous holder has released it — resuming writes",
+                    self.schema.index_label()
                 );
                 *lock = acquired;
                 Ok(())
@@ -937,9 +938,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     fn clear_uncommitted_pk_reservations(&self) {
         if self.pk_reservations_retained.load(Ordering::Acquire) {
             log::warn!(
-                "[primary_key] keeping uncommitted reservations through abort: a \
+                "[primary_key] index={} keeping uncommitted reservations through abort: a \
                  failed post-commit refresh left them as the only record of \
-                 committed keys; they are cleared by the next successful commit"
+                 committed keys; they are cleared by the next successful commit",
+                self.schema.index_label()
             );
             return;
         }
@@ -1101,6 +1103,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 super::primary_key::PrimaryKeyIndex::from_persisted(field, bloom, pk_data, snapshot)
             } else {
                 // Incremental: only iterate new segments' keys.
+                let index_label = self.schema.index_label().to_owned();
                 tokio::task::spawn_blocking(move || {
                     // Insert new segments' keys into the bloom, then construct
                     // PrimaryKeyIndex with the pre-populated bloom.
@@ -1119,7 +1122,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     }
                     if added > 0 {
                         log::info!(
-                            "[primary_key] bloom: added {} keys from {} new segment(s)",
+                            "[primary_key] index={index_label} bloom: added {} keys from {} new segment(s)",
                             added,
                             num_new,
                         );
@@ -1174,7 +1177,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         {
             Ok(writer) => writer,
             Err(error) => {
-                log::warn!("[primary_key] failed to open bloom cache: {}", error);
+                log::warn!(
+                    "[primary_key] index={} failed to open bloom cache: {}",
+                    self.schema.index_label(),
+                    error
+                );
                 return;
             }
         };
@@ -1182,7 +1189,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             write_pk_bloom_stream(pk_index, segment_ids, writer)
         });
         if let Err(e) = result {
-            log::warn!("[primary_key] failed to persist bloom cache: {}", e);
+            log::warn!(
+                "[primary_key] index={} failed to persist bloom cache: {}",
+                self.schema.index_label(),
+                e
+            );
         }
     }
 
@@ -1320,7 +1331,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
                     if b.num_docs() & 0x3FFF == 0 {
                         log::debug!(
-                            "[indexing] docs={}, memory={}, budget={}",
+                            "[indexing] index={} docs={}, memory={}, budget={}",
+                            state.schema.index_label(),
                             b.num_docs(),
                             crate::format_bytes(builder_memory as u64),
                             crate::format_bytes(state.memory_budget_per_worker as u64)
@@ -1338,8 +1350,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         )
                     {
                         log::info!(
-                            "[indexing] memory budget reached, building segment: \
+                            "[indexing] index={} memory budget reached, building segment: \
                              worker={}, docs={}, memory={}, soft_budget={}, hard_budget={}",
+                            state.schema.index_label(),
                             worker_id,
                             b.num_docs(),
                             crate::format_bytes(builder_memory as u64),
@@ -1363,7 +1376,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
             if build_result.is_err() {
                 log::error!(
-                    "[worker] panic during indexing cycle — documents in this cycle may be lost"
+                    "[worker] index={} panic during indexing cycle — documents in this cycle may be lost",
+                    state.schema.index_label()
                 );
                 state.record_cycle_error("indexing worker panicked while building the batch");
             }
@@ -1424,7 +1438,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             Ok(operation) => operation,
             Err(e) => {
                 log::error!(
-                    "[segment_build_failed] segment_id={} lifecycle_error={}",
+                    "[segment_build_failed] index={} segment_id={} lifecycle_error={}",
+                    state.schema.index_label(),
                     segment_hex,
                     e,
                 );
@@ -1439,7 +1454,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let build_start = std::time::Instant::now();
 
         log::info!(
-            "[segment_build] segment_id={} doc_count={} ann={}",
+            "[segment_build] index={} segment_id={} doc_count={} ann={}",
+            state.schema.index_label(),
             segment_hex,
             doc_count,
             trained.is_some()
@@ -1467,7 +1483,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             Ok(meta) if meta.num_docs == doc_count && meta.num_docs > 0 => {
                 let duration_ms = build_start.elapsed().as_millis() as u64;
                 log::info!(
-                    "[segment_build_done] segment_id={} doc_count={} duration_ms={}",
+                    "[segment_build_done] index={} segment_id={} doc_count={} duration_ms={}",
+                    state.schema.index_label(),
                     segment_hex,
                     meta.num_docs,
                     duration_ms,
@@ -1480,12 +1497,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     "segment {segment_hex} built {} docs from a {doc_count}-document builder",
                     meta.num_docs
                 );
-                log::error!("[segment_build_failed] {error}");
+                log::error!(
+                    "[segment_build_failed] index={} {error}",
+                    state.schema.index_label()
+                );
                 state.record_cycle_error(error);
             }
             Err(e) => {
                 log::error!(
-                    "[segment_build_failed] segment_id={} error={:?}",
+                    "[segment_build_failed] index={} segment_id={} error={:?}",
+                    state.schema.index_label(),
                     segment_hex,
                     e
                 );
@@ -1536,7 +1557,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         .await
         .map_err(|error| Error::Internal(format!("failed to join index workers: {}", error)))?;
         if panicked > 0 {
-            log::error!("[index_shutdown] {} indexing worker(s) panicked", panicked);
+            log::error!(
+                "[index_shutdown] index={} {} indexing worker(s) panicked",
+                self.schema.index_label(),
+                panicked
+            );
         }
 
         // No commit is possible after shutdown. Dropping these RAII values
@@ -1616,6 +1641,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // 2. Wait for all workers to complete their flush (via spawn_blocking
         //    to avoid blocking the tokio runtime)
         let state = Arc::clone(&self.worker_state);
+        let index_label = self.schema.index_label().to_owned();
         let all_flushed = tokio::task::spawn_blocking(move || {
             let mut lock = state.flush_mutex.lock();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -1623,7 +1649,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     log::error!(
-                        "[prepare_commit] timed out waiting for workers: {}/{} flushed",
+                        "[prepare_commit] index={index_label} timed out waiting for workers: {}/{} flushed",
                         state.flush_count.load(Ordering::Acquire),
                         state.num_workers
                     );
@@ -1985,7 +2011,11 @@ async fn refresh_primary_key_snapshot<D: DirectoryWriter + 'static>(
         {
             Ok(writer) => writer,
             Err(error) => {
-                log::warn!("[primary_key] failed to open bloom cache: {}", error);
+                log::warn!(
+                    "[primary_key] index={} failed to open bloom cache: {}",
+                    schema.index_label(),
+                    error
+                );
                 return Ok(());
             }
         };
@@ -1997,7 +2027,11 @@ async fn refresh_primary_key_snapshot<D: DirectoryWriter + 'static>(
                 write_pk_bloom_stream(pk_index, &seg_ids, writer)
             })
         {
-            log::warn!("[primary_key] failed to persist bloom cache: {}", error);
+            log::warn!(
+                "[primary_key] index={} failed to persist bloom cache: {}",
+                schema.index_label(),
+                error
+            );
         }
     }
     Ok(())
@@ -2093,7 +2127,10 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
 
         // Fast path: nothing to commit
         if segments.is_empty() {
-            log::debug!("[commit] no segments to commit, skipping");
+            log::debug!(
+                "[commit] index={} no segments to commit, skipping",
+                self.writer.schema.index_label()
+            );
             self.is_resolved = true;
             self.writer.resume_workers();
             return Ok(false);

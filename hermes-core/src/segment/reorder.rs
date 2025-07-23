@@ -152,7 +152,7 @@ impl Drop for GridScratchFiles {
             if let Err(error) = std::fs::remove_file(path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                log::warn!("[reorder_bmp] failed to remove spill {:?}: {}", path, error);
+                log::warn!("[reorder_bmp] failed to remove spill {path:?}: {error}");
             }
         }
     }
@@ -191,6 +191,7 @@ fn spill_grid_entries(
     entries: &mut Vec<BmpGridEntry>,
     scratch: &mut GridScratchFiles,
     field_id: u32,
+    index_label: &str,
     rayon_pool: Option<&rayon::ThreadPool>,
 ) -> Result<()> {
     if entries.is_empty() {
@@ -202,7 +203,8 @@ fn spill_grid_entries(
     crate::segment::builder::bmp::write_grid_run(entries, &path).map_err(crate::Error::Io)?;
     entries.clear();
     log::debug!(
-        "[reorder_bmp] field {}: spilled grid run {} to disk",
+        "[reorder_bmp] index={} field {}: spilled grid run {} to disk",
+        index_label,
         field_id,
         scratch.num_runs(),
     );
@@ -214,6 +216,7 @@ fn write_reorder_grids(
     mut entries: Vec<BmpGridEntry>,
     scratch: &mut GridScratchFiles,
     field_id: u32,
+    index_label: &str,
     dims: usize,
     num_blocks: usize,
     grid_bits: u8,
@@ -244,7 +247,7 @@ fn write_reorder_grids(
         if cancellation_requested(cancellation) {
             return Err(crate::Error::IndexClosed);
         }
-        spill_grid_entries(&mut entries, scratch, field_id, rayon_pool)?;
+        spill_grid_entries(&mut entries, scratch, field_id, index_label, rayon_pool)?;
     }
     drop(entries);
     // Bound both file descriptors and BufReader memory. Extremely large
@@ -511,6 +514,7 @@ fn write_sorted_routed_block(
     grid_run_entries: usize,
     run_files: &mut GridScratchFiles,
     field_id: u32,
+    index_label: &str,
     rayon_pool: Option<&rayon::ThreadPool>,
     scratch: &mut RoutedBlockEncodeScratch,
     encoded_block: &mut Vec<u8>,
@@ -553,7 +557,7 @@ fn write_sorted_routed_block(
             })?);
         scratch.maxima.push(max_impact);
         if grid_entries.len() == grid_run_entries {
-            spill_grid_entries(grid_entries, run_files, field_id, rayon_pool)?;
+            spill_grid_entries(grid_entries, run_files, field_id, index_label, rayon_pool)?;
         }
         grid_entries.push((dimension, out_block, max_impact));
         term_start = term_end;
@@ -959,10 +963,11 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     let dst_files = SegmentFiles::new(output_id.0);
 
     log::info!(
-        "[reorder] segment {} → {} ({} docs)",
+        "[reorder] segment {} → {} ({} docs) index={}",
         source_id.to_hex(),
         output_id.to_hex(),
         num_docs,
+        schema.index_label(),
     );
 
     // Copy unchanged segment files
@@ -990,10 +995,19 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         if cancellation_requested(cancellation.as_deref()) {
             return Err(crate::Error::IndexClosed);
         }
-        clone_segment_file(dir, src, dst, required, cancellation.as_deref()).await?;
+        clone_segment_file(
+            dir,
+            schema.index_label(),
+            src,
+            dst,
+            required,
+            cancellation.as_deref(),
+        )
+        .await?;
     }
     log::info!(
-        "[reorder] copied files in {:.1}s",
+        "[reorder] index={} copied files in {:.1}s",
+        schema.index_label(),
         copy_start.elapsed().as_secs_f64(),
     );
 
@@ -1044,8 +1058,13 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
     let src_files = SegmentFiles::new(source_id.0);
     let dst_files = SegmentFiles::new(output_id.0);
 
+    // Logged when the rewrite *starts*: the ANN payload rebuild that follows
+    // runs for minutes on a large segment, and a line that reads like a
+    // completion made a working rebuild look hung.
+    let rewrite_started = std::time::Instant::now();
     log::info!(
-        "[dense_vector_rewrite] finalizing segment {} → {} ({} docs)",
+        "[dense_vector_rewrite] started: index={} segment {} → {} ({} docs)",
+        schema.index_label(),
         source_id.to_hex(),
         output_id.to_hex(),
         num_docs,
@@ -1071,7 +1090,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
             !reader.sparse_indexes().is_empty() || !reader.bmp_indexes().is_empty(),
         ),
     ] {
-        clone_segment_file(dir, src, dst, required, None).await?;
+        clone_segment_file(dir, schema.index_label(), src, dst, required, None).await?;
     }
 
     let merger = SegmentMerger::new(Arc::clone(schema)).with_background_pool(rayon_pool);
@@ -1100,6 +1119,16 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
     dir.write_durable(&dst_files.meta, &meta.serialize()?)
         .await?;
 
+    log::info!(
+        "[dense_vector_rewrite] completed: index={} segment {} → {} ({} docs, {} vector payload) in {:.1}s",
+        schema.index_label(),
+        source_id.to_hex(),
+        output_id.to_hex(),
+        num_docs,
+        crate::format_bytes(vector_bytes as u64),
+        rewrite_started.elapsed().as_secs_f64(),
+    );
+
     Ok((output_id.to_hex(), num_docs))
 }
 
@@ -1112,6 +1141,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
 /// Empty files are still created (SegmentReader requires their existence).
 async fn clone_segment_file<D: Directory + DirectoryWriter>(
     dir: &D,
+    index_label: &str,
     src: &Path,
     dst: &Path,
     required: bool,
@@ -1130,7 +1160,8 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
         }
         Err(error) => {
             log::debug!(
-                "[segment_clone] link {:?} → {:?} unavailable ({}), streaming instead",
+                "[segment_clone] index={} link {:?} → {:?} unavailable ({}), streaming instead",
+                index_label,
                 src,
                 dst,
                 error,
@@ -1242,12 +1273,14 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     if !has_bmp_data {
         // No BMP field wants reordering — just copy the sparse file as-is
         log::info!(
-            "[reorder] segment {:x}: no BMP field has the `reorder` schema attribute — sparse file copied unchanged",
+            "[reorder] index={} segment {:x}: no BMP field has the `reorder` schema attribute — sparse file copied unchanged",
+            schema.index_label(),
             reader.meta().id,
         );
         let src_files = SegmentFiles::new(reader.meta().id);
         clone_segment_file(
             dir,
+            schema.index_label(),
             &src_files.sparse,
             &dst_files.sparse,
             true,
@@ -1295,7 +1328,8 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                 if !*reorder {
                     // Field opted out of BP: copy its blob byte-identically.
                     log::info!(
-                        "[reorder] field {}: `reorder` attribute not set — blob copied unchanged",
+                        "[reorder] index={} field {}: `reorder` attribute not set — blob copied unchanged",
+                        schema.index_label(),
                         field.0,
                     );
                     copy_bmp_blob(
@@ -1392,7 +1426,14 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     let skip_bytes = u64::from(skip_count)
         .checked_mul(crate::structures::SparseSkipEntry::SIZE as u64)
         .ok_or_else(|| crate::Error::Internal("sparse skip section exceeds u64::MAX".into()))?;
-    super::merger::append_and_delete_temp(dir, &skip_tmp, skip_bytes, &mut writer).await?;
+    super::merger::append_and_delete_temp(
+        dir,
+        &skip_tmp,
+        skip_bytes,
+        &mut writer,
+        schema.index_label(),
+    )
+    .await?;
 
     // Write TOC + footer
     let toc_offset = writer.offset();
@@ -1403,7 +1444,8 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
 
     let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
     log::info!(
-        "[reorder] sparse file written: {} fields, {} dims, {} skip entries (bp_converged={})",
+        "[reorder] index={} sparse file written: {} fields, {} dims, {} skip entries (bp_converged={})",
+        schema.index_label(),
         field_tocs.len(),
         total_dims,
         skip_count,
@@ -1557,7 +1599,8 @@ fn reorder_bmp_field_blockwise(
         .collect();
     drop(perm);
     log::info!(
-        "[reorder_bmp] field {}: blockwise BP over {} blocks in {:.1}ms (converged={})",
+        "[reorder_bmp] index={} field {}: blockwise BP over {} blocks in {:.1}ms (converged={})",
+        index_label,
         field_id,
         num_blocks_total,
         bp_start.elapsed().as_secs_f64() * 1000.0,
@@ -1616,6 +1659,7 @@ fn reorder_bmp_field_blockwise(
                     &mut grid_entries,
                     &mut run_files,
                     field_id,
+                    index_label,
                     rayon_pool.as_deref(),
                 )?;
             }
@@ -1645,6 +1689,7 @@ fn reorder_bmp_field_blockwise(
         grid_entries,
         &mut run_files,
         field_id,
+        index_label,
         dims as usize,
         num_blocks_total,
         grid_bits,
@@ -1711,7 +1756,8 @@ fn reorder_bmp_field_blockwise(
     ));
 
     log::info!(
-        "[reorder_bmp] field {}: blockwise reorder done — {} blocks, {}, phases: data+offsets={:.1}s grids={:.1}s doc_maps={:.1}s total={:.1}s",
+        "[reorder_bmp] index={} field {}: blockwise reorder done — {} blocks, {}, phases: data+offsets={:.1}s grids={:.1}s doc_maps={:.1}s total={:.1}s",
+        index_label,
         field_id,
         num_blocks_total,
         crate::format_bytes(blob_len),
@@ -1913,7 +1959,8 @@ pub(crate) fn reorder_bmp_field(
         })?;
     }
     log::info!(
-        "[reorder_bmp] field {}: validated {} source block(s) in {:.1}ms",
+        "[reorder_bmp] index={} field {}: validated {} source block(s) in {:.1}ms",
+        index_label,
         field_id,
         sources
             .iter()
@@ -1936,7 +1983,8 @@ pub(crate) fn reorder_bmp_field(
                 BpGranularity::Records
             };
             log::info!(
-                "[reorder_bmp] field {}: coherence norm={:.3} (d={:.2}, rand={:.2}, max={:.2}, threshold {:.2}, {}/{} blocks scanned in {:.1}ms) → {:?} granularity",
+                "[reorder_bmp] index={} field {}: coherence norm={:.3} (d={:.2}, rand={:.2}, max={:.2}, threshold {:.2}, {}/{} blocks scanned in {:.1}ms) → {:?} granularity",
+                index_label,
                 field_id,
                 coherence.norm,
                 coherence.d,
@@ -1953,7 +2001,8 @@ pub(crate) fn reorder_bmp_field(
         }
         explicit => {
             log::info!(
-                "[reorder_bmp] field {}: {:?} granularity (explicit, coherence scan skipped)",
+                "[reorder_bmp] index={} field {}: {:?} granularity (explicit, coherence scan skipped)",
+                index_label,
                 field_id,
                 explicit,
             );
@@ -2013,7 +2062,8 @@ pub(crate) fn reorder_bmp_field(
     const MIN_RECORD_WORKSPACE: usize = 16 * 1024 * 1024;
     if record_fixed_peak > memory_budget.saturating_sub(MIN_RECORD_WORKSPACE) {
         log::warn!(
-            "[reorder_bmp] field {}: record maps need {} of the {} total budget; falling back to blockwise order",
+            "[reorder_bmp] index={} field {}: record maps need {} of the {} total budget; falling back to blockwise order",
+            index_label,
             field_id,
             crate::format_bytes(record_fixed_peak as u64),
             crate::format_bytes(memory_budget as u64),
@@ -2082,7 +2132,8 @@ pub(crate) fn reorder_bmp_field(
     }
 
     log::info!(
-        "[reorder_bmp] field {}: running BP on {} real docs from {} source(s)",
+        "[reorder_bmp] index={} field {}: running BP on {} real docs from {} source(s)",
+        index_label,
         field_id,
         num_real_docs,
         sources.len(),
@@ -2103,7 +2154,8 @@ pub(crate) fn reorder_bmp_field(
             *virtual_to_real = Vec::new();
         }
         log::info!(
-            "[reorder_bmp] field {}: zero time budget — identity re-block, forward index skipped",
+            "[reorder_bmp] index={} field {}: zero time budget — identity re-block, forward index skipped",
+            index_label,
             field_id,
         );
         ((0..num_real_docs as u32).collect(), false)
@@ -2134,7 +2186,8 @@ pub(crate) fn reorder_bmp_field(
         };
 
         log::info!(
-            "[reorder_bmp] field {}: forward index built in {:.1}ms ({} terms, {} postings)",
+            "[reorder_bmp] index={} field {}: forward index built in {:.1}ms ({} terms, {} postings)",
+            index_label,
             field_id,
             bp_start.elapsed().as_secs_f64() * 1000.0,
             fwd.num_terms,
@@ -2176,7 +2229,8 @@ pub(crate) fn reorder_bmp_field(
                 run_graph()
             };
             log::info!(
-                "[reorder_bmp] field {}: BP completed in {:.1}ms (converged={})",
+                "[reorder_bmp] index={} field {}: BP completed in {:.1}ms (converged={})",
+                index_label,
                 field_id,
                 graph_start.elapsed().as_secs_f64() * 1000.0,
                 converged,
@@ -2197,7 +2251,8 @@ pub(crate) fn reorder_bmp_field(
     let real_to_virtual: Vec<Vec<u32>> = vid_maps.into_iter().map(|(_, real)| real).collect();
 
     log::info!(
-        "[reorder_bmp] field {}: writing reordered blob ({} blocks)",
+        "[reorder_bmp] index={} field {}: writing reordered blob ({} blocks)",
+        index_label,
         field_id,
         num_real_docs.div_ceil(effective_block_size),
     );
@@ -2341,7 +2396,8 @@ pub(crate) fn reorder_bmp_field(
         };
         if window_end < initial_end {
             log::debug!(
-                "[reorder_bmp] field {}: record window reduced from {} to {} blocks ({} admitted of {} budget)",
+                "[reorder_bmp] index={} field {}: record window reduced from {} to {} blocks ({} admitted of {} budget)",
+                index_label,
                 field_id,
                 initial_end - window_start,
                 window_end - window_start,
@@ -2402,6 +2458,7 @@ pub(crate) fn reorder_bmp_field(
                 grid_run_entries,
                 &mut run_files,
                 field_id,
+                index_label,
                 rayon_pool.as_deref(),
                 &mut block_encode_scratch,
                 &mut encoded_block,
@@ -2448,6 +2505,7 @@ pub(crate) fn reorder_bmp_field(
         grid_entries,
         &mut run_files,
         field_id,
+        index_label,
         dims as usize,
         new_num_blocks,
         grid_bits,
@@ -2510,7 +2568,8 @@ pub(crate) fn reorder_bmp_field(
     ));
 
     log::info!(
-        "[reorder_bmp] field {}: done — {} blocks, {} terms, {} postings, {}, source-block scans={}, phases: transpose+data+offsets={:.1}s grids={:.1}s doc_maps={:.1}s total={:.1}s",
+        "[reorder_bmp] index={} field {}: done — {} blocks, {} terms, {} postings, {}, source-block scans={}, phases: transpose+data+offsets={:.1}s grids={:.1}s doc_maps={:.1}s total={:.1}s",
+        index_label,
         field_id,
         new_num_blocks,
         total_terms,
@@ -2536,12 +2595,12 @@ mod grid_run_prefix_tests {
         let missing = std::path::Path::new("missing");
         let output = std::path::Path::new("output");
 
-        super::clone_segment_file(&dir, missing, output, false, None)
+        super::clone_segment_file(&dir, "test", missing, output, false, None)
             .await
             .unwrap();
         assert!(!dir.exists(output).await.unwrap());
 
-        let error = super::clone_segment_file(&dir, missing, output, true, None)
+        let error = super::clone_segment_file(&dir, "test", missing, output, true, None)
             .await
             .unwrap_err();
         assert!(matches!(error, crate::Error::Corruption(_)));
@@ -2555,7 +2614,7 @@ mod grid_run_prefix_tests {
         let data = vec![0x5a; 4 * 1024 * 1024 + 17];
         dir.write(source, &data).await.unwrap();
 
-        super::clone_segment_file(&dir, source, output, true, None)
+        super::clone_segment_file(&dir, "test", source, output, true, None)
             .await
             .unwrap();
 

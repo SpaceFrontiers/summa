@@ -27,6 +27,7 @@ use crate::structures::vector::ivf::routing::{
     effective_binary_routing_mode, routing_parent_count, select_best, select_best_candidates,
     select_parent_beam, select_parent_beam_for_build,
 };
+use crate::structures::vector::progress::PhaseProgress;
 
 /// Hamming distance from one query code to graph nodes backed by a packed
 /// centroid matrix.
@@ -143,6 +144,33 @@ const MAX_BINARY_IVF_CLUSTERS: usize = 1_048_576;
 const BINARY_IVF_SCORE_BATCH: usize = 8_192;
 const BUILD_ASSIGNMENT_CANDIDATES: usize = 128;
 
+/// A code with no set bits carries no information: its Hamming distance to any
+/// query is a constant `popcount(query)`, so it scores mid-range against
+/// *everything* while matching nothing.
+///
+/// It is also a latency cliff. Equal distances resolve to the lowest cluster
+/// ID, so every zero code lands in the same leaf: one production field
+/// accumulated 31% of its vectors — 20.1M codes, 6.0 GiB — in leaf 0, and any
+/// query probing that leaf scanned all of it.
+///
+/// They are still indexed, because the byte-copy merge path requires an ANN
+/// payload to hold exactly as many vectors as flat storage; withholding them
+/// needs a versioned header field and is deliberately not done here. What the
+/// build does instead is count and report them, so a producer regression is
+/// loud rather than a silent scan cliff.
+#[inline]
+fn is_zero_code(code: &[u8]) -> bool {
+    code.iter().all(|&byte| byte == 0)
+}
+
+/// A leaf this many times larger than the average is a scan cliff regardless of
+/// what produced it, so segment builds report it.
+#[cfg(feature = "native")]
+const LEAF_SKEW_WARN_RATIO: usize = 100;
+/// Below this many vectors a skewed leaf cannot cost enough to be worth a line.
+#[cfg(feature = "native")]
+const LEAF_SKEW_WARN_MINIMUM: usize = 10_000;
+
 /// Global Hamming coarse quantizer shared by every segment of a field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryCoarseQuantizer {
@@ -168,6 +196,7 @@ impl BinaryCoarseQuantizer {
         mut config: BinaryIvfConfig,
         codes: &[u8],
         num_vectors: usize,
+        index_label: &str,
     ) -> io::Result<Self> {
         config
             .validate()
@@ -186,14 +215,14 @@ impl BinaryCoarseQuantizer {
             match effective_binary_routing_mode(config.routing, config.num_clusters) {
                 IvfRoutingMode::TwoLevel => {
                     let (leaves, router) =
-                        train_k_majority_hierarchical(&config, codes, num_vectors);
+                        train_k_majority_hierarchical(&config, codes, num_vectors, index_label);
                     (leaves, Some(router))
                 }
                 IvfRoutingMode::Hnsw => {
                     let leaves = if config.num_clusters >= HIERARCHICAL_TRAINING_THRESHOLD {
-                        train_k_majority_hierarchical(&config, codes, num_vectors).0
+                        train_k_majority_hierarchical(&config, codes, num_vectors, index_label).0
                     } else {
-                        train_k_majority(&config, codes, num_vectors)
+                        train_k_majority(&config, codes, num_vectors, index_label)
                     };
                     let byte_len = config.byte_len();
                     let graph = HnswRoutingGraph::build(
@@ -204,12 +233,14 @@ impl BinaryCoarseQuantizer {
                             kernel: HammingKernel::resolve(),
                         },
                         config.seed,
+                        index_label,
                     );
                     (leaves, Some(BinaryCentroidRouter::Hnsw(graph)))
                 }
-                IvfRoutingMode::Flat | IvfRoutingMode::Auto => {
-                    (train_k_majority(&config, codes, num_vectors), None)
-                }
+                IvfRoutingMode::Flat | IvfRoutingMode::Auto => (
+                    train_k_majority(&config, codes, num_vectors, index_label),
+                    None,
+                ),
             };
         let version = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -630,6 +661,8 @@ pub struct BinaryIvfIndex {
     /// leaves.
     pub(crate) clusters: Vec<(u32, BinaryCluster)>,
     len: usize,
+    /// Indexed codes that carry no information (all bits clear).
+    zero_codes: usize,
 }
 
 /// Streaming build state used by vector-generation rewrites. Only the exact
@@ -642,6 +675,7 @@ pub(crate) struct BinaryIvfBuilder {
     routing: IvfRoutingMode,
     clusters: rustc_hash::FxHashMap<u32, BinaryCluster>,
     len: usize,
+    zero_codes: usize,
 }
 
 impl BinaryIvfBuilder {
@@ -659,6 +693,7 @@ impl BinaryIvfBuilder {
             routing,
             clusters: rustc_hash::FxHashMap::default(),
             len: 0,
+            zero_codes: 0,
         })
     }
 
@@ -705,6 +740,10 @@ impl BinaryIvfBuilder {
         // distinct leaf in the batch instead of per code. Sorting by
         // `(cluster, index)` keeps each leaf's entries in ascending batch order,
         // so the serialized payload is byte-identical to per-code insertion.
+        self.zero_codes += codes
+            .chunks_exact(byte_len)
+            .filter(|code| is_zero_code(code))
+            .count();
         let mut order: Vec<u32> = (0..assignments.len() as u32).collect();
         order.sort_unstable_by_key(|&index| (assignments[index as usize], index));
         let mut run_start = 0usize;
@@ -730,7 +769,7 @@ impl BinaryIvfBuilder {
             }
             run_start = run_end;
         }
-        self.len = self.len.checked_add(doc_id_ordinals.len()).ok_or_else(|| {
+        self.len = self.len.checked_add(order.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "binary IVF count overflows")
         })?;
         Ok(())
@@ -745,6 +784,7 @@ impl BinaryIvfBuilder {
             num_clusters: self.num_clusters,
             clusters,
             len: self.len,
+            zero_codes: self.zero_codes,
         };
         index
             .validate()
@@ -835,6 +875,19 @@ impl BinaryIvfIndex {
         self.len == 0
     }
 
+    /// Indexed codes that were all-zero.
+    pub fn zero_codes(&self) -> usize {
+        self.zero_codes
+    }
+
+    /// Largest leaf as `(cluster_id, count)`, for skew reporting.
+    pub fn largest_cluster(&self) -> Option<(u32, usize)> {
+        self.clusters
+            .iter()
+            .map(|(cluster_id, cluster)| (*cluster_id, cluster.doc_ids.len()))
+            .max_by_key(|&(cluster_id, count)| (count, std::cmp::Reverse(cluster_id)))
+    }
+
     pub fn estimated_memory_bytes(&self) -> usize {
         self.clusters
             .iter()
@@ -843,8 +896,61 @@ impl BinaryIvfIndex {
     }
 }
 
+/// Report build-quality problems for one segment's binary payload.
+///
+/// Both are silent-degradation modes that cost search latency and recall long
+/// before anything looks broken, so they are surfaced at every build, merge and
+/// rewrite rather than left to be discovered from disk.
+#[cfg(feature = "native")]
+pub(crate) fn report_binary_build_quality(
+    index_label: &str,
+    field_id: u32,
+    index: &BinaryIvfIndex,
+) {
+    let indexed = index.len();
+    let zero = index.zero_codes();
+    if zero > 0 {
+        log::warn!(
+            "[binary_ivf] index={index_label} field={field_id}: {zero} of {indexed} indexed \
+             vectors ({:.1}%) are all-zero — they match nothing, collapse into a single leaf, \
+             and every query probing that leaf scans them; check the embedding producer",
+            100.0 * zero as f64 / indexed.max(1) as f64,
+        );
+        crate::observe::binary_zero_vectors(index_label, field_id, zero, indexed);
+    }
+    if let Some((cluster_id, count)) = index.largest_cluster()
+        && count >= LEAF_SKEW_WARN_MINIMUM
+        && index.num_clusters > 1
+        && count.saturating_mul(index.num_clusters as usize)
+            > indexed.saturating_mul(LEAF_SKEW_WARN_RATIO)
+    {
+        log::warn!(
+            "[binary_ivf] index={index_label} field={field_id}: leaf {cluster_id} holds {count}              of {indexed} vectors ({:.1}%, {:.0}x the average) — every query probing it scans              that leaf in full",
+            100.0 * count as f64 / indexed.max(1) as f64,
+            count as f64 * index.num_clusters as f64 / indexed.max(1) as f64,
+        );
+    }
+}
+
 /// Lloyd-style k-majority clustering in Hamming space.
-fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8> {
+fn train_k_majority(
+    config: &BinaryIvfConfig,
+    codes: &[u8],
+    n: usize,
+    index_label: &str,
+) -> Vec<u8> {
+    train_k_majority_reporting(config, codes, n, index_label, true)
+}
+
+/// As [`train_k_majority`], with progress reporting suppressed for the hundreds
+/// of small child codebooks a hierarchical build trains.
+fn train_k_majority_reporting(
+    config: &BinaryIvfConfig,
+    codes: &[u8],
+    n: usize,
+    index_label: &str,
+    report: bool,
+) -> Vec<u8> {
     let byte_len = config.byte_len();
     let k = config.num_clusters;
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
@@ -872,7 +978,17 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
     let first = rng.random_range(0..n);
     centroids[..byte_len].copy_from_slice(vec_at(first));
     let mut minimum_weights = vec![f64::INFINITY; n];
+    // Seeding is one full pass over the sample per centroid, so it is O(N*K)
+    // and by far the longest silent stretch of a large codebook.
+    let mut seeding = PhaseProgress::start_if(
+        report,
+        index_label,
+        "k-majority seeding",
+        format!("{k} centroids over {n} samples"),
+        k,
+    );
     for centroid_id in 1..k {
+        seeding.advance(centroid_id);
         let previous = &centroids[(centroid_id - 1) * byte_len..centroid_id * byte_len];
         #[cfg(feature = "native")]
         {
@@ -905,11 +1021,24 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
             .copy_from_slice(vec_at(chosen));
     }
 
+    seeding.finish();
+
     let mut assignment = vec![u32::MAX; n];
     let mut assignment_distances = vec![u32::MAX; n];
     let mut members: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
 
+    let mut lloyd = PhaseProgress::start_if(
+        report,
+        index_label,
+        "k-majority refinement",
+        format!(
+            "{k} centroids, {n} samples, <= {} iters",
+            config.train_iters
+        ),
+        config.train_iters,
+    );
     for _iter in 0..config.train_iters {
+        lloyd.advance(_iter);
         // Assignment is point-independent. Give every rayon worker its own
         // score buffer so the O(N*K) scan uses all available training CPUs
         // without synchronization or per-point allocation.
@@ -1018,6 +1147,7 @@ fn train_k_majority(config: &BinaryIvfConfig, codes: &[u8], n: usize) -> Vec<u8>
             }
         }
     }
+    lloyd.finish();
 
     centroids
 }
@@ -1197,13 +1327,14 @@ fn train_k_majority_hierarchical(
     config: &BinaryIvfConfig,
     codes: &[u8],
     n: usize,
+    index_label: &str,
 ) -> (Vec<u8>, BinaryCentroidRouter) {
     let byte_len = config.byte_len();
     let parent_count = routing_parent_count(config.num_clusters).min(n);
     let mut parent_config = config.clone();
     parent_config.num_clusters = parent_count;
     parent_config.max_train_samples = config.max_train_samples.min(n);
-    let parents = train_k_majority(&parent_config, codes, n);
+    let parents = train_k_majority(&parent_config, codes, n, index_label);
 
     let mut assignments = vec![0u32; n];
     let mut group_sizes = vec![0usize; parent_count];
@@ -1253,22 +1384,68 @@ fn train_k_majority_hierarchical(
     }
     drop(assignments);
 
-    let mut leaves = Vec::with_capacity(config.num_clusters.saturating_mul(byte_len));
-    let mut children = vec![Vec::new(); parent_count];
-    for (parent, (group, &child_count)) in groups.iter().zip(&child_counts).enumerate() {
+    // Child codebooks share nothing: each trains from its own parent's group
+    // with its own derived seed. Training them concurrently is the level that
+    // actually fills the machine — one child covers only a few tens of
+    // thousands of codes, far too little work for its internal rayon loops to
+    // saturate a 48-core box, so a sequential loop over parents left most of
+    // the machine idle for the bulk of a large codebook's build.
+    let populated = child_counts.iter().filter(|&&count| count > 0).count();
+    let child_phase = PhaseProgress::start(
+        index_label,
+        "child codebooks",
+        format!("{populated} parents -> {} leaves", config.num_clusters),
+        populated,
+    );
+    let shared = child_phase.shared();
+    let train_child = |(parent, (group, &child_count)): (usize, (&Vec<u8>, &usize))| -> Vec<u8> {
         if child_count == 0 {
-            continue;
+            return Vec::new();
         }
         let mut child_config = config.clone();
         child_config.num_clusters = child_count;
         child_config.max_train_samples = group.len() / byte_len;
         child_config.seed = config.seed ^ (parent as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let first_leaf = leaves.len() / byte_len;
-        leaves.extend_from_slice(&train_k_majority(
+        let trained = train_k_majority_reporting(
             &child_config,
             group,
             group.len() / byte_len,
-        ));
+            index_label,
+            false,
+        );
+        shared.complete_one();
+        trained
+    };
+    #[cfg(feature = "native")]
+    let trained_children: Vec<Vec<u8>> = {
+        use rayon::prelude::*;
+        groups
+            .par_iter()
+            .zip(child_counts.par_iter())
+            .enumerate()
+            .map(train_child)
+            .collect()
+    };
+    #[cfg(not(feature = "native"))]
+    let trained_children: Vec<Vec<u8>> = groups
+        .iter()
+        .zip(child_counts.iter())
+        .enumerate()
+        .map(train_child)
+        .collect();
+    child_phase.finish();
+
+    // Assemble in parent order, so the leaf matrix is byte-identical to the
+    // sequential build and every parent still owns one contiguous leaf run.
+    let mut leaves = Vec::with_capacity(config.num_clusters.saturating_mul(byte_len));
+    let mut children = vec![Vec::new(); parent_count];
+    for (parent, (trained, &child_count)) in trained_children.iter().zip(&child_counts).enumerate()
+    {
+        if child_count == 0 {
+            continue;
+        }
+        let first_leaf = leaves.len() / byte_len;
+        leaves.extend_from_slice(trained);
         children[parent].extend((first_leaf..first_leaf + child_count).map(|leaf| leaf as u32));
     }
     debug_assert_eq!(leaves.len(), config.num_clusters * byte_len);
@@ -1294,7 +1471,7 @@ mod tests {
         let mut config = BinaryIvfConfig::new(dim_bits, clusters);
         config.train_iters = 4;
         config.max_train_samples = labels.len();
-        let quantizer = BinaryCoarseQuantizer::train(config, codes, labels.len()).unwrap();
+        let quantizer = BinaryCoarseQuantizer::train(config, codes, labels.len(), "test").unwrap();
         let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, codes, labels).unwrap();
         (quantizer, index)
     }
@@ -1377,7 +1554,7 @@ mod tests {
         config.train_iters = 3;
         config.max_train_samples = points;
         config.routing = IvfRoutingMode::Hnsw;
-        let quantizer = BinaryCoarseQuantizer::train(config, &codes, points).unwrap();
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, points, "test").unwrap();
         let Some(BinaryCentroidRouter::Hnsw(graph)) = quantizer.routing_index.as_ref() else {
             panic!("HNSW routing expected at 4096 clusters");
         };
@@ -1460,6 +1637,47 @@ mod tests {
         );
     }
 
+    /// Child codebooks train concurrently, so the leaf matrix and topology must
+    /// still be byte-identical whatever the pool width — the quantizer is a
+    /// shared artifact and every segment's postings are keyed to its leaf IDs.
+    #[cfg(feature = "native")]
+    #[test]
+    fn hierarchical_training_is_deterministic_across_thread_counts() {
+        let dim_bits = 64;
+        let byte_len = dim_bits / 8;
+        let points = 4_000;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1234_5678);
+        let mut codes = vec![0u8; points * byte_len];
+        rng.fill_bytes(&mut codes);
+
+        let mut config = BinaryIvfConfig::new(dim_bits, 96);
+        config.train_iters = 3;
+        config.max_train_samples = points;
+
+        let train = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| train_k_majority_hierarchical(&config, &codes, points, "test"))
+        };
+        let (one_leaves, one_router) = train(1);
+        let (eight_leaves, eight_router) = train(8);
+
+        assert_eq!(one_leaves, eight_leaves, "leaf centroids diverged");
+        let (
+            BinaryCentroidRouter::TwoLevel { topology: one, .. },
+            BinaryCentroidRouter::TwoLevel {
+                topology: eight, ..
+            },
+        ) = (&one_router, &eight_router)
+        else {
+            panic!("hierarchical training must produce a two-level router");
+        };
+        assert_eq!(one, eight, "parent topology diverged");
+        assert!(one.validate(config.num_clusters), "topology invalid");
+    }
+
     #[cfg(feature = "native")]
     #[test]
     fn k_majority_is_deterministic_across_thread_counts() {
@@ -1477,12 +1695,12 @@ mod tests {
             .num_threads(1)
             .build()
             .unwrap()
-            .install(|| train_k_majority(&config, &codes, points));
+            .install(|| train_k_majority(&config, &codes, points, "test"));
         let four_threads = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| train_k_majority(&config, &codes, points));
+            .install(|| train_k_majority(&config, &codes, points, "test"));
 
         assert_eq!(one_thread, four_threads);
     }
@@ -1520,7 +1738,7 @@ mod tests {
         config.seed = seed;
         config.train_iters = 0;
         config.max_train_samples = codes.len();
-        let centroids = train_k_majority(&config, &codes, codes.len());
+        let centroids = train_k_majority(&config, &codes, codes.len(), "test");
 
         assert_eq!(centroids[0], codes[first]);
         assert_eq!(centroids[1], codes[raw_choice]);
@@ -1621,7 +1839,7 @@ mod tests {
         let codes = [0x00, 0x01, 0x02, 0xf0, 0xf1, 0xf2];
         let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
         let config = BinaryIvfConfig::new(8, 2);
-        let quantizer = BinaryCoarseQuantizer::train(config, &codes, codes.len()).unwrap();
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, codes.len(), "test").unwrap();
         let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat).unwrap();
         builder
             .add_batch(&quantizer, &codes[..3], &labels[..3])
@@ -1654,6 +1872,63 @@ mod tests {
                 left.doc_ids
             );
         }
+    }
+
+    /// All-zero codes are counted and reported. They are still indexed —
+    /// the byte-copy merge requires the payload to hold exactly as many
+    /// vectors as flat storage — so the guard is detection, not removal.
+    #[test]
+    fn all_zero_codes_are_counted_and_reported() {
+        let codes = [0x00u8, 0xf0, 0x00, 0x00, 0x0f, 0x00];
+        let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
+        let mut config = BinaryIvfConfig::new(8, 2);
+        config.train_iters = 2;
+        config.max_train_samples = labels.len();
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
+        let index =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+
+        assert_eq!(index.zero_codes(), 4, "four zero codes must be counted");
+        assert_eq!(index.len(), labels.len(), "every vector stays indexed");
+        // Ties resolve to the lowest cluster ID, so the zeros share one leaf:
+        // this is exactly the collapse the report warns about.
+        let (_, largest) = index.largest_cluster().expect("a populated leaf");
+        assert!(
+            largest >= 4,
+            "all-zero codes should share one leaf, got {largest}"
+        );
+        report_binary_build_quality("test-index", 7, &index);
+    }
+
+    /// A field that is entirely zero still produces a payload, so merges that
+    /// require one keep working.
+    #[test]
+    fn an_entirely_zero_field_still_produces_a_payload() {
+        let codes = [0x00u8; 4];
+        let labels = [(0, 0), (1, 0), (2, 0), (3, 0)];
+        let mut config = BinaryIvfConfig::new(8, 2);
+        config.train_iters = 1;
+        config.max_train_samples = labels.len();
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
+        let index =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        assert!(!index.is_empty(), "payload must cover every flat vector");
+        assert_eq!(index.len(), labels.len());
+        assert_eq!(index.zero_codes(), 4);
+    }
+
+    #[test]
+    fn largest_cluster_reports_the_dominant_leaf() {
+        let codes = [0x0fu8, 0x0f, 0x0e, 0x0f, 0x0d, 0x0f, 0xf0];
+        let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)];
+        let mut config = BinaryIvfConfig::new(8, 2);
+        config.train_iters = 4;
+        config.max_train_samples = labels.len();
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
+        let index =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        let (_, count) = index.largest_cluster().expect("a populated leaf");
+        assert_eq!(count, 6, "the dominant leaf holds every near-duplicate");
     }
 
     #[test]
@@ -1725,7 +2000,7 @@ mod tests {
             config.routing = routing;
             config.train_iters = 3;
             config.max_train_samples = 256;
-            let quantizer = BinaryCoarseQuantizer::train(config, &codes, 256).unwrap();
+            let quantizer = BinaryCoarseQuantizer::train(config, &codes, 256, "test").unwrap();
             quantizer.validate_routing(routing).unwrap();
             let plan = quantizer.probe(&codes[..8], 8, routing);
             assert_eq!(plan.cluster_ids.len(), 8);

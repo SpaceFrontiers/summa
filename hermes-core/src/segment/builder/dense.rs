@@ -132,7 +132,8 @@ fn build_dense_ann_blob(
     };
     let (index_type, bytes) = blob?;
     log::info!(
-        "[dense_vector_build] built ANN(type={}) for field {} ({} vectors, {})",
+        "[dense_vector_build] index={} built ANN(type={}) for field {} ({} vectors, {})",
+        schema.index_label(),
         index_type,
         field_id,
         builder.doc_ids.len(),
@@ -368,6 +369,11 @@ pub(super) fn build_vectors_streaming(
                     &builder.doc_ids,
                 )
                 .map_err(crate::Error::Io)?;
+                crate::structures::vector::index::report_binary_build_quality(
+                    schema.index_label(),
+                    field_id,
+                    &index,
+                );
                 let blob_offset = current_offset;
                 let mut output = &mut *writer;
                 let blob_len = crate::segment::ann_disk::write_built_binary_ivf(
@@ -394,7 +400,8 @@ pub(super) fn build_vectors_streaming(
                     })?;
                 }
                 log::debug!(
-                    "[dense_vector_build] field {}: binary IVF built ({} vectors, {} clusters, {})",
+                    "[dense_vector_build] index={} field {}: binary IVF built ({} vectors, {} clusters, {})",
+                    schema.index_label(),
                     field_id,
                     num_vectors,
                     quantizer.num_clusters,

@@ -29,7 +29,8 @@ impl SegmentMerger {
             let store_docs = segment.store().num_docs();
             if meta_docs != store_docs {
                 log::error!(
-                    "[merge_store] SOURCE MISMATCH segment {:016x}: meta.num_docs={}, store.num_docs={}",
+                    "[merge_store] index={} SOURCE MISMATCH segment {:016x}: meta.num_docs={}, store.num_docs={}",
+                    self.schema.index_label(),
                     segment.meta().id,
                     meta_docs,
                     store_docs

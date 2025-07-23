@@ -337,6 +337,7 @@ mod ann_pin_tests {
         let centroids = CoarseCentroids::train(
             &CoarseConfig::new(2, 2).with_routing(IvfRoutingMode::Flat),
             &vectors,
+            "test",
         );
         let mut trained = TrainedVectorStructures::default();
         trained.centroids.insert(7, Arc::new(centroids));

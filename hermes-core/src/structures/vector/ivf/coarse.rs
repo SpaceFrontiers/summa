@@ -121,7 +121,7 @@ impl CoarseCentroids {
     /// Train coarse centroids using k-means algorithm
     ///
     /// Uses deterministic adaptive D² seeding and Lloyd refinement.
-    pub fn train(config: &CoarseConfig, vectors: &[Vec<f32>]) -> Self {
+    pub fn train(config: &CoarseConfig, vectors: &[Vec<f32>], index_label: &str) -> Self {
         assert!(!vectors.is_empty(), "Cannot train on empty vector set");
         assert!(config.num_clusters > 0, "Need at least 1 cluster");
         assert!(vectors.iter().all(|vector| vector.len() == config.dim));
@@ -133,7 +133,7 @@ impl CoarseCentroids {
             .iter()
             .flat_map(|vector| vector.iter().copied())
             .collect::<Vec<_>>();
-        Self::train_contiguous(config, &flat, vectors.len())
+        Self::train_contiguous(config, &flat, vectors.len(), index_label)
     }
 
     /// Train directly from a contiguous row-major matrix.
@@ -141,6 +141,7 @@ impl CoarseCentroids {
         config: &CoarseConfig,
         vectors: &[f32],
         vector_count: usize,
+        index_label: &str,
     ) -> Self {
         assert!(vector_count > 0, "Cannot train on empty vector set");
         assert!(config.num_clusters > 0, "Need at least 1 cluster");
@@ -171,6 +172,7 @@ impl CoarseCentroids {
                             )
                         },
                         config.seed,
+                        index_label,
                     );
                     (leaves, Some(FloatCentroidRouter::Hnsw(graph)))
                 }
@@ -894,7 +896,7 @@ mod tests {
             .collect();
 
         let config = CoarseConfig::new(dim, num_clusters);
-        let centroids = CoarseCentroids::train(&config, &vectors);
+        let centroids = CoarseCentroids::train(&config, &vectors, "test");
 
         assert_eq!(centroids.num_clusters, num_clusters as u32);
         assert_eq!(centroids.dim, dim);
@@ -915,8 +917,8 @@ mod tests {
             .with_seed(91)
             .with_routing(IvfRoutingMode::TwoLevel);
 
-        let rows = CoarseCentroids::train(&config, &vectors);
-        let contiguous = CoarseCentroids::train_contiguous(&config, &flat, vectors.len());
+        let rows = CoarseCentroids::train(&config, &vectors, "test");
+        let contiguous = CoarseCentroids::train_contiguous(&config, &flat, vectors.len(), "test");
 
         assert_eq!(rows.centroids, contiguous.centroids);
         assert_eq!(
@@ -939,7 +941,7 @@ mod tests {
             .collect();
 
         let config = CoarseConfig::new(dim, num_clusters);
-        let centroids = CoarseCentroids::train(&config, &vectors);
+        let centroids = CoarseCentroids::train(&config, &vectors, "test");
 
         // Test that find_nearest returns valid cluster IDs
         for v in &vectors {
@@ -984,7 +986,7 @@ mod tests {
             spill_threshold: 0.0,
         };
         let config = CoarseConfig::new(dim, num_clusters).with_soar(soar_config);
-        let centroids = CoarseCentroids::train(&config, &vectors);
+        let centroids = CoarseCentroids::train(&config, &vectors, "test");
 
         // Test SOAR assignment
         let assignment = centroids.assign(&vectors[0]);
@@ -1171,6 +1173,7 @@ mod tests {
                 .with_routing(IvfRoutingMode::Flat)
                 .with_soar(SoarConfig::new().target_spill_fraction(TARGET_SPILL)),
             &corpus,
+            "test",
         );
         // Share the exact trained codebook so the only variable is whether
         // documents receive selective secondary postings.
@@ -1397,7 +1400,7 @@ mod tests {
             .collect();
 
         let config = CoarseConfig::new(dim, num_clusters);
-        let centroids = CoarseCentroids::train(&config, &vectors);
+        let centroids = CoarseCentroids::train(&config, &vectors, "test");
 
         // Serialize and deserialize
         let bytes = bincode::serde::encode_to_vec(&centroids, bincode::config::standard()).unwrap();
@@ -1419,8 +1422,11 @@ mod tests {
             .collect();
 
         for routing in [IvfRoutingMode::Hnsw, IvfRoutingMode::TwoLevel] {
-            let trained =
-                CoarseCentroids::train(&CoarseConfig::new(dim, 16).with_routing(routing), &vectors);
+            let trained = CoarseCentroids::train(
+                &CoarseConfig::new(dim, 16).with_routing(routing),
+                &vectors,
+                "test",
+            );
             trained.validate_routing(routing).unwrap();
             let plan = trained.probe(&vectors[0], 8, routing);
             assert_eq!(plan.cluster_ids.len(), 8);

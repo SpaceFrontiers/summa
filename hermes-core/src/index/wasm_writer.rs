@@ -344,8 +344,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             let buffered = self.builder.take().map(|b| b.num_docs()).unwrap_or(0);
             let lost = buffered.saturating_sub(1);
             log::warn!(
-                "[wasm_writer] segment builder poisoned by failed add_document ({e}); \
-                 discarding {lost} buffered document(s)"
+                "[wasm_writer] index={} segment builder poisoned by failed add_document ({e}); \
+                 discarding {lost} buffered document(s)",
+                self.schema.index_label()
             );
             return Err(crate::Error::Internal(format!(
                 "document failed mid-indexing and poisoned the segment builder: {e}; \
@@ -380,7 +381,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 let doc_count = builder.num_docs();
 
                 log::info!(
-                    "[wasm_writer] building segment: id={} docs={}",
+                    "[wasm_writer] index={} building segment: id={} docs={}",
+                    self.schema.index_label(),
                     segment_hex,
                     doc_count
                 );

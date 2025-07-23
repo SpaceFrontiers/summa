@@ -593,7 +593,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     async fn build_vector_generation(&self, mode: VectorGenerationMode) -> Result<()> {
         let dense_fields = self.get_ivf_vector_fields();
         if dense_fields.is_empty() {
-            log::info!("No dense vector fields configured for ANN indexing");
+            log::info!(
+                "[vector_training] no dense vector fields configured for ANN indexing: index={}",
+                self.schema.index_label()
+            );
             return Ok(());
         }
 
@@ -702,8 +705,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .await?;
         self.cleanup_unreferenced_vector_artifacts().await;
         log::info!(
-            "Dense vector ANN generation {:?} complete for {} field(s)",
+            "[vector_training] ANN generation {:?} complete: index={} {} field(s)",
             mode,
+            self.schema.index_label(),
             target_field_ids.len(),
         );
         Ok(())
@@ -717,6 +721,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         artifact_generation: &str,
     ) -> Result<Vec<TrainedFieldUpdate>> {
         let training_pool = self.segment_manager.background_cpu_pool();
+        let index_label = self.schema.index_label();
         let mut missing = Vec::new();
         let mut updates = Vec::with_capacity(fields.len());
         for (field, config) in fields {
@@ -739,6 +744,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         &mut sample,
                         corpus_count,
                         artifact_generation,
+                        index_label,
                     )
                 })
             })?;
@@ -754,7 +760,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
         if !missing.is_empty() {
             log::info!(
-                "Skipping dense vector field(s) {missing:?}: the current corpus contains no vectors"
+                "[vector_training] skipping dense vector field(s) {missing:?}: index={index_label} has no vectors in the current corpus"
             );
         }
         Ok(updates)
@@ -784,7 +790,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let files = match self.directory.list_files(std::path::Path::new("")).await {
             Ok(files) => files,
             Err(error) => {
-                log::warn!("[trained] failed listing abandoned dense vector artifacts: {error}");
+                log::warn!(
+                    "[trained] index={} failed listing abandoned dense vector artifacts: {error}",
+                    self.schema.index_label()
+                );
                 return;
             }
         };
@@ -800,7 +809,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             if let Err(error) = self.directory.delete(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                log::warn!("[trained] failed deleting abandoned artifact {path:?}: {error}");
+                log::warn!(
+                    "[trained] index={} failed deleting abandoned artifact {path:?}: {error}",
+                    self.schema.index_label()
+                );
             }
         }
     }
@@ -981,6 +993,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             )),
         };
         let max_read_vectors = (MAX_SAMPLE_READ_BYTES / bytes_per_sample.max(1)).max(1);
+        let mut zero_codes = 0usize;
         let mut global_offset = 0usize;
         let mut cursor = 0usize;
         let field_ids = [field.0];
@@ -1036,9 +1049,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         for &ordinal in &selected[run_start..run_end] {
                             let relative = ordinal - selected[run_start];
                             let offset = relative * bytes_per_sample;
-                            codes.extend_from_slice(
-                                &bytes.as_slice()[offset..offset + bytes_per_sample],
-                            );
+                            let code = &bytes.as_slice()[offset..offset + bytes_per_sample];
+                            // All-zero codes are never indexed, so training on
+                            // them only spends centroids that can never be
+                            // assigned: a production field turned ~30% of a
+                            // 163k codebook into duplicate zero centroids.
+                            if code.iter().all(|&byte| byte == 0) {
+                                zero_codes += 1;
+                                continue;
+                            }
+                            codes.extend_from_slice(code);
                         }
                     }
                     TrainingSample::Float(values) => {
@@ -1066,17 +1086,45 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         let collected = sample.len(config.dim());
-        if global_offset != total || cursor != take || collected != take {
+        // Coverage is checked against what was *selected*; withheld all-zero
+        // codes are subtracted explicitly so a real traversal bug still trips.
+        if global_offset != total || cursor != take || collected + zero_codes != take {
             return Err(Error::Corruption(format!(
-                "training sample coverage mismatch for field {}: counted={total}, traversed={global_offset}, selected={cursor}, collected={collected}",
+                "training sample coverage mismatch for field {}: counted={total}, traversed={global_offset}, selected={cursor}, collected={collected}, zero={zero_codes}",
                 field.0,
             )));
         }
+        if zero_codes > 0 {
+            log::warn!(
+                "[vector_training] index={} field={}: {zero_codes} of {take} sampled vectors \
+                 ({:.1}%) are all-zero and were excluded from training — they cannot be assigned \
+                 to any leaf, so training on them only wastes centroids",
+                self.schema.index_label(),
+                field.0,
+                100.0 * zero_codes as f64 / take.max(1) as f64,
+            );
+            crate::observe::binary_zero_vectors(
+                self.schema.index_label(),
+                field.0,
+                zero_codes,
+                take,
+            );
+        }
+        if collected == 0 {
+            log::warn!(
+                "[vector_training] index={} field={}: every sampled vector is all-zero; \
+                 skipping ANN training for this field",
+                self.schema.index_label(),
+                field.0,
+            );
+            return Ok(None);
+        }
         if collected < total {
             log::info!(
-                "Sampled {} / {} dense vectors for field {} (max {} vectors / {} resident)",
+                "[vector_training] sampled {} / {} dense vectors: index={} field={} (max {} vectors / {} resident)",
                 collected,
                 total,
+                self.schema.index_label(),
                 field.0,
                 self.config.vector_training_max_samples,
                 crate::format_bytes(self.config.vector_training_memory_bytes as u64),
@@ -1093,6 +1141,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         sample: &mut TrainingSample,
         corpus_count: usize,
         artifact_generation: &str,
+        index_label: &str,
     ) -> Result<TrainedFieldModel> {
         let field_id = field.0;
         let dim = config.dim();
@@ -1105,7 +1154,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let num_clusters = effective_field_num_clusters(config, corpus_count, sample_count)?;
 
         log::info!(
-            "Training dense vector index for field {} with {} sampled / {} total vectors, {} clusters (dim={})",
+            "[vector_training] training model: index={} field={} with {} sampled / {} total vectors, {} clusters (dim={})",
+            index_label,
             field_id,
             sample_count,
             corpus_count,
@@ -1149,14 +1199,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 let validation_count = validation.len() / dim;
                 if seeds.len() > 1 {
                     log::info!(
-                        "Field {field_id}: {} training + {} held-out vectors; evaluating {} deterministic centroid seed(s)",
+                        "[vector_training] model selection: index={index_label} field={field_id}, {} training + {} held-out vectors, {} deterministic centroid seed(s)",
                         training_count,
                         validation_count,
                         seeds.len(),
                     );
                 } else {
                     log::info!(
-                        "Field {field_id}: training all {} sampled vectors with one deterministic \
+                        "[vector_training] model selection: index={index_label} field={field_id}, all {} sampled vectors with one deterministic \
                          centroid seed; model-selection holdout disabled",
                         training_count,
                     );
@@ -1178,12 +1228,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         &base_config.clone().with_seed(seed),
                         training_values,
                         training_count,
+                        index_label,
                     );
                     let quality =
                         evaluate_float_build_quality(&candidate, validation, config.ivf_routing);
                     if let Some(quality) = quality {
                         log::info!(
-                            "Field {field_id} IVF candidate seed={seed}: objective={:.6}, \
+                            "[vector_training] IVF candidate: index={index_label} field={field_id} seed={seed}, objective={:.6}, \
                              exact/routed_mean_distortion={:.6}/{:.6}, router_recall@1={:.4}, \
                              construction_postings/vector={:.3}, \
                              residual_scale[p50/p95/p99]={:.4}/{:.4}/{:.4}, \
@@ -1221,14 +1272,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     selected.expect("the fixed centroid seed bank is non-empty");
                 if let Some(quality) = quality {
                     log::info!(
-                        "Field {field_id}: selected IVF seed {seed} with held-out objective {:.6} \
+                        "[vector_training] selected IVF seed: index={index_label} field={field_id} seed={seed}, held-out objective {:.6} \
                          (occupancy penalty {:.4})",
                         quality.objective,
                         quality.occupancy.penalty,
                     );
                 } else {
                     log::info!(
-                        "Field {field_id}: selected IVF seed {seed} without a model-selection \
+                        "[vector_training] selected IVF seed: index={index_label} field={field_id} seed={seed}, without a model-selection \
                          holdout",
                     );
                 }
@@ -1246,6 +1297,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     binary_config,
                     codes,
                     training_count,
+                    index_label,
                 )
                 .map_err(Error::Io)?;
                 TrainedFieldArtifacts::Binary(quantizer)
@@ -1281,7 +1333,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 self.save_trained_artifact(&centroids, &update.centroids_file)
                     .await?;
                 log::info!(
-                    "Saved IVF-TQ coarse artifact for field {} ({} clusters; leaf codec is derived)",
+                    "[vector_training] saved IVF-TQ coarse artifact: index={} field={} ({} clusters; leaf codec is derived)",
+                    self.schema.index_label(),
                     update.field_id,
                     centroids.num_clusters,
                 );
@@ -1290,7 +1343,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 self.save_trained_artifact(&quantizer, &update.centroids_file)
                     .await?;
                 log::info!(
-                    "Saved binary IVF artifact for field {} ({} clusters)",
+                    "[vector_training] saved binary IVF artifact: index={} field={} ({} clusters)",
+                    self.schema.index_label(),
                     update.field_id,
                     quantizer.num_clusters,
                 );
@@ -1497,7 +1551,12 @@ mod tests {
     fn float_quality_reports_exact_query_router_recall() {
         let training = [0.0, 0.0, 0.1, 0.0, 10.0, 10.0, 10.1, 10.0];
         let config = crate::structures::CoarseConfig::new(2, 2);
-        let centroids = crate::structures::CoarseCentroids::train_contiguous(&config, &training, 4);
+        let centroids = crate::structures::CoarseCentroids::train_contiguous(
+            &config,
+            &training,
+            4,
+            "test-index",
+        );
         for routing in [
             crate::dsl::IvfRoutingMode::Flat,
             crate::dsl::IvfRoutingMode::Auto,
@@ -1522,7 +1581,12 @@ mod tests {
         let config = crate::structures::CoarseConfig::new(2, 2)
             .with_routing(crate::dsl::IvfRoutingMode::Flat)
             .with_soar(crate::structures::SoarConfig::full());
-        let centroids = crate::structures::CoarseCentroids::train_contiguous(&config, &training, 4);
+        let centroids = crate::structures::CoarseCentroids::train_contiguous(
+            &config,
+            &training,
+            4,
+            "test-index",
+        );
         let quality = evaluate_float_build_quality(
             &centroids,
             &[0.05, 0.0, 10.05, 10.0],
@@ -1554,6 +1618,7 @@ mod tests {
             &mut sample,
             3,
             "test",
+            "test-index",
         )
         .unwrap();
         let TrainedFieldArtifacts::FloatCentroids(centroids) = model.artifacts else {
@@ -1588,6 +1653,7 @@ mod tests {
             &mut sample,
             3,
             "test-no-soar",
+            "test-index",
         )
         .unwrap();
         let TrainedFieldArtifacts::FloatCentroids(centroids) = model.artifacts else {

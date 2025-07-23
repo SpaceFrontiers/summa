@@ -10,6 +10,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use crate::dsl::IvfRoutingMode;
+use crate::structures::vector::progress::PhaseProgress;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -245,7 +246,12 @@ pub struct HnswRoutingGraph {
 }
 
 impl HnswRoutingGraph {
-    pub fn build(node_count: usize, distance: impl PairDistance, seed: u64) -> Self {
+    pub fn build(
+        node_count: usize,
+        distance: impl PairDistance,
+        seed: u64,
+        index_label: &str,
+    ) -> Self {
         assert!(node_count > 0 && node_count <= u32::MAX as usize);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let level_multiplier = 1.0 / (HNSW_M as f64).ln();
@@ -265,7 +271,14 @@ impl HnswRoutingGraph {
         let mut entry_point = insertion_order[0];
         let mut max_level = node_levels[entry_point as usize];
 
-        for &node in insertion_order.iter().skip(1) {
+        let mut progress = PhaseProgress::start(
+            index_label,
+            "hnsw graph build",
+            format!("{node_count} centroids, M={HNSW_M}, ef={HNSW_EF_CONSTRUCTION}"),
+            node_count,
+        );
+        for (inserted, &node) in insertion_order.iter().enumerate().skip(1) {
+            progress.advance(inserted);
             let node_level = node_levels[node as usize];
             let mut entry = entry_point;
             let node_distance = PairQueryDistance {
@@ -322,6 +335,7 @@ impl HnswRoutingGraph {
                 max_level = node_level;
             }
         }
+        progress.finish();
 
         Self::compact(
             HNSW_M,
@@ -1439,7 +1453,7 @@ mod tests {
             let [rx, ry] = points[right as usize];
             (lx - rx).powi(2) + (ly - ry).powi(2)
         };
-        let graph = HnswRoutingGraph::build(points.len(), distance, 42);
+        let graph = HnswRoutingGraph::build(points.len(), distance, 42, "test");
         assert!(graph.validate(points.len()));
         assert!(graph.size_bytes() < points.len() * 512);
 

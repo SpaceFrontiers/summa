@@ -421,7 +421,8 @@ impl SegmentMerger {
         let output_size = writer.offset() as usize;
         super::block_in_place_if_multithread(move || writer.finish())?;
         log::info!(
-            "[dense_vector_merge] file written: {} ({} fields) in {:.1}s",
+            "[dense_vector_merge] index={} file written: {} ({} fields) in {:.1}s",
+            self.schema.index_label(),
             crate::format_bytes(output_size as u64),
             toc.len(),
             write_start.elapsed().as_secs_f64()
@@ -552,7 +553,8 @@ impl SegmentMerger {
         result.map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
         log::debug!(
-            "[dense_vector_merge] field {}: copied {} compatible ANN run source(s), {}",
+            "[dense_vector_merge] index={} field {}: copied {} compatible ANN run source(s), {}",
+            self.schema.index_label(),
             field.0,
             sources.len(),
             crate::format_bytes(data_size),
@@ -635,7 +637,8 @@ impl SegmentMerger {
             result.map_err(crate::Error::Io)?;
             let data_size = writer.offset() - data_offset;
             log::debug!(
-                "[merge_vectors] field {}: copied {} compatible TQ run source(s), {} bytes",
+                "[merge_vectors] index={} field {}: copied {} compatible TQ run source(s), {} bytes",
+                self.schema.index_label(),
                 field.0,
                 sources.len(),
                 data_size,
@@ -650,8 +653,9 @@ impl SegmentMerger {
         // Payload-less sources (pre-TQ builds or a schema switch to `tq`)
         // are re-encoded; every compatible source is still byte-copied.
         log::info!(
-            "[merge_vectors] field {}: {}/{} TQ source(s) have no payload; re-encoding only \
+            "[merge_vectors] index={} field {}: {}/{} TQ source(s) have no payload; re-encoding only \
              those from flat vectors (training-free), byte-copying the rest",
+            self.schema.index_label(),
             field.0,
             missing_segments.len(),
             segments_with_vectors,
@@ -688,8 +692,9 @@ impl SegmentMerger {
         let vector_count = builder.len();
         if sources.is_empty() && vector_count == 0 {
             log::warn!(
-                "[merge_vectors] field {}: TQ re-encode found no vectors in any source; \
+                "[merge_vectors] index={} field {}: TQ re-encode found no vectors in any source; \
                  the merged segment will carry no TQ payload and fall back to exact scan",
+                self.schema.index_label(),
                 field.0,
             );
             return Ok(None);
@@ -719,7 +724,8 @@ impl SegmentMerger {
             result.map_err(crate::Error::Io)?;
         }
         log::info!(
-            "[merge_vectors] field {}: TQ re-encoded {} vectors in {:.1}s ({} sources copied)",
+            "[merge_vectors] index={} field {}: TQ re-encoded {} vectors in {:.1}s ({} sources copied)",
+            self.schema.index_label(),
             field.0,
             vector_count,
             encode_start.elapsed().as_secs_f64(),
@@ -824,7 +830,8 @@ impl SegmentMerger {
         result.map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
         log::debug!(
-            "[merge_vectors] field {}: copied {} compatible IVF-TQ run source(s), {} bytes",
+            "[merge_vectors] index={} field {}: copied {} compatible IVF-TQ run source(s), {} bytes",
+            self.schema.index_label(),
             field.0,
             sources.len(),
             data_size,
@@ -906,7 +913,8 @@ impl SegmentMerger {
             return Ok(None);
         }
         log::info!(
-            "[merge_vectors] field {} IVF-TQ rebuilt from {} vectors into {} assignments ({:.1}s)",
+            "[merge_vectors] index={} field {} IVF-TQ rebuilt from {} vectors into {} assignments ({:.1}s)",
+            self.schema.index_label(),
             field.0,
             total_fed,
             index.len(),
@@ -990,8 +998,14 @@ impl SegmentMerger {
         }
         let num_clusters = quantizer.num_clusters;
         let index = builder.finish().map_err(crate::Error::Io)?;
+        crate::structures::vector::index::report_binary_build_quality(
+            self.schema.index_label(),
+            field.0,
+            &index,
+        );
         log::debug!(
-            "[dense_vector_merge] field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {})",
+            "[dense_vector_merge] index={} field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {})",
+            self.schema.index_label(),
             field.0,
             vector_count,
             num_clusters,

@@ -959,10 +959,11 @@ impl SegmentBuilder {
         if !self.position_saturation_warned {
             self.position_saturation_warned = true;
             log::warn!(
-                "[segment_builder] {what} {value} exceeds the position-encoding limit {max}; \
+                "[segment_builder] index={} {what} {value} exceeds the position-encoding limit {max}; \
                  saturating — phrase/ordinal matching degrades for the overflowing \
                  elements/tokens instead of corrupting other documents' matches \
-                 (further occurrences in this segment are not logged)"
+                 (further occurrences in this segment are not logged)",
+                self.schema.index_label()
             );
         }
     }
@@ -1425,7 +1426,8 @@ impl SegmentBuilder {
         drop(sparse_vectors);
 
         log::info!(
-            "[segment_build] docs={}: term_dict={}, postings={}, store={}, dense_vectors={}, sparse_vectors={}, fast_fields={}",
+            "[segment_build] index={} docs={}: term_dict={}, postings={}, store={}, dense_vectors={}, sparse_vectors={}, fast_fields={}",
+            self.schema.index_label(),
             num_docs,
             crate::format_bytes(term_dict_bytes as u64),
             crate::format_bytes(postings_bytes as u64),

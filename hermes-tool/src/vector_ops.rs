@@ -78,7 +78,7 @@ pub fn train_centroids(
     let coarse_config = hermes_core::structures::CoarseConfig::new(dim, num_clusters)
         .with_max_iters(max_iters)
         .with_seed(seed);
-    let centroids = CoarseCentroids::train(&coarse_config, &vectors);
+    let centroids = CoarseCentroids::train(&coarse_config, &vectors, "hermes-tool");
     let elapsed = start.elapsed();
 
     info!(
@@ -163,7 +163,7 @@ pub async fn retrain_centroids(
     let coarse_config = hermes_core::structures::CoarseConfig::new(dim, num_clusters)
         .with_max_iters(max_iters)
         .with_seed(seed);
-    let centroids = CoarseCentroids::train(&coarse_config, &vectors);
+    let centroids = CoarseCentroids::train(&coarse_config, &vectors, "hermes-tool");
 
     // Save centroids to index directory
     let centroids_path = index_path.join("coarse_centroids.bin");
