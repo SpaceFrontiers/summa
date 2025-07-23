@@ -13,7 +13,7 @@ The implementation has three boundaries:
    bounded diagnostic pass, and writes a portable JSON bundle.
 2. `hermes-llm lab` keeps that same model resident, serves the model-lab page on
    loopback, and accepts bounded prompt requests through `POST /api/trace`.
-3. The standalone model-lab entry in `hermes-web` can submit a query to that
+3. The standalone `hermes-model-lab` project can submit a query to that
    local session or load a saved bundle, then renders architecture, inference,
    and training views. It does not parse MAL or load model weights in
    JavaScript.

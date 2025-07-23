@@ -1542,9 +1542,9 @@ fn merge_ranked_reuse(
 }
 
 /// Merge two canonically sorted batches while moving (not cloning) hits.
-/// Native parallel reductions use this eagerly, so retained cross-segment
+/// Synchronous parallel reductions use this eagerly, so retained cross-segment
 /// results stay O(k) instead of O(number_of_segments × k).
-#[cfg(any(feature = "native", test))]
+#[cfg(any(feature = "sync", test))]
 fn merge_two_ranked(
     left: Vec<crate::query::SearchResult>,
     right: Vec<crate::query::SearchResult>,

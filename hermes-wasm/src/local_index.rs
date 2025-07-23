@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use hermes_core::directories::RamDirectory;
 use hermes_core::{IndexConfig, Searcher, WasmIndexWriter};
-use serde::Serialize;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -291,14 +290,7 @@ impl LocalIndex {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("No committed data — call commit() first"))?;
 
-        let response = searcher
-            .query_offset(&query_str, limit, offset)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
-
-        response
-            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+        crate::searcher::search_offset(searcher, &query_str, limit, offset).await
     }
 
     /// Structured search: accepts a query object instead of a query string.
@@ -357,23 +349,14 @@ impl LocalIndex {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("No committed data"))?;
 
-        let segment_id_u128 = u128::from_str_radix(&segment_id, 16)
-            .map_err(|e| JsValue::from_str(&format!("Invalid segment_id: {}", e)))?;
-        let address = hermes_core::query::DocAddress::new(segment_id_u128, doc_id);
-
-        let doc = searcher
-            .get_document_with_fields(&address, fields.as_ref())
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
-
-        match doc {
-            Some(document) => {
-                let json = document.to_json(searcher.schema());
-                json.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-                    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-            }
-            None => Ok(JsValue::NULL),
-        }
+        crate::searcher::get_document(
+            searcher,
+            &segment_id,
+            doc_id,
+            fields.as_ref(),
+            "Invalid segment_id",
+        )
+        .await
     }
 
     /// Number of indexed documents (across all committed segments).
@@ -391,12 +374,7 @@ impl LocalIndex {
     /// Get field names from the schema.
     #[wasm_bindgen(js_name = "fieldNames")]
     pub fn field_names(&self) -> JsValue {
-        let names: Vec<String> = self
-            .writer
-            .as_ref()
-            .map(|w| w.schema().fields().map(|(_, f)| f.name.clone()).collect())
-            .unwrap_or_default();
-        serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
+        crate::searcher::field_names(self.writer.as_ref().map(WasmIndexWriter::schema))
     }
 
     // ── Internal helpers ──

@@ -25,12 +25,12 @@
       >
         <!-- Document content -->
         <div v-if="hit.document" class="space-y-3">
-            <!-- Use UX config columns if available -->
-            <template v-if="displayColumns.length > 0">
-              <template
-                v-for="fieldName in displayColumns"
-                :key="fieldName"
-              >
+          <!-- Use UX config columns if available -->
+          <template v-if="displayColumns.length > 0">
+            <template
+              v-for="fieldName in displayColumns"
+              :key="fieldName"
+            >
               <div v-if="!isFieldEmpty(hit.document[fieldName])"
               >
                 <!-- Label (skip for ipfs_files which handles its own label) -->
@@ -76,20 +76,20 @@
                   {{ formatField(fieldName, hit.document[fieldName]) }}
                 </div>
               </div>
-              </template>
             </template>
-            <!-- Fallback: show all fields -->
-            <template v-else>
-              <div
-                v-for="(value, key) in hit.document"
-                :key="key"
-              >
-                <div class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-0.5">{{ key }}</div>
-                <div class="text-sm text-gray-900">
-                  {{ typeof value === 'object' ? JSON.stringify(value) : value }}
-                </div>
+          </template>
+          <!-- Fallback: show all fields -->
+          <template v-else>
+            <div
+              v-for="(value, key) in hit.document"
+              :key="key"
+            >
+              <div class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-0.5">{{ key }}</div>
+              <div class="text-sm text-gray-900">
+                {{ typeof value === 'object' ? JSON.stringify(value) : value }}
               </div>
-            </template>
+            </div>
+          </template>
         </div>
 
         <!-- No stored fields -->
@@ -156,7 +156,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['next-page', 'prev-page'])
+defineEmits(['next-page', 'prev-page'])
 
 const showRaw = ref(false)
 

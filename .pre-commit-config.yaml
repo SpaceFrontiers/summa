@@ -1,5 +1,7 @@
+default_install_hook_types: [pre-commit, pre-push]
+
 repos:
-  # Rust - single combined check (fmt + clippy in one compilation)
+  # Rust formatting and portable linting
   - repo: local
     hooks:
       - id: rustfmt
@@ -10,15 +12,29 @@ repos:
         pass_filenames: false
       - id: clippy
         name: clippy
-        entry: cargo clippy --all-targets --features metal -- -D warnings
+        entry: cargo clippy --workspace --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
+      - id: clippy-metal
+        name: clippy (Metal)
+        entry: cargo clippy -p hermes-llm -p hermes-train --all-targets --features metal -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [manual]
+      - id: clippy-cuda
+        name: clippy (CUDA)
+        entry: cargo clippy -p hermes-llm -p hermes-train --all-targets --features cuda -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [manual]
 
   # Python formatting and linting
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.5
+    rev: v0.16.0
     hooks:
       - id: ruff
         args: ["--fix"]
@@ -38,7 +54,7 @@ repos:
 
   # YAML formatting
   - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v4.0.0-alpha.8
+    rev: v3.1.0
     hooks:
       - id: prettier
         types_or: [yaml, json, markdown]

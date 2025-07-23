@@ -707,19 +707,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         let metadata = super::IndexMetadata::new((*schema).clone());
 
-        let segment_manager = Arc::new(crate::merge::SegmentManager::new(
-            Arc::clone(&directory),
-            Arc::clone(&schema),
-            metadata,
-            config.merge_policy.clone_box(),
-            config.term_cache_blocks,
-            config.max_concurrent_merges,
-            Arc::clone(&config.background_merge_permits),
-            config.merge_bp_time_budget,
-            config.bp_memory_budget_bytes,
-            Arc::clone(&config.background_reorder_permits),
-            config.background_reorder_pool.clone(),
-        ));
+        let segment_manager =
+            super::segment_manager_from_config(&directory, &schema, metadata, &config);
         segment_manager.update_metadata(|_| {}).await?;
 
         Ok(Self::new_with_parts(
@@ -765,19 +754,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());
 
-        let segment_manager = Arc::new(crate::merge::SegmentManager::new(
-            Arc::clone(&directory),
-            Arc::clone(&schema),
-            metadata,
-            config.merge_policy.clone_box(),
-            config.term_cache_blocks,
-            config.max_concurrent_merges,
-            Arc::clone(&config.background_merge_permits),
-            config.merge_bp_time_budget,
-            config.bp_memory_budget_bytes,
-            Arc::clone(&config.background_reorder_permits),
-            config.background_reorder_pool.clone(),
-        ));
+        let segment_manager =
+            super::segment_manager_from_config(&directory, &schema, metadata, &config);
         let swept = segment_manager.cleanup_orphan_segments().await?;
         if swept > 0 {
             log::warn!(

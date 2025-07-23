@@ -1,6 +1,6 @@
 //! Simple HTTP server for serving test index files
 //!
-//! Run with: cargo run --bin serve_test_index
+//! Run with: `cargo run -p hermes-server --bin serve-index -- PATH [PORT]`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

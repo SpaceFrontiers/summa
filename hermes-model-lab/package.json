@@ -1,0 +1,28 @@
+{
+  "name": "hermes-model-lab",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Standalone local observability UI for Hermes LLM traces",
+  "scripts": {
+    "dev": "python3 -m http.server 4173 --bind 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test src/*.test.js",
+    "lint": "eslint src",
+    "check": "pnpm lint && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "eslint": "^9.39.2",
+    "vite": "^7.3.6"
+  },
+  "pnpm": {
+    "overrides": {
+      "rollup": "^4.62.2",
+      "picomatch": "^4.0.5",
+      "flatted": "^3.4.2",
+      "minimatch@3": "^3.1.5"
+    }
+  }
+}

@@ -282,9 +282,13 @@ const results = await index.searchStructured({
 ```bash
 cd hermes-wasm
 bash build.sh  # requires Homebrew LLVM on macOS
+npm ci
+npm test
 ```
 
 The build script sets `CC` and `AR` to Homebrew LLVM binaries for zstd cross-compilation to `wasm32-unknown-unknown`.
+The root `package.json` is a private Vitest harness; the publishable npm
+metadata is generated in `pkg/` by `wasm-pack` from `Cargo.toml`.
 
 ## Example
 

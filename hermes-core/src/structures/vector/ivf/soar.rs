@@ -6,7 +6,7 @@
 //! - When query is parallel to primary residual (high error), secondary has low error
 //!
 //! Reference: "SOAR: New algorithms for even faster vector search with ScaNN"
-//! https://research.google/blog/soar-new-algorithms-for-even-faster-vector-search-with-scann/
+//! <https://research.google/blog/soar-new-algorithms-for-even-faster-vector-search-with-scann/>
 
 use serde::{Deserialize, Serialize};
 

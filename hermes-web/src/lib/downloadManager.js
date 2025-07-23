@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { parseContentPath } from './ipfsUrl'
 
 // Configuration
 const MAX_RETRIES = 10
@@ -42,27 +43,8 @@ export function createDownloadManager(appConfig) {
    * Parse IPFS/IPNS URL or local path
    */
   const parseIpfsUrl = (url) => {
-    const trimmed = url.trim()
-
-    if (trimmed.startsWith('ipfs://')) {
-      return { type: 'ipfs', path: trimmed.slice(7) }
-    }
-    if (trimmed.startsWith('ipns://')) {
-      return { type: 'ipns', path: trimmed.slice(7) }
-    }
-    if (trimmed.startsWith('/ipfs/')) {
-      return { type: 'ipfs', path: trimmed.slice(6) }
-    }
-    if (trimmed.startsWith('/ipns/')) {
-      return { type: 'ipns', path: trimmed.slice(6) }
-    }
-
-    // Local path starting with / (e.g., /s/file.bin)
-    if (trimmed.startsWith('/')) {
-      return { type: 'local', path: trimmed }
-    }
-
-    return { type: null, path: trimmed }
+    const { type, path } = parseContentPath(url)
+    return { type, path }
   }
 
   /**

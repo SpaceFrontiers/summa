@@ -7,7 +7,6 @@
 
 use super::mask::{MaskScheme, MaskState};
 use super::o200k_family;
-use crate::pretokenize::Pretoken;
 
 pub(crate) struct NemotronScheme;
 
@@ -40,36 +39,4 @@ pub struct FastNemotronPretokenizer<'a> {
     state: MaskState,
 }
 
-impl<'a> FastNemotronPretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self {
-            bytes,
-            state: MaskState::new(pos),
-        }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastNemotronPretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<NemotronScheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastNemotronPretokenizer, NemotronScheme);
+super::impl_mask_pretokenizer!(FastNemotronPretokenizer, NemotronScheme);

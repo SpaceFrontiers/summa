@@ -6,8 +6,8 @@ A high-performance gRPC search server for Hermes indexes.
 
 - **Index Management**: Create, delete, and manage search indexes
 - **Document Indexing**: Stream or batch index documents
-- **Full-Text Search**: Term queries, boolean queries, and boosting
-- **Document Retrieval**: Get documents by ID
+- **Search**: Text, range, sparse/dense vector, binary vector, and fusion queries
+- **Document Retrieval**: Get documents by stable segment/document address
 - **Segment Management**: Commit changes and force merge segments
 
 ## Installation
@@ -89,18 +89,18 @@ budget fails with `RESOURCE_EXHAUSTED`; request fewer hits or fields.
 The server uses one BP CPU pool and one whole-pass gate across all indexes.
 These are deliberately separate controls:
 
-| Option                                   |   Default | Meaning                                                                                                                                  |
-| ---------------------------------------- | --------: | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `--optimizer-threads`                    |       `0` | Threads in the shared BP pool. `0` disables periodic optimizer scans; merge-time and manual BP still use the process-wide fallback pool. |
+| Option                                   |   Default | Meaning                                                                                                                                                                                                             |
+| ---------------------------------------- | --------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--optimizer-threads`                    |       `0` | Threads in the shared BP pool. `0` disables periodic optimizer scans; merge-time and manual BP still use the process-wide fallback pool.                                                                            |
 | `--optimizer-concurrent-passes`          |       `2` | Maximum simultaneous whole-segment BP passes across optimizer, merge-time, and manual reorder. Values are clamped to `1..=2`; automatic merges use at most one slot so fresh-segment optimization retains capacity. |
-| `--optimizer-scan-interval-secs`         |      `60` | Interval between background scans.                                                                                                       |
-| `--optimizer-large-segment-docs`         | `5000000` | Document threshold for partial/budgeted first passes.                                                                                    |
-| `--optimizer-time-budget-secs`           |     `600` | Wall-clock budget for an optimizer pass on a large segment.                                                                              |
-| `--optimizer-partial-min-partition-docs` |     `256` | Initial depth floor for large segments (one default LSP superblock).                                                                     |
-| `--optimizer-unconverged-cooldown-secs`  |     `600` | Delay after a rewrite finishes before another deepening pass.                                                                            |
-| `--optimizer-max-unconverged-passes`     |       `3` | Optimizer follow-up eligibility limit per truncated lineage, including the initial partial pass. `0` disables follow-up deepening.       |
-| `--merge-bp-budget-secs`                 |     `600` | Wall-clock budget for BP performed inside a merge; `0` explicitly selects an unbudgeted pass.                                           |
-| `--bp-memory-budget-mb`                  |   `24576` | Per-pass algorithmic working-set bound; not a reservation or a total-process RSS limit.                                                  |
+| `--optimizer-scan-interval-secs`         |      `60` | Interval between background scans.                                                                                                                                                                                  |
+| `--optimizer-large-segment-docs`         | `5000000` | Document threshold for partial/budgeted first passes.                                                                                                                                                               |
+| `--optimizer-time-budget-secs`           |     `600` | Wall-clock budget for an optimizer pass on a large segment.                                                                                                                                                         |
+| `--optimizer-partial-min-partition-docs` |     `256` | Initial depth floor for large segments (one default LSP superblock).                                                                                                                                                |
+| `--optimizer-unconverged-cooldown-secs`  |     `600` | Delay after a rewrite finishes before another deepening pass.                                                                                                                                                       |
+| `--optimizer-max-unconverged-passes`     |       `3` | Optimizer follow-up eligibility limit per truncated lineage, including the initial partial pass. `0` disables follow-up deepening.                                                                                  |
+| `--merge-bp-budget-secs`                 |     `600` | Wall-clock budget for BP performed inside a merge; `0` explicitly selects an unbudgeted pass.                                                                                                                       |
+| `--bp-memory-budget-mb`                  |   `24576` | Per-pass algorithmic working-set bound; not a reservation or a total-process RSS limit.                                                                                                                             |
 
 An active BP pass is CPU-bound and is expected to occupy up to
 `--optimizer-threads` cores. Concurrent passes share that same pool, so a
@@ -168,11 +168,11 @@ message CreateIndexRequest {
 
 ```
 index articles {
-    title: text indexed stored
-    body: text indexed stored
-    author: text indexed stored
-    published_at: u64 indexed stored
-    tags: text indexed stored
+    field title: text<simple> [indexed, stored]
+    field body: text<simple> [indexed, stored]
+    field author: text<simple> [indexed, stored]
+    field published_at: u64 [indexed, stored]
+    field tags: text<raw> [indexed, stored<multi>]
 }
 ```
 
@@ -201,9 +201,17 @@ message BatchIndexDocumentsRequest {
 }
 
 message NamedDocument {
-  map<string, FieldValue> fields = 1;
+  repeated FieldEntry fields = 1;
+}
+
+message FieldEntry {
+  string name = 1;
+  FieldValue value = 2;
 }
 ```
+
+`FieldEntry` is repeated so callers can send multiple values with the same
+field name.
 
 #### IndexDocuments (Streaming)
 
@@ -275,13 +283,14 @@ message SearchRequest {
 
 **Query Types:**
 
-- **TermQuery**: Match a specific term in a field
-- **BooleanQuery**: Combine queries with must/should/must_not
-- **BoostQuery**: Boost the score of a query
+- `TermQuery` and `MatchQuery`
+- `BooleanQuery`, `BoostQuery`, `RangeQuery`, `PrefixQuery`, and `AllQuery`
+- `SparseVectorQuery`, `DenseVectorQuery`, and `BinaryDenseVectorQuery`
+- top-level `FusionQuery` for hybrid union retrieval
 
 #### GetDocument
 
-Retrieve a document by its ID.
+Retrieve a document by the `DocAddress` returned in a search hit.
 
 ```protobuf
 rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
@@ -308,60 +317,36 @@ rpc GetIndexInfo(GetIndexInfoRequest) returns (GetIndexInfoResponse);
 | `sparse_vector` | Sparse vector for semantic search |
 | `dense_vector`  | Dense vector for semantic search  |
 
-## Example: Python Client
+## Example: Python client
+
+The maintained client handles protobuf conversion and channel lifecycle:
 
 ```python
-import grpc
-from hermes_pb2 import *
-from hermes_pb2_grpc import IndexServiceStub, SearchServiceStub
+from hermes_client_python import HermesClient
 
-channel = grpc.insecure_channel("localhost:50051")
-index_service = IndexServiceStub(channel)
-search_service = SearchServiceStub(channel)
-
-# Create index
-schema = """
-index articles {
-    title: text indexed stored
-    body: text indexed stored
-}
-"""
-index_service.CreateIndex(CreateIndexRequest(index_name="articles", schema=schema))
-
-# Index documents
-docs = [
-    NamedDocument(
-        fields={
-            "title": FieldValue(text="Hello World"),
-            "body": FieldValue(text="This is my first article"),
+async with HermesClient("localhost:50051") as client:
+    await client.create_index(
+        "articles",
+        """
+        index articles {
+            field title: text<simple> [indexed, stored]
+            field body: text<simple> [indexed, stored]
         }
-    ),
-    NamedDocument(
-        fields={
-            "title": FieldValue(text="Goodbye World"),
-            "body": FieldValue(text="This is my last article"),
-        }
-    ),
-]
-index_service.BatchIndexDocuments(
-    BatchIndexDocumentsRequest(index_name="articles", documents=docs)
-)
+        """,
+    )
+    await client.index_documents(
+        "articles",
+        [{"title": "Hello World", "body": "My first article"}],
+    )
+    await client.commit("articles")
 
-# Commit
-index_service.Commit(CommitRequest(index_name="articles"))
-
-# Search
-response = search_service.Search(
-    SearchRequest(
-        index_name="articles",
-        query=Query(term=TermQuery(field="title", term="hello")),
-        limit=10,
+    response = await client.search(
+        "articles",
+        query={"term": {"field": "title", "term": "hello"}},
         fields_to_load=["title", "body"],
     )
-)
-
-for hit in response.hits:
-    print(f"Doc {hit.doc_id}: {hit.score} - {hit.fields}")
+    for hit in response.hits:
+        print(hit.address, hit.score, hit.fields)
 ```
 
 ## Docker
@@ -383,3 +368,11 @@ docker run -p 50051:50051 -v ./data:/data ghcr.io/spacefrontiers/hermes/hermes-s
 ## License
 
 MIT
+
+## Development checks
+
+```bash
+cargo fmt --all -- --check
+cargo clippy -p hermes-server --all-targets -- -D warnings
+cargo test -p hermes-server
+```

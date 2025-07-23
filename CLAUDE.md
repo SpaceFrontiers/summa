@@ -43,10 +43,16 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-tool**: CLI for index management and data processing pipelines
 - **hermes-server**: gRPC server for remote search operations
 - **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
+- **hermes-web**: Vue/WASM search UI
+- **hermes-model-lab**: Standalone local LLM trace and observability UI
+- **hermes-client-python**: Async Python gRPC client
+- **hermes-client-typescript**: TypeScript gRPC client
+- **hermes-proto**: Shared gRPC protocol definition
+- **hermes-mal**: Shared Model Architecture Language parser
+- **hermes-mal-python**: Thin PyO3 binding around `hermes-mal`
+- **hermes-tokenizer**: Stable-Rust byte-level BPE tokenizer
 - **hermes-llm**: Shared Transformer/Mamba model, inference, generation, and MAL integration
 - **hermes-train**: Autodiff training for the shared hermes-llm model
-- **hermes-client-python**: Python gRPC client
-- **hermes-web**: Vue.js web UI
 
 LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same `hermes_llm::Transformer` used by inference, saves a safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
 
@@ -61,11 +67,12 @@ MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, 
 cargo build --release
 
 # Run all tests
-cargo test --all-features
+cargo test --workspace
 
 # Lint and format
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Build WASM (requires Homebrew LLVM for zstd cross-compilation)
 cd hermes-wasm && bash build.sh
@@ -101,7 +108,8 @@ Key modules:
 
 ### CLI Tool (hermes-tool)
 
-Single `main.rs` with clap-based subcommands:
+`main.rs` owns clap dispatch; `index_ops.rs`, `data_processing.rs`, and
+`vector_ops.rs` own the corresponding command implementations:
 
 - `create` - Create index from SDL schema
 - `index` - Index documents from JSONL/stdin
@@ -140,6 +148,15 @@ The WASM build uses `hermes-core` with features `["wasm", "http"]`. The `wasm` f
 
 Key constraint: WASM has no threads, no filesystem, no `SystemTime`. All native-only code is behind `#[cfg(feature = "native")]`.
 
+### Web interfaces
+
+- `hermes-web` is the Vue/WASM search application. Its source may depend on
+  `hermes-wasm` but must not contain LLM trace or Model Lab code.
+- `hermes-model-lab` is a standalone, dependency-light LLM trace UI served by
+  `hermes-llm lab`. It must not depend on Vue, `hermes-web`, or `hermes-wasm`.
+- The historical `pnpm lab:*` commands in `hermes-web` are forwarding aliases
+  only. `/model-lab.html` remains the stable Lab entry route.
+
 ### hermes-core Feature Flags
 
 - **`native`** (default via `sync`): Full native build — tokio, rayon, threads, mmap, lasso, uuid, etc.
@@ -169,6 +186,9 @@ Full SDL reference: `docs/schema.md`
 - Rust 1.97+ (see `rust-toolchain.toml`)
 - Python 3.12+ (for Python bindings)
 - Node.js 20+ (for WASM and web)
+- pnpm 10+ (for TypeScript and web packages)
+- uv (for the Python gRPC client)
+- maturin (for the MAL Python wheel)
 - wasm-pack (for WASM builds)
 - protoc (for gRPC)
 
@@ -186,7 +206,10 @@ gh run list --workflow=ci.yml --limit=5
 
 **Workflows:**
 
-- **ci.yml**: Runs on push/PR to main. Rust (fmt, clippy, test, build), WASM build, Python client lint, TypeScript build, cargo audit.
+- **ci.yml**: Runs on push/PR to main. Rust format/clippy/feature checks,
+  workspace tests/build/docs, shell training harnesses, WASM and search UI,
+  Model Lab, Python/TypeScript clients with generated-binding freshness, MAL
+  wheel smoke tests, cargo audit, and unused-dependency checks.
 - **publish.yml**: Manual trigger (`workflow_dispatch`). Bumps version, publishes to crates.io, NPM (WASM + TS client), PyPI, and GHCR Docker.
 
 ## Key Dependencies

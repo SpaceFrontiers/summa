@@ -1,4 +1,5 @@
 export { HermesClient } from "./client";
+export type { HermesClientOptions } from "./client";
 export type {
   DocAddress,
   Document,
@@ -19,6 +20,9 @@ export type {
   DenseVectorQuery,
   BinaryDenseVectorQuery,
   RangeQuery,
+  PrefixQuery,
+  WeightedQuery,
+  FusionQuery,
   Combiner,
   Reranker,
 } from "./types";

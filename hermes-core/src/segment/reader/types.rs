@@ -8,8 +8,9 @@ use crate::structures::{BlockSparsePostingList, SparseBlock, SparseSkipEntry};
 
 /// Production ANN payloads for float IVF-PQ and packed-binary IVF.
 ///
-/// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
-/// via mmap for reranking and merge. This enum only holds ANN indexes.
+/// Raw flat vectors are stored separately in
+/// [`LazyFlatVectorData`](crate::segment::LazyFlatVectorData) and accessed via
+/// mmap for reranking and merge. This enum only holds ANN indexes.
 ///
 /// Both variants use the same validated mmap-backed run format. Corpus-sized
 /// columns stay in the file mapping; only the compact run directory is parsed.

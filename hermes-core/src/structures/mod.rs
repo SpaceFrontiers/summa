@@ -12,6 +12,7 @@ pub mod simd;
 mod sstable;
 mod sstable_index;
 pub mod vector;
+mod vint;
 
 // Re-export postings
 pub use postings::{

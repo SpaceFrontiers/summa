@@ -38,7 +38,7 @@ env_logger = "0.11"
 clap = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
-num_cpus = "1.16"
+num_cpus = { workspace = true }
 rayon = { workspace = true }
 
 [build-dependencies]

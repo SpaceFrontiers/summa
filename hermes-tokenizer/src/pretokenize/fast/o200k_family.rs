@@ -204,15 +204,7 @@ fn try_suffix<const CONTRACTIONS: bool>(bytes: &[u8], end: usize) -> usize {
     if !CONTRACTIONS || bytes.get(end) != Some(&b'\'') {
         return end;
     }
-    match bytes.get(end + 1).map(u8::to_ascii_lowercase) {
-        Some(b's' | b'd' | b'm' | b't') => end + 2,
-        Some(b'l') if bytes.get(end + 2).map(u8::to_ascii_lowercase) == Some(b'l') => end + 3,
-        Some(b'v') if bytes.get(end + 2).map(u8::to_ascii_lowercase) == Some(b'e') => end + 3,
-        Some(b'r') if bytes.get(end + 2).map(u8::to_ascii_lowercase) == Some(b'e') => end + 3,
-        // U+017F LATIN SMALL LETTER LONG S case-folds to 's' under `(?i)`
-        Some(0xC5) if bytes.get(end + 2) == Some(&0xBF) => end + 3,
-        _ => end,
-    }
+    super::contraction_end(bytes, end).unwrap_or(end)
 }
 
 /// `[^\s\p{L}\p{N}]+` from `pos` (punctuation, symbols, marks, controls —
@@ -279,41 +271,9 @@ fn scan_han_run(bytes: &[u8], mut pos: usize) -> usize {
 /// space+punct alternatives were ruled out.
 #[inline(always)]
 fn ws_token_end(bytes: &[u8], start: usize) -> usize {
-    let len = bytes.len();
-    let mut p = start;
-    let mut last_nl_end = 0usize; // 0 = run contains no \r\n
-    let mut last_char_start = start;
-    while p < len {
-        let b = unsafe { *bytes.get_unchecked(p) };
-        if b == b'\r' || b == b'\n' {
-            last_char_start = p;
-            p += 1;
-            last_nl_end = p;
-        } else if is_ascii_ws(b) {
-            last_char_start = p;
-            p += 1;
-        } else if b >= 0x80 {
-            let (cp, l) = unsafe { decode_cp(bytes, p) };
-            if o200k_class_of(cp) == O200kCharClass::Whitespace {
-                last_char_start = p;
-                p += l;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if last_nl_end != 0 {
-        return last_nl_end; // `\s*[\r\n]+`: through the last newline
-    }
-    if p >= len {
-        return p; // `\s+(?!\S)`: lookahead succeeds at EOS
-    }
-    if last_char_start > start {
-        return last_char_start; // `\s+(?!\S)`: all but the last ws char
-    }
-    p // `\s+`: single whitespace char before content
+    super::whitespace_token_end::<true>(bytes, start, |codepoint| {
+        o200k_class_of(codepoint) == O200kCharClass::Whitespace
+    })
 }
 
 /// `\p{N}{1,3}` or `\p{N}` starting at a digit char ending at `first_end`.

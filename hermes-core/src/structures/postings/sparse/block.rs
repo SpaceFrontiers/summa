@@ -285,8 +285,11 @@ impl SparseBlock {
     /// Fused decode + multiply + scatter-accumulate into flat_scores array.
     ///
     /// Equivalent to:
-    ///   decode_scored_weights_into(qw, &mut weights_buf);
-    ///   for i in 0..count { flat_scores[doc_ids[i] - base] += weights_buf[i]; }
+    ///
+    /// ```text
+    /// decode_scored_weights_into(qw, &mut weights_buf);
+    /// for i in 0..count { flat_scores[doc_ids[i] - base] += weights_buf[i]; }
+    /// ```
     ///
     /// But avoids allocating/filling weights_buf — decodes directly into flat_scores.
     /// Tracks dirty entries (first touch) for efficient collection.

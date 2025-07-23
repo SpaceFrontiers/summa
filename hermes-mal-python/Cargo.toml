@@ -12,6 +12,7 @@ publish = false
 [lib]
 name = "hermes_mal"
 crate-type = ["cdylib"]
+doc = false
 
 [dependencies]
 # Renamed to `mal` to avoid colliding with this crate's own `hermes_mal` lib

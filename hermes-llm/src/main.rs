@@ -17,68 +17,118 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(clap::Args)]
+struct InferenceArtifacts {
+    /// Model weights path or remote URI
+    #[arg(short, long)]
+    checkpoint: String,
+
+    /// MAL source or exported JSON model config path/URI
+    #[arg(long)]
+    config: String,
+
+    /// Tokenizer path or remote URI
+    #[arg(short, long)]
+    tokenizer: String,
+}
+
+#[derive(clap::Args)]
+struct SamplingControls {
+    /// Prompt text
+    #[arg(short, long)]
+    prompt: String,
+
+    /// Sampling temperature; <= 0 uses greedy decoding
+    #[arg(long, default_value = "0.9")]
+    temperature: f64,
+
+    /// Top-k sampling
+    #[arg(long)]
+    top_k: Option<usize>,
+
+    /// Penalize tokens already present in the context (1 disables)
+    #[arg(long, default_value = "1.0")]
+    repetition_penalty: f64,
+
+    /// RNG seed for reproducible sampling (random if unset)
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Keep generating for the full --max-tokens instead of stopping at EOS
+    #[arg(long, default_value_t = false)]
+    no_eos: bool,
+}
+
+impl SamplingControls {
+    fn config(
+        &self,
+        max_new_tokens: usize,
+        eos_token: u32,
+        seed: Option<u64>,
+    ) -> hermes_llm::generate::SamplingConfig {
+        hermes_llm::generate::SamplingConfig {
+            max_new_tokens,
+            temperature: self.temperature,
+            top_k: self.top_k,
+            repetition_penalty: self.repetition_penalty,
+            eos_token: (!self.no_eos).then_some(eos_token),
+            seed,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct TraceLimits {
+    /// Maximum trailing tokens captured by the diagnostic pass
+    #[arg(long, default_value_t = 128)]
+    trace_tokens: usize,
+
+    /// Maximum residual/Mamba channel bins per heatmap
+    #[arg(long, default_value_t = 64)]
+    channel_bins: usize,
+
+    /// Maximum attention heads captured per attention layer
+    #[arg(long, default_value_t = 4)]
+    attention_heads: usize,
+
+    /// Maximum training metric rows retained in the bundle
+    #[arg(long, default_value_t = 2_000)]
+    metrics_points: usize,
+}
+
+impl TraceLimits {
+    fn options(&self) -> hermes_llm::TraceOptions {
+        hermes_llm::TraceOptions {
+            token_limit: self.trace_tokens,
+            channel_limit: self.channel_bins,
+            attention_head_limit: self.attention_heads,
+            metrics_row_limit: self.metrics_points,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Generate text from a trained model
     Generate {
-        /// Model weights path or remote URI
-        #[arg(short, long)]
-        checkpoint: String,
+        #[command(flatten)]
+        artifacts: InferenceArtifacts,
 
-        /// Model config path or remote URI
-        #[arg(long)]
-        config: String,
-
-        /// Tokenizer path or remote URI
-        #[arg(short, long)]
-        tokenizer: String,
-
-        /// Prompt text
-        #[arg(short, long)]
-        prompt: String,
+        #[command(flatten)]
+        sampling: SamplingControls,
 
         /// Maximum number of tokens to generate
         #[arg(short, long, default_value = "100")]
         max_tokens: usize,
-
-        /// Sampling temperature
-        #[arg(long, default_value = "0.9")]
-        temperature: f64,
-
-        /// Top-k sampling
-        #[arg(long)]
-        top_k: Option<usize>,
-
-        /// Penalize tokens already present in the context (1 disables)
-        #[arg(long, default_value = "1.0")]
-        repetition_penalty: f64,
-
-        /// RNG seed for reproducible sampling (random if unset)
-        #[arg(long)]
-        seed: Option<u64>,
-
-        /// Keep generating for the full --max-tokens instead of stopping at EOS
-        #[arg(long, default_value_t = false)]
-        no_eos: bool,
     },
 
     /// Generate text and export a bounded model-visualization trace
     Trace {
-        /// Model weights path or remote URI
-        #[arg(short, long)]
-        checkpoint: String,
+        #[command(flatten)]
+        artifacts: InferenceArtifacts,
 
-        /// MAL source or exported JSON model config path/URI
-        #[arg(long)]
-        config: String,
-
-        /// Tokenizer path or remote URI
-        #[arg(short, long)]
-        tokenizer: String,
-
-        /// Prompt text
-        #[arg(short, long)]
-        prompt: String,
+        #[command(flatten)]
+        sampling: SamplingControls,
 
         /// JSON trace bundle output
         #[arg(short, long)]
@@ -92,64 +142,22 @@ enum Commands {
         #[arg(short, long, default_value = "32")]
         max_tokens: usize,
 
-        /// Sampling temperature; <= 0 uses greedy decoding
-        #[arg(long, default_value = "0.9")]
-        temperature: f64,
-
-        /// Top-k sampling
-        #[arg(long)]
-        top_k: Option<usize>,
-
-        /// Penalize tokens already present in the context (1 disables)
-        #[arg(long, default_value = "1.0")]
-        repetition_penalty: f64,
-
-        /// RNG seed for reproducible sampling (random if unset)
-        #[arg(long)]
-        seed: Option<u64>,
-
-        /// Keep generating for the full --max-tokens instead of stopping at EOS
-        #[arg(long, default_value_t = false)]
-        no_eos: bool,
-
-        /// Maximum trailing tokens captured by the diagnostic pass
-        #[arg(long, default_value_t = 128)]
-        trace_tokens: usize,
-
-        /// Maximum residual/Mamba channel bins per heatmap
-        #[arg(long, default_value_t = 64)]
-        channel_bins: usize,
-
-        /// Maximum attention heads captured per attention layer
-        #[arg(long, default_value_t = 4)]
-        attention_heads: usize,
-
-        /// Maximum training metric rows retained in the bundle
-        #[arg(long, default_value_t = 2_000)]
-        metrics_points: usize,
+        #[command(flatten)]
+        limits: TraceLimits,
     },
 
     /// Keep a checkpoint loaded and serve the interactive Model Lab locally
     #[cfg(feature = "lab")]
     Lab {
-        /// Model weights path or remote URI
-        #[arg(short, long)]
-        checkpoint: String,
-
-        /// MAL source or exported JSON model config path/URI
-        #[arg(long)]
-        config: String,
-
-        /// Tokenizer path or remote URI
-        #[arg(short, long)]
-        tokenizer: String,
+        #[command(flatten)]
+        artifacts: InferenceArtifacts,
 
         /// Optional hermes-train metrics.jsonl included with every trace
         #[arg(long)]
         metrics: Option<PathBuf>,
 
-        /// Directory containing model-lab.html and src/model-lab
-        #[arg(long, default_value = "hermes-web")]
+        /// Directory containing the Model Lab static assets
+        #[arg(long, default_value = "hermes-model-lab")]
         web_root: PathBuf,
 
         /// HTTP address; loopback is required unless --allow-remote is set
@@ -168,21 +176,8 @@ enum Commands {
         #[arg(long, default_value_t = 16 * 1024)]
         max_prompt_bytes: usize,
 
-        /// Maximum trailing tokens captured by the diagnostic pass
-        #[arg(long, default_value_t = 128)]
-        trace_tokens: usize,
-
-        /// Maximum residual/Mamba channel bins per heatmap
-        #[arg(long, default_value_t = 64)]
-        channel_bins: usize,
-
-        /// Maximum attention heads captured per attention layer
-        #[arg(long, default_value_t = 4)]
-        attention_heads: usize,
-
-        /// Maximum training metric rows retained in each response
-        #[arg(long, default_value_t = 2_000)]
-        metrics_points: usize,
+        #[command(flatten)]
+        limits: TraceLimits,
     },
 
     /// Show model info
@@ -278,97 +273,68 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Generate {
-            checkpoint,
-            config: config_path,
-            tokenizer: tokenizer_path,
-            prompt,
+            artifacts,
+            sampling,
             max_tokens,
-            temperature,
-            top_k,
-            repetition_penalty,
-            seed,
-            no_eos,
         } => {
-            let (model, device, tokenizer, checkpoint_path) =
-                load_inference_artifacts(&checkpoint, &config_path, &tokenizer_path)?;
+            let (model, device, tokenizer, checkpoint_path) = load_inference_artifacts(
+                &artifacts.checkpoint,
+                &artifacts.config,
+                &artifacts.tokenizer,
+            )?;
 
             info!("Loaded model from {}", checkpoint_path.display());
 
-            let prompt_tokens = tokenizer.encode(&prompt, false)?;
+            let prompt_tokens = tokenizer.encode(&sampling.prompt, false)?;
             info!("Prompt tokens: {:?}", prompt_tokens);
 
             let generator = hermes_llm::TextGenerator::new(&model, &device);
-            let sampling = hermes_llm::generate::SamplingConfig {
-                max_new_tokens: max_tokens,
-                temperature,
-                top_k,
-                repetition_penalty,
-                eos_token: (!no_eos).then(|| tokenizer.eos_token_id()),
-                seed,
-            };
-            let output_tokens = generator.generate(&prompt_tokens, &sampling)?;
+            let config = sampling.config(max_tokens, tokenizer.eos_token_id(), sampling.seed);
+            let output_tokens = generator.generate(&prompt_tokens, &config)?;
 
             let output_text = tokenizer.decode(&output_tokens, true)?;
             println!("\n{}", output_text);
         }
 
         Commands::Trace {
-            checkpoint,
-            config,
-            tokenizer: tokenizer_path,
-            prompt,
+            artifacts,
+            sampling,
             output,
             metrics,
             max_tokens,
-            temperature,
-            top_k,
-            repetition_penalty,
-            seed,
-            no_eos,
-            trace_tokens,
-            channel_bins,
-            attention_heads,
-            metrics_points,
+            limits,
         } => {
-            let (model, device, tokenizer, checkpoint_path) =
-                load_inference_artifacts(&checkpoint, &config, &tokenizer_path)?;
+            let (model, device, tokenizer, checkpoint_path) = load_inference_artifacts(
+                &artifacts.checkpoint,
+                &artifacts.config,
+                &artifacts.tokenizer,
+            )?;
             info!("Loaded model from {}", checkpoint_path.display());
-            let prompt_tokens = tokenizer.encode(&prompt, false)?;
+            let prompt_tokens = tokenizer.encode(&sampling.prompt, false)?;
             anyhow::ensure!(!prompt_tokens.is_empty(), "prompt encodes to zero tokens");
-            let actual_seed = seed.unwrap_or_else(rand::random);
-            let sampling = hermes_llm::generate::SamplingConfig {
-                max_new_tokens: max_tokens,
-                temperature,
-                top_k,
-                repetition_penalty,
-                eos_token: (!no_eos).then(|| tokenizer.eos_token_id()),
-                seed: Some(actual_seed),
-            };
+            let actual_seed = sampling.seed.unwrap_or_else(rand::random);
+            let config = sampling.config(max_tokens, tokenizer.eos_token_id(), Some(actual_seed));
             let generator = hermes_llm::TextGenerator::new(&model, &device);
-            let output_tokens = generator.generate(&prompt_tokens, &sampling)?;
+            let output_tokens = generator.generate(&prompt_tokens, &config)?;
             info!(
-                "Generation complete; running opt-in full-sequence diagnostic pass over at most {trace_tokens} tokens"
+                "Generation complete; running opt-in full-sequence diagnostic pass over at most {} tokens",
+                limits.trace_tokens
             );
-            let options = hermes_llm::TraceOptions {
-                token_limit: trace_tokens,
-                channel_limit: channel_bins,
-                attention_head_limit: attention_heads,
-                metrics_row_limit: metrics_points,
-            };
+            let options = limits.options();
             let bundle = hermes_llm::capture_bundle(
                 &model,
                 &tokenizer,
                 hermes_llm::TraceRequest {
-                    prompt: &prompt,
+                    prompt: &sampling.prompt,
                     prompt_token_count: prompt_tokens.len(),
                     output_tokens: &output_tokens,
                     generation: hermes_llm::TraceGeneration {
                         max_new_tokens: max_tokens,
-                        temperature,
-                        top_k,
-                        repetition_penalty,
+                        temperature: sampling.temperature,
+                        top_k: sampling.top_k,
+                        repetition_penalty: sampling.repetition_penalty,
                         seed: actual_seed,
-                        stop_at_eos: !no_eos,
+                        stop_at_eos: !sampling.no_eos,
                     },
                     metrics_path: metrics.as_deref(),
                 },
@@ -415,34 +381,27 @@ fn main() -> Result<()> {
 
         #[cfg(feature = "lab")]
         Commands::Lab {
-            checkpoint,
-            config,
-            tokenizer: tokenizer_path,
+            artifacts,
             metrics,
             web_root,
             bind,
             allow_remote,
             max_new_tokens,
             max_prompt_bytes,
-            trace_tokens,
-            channel_bins,
-            attention_heads,
-            metrics_points,
+            limits,
         } => {
-            let (model, device, tokenizer, checkpoint_path) =
-                load_inference_artifacts(&checkpoint, &config, &tokenizer_path)?;
+            let (model, device, tokenizer, checkpoint_path) = load_inference_artifacts(
+                &artifacts.checkpoint,
+                &artifacts.config,
+                &artifacts.tokenizer,
+            )?;
             info!("Loaded model from {}", checkpoint_path.display());
             let server = hermes_llm::lab::LabServerConfig {
                 bind,
                 allow_remote,
                 web_root,
                 metrics_path: metrics,
-                trace_options: hermes_llm::TraceOptions {
-                    token_limit: trace_tokens,
-                    channel_limit: channel_bins,
-                    attention_head_limit: attention_heads,
-                    metrics_row_limit: metrics_points,
-                },
+                trace_options: limits.options(),
                 max_new_tokens,
                 max_prompt_bytes,
             };
@@ -473,4 +432,108 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_cli_keeps_shared_artifact_and_sampling_defaults() {
+        let cli = Cli::try_parse_from([
+            "hermes-llm",
+            "generate",
+            "--checkpoint",
+            "weights.safetensors",
+            "--config",
+            "config.json",
+            "--tokenizer",
+            "tokenizer.json",
+            "--prompt",
+            "hello",
+        ])
+        .unwrap();
+
+        let Commands::Generate {
+            artifacts,
+            sampling,
+            max_tokens,
+        } = cli.command
+        else {
+            panic!("expected generate command");
+        };
+        assert_eq!(artifacts.checkpoint, "weights.safetensors");
+        assert_eq!(artifacts.config, "config.json");
+        assert_eq!(artifacts.tokenizer, "tokenizer.json");
+        assert_eq!(sampling.prompt, "hello");
+        assert_eq!(sampling.temperature, 0.9);
+        assert_eq!(sampling.top_k, None);
+        assert_eq!(sampling.repetition_penalty, 1.0);
+        assert_eq!(sampling.seed, None);
+        assert!(!sampling.no_eos);
+        assert_eq!(max_tokens, 100);
+    }
+
+    #[test]
+    fn trace_cli_keeps_trace_specific_defaults() {
+        let cli = Cli::try_parse_from([
+            "hermes-llm",
+            "trace",
+            "-c",
+            "weights.safetensors",
+            "--config",
+            "config.mal",
+            "-t",
+            "tokenizer.json",
+            "-p",
+            "hello",
+            "-o",
+            "trace.json",
+        ])
+        .unwrap();
+
+        let Commands::Trace {
+            artifacts,
+            sampling,
+            output,
+            metrics,
+            max_tokens,
+            limits,
+        } = cli.command
+        else {
+            panic!("expected trace command");
+        };
+        assert_eq!(artifacts.checkpoint, "weights.safetensors");
+        assert_eq!(artifacts.config, "config.mal");
+        assert_eq!(artifacts.tokenizer, "tokenizer.json");
+        assert_eq!(sampling.prompt, "hello");
+        assert_eq!(output, PathBuf::from("trace.json"));
+        assert_eq!(metrics, None);
+        assert_eq!(max_tokens, 32);
+        assert_eq!(limits.trace_tokens, 128);
+        assert_eq!(limits.channel_bins, 64);
+        assert_eq!(limits.attention_heads, 4);
+        assert_eq!(limits.metrics_points, 2_000);
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_cli_defaults_to_the_dedicated_model_lab_project() {
+        let cli = Cli::try_parse_from([
+            "hermes-llm",
+            "lab",
+            "--checkpoint",
+            "weights.safetensors",
+            "--config",
+            "config.json",
+            "--tokenizer",
+            "tokenizer.json",
+        ])
+        .unwrap();
+
+        let Commands::Lab { web_root, .. } = cli.command else {
+            panic!("expected lab command");
+        };
+        assert_eq!(web_root, PathBuf::from("hermes-model-lab"));
+    }
 }

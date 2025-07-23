@@ -29,6 +29,8 @@ use data::{
 use muon::BatchedMuon;
 
 const MUON_LR_SCALE: f64 = 20.0;
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
 
 #[derive(Parser)]
 #[command(name = "hermes-train", about = "Hermes model training")]
@@ -137,14 +139,11 @@ fn layer_gradient_norms(
 ) -> Result<Vec<f32>> {
     let mut norms = Vec::with_capacity(model.config().num_layers);
     for layer in 0..model.config().num_layers {
-        let sum = match (
+        let sum = sum_optional_tensors(
             squared_layer_gradient_norm(model, layer, muon_grads)?,
             squared_layer_gradient_norm(model, layer, adamw_grads)?,
-        ) {
-            (Some(muon), Some(adamw)) => muon + adamw,
-            (Some(sum), None) | (None, Some(sum)) => sum,
-            (None, None) => bail!("layer {} has no gradients", layer + 1),
-        };
+        )
+        .ok_or_else(|| anyhow::anyhow!("layer {} has no gradients", layer + 1))?;
         norms.push(sum.sqrt());
     }
     let values = Tensor::cat(norms, 0)
@@ -183,13 +182,11 @@ fn gradient_norm_and_clip(
     adamw_grads: &mut GradientsParams,
     max_norm: f32,
 ) -> Result<f32> {
-    let sum = match (
+    let Some(sum) = sum_optional_tensors(
         squared_gradient_norm(model, muon_grads),
         squared_gradient_norm(model, adamw_grads),
-    ) {
-        (Some(muon), Some(adamw)) => muon + adamw,
-        (Some(sum), None) | (None, Some(sum)) => sum,
-        (None, None) => return Ok(0.0),
+    ) else {
+        return Ok(0.0);
     };
     let norm = scalar_value(sum.sqrt())?;
     if max_norm > 0.0 && norm > max_norm {
@@ -202,6 +199,21 @@ fn gradient_norm_and_clip(
 
 fn scalar_value(tensor: Tensor<1>) -> Result<f32> {
     Ok(tensor.into_data().convert::<f32>().to_vec::<f32>()?[0])
+}
+
+fn sum_optional_tensors(left: Option<Tensor<1>>, right: Option<Tensor<1>>) -> Option<Tensor<1>> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(tensor), None) | (None, Some(tensor)) => Some(tensor),
+        (None, None) => None,
+    }
+}
+
+fn accumulate_tensor(total: &mut Option<Tensor<1>>, value: Tensor<1>) {
+    *total = Some(match total.take() {
+        Some(current) => current + value,
+        None => value,
+    });
 }
 
 fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
@@ -332,21 +344,21 @@ fn file_fingerprint(path: &Path) -> Result<String> {
     let bytes = fs::read(path)
         .map_err(anyhow::Error::from)
         .map_err(|error| error.context(format!("failed to fingerprint {}", path.display())))?;
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in &bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    let hash = fnv1a64(&bytes);
     Ok(format!("fnv1a64:{hash:016x}:{}", bytes.len()))
 }
 
 fn stable_cache_id(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    format!("{:016x}", fnv1a64(value.as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
     }
-    format!("{hash:016x}")
+    hash
 }
 
 #[derive(Serialize)]
@@ -479,11 +491,7 @@ fn objective_loss(
             let loss = CrossEntropyLossConfig::new()
                 .init(&labels.device())
                 .forward(logits, labels);
-            let router_loss = match (query_router_loss, document_router_loss) {
-                (Some(query), Some(document)) => Some(query + document),
-                (Some(loss), None) | (None, Some(loss)) => Some(loss),
-                (None, None) => None,
-            };
+            let router_loss = sum_optional_tensors(query_router_loss, document_router_loss);
             (loss, router_loss)
         }
     };
@@ -556,6 +564,20 @@ mod tests {
             let err = validate_train_args(&args).unwrap_err().to_string();
             assert!(err.contains(field), "{field}: {err}");
         }
+    }
+
+    #[test]
+    fn stable_hash_helpers_share_the_resume_signature_contract() {
+        assert_eq!(fnv1a64(b"hello"), 0xa430_d846_80aa_bd0b);
+        assert_eq!(stable_cache_id("hello"), "a430d84680aabd0b");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        fs::write(&path, b"hello").unwrap();
+        assert_eq!(
+            file_fingerprint(&path).unwrap(),
+            "fnv1a64:a430d84680aabd0b:5"
+        );
     }
 
     #[test]

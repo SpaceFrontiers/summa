@@ -30,6 +30,8 @@ test("Search in index", async () => {
 
 	// Commit (builds the segment)
 	await index.commit();
+	expect(index.numDocs()).toBe(2);
+	expect(index.fieldNames()).toEqual(["title", "body", "views"]);
 
 	// Search
 	const results = await index.search("rust", 10);
@@ -46,4 +48,11 @@ test("Search in index", async () => {
 		body: "Rust is a systems language.",
 		views: 1500,
 	});
+
+	const titleOnly = await index.getDocumentWithFields(
+		results.hits[0].address.segment_id,
+		results.hits[0].address.doc_id,
+		["title"],
+	);
+	expect(titleOnly).toEqual({ title: "Rust Programming" });
 });

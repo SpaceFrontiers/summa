@@ -1,3 +1,10 @@
+//! Immutable index segments and their lifecycle building blocks.
+//!
+//! Builders write a complete segment, readers expose its text, stored-field,
+//! and vector data, and native mergers combine committed segments. Publication
+//! and deletion are coordinated at the index layer by
+//! [`crate::merge::SegmentManager`].
+
 pub(crate) mod ann_build;
 mod ann_disk;
 pub use ann_disk::AnnHealth;

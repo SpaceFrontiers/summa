@@ -10,6 +10,8 @@
   "scripts": {
     "generate": "bash generate_proto.sh",
     "build": "tsc",
+    "test": "pnpm run build && node --test tests/*.test.cjs",
+    "check": "pnpm test",
     "prepublishOnly": "pnpm run build",
     "clean": "rm -rf dist"
   },

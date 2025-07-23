@@ -3,7 +3,8 @@
 //! # Overview
 //!
 //! This package provides command-line tools for creating, managing, and
-//! preprocessing data for Hermes search indexes.
+//! preprocessing data for Hermes search indexes. See the package README for
+//! complete lifecycle examples and current vector-tool limitations.
 //!
 //! # Index Commands
 //!
@@ -12,9 +13,12 @@
 //! - `index` - Index documents from a JSONL file or stdin
 //! - `commit` - Commit any pending changes to the index
 //! - `merge` - Force merge all segments into one
+//! - `reorder` - Reorder BMP records for more effective pruning
 //! - `info` - Display index information
 //! - `diagnose` - Index health: ANN leaf skew/fragmentation, per-field disk
 //!   usage, degenerate-vector scans, probe cost, page-cache residency
+//! - `search` - Run a query against a local index
+//! - `heatmap` - Visualize a BMP grid in the terminal
 //! - `warmup` - Warm up slice cache and save to file
 //!
 //! # Data Processing Commands
@@ -22,6 +26,7 @@
 //! - `simhash` - Calculate SimHash for a text field and add it to each JSON object
 //! - `sort` - Sort JSON objects by a specified field
 //! - `term-stats` - Compute term statistics for WAND optimization
+//! - `train-centroids` - Train IVF coarse centroids from JSONL vectors
 //!
 //! # Examples
 //!

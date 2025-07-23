@@ -307,7 +307,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
 
     let num_indexing_threads = args
         .indexing_threads
-        .unwrap_or_else(|| (num_cpus::get() / 4).max(1));
+        .unwrap_or_else(hermes_core::default_indexing_threads);
     let max_concurrent_searches = args
         .max_concurrent_searches
         .unwrap_or_else(|| (num_cpus::get() / 8).clamp(1, 8));

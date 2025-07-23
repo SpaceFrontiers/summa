@@ -1229,7 +1229,7 @@ pub fn unpack_32bit(input: &[u8], output: &mut [u32], count: usize) {
 /// Delta decode with SIMD acceleration
 ///
 /// Converts delta-encoded values to absolute values.
-/// Input: deltas[i] = value[i+1] - value[i] - 1 (gap minus one)
+/// Input: `deltas[i] = value[i + 1] - value[i] - 1` (gap minus one)
 /// Output: absolute values starting from first_value
 #[inline]
 pub fn delta_decode(output: &mut [u32], deltas: &[u32], first_value: u32, count: usize) {
@@ -1649,7 +1649,7 @@ pub fn unpack_delta_decode(
 
 /// Dequantize UInt8 weights to f32 with SIMD acceleration
 ///
-/// Computes: output[i] = input[i] as f32 * scale + min_val
+/// Computes `output[i] = input[i] as f32 * scale + min_val`.
 #[inline]
 pub fn dequantize_uint8(input: &[u8], output: &mut [f32], scale: f32, min_val: f32, count: usize) {
     #[cfg(target_arch = "aarch64")]
@@ -2426,7 +2426,7 @@ pub fn batch_f32_to_f16(src: &[f32], dst: &mut [u16]) {
     }
 }
 
-/// Batch convert f32 slice to u8 with [-1,1] → [0,255] mapping
+/// Batch convert an f32 slice to u8 with `[-1, 1]` to `[0, 255]` mapping.
 pub fn batch_f32_to_u8(src: &[f32], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
     for (s, d) in src.iter().zip(dst.iter_mut()) {
@@ -3107,7 +3107,8 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
 
 /// Batch cosine similarity: f32 query vs N contiguous u8 vectors.
 ///
-/// `vectors_raw` is raw bytes: N vectors × dim bytes (u8, mapping [-1,1]→[0,255]).
+/// `vectors_raw` is raw bytes: N vectors × dim bytes (u8, mapping
+/// `[-1, 1]` to `[0, 255]`).
 /// Converts u8→f32 using NEON widening chain (16 values/iteration), scores with FMA.
 /// Memory bandwidth is quartered compared to f32 scoring.
 #[inline]

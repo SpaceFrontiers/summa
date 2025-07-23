@@ -160,12 +160,6 @@ function parse(tokens) {
     return block
   }
 
-  function _parseFieldBlock() {
-    const fieldName = consume('identifier').value
-    const fieldConfig = parseBlock()
-    return { name: fieldName, config: fieldConfig }
-  }
-
   // Main parsing loop
   while (i < tokens.length) {
     const token = peek()

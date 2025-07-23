@@ -4,7 +4,6 @@ import { useUxConfig } from './useUxConfig'
 import { parseUxConfig } from '../lib/uxConfigParser'
 import { useConnectionsStore } from '../stores/connections'
 
-let wasmModule = null
 let RemoteIndex = null
 let IpfsIndex = null
 
@@ -14,7 +13,6 @@ const wasmInitPromise = (async () => {
     const module = await import('hermes-wasm')
     await module.default()
     module.setup_logging()
-    wasmModule = module
     RemoteIndex = module.RemoteIndex
     IpfsIndex = module.IpfsIndex
     console.log('WASM module initialized')
@@ -69,13 +67,6 @@ export function useHermes() {
     const signal = abortController.signal
 
     try {
-      // Check if aborted
-      const checkAborted = () => {
-        if (abortController?.signal.aborted) {
-          throw new Error('Connection aborted')
-        }
-      }
-
       // Helper to race a promise against abort signal
       const withAbort = (promise) => {
         return Promise.race([

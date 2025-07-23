@@ -59,83 +59,83 @@
           </div>
 
           <!-- Connection Status / Dropdown -->
-        <div class="relative">
-          <button
-            v-if="isConnected"
-            @click="showDropdown = !showDropdown"
-            class="flex items-center gap-2 px-3 py-1.5 text-sm bg-green-50 text-green-700 rounded-lg hover:bg-green-100 transition-colors"
-          >
-            <span class="w-2 h-2 bg-green-500 rounded-full"></span>
-            <span class="hidden sm:inline truncate max-w-32">{{ displayUrl }}</span>
-            <span class="sm:hidden">Connected</span>
-            <svg class="w-4 h-4" :class="{ 'rotate-180': showDropdown }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-          <button
-            v-else
-            @click="$emit('showConnect')"
-            class="flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
-          >
-            <span class="w-2 h-2 bg-gray-400 rounded-full"></span>
-            Not connected
-          </button>
-
-          <!-- Dropdown Menu -->
-          <div
-            v-if="showDropdown && isConnected"
-            class="absolute right-0 mt-2 w-72 bg-white rounded-lg shadow-lg border border-gray-200 py-2"
-          >
-            <div class="px-4 py-2 border-b border-gray-100">
-              <div class="text-xs text-gray-500 mb-1">Connected to</div>
-              <div class="text-sm font-medium text-gray-900 truncate">{{ currentUrl }}</div>
-              <div v-if="connectionType" class="mt-1">
-                <span class="px-2 py-0.5 text-xs rounded-full"
-                      :class="connectionType === 'ipfs' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'">
-                  {{ connectionType.toUpperCase() }}
-                </span>
-              </div>
-            </div>
-
-            <div v-if="indexInfo" class="px-4 py-2 border-b border-gray-100 text-xs text-gray-600">
-              <div class="flex justify-between">
-                <span>Documents:</span>
-                <span class="font-medium">{{ indexInfo.numDocs?.toLocaleString() }}</span>
-              </div>
-              <div class="flex justify-between mt-1">
-                <span>Segments:</span>
-                <span class="font-medium">{{ indexInfo.numSegments }}</span>
-              </div>
-            </div>
-
-            <!-- Recent connections -->
-            <div v-if="recentConnections.length > 1" class="px-4 py-2 border-b border-gray-100">
-              <div class="text-xs text-gray-500 mb-2">Switch to</div>
-              <div class="space-y-1 max-h-32 overflow-y-auto">
-                <button
-                  v-for="conn in recentConnections.filter(c => c.url !== currentUrl).slice(0, 3)"
-                  :key="conn.url"
-                  @click="switchConnection(conn.url)"
-                  class="w-full text-left text-sm text-gray-700 hover:bg-gray-50 px-2 py-1 rounded"
-                >
-                  <span v-if="conn.label || getDisplayLabel(conn.url)" class="font-medium block truncate">
-                    {{ conn.label || getDisplayLabel(conn.url) }}
-                  </span>
-                  <span :class="conn.label || getDisplayLabel(conn.url) ? 'text-xs text-gray-400' : ''" class="truncate block">
-                    {{ conn.url }}
-                  </span>
-                </button>
-              </div>
-            </div>
-
+          <div class="relative">
             <button
-              @click="handleDisconnect"
-              class="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50"
+              v-if="isConnected"
+              @click="showDropdown = !showDropdown"
+              class="flex items-center gap-2 px-3 py-1.5 text-sm bg-green-50 text-green-700 rounded-lg hover:bg-green-100 transition-colors"
             >
-              Disconnect
+              <span class="w-2 h-2 bg-green-500 rounded-full"></span>
+              <span class="hidden sm:inline truncate max-w-32">{{ displayUrl }}</span>
+              <span class="sm:hidden">Connected</span>
+              <svg class="w-4 h-4" :class="{ 'rotate-180': showDropdown }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+              </svg>
             </button>
+            <button
+              v-else
+              @click="$emit('showConnect')"
+              class="flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+            >
+              <span class="w-2 h-2 bg-gray-400 rounded-full"></span>
+              Not connected
+            </button>
+
+            <!-- Dropdown Menu -->
+            <div
+              v-if="showDropdown && isConnected"
+              class="absolute right-0 mt-2 w-72 bg-white rounded-lg shadow-lg border border-gray-200 py-2"
+            >
+              <div class="px-4 py-2 border-b border-gray-100">
+                <div class="text-xs text-gray-500 mb-1">Connected to</div>
+                <div class="text-sm font-medium text-gray-900 truncate">{{ currentUrl }}</div>
+                <div v-if="connectionType" class="mt-1">
+                  <span class="px-2 py-0.5 text-xs rounded-full"
+                        :class="connectionType === 'ipfs' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'">
+                    {{ connectionType.toUpperCase() }}
+                  </span>
+                </div>
+              </div>
+
+              <div v-if="indexInfo" class="px-4 py-2 border-b border-gray-100 text-xs text-gray-600">
+                <div class="flex justify-between">
+                  <span>Documents:</span>
+                  <span class="font-medium">{{ indexInfo.numDocs?.toLocaleString() }}</span>
+                </div>
+                <div class="flex justify-between mt-1">
+                  <span>Segments:</span>
+                  <span class="font-medium">{{ indexInfo.numSegments }}</span>
+                </div>
+              </div>
+
+              <!-- Recent connections -->
+              <div v-if="recentConnections.length > 1" class="px-4 py-2 border-b border-gray-100">
+                <div class="text-xs text-gray-500 mb-2">Switch to</div>
+                <div class="space-y-1 max-h-32 overflow-y-auto">
+                  <button
+                    v-for="conn in recentConnections.filter(c => c.url !== currentUrl).slice(0, 3)"
+                    :key="conn.url"
+                    @click="switchConnection(conn.url)"
+                    class="w-full text-left text-sm text-gray-700 hover:bg-gray-50 px-2 py-1 rounded"
+                  >
+                    <span v-if="conn.label || getDisplayLabel(conn.url)" class="font-medium block truncate">
+                      {{ conn.label || getDisplayLabel(conn.url) }}
+                    </span>
+                    <span :class="conn.label || getDisplayLabel(conn.url) ? 'text-xs text-gray-400' : ''" class="truncate block">
+                      {{ conn.url }}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <button
+                @click="handleDisconnect"
+                class="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50"
+              >
+                Disconnect
+              </button>
+            </div>
           </div>
-        </div>
         </div>
       </div>
     </div>

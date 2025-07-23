@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Generate Python protobuf stubs from hermes.proto."""
+"""Generate deterministic Python protobuf stubs from hermes.proto."""
 
 import subprocess
 import sys
 from pathlib import Path
 
 
-def main():
+def main() -> None:
     root = Path(__file__).parent
     proto_dir = root.parent / "hermes-proto"
     output_dir = root / "src" / "hermes_client_python"
@@ -39,16 +39,42 @@ def main():
     # Fix imports in generated files
     grpc_file = output_dir / "hermes_pb2_grpc.py"
     if grpc_file.exists():
-        content = grpc_file.read_text()
+        content = grpc_file.read_text(encoding="utf-8")
         content = content.replace(
             "import hermes_pb2 as hermes__pb2",
             "from . import hermes_pb2 as hermes__pb2",
         )
-        grpc_file.write_text(content)
+        grpc_file.write_text(content, encoding="utf-8")
+
+    # Keep checked-in bindings deterministic and consistent with the rest of the
+    # Python package. Ruff is pinned in the development lockfile used by CI and
+    # the release workflow.
+    generated_files = [output_dir / "hermes_pb2.py", grpc_file]
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "--fix",
+            *(str(path) for path in generated_files),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "format",
+            *(str(path) for path in generated_files),
+        ],
+        check=True,
+    )
 
     print("Generated:")
-    print(f"  - {output_dir / 'hermes_pb2.py'}")
-    print(f"  - {output_dir / 'hermes_pb2_grpc.py'}")
+    for path in generated_files:
+        print(f"  - {path}")
 
 
 if __name__ == "__main__":

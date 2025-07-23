@@ -93,26 +93,26 @@
 
           <!-- Progress status (unified: status message or download progress) -->
           <div v-if="isLoading" class="text-center text-xs text-gray-500 font-mono tabular-nums">
-              <!-- Show download progress if available -->
-              <template v-if="downloadStats?.value && (downloadStats.value.bytesDownloaded > 0 || downloadStats.value.currentDownload)">
-                <span v-if="downloadStats.value.currentDownload" class="block text-gray-600">
-                  {{ downloadStats.value.currentDownload.file }}
-                  <span v-if="downloadStats.value.currentDownload.totalBytes">
-                    · <span class="inline-block min-w-16 text-right">{{ formatBytes(downloadStats.value.currentDownload.bytesDownloaded) }}</span> / {{ formatBytes(downloadStats.value.currentDownload.totalBytes) }}
-                    (<span class="inline-block w-8 text-right">{{ Math.round(downloadStats.value.currentDownload.bytesDownloaded / downloadStats.value.currentDownload.totalBytes * 100) }}%</span>)
-                  </span>
-                  <span v-else>
-                    · {{ formatBytes(downloadStats.value.currentDownload.bytesDownloaded) }}
-                  </span>
+            <!-- Show download progress if available -->
+            <template v-if="downloadStats?.value && (downloadStats.value.bytesDownloaded > 0 || downloadStats.value.currentDownload)">
+              <span v-if="downloadStats.value.currentDownload" class="block text-gray-600">
+                {{ downloadStats.value.currentDownload.file }}
+                <span v-if="downloadStats.value.currentDownload.totalBytes">
+                  · <span class="inline-block min-w-16 text-right">{{ formatBytes(downloadStats.value.currentDownload.bytesDownloaded) }}</span> / {{ formatBytes(downloadStats.value.currentDownload.totalBytes) }}
+                  (<span class="inline-block w-8 text-right">{{ Math.round(downloadStats.value.currentDownload.bytesDownloaded / downloadStats.value.currentDownload.totalBytes * 100) }}%</span>)
                 </span>
-                <span v-if="downloadStats.value.requestCount > 0" class="block text-gray-400">
-                  {{ downloadStats.value.requestCount }} requests · {{ formatBytes(downloadStats.value.bytesDownloaded) }} total
+                <span v-else>
+                  · {{ formatBytes(downloadStats.value.currentDownload.bytesDownloaded) }}
                 </span>
-              </template>
-              <!-- Otherwise show status message -->
-              <span v-else-if="progress?.message" class="block text-gray-600">
-                {{ progress.message }}
               </span>
+              <span v-if="downloadStats.value.requestCount > 0" class="block text-gray-400">
+                {{ downloadStats.value.requestCount }} requests · {{ formatBytes(downloadStats.value.bytesDownloaded) }} total
+              </span>
+            </template>
+            <!-- Otherwise show status message -->
+            <span v-else-if="progress?.message" class="block text-gray-600">
+              {{ progress.message }}
+            </span>
           </div>
 
           <div v-if="error" class="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">

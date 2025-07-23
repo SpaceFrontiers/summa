@@ -207,7 +207,7 @@ pub struct SegmentBuilder {
     field_stats: FxHashMap<u32, FieldStats>,
 
     /// Per-document field lengths stored compactly
-    /// Uses a flat Vec instead of Vec<HashMap> for better cache locality
+    /// Uses a flat `Vec` instead of `Vec<HashMap>` for better cache locality
     /// Layout: [doc0_field0_len, doc0_field1_len, ..., doc1_field0_len, ...]
     doc_field_lengths: Vec<u32>,
     num_indexed_fields: usize,

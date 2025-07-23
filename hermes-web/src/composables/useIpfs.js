@@ -1,6 +1,7 @@
 import { ref } from 'vue'
 import { useAppConfig } from './useAppConfig'
 import { createDownloadManager } from '../lib/downloadManager'
+import { parseContentPath } from '../lib/ipfsUrl'
 
 // Singleton state
 const isInitialized = ref(false)
@@ -75,31 +76,12 @@ export function useIpfs() {
    * @returns {{ type: 'ipfs'|'ipns'|'local'|null, path: string, original: string }}
    */
   const parseIpfsUrl = (url) => {
-    const trimmed = url.trim()
-
-    // Handle ipfs:// and ipns:// URI schemes
-    if (trimmed.startsWith('ipfs://')) {
-      return { type: 'ipfs', path: trimmed.slice(7), original: trimmed }
+    const parsed = parseContentPath(url)
+    return {
+      ...parsed,
+      // Preserve the composable's existing null sentinel for ordinary URLs.
+      path: parsed.type ? parsed.path : null
     }
-    if (trimmed.startsWith('ipns://')) {
-      return { type: 'ipns', path: trimmed.slice(7), original: trimmed }
-    }
-
-    // Handle /ipfs/ and /ipns/ paths
-    if (trimmed.startsWith('/ipfs/')) {
-      return { type: 'ipfs', path: trimmed.slice(6), original: trimmed }
-    }
-    if (trimmed.startsWith('/ipns/')) {
-      return { type: 'ipns', path: trimmed.slice(6), original: trimmed }
-    }
-
-    // Local path starting with / (e.g., /s)
-    if (trimmed.startsWith('/')) {
-      return { type: 'local', path: trimmed, original: trimmed }
-    }
-
-    // Not an IPFS URL
-    return { type: null, path: null, original: trimmed }
   }
 
   /**

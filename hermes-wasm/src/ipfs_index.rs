@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use hermes_core::directories::{Directory, FileHandle, OwnedBytes, SliceCachingDirectory};
-use hermes_core::{IndexMetadata, SLICE_CACHE_FILENAME, Searcher};
+use hermes_core::{SLICE_CACHE_FILENAME, Searcher};
 use parking_lot::RwLock;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -321,18 +321,7 @@ impl IpfsIndex {
 
         let cached_dir = Arc::new(cached_dir);
 
-        // Load metadata to get schema and segment IDs
-        let metadata = IndexMetadata::load(cached_dir.as_ref())
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
-
-        let schema = Arc::new(metadata.schema.clone());
-        let segment_ids = metadata.segment_ids();
-
-        // Create Searcher directly
-        let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to open searcher: {}", e)))?;
+        let searcher = crate::searcher::open(Arc::clone(&cached_dir)).await?;
 
         self.searcher = Some(searcher);
         self.directory = Some(cached_dir);
@@ -393,18 +382,7 @@ impl IpfsIndex {
 
         let cached_dir = Arc::new(cached_dir);
 
-        // Load metadata to get schema and segment IDs
-        let metadata = IndexMetadata::load(cached_dir.as_ref())
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
-
-        let schema = Arc::new(metadata.schema.clone());
-        let segment_ids = metadata.segment_ids();
-
-        // Create Searcher directly
-        let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to open searcher: {}", e)))?;
+        let searcher = crate::searcher::open(Arc::clone(&cached_dir)).await?;
 
         self.searcher = Some(searcher);
         self.directory = Some(cached_dir);
@@ -477,12 +455,7 @@ impl IpfsIndex {
     /// Get field names
     #[wasm_bindgen]
     pub fn field_names(&self) -> JsValue {
-        let names: Vec<String> = self
-            .searcher
-            .as_ref()
-            .map(|s| s.schema().fields().map(|(_, f)| f.name.clone()).collect())
-            .unwrap_or_default();
-        serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
+        crate::searcher::field_names(self.searcher.as_ref().map(Searcher::schema))
     }
 
     /// Search the index
@@ -507,14 +480,7 @@ impl IpfsIndex {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        let response = searcher
-            .query_offset(&query_str, limit, offset)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
-
-        response
-            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+        crate::searcher::search_offset(searcher, &query_str, limit, offset).await
     }
 
     /// Structured search: accepts a query object instead of a query string.
@@ -562,39 +528,20 @@ impl IpfsIndex {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        let segment_id_u128 = u128::from_str_radix(&segment_id, 16)
-            .map_err(|e| JsValue::from_str(&format!("Invalid segment_id hex: {}", e)))?;
-        let address = hermes_core::query::DocAddress::new(segment_id_u128, doc_id);
-
-        let doc = searcher
-            .get_document_with_fields(&address, fields.as_ref())
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
-
-        match doc {
-            Some(document) => {
-                let json = document.to_json(searcher.schema());
-                json.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-                    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-            }
-            None => Ok(JsValue::NULL),
-        }
+        crate::searcher::get_document(
+            searcher,
+            &segment_id,
+            doc_id,
+            fields.as_ref(),
+            "Invalid segment_id hex",
+        )
+        .await
     }
 
     /// Get default fields
     #[wasm_bindgen]
     pub fn default_fields(&self) -> JsValue {
-        let names: Vec<String> = self
-            .searcher
-            .as_ref()
-            .map(|s| {
-                s.default_fields()
-                    .iter()
-                    .filter_map(|f| s.schema().get_field_name(*f).map(|name| name.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
+        crate::searcher::default_fields(self.searcher.as_ref())
     }
 
     /// Export cache

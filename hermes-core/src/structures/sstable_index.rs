@@ -13,10 +13,12 @@
 //! Both approaches use a compact BlockAddrStore with bitpacked offsets/lengths.
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Write};
+use std::io;
 use std::ops::Range;
 
 use crate::directories::OwnedBytes;
+
+use super::vint::{read_vint, write_vint};
 
 /// Block address - offset and length in the data section
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,46 +803,6 @@ impl BlockIndex {
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-fn write_vint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            writer.write_all(&[byte])?;
-            return Ok(());
-        } else {
-            writer.write_all(&[byte | 0x80])?;
-        }
-    }
-}
-
-fn read_vint(reader: &mut &[u8]) -> io::Result<u64> {
-    let mut result = 0u64;
-    let mut shift = 0;
-
-    loop {
-        if reader.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Unexpected end of varint",
-            ));
-        }
-        let byte = reader[0];
-        *reader = &reader[1..];
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Varint too long",
-            ));
-        }
-    }
 }
 
 /// Simple bit writer for packing

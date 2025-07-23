@@ -1,6 +1,7 @@
-# Hermes Client
+# Hermes Python client
 
-Async Python client for [Hermes](https://github.com/SpaceFrontiers/hermes) search server.
+Async Python client for the
+[Hermes](https://github.com/SpaceFrontiers/hermes) gRPC search server.
 
 ## Installation
 
@@ -8,233 +9,247 @@ Async Python client for [Hermes](https://github.com/SpaceFrontiers/hermes) searc
 pip install hermes-client-python
 ```
 
-## Quick Start
+Python 3.10 or newer is required.
+
+## Quick start
 
 ```python
 import asyncio
+
 from hermes_client_python import HermesClient
 
 
 async def main():
     async with HermesClient("localhost:50051") as client:
-        # Create index with SDL schema
         await client.create_index(
             "articles",
             """
             index articles {
-                field title: text [indexed, stored]
-                field body: text [indexed, stored]
-                field score: f64 [stored]
+                field title: text<simple> [indexed, stored]
+                field body: text<simple> [indexed, stored]
             }
-        """,
+            """,
         )
 
-        # Index documents
-        await client.index_documents(
+        indexed, error_count, errors = await client.index_documents(
             "articles",
             [
-                {"title": "Hello World", "body": "First article", "score": 1.5},
-                {"title": "Goodbye World", "body": "Last article", "score": 2.0},
+                {"title": "Hello World", "body": "First article"},
+                {"title": "Hermes Search", "body": "Fast retrieval"},
             ],
         )
+        if error_count:
+            raise RuntimeError(errors)
+        print(f"Indexed {indexed} documents")
 
-        # Commit changes
         await client.commit("articles")
 
-        # Search
-        results = await client.search("articles", term=("title", "hello"), limit=10)
+        results = await client.search(
+            "articles",
+            query={"match": {"field": "title", "text": "hello"}},
+            fields_to_load=["title", "body"],
+        )
         for hit in results.hits:
-            print(f"Doc {hit.doc_id}: score={hit.score}, fields={hit.fields}")
+            print(hit.address, hit.score, hit.fields)
 
-        # Get document by ID
-        doc = await client.get_document("articles", 0)
-        print(doc.fields)
+        if results.hits:
+            document = await client.get_document("articles", results.hits[0].address)
+            print(document.fields if document else "document not found")
 
-        # Delete index
         await client.delete_index("articles")
 
 
 asyncio.run(main())
 ```
 
-## API Reference
-
-### HermesClient
-
-```python
-client = HermesClient(address="localhost:50051")
-```
-
-#### Connection
+The context manager calls `connect()` and `close()` automatically. For manual
+lifecycle management:
 
 ```python
-# Using context manager (recommended)
-async with HermesClient("localhost:50051") as client:
-    ...
-
-# Manual connection
 client = HermesClient("localhost:50051")
 await client.connect()
-# ... use client ...
-await client.close()
+try:
+    ...
+finally:
+    await client.close()
 ```
 
-#### Index Management
+## Index management
 
 ```python
-# Create index with SDL schema
-await client.create_index(
-    "myindex",
-    """
-    index myindex {
-        field title: text [indexed, stored]
-        field body: text [indexed, stored]
-    }
-""",
-)
+await client.create_index("articles", schema_sdl)
+names = await client.list_indexes()
+info = await client.get_index_info("articles")
+print(info.num_docs, info.num_segments, info.vector_stats)
 
-# Create index with JSON schema
-await client.create_index(
-    "myindex",
-    """
-{
-    "fields": [
-        {"name": "title", "type": "text", "indexed": true, "stored": true},
-        {"name": "body", "type": "text", "indexed": true, "stored": true}
-    ]
-}
-""",
-)
-
-# Get index info
-info = await client.get_index_info("myindex")
-print(f"Documents: {info.num_docs}, Segments: {info.num_segments}")
-
-# Delete index
-await client.delete_index("myindex")
+await client.force_merge("articles")
+await client.reorder("articles")
+await client.retrain_vector_index("articles")
+await client.delete_index("articles")
 ```
 
-#### Document Indexing
+`commit()` is required before newly indexed documents become searchable.
+
+### Batch and streaming indexing
 
 ```python
-# Index multiple documents (batch)
-indexed, errors = await client.index_documents(
-    "myindex",
+indexed, error_count, errors = await client.index_documents(
+    "articles",
     [
-        {"title": "Doc 1", "body": "Content 1"},
-        {"title": "Doc 2", "body": "Content 2"},
+        {"title": "One", "tags": ["search", "rust"]},
+        {"title": "Two", "tags": ["python"]},
     ],
 )
 
-# Index single document
-await client.index_document("myindex", {"title": "Doc", "body": "Content"})
+
+async def documents():
+    for number in range(10_000):
+        yield {"title": f"Document {number}"}
 
 
-# Stream documents (for large datasets)
-async def doc_generator():
-    for i in range(10000):
-        yield {"title": f"Doc {i}", "body": f"Content {i}"}
-
-
-count = await client.index_documents_stream("myindex", doc_generator())
-
-# Commit changes (required to make documents searchable)
-num_docs = await client.commit("myindex")
-
-# Force merge segments (for optimization)
-num_segments = await client.force_merge("myindex")
+streamed, stream_errors = await client.index_documents_stream("articles", documents())
 ```
 
-#### Searching
+Repeated list values become repeated field entries. Flat numeric lists are
+dense vectors; lists of `(dimension, weight)` pairs are sparse vectors.
+
+## Searching
+
+Every search takes one `query` object whose single key matches a Hermes query
+variant:
 
 ```python
-# Term query
-results = await client.search("myindex", term=("title", "hello"), limit=10)
+# Exact term
+await client.search(
+    "articles",
+    query={"term": {"field": "title", "term": "hermes"}},
+)
 
-# Boolean query
-results = await client.search(
-    "myindex",
-    boolean={
-        "must": [("title", "hello")],
-        "should": [("body", "world")],
-        "must_not": [("title", "spam")],
+# Tokenized full-text match
+await client.search(
+    "articles",
+    query={"match": {"field": "body", "text": "fast retrieval"}},
+)
+
+# Recursive boolean query
+await client.search(
+    "articles",
+    query={
+        "boolean": {
+            "must": [{"match": {"field": "body", "text": "retrieval"}}],
+            "must_not": [{"term": {"field": "title", "term": "draft"}}],
+        }
     },
 )
 
-# With pagination
-results = await client.search("myindex", term=("title", "hello"), limit=10, offset=20)
-
-# With field loading
-results = await client.search(
-    "myindex", term=("title", "hello"), fields_to_load=["title", "body"]
+# Dense vector query and optional reranking
+await client.search(
+    "articles",
+    query={
+        "dense_vector": {
+            "field": "embedding",
+            "vector": [0.1, 0.2, 0.3],
+            "nprobe": 16,
+        }
+    },
+    reranker={"field": "embedding", "vector": [0.1, 0.2, 0.3]},
+    candidate_limit=20,
+    limit=10,
+    fields_to_load=["title"],
 )
 
-# Access results
-for hit in results.hits:
-    print(f"Doc {hit.doc_id}: {hit.score}")
-    print(f"  Title: {hit.fields.get('title')}")
-
-print(f"Total hits: {results.total_hits}")
-print(f"Took: {results.took_ms}ms")
+# Hybrid union fusion
+await client.search(
+    "articles",
+    query={
+        "fusion": {
+            "method": "rrf",
+            "rrf_k": 60,
+            "queries": [
+                {
+                    "query": {
+                        "sparse_vector": {
+                            "field": "sparse_embedding",
+                            "indices": [1, 5],
+                            "values": [0.8, 0.2],
+                        }
+                    },
+                    "weight": 1.0,
+                },
+                {
+                    "query": {
+                        "dense_vector": {
+                            "field": "embedding",
+                            "vector": [0.1, 0.2, 0.3],
+                        }
+                    },
+                    "weight": 1.0,
+                },
+            ],
+        }
+    },
+)
 ```
 
-#### Document Retrieval
+Other supported variants are `binary_dense_vector`, `boost`, `range`,
+`prefix`, and `all`. Search results expose the full `DocAddress` needed by
+`get_document()`:
 
 ```python
-# Get document by ID
-doc = await client.get_document("myindex", doc_id=42)
-if doc:
-    print(doc.fields["title"])
+hit = results.hits[0]
+document = await client.get_document("articles", hit.address)
 ```
 
-## Field Types
+## Deadlines and errors
 
-| Type            | Python Type     | Description                           |
-| --------------- | --------------- | ------------------------------------- |
-| `text`          | `str`           | Full-text searchable string           |
-| `u64`           | `int` (>= 0)    | Unsigned 64-bit integer               |
-| `i64`           | `int`           | Signed 64-bit integer                 |
-| `f64`           | `float`         | 64-bit floating point                 |
-| `bytes`         | `bytes`         | Binary data                           |
-| `json`          | `dict` / `list` | JSON object (auto-serialized)         |
-| `dense_vector`  | `list[float]`   | Dense vector for semantic search      |
-| `sparse_vector` | `dict`          | Sparse vector with indices and values |
+Every RPC accepts an optional `timeout` in seconds. A per-call value overrides
+the client default:
 
-## Error Handling
+```python
+client = HermesClient("localhost:50051", default_timeout=5.0)
+results = await client.search(
+    "articles",
+    query={"all": {}},
+    timeout=0.5,
+)
+await client.force_merge("articles", timeout=3600)
+```
+
+gRPC failures raise `grpc.RpcError` (normally
+`grpc.aio.AioRpcError`). `get_document()` is the exception: it returns `None`
+for `NOT_FOUND`.
 
 ```python
 import grpc
 
 try:
-    await client.search("nonexistent", term=("field", "value"))
-except grpc.RpcError as e:
-    if e.code() == grpc.StatusCode.NOT_FOUND:
-        print("Index not found")
+    await client.search("missing", query={"all": {}})
+except grpc.RpcError as error:
+    if error.code() == grpc.StatusCode.NOT_FOUND:
+        print("index not found")
     else:
         raise
 ```
 
 ## Development
 
-Generate protobuf stubs:
+From `hermes-client-python`:
 
 ```bash
-pip install grpcio-tools
-python generate_proto.py
+uv sync --group dev --group test
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest tests/test_client_unit.py
+```
+
+The remaining tests are integration tests and expect a debug
+`target/debug/hermes-server` binary. Regenerate checked-in protobuf stubs after
+changing `hermes-proto/hermes.proto`:
+
+```bash
+uv run --group dev python generate_proto.py
 ```
 
 ## License
 
 MIT
-
-## Timeouts / deadlines
-
-Every RPC accepts an optional `timeout` (seconds) which sets a gRPC deadline;
-a client-wide default can be set in the constructor. On expiry the call
-raises `grpc.aio.AioRpcError` with `DEADLINE_EXCEEDED`.
-
-```python
-client = HermesClient("localhost:50051", default_timeout=5.0)
-results = await client.search("articles", query={...}, timeout=0.5)  # per-call override
-await client.force_merge("articles", timeout=3600)  # long op, long deadline
-```

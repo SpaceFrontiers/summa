@@ -802,7 +802,7 @@ impl LazyFlatVectorData {
         dequantize_raw(bytes.as_slice(), self.quantization, self.dim, out)
     }
 
-    /// Read a single vector by index, dequantized to f32 (allocates a new Vec<f32>).
+    /// Read a single vector by index, dequantized to f32 (allocates a new `Vec<f32>`).
     pub async fn get_vector(&self, idx: usize) -> io::Result<Vec<f32>> {
         let mut vector = vec![0f32; self.dim];
         self.read_vector_into(idx, &mut vector).await?;

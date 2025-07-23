@@ -1,3 +1,9 @@
+//! Schema and query-language front ends.
+//!
+//! The SDL parser builds a [`Schema`] from index definitions. The query
+//! language parser turns user text into executable queries and can apply
+//! field-routing rules before planning.
+
 pub mod ql;
 pub mod query_field_router;
 mod schema;
