@@ -541,24 +541,56 @@ impl SegmentMerger {
         if sources.is_empty() {
             return Ok(None);
         }
+        // Byte-copy preserves every source extent, so fragmentation (extents
+        // per probed cluster) multiplies with each merge generation and every
+        // extent is a potential seek on a cold index. When the merged output
+        // would cross the threshold, compact instead: same payload bytes
+        // streamed, plus one u32 add per posting, and the result is
+        // indistinguishable from a freshly built segment (fragmentation 1.0).
+        // Only binary payloads compact — TQ codes are block-packed and cannot
+        // be concatenated without re-packing.
+        let predicted_fragmentation =
+            crate::segment::ann_disk::predicted_merge_fragmentation(&sources);
+        let compact = index_type == crate::segment::ann_build::BINARY_IVF_TYPE
+            && (self.force_ann_compaction && predicted_fragmentation > 1.0 + 1e-9
+                || predicted_fragmentation
+                    >= crate::segment::ann_disk::ANN_COMPACTION_FRAGMENTATION_THRESHOLD);
         let data_offset = writer.offset();
         let result = super::block_in_place_if_multithread(|| {
-            crate::segment::ann_disk::write_merged_ann_cancellable(
-                &sources,
-                writer,
-                self.cancellation.as_deref(),
-            )
+            if compact {
+                crate::segment::ann_disk::write_compacted_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            } else {
+                crate::segment::ann_disk::write_merged_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            }
         });
         self.ensure_not_cancelled()?;
         result.map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
-        log::debug!(
-            "[dense_vector_merge] index={} field {}: copied {} compatible ANN run source(s), {}",
-            self.schema.index_label(),
-            field.0,
-            sources.len(),
-            crate::format_bytes(data_size),
-        );
+        if compact {
+            log::info!(
+                "[dense_vector_merge] index={} field {}: compacted {} ANN source(s) at predicted                  fragmentation {predicted_fragmentation:.1} ({}) — one extent per cluster again",
+                self.schema.index_label(),
+                field.0,
+                sources.len(),
+                crate::format_bytes(data_size),
+            );
+        } else {
+            log::debug!(
+                "[dense_vector_merge] index={} field {}: copied {} compatible ANN run source(s),                  {} (predicted fragmentation {predicted_fragmentation:.1})",
+                self.schema.index_label(),
+                field.0,
+                sources.len(),
+                crate::format_bytes(data_size),
+            );
+        }
         Ok(Some((index_type, data_offset, data_size)))
     }
 
