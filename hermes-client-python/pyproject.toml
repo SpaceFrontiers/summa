@@ -37,6 +37,7 @@ Repository = "https://github.com/SpaceFrontiers/hermes"
 [dependency-groups]
 dev = [
     "grpcio-tools>=1.76.0",
+    "ruff==0.16.0",
 ]
 
 test = [

@@ -10,48 +10,10 @@ use std::io::{self, Read, Write};
 
 use crate::DocId;
 
+pub use crate::structures::vint::{read_vint, write_vint};
+
 /// Standard block size for posting lists (SIMD-friendly)
 pub const BLOCK_SIZE: usize = 128;
-
-/// Write variable-length integer (1-9 bytes)
-///
-/// Uses continuation bit encoding: 7 bits of data per byte,
-/// high bit indicates more bytes follow.
-#[inline]
-pub fn write_vint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            writer.write_u8(byte)?;
-            return Ok(());
-        } else {
-            writer.write_u8(byte | 0x80)?;
-        }
-    }
-}
-
-/// Read variable-length integer
-#[inline]
-pub fn read_vint<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut result = 0u64;
-    let mut shift = 0;
-
-    loop {
-        let byte = reader.read_u8()?;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint too long",
-            ));
-        }
-    }
-}
 
 /// Skip list entry for block-based posting lists
 ///

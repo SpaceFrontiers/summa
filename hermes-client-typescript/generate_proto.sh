@@ -7,7 +7,7 @@ OUT_DIR="$SCRIPT_DIR/src/generated"
 
 mkdir -p "$OUT_DIR"
 
-npx grpc_tools_node_protoc \
+"$SCRIPT_DIR/node_modules/.bin/grpc_tools_node_protoc" \
   --plugin="protoc-gen-ts_proto=$SCRIPT_DIR/node_modules/.bin/protoc-gen-ts_proto" \
   --ts_proto_out="$OUT_DIR" \
   --ts_proto_opt=outputServices=generic-definitions \

@@ -116,6 +116,8 @@ export interface SparseVectorQuery {
   maxQueryDims?: number;
   /** Fraction of query dims to keep (0-1, e.g. 0.1 = top 10%) */
   pruning?: number;
+  /** LSP/0 gamma (unset = depth-derived, 0 = exhaustive) */
+  lspGamma?: number;
 }
 
 export interface DenseVectorQuery {

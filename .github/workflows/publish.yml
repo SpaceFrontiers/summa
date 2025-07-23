@@ -104,6 +104,11 @@ jobs:
           sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-mal-python/pyproject.toml
           echo "Updated Python packages to version ${{ steps.bump.outputs.new_version }}"
 
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Update Python client lockfile
+        run: uv lock --project hermes-client-python
+
       - name: Update TypeScript client version
         run: |
           cd hermes-client-typescript
@@ -115,7 +120,11 @@ jobs:
 
       - name: Commit and push
         run: |
-          git add Cargo.toml Cargo.lock hermes-client-python/pyproject.toml hermes-mal-python/pyproject.toml hermes-client-typescript/package.json
+          git add Cargo.toml Cargo.lock \
+            hermes-client-python/pyproject.toml \
+            hermes-client-python/uv.lock \
+            hermes-mal-python/pyproject.toml \
+            hermes-client-typescript/package.json
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
           git push
 
@@ -227,7 +236,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: cd hermes-client-typescript && pnpm install
+        run: cd hermes-client-typescript && pnpm install --frozen-lockfile
 
       - name: Generate proto stubs
         run: cd hermes-client-typescript && pnpm run generate
@@ -259,8 +268,8 @@ jobs:
       - name: Generate proto stubs
         run: |
           cd hermes-client-python
-          uv sync
-          uv run python generate_proto.py
+          uv sync --locked --group dev
+          uv run --locked --group dev python generate_proto.py
 
       - name: Build package
         run: |

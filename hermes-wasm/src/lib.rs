@@ -14,6 +14,7 @@ mod local_index;
 mod query;
 mod registry;
 mod remote_index;
+mod searcher;
 
 use wasm_bindgen::prelude::*;
 

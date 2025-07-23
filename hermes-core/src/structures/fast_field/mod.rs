@@ -548,7 +548,8 @@ impl FastFieldWriter {
 
     /// Serialize column data using blocked format with auto-selecting codec.
     ///
-    /// Writes a single block: [num_blocks(4)] [BlockIndexEntry] [block_data] [block_dict?]
+    /// Writes a single block:
+    /// `[num_blocks(4)] [BlockIndexEntry] [block_data] [block_dict?]`.
     /// Returns `(toc_entry, total_bytes_written)`.
     pub fn serialize(
         &mut self,

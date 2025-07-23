@@ -857,7 +857,7 @@ impl BlockPostingList {
 /// Iterator over block posting list with skip support
 /// Can be either borrowed or owned via Cow
 ///
-/// Uses struct-of-arrays layout: separate Vec<u32> for doc_ids and term_freqs.
+/// Uses struct-of-arrays layout: separate `Vec<u32>` for doc_ids and term_freqs.
 /// This is more cache-friendly for SIMD seek (contiguous doc_ids) and halves
 /// memory vs the previous AoS + separate doc_ids approach.
 pub struct BlockPostingIterator<'a> {

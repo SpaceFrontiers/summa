@@ -243,30 +243,36 @@ pub struct BlockDef {
 }
 
 impl BlockDef {
+    /// Whether this block uses its state-space mixer instead of attention.
     pub fn is_ssm(&self) -> bool {
         self.ssm.is_some()
     }
 
     // Per-block computed properties (pattern-aware model construction)
 
+    /// Configured query-head count, or the MAL default when omitted.
     pub fn num_heads(&self) -> usize {
         self.attention.num_heads.unwrap_or(12)
     }
 
+    /// Configured key/value-head count, defaulting to the query-head count.
     pub fn num_kv_heads(&self) -> usize {
         self.attention.num_kv_heads.unwrap_or(self.num_heads())
     }
 
+    /// Configured head width, or an even split of `hidden_size` when omitted.
     pub fn head_dim(&self, hidden_size: usize) -> usize {
         self.attention
             .head_dim
             .unwrap_or(hidden_size / self.num_heads())
     }
 
+    /// Configured FFN width, or four times `hidden_size` when omitted.
     pub fn intermediate_size(&self, hidden_size: usize) -> usize {
         self.ffn.hidden_dim.unwrap_or(hidden_size * 4)
     }
 
+    /// Effective normalization epsilon, including the MAL default.
     pub fn norm_eps(&self) -> f64 {
         if self.norm.eps > 0.0 {
             self.norm.eps
@@ -275,6 +281,7 @@ impl BlockDef {
         }
     }
 
+    /// Effective RoPE theta, including the MAL default for non-RoPE blocks.
     pub fn rope_theta(&self) -> f64 {
         match &self.attention.position_encoding {
             PositionEncoding::Rope { theta, .. } => *theta,
@@ -282,6 +289,7 @@ impl BlockDef {
         }
     }
 
+    /// Optional RoPE scaling for this block.
     pub fn rope_scaling(&self) -> Option<f64> {
         match &self.attention.position_encoding {
             PositionEncoding::Rope { scaling, .. } => *scaling,
@@ -443,41 +451,52 @@ impl ModelDef {
         ssm.dt_rank.unwrap_or(self.hidden_size.div_ceil(16))
     }
 
+    /// Query-head count of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::num_heads`] instead.
     pub fn num_heads(&self) -> usize {
-        self.block.attention.num_heads.unwrap_or(12)
+        self.block.num_heads()
     }
 
+    /// Key/value-head count of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::num_kv_heads`] instead.
     pub fn num_kv_heads(&self) -> usize {
-        self.block
-            .attention
-            .num_kv_heads
-            .unwrap_or(self.num_heads())
+        self.block.num_kv_heads()
     }
 
+    /// Attention-head width of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::head_dim`] instead.
     pub fn head_dim(&self) -> usize {
-        self.block
-            .attention
-            .head_dim
-            .unwrap_or(self.hidden_size / self.num_heads())
+        self.block.head_dim(self.hidden_size)
     }
 
+    /// FFN width of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::intermediate_size`] instead.
     pub fn intermediate_size(&self) -> usize {
-        self.block.ffn.hidden_dim.unwrap_or(self.hidden_size * 4)
+        self.block.intermediate_size(self.hidden_size)
     }
 
+    /// Normalization epsilon of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::norm_eps`] instead.
     pub fn norm_eps(&self) -> f64 {
-        if self.block.norm.eps > 0.0 {
-            self.block.norm.eps
-        } else {
-            1e-5
-        }
+        self.block.norm_eps()
     }
 
+    /// RoPE theta of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::rope_theta`] instead.
     pub fn rope_theta(&self) -> f64 {
-        match &self.block.attention.position_encoding {
-            PositionEncoding::Rope { theta, .. } => *theta,
-            _ => 10000.0,
-        }
+        self.block.rope_theta()
     }
 
     /// Vocabulary rows stored by embeddings and the output projection.
@@ -1550,6 +1569,33 @@ mod tests {
         assert_eq!(def.hidden_size, 128);
         assert_eq!(def.num_layers, 4);
         assert_eq!(def.num_heads(), 4);
+    }
+
+    #[test]
+    fn homogeneous_model_helpers_match_the_default_block() {
+        let mut def = ModelDef {
+            hidden_size: 96,
+            ..ModelDef::default()
+        };
+        def.block.attention.num_heads = Some(6);
+        def.block.attention.num_kv_heads = Some(2);
+        def.block.attention.head_dim = Some(16);
+        def.block.attention.position_encoding = PositionEncoding::Rope {
+            theta: 500_000.0,
+            scaling: Some(2.0),
+        };
+        def.block.ffn.hidden_dim = Some(320);
+        def.block.norm.eps = 1e-6;
+
+        assert_eq!(def.num_heads(), def.block.num_heads());
+        assert_eq!(def.num_kv_heads(), def.block.num_kv_heads());
+        assert_eq!(def.head_dim(), def.block.head_dim(def.hidden_size));
+        assert_eq!(
+            def.intermediate_size(),
+            def.block.intermediate_size(def.hidden_size)
+        );
+        assert_eq!(def.norm_eps(), def.block.norm_eps());
+        assert_eq!(def.rope_theta(), def.block.rope_theta());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 """Async Python client for Hermes search server."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .client import HermesClient
 from .types import (
     AllQuery,
@@ -46,4 +48,8 @@ __all__ = [
     "VectorFieldStats",
 ]
 
-__version__ = "1.0.2"
+try:
+    __version__ = version("hermes-client-python")
+except PackageNotFoundError:
+    # Source-only imports (without an installed wheel/editable distribution).
+    __version__ = "0.0.0+unknown"

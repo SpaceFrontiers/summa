@@ -178,7 +178,7 @@ pub enum DenseVectorQuantization {
     F32,
     /// 16-bit IEEE 754 half-float (2 bytes/dim) — <0.1% recall loss for normalized embeddings
     F16,
-    /// 8-bit unsigned scalar quantization (1 byte/dim) — maps [-1,1] → [0,255]
+    /// 8-bit unsigned scalar quantization (1 byte/dim) — maps `[-1, 1]` to `[0, 255]`
     UInt8,
     /// Binary packed-bit storage (1 bit per dimension, ceil(dim/8) bytes per vector).
     /// Used internally by BinaryDenseVector fields. Not selectable for DenseVector fields.

@@ -5,36 +5,36 @@
       {{ label }}
     </div>
     <div class="flex flex-wrap gap-2">
-    <template v-for="format in formats" :key="format">
-      <a
-        v-if="availableFormats[format]"
-        :href="buildUrl(format)"
-        target="_blank"
-        class="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md transition-colors"
-        :class="formatClasses[format]"
-      >
-        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-        </svg>
-        {{ format.toUpperCase() }}
-      </a>
-      <span
-        v-else-if="checking[format]"
-        class="inline-flex items-center gap-1 px-2 py-1 text-xs text-gray-400 bg-gray-100 rounded-md"
-      >
-        <svg class="animate-spin w-3 h-3" viewBox="0 0 24 24">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
-          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-        </svg>
-        {{ format.toUpperCase() }}
-      </span>
-    </template>
+      <template v-for="format in formats" :key="format">
+        <a
+          v-if="availableFormats[format]"
+          :href="buildUrl(format)"
+          target="_blank"
+          class="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md transition-colors"
+          :class="formatClasses[format]"
+        >
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          {{ format.toUpperCase() }}
+        </a>
+        <span
+          v-else-if="checking[format]"
+          class="inline-flex items-center gap-1 px-2 py-1 text-xs text-gray-400 bg-gray-100 rounded-md"
+        >
+          <svg class="animate-spin w-3 h-3" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          {{ format.toUpperCase() }}
+        </span>
+      </template>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, computed } from 'vue'
+import { reactive, onMounted, computed } from 'vue'
 
 const props = defineProps({
   id: {

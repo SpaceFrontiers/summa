@@ -20,3 +20,16 @@ at load time instead of silently producing different token IDs.
 The optimized merge engine and pretokenizers are extracted from GigaToken and
 run without Python, networking, Arrow, SentencePiece, or nightly Rust. See
 [`UPSTREAM.md`](UPSTREAM.md) for exact provenance and refresh policy.
+
+## Development
+
+Run the unit and Hugging Face parity suites together:
+
+```bash
+cargo test -p hermes-tokenizer
+cargo clippy -p hermes-tokenizer --all-targets -- -D warnings
+```
+
+Pretokenizer refactors must retain both whole-input and resumed/chunked
+boundaries. Keep scalar and SIMD family differences explicit and extend the
+parity fixtures before consolidating a hot-path policy.

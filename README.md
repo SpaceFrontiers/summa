@@ -15,13 +15,22 @@ A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and 
 
 ## Packages
 
-| Package                | Description                                  | Registry                                              |
-| ---------------------- | -------------------------------------------- | ----------------------------------------------------- |
-| `hermes-core`          | Core search engine library                   | [crates.io](https://crates.io/crates/hermes-core)     |
-| `hermes-tool`          | CLI for index management and data processing | [crates.io](https://crates.io/crates/hermes-tool)     |
-| `hermes-server`        | gRPC server for remote search                | [crates.io](https://crates.io/crates/hermes-server)   |
-| `hermes-client-python` | Python gRPC client                           | [PyPI](https://pypi.org/project/hermes-client-python) |
-| `hermes-wasm`          | WASM bindings for browsers                   | [npm](https://www.npmjs.com/package/hermes-wasm)      |
+| Package                    | Description                                                  | Distribution                                                  |
+| -------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------- |
+| `hermes-core`              | Core search engine library                                   | [crates.io](https://crates.io/crates/hermes-core)             |
+| `hermes-server`            | gRPC server for remote search and indexing                   | [crates.io](https://crates.io/crates/hermes-server)           |
+| `hermes-tool`              | CLI for index management and data processing                 | [crates.io](https://crates.io/crates/hermes-tool)             |
+| `hermes-wasm`              | WASM bindings for browser search and indexing                | [npm](https://www.npmjs.com/package/hermes-wasm)              |
+| `hermes-web`               | Vue/WASM search UI                                           | Workspace application                                         |
+| `hermes-model-lab`         | Standalone local LLM trace and observability UI              | Workspace application                                         |
+| `hermes-client-python`     | Async Python gRPC client                                     | [PyPI](https://pypi.org/project/hermes-client-python)         |
+| `hermes-client-typescript` | TypeScript gRPC client                                       | [npm](https://www.npmjs.com/package/hermes-client-typescript) |
+| `hermes-proto`             | Shared gRPC protocol definition                              | Source package                                                |
+| `hermes-mal`               | Model Architecture Language parser and bundled model configs | [crates.io](https://crates.io/crates/hermes-mal)              |
+| `hermes-mal-python`        | Python bindings for the shared MAL parser                    | Python extension                                              |
+| `hermes-tokenizer`         | Stable-Rust byte-level BPE tokenizer                         | [crates.io](https://crates.io/crates/hermes-tokenizer)        |
+| `hermes-llm`               | Shared model, inference, generation, and accelerator kernels | Workspace crate                                               |
+| `hermes-train`             | Training CLI for the shared LLM implementation               | Workspace crate                                               |
 
 ## Quick Start
 
@@ -257,6 +266,8 @@ Full SDL reference: [docs/schema.md](docs/schema.md)
 - Rust 1.97+ (see `rust-toolchain.toml`)
 - Python 3.12+ (for Python client and bindings)
 - Node.js 20+ (for WASM and web UI)
+- pnpm 10+ (for TypeScript and web projects)
+- uv and maturin (for Python projects)
 - wasm-pack (for WASM builds)
 - protoc (for gRPC)
 
@@ -286,23 +297,27 @@ Examples:
 ### Testing
 
 ```bash
-cargo test --all-features
+cargo test --workspace
 ```
 
 LLM contributors should start with the [inference and training code map](docs/llm-code-map.md).
 Temporary GPU dependency forks and their upstream removal criteria are listed
-in [the fork register](docs/forked-dependencies.md).
+in [the fork register](docs/forked-dependencies.md). Backend-specific Metal and
+CUDA checks are documented in those guides; enabling every backend at once is
+not the portable test configuration.
 
 ### Linting
 
 ```bash
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
-# Or run all pre-commit hooks
+# Or run the commit and push hooks
 pip install pre-commit
 pre-commit install
 pre-commit run --all-files
+pre-commit run --all-files --hook-stage pre-push
 ```
 
 ## License

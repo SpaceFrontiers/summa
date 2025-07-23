@@ -69,11 +69,49 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     )
 }
 
-/// Implement [`crate::pretokenize::PretokenSpans`] for a mask-scanner
-/// pretokenizer (any `{ bytes, state: MaskState }` struct) by delegating
-/// to its scheme's [`fill_spans_keyed_mask`] monomorphization.
-macro_rules! impl_mask_pretoken_spans {
+/// Implement the shared constructor, cursor, iterator, and chunked-span
+/// surface for a mask-scanner pretokenizer.
+///
+/// The concrete module still declares the `{ bytes, state: MaskState }`
+/// struct and its [`mask::MaskScheme`], keeping scheme-specific boundary
+/// semantics next to their scalar and SIMD implementations. This macro owns
+/// only the identical adapter layer between that scheme and the public
+/// pretokenizer interfaces.
+macro_rules! impl_mask_pretokenizer {
     ($pretokenizer:ident, $scheme:ty) => {
+        impl<'a> $pretokenizer<'a> {
+            #[inline]
+            pub fn new(bytes: &'a [u8]) -> Self {
+                Self::with_pos(bytes, 0)
+            }
+
+            /// Resume iteration at a byte offset previously returned by
+            /// [`Self::pos`].
+            #[inline]
+            pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
+                Self {
+                    bytes,
+                    state: crate::pretokenize::fast::mask::MaskState::new(pos),
+                }
+            }
+
+            /// Current position as a byte offset into the input.
+            #[inline]
+            pub fn pos(&self) -> usize {
+                self.state.pos
+            }
+        }
+
+        impl<'a> Iterator for $pretokenizer<'a> {
+            type Item = crate::pretokenize::Pretoken<'a>;
+
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                let (start, end) = self.state.next_span::<$scheme>(self.bytes)?;
+                Some(crate::pretokenize::Pretoken(&self.bytes[start..end]))
+            }
+        }
+
         // SAFETY: delegates to `fill_spans_keyed_mask`, whose bodies
         // (`fill_spans_keyed_with_buf` / `fill_spans_two_phase`) write
         // exactly the first `n` entries from live spans of `self.bytes`.
@@ -94,7 +132,7 @@ macro_rules! impl_mask_pretoken_spans {
         }
     };
 }
-pub(crate) use impl_mask_pretoken_spans;
+pub(crate) use impl_mask_pretokenizer;
 
 // -----------------------------------------------------------------------
 // Branchless byte predicates
@@ -247,6 +285,90 @@ pub(crate) fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
         }
     }
     pos
+}
+
+/// End of a whitespace-led token for the common
+/// `\s*[\r\n]+ | \s+(?!\S) | \s+` family of alternatives.
+///
+/// `NEWLINE_AT_EOS` captures the one regex-ordering difference between the
+/// supported families: Qwen/OLMo/o200k let the newline alternative win even
+/// at end of input, while cl100k's earlier `\s++$` keeps all trailing
+/// whitespace together. `is_unicode_whitespace` supplies the scheme's packed
+/// Unicode classifier and is monomorphized into each hot scalar walker.
+///
+/// Precondition: `start` begins a whitespace run and any higher-priority
+/// letter-prefix or space-punctuation alternative has already been ruled out.
+#[inline(always)]
+pub(crate) fn whitespace_token_end<const NEWLINE_AT_EOS: bool>(
+    bytes: &[u8],
+    start: usize,
+    is_unicode_whitespace: impl Fn(u32) -> bool,
+) -> usize {
+    let len = bytes.len();
+    let mut pos = start;
+    let mut last_newline_end = 0usize;
+    let mut last_char_start = start;
+    while pos < len {
+        let byte = unsafe { *bytes.get_unchecked(pos) };
+        if byte == b'\r' || byte == b'\n' {
+            last_char_start = pos;
+            pos += 1;
+            last_newline_end = pos;
+        } else if is_ascii_ws(byte) {
+            last_char_start = pos;
+            pos += 1;
+        } else if byte >= 0x80 {
+            let (codepoint, width) = unsafe { decode_cp(bytes, pos) };
+            if is_unicode_whitespace(codepoint) {
+                last_char_start = pos;
+                pos += width;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if NEWLINE_AT_EOS && last_newline_end != 0 {
+        return last_newline_end;
+    }
+    if pos >= len {
+        return pos;
+    }
+    if last_newline_end != 0 {
+        return last_newline_end;
+    }
+    if last_char_start > start {
+        return last_char_start;
+    }
+    pos
+}
+
+/// End offset of the case-insensitive contraction beginning at
+/// `apostrophe`, or `None` when the following bytes are not one of
+/// `'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, or `'d`.
+///
+/// U+017F LATIN SMALL LETTER LONG S is included because Unicode
+/// case-insensitive matching folds it to `s`.
+#[inline(always)]
+pub(crate) fn contraction_end(bytes: &[u8], apostrophe: usize) -> Option<usize> {
+    if bytes.get(apostrophe) != Some(&b'\'') {
+        return None;
+    }
+    match bytes.get(apostrophe + 1).map(u8::to_ascii_lowercase) {
+        Some(b's' | b'd' | b'm' | b't') => Some(apostrophe + 2),
+        Some(b'l') if bytes.get(apostrophe + 2).map(u8::to_ascii_lowercase) == Some(b'l') => {
+            Some(apostrophe + 3)
+        }
+        Some(b'v') if bytes.get(apostrophe + 2).map(u8::to_ascii_lowercase) == Some(b'e') => {
+            Some(apostrophe + 3)
+        }
+        Some(b'r') if bytes.get(apostrophe + 2).map(u8::to_ascii_lowercase) == Some(b'e') => {
+            Some(apostrophe + 3)
+        }
+        Some(0xC5) if bytes.get(apostrophe + 2) == Some(&0xBF) => Some(apostrophe + 3),
+        _ => None,
+    }
 }
 
 /// If the char at `pos` is a letter (`\p{L}` under the 4-way `CharClass`
@@ -442,5 +564,99 @@ pub(crate) fn scan_other_from(bytes: &[u8], pos: usize) -> usize {
             }
         }
         return p;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pretokenize::{Pretoken, PretokenSpans, SpanBatch};
+
+    fn pieces<'a>(scanner: impl Iterator<Item = Pretoken<'a>>) -> Vec<&'a [u8]> {
+        scanner.map(|pretoken| pretoken.0).collect()
+    }
+
+    #[test]
+    fn every_mask_adapter_preserves_boundaries_when_resumed() {
+        macro_rules! assert_resumable {
+            ($scanner:ident) => {{
+                let input = "we'RE 123\n\u{2003}漢字".as_bytes();
+                let full = pieces($scanner::new(input));
+                assert_eq!(full.concat(), input, stringify!($scanner));
+
+                let first_end = full[0].len();
+                let mut cursor = $scanner::new(input);
+                assert_eq!(cursor.next().unwrap().0, full[0], stringify!($scanner));
+                assert_eq!(cursor.pos(), first_end, stringify!($scanner));
+                let resumed = pieces($scanner::with_pos(input, first_end));
+                assert_eq!(resumed.as_slice(), &full[1..], stringify!($scanner));
+
+                let mut chunked = $scanner::new(input);
+                let mut batch = SpanBatch::new();
+                let count = chunked.fill_spans_keyed(&mut batch, &|_| {});
+                let chunked_spans = (0..count)
+                    // SAFETY: `count` is the live prefix written by this fill.
+                    .map(|index| unsafe { batch.span(index) })
+                    .collect::<Vec<_>>();
+                assert_eq!(chunked_spans, full, stringify!($scanner));
+                assert_eq!(
+                    chunked.fill_spans_keyed(&mut batch, &|_| {}),
+                    0,
+                    stringify!($scanner)
+                );
+            }};
+        }
+
+        assert_resumable!(FastR50kPretokenizer);
+        assert_resumable!(FastCl100kPretokenizer);
+        assert_resumable!(FastQwen2Pretokenizer);
+        assert_resumable!(FastQwen35Pretokenizer);
+        assert_resumable!(FastOlmo3Pretokenizer);
+        assert_resumable!(FastO200kPretokenizer);
+        assert_resumable!(FastNemotronPretokenizer);
+        assert_resumable!(FastKimiPretokenizer);
+    }
+
+    #[test]
+    fn shared_whitespace_walker_preserves_regex_priority() {
+        let trailing = b" \n  ";
+        let ascii_only = |_| false;
+        assert_eq!(
+            whitespace_token_end::<false>(trailing, 0, ascii_only),
+            trailing.len(),
+            "cl100k's end-of-input alternative keeps trailing whitespace together"
+        );
+        assert_eq!(
+            whitespace_token_end::<true>(trailing, 0, ascii_only),
+            2,
+            "Qwen/OLMo/o200k newline alternatives win at end of input"
+        );
+        assert_eq!(
+            pieces(FastCl100kPretokenizer::new(trailing)),
+            [trailing.as_slice()]
+        );
+        assert_eq!(
+            pieces(FastQwen2Pretokenizer::new(trailing)),
+            [&trailing[..2], &trailing[2..]]
+        );
+    }
+
+    #[test]
+    fn shared_contraction_matcher_covers_ascii_case_and_long_s() {
+        for token in ["'s", "'T", "'re", "'VE", "'m", "'Ll", "'d"] {
+            assert_eq!(contraction_end(token.as_bytes(), 0), Some(token.len()));
+        }
+        assert_eq!(contraction_end(b"'\xC5\xBF", 0), Some(3));
+        assert_eq!(contraction_end(b"'x", 0), None);
+        assert_eq!(contraction_end(b"word", 0), None);
+
+        assert_eq!(
+            pieces(FastCl100kPretokenizer::new(b"we'RE")),
+            [b"we".as_slice(), b"'RE".as_slice()]
+        );
+        assert_eq!(
+            pieces(FastO200kPretokenizer::new(b"we'RE")),
+            [b"we'RE".as_slice()]
+        );
     }
 }

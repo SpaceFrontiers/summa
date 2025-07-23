@@ -31,7 +31,7 @@ fn zero_bmp_io_concurrency_is_rejected() {
     assert!(super::searcher::SearcherResources::new(1, 1, 1, 0).is_err());
 }
 
-#[cfg(feature = "native")]
+#[cfg(feature = "sync")]
 #[tokio::test]
 async fn bmp_io_gate_shares_capacity_between_sync_and_async_paths() {
     use std::time::Duration;

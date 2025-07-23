@@ -11,6 +11,7 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Core async search engine library with WASM support"
+readme = "README.md"
 
 [dependencies]
 tokio = { workspace = true, optional = true }

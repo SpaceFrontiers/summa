@@ -19,7 +19,6 @@ use super::{
     decode_cp, is_ascii_ws, is_digit, is_letter, letter_end_at, scan_letters_from, scan_newlines,
     scan_numbers_max3, scan_other_from,
 };
-use crate::pretokenize::Pretoken;
 use crate::pretokenize::unicode::{self, CharClass};
 
 pub(crate) struct Olmo3Scheme;
@@ -59,39 +58,7 @@ pub struct FastOlmo3Pretokenizer<'a> {
     state: MaskState,
 }
 
-impl<'a> FastOlmo3Pretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self {
-            bytes,
-            state: MaskState::new(pos),
-        }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastOlmo3Pretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<Olmo3Scheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastOlmo3Pretokenizer, Olmo3Scheme);
+super::impl_mask_pretokenizer!(FastOlmo3Pretokenizer, Olmo3Scheme);
 
 /// Whitespace-led token starting at `start`, i.e. the alternatives
 /// `\s*[\r\n]+` | `\s+(?!\S)` | `\s+`, in that priority.
@@ -99,41 +66,9 @@ super::impl_mask_pretoken_spans!(FastOlmo3Pretokenizer, Olmo3Scheme);
 /// space+punct (` ?[^\s\p{L}\p{N}]+...`) alternatives were ruled out.
 #[inline(always)]
 fn ws_token_end(bytes: &[u8], start: usize) -> usize {
-    let len = bytes.len();
-    let mut p = start;
-    let mut last_nl_end = 0usize; // 0 = run contains no \r\n
-    let mut last_char_start = start;
-    while p < len {
-        let b = unsafe { *bytes.get_unchecked(p) };
-        if b == b'\r' || b == b'\n' {
-            last_char_start = p;
-            p += 1;
-            last_nl_end = p;
-        } else if is_ascii_ws(b) {
-            last_char_start = p;
-            p += 1;
-        } else if b >= 0x80 {
-            let (cp, l) = unsafe { decode_cp(bytes, p) };
-            if unicode::class_of(cp) == CharClass::Whitespace {
-                last_char_start = p;
-                p += l;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if last_nl_end != 0 {
-        return last_nl_end; // `\s*[\r\n]+`: through the last newline, even at EOS
-    }
-    if p >= len {
-        return p; // `\s+(?!\S)`: lookahead succeeds at EOS
-    }
-    if last_char_start > start {
-        return last_char_start; // `\s+(?!\S)`: all but the last ws char
-    }
-    p // `\s+`: single whitespace char before content
+    super::whitespace_token_end::<true>(bytes, start, |codepoint| {
+        unicode::class_of(codepoint) == CharClass::Whitespace
+    })
 }
 
 /// Advance past one token starting at `pos`. Returns the new position.
@@ -208,22 +143,8 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
 
     // Apostrophe: case-insensitive contractions
     if b0 == b'\'' {
-        match bytes.get(pos + 1).map(u8::to_ascii_lowercase) {
-            Some(b's' | b'd' | b'm' | b't') => return pos + 2,
-            Some(b'l') if bytes.get(pos + 2).map(u8::to_ascii_lowercase) == Some(b'l') => {
-                return pos + 3;
-            }
-            Some(b'v') if bytes.get(pos + 2).map(u8::to_ascii_lowercase) == Some(b'e') => {
-                return pos + 3;
-            }
-            Some(b'r') if bytes.get(pos + 2).map(u8::to_ascii_lowercase) == Some(b'e') => {
-                return pos + 3;
-            }
-            _ => {}
-        }
-        // U+017F LATIN SMALL LETTER LONG S case-folds to 's' under `(?i)`
-        if bytes.get(pos + 1) == Some(&0xC5) && bytes.get(pos + 2) == Some(&0xBF) {
-            return pos + 3;
+        if let Some(end) = super::contraction_end(bytes, pos) {
+            return end;
         }
         // Not a contraction: `'` can still prefix a letter run
         if let Some(p) = letter_end_at(bytes, pos + 1) {

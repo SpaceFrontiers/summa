@@ -33,7 +33,7 @@ export function useUxConfig() {
       config.value = parseUxConfig(text)
       isLoaded.value = true
       console.log('UX config loaded:', config.value)
-    } catch (e) {
+    } catch {
       // ux.dsl is optional, use defaults if not found
       console.log('No ux.dsl found, using defaults')
       config.value = { ...DEFAULT_CONFIG }

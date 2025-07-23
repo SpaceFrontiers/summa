@@ -1,3 +1,10 @@
+#![deny(
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::private_intra_doc_links
+)]
+
 //! Hermes - A minimal async search engine library
 //!
 //! Features:
@@ -120,19 +127,24 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Centralized so all configs share one definition.
 #[cfg(feature = "native")]
 pub fn default_indexing_threads() -> usize {
-    (num_cpus::get() / 4).max(1)
+    default_quarter_cpu_threads()
 }
 
 /// Default width of the process-wide search CPU pool (cpu / 4, minimum 1).
 #[cfg(feature = "native")]
 pub fn default_search_threads() -> usize {
-    (num_cpus::get() / 4).max(1)
+    default_quarter_cpu_threads()
 }
 
 /// Default width of the process-wide document-store compression pool
 /// (cpu / 4, minimum 1).
 #[cfg(feature = "native")]
 pub fn default_compression_threads() -> usize {
+    default_quarter_cpu_threads()
+}
+
+#[cfg(feature = "native")]
+fn default_quarter_cpu_threads() -> usize {
     (num_cpus::get() / 4).max(1)
 }
 
@@ -149,5 +161,15 @@ mod tests {
             super::format_bytes(2 * 1024 * 1024 * 1024 * 1024),
             "2.00 TiB"
         );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn cpu_bound_defaults_share_one_policy() {
+        let expected = (num_cpus::get() / 4).max(1);
+
+        assert_eq!(super::default_indexing_threads(), expected);
+        assert_eq!(super::default_search_threads(), expected);
+        assert_eq!(super::default_compression_threads(), expected);
     }
 }

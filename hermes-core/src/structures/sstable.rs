@@ -7,7 +7,7 @@
 //!
 //! 1. **FST-based Block Index**: Uses Finite State Transducer for key lookup
 //!    - Can be mmap'd directly without parsing into heap-allocated structures
-//!    - ~90% memory reduction compared to Vec<BlockIndexEntry>
+//!    - ~90% memory reduction compared to `Vec<BlockIndexEntry>`
 //!
 //! 2. **Bitpacked Block Addresses**: Offsets and lengths stored with delta encoding
 //!    - Minimal memory footprint for block metadata
@@ -27,6 +27,7 @@ use std::sync::Arc;
 #[cfg(feature = "fst-index")]
 use super::sstable_index::FstBlockIndex;
 use super::sstable_index::{BlockAddr, BlockIndex, MmapBlockIndex};
+use super::vint::{read_vint, write_vint};
 use crate::compression::{CompressionDict, CompressionLevel};
 use crate::directories::{FileHandle, OwnedBytes};
 
@@ -400,9 +401,17 @@ fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     (h1, h2)
 }
 
-/// SSTable value trait
+/// A value that can be stored in an [`SSTableWriter`] and read by an
+/// [`AsyncSSTableReader`].
+///
+/// Implementations form part of the on-disk format. `deserialize` must consume
+/// exactly the bytes written by one `serialize` call so the block decoder can
+/// continue at the following entry.
 pub trait SSTableValue: Clone + Send + Sync {
+    /// Append this value's binary representation to `writer`.
     fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()>;
+
+    /// Read one value from `reader`, leaving subsequent entry bytes untouched.
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self>;
 }
 
@@ -417,7 +426,7 @@ impl SSTableValue for u64 {
     }
 }
 
-/// Vec<u8> value implementation
+/// `Vec<u8>` value implementation
 impl SSTableValue for Vec<u8> {
     fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         write_vint(writer, self.len() as u64)?;
@@ -576,7 +585,7 @@ impl TermInfo {
     }
 
     /// Try to create an inline TermInfo from an iterator of (doc_id, term_freq) pairs.
-    /// Zero-allocation alternative to `try_inline` — avoids collecting into Vec<u32>.
+    /// Zero-allocation alternative to `try_inline` — avoids collecting into `Vec<u32>`.
     /// `count` is the number of postings (must match iterator length).
     pub fn try_inline_iter(count: usize, iter: impl Iterator<Item = (u32, u32)>) -> Option<Self> {
         if count > MAX_INLINE_POSTINGS || count == 0 {
@@ -794,55 +803,53 @@ impl SSTableValue for TermInfo {
     }
 }
 
-/// Write variable-length integer
-pub fn write_vint<W: Write + ?Sized>(writer: &mut W, mut value: u64) -> io::Result<()> {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            writer.write_u8(byte)?;
-            return Ok(());
-        } else {
-            writer.write_u8(byte | 0x80)?;
-        }
-    }
-}
-
-/// Read variable-length integer
-pub fn read_vint<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut result = 0u64;
-    let mut shift = 0;
-
-    loop {
-        let byte = reader.read_u8()?;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint too long",
-            ));
-        }
-    }
-}
-
 /// Compute common prefix length
 pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// Decode one prefix-compressed key/value entry from an SSTable block.
+///
+/// Keeping this in one place is important: point lookup, scans, and iteration
+/// must consume exactly the same number of bytes and reconstruct keys with the
+/// same rules.
+fn decode_block_entry<V: SSTableValue>(
+    reader: &mut &[u8],
+    current_key: &mut Vec<u8>,
+) -> io::Result<V> {
+    let common_prefix_len = read_vint(reader)? as usize;
+    let suffix_len = read_vint(reader)? as usize;
+
+    if suffix_len > reader.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "SSTable block suffix truncated",
+        ));
+    }
+
+    current_key.truncate(common_prefix_len);
+    current_key.extend_from_slice(&reader[..suffix_len]);
+    *reader = &reader[suffix_len..];
+
+    V::deserialize(reader)
+}
+
 /// SSTable statistics for debugging
 #[derive(Debug, Clone)]
 pub struct SSTableStats {
+    /// Number of independently compressed data blocks.
     pub num_blocks: usize,
+    /// Number of entries retained in the sparse block index.
     pub num_sparse_entries: usize,
+    /// Total number of key/value entries.
     pub num_entries: u64,
+    /// Whether the table includes a bloom filter.
     pub has_bloom_filter: bool,
+    /// Whether blocks use a shared compression dictionary.
     pub has_dictionary: bool,
+    /// Serialized bloom-filter size in bytes.
     pub bloom_filter_size: usize,
+    /// Compression dictionary size in bytes.
     pub dictionary_size: usize,
 }
 
@@ -1747,20 +1754,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let mut current_key = Vec::new();
 
         while !reader.is_empty() {
-            let common_prefix_len = read_vint(&mut reader)? as usize;
-            let suffix_len = read_vint(&mut reader)? as usize;
-
-            if suffix_len > reader.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "SSTable block suffix truncated",
-                ));
-            }
-            current_key.truncate(common_prefix_len);
-            current_key.extend_from_slice(&reader[..suffix_len]);
-            reader = &reader[suffix_len..];
-
-            let value = V::deserialize(&mut reader)?;
+            let value = decode_block_entry(&mut reader, &mut current_key)?;
 
             match current_key.as_slice().cmp(target_key) {
                 std::cmp::Ordering::Equal => return Ok(Some(value)),
@@ -1802,20 +1796,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
-                let common_prefix_len = read_vint(&mut reader)? as usize;
-                let suffix_len = read_vint(&mut reader)? as usize;
-
-                if suffix_len > reader.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "SSTable block suffix truncated",
-                    ));
-                }
-                current_key.truncate(common_prefix_len);
-                current_key.extend_from_slice(&reader[..suffix_len]);
-                reader = &reader[suffix_len..];
-
-                let value = V::deserialize(&mut reader)?;
+                let value = decode_block_entry(&mut reader, &mut current_key)?;
                 results.push((current_key.clone(), value));
             }
         }
@@ -1857,20 +1838,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
-                let common_prefix_len = read_vint(&mut reader)? as usize;
-                let suffix_len = read_vint(&mut reader)? as usize;
-
-                if suffix_len > reader.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "SSTable block suffix truncated",
-                    ));
-                }
-                current_key.truncate(common_prefix_len);
-                current_key.extend_from_slice(&reader[..suffix_len]);
-                reader = &reader[suffix_len..];
-
-                let value = V::deserialize(&mut reader)?;
+                let value = decode_block_entry(&mut reader, &mut current_key)?;
 
                 if current_key.starts_with(prefix) {
                     if results.len() >= max_results {
@@ -1918,20 +1886,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
-                let common_prefix_len = read_vint(&mut reader)? as usize;
-                let suffix_len = read_vint(&mut reader)? as usize;
-
-                if suffix_len > reader.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "SSTable block suffix truncated",
-                    ));
-                }
-                current_key.truncate(common_prefix_len);
-                current_key.extend_from_slice(&reader[..suffix_len]);
-                reader = &reader[suffix_len..];
-
-                let value = V::deserialize(&mut reader)?;
+                let value = decode_block_entry(&mut reader, &mut current_key)?;
 
                 if current_key.starts_with(prefix) {
                     if results.len() >= max_results {
@@ -2005,20 +1960,7 @@ impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
             let mut reader = &block[self.block_offset..];
             let start_len = reader.len();
 
-            let common_prefix_len = read_vint(&mut reader)? as usize;
-            let suffix_len = read_vint(&mut reader)? as usize;
-
-            if suffix_len > reader.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "SSTable block suffix truncated",
-                ));
-            }
-            self.current_key.truncate(common_prefix_len);
-            self.current_key.extend_from_slice(&reader[..suffix_len]);
-            reader = &reader[suffix_len..];
-
-            let value = V::deserialize(&mut reader)?;
+            let value = decode_block_entry(&mut reader, &mut self.current_key)?;
 
             self.block_offset += start_len - reader.len();
 
@@ -2167,5 +2109,46 @@ mod tests {
         assert_eq!(common_prefix_len(b"hello", b"world"), 0);
         assert_eq!(common_prefix_len(b"", b"hello"), 0);
         assert_eq!(common_prefix_len(b"hello", b""), 0);
+    }
+
+    #[test]
+    fn decode_block_entry_reconstructs_keys_and_consumes_one_entry() {
+        let mut encoded = Vec::new();
+
+        write_vint(&mut encoded, 0).unwrap();
+        write_vint(&mut encoded, 5).unwrap();
+        encoded.extend_from_slice(b"alpha");
+        7_u64.serialize(&mut encoded).unwrap();
+
+        write_vint(&mut encoded, 3).unwrap();
+        write_vint(&mut encoded, 3).unwrap();
+        encoded.extend_from_slice(b"ine");
+        11_u64.serialize(&mut encoded).unwrap();
+
+        let mut reader = encoded.as_slice();
+        let mut key = Vec::new();
+
+        assert_eq!(decode_block_entry::<u64>(&mut reader, &mut key).unwrap(), 7);
+        assert_eq!(key, b"alpha");
+        assert!(!reader.is_empty(), "the second entry must remain unread");
+
+        assert_eq!(
+            decode_block_entry::<u64>(&mut reader, &mut key).unwrap(),
+            11
+        );
+        assert_eq!(key, b"alpine");
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn decode_block_entry_rejects_truncated_suffix() {
+        let encoded = [0, 4, b'o', b'n'];
+        let mut reader = encoded.as_slice();
+        let mut key = Vec::new();
+
+        let error = decode_block_entry::<u64>(&mut reader, &mut key).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "SSTable block suffix truncated");
     }
 }

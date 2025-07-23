@@ -39,7 +39,6 @@ use super::{
     decode_cp, is_ascii_ws, is_digit, is_letter, scan_digits_from, scan_letters_from,
     scan_other_from,
 };
-use crate::pretokenize::Pretoken;
 use crate::pretokenize::unicode::{self, CharClass};
 
 // -----------------------------------------------------------------------
@@ -461,41 +460,7 @@ pub struct FastR50kPretokenizer<'a> {
     state: MaskState,
 }
 
-impl<'a> FastR50kPretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    /// Used by the Python bindings, which re-borrow the underlying buffer on
-    /// every `__next__` call.
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self {
-            bytes,
-            state: MaskState::new(pos),
-        }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastR50kPretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<R50kScheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastR50kPretokenizer, R50kScheme);
+super::impl_mask_pretokenizer!(FastR50kPretokenizer, R50kScheme);
 
 /// Advance past one token starting at `start`; returns the token's end.
 /// `start` must be < `bytes.len()` and a valid token start.

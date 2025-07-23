@@ -395,7 +395,8 @@ class HermesClient:
         Args:
             index_name: Name of the index
             query: Query dict with one key: "term", "match", "boolean",
-                "sparse_vector", "dense_vector", "boost", "all", or "fusion".
+                "sparse_vector", "dense_vector", "binary_dense_vector",
+                "boost", "range", "prefix", "all", or "fusion".
                 Fusion (hybrid union of sub-queries, top-level only):
                 {"fusion": {"queries": [{"query": {...}, "weight": 1.0}, ...],
                 "method": "rrf" | "normalized_weighted_sum",
@@ -588,6 +589,19 @@ def _is_multi_dense_vector(value: list) -> bool:
     return all(_is_dense_vector(item) for item in value)
 
 
+def _sparse_vector_to_proto(value: list) -> pb.SparseVector:
+    """Build the protobuf representation used by fields and queries."""
+    return pb.SparseVector(
+        indices=[int(item[0]) for item in value],
+        values=[float(item[1]) for item in value],
+    )
+
+
+def _dense_vector_to_proto(value: list) -> pb.DenseVector:
+    """Build a dense protobuf vector with normalized float values."""
+    return pb.DenseVector(values=[float(item) for item in value])
+
+
 def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
     """Convert document dict to list of FieldEntry for multi-value field support.
 
@@ -600,35 +614,23 @@ def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
             # Check for multi-value sparse vectors: [[(idx, val), ...], ...]
             if _is_multi_sparse_vector(value):
                 for sv in value:
-                    indices = [int(item[0]) for item in sv]
-                    values = [float(item[1]) for item in sv]
-                    fv = pb.FieldValue(
-                        sparse_vector=pb.SparseVector(indices=indices, values=values)
-                    )
+                    fv = pb.FieldValue(sparse_vector=_sparse_vector_to_proto(sv))
                     entries.append(pb.FieldEntry(name=name, value=fv))
                 continue
             # Check for multi-value dense vectors: [[f1, f2, ...], ...]
             if _is_multi_dense_vector(value):
                 for dv in value:
-                    fv = pb.FieldValue(
-                        dense_vector=pb.DenseVector(values=[float(v) for v in dv])
-                    )
+                    fv = pb.FieldValue(dense_vector=_dense_vector_to_proto(dv))
                     entries.append(pb.FieldEntry(name=name, value=fv))
                 continue
             # Single sparse vector: [(idx, val), ...]
             if _is_sparse_vector(value):
-                indices = [int(item[0]) for item in value]
-                values = [float(item[1]) for item in value]
-                fv = pb.FieldValue(
-                    sparse_vector=pb.SparseVector(indices=indices, values=values)
-                )
+                fv = pb.FieldValue(sparse_vector=_sparse_vector_to_proto(value))
                 entries.append(pb.FieldEntry(name=name, value=fv))
                 continue
             # Single dense vector: [f1, f2, ...]
             if _is_dense_vector(value):
-                fv = pb.FieldValue(
-                    dense_vector=pb.DenseVector(values=[float(v) for v in value])
-                )
+                fv = pb.FieldValue(dense_vector=_dense_vector_to_proto(value))
                 entries.append(pb.FieldEntry(name=name, value=fv))
                 continue
             # Multi-value plain field: ["val1", "val2", ...] -> separate entries
@@ -667,16 +669,10 @@ def _to_field_value(value: Any) -> pb.FieldValue:
     elif isinstance(value, list):
         # Check if it's a sparse vector: list of (index, value) pairs
         if _is_sparse_vector(value):
-            indices = [int(item[0]) for item in value]
-            values = [float(item[1]) for item in value]
-            return pb.FieldValue(
-                sparse_vector=pb.SparseVector(indices=indices, values=values)
-            )
+            return pb.FieldValue(sparse_vector=_sparse_vector_to_proto(value))
         # Check if it's a dense vector: flat list of numeric values
         if _is_dense_vector(value):
-            return pb.FieldValue(
-                dense_vector=pb.DenseVector(values=[float(v) for v in value])
-            )
+            return pb.FieldValue(dense_vector=_dense_vector_to_proto(value))
         # Otherwise treat as JSON
         return pb.FieldValue(json_value=json.dumps(value))
     else:
@@ -742,7 +738,8 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
     """Recursively convert a Query dict to protobuf Query.
 
     The dict must have exactly one key matching the proto Query oneof:
-    "term", "match", "boolean", "sparse_vector", "dense_vector", "boost", "all".
+    "term", "match", "boolean", "sparse_vector", "dense_vector",
+    "binary_dense_vector", "boost", "range", "prefix", "all", or "fusion".
     """
     if "term" in q:
         t = q["term"]
@@ -764,22 +761,23 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
 
     if "sparse_vector" in q:
         sv = q["sparse_vector"]
-        return pb.Query(
-            sparse_vector=pb.SparseVectorQuery(
-                field=sv["field"],
-                indices=sv.get("indices", []),
-                values=sv.get("values", []),
-                text=sv.get("text", ""),
-                combiner=_combiner_to_proto(sv.get("combiner")),
-                heap_factor=sv.get("heap_factor", 0),
-                combiner_temperature=sv.get("combiner_temperature", 0),
-                combiner_top_k=sv.get("combiner_top_k", 0),
-                combiner_decay=sv.get("combiner_decay", 0),
-                weight_threshold=sv.get("weight_threshold", 0),
-                max_query_dims=sv.get("max_query_dims", 0),
-                pruning=sv.get("pruning", 0),
-            )
-        )
+        sparse_vector = {
+            "field": sv["field"],
+            "indices": sv.get("indices", []),
+            "values": sv.get("values", []),
+            "text": sv.get("text", ""),
+            "combiner": _combiner_to_proto(sv.get("combiner")),
+            "heap_factor": sv.get("heap_factor", 0),
+            "combiner_temperature": sv.get("combiner_temperature", 0),
+            "combiner_top_k": sv.get("combiner_top_k", 0),
+            "combiner_decay": sv.get("combiner_decay", 0),
+            "weight_threshold": sv.get("weight_threshold", 0),
+            "max_query_dims": sv.get("max_query_dims", 0),
+            "pruning": sv.get("pruning", 0),
+        }
+        if "lsp_gamma" in sv:
+            sparse_vector["lsp_gamma"] = sv["lsp_gamma"]
+        return pb.Query(sparse_vector=pb.SparseVectorQuery(**sparse_vector))
 
     if "dense_vector" in q:
         dv = q["dense_vector"]

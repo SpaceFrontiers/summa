@@ -124,6 +124,7 @@ impl BmpIoGate {
         }
     }
 
+    #[cfg(feature = "sync")]
     fn acquire(&self) -> BmpIoPermit<'_> {
         let mut active = self.active.lock();
         while *active >= self.limit {
@@ -540,6 +541,33 @@ impl Default for IndexConfig {
     }
 }
 
+/// Build the segment-lifecycle owner from the corresponding index policy.
+///
+/// `Index` and `IndexWriter` both support create/open entry points. Routing
+/// their shared configuration through this helper prevents a new
+/// `SegmentManager` option from being wired into only some constructors.
+#[cfg(feature = "native")]
+fn segment_manager_from_config<D: crate::directories::DirectoryWriter + 'static>(
+    directory: &Arc<D>,
+    schema: &Arc<Schema>,
+    metadata: IndexMetadata,
+    config: &IndexConfig,
+) -> Arc<crate::merge::SegmentManager<D>> {
+    Arc::new(crate::merge::SegmentManager::new(
+        Arc::clone(directory),
+        Arc::clone(schema),
+        metadata,
+        config.merge_policy.clone_box(),
+        config.term_cache_blocks,
+        config.max_concurrent_merges,
+        Arc::clone(&config.background_merge_permits),
+        config.merge_bp_time_budget,
+        config.bp_memory_budget_bytes,
+        Arc::clone(&config.background_reorder_permits),
+        config.background_reorder_pool.clone(),
+    ))
+}
+
 /// Multi-segment async Index
 ///
 /// The central concept for search. Owns segment lifecycle and provides:
@@ -593,19 +621,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
         let metadata = IndexMetadata::new((*schema).clone());
 
-        let segment_manager = Arc::new(crate::merge::SegmentManager::new(
-            Arc::clone(&directory),
-            Arc::clone(&schema),
-            metadata,
-            config.merge_policy.clone_box(),
-            config.term_cache_blocks,
-            config.max_concurrent_merges,
-            Arc::clone(&config.background_merge_permits),
-            config.merge_bp_time_budget,
-            config.bp_memory_budget_bytes,
-            Arc::clone(&config.background_reorder_permits),
-            config.background_reorder_pool.clone(),
-        ));
+        let segment_manager = segment_manager_from_config(&directory, &schema, metadata, &config);
 
         // Save initial metadata
         segment_manager.update_metadata(|_| {}).await?;
@@ -636,19 +652,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());
 
-        let segment_manager = Arc::new(crate::merge::SegmentManager::new(
-            Arc::clone(&directory),
-            Arc::clone(&schema),
-            metadata,
-            config.merge_policy.clone_box(),
-            config.term_cache_blocks,
-            config.max_concurrent_merges,
-            Arc::clone(&config.background_merge_permits),
-            config.merge_bp_time_budget,
-            config.bp_memory_budget_bytes,
-            Arc::clone(&config.background_reorder_permits),
-            config.background_reorder_pool.clone(),
-        ));
+        let segment_manager = segment_manager_from_config(&directory, &schema, metadata, &config);
 
         // Load trained structures into SegmentManager's ArcSwap
         segment_manager.try_load_and_publish_trained().await?;

@@ -56,6 +56,7 @@ class SparseVectorQuery(TypedDict, total=False):
     weight_threshold: float
     max_query_dims: int
     pruning: float
+    lsp_gamma: int
 
 
 class DenseVectorQuery(TypedDict, total=False):
@@ -87,8 +88,8 @@ class RangeQuery(TypedDict, total=False):
     max_f64: float
 
 
-# Query is a dict with exactly one key: "term", "match", "boolean",
-# "sparse_vector", "dense_vector", "binary_dense_vector", "boost", "range", or "all".
+# Query is a dict with exactly one key matching a protobuf Query variant,
+# including text, Boolean, vector, range/prefix, all, and fusion queries.
 Query = dict[str, Any]
 
 # =============================================================================

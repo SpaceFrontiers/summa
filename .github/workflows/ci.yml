@@ -41,16 +41,24 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Hermes Core native-without-sync boundary
+        run: cargo check -p hermes-core --no-default-features --features native --all-targets
+
+      - name: API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --workspace --release
 
   training-supervisor:
-    name: Training Relaunch
+    name: Shell and Training Harness
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,14 +66,15 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
-      - name: Check and test relaunch supervisor
+      - name: Check shell scripts and test relaunch supervisor
         run: |
-          shellcheck -x hermes-train/scripts/relaunch.sh hermes-train/scripts/relaunch_test.sh
+          git ls-files '*.sh' -z | xargs -0 shellcheck -x -e SC1091
           python3 -m py_compile \
             hermes-train/scripts/wandb_tail.py \
             hermes-train/scripts/education_curriculum.py \
             hermes-train/scripts/build_education_curriculum.py
           python3 hermes-train/scripts/test_education_curriculum.py
+          python3 hermes-train/scripts/test_wandb_tail.py
           hermes-train/scripts/relaunch_test.sh
 
   # Security audit - check for known vulnerabilities
@@ -96,9 +105,9 @@ jobs:
       - name: Run cargo machete
         run: cargo machete
 
-  # WASM build - separate due to different target
+  # WASM build - separate due to different target; its output feeds the search UI
   wasm:
-    name: WASM Build
+    name: WASM and Search Web
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -142,9 +151,62 @@ jobs:
         working-directory: hermes-wasm
         run: npm test
 
-  # Python lint - fast, no compilation
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install web dependencies
+        working-directory: hermes-web
+        run: pnpm install --frozen-lockfile
+
+      - name: Check and build web
+        working-directory: hermes-web
+        run: |
+          pnpm run lint
+          pnpm test
+          pnpm run build
+
+  model-lab:
+    name: LLM Model Lab
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify search and Model Lab source ownership
+        run: |
+          if git grep -n -E 'hermes-web|hermes-wasm' -- hermes-model-lab/src; then
+            echo "Model Lab source must not depend on the search UI or WASM package"
+            exit 1
+          fi
+          if git grep -n -E 'model-lab|hermes-model-lab' -- hermes-web/src; then
+            echo "Search UI source must not contain Model Lab code"
+            exit 1
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: hermes-model-lab/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hermes-model-lab
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Model Lab
+        working-directory: hermes-model-lab
+        run: pnpm check
+
+  # Python lint and unit tests - no native extension compilation
   python:
-    name: Python Lint
+    name: Python Lint and Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -153,9 +215,61 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install ruff
-      - run: ruff check .
-      - run: ruff format --check .
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Lint and format Python
+        run: |
+          uv run --locked --project hermes-client-python --group dev ruff check .
+          uv run --locked --project hermes-client-python --group dev ruff format --check .
+      - name: Check generated Python protocol bindings
+        working-directory: hermes-client-python
+        run: |
+          uv run --locked --group dev python generate_proto.py
+          git diff --exit-code -- \
+            src/hermes_client_python/hermes_pb2.py \
+            src/hermes_client_python/hermes_pb2_grpc.py
+      - name: Test Python client helpers
+        run: |
+          uv run --locked --project hermes-client-python --group test \
+            pytest hermes-client-python/tests/test_client_unit.py \
+              hermes-client-python/stress_test/test_stress_test.py
+
+  mal-python:
+    name: MAL Python Wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and install wheel
+        run: |
+          python -m pip install "maturin>=1.7,<2"
+          maturin build \
+            --release \
+            --manifest-path hermes-mal-python/Cargo.toml \
+            --out hermes-mal-python/dist
+          python -m pip install hermes-mal-python/dist/*.whl
+
+      - name: Smoke-test the installed extension
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from hermes_mal import parse_mal
+
+          source = Path("hermes-mal/well-known/tiny.mal").read_text()
+          model = json.loads(parse_mal(source))
+          assert model["vocab_size"] == 32_000
+          PY
 
   # TypeScript client - build check
   typescript:
@@ -177,10 +291,13 @@ jobs:
           cache-dependency-path: hermes-client-typescript/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: cd hermes-client-typescript && pnpm install
+        run: cd hermes-client-typescript && pnpm install --frozen-lockfile
 
       - name: Generate proto stubs
-        run: cd hermes-client-typescript && pnpm run generate
+        working-directory: hermes-client-typescript
+        run: |
+          pnpm run generate
+          git diff --exit-code -- src/generated/hermes.ts
 
-      - name: Build
-        run: cd hermes-client-typescript && pnpm run build
+      - name: Build and test
+        run: cd hermes-client-typescript && pnpm test

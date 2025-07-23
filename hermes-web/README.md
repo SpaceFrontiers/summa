@@ -1,79 +1,28 @@
 # Hermes Web
 
-A Vue 3 + Tailwind CSS web application for searching Hermes indexes via WASM.
+A Vue 3 + Tailwind CSS application for searching Hermes indexes via WASM.
+This project is search-only; the LLM observability UI lives in
+[`../hermes-model-lab`](../hermes-model-lab/README.md).
 
-## Model Lab
-
-The standalone Model Lab visualizes a versioned trace produced by the shared
-Hermes LLM model. Start the local live server to keep one checkpoint resident,
-submit queries in the page, and play the resulting residual stream from the
-embedding through every layer:
-
-```bash
-cargo run --release -p hermes-llm --features metal -- lab \
-  --checkpoint checkpoint/weights.safetensors \
-  --config checkpoint/config.json \
-  --tokenizer tokenizer.json \
-  --metrics checkpoint/metrics.jsonl
-```
-
-Open http://127.0.0.1:4173/model-lab.html. The live server binds to loopback by
-default, accepts one bounded inference job at a time, and serves the page and
-API from the same origin. Use `--max-new-tokens`, `--trace-tokens`,
-`--channel-bins`, and `--attention-heads` to change its explicit limits.
-
-For bundle-only inspection without loading a checkpoint:
-
-```bash
-pnpm lab:dev
-pnpm lab:test
-pnpm lab:build
-```
-
-`lab:dev` needs no JavaScript install or WASM build. It starts with a clearly
-marked synthetic trace and can open real JSON bundles entirely in the browser;
-selected files never leave the machine. Live query controls remain disabled in
-this static mode. The production build uses the repository's pinned Vite
-dependency.
-
-Create a bundle from a checkpoint, optionally attaching trainer metrics:
-
-```bash
-cargo run -p hermes-llm -- trace \
-  --checkpoint checkpoint/weights.safetensors \
-  --config checkpoint/config.json \
-  --tokenizer tokenizer.json \
-  --prompt "Plan what evidence to retrieve" \
-  --max-tokens 32 \
-  --metrics checkpoint/metrics.jsonl \
-  --output checkpoint/model-trace.json
-```
-
-The trace command prints every capture reduction. Use `--trace-tokens`,
-`--channel-bins`, `--attention-heads`, and `--metrics-points` to change the
-bounded defaults. Training can add the optional layer-gradient heatmap with
-`hermes-train train --layer-metrics-every N`.
+The historical `pnpm lab:dev`, `lab:test`, `lab:lint`, `lab:build`, and
+`lab:preview` commands remain as forwarding aliases during the project split.
 
 ## Quick Start
 
-### 1. Start the index server (from project root)
+### 1. Start the index server (from the repository root)
 
 ```bash
-# Build test index and serve it
-./scripts/serve-index.sh
-
-# Or just serve an existing index
-./scripts/serve-index.sh --serve-only
+cargo run -p hermes-server --bin serve-index -- /path/to/index 8765
 ```
 
 ### 2. Start the web app
 
 ```bash
 # Build WASM, install deps, and launch dev server
-./scripts/dev.sh
+./hermes-web/scripts/dev.sh
 
 # Or skip WASM build if already built
-./scripts/dev.sh --skip-wasm
+./hermes-web/scripts/dev.sh --skip-wasm
 ```
 
 Open http://localhost:5173 in your browser.
@@ -101,6 +50,18 @@ pnpm build
 ```
 
 The static files will be in the `dist/` directory. Serve them with any static file server.
+
+## Quality checks
+
+```bash
+pnpm test
+pnpm lint
+pnpm build
+```
+
+The unit suite covers framework-independent URL/configuration helpers. Keep
+protocol parsing in `src/lib` so it can be shared and tested without booting
+Vue or WASM.
 
 ## Usage
 

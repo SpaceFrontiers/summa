@@ -244,23 +244,13 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     let (task_loss, router_loss, batch_stats, retrieval_correct) =
                         objective_loss(current, training_batch, &stage.objective)?;
                     let detached_loss = task_loss.clone().detach();
-                    loss_sum = Some(match loss_sum.take() {
-                        Some(sum) => sum + detached_loss,
-                        None => detached_loss,
-                    });
+                    accumulate_tensor(&mut loss_sum, detached_loss);
                     if let Some(router_loss) = &router_loss {
-                        let detached = router_loss.clone().detach();
-                        router_loss_sum = Some(match router_loss_sum.take() {
-                            Some(sum) => sum + detached,
-                            None => detached,
-                        });
+                        accumulate_tensor(&mut router_loss_sum, router_loss.clone().detach());
                     }
                     add_batch_stats(&mut step_stats, batch_stats)?;
                     if let Some(correct) = retrieval_correct {
-                        retrieval_correct_sum = Some(match retrieval_correct_sum.take() {
-                            Some(sum) => sum + correct,
-                            None => correct,
-                        });
+                        accumulate_tensor(&mut retrieval_correct_sum, correct);
                     }
                     let optimized_loss = match router_loss {
                         Some(router_loss) => task_loss + router_loss,

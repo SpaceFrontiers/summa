@@ -37,7 +37,7 @@ const TQ_LLOYD_TOLERANCE: f64 = 1e-9;
 const TQ_ACCUMULATE_CHUNK_DIMS: usize = 128;
 
 /// Code-layout dimension: the input dimension rounded up to an even count
-/// (two 4-bit coordinates per byte), floored at [`TQ_MIN_PADDED_DIM`]. Since
+/// (two 4-bit coordinates per byte), floored at `TQ_MIN_PADDED_DIM`. Since
 /// codec v2 the rotation is padding-free, so this tracks the true dimension
 /// instead of the next power of two. Cheap; usable for header validation
 /// without building a codec.

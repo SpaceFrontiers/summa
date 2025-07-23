@@ -70,7 +70,7 @@ unsafe fn read_u64_unchecked(base: *const u8, idx: usize) -> u64 {
     }
 }
 
-/// Result of [`BmpIndex::dim_stats`] — see its docs for meaning.
+/// Summary statistics for per-dimension postings in a BMP sparse index.
 #[derive(Debug, Clone)]
 pub struct BmpDimStats {
     pub nonzero_dims: u32,

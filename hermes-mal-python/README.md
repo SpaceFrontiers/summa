@@ -18,3 +18,19 @@ json_str = parse_mal(source)  # -> str (serde JSON of ModelDef)
 The returned JSON is byte-for-byte identical to what `hermes-llm export`
 emits and can be consumed by any serde-compatible tool.
 Syntax errors, unknown keys, and undefined references raise `ValueError`.
+
+## Development
+
+From this directory, build and install the extension in the active virtual
+environment, then smoke-test the import:
+
+```bash
+maturin develop
+python -c 'from pathlib import Path; from hermes_mal import parse_mal; print(parse_mal(Path("../hermes-mal/well-known/tiny.mal").read_text()))'
+```
+
+The Rust seam has a fast workspace test:
+
+```bash
+cargo test -p hermes-mal-python
+```

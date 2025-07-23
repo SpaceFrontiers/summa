@@ -28,7 +28,7 @@ bincode = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 murmur3 = "0.5"
-rayon = "1.11"
+rayon = { workspace = true }
 crossbeam-channel = "0.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
