@@ -25,6 +25,7 @@
 pub mod index;
 pub mod ivf;
 mod kmeans;
+pub(crate) mod progress;
 pub mod quantization;
 
 #[cfg(feature = "native")]

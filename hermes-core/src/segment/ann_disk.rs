@@ -2231,7 +2231,7 @@ mod tests {
                 v
             })
             .collect();
-        let mut centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 8), &vectors);
+        let mut centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 8), &vectors, "test");
         centroids.version = crate::structures::mark_ivf_tq_cosine_generation(centroids.version);
         let mut index = IvfTqIndex::new(
             dim,

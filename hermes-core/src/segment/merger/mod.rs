@@ -230,6 +230,7 @@ pub(crate) async fn append_and_delete_temp<D: DirectoryWriter>(
     path: &std::path::Path,
     expected_bytes: u64,
     writer: &mut OffsetWriter,
+    index_label: &str,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -270,7 +271,8 @@ pub(crate) async fn append_and_delete_temp<D: DirectoryWriter>(
         // scratch file is safe for the startup orphan sweep and must not
         // invalidate an otherwise successful multi-hour merge.
         log::warn!(
-            "[merge] failed to remove temporary sparse section {:?}: {}",
+            "[merge] index={} failed to remove temporary sparse section {:?}: {}",
+            index_label,
             path,
             error,
         );
@@ -596,7 +598,8 @@ impl SegmentMerger {
                 let _ = dir.delete(&files.positions).await;
             }
             log::info!(
-                "[merge] postings done: {} terms, term_dict={}, postings={}, positions={}",
+                "[merge] index={} postings done: {} terms, term_dict={}, postings={}, positions={}",
+                self.schema.index_label(),
                 terms_processed,
                 crate::format_bytes(term_dict_bytes as u64),
                 crate::format_bytes(postings_bytes as u64),
@@ -625,7 +628,8 @@ impl SegmentMerger {
         self.ensure_not_cancelled()?;
 
         log::info!(
-            "[merge] stage 1 done in {:.1}s (postings + store + fast)",
+            "[merge] index={} stage 1 done in {:.1}s (postings + store + fast)",
+            self.schema.index_label(),
             merge_start.elapsed().as_secs_f64()
         );
 
@@ -660,7 +664,8 @@ impl SegmentMerger {
         stats.bp_converged = bp_converged;
         stats.fast_bytes = fast_bytes;
         log::info!(
-            "[merge] all phases done in {:.1}s: {}",
+            "[merge] index={} all phases done in {:.1}s: {}",
+            self.schema.index_label(),
             merge_start.elapsed().as_secs_f64(),
             stats
         );
@@ -697,8 +702,9 @@ impl SegmentMerger {
         // source segment metadata disagrees with its store.
         if store_num_docs != total_docs {
             log::error!(
-                "[merge] STORE/META MISMATCH: store has {} docs but metadata expects {}. \
+                "[merge] index={} STORE/META MISMATCH: store has {} docs but metadata expects {}. \
                  Per-segment: {:?}",
+                self.schema.index_label(),
                 store_num_docs,
                 total_docs,
                 segments
@@ -734,7 +740,12 @@ impl SegmentMerger {
         // wall-clock timer also includes postings, store, sparse BP and any BP
         // scheduler wait. Calling this an "ANN merge" made long sparse waits
         // look like ANN construction in production logs.
-        log::info!("[merge] complete: {} docs, {}", total_docs, stats);
+        log::info!(
+            "[merge] index={} complete: {} docs, {}",
+            self.schema.index_label(),
+            total_docs,
+            stats
+        );
 
         Ok((meta, stats))
     }

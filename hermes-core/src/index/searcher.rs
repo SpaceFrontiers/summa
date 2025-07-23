@@ -344,7 +344,8 @@ impl<D: Directory + 'static> Searcher<D> {
 
         if !existing_segments.is_empty() {
             log::info!(
-                "[searcher] reusing {} segment readers, loading {} new",
+                "[searcher] index={} reusing {} segment readers, loading {} new",
+                schema.index_label(),
                 reused.len(),
                 to_load.len(),
             );
@@ -424,11 +425,12 @@ impl<D: Directory + 'static> Searcher<D> {
             total_pinned = total_pinned.saturating_add(stats.pinned_metadata_bytes);
             total_pin_intended = total_pin_intended.saturating_add(stats.pin_intended_bytes);
             log::info!(
-                "[searcher] segment {:016x}: docs={}, heap_estimate={} \
+                "[searcher] index={} segment {:016x}: docs={}, heap_estimate={} \
                  (term_cache={}, store_cache={}, sparse_vectors={}, dense_vectors={}), \
                  file_backed={} (term_bloom={}, sparse_vectors={}, dense_vectors={}), \
                  pinned_metadata={} of {} eligible \
                  (sparse_vectors={} of {}, dense_vectors={} of {})",
+                schema.index_label(),
                 stats.segment_id,
                 stats.num_docs,
                 crate::format_bytes(heap as u64),
@@ -451,9 +453,10 @@ impl<D: Directory + 'static> Searcher<D> {
         // Log process RSS if available (helps diagnose OOM)
         let rss_bytes = process_rss_bytes();
         log::info!(
-            "[searcher] loaded {} segments: total_docs={}, heap_estimate={}, \
+            "[searcher] index={} loaded {} segments: total_docs={}, heap_estimate={}, \
              file_backed={}, pinned_metadata={} of {} eligible, \
              shared_store_cache={} in {} blocks, process_rss={}",
+            schema.index_label(),
             segments.len(),
             total_docs,
             crate::format_bytes(total_heap as u64),
@@ -804,7 +807,8 @@ impl<D: Directory + 'static> Searcher<D> {
             selection.evaluated_superblocks,
         );
         log::debug!(
-            "BMP hierarchical LSP: field={}, coarse_groups={}/{}, E_superblocks={}/{}, gamma={}",
+            "[searcher] BMP hierarchical LSP: index={}, field={}, coarse_groups={}/{}, E_superblocks={}/{}, gamma={}",
+            self.schema.index_label(),
             field_label,
             selection.expanded_groups,
             coarse_bounds

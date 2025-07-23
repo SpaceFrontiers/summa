@@ -432,7 +432,7 @@ mod tests {
         let dim = 64;
         let codec = std::sync::Arc::new(TqCodec::new(dim));
         let vectors: Vec<Vec<f32>> = (0..64).map(|i| seeded_unit_vector(dim, 100 + i)).collect();
-        let mut centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 4), &vectors);
+        let mut centroids = CoarseCentroids::train(&CoarseConfig::new(dim, 4), &vectors, "test");
         centroids.version = mark_ivf_tq_cosine_generation(centroids.version);
 
         let mut index = IvfTqIndex::new(

@@ -280,10 +280,13 @@ struct ActiveSegmentOperations {
     idle: Notify,
     shutdown: Notify,
     shutdown_requested: Arc<AtomicBool>,
+    /// Owning index, so lifecycle decisions are attributable when several
+    /// indexes register and defer operations concurrently.
+    index_label: Arc<str>,
 }
 
 impl ActiveSegmentOperations {
-    fn new() -> Self {
+    fn new(index_label: Arc<str>) -> Self {
         Self {
             inner: parking_lot::Mutex::new(ActiveOperationState {
                 segment_ids: HashSet::new(),
@@ -296,6 +299,7 @@ impl ActiveSegmentOperations {
             idle: Notify::new(),
             shutdown: Notify::new(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            index_label,
         }
     }
 
@@ -332,18 +336,25 @@ impl ActiveSegmentOperations {
     ) -> Option<SegmentOperationGuard> {
         let mut inner = self.inner.lock();
         if !inner.accepting {
-            log::debug!("[segment_lifecycle] rejected operation during shutdown");
+            log::debug!(
+                "[segment_lifecycle] index={} rejected operation during shutdown",
+                self.index_label
+            );
             return None;
         }
         if !indexing && !vector_update && inner.non_indexing_paused {
-            log::debug!("[segment_lifecycle] deferred operation during dense vector retraining");
+            log::debug!(
+                "[segment_lifecycle] index={} deferred operation during dense vector retraining",
+                self.index_label
+            );
             return None;
         }
         // Check for overlap with any active lifecycle operation.
         for id in &segment_ids {
             if inner.segment_ids.contains(id) {
                 log::debug!(
-                    "[segment_lifecycle] rejected: {} overlaps with an active operation ({} active IDs)",
+                    "[segment_lifecycle] index={} rejected: {} overlaps with an active operation ({} active IDs)",
+                    self.index_label,
                     id,
                     inner.segment_ids.len()
                 );
@@ -351,7 +362,8 @@ impl ActiveSegmentOperations {
             }
         }
         log::debug!(
-            "[segment_lifecycle] registered {} IDs (total active: {})",
+            "[segment_lifecycle] index={} registered {} IDs (total active: {})",
+            self.index_label,
             segment_ids.len(),
             inner.segment_ids.len() + segment_ids.len()
         );
@@ -645,7 +657,7 @@ type ReplacementRefresh = Arc<
 /// Reconcile a long-lived consumer after a durable segment replacement.
 /// This runs inside the same lifecycle-owned task as metadata publication, so
 /// cancelling the caller cannot leave the replacement published but unannounced.
-async fn refresh_replacement_topology(refresh: Option<ReplacementRefresh>) {
+async fn refresh_replacement_topology(refresh: Option<ReplacementRefresh>, index_label: &str) {
     let Some(refresh) = refresh else {
         return;
     };
@@ -663,7 +675,7 @@ async fn refresh_replacement_topology(refresh: Option<ReplacementRefresh>) {
     }
     if let Some(error) = last_error {
         log::warn!(
-            "[segment_lifecycle] replacement topology refresh failed after 3 attempts: {}",
+            "[segment_lifecycle] index={index_label} replacement topology refresh failed after 3 attempts: {}",
             error,
         );
     }
@@ -915,7 +927,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // at index creation. Absent = disabled (merges block-copy).
         let reorder_on_merge = schema.reorder_on_merge();
         if reorder_on_merge {
-            log::info!("[merge] reorder-on-merge enabled by index schema");
+            log::info!(
+                "[merge] index={} reorder-on-merge enabled by index schema",
+                schema.index_label()
+            );
         }
 
         let tracker = Arc::new(SegmentTracker::new());
@@ -929,6 +944,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let dir = Arc::clone(&directory);
             let tracker = Arc::clone(&tracker);
             let lifecycle_handles = Arc::clone(&lifecycle_handles);
+            let cleanup_index_label: Arc<str> = schema.index_label().into();
             Arc::new(move |segment_ids| {
                 // Guard: if the tokio runtime is gone (program exit), skip async
                 // deletion. Segment files become orphans cleaned up on next startup.
@@ -940,18 +956,21 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 };
                 let dir = Arc::clone(&dir);
                 let task_tracker = Arc::clone(&tracker);
+                let task_index_label = Arc::clone(&cleanup_index_label);
                 let cleanup_ids = segment_ids.clone();
                 let future = async move {
                     for &segment_id in &segment_ids {
                         log::info!(
-                            "[segment_cleanup] deleting deferred segment {}",
+                            "[segment_cleanup] index={} deleting deferred segment {}",
+                            task_index_label,
                             segment_id.to_hex()
                         );
                         if let Err(error) =
                             crate::segment::delete_segment(dir.as_ref(), segment_id).await
                         {
                             log::warn!(
-                                "[segment_cleanup] deferred delete failed for {}: {}",
+                                "[segment_cleanup] index={} deferred delete failed for {}: {}",
+                                task_index_label,
                                 segment_id.to_hex(),
                                 error,
                             );
@@ -965,7 +984,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     // retry; crash recovery handles a process exit.
                     tracker.complete_deletion(&cleanup_ids);
                     log::warn!(
-                        "[segment_cleanup] runtime rejected deferred deletion; files will be swept later"
+                        "[segment_cleanup] index={} runtime rejected deferred deletion; files will be swept later",
+                        cleanup_index_label
                     );
                 }
             })
@@ -976,7 +996,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 metadata,
                 merge_policy,
             })),
-            active_operations: Arc::new(ActiveSegmentOperations::new()),
+            active_operations: Arc::new(ActiveSegmentOperations::new(schema.index_label().into())),
             quarantined_segments: parking_lot::Mutex::new(HashSet::new()),
             merge_retry: parking_lot::Mutex::new(MergeRetryState::default()),
             reorder_retries: parking_lot::Mutex::new(HashMap::new()),
@@ -1078,7 +1098,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let cleanup: Arc<dyn Fn(SegmentId) + Send + Sync> = Arc::new(move |segment_id| {
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 log::warn!(
-                    "[segment_cleanup] runtime unavailable; partial output {} will be swept on startup",
+                    "[segment_cleanup] index={} runtime unavailable; partial output {} will be swept on startup",
+                    manager.schema.index_label(),
                     segment_id.to_hex(),
                 );
                 return;
@@ -1092,7 +1113,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
             if !try_spawn_lifecycle(&manager.lifecycle_handles, &handle, future) {
                 log::warn!(
-                    "[segment_cleanup] runtime rejected output cleanup; {} will be swept on startup",
+                    "[segment_cleanup] index={} runtime rejected output cleanup; {} will be swept on startup",
+                    manager.schema.index_label(),
                     segment_id.to_hex(),
                 );
             }
@@ -1123,7 +1145,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             // The dropped future releases operation ownership. Startup sweep
             // handles its output if the runtime is already tearing down.
             log::warn!(
-                "[segment_cleanup] runtime unavailable; indexing output {} will be swept on startup",
+                "[segment_cleanup] index={} runtime unavailable; indexing output {} will be swept on startup",
+                self.schema.index_label(),
                 output_hex,
             );
         }
@@ -1203,8 +1226,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .insert(segment_id.to_string());
         if inserted {
             log::error!(
-                "[merge] quarantined metadata-live segment {} after deterministic source/validation failure: {}. \
+                "[merge] index={} quarantined metadata-live segment {} after deterministic source/validation failure: {}. \
                  It remains metadata-live for explicit repair but is excluded from merges until restart",
+                self.schema.index_label(),
                 segment_id,
                 error,
             );
@@ -1217,7 +1241,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let delay = merge_retry_delay(retry.consecutive_failures);
         retry.retry_after = std::time::Instant::now().checked_add(delay);
         log::warn!(
-            "[merge] pausing background merge scheduling for {:.0}s after consecutive failure #{}: {}",
+            "[merge] index={} pausing background merge scheduling for {:.0}s after consecutive failure #{}: {}",
+            self.schema.index_label(),
             delay.as_secs_f64(),
             retry.consecutive_failures,
             error,
@@ -1248,7 +1273,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let delay = merge_retry_delay(retry.consecutive_failures);
         retry.retry_after = std::time::Instant::now().checked_add(delay);
         log::warn!(
-            "[reorder] pausing optimizer retries for segment {} for {:.0}s after failure #{}: {}",
+            "[reorder] index={} pausing optimizer retries for segment {} for {:.0}s after failure #{}: {}",
+            self.schema.index_label(),
             segment_id,
             delay.as_secs_f64(),
             retry.consecutive_failures,
@@ -1311,7 +1337,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
             self.global_merge_wakeup_pending
                 .store(false, Ordering::Release);
-            log::warn!("[merge] runtime rejected global-capacity wakeup task");
+            log::warn!(
+                "[merge] index={} runtime rejected global-capacity wakeup task",
+                self.schema.index_label()
+            );
         }
     }
 
@@ -1337,14 +1366,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // publisher after this check. Never hold the metadata mutex while a
         // multi-GB filesystem deletion runs.
         log::info!(
-            "[segment_cleanup] deleting uncommitted output {} after {}",
+            "[segment_cleanup] index={} deleting uncommitted output {} after {}",
+            self.schema.index_label(),
             output_hex,
             reason,
         );
         if let Err(error) = crate::segment::delete_segment(self.directory.as_ref(), output_id).await
         {
             log::warn!(
-                "[segment_cleanup] failed deleting uncommitted output {}: {}",
+                "[segment_cleanup] index={} failed deleting uncommitted output {}: {}",
+                self.schema.index_label(),
                 output_hex,
                 error,
             );
@@ -1510,6 +1541,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // after the metadata transaction has been detached. The last guard
         // clone drops only after durable metadata and ArcSwap state agree.
         let artifact_update = artifact_update.clone();
+        let index_label = self.schema.index_label().to_owned();
         self.run_lifecycle_transaction(async move {
             let _artifact_update = artifact_update;
             next.save(directory.as_ref()).await?;
@@ -1536,14 +1568,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     crate::segment::delete_segment(directory.as_ref(), segment_id).await
                 {
                     log::warn!(
-                        "[segment_cleanup] immediate dense-vector generation delete failed for {}: {}",
+                        "[segment_cleanup] index={index_label} immediate dense-vector generation delete failed for {}: {}",
                         segment_id.to_hex(),
                         error,
                     );
                 }
             }
             tracker.complete_deletion(&ready_to_delete);
-            refresh_replacement_topology(replacement_refresh).await;
+            refresh_replacement_topology(replacement_refresh, &index_label).await;
             Ok(())
         })
         .await
@@ -1658,11 +1690,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// concurrent triggers cannot exceed configured merge capacity.
     pub async fn maybe_merge(self: &Arc<Self>) {
         if !self.active_operations.is_accepting() {
-            log::debug!("[maybe_merge] manager is shutting down, skipping");
+            log::debug!(
+                "[maybe_merge] index={} manager is shutting down, skipping",
+                self.schema.index_label()
+            );
             return;
         }
         if self.merge_retry_is_paused() {
-            log::debug!("[maybe_merge] retry backoff active, skipping");
+            log::debug!(
+                "[maybe_merge] index={} retry backoff active, skipping",
+                self.schema.index_label()
+            );
             return;
         }
 
@@ -1710,7 +1748,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .cloned()
                 .collect();
 
-            log::debug!("[maybe_merge] {} eligible segments", segments.len());
+            log::debug!(
+                "[maybe_merge] index={} {} eligible segments",
+                self.schema.index_label(),
+                segments.len()
+            );
 
             let candidates = st.merge_policy.find_merges(&segments);
 
@@ -1725,12 +1767,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if local_slots > 0 && global_slots == 0 {
                     self.schedule_global_merge_wakeup();
                 }
-                log::debug!("[maybe_merge] at max concurrent merges, skipping");
+                log::debug!(
+                    "[maybe_merge] index={} at max concurrent merges, skipping",
+                    self.schema.index_label()
+                );
                 return;
             }
 
             log::debug!(
-                "[maybe_merge] {} merge candidates, {} slots available",
+                "[maybe_merge] index={} {} merge candidates, {} slots available",
+                self.schema.index_label(),
                 candidates.len(),
                 slots_available
             );
@@ -1753,8 +1799,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             if !handles.is_empty() {
                 if severe_backlog && self.reorder_on_merge {
                     log::info!(
-                        "[maybe_merge] severe backlog: {} live segments; started {} fast \
+                        "[maybe_merge] index={} severe backlog: {} live segments; started {} fast \
                          block-copy merge(s), deferring BP to the optimizer",
+                        self.schema.index_label(),
                         live_segments.len(),
                         handles.len(),
                     );
@@ -1782,13 +1829,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         reorder_bmp: bool,
     ) -> Option<JoinHandle<()>> {
         if self.force_merge_active.load(Ordering::Acquire) > 0 {
-            log::debug!("[spawn_merge] skipped: explicit force merge has priority");
+            log::debug!(
+                "[spawn_merge] index={} skipped: explicit force merge has priority",
+                self.schema.index_label()
+            );
             return None;
         }
         let global_merge_permit = match Arc::clone(&self.global_merge_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                log::debug!("[spawn_merge] skipped: global merge capacity is full");
+                log::debug!(
+                    "[spawn_merge] index={} skipped: global merge capacity is full",
+                    self.schema.index_label()
+                );
                 self.schedule_global_merge_wakeup();
                 return None;
             }
@@ -1796,7 +1849,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let merge_permit = match Arc::clone(&self.merge_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                log::debug!("[spawn_merge] skipped: no merge permit available");
+                log::debug!(
+                    "[spawn_merge] index={} skipped: no merge permit available",
+                    self.schema.index_label()
+                );
                 return None;
             }
         };
@@ -1809,7 +1865,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let guard = match self.active_operations.try_register(all_ids) {
             Some(g) => g,
             None => {
-                log::debug!("[spawn_merge] skipped: segments overlap with an active operation");
+                log::debug!(
+                    "[spawn_merge] index={} skipped: segments overlap with an active operation",
+                    self.schema.index_label()
+                );
                 return None;
             }
         };
@@ -1817,6 +1876,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let sm = Arc::clone(self);
         let ids = segment_ids_to_merge;
 
+        let index_label = self.schema.index_label().to_owned();
         Some(tokio::spawn(async move {
             let mut reevaluate = false;
             let mut retry_delay = None;
@@ -1840,7 +1900,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     ..
                 }) => {
                     log::debug!(
-                        "[merge] background merge for segments {:?} cancelled during shutdown",
+                        "[merge] index={index_label} background merge for segments {:?} cancelled during shutdown",
                         ids,
                     );
                 }
@@ -1849,7 +1909,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     unavailable_segments,
                 }) => {
                     log::error!(
-                        "[merge] background merge failed for segments {:?}: {}",
+                        "[merge] index={index_label} background merge failed for segments {:?}: {}",
                         ids,
                         error
                     );
@@ -1971,8 +2031,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let runtime = tokio::runtime::Handle::current();
         if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
             log::warn!(
-                "[merge] runtime rejected merge-retry wakeup task; eligible segments may stay \
-                 unmerged until the next commit re-runs merge policy evaluation"
+                "[merge] index={} runtime rejected merge-retry wakeup task; eligible segments may stay \
+                 unmerged until the next commit re-runs merge policy evaluation",
+                self.schema.index_label()
             );
         }
     }
@@ -2094,6 +2155,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let directory = Arc::clone(&self.directory);
         let tracker = Arc::clone(&self.tracker);
         let replacement_refresh = self.replacement_refresh.read().clone();
+        let index_label = self.schema.index_label().to_owned();
         self.run_lifecycle_transaction(async move {
             // Durable-before-visible. If persistence fails, old metadata and
             // tracker ownership stay intact and source deletion is never armed.
@@ -2111,14 +2173,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     crate::segment::delete_segment(directory.as_ref(), segment_id).await
                 {
                     log::warn!(
-                        "[segment_cleanup] immediate delete failed for {}: {}",
+                        "[segment_cleanup] index={index_label} immediate delete failed for {}: {}",
                         segment_id.to_hex(),
                         error,
                     );
                 }
             }
             tracker.complete_deletion(&ready_to_delete);
-            refresh_replacement_topology(replacement_refresh).await;
+            refresh_replacement_topology(replacement_refresh, &index_label).await;
             Ok(())
         })
         .await
@@ -2212,7 +2274,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
                 Err(e) => {
                     log::error!(
-                        "[merge] Failed to open segment {}: {:?}",
+                        "[merge] index={} Failed to open segment {}: {:?}",
+                        schema.index_label(),
                         segment_ids_to_merge[i],
                         e
                     );
@@ -2246,7 +2309,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         log::info!(
-            "[merge] loaded {} segment readers in {:.1}s",
+            "[merge] index={} loaded {} segment readers in {:.1}s",
+            schema.index_label(),
             readers.len(),
             load_start.elapsed().as_secs_f64()
         );
@@ -2265,7 +2329,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .with_background_pool(bg_cpu_pool);
 
         log::info!(
-            "[merge] {} segments -> {} (trained={})",
+            "[merge] index={} {} segments -> {} (trained={})",
+            schema.index_label(),
             segment_ids_to_merge.len(),
             output_hex,
             trained.map_or(0, |t| t.centroids.len()),
@@ -2289,13 +2354,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let bp_converged = merge_stats.bp_converged;
         if !bp_converged {
             log::info!(
-                "[merge] merge-time BP hit its wall-clock budget — output marked unconverged; \
+                "[merge] index={} merge-time BP hit its wall-clock budget — output marked unconverged; \
                  the background optimizer deepens it later",
+                schema.index_label(),
             );
         }
 
         log::info!(
-            "[merge] total wall-clock: {:.1}s ({} segments, {} docs)",
+            "[merge] index={} total wall-clock: {:.1}s ({} segments, {} docs)",
+            schema.index_label(),
             load_start.elapsed().as_secs_f64(),
             readers.len(),
             total_docs,
@@ -2323,7 +2390,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if let Err(error) = result
                     && error.is_panic()
                 {
-                    log::error!("[merge] background task panicked while draining: {}", error);
+                    log::error!(
+                        "[merge] index={} background task panicked while draining: {}",
+                        self.schema.index_label(),
+                        error
+                    );
                 }
             }
         }
@@ -2372,7 +2443,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if let Err(error) = handle.await
                     && error.is_panic()
                 {
-                    log::error!("[segment_cleanup] task panicked while draining: {}", error);
+                    log::error!(
+                        "[segment_cleanup] index={} task panicked while draining: {}",
+                        self.schema.index_label(),
+                        error
+                    );
                 }
             }
         }
@@ -2441,7 +2516,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .count();
         if background_merges > 0 {
             log::info!(
-                "[force_merge] waiting for {} in-flight background merge(s) before planning",
+                "[force_merge] index={} waiting for {} in-flight background merge(s) before planning",
+                self.schema.index_label(),
                 background_merges,
             );
         }
@@ -2449,7 +2525,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.wait_for_all_merges().await;
         if drain_start.elapsed() >= std::time::Duration::from_secs(1) {
             log::info!(
-                "[force_merge] drained background merges in {:.1}s",
+                "[force_merge] index={} drained background merges in {:.1}s",
+                self.schema.index_label(),
                 drain_start.elapsed().as_secs_f64(),
             );
         }
@@ -2462,7 +2539,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         refresh_snapshots().await?;
         if refresh_start.elapsed() >= std::time::Duration::from_secs(1) {
             log::info!(
-                "[force_merge] initial snapshot refresh took {:.1}s",
+                "[force_merge] index={} initial snapshot refresh took {:.1}s",
+                self.schema.index_label(),
                 refresh_start.elapsed().as_secs_f64(),
             );
         }
@@ -2534,13 +2612,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
                 if !logged_held_wait {
                     log::info!(
-                        "[force_merge] waiting: {} segment(s) held by active \
+                        "[force_merge] index={} waiting: {} segment(s) held by active \
                          merge/reorder operations, no free group can merge",
+                        self.schema.index_label(),
                         held
                     );
                     logged_held_wait = true;
                 } else {
-                    log::debug!("[force_merge] still waiting on {} held segment(s)", held);
+                    log::debug!(
+                        "[force_merge] index={} still waiting on {} held segment(s)",
+                        self.schema.index_label(),
+                        held
+                    );
                 }
                 #[cfg(test)]
                 self.force_merge_conflict_retries
@@ -2583,7 +2666,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     #[cfg(test)]
                     self.force_merge_conflict_retries
                         .fetch_add(1, Ordering::Relaxed);
-                    log::debug!("[force_merge] group lost a registration race, replanning");
+                    log::debug!(
+                        "[force_merge] index={} group lost a registration race, replanning",
+                        self.schema.index_label()
+                    );
                     let had_tracked_merges = !self.merge_handles.lock().is_empty();
                     self.wait_for_merging_thread().await;
                     if !had_tracked_merges {
@@ -2594,7 +2680,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
 
             log::info!(
-                "[force_merge] planned final group: {} segments, {} docs, {} merge pass(es)",
+                "[force_merge] index={} planned final group: {} segments, {} docs, {} merge pass(es)",
+                self.schema.index_label(),
                 group.segments.len(),
                 group.total_docs,
                 output_ids.len(),
@@ -2626,7 +2713,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 };
                 if capacity_start.elapsed() >= std::time::Duration::from_secs(1) {
                     log::info!(
-                        "[force_merge] waited {:.1}s for foreground global merge capacity",
+                        "[force_merge] index={} waited {:.1}s for foreground global merge capacity",
+                        self.schema.index_label(),
                         capacity_start.elapsed().as_secs_f64(),
                     );
                 }
@@ -2636,7 +2724,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
             let _foreground_reorder = if self.reorder_on_merge {
                 log::info!(
-                    "[force_merge] prioritizing BP capacity ({} total pass slot(s))",
+                    "[force_merge] index={} prioritizing BP capacity ({} total pass slot(s))",
+                    self.schema.index_label(),
                     self.reorder_permits.limit(),
                 );
                 let admission_start = std::time::Instant::now();
@@ -2648,7 +2737,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     })?;
                 if admission_start.elapsed() >= std::time::Duration::from_secs(1) {
                     log::info!(
-                        "[force_merge] acquired foreground BP capacity in {:.1}s",
+                        "[force_merge] index={} acquired foreground BP capacity in {:.1}s",
+                        self.schema.index_label(),
                         admission_start.elapsed().as_secs_f64(),
                     );
                 }
@@ -2695,7 +2785,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 };
                 if capacity_start.elapsed() >= std::time::Duration::from_secs(1) {
                     log::info!(
-                        "[force_merge] waited {:.1}s for global merge capacity",
+                        "[force_merge] index={} waited {:.1}s for global merge capacity",
+                        self.schema.index_label(),
                         capacity_start.elapsed().as_secs_f64(),
                     );
                 }
@@ -2705,7 +2796,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 // tiny sources never reorders the same documents repeatedly.
                 let reorder_bmp = final_pass && self.reorder_on_merge;
                 log::info!(
-                    "[force_merge] {} pass: {} segments ({} docs, bp={})",
+                    "[force_merge] index={} {} pass: {} segments ({} docs, bp={})",
+                    self.schema.index_label(),
                     if final_pass {
                         "final"
                     } else {
@@ -2732,7 +2824,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 refresh_snapshots().await?;
                 if refresh_start.elapsed() >= std::time::Duration::from_secs(1) {
                     log::info!(
-                        "[force_merge] post-replacement snapshot refresh took {:.1}s",
+                        "[force_merge] index={} post-replacement snapshot refresh took {:.1}s",
+                        self.schema.index_label(),
                         refresh_start.elapsed().as_secs_f64(),
                     );
                 }
@@ -3130,7 +3223,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
             if !conflicted && !changed {
                 log::info!(
-                    "[dense_vector_rewrite] ANN finalization complete ({} segment(s) rewritten)",
+                    "[dense_vector_rewrite] index={} ANN finalization complete ({} segment(s) rewritten)",
+                    self.schema.index_label(),
                     rewritten,
                 );
                 return Ok(rewritten);
@@ -3178,7 +3272,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         Ok(_) => break,
                         Err(error) => {
                             log::error!(
-                                "[dense_vector_rewrite] failed to upgrade newly committed segment {}: {}",
+                                "[dense_vector_rewrite] index={} failed to upgrade newly committed segment {}: {}",
+                                manager.schema.index_label(),
                                 segment_id,
                                 error,
                             );
@@ -3190,13 +3285,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             log::warn!(
-                "[dense_vector_rewrite] runtime unavailable; newly committed flat segment upgrade deferred"
+                "[dense_vector_rewrite] index={} runtime unavailable; newly committed flat segment upgrade deferred",
+                self.schema.index_label()
             );
             return;
         };
         if !try_spawn_lifecycle(&self.lifecycle_handles, &runtime, future) {
             log::warn!(
-                "[dense_vector_rewrite] runtime rejected newly committed flat segment upgrade"
+                "[dense_vector_rewrite] index={} runtime rejected newly committed flat segment upgrade",
+                self.schema.index_label()
             );
         }
     }
@@ -3227,11 +3324,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let segment_ids = self.get_segment_ids().await;
 
         if segment_ids.is_empty() {
-            log::info!("[reorder] no segments to reorder");
+            log::info!(
+                "[reorder] index={} no segments to reorder",
+                self.schema.index_label()
+            );
             return Ok(());
         }
 
-        log::info!("[reorder] reordering {} segments", segment_ids.len());
+        log::info!(
+            "[reorder] index={} reordering {} segments",
+            self.schema.index_label(),
+            segment_ids.len()
+        );
 
         for seg_id in segment_ids {
             match self
@@ -3239,7 +3343,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .await
             {
                 Ok(true) => refresh_snapshots().await?,
-                Ok(false) => log::warn!("[reorder] segment {} skipped (in merge)", seg_id),
+                Ok(false) => log::warn!(
+                    "[reorder] index={} segment {} skipped (in merge)",
+                    self.schema.index_label(),
+                    seg_id
+                ),
                 Err(e) => return Err(e),
             }
         }
@@ -3247,7 +3355,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // A segment skipped because another lifecycle owner held it may have
         // been replaced after the preceding callback.
         refresh_snapshots().await?;
-        log::info!("[reorder] all segments reordered");
+        log::info!(
+            "[reorder] index={} all segments reordered",
+            self.schema.index_label()
+        );
         Ok(())
     }
 
@@ -3339,7 +3450,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         drop(st);
         if deepening {
             log::info!(
-                "[reorder] source BP lineage unconverged — forcing record-level BP (deepening pass)",
+                "[reorder] index={} source BP lineage unconverged — forcing record-level BP (deepening pass)",
+                self.schema.index_label(),
             );
             crate::segment::reorder::BpGranularity::Records
         } else {
@@ -3367,7 +3479,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
         if self.force_merge_active.load(Ordering::Acquire) > 0 {
             log::debug!(
-                "[optimizer] explicit force merge active, skipping reorder of {}",
+                "[optimizer] index={} explicit force merge active, skipping reorder of {}",
+                self.schema.index_label(),
                 seg_id,
             );
             return Ok(false);
@@ -3408,14 +3521,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             // above and prevents optimizer starvation between final groups.
             if self.force_merge_active.load(Ordering::Acquire) > 0 {
                 log::debug!(
-                    "[optimizer] explicit force merge active, skipping reorder of {}",
+                    "[optimizer] index={} explicit force merge active, skipping reorder of {}",
+                    self.schema.index_label(),
                     seg_id,
                 );
                 return Ok(false);
             }
             let Some(source_meta) = st.metadata.segment_metas.get(seg_id) else {
                 log::info!(
-                    "[optimizer] segment {} no longer in metadata (merged away), skipping reorder",
+                    "[optimizer] index={} segment {} no longer in metadata (merged away), skipping reorder",
+                    self.schema.index_label(),
                     seg_id
                 );
                 self.clear_reorder_retry(seg_id);
@@ -3428,7 +3543,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     return Err(Error::IndexClosed);
                 }
                 None => {
-                    log::debug!("[optimizer] segment {} in active merge, skipping", seg_id);
+                    log::debug!(
+                        "[optimizer] index={} segment {} in active merge, skipping",
+                        self.schema.index_label(),
+                        seg_id
+                    );
                     return Ok(false);
                 }
             }
@@ -3576,7 +3695,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => {
                     log::warn!(
-                        "[segment_cleanup] failed sweeping orphan segment {}: {}",
+                        "[segment_cleanup] index={} failed sweeping orphan segment {}: {}",
+                        self.schema.index_label(),
                         hex_id,
                         error,
                     );
@@ -3588,7 +3708,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             drop(deletion_guard);
             if removed {
                 deleted += 1;
-                log::info!("[segment_cleanup] swept orphan segment {}", hex_id);
+                log::info!(
+                    "[segment_cleanup] index={} swept orphan segment {}",
+                    self.schema.index_label(),
+                    hex_id
+                );
             }
         }
 
@@ -3939,7 +4063,7 @@ mod tests {
 
     #[test]
     fn test_active_operation_guard_releases_ownership() {
-        let active = Arc::new(ActiveSegmentOperations::new());
+        let active = Arc::new(ActiveSegmentOperations::new("test".into()));
         {
             let _guard = active.try_register(vec!["a".into(), "b".into()]).unwrap();
             let snap = active.snapshot();
@@ -3951,7 +4075,7 @@ mod tests {
 
     #[test]
     fn test_non_overlapping_operations_can_run_concurrently() {
-        let active = Arc::new(ActiveSegmentOperations::new());
+        let active = Arc::new(ActiveSegmentOperations::new("test".into()));
         let first = active.try_register(vec!["a".into(), "b".into()]).unwrap();
         let _second = active.try_register(vec!["c".into(), "d".into()]).unwrap();
         let snap = active.snapshot();
@@ -3966,7 +4090,7 @@ mod tests {
 
     #[test]
     fn test_overlapping_operation_is_rejected_until_release() {
-        let active = Arc::new(ActiveSegmentOperations::new());
+        let active = Arc::new(ActiveSegmentOperations::new("test".into()));
         let first = active.try_register(vec!["a".into(), "b".into()]).unwrap();
         assert!(active.try_register(vec!["b".into(), "c".into()]).is_none());
         drop(first);
@@ -3975,7 +4099,7 @@ mod tests {
 
     #[test]
     fn test_active_operation_snapshot() {
-        let active = Arc::new(ActiveSegmentOperations::new());
+        let active = Arc::new(ActiveSegmentOperations::new("test".into()));
         let _guard = active.try_register(vec!["x".into(), "y".into()]).unwrap();
         let snap = active.snapshot();
         assert!(snap.contains("x"));
@@ -3985,7 +4109,7 @@ mod tests {
 
     #[tokio::test]
     async fn operation_barrier_ignores_producers_started_after_snapshot() {
-        let active = Arc::new(ActiveSegmentOperations::new());
+        let active = Arc::new(ActiveSegmentOperations::new("test".into()));
         let before_gate = active.try_register(vec!["old".into()]).unwrap();
         let (barrier, parked_indexing) = active.draining_operation_tokens_snapshot();
         assert_eq!(parked_indexing, 0);
@@ -4067,7 +4191,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_rejects_new_work_and_waits_for_existing_guard() {
-        let active = Arc::new(ActiveSegmentOperations::new());
+        let active = Arc::new(ActiveSegmentOperations::new("test".into()));
         let guard = active.try_register(vec!["live".into()]).unwrap();
         let cancellation = active.cancellation_flag();
         active.stop_accepting();

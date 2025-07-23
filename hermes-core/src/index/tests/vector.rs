@@ -1282,6 +1282,58 @@ async fn test_binary_ivf_end_to_end() {
     );
 }
 
+/// An all-zero query carries no information: Hamming distance from it is
+/// `popcount(candidate)` for every candidate, so it ranks by bit count rather
+/// than similarity. Almost always a caller that failed to embed, so it is
+/// refused rather than silently answered with nonsense.
+#[tokio::test]
+async fn test_all_zero_binary_query_is_refused() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::query::BinaryDenseVectorQuery;
+
+    let dim_bits = 64;
+    let byte_len = dim_bits / 8;
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let cfg = BinaryDenseVectorConfig::new(dim_bits);
+    let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+    for i in 0u8..8 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("doc {i}"));
+        doc.add_binary_dense_vector(bvec, vec![i | 0x0f; byte_len]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let error = searcher
+        .search(&BinaryDenseVectorQuery::new(bvec, vec![0u8; byte_len]), 5)
+        .await
+        .expect_err("an all-zero binary query must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("all-zero"),
+        "error should name the cause, got: {message}"
+    );
+
+    // A real query on the same field still works.
+    let results = searcher
+        .search(&BinaryDenseVectorQuery::new(bvec, vec![0x0f; byte_len]), 5)
+        .await
+        .unwrap();
+    assert!(!results.is_empty(), "non-zero queries must still be served");
+}
+
 /// Partial probing with a non-`Max` combiner: reusing the probe's exact scores
 /// must not lose the ordinals that live *outside* the probed leaves.
 ///

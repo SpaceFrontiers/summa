@@ -154,7 +154,8 @@ impl SegmentMerger {
                         // its schema — fall through to block-copy. Loud so an
                         // operator can see why the merged field stays unordered.
                         log::info!(
-                            "[merge_bmp] field {}: `reorder` schema attribute not set — block-copy merge",
+                            "[merge_bmp] index={} field {}: `reorder` schema attribute not set — block-copy merge",
+                            self.schema.index_label(),
                             field.0,
                         );
                     }
@@ -174,7 +175,8 @@ impl SegmentMerger {
                         let pool = self.background_pool.clone();
                         let granularity = self.granularity;
                         log::info!(
-                            "[merge_bmp] field {}: reorder-on-merge enabled — running BP over {} source(s)",
+                            "[merge_bmp] index={} field {}: reorder-on-merge enabled — running BP over {} source(s)",
+                            self.schema.index_label(),
                             fid,
                             sources.len(),
                         );
@@ -198,7 +200,8 @@ impl SegmentMerger {
                         let permit_wait = permit_wait_start.elapsed();
                         if permit_wait >= std::time::Duration::from_secs(1) {
                             log::info!(
-                                "[merge_bmp] field {}: waited {:.1}s for the BP scheduler",
+                                "[merge_bmp] index={} field {}: waited {:.1}s for the BP scheduler",
+                                self.schema.index_label(),
                                 fid,
                                 permit_wait.as_secs_f64(),
                             );
@@ -251,6 +254,7 @@ impl SegmentMerger {
                             &doc_offs,
                             &source_sparse_paths,
                             field.0,
+                            self.schema.index_label(),
                             dims,
                             bmp_block_size,
                             grid_bits,
@@ -303,7 +307,8 @@ impl SegmentMerger {
                 })?;
 
             log::debug!(
-                "[sparse_vector_merge] field {}: {} unique dims across {} segments, total_vectors={}",
+                "[sparse_vector_merge] index={} field {}: {} unique dims across {} segments, total_vectors={}",
+                self.schema.index_label(),
                 field.0,
                 all_dims.len(),
                 segments.len(),
@@ -488,7 +493,14 @@ impl SegmentMerger {
         // Phase 2: Stream-copy skip entries from temp file to main writer.
         let skip_offset = writer.offset();
         let skip_size = skip_count as u64 * SparseSkipEntry::SIZE as u64;
-        super::append_and_delete_temp(dir, &skip_tmp, skip_size, &mut writer).await?;
+        super::append_and_delete_temp(
+            dir,
+            &skip_tmp,
+            skip_size,
+            &mut writer,
+            self.schema.index_label(),
+        )
+        .await?;
 
         // Phase 3 + 4: Write TOC + footer
         let toc_offset = writer.offset();
@@ -500,7 +512,8 @@ impl SegmentMerger {
 
         let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
         log::info!(
-            "[sparse_vector_merge] file written: {} ({} fields, {} dims, {} skip entries)",
+            "[sparse_vector_merge] index={} file written: {} ({} fields, {} dims, {} skip entries)",
+            self.schema.index_label(),
             crate::format_bytes(output_size as u64),
             field_tocs.len(),
             total_dims,
@@ -615,6 +628,7 @@ fn merge_bmp_field(
     doc_offs: &[u32],
     source_sparse_paths: &[Option<std::path::PathBuf>],
     field_id: u32,
+    index_label: &str,
     dims: u32,
     bmp_block_size: u32,
     grid_bits: u8,
@@ -704,8 +718,9 @@ fn merge_bmp_field(
         total_postings = total_postings.saturating_add(bmp.total_postings());
     }
     log::debug!(
-        "[merge_bmp_v18] field {}: dims={}, {} sources, {} total_blocks, \
+        "[merge_bmp_v18] index={} field {}: dims={}, {} sources, {} total_blocks, \
          block_size={}, max_weight_scale={:.4}",
+        index_label,
         field_id,
         dims,
         sources.len(),

@@ -185,7 +185,8 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             let old_count = self.state.load().segment_ids.len();
             let new_count = new_segment_ids.len();
             log::info!(
-                "[index_reload] old_count={} new_count={}",
+                "[index_reload] index={} old_count={} new_count={}",
+                self.schema.index_label(),
                 old_count,
                 new_count
             );
@@ -226,7 +227,10 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         if segments_changed {
             self.reload_with_segments(new_segment_ids).await
         } else {
-            log::debug!("[reload] segments unchanged, skipping");
+            log::debug!(
+                "[reload] index={} segments unchanged, skipping",
+                self.schema.index_label()
+            );
             Ok(())
         }
     }

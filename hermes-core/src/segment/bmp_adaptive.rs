@@ -17,6 +17,14 @@
 //! chosen exactly when it is no larger than the sparse pairs and slots are
 //! unique, so the representation never grows because of adaptation.
 
+// The encode half of this module — scratch, stats, block inspection and term
+// iteration — exists for segment building (`segment::builder`, gated on
+// `native`/`wasm`) and reordering (`native`). The featureless library build
+// compiles neither, so those items have no caller there. Silence dead-code
+// analysis for exactly that configuration and leave it fully active for the
+// ones that ship.
+#![cfg_attr(not(any(feature = "native", feature = "wasm")), allow(dead_code))]
+
 const WIDE_BLOCK_FLAG: u32 = 1 << 31;
 const NARROW_DENSE_FLAG: u16 = 1 << 15;
 const WIDE_DENSE_FLAG: u32 = 1 << 31;

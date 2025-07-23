@@ -725,6 +725,10 @@ impl BmpIndex {
     }
 
     /// Iterate `(dimension, conservative maximum, postings)` for one block.
+    ///
+    /// Only the build/reorder paths walk a block term by term, and those are
+    /// gated on `native`/`wasm`.
+    #[cfg_attr(not(any(feature = "native", feature = "wasm")), allow(dead_code))]
     pub(crate) fn iter_block_terms(
         &self,
         block_id: u32,

@@ -425,13 +425,15 @@ impl IndexMetadata {
         built_fields.sort_unstable_by_key(|(field_id, _)| **field_id);
 
         log::debug!(
-            "[trained] loading trained structures, dense_vector_fields={:?}",
+            "[trained] index={} loading trained structures, dense_vector_fields={:?}",
+            schema.index_label(),
             vector_fields.keys().collect::<Vec<_>>()
         );
 
         for (field_id, field_meta) in built_fields {
             log::debug!(
-                "[trained] field {} state={:?} centroids_file={:?} codebook_file={:?}",
+                "[trained] index={} field {} state={:?} centroids_file={:?} codebook_file={:?}",
+                schema.index_label(),
                 field_id,
                 field_meta.state,
                 field_meta.centroids_file,
