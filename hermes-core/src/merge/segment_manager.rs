@@ -3579,7 +3579,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             granularity,
             rayon_pool,
             Some(self.active_operations.cancellation_flag()),
-            self.trained_for_segment_build(),
         )
         .await;
         let (new_id, total_docs, bp_converged) = match reorder_result {

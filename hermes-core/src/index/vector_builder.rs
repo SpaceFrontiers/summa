@@ -994,6 +994,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         };
         let max_read_vectors = (MAX_SAMPLE_READ_BYTES / bytes_per_sample.max(1)).max(1);
         let mut zero_codes = 0usize;
+        let mut ones_codes = 0usize;
         let mut global_offset = 0usize;
         let mut cursor = 0usize;
         let field_ids = [field.0];
@@ -1050,12 +1051,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             let relative = ordinal - selected[run_start];
                             let offset = relative * bytes_per_sample;
                             let code = &bytes.as_slice()[offset..offset + bytes_per_sample];
-                            // All-zero codes are never indexed, so training on
-                            // them only spends centroids that can never be
-                            // assigned: a production field turned ~30% of a
-                            // 163k codebook into duplicate zero centroids.
+                            // Degenerate constant codes are withheld from
+                            // training: k-majority dedicates centroids to
+                            // them, which only institutionalizes the producer
+                            // bug. One production field turned ~30% of a 163k
+                            // codebook into duplicate zero centroids; another
+                            // trained centroid 0 to exactly 0xFF from two
+                            // years of signbit-packed NaN vectors. (They are
+                            // still *indexed* — payload/flat parity — just
+                            // not trained on.)
                             if code.iter().all(|&byte| byte == 0) {
                                 zero_codes += 1;
+                                continue;
+                            }
+                            if code.iter().all(|&byte| byte == 0xff) {
+                                ones_codes += 1;
                                 continue;
                             }
                             codes.extend_from_slice(code);
@@ -1086,11 +1096,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         let collected = sample.len(config.dim());
-        // Coverage is checked against what was *selected*; withheld all-zero
+        // Coverage is checked against what was *selected*; withheld degenerate
         // codes are subtracted explicitly so a real traversal bug still trips.
-        if global_offset != total || cursor != take || collected + zero_codes != take {
+        if global_offset != total || cursor != take || collected + zero_codes + ones_codes != take {
             return Err(Error::Corruption(format!(
-                "training sample coverage mismatch for field {}: counted={total}, traversed={global_offset}, selected={cursor}, collected={collected}, zero={zero_codes}",
+                "training sample coverage mismatch for field {}: counted={total}, traversed={global_offset}, selected={cursor}, collected={collected}, zero={zero_codes}, ones={ones_codes}",
                 field.0,
             )));
         }
@@ -1103,17 +1113,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 field.0,
                 100.0 * zero_codes as f64 / take.max(1) as f64,
             );
-            crate::observe::binary_zero_vectors(
+        }
+        if ones_codes > 0 {
+            log::warn!(
+                "[vector_training] index={} field={}: {ones_codes} of {take} sampled vectors \
+                 ({:.1}%) are all-ones and were excluded from training — training on the \
+                 saturated constant only dedicates centroids to a producer bug",
                 self.schema.index_label(),
                 field.0,
-                zero_codes,
-                take,
+                100.0 * ones_codes as f64 / take.max(1) as f64,
             );
         }
         if collected == 0 {
             log::warn!(
-                "[vector_training] index={} field={}: every sampled vector is all-zero; \
-                 skipping ANN training for this field",
+                "[vector_training] index={} field={}: every sampled vector is degenerate \
+                 (all-zero or all-ones); skipping ANN training for this field",
                 self.schema.index_label(),
                 field.0,
             );

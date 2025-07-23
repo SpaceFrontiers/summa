@@ -254,19 +254,6 @@ mod imp {
             .record(coherence_norm as f64);
     }
 
-    /// Vectors withheld from a binary ANN payload for carrying no information.
-    ///
-    /// A counter rather than a log-only warning: the rate matters (it tracks an
-    /// upstream producer regressing) and it has to be visible per index/field.
-    pub fn binary_zero_vectors(index: &str, field: u32, skipped: usize, total: usize) {
-        let index = shared_label(index);
-        let field = field.to_string();
-        metrics::counter!("hermes_binary_zero_vectors_total", "index" => index.clone(), "field" => field.clone())
-            .increment(skipped as u64);
-        metrics::counter!("hermes_binary_indexed_vectors_total", "index" => index, "field" => field)
-            .increment(total as u64);
-    }
-
     /// Structural ANN health gauges, refreshed at every segment open.
     ///
     /// Gauges rather than log-only: leaf collapse and fragmentation build up
@@ -389,9 +376,6 @@ mod imp {
     pub fn maxscore_query(_: &str, _: &str, _: f64, _: usize) {}
     #[inline(always)]
     pub fn dense_l1(_: &str, _: &str, _: &'static str, _: f64, _: usize) {}
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub fn binary_zero_vectors(_: &str, _: u32, _: usize, _: usize) {}
     #[inline(always)]
     pub fn ann_health(_: &str, _: u32, _: f64, _: f64, _: f64) {}
     #[inline(always)]

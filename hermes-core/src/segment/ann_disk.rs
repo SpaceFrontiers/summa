@@ -1497,6 +1497,10 @@ pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) ->
     }
 }
 
+/// Doc IDs rewritten per scratch flush during compaction (256 KiB of u32s).
+#[cfg(feature = "native")]
+const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
+
 /// Cluster-major compacting merge for binary IVF payloads.
 ///
 /// The byte-copy merge keeps each source payload as one physical extent, so a
@@ -1516,21 +1520,13 @@ pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) ->
 /// concatenating runs is trivially valid. TQ payloads pack codes into
 /// fixed-lane blocks with per-run tail padding; concatenating those without
 /// re-packing would corrupt block boundaries, so TQ merges stay byte-copy.
-/// Compact binary ANN runs when a byte-copy merge would leave this many
-/// physical extents per probed cluster.
 ///
-/// A rebuilt segment is 1.0 and each byte-copy merge multiplies by its source
-/// count, so 4 permits roughly two cheap 2-way generations before a merge
-/// pays the compaction pass. Explicit reorder/optimize passes compact at any
-/// fragmentation above 1.0 instead — an optimize command should hand back the
-/// freshly-built layout.
-#[cfg(feature = "native")]
-pub(crate) const ANN_COMPACTION_FRAGMENTATION_THRESHOLD: f64 = 4.0;
-
-/// Doc IDs rewritten per scratch flush during compaction (256 KiB of u32s).
-#[cfg(feature = "native")]
-const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
-
+/// Every binary merge whose prediction is fragmented takes this path.
+/// Measured (interleaved best-of-3, pre-faulted buffers, aarch64): byte-copy
+/// 38.0 GiB/s vs compaction 32.4 GiB/s — ~17% more CPU on a stage that is a
+/// rounding error of merge wall-clock (a production dense stage is ~0.7s of
+/// a 20s+ merge), so there is no threshold below which byte-copy is worth
+/// the fragmentation it leaves behind.
 #[cfg(feature = "native")]
 pub(crate) fn write_compacted_ann_cancellable(
     sources: &[(&AnnDiskIndex, u32)],

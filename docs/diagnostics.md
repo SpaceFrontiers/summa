@@ -35,7 +35,7 @@ Diagnostics span every index structure, not only dense ANN:
 
 | structure                       | cheap (always)                                                                                     | expensive (opt-in)                                                                                                                                                            |
 | ------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| dense ANN (binary IVF / IVF-TQ) | run-directory health (below)                                                                       | `--sample`: zero/NaN scan of flat vectors; `--probe-cost`                                                                                                                     |
+| dense ANN (binary IVF / IVF-TQ) | run-directory health (below)                                                                       | `--sample`: zero/all-ones/NaN scan of flat vectors; `--probe-cost`                                                                                                            |
 | sparse (BMP / MaxScore)         | vectors, postings, dims, blocks, postings per vector, block padding ratio                          | `--sparse-stats`: per-dimension posting distribution (p50/p99/max, top-1% share, hottest dims) and u8 impact saturation                                                       |
 | full-text                       | per-field doc count and avg tokens/doc (BM25F stats), term-dict entry/block/bloom/dictionary sizes | `--terms N`: whole-dictionary scan — doc-frequency distribution (p50/p99/max), inline-term ratio, postings/positions bytes, top-1% postings share, field-attributed top terms |
 | fast fields                     | per-column type, doc count, multi flag, disk bytes                                                 | —                                                                                                                                                                             |
@@ -88,26 +88,18 @@ headroom; both would have fired months early):
 
 Fragmentation now heals itself instead of only being reported:
 
-- **Merges** compact binary ANN runs when the byte-copy output would reach
-  fragmentation ≥ 4 (`ANN_COMPACTION_FRAGMENTATION_THRESHOLD`): the payload is
-  rewritten cluster-major — one extent per cluster, document IDs made absolute
-  — restoring the freshly-built layout. Below the threshold, merges keep the
-  cheap byte-copy, so shallow merge trees pay nothing.
-- **The external `reorder` API** (the optimize pass) compacts at _any_
-  fragmentation above 1.0, alongside its BP reorder of sparse fields. It
-  requires the trained artifacts to be loaded; without them the vectors file
-  is cloned unchanged and a warning names why.
+**Every binary merge** whose byte-copy output would be fragmented (any
+cluster overlap between sources — in practice, every real merge) rewrites
+the payload cluster-major: one extent per cluster, document IDs made
+absolute, the freshly-built layout restored. There is no threshold, and the
+explicit `reorder` pass simply clones the vectors file — a segment reaching
+it is already at fragmentation 1.0.
 
-Compaction streams the same payload bytes the byte-copy merge already
-writes; the only extra work is one `u32` add per posting for the doc-ID
-rewrite. Peak extra memory is a 256 KiB scratch buffer plus one 48-byte
-directory record per non-empty cluster — nothing scales with vectors.
-Measured on 0.32 GiB across 4 sources (aarch64, warm cache): byte-copy
-9.8 GiB/s, compaction 20.1 GiB/s — the cluster-major writer is _faster_
-because it streams larger sequential extents. TQ payloads are exempt: their
-codes are block-packed and cannot be concatenated without re-packing.
-
-`hermes_ann_fragmentation` and `hermes-tool diagnose` observe the outcome.
+The fragmentation diagnostics stay even though binary merges now always
+produce 1.0: TQ payloads still byte-copy, and for binary the ≥ 8 warning
+becomes a regression alarm — it firing means the compaction policy itself
+broke. `hermes_ann_fragmentation` and `hermes-tool diagnose` observe the
+outcome.
 
 ## Tiers
 
@@ -148,11 +140,13 @@ safe to run against a live index — everything is read-only.
 Expensive opt-ins, one flag each (the `run_expensive_tasks` idea):
 
 - `--sample N` — read N deterministically sampled vectors per field per
-  segment from flat storage and report: all-zero count, popcount mean/min/max for binary
-  codes (healthy sign-quantized embeddings sit near 0.5), NaN/∞ rows for
-  float vectors. This is the check that would have
-  caught the zero-embedding regression the week it started. Cost: N reads of
-  one vector each, sequential in the sampled order.
+  segment from flat storage and report: all-zero and all-ones counts, mean
+  bit fraction for binary codes (healthy sign-quantized embeddings sit near
+  0.5), NaN/∞ rows for float vectors. This is the check that would have
+  caught both constant-embedding regressions the week they started — the
+  all-zero face (`x > 0` NaN packing) and the all-ones face (`~signbit(x)`
+  NaN packing). Cost: N reads of one vector each, sequential in the sampled
+  order.
 - `--probe-cost NPROBE` — simulate the per-query I/O of an average probe:
   expected leaves, bytes and extents touched per segment at the given
   `nprobe`, using leaf sizes from the run directory. Extents ≈ seeks on a

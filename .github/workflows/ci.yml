@@ -20,7 +20,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.0
+          toolchain: 1.97.1
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -114,7 +114,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.0
+          toolchain: 1.97.1
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
@@ -242,7 +242,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.0
+          toolchain: 1.97.1
           components: rustfmt, clippy
 
       - uses: actions/setup-python@v5

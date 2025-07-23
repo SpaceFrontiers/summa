@@ -1282,64 +1282,15 @@ async fn test_binary_ivf_end_to_end() {
     );
 }
 
-/// An all-zero query carries no information: Hamming distance from it is
-/// `popcount(candidate)` for every candidate, so it ranks by bit count rather
-/// than similarity. Almost always a caller that failed to embed, so it is
-/// refused rather than silently answered with nonsense.
-#[tokio::test]
-async fn test_all_zero_binary_query_is_refused() {
-    use crate::dsl::BinaryDenseVectorConfig;
-    use crate::query::BinaryDenseVectorQuery;
-
-    let dim_bits = 64;
-    let byte_len = dim_bits / 8;
-    let mut sb = SchemaBuilder::default();
-    let title = sb.add_text_field("title", true, true);
-    let cfg = BinaryDenseVectorConfig::new(dim_bits);
-    let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
-    let schema = sb.build();
-
-    let dir = RamDirectory::new();
-    let config = IndexConfig::default();
-    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
-        .await
-        .unwrap();
-    for i in 0u8..8 {
-        let mut doc = Document::new();
-        doc.add_text(title, format!("doc {i}"));
-        doc.add_binary_dense_vector(bvec, vec![i | 0x0f; byte_len]);
-        writer.add_document(doc).unwrap();
-    }
-    writer.commit().await.unwrap();
-
-    let index = Index::open(dir, config).await.unwrap();
-    let reader = index.reader().await.unwrap();
-    let searcher = reader.searcher().await.unwrap();
-
-    let error = searcher
-        .search(&BinaryDenseVectorQuery::new(bvec, vec![0u8; byte_len]), 5)
-        .await
-        .expect_err("an all-zero binary query must be refused");
-    let message = error.to_string();
-    assert!(
-        message.contains("all-zero"),
-        "error should name the cause, got: {message}"
-    );
-
-    // A real query on the same field still works.
-    let results = searcher
-        .search(&BinaryDenseVectorQuery::new(bvec, vec![0x0f; byte_len]), 5)
-        .await
-        .unwrap();
-    assert!(!results.is_empty(), "non-zero queries must still be served");
-}
-
-/// The merge and reorder compaction policies together: a 2-way byte-copy
-/// merge stays below the merge threshold and carries fragmentation 2.0, and
-/// the explicit reorder pass — the external `reorder` API — then compacts the
-/// binary ANN payload back to one extent per cluster with identical results.
+/// The merge and reorder compaction policies together: every binary merge
+/// compacts — a 2-way merge that byte-copy would leave at fragmentation 2.0
+/// comes out at one extent per cluster with identical scores — and the
+/// explicit reorder pass (the external `reorder` API) keeps an already
+/// compact segment at 1.0. (Reorder healing a *legacy* fragmented payload,
+/// which merges can no longer produce, is pinned at the unit level in
+/// `ann_disk::tests::compacted_merge_matches_byte_copy_and_resets_fragmentation`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_reorder_compacts_fragmented_binary_ann_runs() {
+async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
     use crate::dsl::BinaryDenseVectorConfig;
     use crate::query::BinaryDenseVectorQuery;
 
@@ -1381,8 +1332,8 @@ async fn test_reorder_compacts_fragmented_binary_ann_runs() {
     writer.build_vector_index().await.unwrap();
     add_batch(&mut writer, 100);
     writer.commit().await.unwrap();
-    // Merge the two ANN-bearing segments: 2 sources is below the merge
-    // compaction threshold, so byte-copy preserves both extents per cluster.
+    // Merge the two ANN-bearing segments: byte-copy would leave two extents
+    // per cluster; the merge compaction policy rewrites cluster-major.
     writer.force_merge().await.unwrap();
 
     let fragmentation_of = |segments: &[std::sync::Arc<crate::segment::SegmentReader>]| {
@@ -1395,8 +1346,8 @@ async fn test_reorder_compacts_fragmented_binary_ann_runs() {
     let index = Index::open(dir.clone(), config.clone()).await.unwrap();
     let before = fragmentation_of(&index.segment_readers().await.unwrap());
     assert!(
-        before > 1.5,
-        "byte-copy merge must leave multi-extent clusters, got {before}"
+        (before - 1.0).abs() < 1e-9,
+        "every binary merge must compact to one extent per cluster, got {before}"
     );
     let needle = vec![0x0f_u8 | 0x01; byte_len];
     let reader = index.reader().await.unwrap();
@@ -1407,8 +1358,8 @@ async fn test_reorder_compacts_fragmented_binary_ann_runs() {
         .unwrap();
     drop(searcher);
 
-    // The external reorder API: BP-reorders the sparse field AND compacts
-    // the fragmented binary ANN payload.
+    // The external reorder API: BP-reorders the sparse field; the binary ANN
+    // payload is already compact and must stay that way.
     writer.reorder().await.unwrap();
     drop(writer);
 
@@ -1416,7 +1367,7 @@ async fn test_reorder_compacts_fragmented_binary_ann_runs() {
     let after = fragmentation_of(&index.segment_readers().await.unwrap());
     assert!(
         (after - 1.0).abs() < 1e-9,
-        "reorder must compact ANN runs to one extent per cluster, got {after}"
+        "reorder must keep ANN runs at one extent per cluster, got {after}"
     );
     let reader = index.reader().await.unwrap();
     let searcher = reader.searcher().await.unwrap();

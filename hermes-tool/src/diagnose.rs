@@ -179,13 +179,16 @@ impl From<AnnHealth> for AnnReport {
 
 /// Degenerate-vector scan over a deterministic sample of flat storage.
 ///
-/// This is the check that catches the zero-embedding failure mode: an
-/// upstream producer emitting all-zero vectors that carry no signal and
-/// collapse into a single IVF leaf.
+/// This is the check that catches the constant-embedding failure modes: an
+/// upstream producer emitting all-zero (or, from signbit-packed NaN,
+/// all-ones) vectors that carry no signal and collapse into a single IVF
+/// leaf.
 #[derive(Serialize)]
 pub struct SampleReport {
     pub sampled: usize,
     pub all_zero: usize,
+    /// Binary codes with every bit set — the saturated twin of `all_zero`.
+    pub all_ones: usize,
     /// Binary codes: fraction of bits set, averaged over the sample. Healthy
     /// sign-quantized embeddings sit near 0.5.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,6 +223,7 @@ pub struct FieldAggregate {
     pub clusters_nonempty: u64,
     pub worst_leaf_share: f64,
     pub all_zero_sampled: usize,
+    pub all_ones_sampled: usize,
     pub sampled: usize,
 }
 
@@ -427,6 +431,7 @@ async fn diagnose_segment(
         if let Some(sample_report) = &sample {
             aggregate.sampled += sample_report.sampled;
             aggregate.all_zero_sampled += sample_report.all_zero;
+            aggregate.all_ones_sampled += sample_report.all_ones;
         }
 
         dense_fields.push(DenseFieldReport {
@@ -515,6 +520,7 @@ async fn sample_flat_vectors(
     let is_binary = matches!(flat.quantization, DenseVectorQuantization::Binary);
 
     let mut all_zero = 0usize;
+    let mut all_ones = 0usize;
     let mut bits_set = 0u64;
     let mut non_finite = 0usize;
     let mut raw = vec![0u8; byte_size];
@@ -535,6 +541,11 @@ async fn sample_flat_vectors(
         if raw.iter().all(|&byte| byte == 0) {
             all_zero += 1;
         }
+        // Saturated codes only mean something for binary quantization; a
+        // float row of 0xff bytes is NaN garbage the non-finite check owns.
+        if is_binary && raw.iter().all(|&byte| byte == 0xff) {
+            all_ones += 1;
+        }
         if is_binary {
             bits_set += raw
                 .iter()
@@ -550,6 +561,7 @@ async fn sample_flat_vectors(
     Ok(SampleReport {
         sampled: take,
         all_zero,
+        all_ones,
         mean_bit_fraction: is_binary.then(|| {
             if take == 0 {
                 0.0
@@ -805,8 +817,8 @@ fn print_human(report: &Report) {
             println!();
             if let Some(sample) = &dense.sample {
                 print!(
-                    "        sample: {} vectors, {} all-zero",
-                    sample.sampled, sample.all_zero
+                    "        sample: {} vectors, {} all-zero, {} all-ones",
+                    sample.sampled, sample.all_zero, sample.all_ones
                 );
                 if let Some(fraction) = sample.mean_bit_fraction {
                     print!(", mean bit fraction {fraction:.3}");
@@ -888,10 +900,12 @@ fn print_human(report: &Report) {
             );
             if aggregate.sampled > 0 {
                 print!(
-                    " sampled={} all_zero={} ({:.1}%)",
+                    " sampled={} all_zero={} ({:.1}%) all_ones={} ({:.1}%)",
                     aggregate.sampled,
                     aggregate.all_zero_sampled,
                     100.0 * aggregate.all_zero_sampled as f64 / aggregate.sampled as f64,
+                    aggregate.all_ones_sampled,
+                    100.0 * aggregate.all_ones_sampled as f64 / aggregate.sampled as f64,
                 );
             }
             println!();
@@ -938,6 +952,9 @@ mod tests {
             doc.add_text(title, format!("document {i} about hemoglobin"));
             let code: Vec<u8> = if i % 4 == 0 {
                 vec![0u8; byte_len]
+            } else if i % 8 == 1 {
+                // The saturated face: signbit-packed NaN from the producer.
+                vec![0xffu8; byte_len]
             } else {
                 (0..byte_len)
                     .map(|_| {
@@ -1024,6 +1041,16 @@ mod tests {
         assert!(
             (0.15..=0.35).contains(&zero_rate),
             "sample must recover the ~25% zero rate, got {zero_rate:.2}"
+        );
+        let ones: usize = dense
+            .iter()
+            .filter_map(|f| f.sample.as_ref())
+            .map(|s| s.all_ones)
+            .sum();
+        let ones_rate = ones as f64 / sampled as f64;
+        assert!(
+            (0.06..=0.25).contains(&ones_rate),
+            "sample must recover the ~12.5% all-ones rate, got {ones_rate:.2}"
         );
 
         // Cheap tier covers the other structures too.

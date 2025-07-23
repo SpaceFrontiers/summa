@@ -955,7 +955,6 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     granularity: BpGranularity,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
-    trained: Option<Arc<crate::segment::TrainedVectorStructures>>,
 ) -> Result<(String, u32, bool)> {
     let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
     let num_docs = reader.num_docs();
@@ -971,45 +970,11 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         schema.index_label(),
     );
 
-    // Copy unchanged segment files
+    // Copy unchanged segment files. The vectors file is cloned verbatim:
+    // every binary merge already compacts its ANN payload to one extent per
+    // cluster, so a segment reaching reorder is at fragmentation 1.0 and
+    // there is nothing to rewrite.
     let copy_start = std::time::Instant::now();
-    // Reorder is the explicit optimize pass, so it also un-does the extent
-    // fragmentation byte-copy merges accumulate: any binary ANN field above
-    // fragmentation 1.0 gets its vectors file rewritten cluster-major instead
-    // of cloned. This needs the trained artifacts (the copy path validates
-    // payloads against their quantizer generation); without them the file is
-    // cloned unchanged, loudly.
-    let max_binary_fragmentation = reader
-        .vector_indexes()
-        .iter()
-        .filter(|(_, index)| matches!(index, crate::segment::VectorIndex::BinaryIvf(_)))
-        .filter_map(|(&field_id, _)| reader.ann_health(crate::dsl::Field(field_id)))
-        .map(|health| health.fragmentation())
-        .fold(0.0f64, f64::max);
-    let artifacts_available = trained.as_ref().is_some_and(|trained| {
-        reader
-            .vector_indexes()
-            .iter()
-            .all(|(&field_id, index)| match index {
-                crate::segment::VectorIndex::BinaryIvf(_) => {
-                    trained.binary_quantizers.contains_key(&field_id)
-                }
-                crate::segment::VectorIndex::IvfTq { .. } => {
-                    trained.centroids.contains_key(&field_id)
-                }
-                crate::segment::VectorIndex::Tq { .. } => true,
-            })
-    });
-    let compact_vectors = max_binary_fragmentation > 1.0 + 1e-9 && artifacts_available;
-    if max_binary_fragmentation > 1.0 + 1e-9 && !artifacts_available {
-        log::warn!(
-            "[reorder] index={} segment {}: binary ANN fragmentation {max_binary_fragmentation:.1} \
-             but trained artifacts are unavailable — vectors file cloned unchanged",
-            schema.index_label(),
-            source_id.to_hex(),
-        );
-    }
-
     for (src, dst, required) in [
         (&src_files.term_dict, &dst_files.term_dict, true),
         (&src_files.postings, &dst_files.postings, true),
@@ -1027,8 +992,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         (
             &src_files.vectors,
             &dst_files.vectors,
-            !compact_vectors
-                && (!reader.vector_indexes().is_empty() || !reader.flat_vectors().is_empty()),
+            !reader.vector_indexes().is_empty() || !reader.flat_vectors().is_empty(),
         ),
     ] {
         if cancellation_requested(cancellation.as_deref()) {
@@ -1043,33 +1007,6 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
             cancellation.as_deref(),
         )
         .await?;
-    }
-    if compact_vectors {
-        // Single-source copy "merge": flat and TQ sections are byte-copied,
-        // and the binary ANN payload goes through the compaction policy —
-        // with one fragmented source its predicted fragmentation is its own,
-        // and reorder compacts at any value above 1.0.
-        let compaction_started = std::time::Instant::now();
-        let merger = super::merger::SegmentMerger::new(Arc::clone(schema))
-            .with_background_pool(rayon_pool.clone())
-            .with_forced_ann_compaction(true);
-        let trained_ref = trained.as_deref().expect("gated on artifacts_available");
-        merger
-            .merge_dense_vectors(
-                dir,
-                std::slice::from_ref(&reader),
-                &dst_files,
-                Some(trained_ref),
-                super::merger::AnnWriteMode::Copy,
-            )
-            .await?;
-        log::info!(
-            "[reorder] index={} segment {}: compacted binary ANN runs \
-             (fragmentation {max_binary_fragmentation:.1} → 1.0) in {:.1}s",
-            schema.index_label(),
-            source_id.to_hex(),
-            compaction_started.elapsed().as_secs_f64(),
-        );
     }
     log::info!(
         "[reorder] index={} copied files in {:.1}s",

@@ -163,6 +163,18 @@ fn is_zero_code(code: &[u8]) -> bool {
     code.iter().all(|&byte| byte == 0)
 }
 
+/// The saturated twin of [`is_zero_code`]: every bit set. Produced by packers
+/// that route NaN through a signbit test (`~signbit(NaN)` is true), where the
+/// `x > 0` convention produces zeros instead. One production corpus carried
+/// this face for two years — 36% of a field's vectors were the identical
+/// all-ones code, with a codebook centroid trained to exactly 0xFF — so it
+/// gets the same count-and-report treatment. `dim_bits` is validated to be a
+/// multiple of 8, so a byte-level check is exact (no pad bits).
+#[inline]
+fn is_ones_code(code: &[u8]) -> bool {
+    code.iter().all(|&byte| byte == 0xff)
+}
+
 /// A leaf this many times larger than the average is a scan cliff regardless of
 /// what produced it, so segment builds report it.
 #[cfg(feature = "native")]
@@ -663,6 +675,8 @@ pub struct BinaryIvfIndex {
     len: usize,
     /// Indexed codes that carry no information (all bits clear).
     zero_codes: usize,
+    /// Indexed codes that carry no information (all bits set).
+    ones_codes: usize,
 }
 
 /// Streaming build state used by vector-generation rewrites. Only the exact
@@ -676,6 +690,7 @@ pub(crate) struct BinaryIvfBuilder {
     clusters: rustc_hash::FxHashMap<u32, BinaryCluster>,
     len: usize,
     zero_codes: usize,
+    ones_codes: usize,
 }
 
 impl BinaryIvfBuilder {
@@ -694,6 +709,7 @@ impl BinaryIvfBuilder {
             clusters: rustc_hash::FxHashMap::default(),
             len: 0,
             zero_codes: 0,
+            ones_codes: 0,
         })
     }
 
@@ -740,10 +756,13 @@ impl BinaryIvfBuilder {
         // distinct leaf in the batch instead of per code. Sorting by
         // `(cluster, index)` keeps each leaf's entries in ascending batch order,
         // so the serialized payload is byte-identical to per-code insertion.
-        self.zero_codes += codes
-            .chunks_exact(byte_len)
-            .filter(|code| is_zero_code(code))
-            .count();
+        for code in codes.chunks_exact(byte_len) {
+            if is_zero_code(code) {
+                self.zero_codes += 1;
+            } else if is_ones_code(code) {
+                self.ones_codes += 1;
+            }
+        }
         let mut order: Vec<u32> = (0..assignments.len() as u32).collect();
         order.sort_unstable_by_key(|&index| (assignments[index as usize], index));
         let mut run_start = 0usize;
@@ -785,6 +804,7 @@ impl BinaryIvfBuilder {
             clusters,
             len: self.len,
             zero_codes: self.zero_codes,
+            ones_codes: self.ones_codes,
         };
         index
             .validate()
@@ -880,6 +900,11 @@ impl BinaryIvfIndex {
         self.zero_codes
     }
 
+    /// Indexed codes that were all-ones.
+    pub fn ones_codes(&self) -> usize {
+        self.ones_codes
+    }
+
     /// Largest leaf as `(cluster_id, count)`, for skew reporting.
     pub fn largest_cluster(&self) -> Option<(u32, usize)> {
         self.clusters
@@ -916,7 +941,16 @@ pub(crate) fn report_binary_build_quality(
              and every query probing that leaf scans them; check the embedding producer",
             100.0 * zero as f64 / indexed.max(1) as f64,
         );
-        crate::observe::binary_zero_vectors(index_label, field_id, zero, indexed);
+    }
+    let ones = index.ones_codes();
+    if ones > 0 {
+        log::warn!(
+            "[binary_ivf] index={index_label} field={field_id}: {ones} of {indexed} indexed \
+             vectors ({:.1}%) are all-ones — the saturated twin of the zero code (NaN packed \
+             through a signbit test): they match nothing, collapse into a single leaf, and \
+             every query probing that leaf scans them; check the embedding producer",
+            100.0 * ones as f64 / indexed.max(1) as f64,
+        );
     }
     if let Some((cluster_id, count)) = index.largest_cluster()
         && count >= LEAF_SKEW_WARN_MINIMUM
@@ -1896,6 +1930,37 @@ mod tests {
         assert!(
             largest >= 4,
             "all-zero codes should share one leaf, got {largest}"
+        );
+        report_binary_build_quality("test-index", 7, &index);
+    }
+
+    /// All-ones codes — signbit-packed NaN — are counted and reported the
+    /// same way as zeros, and separately from them: the two faces attribute
+    /// to different producer revisions.
+    #[test]
+    fn all_ones_codes_are_counted_and_reported() {
+        let codes = [0xffu8, 0xf0, 0xff, 0xff, 0x0f, 0x00];
+        let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
+        let mut config = BinaryIvfConfig::new(8, 2);
+        config.train_iters = 2;
+        config.max_train_samples = labels.len();
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
+        let index =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+
+        assert_eq!(
+            index.ones_codes(),
+            3,
+            "three all-ones codes must be counted"
+        );
+        assert_eq!(index.zero_codes(), 1, "the zero code is counted on its own");
+        assert_eq!(index.len(), labels.len(), "every vector stays indexed");
+        // Identical codes share a nearest centroid, so the constant collapses
+        // into one leaf: the same topology the ann_health warning names.
+        let (_, largest) = index.largest_cluster().expect("a populated leaf");
+        assert!(
+            largest >= 3,
+            "all-ones codes should share one leaf, got {largest}"
         );
         report_binary_build_quality("test-index", 7, &index);
     }

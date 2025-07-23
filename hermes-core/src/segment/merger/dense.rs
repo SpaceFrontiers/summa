@@ -543,18 +543,18 @@ impl SegmentMerger {
         }
         // Byte-copy preserves every source extent, so fragmentation (extents
         // per probed cluster) multiplies with each merge generation and every
-        // extent is a potential seek on a cold index. When the merged output
-        // would cross the threshold, compact instead: same payload bytes
+        // extent is a potential seek on a cold index. Every binary merge whose
+        // output would be fragmented compacts instead: same payload bytes
         // streamed, plus one u32 add per posting, and the result is
         // indistinguishable from a freshly built segment (fragmentation 1.0).
+        // Measured ~17% more CPU than the byte-copy on a stage that is a
+        // rounding error of merge wall-clock, so there is no threshold.
         // Only binary payloads compact — TQ codes are block-packed and cannot
         // be concatenated without re-packing.
         let predicted_fragmentation =
             crate::segment::ann_disk::predicted_merge_fragmentation(&sources);
         let compact = index_type == crate::segment::ann_build::BINARY_IVF_TYPE
-            && (self.force_ann_compaction && predicted_fragmentation > 1.0 + 1e-9
-                || predicted_fragmentation
-                    >= crate::segment::ann_disk::ANN_COMPACTION_FRAGMENTATION_THRESHOLD);
+            && predicted_fragmentation > 1.0 + 1e-9;
         let data_offset = writer.offset();
         let result = super::block_in_place_if_multithread(|| {
             if compact {
@@ -576,7 +576,8 @@ impl SegmentMerger {
         let data_size = writer.offset() - data_offset;
         if compact {
             log::info!(
-                "[dense_vector_merge] index={} field {}: compacted {} ANN source(s) at predicted                  fragmentation {predicted_fragmentation:.1} ({}) — one extent per cluster again",
+                "[dense_vector_merge] index={} field {}: compacted {} ANN source(s) at predicted \
+                 fragmentation {predicted_fragmentation:.1} ({}) — one extent per cluster again",
                 self.schema.index_label(),
                 field.0,
                 sources.len(),
@@ -584,7 +585,8 @@ impl SegmentMerger {
             );
         } else {
             log::debug!(
-                "[dense_vector_merge] index={} field {}: copied {} compatible ANN run source(s),                  {} (predicted fragmentation {predicted_fragmentation:.1})",
+                "[dense_vector_merge] index={} field {}: copied {} compatible ANN run source(s), \
+                 {} (predicted fragmentation {predicted_fragmentation:.1})",
                 self.schema.index_label(),
                 field.0,
                 sources.len(),

@@ -2304,17 +2304,6 @@ impl SegmentReader {
                 config.byte_len()
             )));
         }
-        if query.iter().all(|&byte| byte == 0) {
-            // Hamming distance from an all-zero query is `popcount(candidate)`
-            // for every candidate, so the ranking it produces is "fewest bits
-            // set" — not similarity. Almost always a caller that failed to
-            // embed and sent a zero-filled buffer.
-            return Err(Error::Query(format!(
-                "binary query for field '{}' is all-zero: it carries no information and would \
-                 rank candidates by bit count rather than similarity",
-                entry.name,
-            )));
-        }
         Ok(config.dim)
     }
 
