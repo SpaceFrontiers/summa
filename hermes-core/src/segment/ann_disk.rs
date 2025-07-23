@@ -5,7 +5,6 @@
 //! rewrites only the compact run directory with an adjusted document base.
 //! No centroid assignment, payload deserialization, or reserialization occurs
 //! on the merge path.
-
 #[cfg(feature = "native")]
 use std::cmp::Reverse;
 #[cfg(feature = "native")]
@@ -466,7 +465,8 @@ impl AnnDiskIndex {
             log::warn!(
                 "[ann_health] index={index_label} field={field_id} segment={segment_id:016x}: \
                  {fragmentation:.1} extents per probed cluster ({} runs / {} clusters) — \
-                 cold probes pay that many seeks; a vector-generation rewrite compacts to 1.0",
+                 cold probes pay that many seeks; the next merge or vector-generation rewrite \
+                 compacts to 1.0",
                 health.runs,
                 health.clusters_nonempty,
             );
@@ -1457,6 +1457,261 @@ pub(crate) fn write_merged_ann_cancellable(
     write_merged_ann_impl(sources, &[], writer, cancellation)
 }
 
+/// Physical extents per non-empty cluster the byte-copy merge of `sources`
+/// would produce.
+///
+/// Byte-copy preserves every source run, so the merged fragmentation is
+/// `total runs / distinct non-empty clusters` — computable exactly from the
+/// in-memory directories before writing a byte. The merge policy compacts
+/// when this crosses its threshold instead of letting probe read
+/// amplification grow another generation.
+#[cfg(feature = "native")]
+pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) -> f64 {
+    let mut total_runs = 0usize;
+    // Distinct clusters via a k-way sorted walk over the (already
+    // cluster-sorted) directories — no allocation proportional to clusters.
+    let mut cursors: Vec<std::iter::Peekable<std::slice::Iter<'_, AnnRun>>> = sources
+        .iter()
+        .map(|(source, _)| {
+            total_runs += source.runs.len();
+            source.runs.iter().peekable()
+        })
+        .collect();
+    let mut distinct = 0usize;
+    while let Some(cluster) = cursors
+        .iter_mut()
+        .filter_map(|cursor| cursor.peek().map(|run| run.cluster_id))
+        .min()
+    {
+        distinct += 1;
+        for cursor in &mut cursors {
+            while cursor.peek().is_some_and(|run| run.cluster_id == cluster) {
+                cursor.next();
+            }
+        }
+    }
+    if distinct == 0 {
+        0.0
+    } else {
+        total_runs as f64 / distinct as f64
+    }
+}
+
+/// Cluster-major compacting merge for binary IVF payloads.
+///
+/// The byte-copy merge keeps each source payload as one physical extent, so a
+/// logical cluster's postings scatter across up to `sources.len()` extents —
+/// and another factor per earlier merge generation. Every extent is a
+/// potential seek when the index is cold; production measured the array
+/// IOPS-bound at 32 KB/read from exactly this. This writer instead gathers
+/// each cluster's runs from all sources and emits **one contiguous run per
+/// cluster**, restoring the freshly-built layout (fragmentation 1.0).
+///
+/// Cost: the same total payload bytes the byte-copy merge already streams,
+/// plus one `u32` add per posting — document IDs are rewritten absolute
+/// (`doc_base = 0`) because runs from different sources cannot share a single
+/// directory entry otherwise. Codes and ordinals are copied verbatim.
+///
+/// Binary only: binary code columns are exactly `count × code_size`, so
+/// concatenating runs is trivially valid. TQ payloads pack codes into
+/// fixed-lane blocks with per-run tail padding; concatenating those without
+/// re-packing would corrupt block boundaries, so TQ merges stay byte-copy.
+/// Compact binary ANN runs when a byte-copy merge would leave this many
+/// physical extents per probed cluster.
+///
+/// A rebuilt segment is 1.0 and each byte-copy merge multiplies by its source
+/// count, so 4 permits roughly two cheap 2-way generations before a merge
+/// pays the compaction pass. Explicit reorder/optimize passes compact at any
+/// fragmentation above 1.0 instead — an optimize command should hand back the
+/// freshly-built layout.
+#[cfg(feature = "native")]
+pub(crate) const ANN_COMPACTION_FRAGMENTATION_THRESHOLD: f64 = 4.0;
+
+/// Doc IDs rewritten per scratch flush during compaction (256 KiB of u32s).
+#[cfg(feature = "native")]
+const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
+
+#[cfg(feature = "native")]
+pub(crate) fn write_compacted_ann_cancellable(
+    sources: &[(&AnnDiskIndex, u32)],
+    writer: &mut (impl Write + ?Sized),
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<u64> {
+    let Some((first, _)) = sources.first() else {
+        return Err(invalid_data("cannot compact an empty ANN source list"));
+    };
+    if first.header.kind != AnnKind::BinaryIvf {
+        return Err(invalid_data(
+            "ANN run compaction is only defined for binary IVF payloads",
+        ));
+    }
+    let mut header = first.header.clone();
+    header.vector_count = 0;
+    for &(source, _) in sources {
+        if !headers_compatible(&first.header, &source.header) {
+            return Err(invalid_data(
+                "ANN compaction sources use incompatible generations",
+            ));
+        }
+        header.vector_count = header
+            .vector_count
+            .checked_add(source.header.vector_count)
+            .ok_or_else(|| invalid_data("compacted ANN vector count overflows usize"))?;
+    }
+    validate_header(&header)?;
+    write_header(writer, &header)?;
+
+    let code_size = header.code_size;
+    let mut offset = ANN_HEADER_SIZE as u64;
+    let mut records: Vec<RunRecord> = Vec::new();
+    let mut scratch = Vec::new();
+    let mut cursors: Vec<usize> = vec![0; sources.len()];
+
+    loop {
+        if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "ANN compaction cancelled",
+            ));
+        }
+        // Next cluster = minimum un-consumed cluster ID across sources.
+        let Some(cluster_id) = sources
+            .iter()
+            .zip(&cursors)
+            .filter_map(|((source, _), &cursor)| source.runs.get(cursor).map(|run| run.cluster_id))
+            .min()
+        else {
+            break;
+        };
+
+        // Pass 1: doc IDs, rewritten absolute. Sources are visited in
+        // segment order and each source's same-cluster runs in directory
+        // order, which is ascending document ranges — so the output column
+        // stays sorted like a built segment's.
+        let mut count = 0usize;
+        let mut max_doc_id = 0u32;
+        let doc_ids_offset = offset;
+        for (source_index, &(source, segment_base)) in sources.iter().enumerate() {
+            let mut cursor = cursors[source_index];
+            while let Some(run) = source
+                .runs
+                .get(cursor)
+                .filter(|run| run.cluster_id == cluster_id)
+            {
+                let base = run
+                    .doc_base
+                    .checked_add(segment_base)
+                    .ok_or_else(|| invalid_data("compacted ANN document base overflows u32"))?;
+                let bytes = source.raw.as_slice();
+                // Chunked rewrite: peak scratch stays at 256 KiB no matter how
+                // large the run — the production incident had a single run of
+                // 20M postings, and buffering it whole would be an 80 MB spike
+                // in the middle of a merge.
+                for chunk_start in (0..run.count).step_by(DOC_ID_REWRITE_CHUNK) {
+                    let chunk_end = (chunk_start + DOC_ID_REWRITE_CHUNK).min(run.count);
+                    scratch.clear();
+                    scratch.reserve((chunk_end - chunk_start) * 4);
+                    for index in chunk_start..chunk_end {
+                        let doc_id = run_doc_id_with_base(bytes, run, index, base)?;
+                        max_doc_id = max_doc_id.max(doc_id);
+                        scratch.extend_from_slice(&doc_id.to_le_bytes());
+                    }
+                    writer.write_all(&scratch)?;
+                    if cancellation
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "ANN compaction cancelled",
+                        ));
+                    }
+                }
+                offset = checked_advance(offset, run.count * 4)?;
+                count = count
+                    .checked_add(run.count)
+                    .ok_or_else(|| invalid_data("compacted ANN run count overflows usize"))?;
+                cursor += 1;
+            }
+        }
+
+        // Pass 2: ordinals, verbatim.
+        let ordinals_offset = offset;
+        for (source_index, &(source, _)) in sources.iter().enumerate() {
+            let mut cursor = cursors[source_index];
+            while let Some(run) = source
+                .runs
+                .get(cursor)
+                .filter(|run| run.cluster_id == cluster_id)
+            {
+                copy_range(writer, &source.raw, run.ordinals.clone(), cancellation)?;
+                offset = checked_advance(offset, run.ordinals.len())?;
+                cursor += 1;
+            }
+        }
+
+        // Pass 3: codes, verbatim — the dominant bytes.
+        let codes_offset = offset;
+        for (source_index, &(source, _)) in sources.iter().enumerate() {
+            let mut cursor = cursors[source_index];
+            while let Some(run) = source
+                .runs
+                .get(cursor)
+                .filter(|run| run.cluster_id == cluster_id)
+            {
+                copy_range(writer, &source.raw, run.codes.clone(), cancellation)?;
+                offset = checked_advance(offset, run.codes.len())?;
+                cursor += 1;
+            }
+        }
+
+        // Consume this cluster's runs from every cursor.
+        for (source_index, &(source, _)) in sources.iter().enumerate() {
+            while source
+                .runs
+                .get(cursors[source_index])
+                .is_some_and(|run| run.cluster_id == cluster_id)
+            {
+                cursors[source_index] += 1;
+            }
+        }
+
+        records.push(RunRecord {
+            cluster_id,
+            doc_base: 0,
+            count: u32::try_from(count)
+                .map_err(|_| invalid_data("compacted ANN run exceeds u32 vectors"))?,
+            max_doc_id,
+            doc_ids_offset,
+            ordinals_offset,
+            codes_offset,
+            codes_len: u64::try_from(expected_codes_column_len(
+                AnnKind::BinaryIvf,
+                count,
+                code_size,
+            )?)
+            .map_err(|_| invalid_data("compacted ANN code length exceeds u64"))?,
+        });
+    }
+
+    if records.is_empty() {
+        return Err(invalid_data("cannot compact an ANN payload with no runs"));
+    }
+    finish_layout(writer, offset, &records)
+}
+
+/// [`run_doc_id`] against an explicit base, for rewriting IDs absolute.
+#[cfg(feature = "native")]
+fn run_doc_id_with_base(bytes: &[u8], run: &AnnRun, index: usize, base: u32) -> io::Result<u32> {
+    let local_doc_id = read_u32(bytes, run.doc_ids.start + index * 4);
+    if local_doc_id > run.max_doc_id {
+        return Err(invalid_data(
+            "ANN run contains a document above its declared maximum",
+        ));
+    }
+    base.checked_add(local_doc_id)
+        .ok_or_else(|| invalid_data("compacted ANN document ID overflows u32"))
+}
+
 /// [`write_merged_ann`] plus freshly built runs appended to the payload —
 /// used when some merge sources predate the field's current format and were
 /// re-encoded while every compatible source is still byte-copied.
@@ -1904,6 +2159,159 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    /// Compaction must produce a payload indistinguishable from a fresh
+    /// build: one run per cluster, fragmentation 1.0, absolute doc IDs — and
+    /// return exactly the results the byte-copy merge of the same sources
+    /// returns, for every cluster.
+    #[test]
+    fn compacted_merge_matches_byte_copy_and_resets_fragmentation() {
+        // Segment A: clusters {0: 3 docs, 5: 2 docs}. Segment B: {0: 2, 2: 1}.
+        // Merging A+B and then merging that result with A again produces
+        // multi-generation fragmentation (cluster 0 in three extents).
+        let a0_docs = [0u32, 1, 2];
+        let a0_ords = [0u16, 0, 1];
+        let a0_codes = [0x11u8, 0x22, 0x33];
+        let a5_docs = [3u32, 4];
+        let a5_ords = [0u16; 2];
+        let a5_codes = [0x44u8, 0x55];
+        let a_runs = [
+            BuildRun {
+                cluster_id: 0,
+                doc_ids: &a0_docs,
+                ordinals: &a0_ords,
+                codes: &a0_codes,
+            },
+            BuildRun {
+                cluster_id: 5,
+                doc_ids: &a5_docs,
+                ordinals: &a5_ords,
+                codes: &a5_codes,
+            },
+        ];
+        let mut header = binary_header(5);
+        header.num_clusters = 8;
+        let mut a_bytes = Vec::new();
+        write_built_runs(header.clone(), &a_runs, &mut a_bytes).unwrap();
+        let a = AnnDiskIndex::open(OwnedBytes::new(a_bytes), AnnKind::BinaryIvf, 5).unwrap();
+
+        let b0_docs = [0u32, 2];
+        let b0_ords = [1u16, 0];
+        let b0_codes = [0x66u8, 0x77];
+        let b2_docs = [1u32];
+        let b2_ords = [0u16];
+        let b2_codes = [0x88u8];
+        let b_runs = [
+            BuildRun {
+                cluster_id: 0,
+                doc_ids: &b0_docs,
+                ordinals: &b0_ords,
+                codes: &b0_codes,
+            },
+            BuildRun {
+                cluster_id: 2,
+                doc_ids: &b2_docs,
+                ordinals: &b2_ords,
+                codes: &b2_codes,
+            },
+        ];
+        let mut header_b = binary_header(3);
+        header_b.num_clusters = 8;
+        let mut b_bytes = Vec::new();
+        write_built_runs(header_b, &b_runs, &mut b_bytes).unwrap();
+        let b = AnnDiskIndex::open(OwnedBytes::new(b_bytes), AnnKind::BinaryIvf, 3).unwrap();
+
+        // Generation 1: byte-copy A (docs 0..5) + B (docs 5..8).
+        let mut gen1_bytes = Vec::new();
+        write_merged_ann(&[(&a, 0), (&b, 5)], &mut gen1_bytes).unwrap();
+        let gen1 = AnnDiskIndex::open(OwnedBytes::new(gen1_bytes), AnnKind::BinaryIvf, 8).unwrap();
+
+        // Generation 2 sources: gen1 (docs 0..8) + A again (docs 8..13).
+        let sources: [(&AnnDiskIndex, u32); 2] = [(&gen1, 0), (&a, 8)];
+        let predicted = predicted_merge_fragmentation(&sources);
+        // 4 runs (gen1) + 2 runs (a) over 3 distinct clusters {0, 2, 5}.
+        assert!((predicted - 2.0).abs() < 1e-9, "{predicted}");
+
+        let mut copied_bytes = Vec::new();
+        write_merged_ann(&sources, &mut copied_bytes).unwrap();
+        let copied =
+            AnnDiskIndex::open(OwnedBytes::new(copied_bytes), AnnKind::BinaryIvf, 13).unwrap();
+        let mut compacted_bytes = Vec::new();
+        write_compacted_ann_cancellable(&sources, &mut compacted_bytes, None).unwrap();
+        let compacted =
+            AnnDiskIndex::open(OwnedBytes::new(compacted_bytes), AnnKind::BinaryIvf, 13).unwrap();
+
+        // Byte-copy carries the fragmentation forward; compaction resets it.
+        let copied_health = copied.health();
+        let compacted_health = compacted.health();
+        assert!((copied_health.fragmentation() - 2.0).abs() < 1e-9);
+        assert!((compacted_health.fragmentation() - 1.0).abs() < 1e-9);
+        assert_eq!(compacted_health.runs, 3, "one run per non-empty cluster");
+        assert_eq!(copied_health.vectors, compacted_health.vectors);
+        assert_eq!(copied_health.payload_bytes, compacted_health.payload_bytes);
+        assert_eq!(
+            copied_health.largest_cluster_vectors,
+            compacted_health.largest_cluster_vectors
+        );
+
+        // Every cluster returns identical (doc, ordinal, score) results.
+        for cluster in 0..8u32 {
+            let query = [0x5Au8];
+            let from_copy = copied
+                .search_binary_clusters::<false>(&query, 16, &[cluster])
+                .unwrap();
+            let from_compact = compacted
+                .search_binary_clusters::<false>(&query, 16, &[cluster])
+                .unwrap();
+            assert_eq!(from_copy, from_compact, "cluster {cluster} diverged");
+        }
+
+        // Doc IDs are absolute now: every directory entry has doc_base 0.
+        assert!(compacted.runs.iter().all(|run| run.doc_base == 0));
+
+        // A compacted payload is indistinguishable from a built one, so it
+        // must remain a valid source for future ordinary byte-copy merges.
+        let mut generation3 = Vec::new();
+        write_merged_ann(&[(&compacted, 0), (&b, 13)], &mut generation3).unwrap();
+        let generation3 =
+            AnnDiskIndex::open(OwnedBytes::new(generation3), AnnKind::BinaryIvf, 16).unwrap();
+        assert_eq!(generation3.health().vectors, 16);
+        // And the third A copy's docs landed at offset 8.
+        let all: Vec<(u32, u16, f32)> = compacted
+            .search_binary_clusters::<false>(&[0x5A], 32, &[0, 2, 5])
+            .unwrap();
+        let mut docs: Vec<u32> = all.iter().map(|&(doc, _, _)| doc).collect();
+        docs.sort_unstable();
+        assert_eq!(docs, (0..=12).collect::<Vec<u32>>());
+    }
+
+    /// Compaction is undefined for block-packed TQ codes and must refuse.
+    #[test]
+    fn compaction_refuses_non_binary_payloads() {
+        // A binary payload whose header is rewritten to the TQ kind would not
+        // validate, so exercise the guard through the real gate: any source
+        // list whose first header is not BinaryIvf is refused before a byte
+        // is written. Reuse a TQ payload from the flat-TQ writer used by the
+        // pruning tests.
+        let codec = std::sync::Arc::new(crate::structures::TqCodec::new(8));
+        let mut builder = crate::structures::TqFlatBuilder::new(codec);
+        builder
+            .add_batch(
+                &[(0, 0), (1, 0)],
+                &[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                    0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+            )
+            .unwrap();
+        builder.finish();
+        let mut bytes = Vec::new();
+        write_built_tq_flat(&builder, &mut bytes).unwrap();
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, 2).unwrap();
+        let error = write_compacted_ann_cancellable(&[(&disk, 0)], &mut Vec::new(), None)
+            .expect_err("TQ payloads must not compact");
+        assert!(error.to_string().contains("binary"), "{error}");
+    }
 
     /// Health math on a hand-built payload: two runs of one cluster (a
     /// byte-copy merge shape) plus one dominant leaf, checked against the

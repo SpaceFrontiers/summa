@@ -1334,6 +1334,105 @@ async fn test_all_zero_binary_query_is_refused() {
     assert!(!results.is_empty(), "non-zero queries must still be served");
 }
 
+/// The merge and reorder compaction policies together: a 2-way byte-copy
+/// merge stays below the merge threshold and carries fragmentation 2.0, and
+/// the explicit reorder pass — the external `reorder` API — then compacts the
+/// binary ANN payload back to one extent per cluster with identical results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reorder_compacts_fragmented_binary_ann_runs() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::query::BinaryDenseVectorQuery;
+
+    let dim_bits = 64;
+    let byte_len = dim_bits / 8;
+    let mut sb = SchemaBuilder::default();
+    sb.set_index_name("reorder-compaction");
+    let title = sb.add_text_field("title", true, true);
+    let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
+    let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
+    // A reorder-enabled BMP sparse field so the reorder pass has its usual
+    // BP work to do alongside the ANN compaction.
+    let sparse = sb.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        crate::structures::SparseVectorConfig::splade_bmp(),
+    );
+    sb.set_reorder(sparse, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+    let add_batch = |writer: &mut IndexWriter<RamDirectory>, offset: u32| {
+        for i in 0u32..60 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("doc {} hemoglobin", offset + i));
+            let value = (offset + i) as u8 | 0x01;
+            doc.add_binary_dense_vector(bvec, vec![value; byte_len]);
+            doc.add_sparse_vector(sparse, vec![(0, 1.0), (1 + (i % 5), 0.5)]);
+            writer.add_document(doc).unwrap();
+        }
+    };
+    add_batch(&mut writer, 0);
+    writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    add_batch(&mut writer, 100);
+    writer.commit().await.unwrap();
+    // Merge the two ANN-bearing segments: 2 sources is below the merge
+    // compaction threshold, so byte-copy preserves both extents per cluster.
+    writer.force_merge().await.unwrap();
+
+    let fragmentation_of = |segments: &[std::sync::Arc<crate::segment::SegmentReader>]| {
+        segments
+            .iter()
+            .filter_map(|segment| segment.ann_health(bvec))
+            .map(|health| health.fragmentation())
+            .fold(0.0f64, f64::max)
+    };
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let before = fragmentation_of(&index.segment_readers().await.unwrap());
+    assert!(
+        before > 1.5,
+        "byte-copy merge must leave multi-extent clusters, got {before}"
+    );
+    let needle = vec![0x0f_u8 | 0x01; byte_len];
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let before_results = searcher
+        .search(&BinaryDenseVectorQuery::new(bvec, needle.clone()), 10)
+        .await
+        .unwrap();
+    drop(searcher);
+
+    // The external reorder API: BP-reorders the sparse field AND compacts
+    // the fragmented binary ANN payload.
+    writer.reorder().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    let after = fragmentation_of(&index.segment_readers().await.unwrap());
+    assert!(
+        (after - 1.0).abs() < 1e-9,
+        "reorder must compact ANN runs to one extent per cluster, got {after}"
+    );
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let after_results = searcher
+        .search(&BinaryDenseVectorQuery::new(bvec, needle), 10)
+        .await
+        .unwrap();
+    assert_eq!(before_results.len(), after_results.len());
+    for (before_hit, after_hit) in before_results.iter().zip(&after_results) {
+        assert!(
+            (before_hit.score - after_hit.score).abs() < 1e-6,
+            "scores must be identical after compaction"
+        );
+    }
+}
+
 /// Partial probing with a non-`Max` combiner: reusing the probe's exact scores
 /// must not lose the ordinals that live *outside* the probed leaves.
 ///

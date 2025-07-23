@@ -291,6 +291,10 @@ pub struct SegmentMerger {
     /// the SegmentManager always passes its background pool so BP cannot
     /// starve query scoring.
     background_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Compact binary ANN runs regardless of the fragmentation threshold.
+    /// The explicit reorder/optimize pass sets this: an optimize command
+    /// should hand back the freshly-built one-extent-per-cluster layout.
+    pub(crate) force_ann_compaction: bool,
     /// Granularity for merge-time BP. `Auto` by default; the SegmentManager
     /// forces `Records` when any merge source is an unconverged partial
     /// reorder.
@@ -319,6 +323,7 @@ impl SegmentMerger {
             schema,
             reorder_bmp: false,
             background_pool: None,
+            force_ann_compaction: false,
             granularity: crate::segment::reorder::BpGranularity::Auto,
             bp_budget: crate::segment::BpBudget::full(),
             cancellation: None,
@@ -335,6 +340,12 @@ impl SegmentMerger {
     }
 
     /// Run merge-time BP on this bounded pool instead of the global one.
+    /// Compact binary ANN runs even below the merge fragmentation threshold.
+    pub fn with_forced_ann_compaction(mut self, force: bool) -> Self {
+        self.force_ann_compaction = force;
+        self
+    }
+
     pub fn with_background_pool(mut self, pool: Option<Arc<rayon::ThreadPool>>) -> Self {
         self.background_pool = pool;
         self

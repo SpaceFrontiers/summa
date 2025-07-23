@@ -84,6 +84,31 @@ headroom; both would have fired months early):
 - `fragmentation ≥ 8` → warn (a rebuilt segment is 1.0; 32-way merges can
   reach 32 in one step)
 
+## Run compaction
+
+Fragmentation now heals itself instead of only being reported:
+
+- **Merges** compact binary ANN runs when the byte-copy output would reach
+  fragmentation ≥ 4 (`ANN_COMPACTION_FRAGMENTATION_THRESHOLD`): the payload is
+  rewritten cluster-major — one extent per cluster, document IDs made absolute
+  — restoring the freshly-built layout. Below the threshold, merges keep the
+  cheap byte-copy, so shallow merge trees pay nothing.
+- **The external `reorder` API** (the optimize pass) compacts at _any_
+  fragmentation above 1.0, alongside its BP reorder of sparse fields. It
+  requires the trained artifacts to be loaded; without them the vectors file
+  is cloned unchanged and a warning names why.
+
+Compaction streams the same payload bytes the byte-copy merge already
+writes; the only extra work is one `u32` add per posting for the doc-ID
+rewrite. Peak extra memory is a 256 KiB scratch buffer plus one 48-byte
+directory record per non-empty cluster — nothing scales with vectors.
+Measured on 0.32 GiB across 4 sources (aarch64, warm cache): byte-copy
+9.8 GiB/s, compaction 20.1 GiB/s — the cluster-major writer is _faster_
+because it streams larger sequential extents. TQ payloads are exempt: their
+codes are block-packed and cannot be concatenated without re-packing.
+
+`hermes_ann_fragmentation` and `hermes-tool diagnose` observe the outcome.
+
 ## Tiers
 
 ### Passive: segment open (always on)
