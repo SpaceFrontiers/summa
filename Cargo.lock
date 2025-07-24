@@ -1383,9 +1383,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e30e509674ef0ec91e21a7735766db37d163d46151b6a361d8b83dd79116bd"
+checksum = "e9bb72bb94fdc1bd619f4c18cc91ecf6302aeb333d31b3c6ec0bb841cd920209"
 dependencies = [
  "link-section",
  "linktime-proc-macro",
@@ -2411,11 +2411,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -3029,7 +3028,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3074,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "anyhow",
  "axum",
@@ -3108,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "anyhow",
  "pest",
@@ -3120,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3129,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "anyhow",
  "clap",
@@ -3153,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3172,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3195,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3214,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.98"
+version = "1.8.99"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
