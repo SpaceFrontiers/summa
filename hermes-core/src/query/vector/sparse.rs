@@ -78,10 +78,10 @@ impl std::fmt::Display for SparseVectorQuery {
 impl SparseVectorQuery {
     /// Create a new sparse vector query
     ///
-    /// Default combiner is `LogSumExp { temperature: 0.7 }` which provides
-    /// saturation for documents with many sparse vectors (e.g., 100+ ordinals).
-    /// This prevents over-weighting from multiple matches while still allowing
-    /// additional matches to contribute to the score.
+    /// Default combiner is `LogSumExp { temperature: 0.7 }` — a
+    /// softmax-weighted smooth maximum. A document's score follows its
+    /// strongest ordinals; ordinal *count* contributes nothing on its own,
+    /// so many-chunk documents cannot outrank a focused strong match.
     pub fn new(field: Field, vector: Vec<(u32, f32)>) -> Self {
         let mut q = Self {
             field,

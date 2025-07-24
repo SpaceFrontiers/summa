@@ -9,9 +9,17 @@ pub enum MultiValueCombiner {
     Max,
     /// Take the average score
     Avg,
-    /// Log-Sum-Exp: smooth maximum approximation (default)
-    /// `score = (1/t) * log(Σ exp(t * sᵢ))`
-    /// Higher temperature → closer to max; lower → closer to mean
+    /// Softmax-weighted smooth maximum (default)
+    /// `score = Σ softmax(t * sᵢ) * sᵢ`
+    /// Higher temperature → closer to max; lower → closer to mean.
+    ///
+    /// Deliberately NOT the raw `(1/t)·log(Σ exp(t·sᵢ))`: that form adds
+    /// `ln(n)/t` per document, so chunk *count* outranked chunk quality —
+    /// a 300-chunk compendium of mediocre matches beat every focused paper
+    /// (score 0.55 + ln(300)/1.5 ≈ 4.3 vs 0.72 + ln(3)/1.5 ≈ 1.4). The
+    /// softmax weighting is count-invariant (n identical scores combine to
+    /// that score), bounded by the max, and still tracks a dominant score
+    /// at any scale.
     LogSumExp {
         /// Temperature parameter (default: 1.5)
         temperature: f32,
@@ -94,8 +102,9 @@ impl MultiValueCombiner {
                 sum / scores.len() as f32
             }
             MultiValueCombiner::LogSumExp { temperature } => {
-                // Numerically stable log-sum-exp:
-                // LSE(x) = max(x) + log(Σ exp(xᵢ - max(x)))
+                // Softmax-weighted average, numerically stabilized by
+                // subtracting the max before exponentiation. The max's own
+                // weight is exp(0) = 1, so the denominator is never zero.
                 let t = *temperature;
                 let max_score = scores
                     .iter()
@@ -103,12 +112,14 @@ impl MultiValueCombiner {
                     .max_by(|a, b| a.total_cmp(b))
                     .unwrap_or(0.0);
 
-                let sum_exp: f32 = scores
-                    .iter()
-                    .map(|(_, s)| (t * (s - max_score)).exp())
-                    .sum();
-
-                max_score + sum_exp.ln() / t
+                let mut weight_sum = 0.0f32;
+                let mut weighted = 0.0f32;
+                for (_, s) in scores {
+                    let weight = (t * (s - max_score)).exp();
+                    weight_sum += weight;
+                    weighted += weight * s;
+                }
+                weighted / weight_sum
             }
             MultiValueCombiner::WeightedTopK { k, decay } => {
                 // Sort scores descending and take top k
@@ -167,9 +178,57 @@ mod tests {
         let scores = vec![(0, 1.0), (1, 2.0), (2, 3.0)];
         let combiner = MultiValueCombiner::log_sum_exp();
         let result = combiner.combine(&scores);
-        // LogSumExp should be between max (3.0) and max + log(n)/t
-        assert!(result >= 3.0);
-        assert!(result <= 3.0 + (3.0_f32).ln() / 1.5);
+        // A smooth maximum lives between the mean and the max, weighted
+        // toward the max.
+        assert!(result > 2.0, "must exceed the mean, got {result}");
+        assert!(result <= 3.0, "must never exceed the max, got {result}");
+    }
+
+    /// The production incident this pins: a 300-chunk compendium whose chunks
+    /// all score ~0.5 must not outrank a 3-chunk paper whose chunks score
+    /// ~0.7. The additive `ln(n)/t` count term of the raw log-sum-exp did
+    /// exactly that (0.55 + ln(300)/1.5 ≈ 4.3 vs 0.72 + ln(3)/1.5 ≈ 1.4),
+    /// which buried every relevant result for "off-label aripiprazole usage"
+    /// under generic long documents.
+    #[test]
+    fn log_sum_exp_is_count_invariant_and_bounded_by_max() {
+        let combiner = MultiValueCombiner::log_sum_exp();
+
+        // n identical scores combine to that score, regardless of n.
+        let identical: Vec<(u32, f32)> = (0..300).map(|i| (i, 0.7)).collect();
+        let combined = combiner.combine(&identical);
+        assert!(
+            (combined - 0.7).abs() < 1e-3,
+            "300 identical 0.7 chunks must combine to 0.7, got {combined}"
+        );
+
+        // Many mediocre chunks never outrank a few strong ones.
+        let mut compendium: Vec<(u32, f32)> = (0..300).map(|i| (i, 0.5)).collect();
+        compendium.push((300, 0.55));
+        let paper = vec![(0, 0.72), (1, 0.70), (2, 0.65)];
+        let compendium_score = combiner.combine(&compendium);
+        let paper_score = combiner.combine(&paper);
+        assert!(
+            paper_score > compendium_score,
+            "3 strong chunks ({paper_score}) must beat 301 mediocre ones ({compendium_score})"
+        );
+    }
+
+    /// The reason the fix is a softmax-weighted average rather than
+    /// `LSE - ln(n)/t`: subtracting the count term turns the combiner into a
+    /// near-average in the peaked regime, collapsing a document whose single
+    /// chunk scores 15 among 299 zeros to ~6.4. The softmax weighting keeps
+    /// it at the dominant score.
+    #[test]
+    fn log_sum_exp_tracks_a_dominant_score_at_sparse_scale() {
+        let combiner = MultiValueCombiner::log_sum_exp_with_temperature(0.7);
+        let mut scores: Vec<(u32, f32)> = (0..299).map(|i| (i, 0.0)).collect();
+        scores.push((299, 15.0));
+        let combined = combiner.combine(&scores);
+        assert!(
+            (combined - 15.0).abs() < 0.3,
+            "one dominant sparse chunk must keep its score, got {combined}"
+        );
     }
 
     #[test]

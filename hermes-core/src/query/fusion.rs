@@ -155,9 +155,10 @@ pub fn fuse_ranked_lists(
 /// - Fused results carry per-chunk `positions`, so `ordinal_scores` survive
 ///   fusion (chunk attribution for snippets / chunk selection).
 ///
-/// `MultiValueCombiner::Max` is the recommended combiner: RRF contributions
-/// are small in magnitude, which makes `LogSumExp` degenerate (temperature
-/// far exceeds the score scale).
+/// `MultiValueCombiner::Max` is the recommended combiner. `LogSumExp` is
+/// also safe now that it is a softmax-weighted maximum — at RRF's small
+/// score scale it degrades toward a mean rather than growing with chunk
+/// count — but `Max` states the intent directly.
 pub fn fuse_ranked_lists_chunked(
     lists: Vec<(Vec<SearchResult>, f32)>,
     method: FusionMethod,

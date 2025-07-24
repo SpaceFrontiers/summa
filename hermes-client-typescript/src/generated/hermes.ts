@@ -47,7 +47,7 @@ export function fusionMethodToJSON(object: FusionMethod): string {
 
 /** How to combine scores for multi-valued documents */
 export enum MultiValueCombiner {
-  /** COMBINER_LOG_SUM_EXP - Log-sum-exp smooth maximum (default) */
+  /** COMBINER_LOG_SUM_EXP - Softmax-weighted smooth maximum (default); count-invariant */
   COMBINER_LOG_SUM_EXP = 0,
   /** COMBINER_MAX - Take maximum score */
   COMBINER_MAX = 1,

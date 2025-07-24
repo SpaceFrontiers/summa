@@ -91,7 +91,7 @@ message FusionQuery {
 
 // How to combine scores for multi-valued documents
 enum MultiValueCombiner {
-  COMBINER_LOG_SUM_EXP = 0;  // Log-sum-exp smooth maximum (default)
+  COMBINER_LOG_SUM_EXP = 0;  // Softmax-weighted smooth maximum (default); count-invariant
   COMBINER_MAX = 1;          // Take maximum score
   COMBINER_AVG = 2;          // Average all scores
   COMBINER_SUM = 3;          // Sum all scores

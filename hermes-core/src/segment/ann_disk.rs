@@ -2593,29 +2593,54 @@ mod tests {
         write_built_runs(binary_header(6), &runs, &mut bytes).unwrap();
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 3).unwrap();
 
-        for combiner in [
-            crate::query::MultiValueCombiner::Sum,
-            crate::query::MultiValueCombiner::default(),
-        ] {
-            let (result, probed) = disk
-                .search_binary_combined_documents(1, &[0], &[0, 1], combiner)
-                .unwrap();
-            assert_eq!(result.len(), 1, "combined search must honor k");
-            assert_eq!(
-                result[0].doc_id, 1,
-                "SOAR duplicate changed {combiner:?} ranking: {result:?}",
-            );
-            // Exact leaf scores are handed back only for the retained document,
-            // deduplicated and sorted, so reranking can skip re-reading them.
-            assert_eq!(
-                probed
-                    .iter()
-                    .map(|&(doc_id, ordinal, _)| (doc_id, ordinal))
-                    .collect::<Vec<_>>(),
-                vec![(1, 0), (1, 1)],
-                "{combiner:?}",
-            );
-        }
+        // Under Sum the SOAR duplicate decides the winner outright: doc 0
+        // counted twice (2.0) would beat doc 1's two distinct values (1.5);
+        // deduplicated, doc 1 wins.
+        let sum = crate::query::MultiValueCombiner::Sum;
+        let (result, probed) = disk
+            .search_binary_combined_documents(1, &[0], &[0, 1], sum)
+            .unwrap();
+        assert_eq!(result.len(), 1, "combined search must honor k");
+        assert_eq!(
+            result[0].doc_id, 1,
+            "SOAR duplicate changed {sum:?} ranking: {result:?}",
+        );
+        // Exact leaf scores are handed back only for the retained document,
+        // deduplicated and sorted, so reranking can skip re-reading them.
+        assert_eq!(
+            probed
+                .iter()
+                .map(|&(doc_id, ordinal, _)| (doc_id, ordinal))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (1, 1)],
+            "{sum:?}",
+        );
+
+        // Under the default smooth-max combiner doc 0's perfect ordinal wins
+        // regardless of the duplicate, so dedup is pinned through the exact
+        // score instead: it must equal the combiner over the two *distinct*
+        // ordinals (1.0 and 0.0) — a double-counted (doc 0, ordinal 0) would
+        // inflate it.
+        let smooth_max = crate::query::MultiValueCombiner::default();
+        let (result, probed) = disk
+            .search_binary_combined_documents(1, &[0], &[0, 1], smooth_max)
+            .unwrap();
+        assert_eq!(result.len(), 1, "combined search must honor k");
+        assert_eq!(result[0].doc_id, 0, "{result:?}");
+        let expected = smooth_max.combine(&[(0, 1.0), (1, 0.0)]);
+        assert!(
+            (result[0].score - expected).abs() < 1e-6,
+            "SOAR duplicate leaked into {smooth_max:?}: got {}, expected {expected}",
+            result[0].score,
+        );
+        assert_eq!(
+            probed
+                .iter()
+                .map(|&(doc_id, ordinal, _)| (doc_id, ordinal))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (0, 1)],
+            "{smooth_max:?}",
+        );
 
         let (top_two, probed) = disk
             .search_binary_combined_documents(
@@ -2738,9 +2763,12 @@ mod tests {
             sum[0].doc_id, 1,
             "two complete values must make doc 1 win by Sum: {sum:?}"
         );
+        // The default combiner is a smooth maximum: doc 0's single best value
+        // (1.0) outranks doc 1's two 0.8 values — value count alone no longer
+        // wins. Sum above is what pins that both of doc 1's values were seen.
         assert_eq!(
-            default_combiner[0].doc_id, 1,
-            "default LogSumExp must aggregate complete documents: {default_combiner:?}"
+            default_combiner[0].doc_id, 0,
+            "default smooth-max must follow the best value: {default_combiner:?}"
         );
         assert!(sum[0].score > max[0].2);
 
