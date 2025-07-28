@@ -8,9 +8,11 @@ live clients so selection, replay, and leakage controls are testable.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -20,8 +22,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-MAX_SEARCH_WINDOW = 50_000
 MAX_SEARCH_API_PAGE = 500
+MIN_SEARCH_API_PAGE = 10
+MAX_SEARCH_WINDOW = MAX_SEARCH_API_PAGE
+CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+class SearchPageCapacityError(RuntimeError):
+    """A transient Search API failure that may improve with a smaller page."""
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,7 @@ class SearchMatch:
     language: str | None
     rank: int
     score: float
+    partition: str = "all"
 
 
 @dataclass
@@ -119,6 +128,40 @@ def _nonnegative_number(value: Any, label: str) -> float:
     return float(value)
 
 
+def _validate_time_partitions(value: Any, label: str) -> None:
+    _require(
+        isinstance(value, list) and value,
+        f"{label} must be a non-empty array",
+    )
+    names: set[str] = set()
+    for partition in value:
+        _require(isinstance(partition, dict), f"{label} entries must be objects")
+        name = partition.get("name")
+        _require(
+            isinstance(name, str) and name.strip(),
+            f"{label} entries need a name",
+        )
+        _require(name not in names, f"duplicate {label} entry {name!r}")
+        issued_after = partition.get("issued_after")
+        issued_before = partition.get("issued_before")
+        for boundary, boundary_name in (
+            (issued_after, "issued_after"),
+            (issued_before, "issued_before"),
+        ):
+            if boundary is not None:
+                _require(
+                    isinstance(boundary, int) and not isinstance(boundary, bool),
+                    f"{label} entry {name!r} {boundary_name} must be Unix seconds",
+                )
+        _require(
+            issued_after is None
+            or issued_before is None
+            or issued_after < issued_before,
+            f"{label} entry {name!r} must have issued_after < issued_before",
+        )
+        names.add(name)
+
+
 def validate_config(config: dict[str, Any]) -> None:
     """Validate the versioned build configuration before any network I/O."""
     _require(
@@ -139,6 +182,30 @@ def validate_config(config: dict[str, Any]) -> None:
         page_size <= MAX_SEARCH_API_PAGE,
         "search_api.page_size exceeds the Search API page limit",
     )
+    _positive_int(
+        search_api.get("concurrency", 1),
+        "search_api.concurrency must be positive",
+    )
+    _positive_int(
+        search_api.get("fallback_concurrency", 1),
+        "search_api.fallback_concurrency must be positive",
+    )
+    _nonnegative_int(
+        search_api.get("minimum_page_retries", 12),
+        "search_api.minimum_page_retries must be non-negative",
+    )
+    minimum_page_retry = _nonnegative_number(
+        search_api.get("minimum_page_retry_seconds", 30),
+        "search_api.minimum_page_retry_seconds must be non-negative",
+    )
+    maximum_page_retry = _nonnegative_number(
+        search_api.get("minimum_page_retry_max_seconds", 180),
+        "search_api.minimum_page_retry_max_seconds must be non-negative",
+    )
+    _require(
+        maximum_page_retry >= minimum_page_retry,
+        "search_api.minimum_page_retry_max_seconds must be at least minimum_page_retry_seconds",
+    )
     _nonnegative_int(
         search_api.get("max_retries", 6),
         "search_api.max_retries must be non-negative",
@@ -155,6 +222,44 @@ def validate_config(config: dict[str, Any]) -> None:
         maximum_retry >= initial_retry,
         "search_api.retry_max_seconds must be at least retry_initial_seconds",
     )
+    for key in ("filter_language", "filter_document_types", "cross_rerank"):
+        if key in search_api:
+            _require(
+                isinstance(search_api[key], bool),
+                f"search_api.{key} must be boolean",
+            )
+    _require(
+        search_api.get("cross_rerank", False) is False,
+        "search_api.cross_rerank must be false for curriculum discovery",
+    )
+    _require(
+        "rerank_factor" not in search_api,
+        "search_api.rerank_factor is not supported for curriculum discovery",
+    )
+    if "heap_factor" in search_api:
+        heap_factor = search_api["heap_factor"]
+        _require(
+            isinstance(heap_factor, (int, float)) and 0 < heap_factor <= 1,
+            "search_api.heap_factor must be in (0, 1]",
+        )
+    _validate_time_partitions(
+        search_api.get("time_partitions", [{"name": "all"}]),
+        "search_api.time_partitions",
+    )
+    partition_profiles = search_api.get("time_partition_profiles", {})
+    _require(
+        isinstance(partition_profiles, dict),
+        "search_api.time_partition_profiles must be an object",
+    )
+    for profile_name, profile in partition_profiles.items():
+        _require(
+            isinstance(profile_name, str) and profile_name.strip(),
+            "search_api.time_partition_profiles keys must be non-empty",
+        )
+        _validate_time_partitions(
+            profile,
+            f"search_api.time_partition_profiles[{profile_name!r}]",
+        )
 
     stages = config.get("stages")
     _require(isinstance(stages, list) and stages, "at least one stage is required")
@@ -164,6 +269,21 @@ def validate_config(config: dict[str, Any]) -> None:
         name = stage.get("name")
         _require(isinstance(name, str) and name.strip(), f"stage {index} needs a name")
         _require(name not in names, f"duplicate stage name {name!r}")
+        _require(
+            not ("time_partitions" in stage and "time_partition_profile" in stage),
+            f"stage {name!r} cannot set both time_partitions and time_partition_profile",
+        )
+        if "time_partitions" in stage:
+            _validate_time_partitions(
+                stage["time_partitions"],
+                f"stage {name!r} time_partitions",
+            )
+        if "time_partition_profile" in stage:
+            profile_name = stage["time_partition_profile"]
+            _require(
+                isinstance(profile_name, str) and profile_name in partition_profiles,
+                f"stage {name!r} references unknown time partition profile {profile_name!r}",
+            )
         searches = stage.get("searches")
         _require(
             isinstance(searches, list) and searches, f"stage {name!r} needs searches"
@@ -193,7 +313,7 @@ def validate_config(config: dict[str, Any]) -> None:
             )
             _require(
                 limit <= MAX_SEARCH_WINDOW,
-                f"search {search_name!r} exceeds 50,000 hits",
+                f"search {search_name!r} exceeds the Search API 500-hit window",
             )
             search_names.add(search_name)
 
@@ -215,6 +335,21 @@ def validate_config(config: dict[str, Any]) -> None:
         _validate_training(name, stage.get("training"))
         names.add(name)
 
+    alloydb = config.get("alloydb", {})
+    _require(isinstance(alloydb, dict), "alloydb must be an object")
+    _positive_int(
+        alloydb.get("batch_size", 500),
+        "alloydb.batch_size must be positive",
+    )
+    connections = _positive_int(
+        alloydb.get("connections", 1),
+        "alloydb.connections must be positive",
+    )
+    _positive_int(
+        alloydb.get("prefetch_batches", connections),
+        "alloydb.prefetch_batches must be positive",
+    )
+
     output = config.get("output", {})
     _require(isinstance(output, dict), "output must be an object")
     _require(
@@ -226,6 +361,42 @@ def validate_config(config: dict[str, Any]) -> None:
         and 0 <= validation_fraction < 0.5,
         "output.validation_fraction must be in [0, 0.5)",
     )
+    for key in ("minimum_causal_tokens", "target_causal_tokens"):
+        if key in output:
+            _positive_int(output[key], f"output.{key} must be positive")
+    if "minimum_causal_tokens" in output and "target_causal_tokens" in output:
+        _require(
+            output["target_causal_tokens"] >= output["minimum_causal_tokens"],
+            "output.target_causal_tokens must be at least minimum_causal_tokens",
+        )
+    if output.get("streaming", False):
+        _require(
+            output.get("compression", "zstd") in {"none", "zstd"},
+            "streaming output has an invalid compression",
+        )
+        _positive_int(
+            output.get("token_batch_characters", 16_000_000),
+            "output.token_batch_characters must be positive",
+        )
+    for key in ("streaming", "cleanup_build_artifacts"):
+        if key in output:
+            _require(isinstance(output[key], bool), f"output.{key} must be boolean")
+    quality = config.get("quality", {})
+    _require(isinstance(quality, dict), "quality must be an object")
+    for key in (
+        "max_control_character_fraction",
+        "max_replacement_character_fraction",
+    ):
+        if key not in quality:
+            continue
+        value = quality[key]
+        _require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and 0 <= value < 1,
+            f"quality.{key} must be in [0, 1)",
+        )
 
 
 def _validate_training(stage_name: str, training: Any) -> None:
@@ -294,76 +465,187 @@ async def discover_with_search_api(
         "segments": info.get("num_segments"),
     }
     page_size = search_api.get("page_size", 250)
+    default_partitions = search_api.get("time_partitions", [{"name": "all"}])
+    partition_profiles = search_api.get("time_partition_profiles", {})
+    semaphore = asyncio.Semaphore(int(search_api.get("concurrency", 1)))
+    fallback_semaphore = asyncio.Semaphore(
+        int(search_api.get("fallback_concurrency", 1))
+    )
     candidates: dict[str, dict[str, Candidate]] = {
         stage["name"]: {} for stage in config["stages"]
     }
     search_stats: list[dict[str, Any]] = []
 
-    for stage in config["stages"]:
-        stage_candidates = candidates[stage["name"]]
-        for search in stage["searches"]:
-            configured_limit = search.get(
-                "limit", search_api.get("limit_per_search", 1_000)
-            )
-            limit = (
-                min(configured_limit, search_limit_override)
-                if search_limit_override is not None
-                else configured_limit
-            )
-            offset = 0
-            unique_ids: set[str] = set()
-            total_hits: int | None = None
-            while offset < limit:
-                request_limit = min(page_size, limit - offset)
-                response = await client.search(
+    async def run_search(
+        stage: dict[str, Any],
+        search: dict[str, Any],
+        partition: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        list[tuple[int, dict[str, Any]]],
+        int | None,
+        int,
+    ]:
+        configured_limit = search.get(
+            "limit", search_api.get("limit_per_search", MAX_SEARCH_WINDOW)
+        )
+        limit = (
+            min(configured_limit, search_limit_override)
+            if search_limit_override is not None
+            else configured_limit
+        )
+        offset = 0
+        dynamic_page_size = page_size
+        minimum_page_failures = 0
+        unique_ids: set[str] = set()
+        ranked_hits: list[tuple[int, dict[str, Any]]] = []
+        total_hits: int | None = None
+
+        async def request_page(
+            request_limit: int, request_offset: int
+        ) -> dict[str, Any]:
+            async with semaphore:
+                return await client.search(
                     index_name,
                     query=search["query"],
                     limit=request_limit,
-                    offset=offset,
+                    offset=request_offset,
                     language=search.get("language"),
+                    document_types=tuple(stage.get("document_types", [])),
+                    issued_after=partition.get("issued_after"),
+                    issued_before=partition.get("issued_before"),
                 )
-                total_hits = response["total_hits"]
-                if not response["hits"]:
-                    break
-                for page_rank, hit in enumerate(response["hits"]):
-                    document_id = _as_scalar(hit.get("id"))
-                    if not document_id or document_id in unique_ids:
-                        continue
-                    unique_ids.add(document_id)
-                    candidate = stage_candidates.setdefault(
-                        document_id,
-                        Candidate(
-                            document_id=document_id,
-                            stage=stage["name"],
-                            uris=_as_strings(hit.get("uris")),
-                        ),
+
+        while offset < limit:
+            request_limit = min(dynamic_page_size, limit - offset)
+            try:
+                if dynamic_page_size < page_size:
+                    async with fallback_semaphore:
+                        response = await request_page(request_limit, offset)
+                else:
+                    response = await request_page(request_limit, offset)
+            except SearchPageCapacityError:
+                if request_limit <= MIN_SEARCH_API_PAGE:
+                    minimum_page_failures += 1
+                    maximum_failures = int(search_api.get("minimum_page_retries", 12))
+                    if minimum_page_failures > maximum_failures:
+                        raise
+                    delay = min(
+                        float(search_api.get("minimum_page_retry_seconds", 30))
+                        * (2 ** (minimum_page_failures - 1)),
+                        float(search_api.get("minimum_page_retry_max_seconds", 180)),
                     )
-                    score = float(hit.get("score", 0.0))
-                    candidate.matches.append(
-                        SearchMatch(
-                            stage=stage["name"],
-                            search=search["name"],
-                            retrieval_query=search["query"],
-                            language=search.get("language"),
-                            rank=offset + page_rank,
-                            score=score if math.isfinite(score) else 0.0,
-                        )
+                    logging.warning(
+                        "minimum Search API page failed stage=%s search=%s partition=%s offset=%d; retrying in %.1fs (%d/%d)",
+                        stage["name"],
+                        search["name"],
+                        partition["name"],
+                        offset,
+                        delay,
+                        minimum_page_failures,
+                        maximum_failures,
                     )
-                offset += len(response["hits"])
-                if (
-                    len(response["hits"]) < request_limit
-                    or offset >= response["total_hits"]
-                ):
-                    break
-            search_stats.append(
-                {
-                    "stage": stage["name"],
-                    "search": search["name"],
-                    "total_hits": total_hits,
-                    "fetched_unique_ids": len(unique_ids),
-                    "limit": limit,
-                }
+                    await asyncio.sleep(delay)
+                    continue
+                if request_limit > 250:
+                    dynamic_page_size = 250
+                elif request_limit > 50:
+                    dynamic_page_size = 50
+                else:
+                    dynamic_page_size = max(MIN_SEARCH_API_PAGE, request_limit // 2)
+                logging.warning(
+                    "splitting Search API page stage=%s search=%s partition=%s offset=%d from=%d to=%d",
+                    stage["name"],
+                    search["name"],
+                    partition["name"],
+                    offset,
+                    request_limit,
+                    dynamic_page_size,
+                )
+                continue
+            minimum_page_failures = 0
+            total_hits = response["total_hits"]
+            logging.info(
+                "discovered stage=%s search=%s partition=%s offset=%d hits=%d total_hits=%d",
+                stage["name"],
+                search["name"],
+                partition["name"],
+                offset,
+                len(response["hits"]),
+                total_hits,
             )
+            if not response["hits"]:
+                break
+            for page_rank, hit in enumerate(response["hits"]):
+                document_id = _as_scalar(hit.get("id"))
+                if not document_id or document_id in unique_ids:
+                    continue
+                unique_ids.add(document_id)
+                ranked_hits.append((offset + page_rank, hit))
+            offset += len(response["hits"])
+            if (
+                len(response["hits"]) < request_limit
+                or offset >= response["total_hits"]
+            ):
+                break
+        return stage, search, partition, ranked_hits, total_hits, limit
+
+    def stage_partitions(stage: dict[str, Any]) -> list[dict[str, Any]]:
+        if "time_partitions" in stage:
+            return stage["time_partitions"]
+        profile_name = stage.get("time_partition_profile")
+        if profile_name is not None:
+            return partition_profiles[profile_name]
+        return default_partitions
+
+    tasks = [
+        asyncio.create_task(run_search(stage, search, partition))
+        for stage in config["stages"]
+        for search in stage["searches"]
+        for partition in stage_partitions(stage)
+    ]
+    for task in asyncio.as_completed(tasks):
+        stage, search, partition, ranked_hits, total_hits, limit = await task
+        stage_candidates = candidates[stage["name"]]
+        for rank, hit in ranked_hits:
+            document_id = _as_scalar(hit.get("id"))
+            candidate = stage_candidates.setdefault(
+                document_id,
+                Candidate(
+                    document_id=document_id,
+                    stage=stage["name"],
+                    uris=_as_strings(hit.get("uris")),
+                ),
+            )
+            score = float(hit.get("score", 0.0))
+            candidate.matches.append(
+                SearchMatch(
+                    stage=stage["name"],
+                    search=search["name"],
+                    retrieval_query=search["query"],
+                    language=search.get("language"),
+                    rank=rank,
+                    score=score if math.isfinite(score) else 0.0,
+                    partition=partition["name"],
+                )
+            )
+        search_stats.append(
+            {
+                "stage": stage["name"],
+                "search": search["name"],
+                "partition": partition["name"],
+                "issued_after": partition.get("issued_after"),
+                "issued_before": partition.get("issued_before"),
+                "total_hits": total_hits,
+                "fetched_unique_ids": len(ranked_hits),
+                "limit": limit,
+            }
+        )
+    search_stats.sort(
+        key=lambda item: (item["stage"], item["search"], item["partition"])
+    )
     return Discovery(candidates=candidates, searches=search_stats, index=index)
 
 
@@ -443,13 +725,27 @@ def _eligible(
     stage: dict[str, Any],
     candidate: Candidate,
     document: FullDocument,
+    quality: dict[str, Any] | None = None,
 ) -> str | None:
     title = document.title
     content = document.content
+    quality = quality or {}
     if len(content) < stage.get("min_content_chars", 500):
         return "content_too_short"
     if len(content) > stage.get("max_content_chars", 5_000_000):
         return "content_too_long"
+    content_length = max(len(content), 1)
+    replacement_fraction = content.count("\ufffd") / content_length
+    if replacement_fraction > quality.get(
+        "max_replacement_character_fraction",
+        1.0,
+    ):
+        return "replacement_characters"
+    control_fraction = (
+        sum(1 for _ in CONTROL_CHARACTER_RE.finditer(content)) / content_length
+    )
+    if control_fraction > quality.get("max_control_character_fraction", 1.0):
+        return "control_characters"
     allowed_types = stage.get("document_types", [])
     if allowed_types and document.document_type not in allowed_types:
         return "document_type"
@@ -529,7 +825,12 @@ def select_documents(
             if document is None:
                 rejected["missing_in_alloydb"] += 1
                 continue
-            reason = _eligible(stage, candidate, document)
+            reason = _eligible(
+                stage,
+                candidate,
+                document,
+                config.get("quality", {}),
+            )
             if reason is not None:
                 rejected[reason] += 1
                 continue
@@ -558,6 +859,13 @@ def select_documents(
                 )
             )
         minimum = stage.get("min_documents", 2)
+        logging.info(
+            "selected stage=%s accepted=%d candidates=%d rejected=%s",
+            name,
+            len(accepted),
+            len(candidates),
+            json.dumps(dict(sorted(rejected.items())), sort_keys=True),
+        )
         _require(
             len(accepted) >= minimum,
             f"stage {name!r} selected {len(accepted)} documents, below min_documents {minimum}",
@@ -581,6 +889,13 @@ def _split_long_paragraph(paragraph: str, limit: int) -> list[str]:
     return pieces
 
 
+def _sanitize_training_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\x0c", "\n\n").replace("\ufffd", " ")
+    text = CONTROL_CHARACTER_RE.sub(" ", text)
+    return re.sub(r" {3,}", "  ", text).strip()
+
+
 def chunk_document(
     selected: SelectedDocument,
     *,
@@ -590,9 +905,9 @@ def chunk_document(
 ) -> list[str]:
     """Split a canonical document on paragraph boundaries without overlap."""
     document = selected.document
-    title = document.title
-    abstract = document.abstract
-    content = document.content.replace("\x00", "").replace("\r\n", "\n")
+    title = _sanitize_training_text(document.title)
+    abstract = _sanitize_training_text(document.abstract)
+    content = _sanitize_training_text(document.content)
     prefix_parts = []
     if title:
         prefix_parts.append(f"# {title}")
@@ -711,7 +1026,7 @@ def _retrieval_records(
         own_chunks = chunks.get(item.document.document_id, [])
         if not own_chunks:
             continue
-        title = item.document.title
+        title = _sanitize_training_text(item.document.title)
         fallback_query = min(
             item.candidate.matches, key=lambda match: match.rank
         ).retrieval_query
@@ -831,10 +1146,36 @@ def _write_jsonl(
     compression: str,
 ) -> dict[str, Any]:
     temporary = path.with_name(f".{path.name}.tmp")
+    uncompressed_bytes = 0
+    payload_characters = 0
     with _open_jsonl(temporary, compression) as stream:
         for record in records:
-            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
-            stream.write("\n")
+            serialized = json.dumps(
+                record,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            line = f"{serialized}\n"
+            stream.write(line)
+            uncompressed_bytes += len(line.encode("utf-8"))
+            for key in (
+                "text",
+                "document",
+                "summary",
+                "request",
+                "plan",
+                "context",
+                "query",
+                "positive",
+            ):
+                value = record.get(key)
+                if isinstance(value, str):
+                    payload_characters += len(value)
+            negatives = record.get("negatives")
+            if isinstance(negatives, list):
+                payload_characters += sum(
+                    len(value) for value in negatives if isinstance(value, str)
+                )
     os.replace(temporary, path)
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -844,6 +1185,8 @@ def _write_jsonl(
         "path": path.name,
         "records": len(records),
         "bytes": path.stat().st_size,
+        "uncompressed_bytes": uncompressed_bytes,
+        "payload_characters": payload_characters,
         "sha256": digest.hexdigest(),
     }
 
@@ -963,10 +1306,24 @@ def write_outputs(
     stage_stats = {}
     for stage in config["stages"]:
         name = stage["name"]
+        stage_documents = selected[name]
         stage_stats[name] = {
-            "selected_documents": len(selected[name]),
-            "training_documents": sum(not item.validation for item in selected[name]),
-            "validation_documents": sum(item.validation for item in selected[name]),
+            "selected_documents": len(stage_documents),
+            "training_documents": sum(not item.validation for item in stage_documents),
+            "validation_documents": sum(item.validation for item in stage_documents),
+            "languages": dict(
+                sorted(Counter(item.language for item in stage_documents).items())
+            ),
+            "document_types": dict(
+                sorted(
+                    Counter(
+                        item.document.document_type for item in stage_documents
+                    ).items()
+                )
+            ),
+            "canonical_content_characters": sum(
+                len(item.document.content) for item in stage_documents
+            ),
             "rejections": rejection_stats[name],
         }
     manifest = {

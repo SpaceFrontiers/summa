@@ -41,23 +41,64 @@ hybrid discovery and returns IDs plus lightweight metadata;
 copy for only those IDs. Search-result text can never enter the output. URI
 scheme and prefix do not affect selection; URIs are metadata only. The builder
 requires Search API's `hybrid` mode, which fuses sparse and dense retrieval.
+Both reranking paths are explicitly disabled: discovery sends `rerank: false`
+and `cross_rerank: false`.
+The example uses focused English and Russian subject queries rather than one
+generic result window. Each query runs once without a date constraint and again
+across publication-time buckets, always using the Search API's complete 500-hit
+window; IDs are then globally deduplicated. This broadens coverage without
+offset pagination beyond the API's `offset + limit <= 500` contract. Discovery
+is constrained by each stage's document types, while language is verified
+against the canonical AlloyDB record instead of adding an expensive search-time
+language scan. University and research stages use a named yearly partition
+profile from 1980 onward, exposing enough distinct high-quality results to meet
+the corpus token contract without weakening title or text-quality filters.
 
 Install the live-only dependencies, set the standard libpq environment
 variables (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`), and
 run:
 
 ```bash
-python -m pip install asyncpg zstandard
+python -m pip install asyncpg zstandard gigatoken==0.10.0
 python hermes-train/scripts/build_education_curriculum.py \
   --config hermes-train/education-curriculum.example.json \
+  --tokenizer tokenizer.json \
   --output /data/education-curriculum
 ```
 
-Use `--search-limit 10` for a live smoke build. The output includes the staged
-JSONL files, validation splits, a directly consumable `curriculum.json`, and a
-checksummed `manifest.json` with Search API query and rejection counts. Selection
-and replay are covered without live services by
+Use `--search-limit 10` for a live smoke build; an explicit search cap is
+recorded in the manifest and skips the production minimum-token gate. The
+output includes the staged JSONL files, validation splits, a directly
+consumable `curriculum.json`, and a checksummed `manifest.json` with Search API
+query and rejection counts. The manifest embeds the complete non-secret build
+configuration and its canonical hash for deterministic reproduction. An
+ID/score/URI-only cache under `.discovery-cache/` makes interrupted discovery
+resumable without retaining Search API snippets or other enriched fields.
+The manifest also records canonical character counts plus language and document
+type distributions so a completed corpus can be sized and audited without
+opening document bodies. Documents with concentrated extraction-control or
+Unicode replacement characters are rejected; isolated parser controls are
+normalized before shard writing.
+Large builds use a bounded-memory streaming path: canonical bodies are fetched
+from AlloyDB with deterministic multi-connection prefetch, written immediately,
+and never retained beyond the bounded prefetch/tokenization windows. A SQLite
+build catalog plus atomic tier files makes discovery and completed tiers
+restartable. GigaToken counts every emitted chunk with the exact deployed
+`tokenizer.json`; the example refuses to finish below 10 billion unique causal
+tokens and records both unique tokens and replay-adjusted curriculum exposure in
+the manifest. The final advanced stage stops after the exact count crosses the
+15-billion target (with at most one prefetched-batch overshoot); hard document
+caps keep the result in the requested 10–20B range.
+Selection and replay are covered without live services by
 `python3 hermes-train/scripts/test_education_curriculum.py`.
+After a production build, independently re-read every shard, verify checksums,
+split isolation, text hygiene, and all stored token counts with:
+
+```bash
+python hermes-train/scripts/audit_education_curriculum.py \
+  --output /data/education-curriculum \
+  --tokenizer tokenizer.json
+```
 
 Training is defined by a versioned JSON curriculum; stage geometry is not split
 between CLI flags and a data manifest. Start from
