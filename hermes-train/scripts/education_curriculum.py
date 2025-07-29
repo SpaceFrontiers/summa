@@ -284,6 +284,26 @@ def validate_config(config: dict[str, Any]) -> None:
                 isinstance(profile_name, str) and profile_name in partition_profiles,
                 f"stage {name!r} references unknown time partition profile {profile_name!r}",
             )
+        split_document_types = stage.get("search_document_types_separately", False)
+        _require(
+            isinstance(split_document_types, bool),
+            f"stage {name!r} search_document_types_separately must be boolean",
+        )
+        if split_document_types:
+            document_types = stage.get("document_types")
+            _require(
+                isinstance(document_types, list)
+                and document_types
+                and all(
+                    isinstance(document_type, str) and document_type.strip()
+                    for document_type in document_types
+                ),
+                f"stage {name!r} needs document_types to split searches",
+            )
+            _require(
+                search_api.get("filter_document_types", False) is True,
+                f"stage {name!r} cannot split types when search document-type filtering is disabled",
+            )
         searches = stage.get("searches")
         _require(
             isinstance(searches, list) and searches, f"stage {name!r} needs searches"
@@ -480,10 +500,12 @@ async def discover_with_search_api(
         stage: dict[str, Any],
         search: dict[str, Any],
         partition: dict[str, Any],
+        document_types: tuple[str, ...],
     ) -> tuple[
         dict[str, Any],
         dict[str, Any],
         dict[str, Any],
+        tuple[str, ...],
         list[tuple[int, dict[str, Any]]],
         int | None,
         int,
@@ -513,7 +535,7 @@ async def discover_with_search_api(
                     limit=request_limit,
                     offset=request_offset,
                     language=search.get("language"),
-                    document_types=tuple(stage.get("document_types", [])),
+                    document_types=document_types,
                     issued_after=partition.get("issued_after"),
                     issued_before=partition.get("issued_before"),
                 )
@@ -538,10 +560,11 @@ async def discover_with_search_api(
                         float(search_api.get("minimum_page_retry_max_seconds", 180)),
                     )
                     logging.warning(
-                        "minimum Search API page failed stage=%s search=%s partition=%s offset=%d; retrying in %.1fs (%d/%d)",
+                        "minimum Search API page failed stage=%s search=%s partition=%s types=%s offset=%d; retrying in %.1fs (%d/%d)",
                         stage["name"],
                         search["name"],
                         partition["name"],
+                        ",".join(document_types) or "all",
                         offset,
                         delay,
                         minimum_page_failures,
@@ -556,10 +579,11 @@ async def discover_with_search_api(
                 else:
                     dynamic_page_size = max(MIN_SEARCH_API_PAGE, request_limit // 2)
                 logging.warning(
-                    "splitting Search API page stage=%s search=%s partition=%s offset=%d from=%d to=%d",
+                    "splitting Search API page stage=%s search=%s partition=%s types=%s offset=%d from=%d to=%d",
                     stage["name"],
                     search["name"],
                     partition["name"],
+                    ",".join(document_types) or "all",
                     offset,
                     request_limit,
                     dynamic_page_size,
@@ -568,10 +592,11 @@ async def discover_with_search_api(
             minimum_page_failures = 0
             total_hits = response["total_hits"]
             logging.info(
-                "discovered stage=%s search=%s partition=%s offset=%d hits=%d total_hits=%d",
+                "discovered stage=%s search=%s partition=%s types=%s offset=%d hits=%d total_hits=%d",
                 stage["name"],
                 search["name"],
                 partition["name"],
+                ",".join(document_types) or "all",
                 offset,
                 len(response["hits"]),
                 total_hits,
@@ -590,7 +615,15 @@ async def discover_with_search_api(
                 or offset >= response["total_hits"]
             ):
                 break
-        return stage, search, partition, ranked_hits, total_hits, limit
+        return (
+            stage,
+            search,
+            partition,
+            document_types,
+            ranked_hits,
+            total_hits,
+            limit,
+        )
 
     def stage_partitions(stage: dict[str, Any]) -> list[dict[str, Any]]:
         if "time_partitions" in stage:
@@ -600,14 +633,29 @@ async def discover_with_search_api(
             return partition_profiles[profile_name]
         return default_partitions
 
+    def stage_document_type_groups(stage: dict[str, Any]) -> list[tuple[str, ...]]:
+        document_types = tuple(stage.get("document_types", []))
+        if stage.get("search_document_types_separately", False):
+            return [(document_type,) for document_type in document_types]
+        return [document_types]
+
     tasks = [
-        asyncio.create_task(run_search(stage, search, partition))
+        asyncio.create_task(run_search(stage, search, partition, document_types))
         for stage in config["stages"]
         for search in stage["searches"]
         for partition in stage_partitions(stage)
+        for document_types in stage_document_type_groups(stage)
     ]
     for task in asyncio.as_completed(tasks):
-        stage, search, partition, ranked_hits, total_hits, limit = await task
+        (
+            stage,
+            search,
+            partition,
+            document_types,
+            ranked_hits,
+            total_hits,
+            limit,
+        ) = await task
         stage_candidates = candidates[stage["name"]]
         for rank, hit in ranked_hits:
             document_id = _as_scalar(hit.get("id"))
@@ -636,6 +684,7 @@ async def discover_with_search_api(
                 "stage": stage["name"],
                 "search": search["name"],
                 "partition": partition["name"],
+                "document_types": list(document_types),
                 "issued_after": partition.get("issued_after"),
                 "issued_before": partition.get("issued_before"),
                 "total_hits": total_hits,
@@ -644,7 +693,12 @@ async def discover_with_search_api(
             }
         )
     search_stats.sort(
-        key=lambda item: (item["stage"], item["search"], item["partition"])
+        key=lambda item: (
+            item["stage"],
+            item["search"],
+            item["partition"],
+            item["document_types"],
+        )
     )
     return Discovery(candidates=candidates, searches=search_stats, index=index)
 

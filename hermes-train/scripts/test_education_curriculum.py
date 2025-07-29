@@ -217,6 +217,25 @@ class EducationCurriculumTests(unittest.IsolatedAsyncioTestCase):
             await discover_with_search_api(search_api, config)
         self.assertEqual(search_api.calls, 1)
 
+    async def test_discovery_can_split_each_search_by_document_type(self):
+        config = minimal_config()
+        stage = config["stages"][0]
+        stage["document_types"] = ["book", "report"]
+        stage["search_document_types_separately"] = True
+        search_api = FakeSearchApi()
+
+        discovery = await discover_with_search_api(search_api, config)
+
+        self.assertEqual(
+            {call[1]["document_types"] for call in search_api.calls},
+            {("book",), ("report",)},
+        )
+        self.assertEqual(len(discovery.candidates["foundations"]), 2)
+        self.assertEqual(
+            {tuple(item["document_types"]) for item in discovery.searches},
+            {("book",), ("report",)},
+        )
+
     async def test_search_api_does_not_retry_hydration_budget_errors(self):
         class OversizedClient(SearchApiClient):
             def __init__(self):
@@ -635,6 +654,19 @@ class EducationCurriculumTests(unittest.IsolatedAsyncioTestCase):
         config = minimal_config()
         config["stages"][0]["time_partition_profile"] = "missing"
         with self.assertRaisesRegex(ValueError, "unknown time partition profile"):
+            validate_config(config)
+
+    def test_document_type_split_requires_document_types(self):
+        config = minimal_config()
+        stage = config["stages"][0]
+        stage["search_document_types_separately"] = True
+        stage["document_types"] = []
+        with self.assertRaisesRegex(ValueError, "needs document_types"):
+            validate_config(config)
+
+        config = minimal_config()
+        config["stages"][0]["search_document_types_separately"] = True
+        with self.assertRaisesRegex(ValueError, "filtering is disabled"):
             validate_config(config)
 
     def test_curriculum_discovery_cannot_enable_reranking(self):

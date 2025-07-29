@@ -944,6 +944,7 @@
     {
       "name": "advanced-scholarship",
       "time_partition_profile": "research-yearly",
+      "search_document_types_separately": true,
       "languages": ["en", "ru"],
       "allow_unknown_language": false,
       "document_types": ["journal-article", "book", "report"],

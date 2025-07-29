@@ -55,7 +55,9 @@ profile from 1980 onward. Their subject-specific hybrid queries provide the
 positive relevance gate; canonical document type, language, negative-title,
 and text-quality checks remain mandatory. Foundation and school stages also
 require positive title patterns, where educational level cannot be inferred
-safely from a broad subject query alone.
+safely from a broad subject query alone. Advanced searches run once per
+canonical document type so one high-volume type cannot consume the complete
+500-hit fusion window for a subject and year.
 
 Install the live-only dependencies, set the standard libpq environment
 variables (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`), and
