@@ -6,7 +6,7 @@
 //! losses, while retrieval batches retain positive and hard-negative grouping.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -72,6 +72,7 @@ fn replay_token_cache(
         cache.write_all(TOKEN_CACHE_MAGIC)?;
         cache.flush()?;
     }
+    cache.rewind()?;
 
     let mut reader = BufReader::new(cache);
     let mut magic = [0_u8; 8];
@@ -595,6 +596,23 @@ mod tests {
                 .unwrap();
         assert_eq!(documents, 3);
         assert_eq!(replay_count, 2);
+    }
+
+    #[test]
+    fn new_token_cache_rewinds_after_writing_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.bin");
+        let mut packer = SamplePacker::new(3);
+        let mut count = 0;
+        let mut visit = |_| Ok(true);
+
+        let (documents, keep_going, writer) =
+            replay_token_cache(&path, 0, &mut packer, &mut count, &mut visit).unwrap();
+
+        assert_eq!(documents, 0);
+        assert!(keep_going);
+        assert!(writer.is_some());
+        assert_eq!(fs::read(path).unwrap(), TOKEN_CACHE_MAGIC);
     }
 
     #[test]

@@ -1467,6 +1467,23 @@ mod tests {
     }
 
     #[test]
+    fn retriever_300m_moe_has_the_intended_sparse_budget() {
+        let model = get_builtin_model("retriever-300m-moe").unwrap();
+        assert_eq!(model.estimated_params(), 299_929_088);
+        assert_eq!(model.num_layers, 24);
+        assert_eq!(model.pattern.as_ref().unwrap().len(), 6);
+
+        let moe_layers: Vec<_> = (0..model.num_layers)
+            .filter_map(|layer| model.block_for_layer(layer).ffn.moe.as_ref())
+            .collect();
+        assert_eq!(moe_layers.len(), 12);
+        assert!(moe_layers.iter().all(|moe| moe.experts == 15));
+        assert!(moe_layers.iter().all(|moe| moe.top_k == 2));
+        assert!(moe_layers.iter().all(|moe| moe.shared_experts == 0));
+        assert_eq!(model.block_for_layer(23).name, "attn_moe_block");
+    }
+
+    #[test]
     fn test_norm_none_and_rmsnorm() {
         let base = |norm: &str| {
             format!(
