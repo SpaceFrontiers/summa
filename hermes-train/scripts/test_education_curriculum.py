@@ -648,6 +648,25 @@ class EducationCurriculumTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "rerank_factor is not supported"):
             validate_config(config)
 
+    def test_query_gated_stage_can_use_only_negative_title_patterns(self):
+        stage = minimal_config()["stages"][0]
+        stage.pop("title_allow_patterns")
+        stage["title_deny_patterns"] = ["course catalog"]
+        candidate = Candidate(document_id="selected", stage="foundations")
+        document = FullDocument(
+            document_id="selected",
+            document_type="book",
+            uris=(),
+            blob={
+                "title": "Collected exercises",
+                "languages": ["en"],
+                "content": "letters form words and sentences " * 20,
+            },
+        )
+        self.assertIsNone(_eligible(stage, candidate, document))
+        document.blob["title"] = "Course catalog"
+        self.assertEqual(_eligible(stage, candidate, document), "title_denied")
+
     def test_concentrated_extraction_corruption_is_rejected(self):
         stage = minimal_config()["stages"][0]
         candidate = Candidate(document_id="corrupt", stage="foundations")

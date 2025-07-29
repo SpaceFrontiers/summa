@@ -705,13 +705,9 @@
       "min_content_chars": 1500,
       "max_content_chars": 5000000,
       "max_duplicate_line_fraction": 0.35,
-      "max_documents": 30000,
-      "max_documents_per_language": 24000,
+      "max_documents": 50000,
+      "max_documents_per_language": 40000,
       "min_documents": 250,
-      "title_allow_patterns": [
-        "\\b(textbook|handbook|lecture notes|course|foundations|principles|calculus|linear algebra|discrete mathematics|probability|statistics|differential equations|mechanics|electrodynamics|chemistry|biology|genetics|algorithms|data structures|operating systems|databases|networks|software engineering|economics|philosophy|logic|psychology|linguistics|research methods)\\b",
-        "(учебник|учебное пособие|задачник|курс лекц|высшая математик|математический анализ|линейная алгебр|дискретн|теори.*вероятност|статистик|дифференциальн|механик|электродинамик|хими|биолог|генетик|алгоритм|структур.*данн|операционн.*систем|баз.*данн|сетев|программирован|экономик|философ|логик|психолог|лингвист|метод.*исследован)"
-      ],
       "title_deny_patterns": [
         "^\\s*(the\\s+)?[\\w .'-]+\\b(university|college)\\s*$",
         "^\\s*[\\w .«»\"'-]+\\b(университет|институт|академия)\\s*$",
@@ -954,13 +950,9 @@
       "min_content_chars": 1500,
       "max_content_chars": 5000000,
       "max_duplicate_line_fraction": 0.35,
-      "max_documents": 50000,
-      "max_documents_per_language": 40000,
+      "max_documents": 200000,
+      "max_documents_per_language": 160000,
       "min_documents": 300,
-      "title_allow_patterns": [
-        "\\b(advanced|graduate|monograph|handbook|review|proceedings|journal|thesis|dissertation|analysis|theory|algebra|geometry|topology|probability|statistics|optimization|algorithms|complexity|machine learning|information retrieval|language model|distributed systems|database|cryptography|quantum|astrophysics|materials science|catalysis|genomics|molecular biology|neuroscience|clinical|climate|econometrics|linguistics|robotics|control systems)\\b",
-        "(монограф|диссертац|научн|теори|анализ|аспирант|алгебр|геометр|тополог|вероятност|статистик|оптимизац|алгоритм|сложност|машинн.*обучен|информационн.*поиск|языков.*модел|распределенн.*систем|баз.*данн|криптограф|квантов|астрофиз|материаловед|катализ|геном|молекулярн.*биолог|нейро|клиническ|климат|эконометр|лингвист|робот|теори.*управлен)"
-      ],
       "title_deny_patterns": [
         "\\b(how to write|getting .* published|publication guide|literature review organizer|research agenda for graduate education|for beginners|introductory|introduction to|basics of|fundamentals of|book review)\\b",
         "(как написать|подготовка презентации|организация работы студентов|публикационная активность|для начинающих|введение в|основы|рецензия на)"

@@ -51,8 +51,11 @@ offset pagination beyond the API's `offset + limit <= 500` contract. Discovery
 is constrained by each stage's document types, while language is verified
 against the canonical AlloyDB record instead of adding an expensive search-time
 language scan. University and research stages use a named yearly partition
-profile from 1980 onward, exposing enough distinct high-quality results to meet
-the corpus token contract without weakening title or text-quality filters.
+profile from 1980 onward. Their subject-specific hybrid queries provide the
+positive relevance gate; canonical document type, language, negative-title,
+and text-quality checks remain mandatory. Foundation and school stages also
+require positive title patterns, where educational level cannot be inferred
+safely from a broad subject query alone.
 
 Install the live-only dependencies, set the standard libpq environment
 variables (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`), and
