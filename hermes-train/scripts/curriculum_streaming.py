@@ -274,6 +274,8 @@ def _state_connection(
         );
         CREATE INDEX IF NOT EXISTS matches_negative_lookup
             ON matches(stage, search, rank, document_id);
+        CREATE INDEX IF NOT EXISTS matches_document_cleanup
+            ON matches(document_id);
         CREATE TABLE IF NOT EXISTS stage_stats (
             stage TEXT PRIMARY KEY,
             stage_index INTEGER NOT NULL,

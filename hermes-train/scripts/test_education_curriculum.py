@@ -9,7 +9,11 @@ from urllib.error import HTTPError
 
 from audit_education_curriculum import audit
 from build_education_curriculum import SearchApiClient
-from curriculum_streaming import _sampled_records, build_live_streaming
+from curriculum_streaming import (
+    _sampled_records,
+    _state_connection,
+    build_live_streaming,
+)
 from education_curriculum import (
     Candidate,
     FullDocument,
@@ -635,6 +639,21 @@ class EducationCurriculumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), 23)
         self.assertEqual(len({record["document_id"] for record in first}), 23)
+
+    def test_streaming_state_indexes_cascade_cleanup_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            connection = _state_connection(
+                Path(temporary) / "state.sqlite3",
+                "config-hash",
+                "tokenizer-hash",
+            )
+            try:
+                indexes = {
+                    row[1] for row in connection.execute("PRAGMA index_list('matches')")
+                }
+            finally:
+                connection.close()
+        self.assertIn("matches_document_cleanup", indexes)
 
     def test_non_text_query_is_rejected(self):
         config = minimal_config()
