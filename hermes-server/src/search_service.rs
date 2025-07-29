@@ -348,10 +348,13 @@ impl SearchResponseBudget {
 
     fn reserve(counter: &mut usize, bytes: usize, maximum: usize) -> Result<(), Status> {
         let next = counter.checked_add(bytes).ok_or_else(|| {
-            Status::resource_exhausted("Search response size accounting overflowed")
+            Status::invalid_argument("Search response size accounting overflowed")
         })?;
         if next > maximum {
-            return Err(Status::resource_exhausted(format!(
+            // Deterministic for a given request shape: retrying cannot succeed,
+            // so this must not be RESOURCE_EXHAUSTED (which clients treat as
+            // retryable capacity pressure, e.g. "Search capacity is full").
+            return Err(Status::invalid_argument(format!(
                 "Search response exceeds the {maximum}-byte hydration budget; \
                  request fewer hits or fields"
             )));
@@ -369,7 +372,7 @@ impl SearchResponseBudget {
         let framed = payload
             .checked_add(protobuf_varint_len(payload))
             .and_then(|bytes| bytes.checked_add(1))
-            .ok_or_else(|| Status::resource_exhausted("Search response encoded size overflowed"))?;
+            .ok_or_else(|| Status::invalid_argument("Search response encoded size overflowed"))?;
         Self::reserve(&mut self.encoded_bytes, framed, self.maximum)
     }
 }
@@ -411,11 +414,11 @@ fn retained_field_value_bytes(value: &CoreFieldValue) -> Result<usize, Status> {
         CoreFieldValue::SparseVector(entries) => entries
             .len()
             .checked_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f32>())
-            .ok_or_else(|| Status::resource_exhausted("Sparse field size overflowed"))?,
+            .ok_or_else(|| Status::invalid_argument("Sparse field size overflowed"))?,
         CoreFieldValue::DenseVector(values) => values
             .len()
             .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| Status::resource_exhausted("Dense field size overflowed"))?,
+            .ok_or_else(|| Status::invalid_argument("Dense field size overflowed"))?,
         CoreFieldValue::Json(json) => {
             let mut writer = CountingWriter::default();
             serde_json::to_writer(&mut writer, json).map_err(|error| {
@@ -427,7 +430,7 @@ fn retained_field_value_bytes(value: &CoreFieldValue) -> Result<usize, Status> {
     std::mem::size_of::<FieldValue>()
         .saturating_mul(2)
         .checked_add(payload)
-        .ok_or_else(|| Status::resource_exhausted("Response field size overflowed"))
+        .ok_or_else(|| Status::invalid_argument("Response field size overflowed"))
 }
 
 fn retained_hit_base_bytes(ordinal_count: usize) -> Result<usize, Status> {
@@ -435,7 +438,7 @@ fn retained_hit_base_bytes(ordinal_count: usize) -> Result<usize, Status> {
         .checked_mul(std::mem::size_of::<OrdinalScore>())
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SearchHit>()))
         .and_then(|bytes| bytes.checked_add(32)) // segment-id String backing bytes
-        .ok_or_else(|| Status::resource_exhausted("Search hit size overflowed"))
+        .ok_or_else(|| Status::invalid_argument("Search hit size overflowed"))
 }
 
 fn retained_field_entry_bytes(name: &str) -> usize {
@@ -1465,7 +1468,10 @@ mod tests {
         let mut retained = SearchResponseBudget::with_maximum(100);
         retained.reserve_retained(80).unwrap();
         let err = retained.reserve_retained(21).unwrap_err();
-        assert_eq!(err.code(), Code::ResourceExhausted);
+        // Budget violations are deterministic caller errors, not transient
+        // capacity pressure: clients retry ResourceExhausted with backoff,
+        // which can never succeed for an oversized hydration request.
+        assert_eq!(err.code(), Code::InvalidArgument);
 
         let hit = SearchHit {
             address: Some(DocAddress {
@@ -1485,7 +1491,7 @@ mod tests {
         };
         let mut encoded = SearchResponseBudget::with_maximum(64);
         let err = encoded.reserve_hit(&hit).unwrap_err();
-        assert_eq!(err.code(), Code::ResourceExhausted);
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[test]
