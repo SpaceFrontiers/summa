@@ -75,7 +75,7 @@ struct TrainArgs {
     #[arg(long, value_enum, default_value_t = Schedule::Wsd)]
     schedule: Schedule,
     /// Save a resumable checkpoint every N optimizer steps; 0 disables it.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 500)]
     checkpoint_every: usize,
     /// Record pre-clip gradient L2 norm for every layer every N optimizer
     /// steps; 0 disables this opt-in visualization/debug metric.

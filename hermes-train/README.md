@@ -24,7 +24,7 @@ hermes-train train \
   --tokenizer tokenizer.json \
   --curriculum curriculum.json \
   --output checkpoint \
-  --checkpoint-every 100
+  --checkpoint-every 500
 ```
 
 ### Build the education curriculum
@@ -127,10 +127,13 @@ both parameter sets. It supports cosine or warmup-stable-decay scheduling and
 fine-tuning from safetensors. CUDA training uses BF16 Tensor Core operands while
 model parameters and optimizer state remain FP32; Muon's Newton-Schulz
 iterations also use BF16.
-It writes the latest checkpoint every 100 optimizer steps by default; pass
-`--checkpoint-every 0` to save only at completion. Files are staged behind an
-in-progress marker and the training-state file is published last, so resume and
-remote sync never consume a partially replaced checkpoint.
+It writes the latest checkpoint every 500 optimizer steps by default; pass
+`--checkpoint-every 0` to save only at completion. A full checkpoint includes
+the model and both optimizer states, so accelerator work pauses while those
+tensors are copied and published. Choose a shorter interval only when the
+additional recovery granularity is worth that throughput cost. Files are staged
+behind an in-progress marker and the training-state file is published last, so
+resume and remote sync never consume a partially replaced checkpoint.
 Each training checkpoint includes weights, AdamW and Muon state, and the exact
 curriculum position. Relaunch the same command with `--resume` to replay the
 deterministic bounded shuffle up to that position and continue the schedule.
@@ -140,6 +143,11 @@ state from this stream without re-running the tokenizer; an interrupted tail
 record is discarded and rebuilt from the corpus. The cache is derived, may be
 deleted safely between runs, and is intentionally not uploaded as part of the
 authoritative model/optimizer checkpoint.
+Corpus reading, Zstandard decompression, tokenization, packing, and bounded
+shuffling run on a dedicated reader thread. It stays up to two batches ahead of
+the optimizer, so increasing host-side buffering does not improve throughput
+when that queue is already full; in that case the remaining utilization gap is
+inside accelerator execution or deliberate checkpoint/diagnostic pauses.
 Resume verifies the entire curriculum and optimization signature. Use
 `--checkpoint` instead when warm-starting a new curriculum from existing
 safetensors.
