@@ -1,0 +1,93 @@
+{
+  "version": 2,
+  "name": "retriever-300m-moe-in-model-sleep",
+  "phases": [
+    {
+      "name": "wake",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "corpus/wake.jsonl.zst",
+      "sequence_length": 4096,
+      "batch_size": 6,
+      "gradient_accumulation": 22,
+      "steps": 10000,
+      "periodic_sleep": {
+        "schedule": {
+          "clock": "optimizer_steps",
+          "terminal_consolidation": "distill_into_base_v1",
+          "tiers": [
+            {
+              "id": "fast",
+              "update_period": 100,
+              "reserve_slots": 2
+            },
+            {
+              "id": "medium",
+              "update_period": 400,
+              "reserve_slots": 4
+            },
+            {
+              "id": "slow",
+              "update_period": 3200,
+              "reserve_slots": 8
+            }
+          ]
+        },
+        "knowledge_seeding": {
+          "chunk_tokens": 512,
+          "teacher_rollouts": 4,
+          "detached_student_rollouts": 4,
+          "temperature": 1.0,
+          "forward_kl_weight": 1.0
+        },
+        "imitation": {
+          "semantic_judge_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "semantic_weight": 0.7,
+          "maximum_edit_distance": 32,
+          "grpo_group_size": 8
+        },
+        "dreaming": {
+          "candidate_count": 64,
+          "retain_top": 8,
+          "retain_random": 2,
+          "lora_rank": 64,
+          "lora_alpha": 128,
+          "restem_iterations": 1,
+          "selector_version": "gradient-cosine-v1",
+          "reference_set_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "trial_evaluator_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "retention_suite": "benchmarks/retention.sealed.json",
+        "retention_suite_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "retention": {
+          "evaluator_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "suite_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "max_anchor_forward_kl": 0.05,
+          "max_anchor_regression": 0.01,
+          "min_incorporation_gain": 0.0
+        },
+        "receiver_learning_rate": 0.0001,
+        "receiver_weight_decay": 0.01,
+        "grpo_clip_epsilon": 0.2,
+        "grpo_advantage_epsilon": 1e-06,
+        "grpo_kl_coefficient": 0.04,
+        "candidate_directory": "candidates"
+      }
+    },
+    {
+      "name": "retention-evaluation",
+      "type": "evaluation",
+      "task": {
+        "type": "qa_reasoning"
+      },
+      "data": "benchmarks/retention.jsonl.zst",
+      "sequence_length": 2048,
+      "batch_size": 8,
+      "parameters": {
+        "suite": "public-and-sealed"
+      }
+    }
+  ]
+}

@@ -47,6 +47,24 @@ impl TrainingSample {
             Self::Retrieval { .. } => "contrastive_retrieval",
         }
     }
+
+    /// A bounded token sequence observed by the wake model. Periodic sleep
+    /// seals these exact tokens into its model-owned context journal; it never
+    /// follows a corpus URI or performs a new search during consolidation.
+    pub(crate) fn wake_context_tokens(&self) -> Vec<i64> {
+        match self {
+            Self::Causal { tokens } | Self::Supervised { tokens, .. } => tokens.clone(),
+            Self::Retrieval {
+                query, documents, ..
+            } => {
+                let mut tokens = query.tokens.clone();
+                if let Some(positive) = documents.first() {
+                    tokens.extend_from_slice(&positive.tokens);
+                }
+                tokens
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

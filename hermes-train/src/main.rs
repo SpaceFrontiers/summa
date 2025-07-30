@@ -1,36 +1,84 @@
-use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use burn::module::{Module, ModuleVisitor, Param};
-use burn::tensor::Tensor;
+use burn::module::{AutodiffModule, Module, ModuleVisitor, Param};
+use burn::tensor::{Device, Tensor};
 use burn_nn::loss::CrossEntropyLossConfig;
 use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
 use clap::{Parser, Subcommand, ValueEnum};
-use hermes_llm::{ModelDef, Tokenizer, Transformer, load_safetensors};
+use hermes_llm::{
+    BlockDef, ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors,
+    upgrade_safetensors_to_memory,
+};
+
+use hermes_train::builtin_sleep_runtime::{
+    BuiltinPeriodicSleepBoundaryDriver, BuiltinSleepPhaseContextFactory,
+};
+use hermes_train::corpus::{
+    CorpusManifest, CurriculumCompositionConfig, HermesCorpusTokenizer,
+    SearchApiPostgresCorpusRecipe,
+};
+use hermes_train::device_sampler::{
+    DeviceSamplerDrain, NvidiaSmiSampler, NvidiaSmiSamplerConfig, validate_physical_device_selector,
+};
+use hermes_train::metrics::{
+    MetricContext, MetricEvent, MetricPhase, MetricPhaseKind, MetricWriter, OptimizationMetrics,
+    PhaseBoundary, PhaseTimingMetrics, QuantizationFormat as MetricQuantizationFormat,
+    QuantizationMetrics, QuantizationStage, ThroughputMetrics,
+};
+use hermes_train::native_sleep::{
+    NativeSleepCheckpoint, NativeSleepContextRegistry, NativeSleepPhaseExecutor,
+    drain_periodic_sleep_before_wake_step,
+};
+use hermes_train::posttrain::forward_kl_distillation_tensor;
+use hermes_train::qat_candidate::{open_qat_candidate, publish_qat_candidate};
+use hermes_train::quantization::{
+    BONSAI_GROUP_SIZE, QuantizationRecipe, UltraQuantFormat, WorkflowQuantizationPlan,
+    WorkflowQuantizationTraining, export_safetensors_archive, fake_quantized_transformer,
+};
+
+use hermes_train::runtime::{
+    ALL_PHASE_KINDS, ExecutorRegistry, ImmutableModelCheckpoint, RuntimeStatus, WorkflowRunState,
+    run_until_yield_or_complete, workflow_signature as runtime_workflow_signature,
+};
+use hermes_train::tier_optimizer::TierOptimizerBank;
+use hermes_train::worker::{AtomicRuntimeCheckpoint, ExternalPhaseExecutor};
+use hermes_train::workflow::{
+    PhaseKind, ResolvedWorkflow, load_workflow as load_workflow_v2,
+    validate_sleep_schedule_for_model, validate_workflow_for_model,
+};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 mod checkpoint;
-mod curriculum;
 mod data;
 mod muon;
 mod trainer;
+mod wake;
 
 use checkpoint::{
-    AdamWOptimizer, TRAINING_STATE_VERSION, TrainingState, load_training_state, parameter_ids,
-    save_training_checkpoint,
+    AdamWOptimizer, ArtifactRef, CheckpointPublication, OptimizerStateRef,
+    QuantizationTrainingState, RngStreamState, TRAINING_STATE_VERSION, TrainingState,
+    load_training_state, parameter_ids, save_training_checkpoint_with_evidence,
 };
-use curriculum::{ObjectiveConfig, ResolvedCurriculum, load_curriculum};
+#[cfg(test)]
+use data::TrainingSample;
 use data::{
     BatchStats, SampleStreamConfig, TrainingBatch, count_samples, make_batch, visit_samples,
 };
 use muon::BatchedMuon;
+use wake::{ObjectiveConfig, ResolvedWakePlan, load_wake_plan};
 
 const MUON_LR_SCALE: f64 = 20.0;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV1A64_PRIME: u64 = 0x100000001b3;
+const DATA_RNG_STREAM: &str = "data";
+const MODEL_RNG_STREAM: &str = "model_dropout";
+const MODEL_RNG_DOMAIN: u64 = 0xd2b7_4407_b1ce_6e93;
 
 #[derive(Parser)]
 #[command(name = "hermes-train", about = "Hermes model training")]
@@ -43,6 +91,19 @@ struct Cli {
 enum Command {
     /// Pretrain or fine-tune a MAL-defined language model.
     Train(TrainArgs),
+    /// Validate and resolve a strict WorkflowV2 file.
+    ValidateWorkflow(ValidateWorkflowArgs),
+    /// Build an immutable corpus using configured search and record adapters.
+    PrepareCorpus(PrepareCorpusArgs),
+    /// Compose classified corpus rows into fixed, stratified curriculum stages.
+    ComposeCurriculum(ComposeCurriculumArgs),
+    /// Export a complete binary/ternary ultra-low-bit checkpoint archive.
+    Quantize(QuantizeArgs),
+    /// Upgrade an ordinary checkpoint into an explicit sleep-memory topology.
+    UpgradeMemoryCheckpoint(UpgradeMemoryCheckpointArgs),
+
+    /// Run WorkflowV2 with pinned workers and first-party native sleep.
+    RunWorkflow(RunWorkflowArgs),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
@@ -52,6 +113,16 @@ enum Schedule {
     Cosine,
 }
 
+#[cfg(feature = "cuda")]
+const fn default_gpu_metrics_interval_ms() -> u64 {
+    1_000
+}
+
+#[cfg(not(feature = "cuda"))]
+const fn default_gpu_metrics_interval_ms() -> u64 {
+    0
+}
+
 #[derive(clap::Args)]
 struct TrainArgs {
     /// MAL source or exported JSON model configuration.
@@ -59,9 +130,9 @@ struct TrainArgs {
     config: PathBuf,
     #[arg(short = 't', long)]
     tokenizer: PathBuf,
-    /// Versioned JSON curriculum with explicit objectives and stage geometry.
+    /// Versioned JSON workflow with explicit objectives and phase geometry.
     #[arg(long)]
-    curriculum: PathBuf,
+    workflow: PathBuf,
     #[arg(short = 'o', long, default_value = "checkpoint")]
     output: PathBuf,
     #[arg(long, default_value_t = 3e-4)]
@@ -81,6 +152,13 @@ struct TrainArgs {
     /// steps; 0 disables this opt-in visualization/debug metric.
     #[arg(long, default_value_t = 0)]
     layer_metrics_every: usize,
+    /// Persistent nvidia-smi sampling interval in milliseconds. Zero disables
+    /// sampling. CUDA builds default to 1000; other builds default to disabled.
+    #[arg(long, default_value_t = default_gpu_metrics_interval_ms())]
+    gpu_metrics_interval_ms: u64,
+    /// Physical NVIDIA index, GPU UUID, or PCI bus ID passed to nvidia-smi.
+    #[arg(long, default_value = "0")]
+    gpu_physical_device: String,
     /// Safetensors checkpoint to fine-tune from.
     #[arg(long, conflicts_with = "resume")]
     checkpoint: Option<PathBuf>,
@@ -89,6 +167,139 @@ struct TrainArgs {
     resume: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Content-pinned first-party adapters and durable stores used by every
+    /// periodic in-model-sleep hook in the workflow.
+    #[arg(long, requires = "sleep_runtime_sha256")]
+    sleep_runtime: Option<PathBuf>,
+    /// Exact `sha256:<64 lowercase hex>` identity of --sleep-runtime.
+    #[arg(long, requires = "sleep_runtime")]
+    sleep_runtime_sha256: Option<String>,
+    /// Print the exact content-derived training run signature and exit without
+    /// creating output, checkpoint, metric, token-cache, or sleep-runtime state.
+    #[arg(long)]
+    print_run_signature: bool,
+}
+
+#[derive(clap::Args)]
+struct ValidateWorkflowArgs {
+    #[arg(long)]
+    workflow: PathBuf,
+    /// Exact MAL or exported JSON model topology to validate against every
+    /// model-mutating workflow phase, including periodic sleep and QAT.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Print only the exact signature consumed by the standalone WorkflowV2
+    /// runtime, without creating or advancing runtime state.
+    #[arg(long)]
+    signature_only: bool,
+}
+
+#[derive(clap::Args)]
+struct PrepareCorpusArgs {
+    /// Search/materialization/pipeline recipe. All field mappings live here.
+    #[arg(long)]
+    recipe: PathBuf,
+    #[arg(short = 't', long)]
+    tokenizer: PathBuf,
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+    /// Restart/audit state; never copied into the immutable corpus.
+    #[arg(long)]
+    work_directory: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct ComposeCurriculumArgs {
+    /// Versioned composition config with a content-pinned source manifest.
+    #[arg(long)]
+    config: PathBuf,
+    /// Parent directory for the immutable curriculum build.
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+    /// Transient bounded-memory stratum spools; removed after publication.
+    #[arg(long)]
+    work_directory: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum UltraQuantFormatArg {
+    BinaryG128,
+    TernaryG128,
+    TernaryEntropyG128,
+}
+
+impl From<UltraQuantFormatArg> for UltraQuantFormat {
+    fn from(value: UltraQuantFormatArg) -> Self {
+        match value {
+            UltraQuantFormatArg::BinaryG128 => Self::BinaryG128,
+            UltraQuantFormatArg::TernaryG128 => Self::TernaryG128,
+            UltraQuantFormatArg::TernaryEntropyG128 => Self::TernaryEntropyG128,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct QuantizeArgs {
+    #[arg(long)]
+    checkpoint: PathBuf,
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+    #[arg(long, value_enum)]
+    format: UltraQuantFormatArg,
+    #[arg(long, default_value_t = 0)]
+    ternary_warmup_steps: u64,
+    #[arg(long, default_value_t = 0.0)]
+    distillation_weight: f64,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    quantize_embeddings: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    quantize_lm_head: bool,
+}
+
+#[derive(clap::Args)]
+struct UpgradeMemoryCheckpointArgs {
+    #[arg(long)]
+    source_config: PathBuf,
+    #[arg(long)]
+    target_config: PathBuf,
+    #[arg(long)]
+    checkpoint: PathBuf,
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct RunWorkflowArgs {
+    #[arg(long)]
+    workflow: PathBuf,
+    /// Local executable implementing the versioned phase-worker protocol.
+    #[arg(long)]
+    executor: PathBuf,
+    /// Exact content identity required before every worker launch.
+    #[arg(long)]
+    executor_sha256: String,
+    #[arg(long = "executor-arg", allow_hyphen_values = true)]
+    executor_arguments: Vec<OsString>,
+    #[arg(long, default_value = "workflow-runtime.json")]
+    state: PathBuf,
+    /// Append-only typed JSONL metric journal emitted by the phase worker.
+    #[arg(long, requires = "run_id")]
+    metrics: Option<PathBuf>,
+    /// Stable metric run identity. Required whenever --metrics is set.
+    #[arg(long, requires = "metrics")]
+    run_id: Option<String>,
+    #[arg(long, requires = "initial_checkpoint_sha256")]
+    initial_checkpoint_uri: Option<String>,
+    #[arg(long, requires = "initial_checkpoint_uri")]
+    initial_checkpoint_sha256: Option<String>,
+    #[arg(long)]
+    resume: bool,
+    /// Content-pinned first-party adapter configuration for standalone sleep
+    /// phases. Periodic sleep is executed by the integrated `train` command.
+    #[arg(long, requires = "sleep_runtime_sha256")]
+    sleep_runtime: Option<PathBuf>,
+    #[arg(long, requires = "sleep_runtime")]
+    sleep_runtime_sha256: Option<String>,
 }
 
 fn load_config(path: &Path) -> Result<ModelDef> {
@@ -136,14 +347,18 @@ fn layer_gradient_norms(
     model: &Transformer,
     muon_grads: &GradientsParams,
     adamw_grads: &GradientsParams,
+    tier_grads: &[GradientsParams],
 ) -> Result<Vec<f32>> {
     let mut norms = Vec::with_capacity(model.config().num_layers);
     for layer in 0..model.config().num_layers {
-        let sum = sum_optional_tensors(
+        let mut sum = sum_optional_tensors(
             squared_layer_gradient_norm(model, layer, muon_grads)?,
             squared_layer_gradient_norm(model, layer, adamw_grads)?,
-        )
-        .ok_or_else(|| anyhow::anyhow!("layer {} has no gradients", layer + 1))?;
+        );
+        for gradients in tier_grads {
+            sum = sum_optional_tensors(sum, squared_layer_gradient_norm(model, layer, gradients)?);
+        }
+        let sum = sum.ok_or_else(|| anyhow::anyhow!("layer {} has no gradients", layer + 1))?;
         norms.push(sum.sqrt());
     }
     let values = Tensor::cat(norms, 0)
@@ -180,12 +395,17 @@ fn gradient_norm_and_clip(
     model: &Transformer,
     muon_grads: &mut GradientsParams,
     adamw_grads: &mut GradientsParams,
+    tier_grads: &mut [GradientsParams],
     max_norm: f32,
 ) -> Result<f32> {
-    let Some(sum) = sum_optional_tensors(
+    let mut sum = sum_optional_tensors(
         squared_gradient_norm(model, muon_grads),
         squared_gradient_norm(model, adamw_grads),
-    ) else {
+    );
+    for gradients in tier_grads.iter() {
+        sum = sum_optional_tensors(sum, squared_gradient_norm(model, gradients));
+    }
+    let Some(sum) = sum else {
         return Ok(0.0);
     };
     let norm = scalar_value(sum.sqrt())?;
@@ -193,6 +413,9 @@ fn gradient_norm_and_clip(
         let scale = max_norm / norm;
         scale_gradients(model, muon_grads, scale);
         scale_gradients(model, adamw_grads, scale);
+        for gradients in tier_grads {
+            scale_gradients(model, gradients, scale);
+        }
     }
     Ok(norm)
 }
@@ -246,34 +469,76 @@ fn validate_train_args(args: &TrainArgs) -> Result<()> {
         args.grad_clip.is_finite() && args.grad_clip >= 0.0,
         "grad_clip must be finite and non-negative"
     );
+    ensure!(
+        args.sleep_runtime.is_some() == args.sleep_runtime_sha256.is_some(),
+        "--sleep-runtime and --sleep-runtime-sha256 must be provided together"
+    );
+    validate_physical_device_selector(&args.gpu_physical_device)?;
+    if args.gpu_metrics_interval_ms > 0 {
+        ensure!(
+            args.gpu_metrics_interval_ms >= 100,
+            "gpu_metrics_interval_ms must be zero or at least 100"
+        );
+    }
     Ok(())
 }
 
-fn resolve_curriculum(args: &TrainArgs) -> Result<ResolvedCurriculum> {
-    load_curriculum(&args.curriculum)
+fn resolve_wake_plan(args: &TrainArgs) -> Result<ResolvedWakePlan> {
+    load_wake_plan(&args.workflow)
 }
 
-fn validate_model_curriculum(config: &ModelDef, curriculum: &ResolvedCurriculum) -> Result<()> {
-    for stage in &curriculum.stages {
+fn validate_model_wake_plan(config: &ModelDef, workflow: &ResolvedWakePlan) -> Result<()> {
+    let memory_enabled =
+        (0..config.num_layers).any(|layer| config.block_for_layer(layer).memory.is_some());
+    let periodic = workflow
+        .phases
+        .iter()
+        .filter_map(|phase| phase.periodic_sleep.as_ref())
+        .collect::<Vec<_>>();
+    if memory_enabled {
         ensure!(
-            stage.sequence_length <= config.max_seq_len,
-            "curriculum stage `{}` sequence_length {} exceeds model max_seq_len {}",
-            stage.name,
-            stage.sequence_length,
+            !periodic.is_empty(),
+            "sleep-capable MAL models require periodic_sleep on every wake phase"
+        );
+        ensure!(
+            periodic.len() == workflow.phases.len(),
+            "every phase training a sleep-capable MAL model must carry periodic_sleep so memory parameters never enter the ordinary wake optimizer"
+        );
+        ensure!(
+            periodic.iter().all(|config| *config == periodic[0]),
+            "all phases in one memory training run must use an identical periodic_sleep configuration"
+        );
+        ensure!(
+            periodic[0].schedule.clock == hermes_train::sleep::UpdateClock::OptimizerSteps,
+            "the stock train command supports periodic sleep only at optimizer_steps boundaries; model_tokens can cross multiple memory boundaries inside one indivisible optimizer update"
+        );
+        validate_sleep_schedule_for_model(config, &periodic[0].schedule, &workflow.phases[0].name)?;
+    } else {
+        ensure!(
+            periodic.is_empty(),
+            "periodic_sleep requires a MAL model with an explicit memory hierarchy"
+        );
+    }
+    for phase in &workflow.phases {
+        ensure!(
+            phase.sequence_length <= config.max_seq_len,
+            "workflow phase `{}` sequence_length {} exceeds model max_seq_len {}",
+            phase.name,
+            phase.sequence_length,
             config.max_seq_len
         );
         if matches!(
-            stage.objective,
+            phase.objective,
             ObjectiveConfig::ContrastiveRetrieval { .. }
         ) {
-            let layer = stage
+            let layer = phase
                 .objective
                 .retrieval_layer()
                 .unwrap_or(config.num_layers);
             ensure!(
                 layer <= config.num_layers,
-                "curriculum stage `{}` requests retrieval layer {layer}, model has {} layers",
-                stage.name,
+                "workflow phase `{}` requests retrieval layer {layer}, model has {} layers",
+                phase.name,
                 config.num_layers
             );
             ensure!(
@@ -281,8 +546,8 @@ fn validate_model_curriculum(config: &ModelDef, curriculum: &ResolvedCurriculum)
                     let block = config.block_for_layer(index);
                     !block.is_ssm() && block.attention.window_size.is_none()
                 }),
-                "curriculum stage `{}` retrieval layer {layer} has no full-attention layer at or before it",
-                stage.name
+                "workflow phase `{}` retrieval layer {layer} has no full-attention layer at or before it",
+                phase.name
             );
         }
     }
@@ -290,36 +555,36 @@ fn validate_model_curriculum(config: &ModelDef, curriculum: &ResolvedCurriculum)
 }
 
 #[derive(Clone, Copy)]
-struct StagePlan {
+struct PhasePlan {
     samples: Option<usize>,
     steps: usize,
 }
 
 fn plan_training(
-    curriculum: &ResolvedCurriculum,
+    workflow: &ResolvedWakePlan,
     tokenizer: &Tokenizer,
     token_cache_root: &Path,
-) -> Result<(Vec<StagePlan>, usize)> {
+) -> Result<(Vec<PhasePlan>, usize)> {
     let mut total_steps = 0usize;
-    let mut plan = Vec::with_capacity(curriculum.stages.len());
-    for (stage_index, stage) in curriculum.stages.iter().enumerate() {
-        let (samples, steps) = match stage.steps {
+    let mut plan = Vec::with_capacity(workflow.phases.len());
+    for (phase_index, phase) in workflow.phases.iter().enumerate() {
+        let (samples, steps) = match phase.steps {
             Some(steps) => (None, steps),
             None => {
                 let samples = count_samples(
-                    &stage.data,
-                    &stage.objective,
+                    &phase.data,
+                    &phase.objective,
                     tokenizer,
-                    stage.sequence_length,
-                    Some(&token_cache_root.join(format!("stage-{stage_index:03}.tokens"))),
+                    phase.sequence_length,
+                    Some(&token_cache_root.join(format!("phase-{phase_index:03}.tokens"))),
                 )?;
                 let steps_per_epoch =
-                    (samples / stage.batch_size).div_euclid(stage.gradient_accumulation);
+                    (samples / phase.batch_size).div_euclid(phase.gradient_accumulation);
                 let optimizer_steps =
-                    steps_per_epoch.checked_mul(stage.epochs).with_context(|| {
+                    steps_per_epoch.checked_mul(phase.epochs).with_context(|| {
                         format!(
-                            "curriculum stage `{}` optimizer-step count overflows usize",
-                            stage.name
+                            "workflow phase `{}` optimizer-step count overflows usize",
+                            phase.name
                         )
                     })?;
                 (Some(samples), optimizer_steps)
@@ -327,29 +592,188 @@ fn plan_training(
         };
         ensure!(
             steps > 0,
-            "curriculum stage `{}` produces zero complete optimizer steps",
-            stage.name
+            "workflow phase `{}` produces zero complete optimizer steps",
+            phase.name
         );
+        if let Some(quantization) = &phase.quantization {
+            let phase_start = u64::try_from(total_steps)
+                .context("workflow phase start exceeds the quantization clock")?;
+            let phase_steps = u64::try_from(steps)
+                .context("workflow phase length exceeds the quantization clock")?;
+            quantization
+                .validate_phase_window(phase_start, phase_steps)
+                .with_context(|| {
+                    format!(
+                        "workflow quantization phase `{}` never trains its target format",
+                        phase.name
+                    )
+                })?;
+        }
         total_steps = total_steps
             .checked_add(steps)
-            .ok_or_else(|| anyhow::anyhow!("curriculum optimizer-step count overflows usize"))?;
-        plan.push(StagePlan { samples, steps });
+            .ok_or_else(|| anyhow::anyhow!("workflow optimizer-step count overflows usize"))?;
+        plan.push(PhasePlan { samples, steps });
     }
     Ok((plan, total_steps))
 }
 
-fn file_fingerprint(path: &Path) -> Result<String> {
-    // Stable FNV-1a is sufficient for accidental tokenizer/config drift and
-    // avoids making resume depend on a platform-specific standard hasher.
-    let bytes = fs::read(path)
-        .map_err(anyhow::Error::from)
-        .map_err(|error| error.context(format!("failed to fingerprint {}", path.display())))?;
-    let hash = fnv1a64(&bytes);
-    Ok(format!("fnv1a64:{hash:016x}:{}", bytes.len()))
+fn file_sha256(path: &Path) -> Result<String> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to hash {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn stable_cache_id(value: &str) -> String {
     format!("{:016x}", fnv1a64(value.as_bytes()))
+}
+
+fn shuffle_seed(seed: u64, phase: usize, epoch: usize) -> u64 {
+    seed.wrapping_add((phase as u64) << 32)
+        .wrapping_add(epoch as u64)
+}
+
+/// SplitMix64 gives every model microbatch a reproducible device seed without
+/// depending on opaque backend RNG state.  The counter is checkpointed, so a
+/// resumed process sees exactly the same dropout stream as an uninterrupted
+/// process even though model construction itself consumes random numbers.
+fn model_microbatch_seed(seed: u64, counter: u64) -> u64 {
+    let mut value = seed
+        .wrapping_add(MODEL_RNG_DOMAIN)
+        .wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn rng_stream<'a>(state: &'a TrainingState, name: &str) -> Result<&'a RngStreamState> {
+    state
+        .rng_streams
+        .iter()
+        .find(|stream| stream.name == name)
+        .with_context(|| format!("checkpoint is missing required `{name}` RNG stream"))
+}
+
+fn rng_stream_mut<'a>(state: &'a mut TrainingState, name: &str) -> Result<&'a mut RngStreamState> {
+    state
+        .rng_streams
+        .iter_mut()
+        .find(|stream| stream.name == name)
+        .with_context(|| format!("checkpoint is missing required `{name}` RNG stream"))
+}
+
+fn validate_wake_rng_state(state: &TrainingState, seed: u64) -> Result<()> {
+    let data = rng_stream(state, DATA_RNG_STREAM)?;
+    ensure!(
+        data.seed == shuffle_seed(seed, state.phase, state.epoch)
+            && data.counter == state.records_in_phase as u64,
+        "checkpoint data RNG stream disagrees with its phase cursor"
+    );
+    let model = rng_stream(state, MODEL_RNG_STREAM)?;
+    ensure!(
+        model.seed == seed,
+        "checkpoint model RNG seed differs from this invocation"
+    );
+    Ok(())
+}
+
+fn metric_phase_kind(kind: PhaseKind) -> MetricPhaseKind {
+    match kind {
+        PhaseKind::Pretrain => MetricPhaseKind::Pretrain,
+        PhaseKind::ContinuedPretrain => MetricPhaseKind::ContinuedPretrain,
+        PhaseKind::Sft => MetricPhaseKind::Sft,
+        PhaseKind::Preference => MetricPhaseKind::Preference,
+        PhaseKind::Rl => MetricPhaseKind::Rl,
+        PhaseKind::Distillation => MetricPhaseKind::Distillation,
+        PhaseKind::Sleep => MetricPhaseKind::Sleep,
+        PhaseKind::Quantization => MetricPhaseKind::Quantization,
+        PhaseKind::Evaluation => MetricPhaseKind::Evaluation,
+        PhaseKind::Promotion => MetricPhaseKind::Promotion,
+    }
+}
+
+fn start_device_sampler(args: &TrainArgs) -> Option<NvidiaSmiSampler> {
+    if args.gpu_metrics_interval_ms == 0 {
+        return None;
+    }
+    let config = NvidiaSmiSamplerConfig::new(
+        Duration::from_millis(args.gpu_metrics_interval_ms),
+        args.gpu_physical_device.clone(),
+    )
+    .expect("validated device sampler configuration");
+    let (sampler, diagnostic) = NvidiaSmiSampler::start_fail_soft(config);
+    if let Some(diagnostic) = diagnostic {
+        eprintln!(
+            "warning: GPU utilization sampling is unavailable and training will continue: {diagnostic}"
+        );
+    }
+    sampler
+}
+
+fn emit_device_sampler_drain(
+    mut drain: DeviceSamplerDrain,
+    metrics: &mut MetricWriter,
+    context: &MetricContext,
+) -> Result<()> {
+    for diagnostic in drain.diagnostics {
+        eprintln!("warning: GPU utilization sampler: {diagnostic}");
+    }
+    drain
+        .samples
+        .sort_by_key(|sample| sample.collected_at_unix_ms);
+    for sample in drain.samples {
+        ensure!(
+            sample.metrics.sampled_at_unix_ms == sample.collected_at_unix_ms,
+            "device sampler timestamp receipt is inconsistent"
+        );
+        // A sample can race with the preceding trainer event or survive a
+        // wall-clock adjustment/resume. Preserve its exact collection time in
+        // the typed payload while clamping only the append-only record's time
+        // to the journal watermark.
+        let emitted_at = metrics
+            .state()
+            .last_emitted_at_unix_ms
+            .map_or(sample.collected_at_unix_ms, |last| {
+                last.max(sample.collected_at_unix_ms)
+            });
+        metrics.append_at(
+            context.clone(),
+            MetricEvent::DeviceUtilization(sample.metrics),
+            emitted_at,
+        )?;
+    }
+    Ok(())
+}
+
+fn drain_device_sampler(
+    sampler: &mut Option<NvidiaSmiSampler>,
+    metrics: &mut MetricWriter,
+    context: &MetricContext,
+) -> Result<()> {
+    if let Some(sampler) = sampler {
+        emit_device_sampler_drain(sampler.drain(), metrics, context)?;
+    }
+    Ok(())
+}
+
+fn shutdown_device_sampler(
+    sampler: &mut Option<NvidiaSmiSampler>,
+    metrics: &mut MetricWriter,
+    context: &MetricContext,
+) -> Result<()> {
+    if let Some(sampler) = sampler {
+        emit_device_sampler_drain(sampler.shutdown_and_drain(), metrics, context)?;
+    }
+    Ok(())
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -364,9 +788,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[derive(Serialize)]
 struct RunSignature<'a> {
     version: u32,
-    curriculum: &'a ResolvedCurriculum,
+    workflow: &'a ResolvedWakePlan,
     model: &'a ModelDef,
+    initial_checkpoint: Option<String>,
     tokenizer: String,
+    data_manifests: &'a [String],
     seed: u64,
     learning_rate: f64,
     weight_decay: f32,
@@ -374,18 +800,24 @@ struct RunSignature<'a> {
     warmup_steps: usize,
     schedule: Schedule,
     muon_learning_rate_scale: f64,
+    gpu_metrics_interval_ms: u64,
+    gpu_physical_device: &'a str,
 }
 
 fn run_signature(
     args: &TrainArgs,
-    curriculum: &ResolvedCurriculum,
+    workflow: &ResolvedWakePlan,
     config: &ModelDef,
+    data_manifests: &[String],
+    initial_checkpoint: Option<String>,
 ) -> Result<String> {
-    Ok(serde_json::to_string(&RunSignature {
+    let encoded = serde_json::to_vec(&RunSignature {
         version: TRAINING_STATE_VERSION,
-        curriculum,
+        workflow,
         model: config,
-        tokenizer: file_fingerprint(&args.tokenizer)?,
+        initial_checkpoint,
+        tokenizer: file_sha256(&args.tokenizer)?,
+        data_manifests,
         seed: args.seed,
         learning_rate: args.lr,
         weight_decay: args.weight_decay,
@@ -393,7 +825,39 @@ fn run_signature(
         warmup_steps: args.warmup_steps,
         schedule: args.schedule,
         muon_learning_rate_scale: MUON_LR_SCALE,
-    })?)
+        gpu_metrics_interval_ms: args.gpu_metrics_interval_ms,
+        gpu_physical_device: &args.gpu_physical_device,
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
+fn phase_data_identity(path: &Path, tokenizer: &Tokenizer, tokenizer_hash: &str) -> Result<String> {
+    let manifest_path = if path.is_dir() {
+        Some(path.join("manifest.json"))
+    } else if path.file_name().is_some_and(|name| name == "manifest.json") {
+        Some(path.to_owned())
+    } else {
+        None
+    };
+    if let Some(manifest_path) = manifest_path {
+        let manifest: CorpusManifest = read_json(&manifest_path)?;
+        let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        manifest.verify(root)?;
+        ensure!(
+            manifest.build.tokenizer.vocabulary_size == tokenizer.vocab_size(),
+            "corpus tokenizer vocabulary {} differs from training tokenizer vocabulary {}",
+            manifest.build.tokenizer.vocabulary_size,
+            tokenizer.vocab_size()
+        );
+        ensure!(
+            manifest.build.tokenizer.revision == tokenizer_hash,
+            "corpus tokenizer revision {} differs from training tokenizer {}",
+            manifest.build.tokenizer.revision,
+            tokenizer_hash
+        );
+        return Ok(format!("sha256:{}", manifest.manifest_sha256));
+    }
+    file_sha256(path)
 }
 
 fn add_batch_stats(total: &mut BatchStats, batch: BatchStats) -> Result<()> {
@@ -444,20 +908,22 @@ fn objective_loss(
                     model.forward_loss_with_router(input_ids, targets)
                 }
                 ObjectiveConfig::Summarization { .. }
-                | ObjectiveConfig::RetrievalPlanning { .. } => {
+                | ObjectiveConfig::RetrievalPlanning { .. }
+                | ObjectiveConfig::InstructionTuning { .. }
+                | ObjectiveConfig::QaReasoning { .. } => {
                     let positions = loss_positions
                         .ok_or_else(|| anyhow::anyhow!("structured batch has no target mask"))?;
                     model.forward_masked_loss_with_router(input_ids, targets, positions)
                 }
                 ObjectiveConfig::ContrastiveRetrieval { .. } => {
-                    bail!("contrastive_retrieval stage produced a language batch")
+                    bail!("contrastive_retrieval phase produced a language batch")
                 }
             }
         }
         TrainingBatch::Retrieval(batch) => {
             ensure!(
                 matches!(objective, ObjectiveConfig::ContrastiveRetrieval { .. }),
-                "non-retrieval stage produced a retrieval batch"
+                "non-retrieval phase produced a retrieval batch"
             );
             let data::RetrievalBatch {
                 query_ids,
@@ -498,10 +964,374 @@ fn objective_loss(
     Ok((loss, router_loss, stats, retrieval_correct))
 }
 
+fn quantization_forward_kl(
+    student: &Transformer,
+    teacher: &Transformer,
+    batch: &TrainingBatch,
+    objective: &ObjectiveConfig,
+    temperature: f64,
+) -> Result<Tensor<1>> {
+    let (teacher_logits, student_logits) = match batch {
+        TrainingBatch::Language(batch) => {
+            let [rows, sequence] = batch.input_ids.dims();
+            let vocabulary = student.config().vocab_size;
+            ensure!(
+                teacher.config().vocab_size == vocabulary,
+                "quantization teacher/student vocabularies differ"
+            );
+            match objective {
+                ObjectiveConfig::CausalLm => {
+                    ensure!(
+                        batch.loss_positions.is_none(),
+                        "causal_lm distillation batch unexpectedly contains a target mask"
+                    );
+                    (
+                        teacher
+                            .forward(batch.input_ids.clone(), 0)
+                            .reshape([rows * sequence, vocabulary]),
+                        student
+                            .forward(batch.input_ids.clone(), 0)
+                            .reshape([rows * sequence, vocabulary]),
+                    )
+                }
+                ObjectiveConfig::Summarization { .. }
+                | ObjectiveConfig::RetrievalPlanning { .. }
+                | ObjectiveConfig::InstructionTuning { .. }
+                | ObjectiveConfig::QaReasoning { .. } => {
+                    let positions = batch.loss_positions.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("structured distillation batch has no target mask")
+                    })?;
+                    (
+                        teacher.forward_selected_logits(batch.input_ids.clone(), positions.clone()),
+                        student.forward_selected_logits(batch.input_ids.clone(), positions.clone()),
+                    )
+                }
+                ObjectiveConfig::ContrastiveRetrieval { .. } => {
+                    bail!("retrieval objective produced a language distillation batch")
+                }
+            }
+        }
+        TrainingBatch::Retrieval(batch) => {
+            let layer = objective.retrieval_layer();
+            let teacher_queries = teacher.forward_embeddings(
+                batch.query_ids.clone(),
+                batch.query_end_positions.clone(),
+                layer,
+            );
+            let teacher_documents = teacher.forward_embeddings(
+                batch.document_ids.clone(),
+                batch.document_end_positions.clone(),
+                layer,
+            );
+            let student_queries = student.forward_embeddings(
+                batch.query_ids.clone(),
+                batch.query_end_positions.clone(),
+                layer,
+            );
+            let student_documents = student.forward_embeddings(
+                batch.document_ids.clone(),
+                batch.document_end_positions.clone(),
+                layer,
+            );
+            (
+                teacher_queries.matmul(teacher_documents.transpose()),
+                student_queries.matmul(student_documents.transpose()),
+            )
+        }
+    };
+    forward_kl_distillation_tensor(teacher_logits, student_logits, temperature, true)
+}
+
+fn metric_quantization_format(format: UltraQuantFormat) -> MetricQuantizationFormat {
+    match format {
+        UltraQuantFormat::BinaryG128 => MetricQuantizationFormat::BinaryG128,
+        UltraQuantFormat::TernaryG128 => MetricQuantizationFormat::TernaryG128,
+        UltraQuantFormat::TernaryEntropyG128 => MetricQuantizationFormat::TernaryEntropyG128,
+    }
+}
+
+struct LoadedQuantizationTeacher {
+    model: Transformer,
+    sha256: String,
+    temperature: f64,
+    loss_weight: f64,
+}
+
+fn disable_quantization_teacher_dropout(config: &mut ModelDef) {
+    fn disable_block(block: &mut BlockDef) {
+        block.dropout = 0.0;
+        block.attention.dropout = 0.0;
+        block.ffn.dropout = 0.0;
+        if let Some(memory) = &mut block.memory {
+            for tier in &mut memory.tiers {
+                // A tier's FfnDef owns dropout for both dense and MoE expert
+                // execution; MoeDef has no independent dropout setting.
+                tier.ffn.dropout = 0.0;
+            }
+        }
+    }
+
+    config.embeddings.dropout = 0.0;
+    disable_block(&mut config.block);
+    if let Some(pattern) = &mut config.pattern {
+        for block in pattern {
+            disable_block(block);
+        }
+    }
+}
+
+fn load_quantization_teacher(
+    plan: Option<&WorkflowQuantizationPlan>,
+    config: &ModelDef,
+    device: &Device,
+) -> Result<Option<LoadedQuantizationTeacher>> {
+    let Some(WorkflowQuantizationTraining::Distillation {
+        teacher_checkpoint,
+        teacher_sha256,
+        temperature,
+        loss_weight,
+    }) = plan.map(|plan| &plan.training)
+    else {
+        return Ok(None);
+    };
+    let metadata = fs::symlink_metadata(teacher_checkpoint).with_context(|| {
+        format!(
+            "failed to inspect frozen quantization teacher {}",
+            teacher_checkpoint.display()
+        )
+    })?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "quantization teacher must be a regular non-symlink file"
+    );
+    ensure!(
+        file_sha256(teacher_checkpoint)? == *teacher_sha256,
+        "quantization teacher checkpoint hash mismatch"
+    );
+    let mut teacher_config = config.clone();
+    disable_quantization_teacher_dropout(&mut teacher_config);
+    let mut teacher = Transformer::new(&teacher_config, device)?;
+    load_safetensors(&mut teacher, teacher_checkpoint)?;
+    Ok(Some(LoadedQuantizationTeacher {
+        model: teacher,
+        sha256: teacher_sha256.clone(),
+        temperature: *temperature,
+        loss_weight: *loss_weight,
+    }))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn validate_workflow_command(args: ValidateWorkflowArgs) -> Result<()> {
+    let workflow = load_workflow_v2(&args.workflow)?;
+    if let Some(config) = &args.config {
+        let model = load_config(config)?;
+        validate_workflow_for_model(&workflow, &model)?;
+    }
+    if args.signature_only {
+        println!("{}", runtime_workflow_signature(&workflow)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&workflow)?);
+    }
+    Ok(())
+}
+
+fn prepare_corpus_command(args: PrepareCorpusArgs) -> Result<()> {
+    let recipe = SearchApiPostgresCorpusRecipe::load(&args.recipe)?;
+    let tokenizer = Tokenizer::from_file(&args.tokenizer)?;
+    let tokenizer_revision = file_sha256(&args.tokenizer)?;
+    let tokenizer = HermesCorpusTokenizer::new(&tokenizer, tokenizer_revision)?;
+    let (path, manifest) = recipe.run(&tokenizer, &args.output, &args.work_directory)?;
+    println!(
+        "published={} manifest={} unique_tokens={} exposure_tokens={}",
+        path.display(),
+        manifest.manifest_sha256,
+        manifest.build.stats.unique_tokens,
+        manifest.build.stats.exposure_tokens,
+    );
+    Ok(())
+}
+
+fn compose_curriculum_command(args: ComposeCurriculumArgs) -> Result<()> {
+    let config = CurriculumCompositionConfig::load(&args.config)?;
+    let (path, manifest) = config.run(&args.config, &args.output, &args.work_directory)?;
+    manifest.verify(&path)?;
+    println!(
+        "published={} manifest={} stages={} tokens={}",
+        path.display(),
+        manifest.manifest_sha256,
+        manifest.build.stages.len(),
+        manifest
+            .build
+            .stages
+            .iter()
+            .try_fold(0_u64, |total, stage| total.checked_add(stage.tokens))
+            .context("curriculum token total overflows u64")?,
+    );
+    Ok(())
+}
+
+fn quantize_command(args: QuantizeArgs) -> Result<()> {
+    let recipe = QuantizationRecipe {
+        format: args.format.into(),
+        group_size: BONSAI_GROUP_SIZE,
+        fake_quant_start_step: 0,
+        ternary_warmup_steps: args.ternary_warmup_steps,
+        distillation_weight: args.distillation_weight,
+        quantize_embeddings: args.quantize_embeddings,
+        quantize_lm_head: args.quantize_lm_head,
+    };
+    let manifest = export_safetensors_archive(&args.checkpoint, &args.output, &recipe)?;
+    println!(
+        "published={} matrices={} floating_tensors={} archive_bits_per_weight={:.4}",
+        args.output.display(),
+        manifest.matrices.len(),
+        manifest.floating_tensors.len(),
+        manifest.true_average_bits_per_weight()?,
+    );
+    Ok(())
+}
+
+fn upgrade_memory_checkpoint_command(args: UpgradeMemoryCheckpointArgs) -> Result<()> {
+    ensure!(
+        !args.output.exists(),
+        "memory-upgrade output {} already exists",
+        args.output.display()
+    );
+    let source = load_config(&args.source_config)?;
+    let target = load_config(&args.target_config)?;
+    let device = hermes_llm::default_device();
+    let mut model = Transformer::new(&target, &device)?;
+    upgrade_safetensors_to_memory(&mut model, &source, &args.checkpoint, &args.output)?;
+    println!("published={}", args.output.display());
+    Ok(())
+}
+
+fn validate_cli_native_sleep_adapters(
+    workflow: &ResolvedWorkflow,
+    registry: &NativeSleepContextRegistry,
+) -> Result<()> {
+    let standalone = workflow
+        .phases
+        .iter()
+        .find(|phase| phase.kind == PhaseKind::Sleep);
+    if let Some(phase) = standalone {
+        ensure!(
+            registry.has_phase_factory(),
+            "workflow sleep phase `{}` requires an in-process NativeSleepPhaseContextFactory; the stock run-workflow CLI has no model/evaluator factory configured. Embed hermes-train, register the pinned adapters with NativeWorkflowAdapters, and run NativeWorkflowHost",
+            phase.name
+        );
+    }
+    let periodic = workflow
+        .phases
+        .iter()
+        .find(|phase| phase.periodic_sleep.is_some());
+    if let Some(phase) = periodic {
+        ensure!(
+            registry.has_periodic_driver(),
+            "workflow phase `{}` enables periodic in-model sleep but the stock run-workflow CLI has no native wake-boundary executor configured. Embed hermes-train, register a NativePeriodicWakeExecutor, and run NativeWorkflowHost",
+            phase.name
+        );
+    }
+    Ok(())
+}
+
+fn run_workflow_command(args: RunWorkflowArgs) -> Result<()> {
+    let workflow = load_workflow_v2(&args.workflow)?;
+    let mut native_context = NativeSleepContextRegistry::new();
+    if let Some((path, sha256)) = args.sleep_runtime.zip(args.sleep_runtime_sha256) {
+        native_context
+            .register_phase_factory(BuiltinSleepPhaseContextFactory::load(path, &sha256)?)?;
+    }
+    // Fail before creating or advancing the runtime checkpoint. Native sleep
+    // cannot be delegated to the generic external worker because its typed
+    // model/evaluator objects and optimizer transaction live in process.
+    validate_cli_native_sleep_adapters(&workflow, &native_context)?;
+    let executor = ExternalPhaseExecutor::new(
+        &args.executor,
+        args.executor_arguments,
+        &args.executor_sha256,
+    )?;
+    let mut checkpoint = AtomicRuntimeCheckpoint::new(&args.state, &args.executor_sha256)?;
+    match (&args.metrics, &args.run_id) {
+        (Some(metrics), Some(run_id)) => {
+            checkpoint.configure_metrics(metrics, run_id, args.resume)?;
+        }
+        (None, None) => {}
+        _ => bail!("--metrics and --run-id must be provided together"),
+    }
+    let mut state = if args.resume {
+        ensure!(
+            args.initial_checkpoint_uri.is_none(),
+            "--resume cannot replace the initial immutable checkpoint"
+        );
+        checkpoint.load(&workflow)?
+    } else {
+        let initial_checkpoint = args
+            .initial_checkpoint_uri
+            .zip(args.initial_checkpoint_sha256)
+            .map(|(uri, sha256)| ImmutableModelCheckpoint::new(uri, sha256))
+            .transpose()?;
+        let state = WorkflowRunState::new(&workflow, initial_checkpoint)?;
+        checkpoint.initialize(&state)?;
+        state
+    };
+    let mut registry = ExecutorRegistry::new();
+    for kind in ALL_PHASE_KINDS {
+        if !matches!(kind, PhaseKind::Sleep | PhaseKind::Promotion) {
+            registry.register(kind, executor.clone())?;
+        }
+    }
+    registry.register(
+        PhaseKind::Sleep,
+        NativeSleepPhaseExecutor::new(state.workflow_signature().to_owned())?,
+    )?;
+
+    let status = run_until_yield_or_complete(
+        &workflow,
+        &mut state,
+        &mut registry,
+        &mut native_context,
+        &mut checkpoint,
+    )?;
+    match status {
+        RuntimeStatus::AlreadyComplete => println!(
+            "workflow=complete phases={} checkpoint={}",
+            state.completed_phases().len(),
+            state
+                .current_checkpoint()
+                .map_or("none", ImmutableModelCheckpoint::uri)
+        ),
+        RuntimeStatus::Yielded {
+            phase_index,
+            phase_name,
+        } => println!(
+            "workflow=yielded phase={} name={} state={}",
+            phase_index,
+            phase_name,
+            args.state.display()
+        ),
+        RuntimeStatus::PhaseCommitted { .. } => {
+            unreachable!("run-until returns only yielded or complete")
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().command {
         Command::Train(args) => trainer::train(args),
+        Command::ValidateWorkflow(args) => validate_workflow_command(args),
+        Command::PrepareCorpus(args) => prepare_corpus_command(args),
+        Command::ComposeCurriculum(args) => compose_curriculum_command(args),
+        Command::Quantize(args) => quantize_command(args),
+        Command::UpgradeMemoryCheckpoint(args) => upgrade_memory_checkpoint_command(args),
+
+        Command::RunWorkflow(args) => run_workflow_command(args),
     }
 }
 
@@ -512,6 +1342,69 @@ mod tests {
     use hermes_llm::get_builtin_model;
 
     use super::*;
+
+    #[test]
+    fn quantization_teacher_disables_every_dropout_without_mutating_student() {
+        let student = hermes_llm::parse_mal(
+            r#"
+            ffn dense { hidden_dim: 16 activation: swiglu dropout: 0.11 }
+            ffn routed {
+                hidden_dim: 12 activation: swiglu dropout: 0.22
+                moe { experts: 3 top_k: 1 }
+            }
+            memory cms {
+                tier fast {
+                    ffn: routed
+                    reserve_experts { capacity: 1 rank: 2 top_k: 1 }
+                }
+                tier slow {
+                    ffn: dense residual_init: zero
+                    reserve_experts { capacity: 2 rank: 2 top_k: 1 }
+                }
+            }
+            block ordinary {
+                attention: { num_heads: 2 num_kv_heads: 1 head_dim: 4 dropout: 0.33 position_encoding: none }
+                ffn: dense dropout: 0.44
+            }
+            block sleeping {
+                attention: { num_heads: 2 num_kv_heads: 1 head_dim: 4 dropout: 0.55 position_encoding: none }
+                memory: cms dropout: 0.66
+            }
+            model teacher-dropout {
+                vocab_size: 32 max_seq_len: 8 hidden_size: 8 num_layers: 2
+                block: sleeping pattern: [ordinary, sleeping]
+                embeddings { dropout: 0.77 tie_weights: true }
+            }
+            "#,
+        )
+        .unwrap();
+        let mut teacher = student.clone();
+        disable_quantization_teacher_dropout(&mut teacher);
+
+        assert!(student.embeddings.dropout > 0.0);
+        assert!(student.block.dropout > 0.0);
+        assert!(
+            student
+                .block
+                .memory
+                .as_ref()
+                .unwrap()
+                .tiers
+                .iter()
+                .all(|tier| tier.ffn.dropout > 0.0)
+        );
+        assert_eq!(teacher.embeddings.dropout, 0.0);
+        for block in std::iter::once(&teacher.block)
+            .chain(teacher.pattern.as_deref().unwrap_or_default().iter())
+        {
+            assert_eq!(block.dropout, 0.0);
+            assert_eq!(block.attention.dropout, 0.0);
+            assert_eq!(block.ffn.dropout, 0.0);
+            if let Some(memory) = &block.memory {
+                assert!(memory.tiers.iter().all(|tier| tier.ffn.dropout == 0.0));
+            }
+        }
+    }
 
     fn small_hybrid() -> ModelDef {
         let mut config = get_builtin_model("hybrid-tiny").unwrap();
@@ -535,7 +1428,7 @@ mod tests {
         TrainArgs {
             config: "config.mal".into(),
             tokenizer: "tokenizer.json".into(),
-            curriculum: "curriculum.json".into(),
+            workflow: "workflow.json".into(),
             output: "checkpoint".into(),
             lr: 3e-4,
             weight_decay: 0.1,
@@ -544,19 +1437,288 @@ mod tests {
             schedule: Schedule::Wsd,
             checkpoint_every: 0,
             layer_metrics_every: 0,
+            gpu_metrics_interval_ms: 0,
+            gpu_physical_device: "0".into(),
             checkpoint: None,
             resume: false,
             seed: 0,
+            sleep_runtime: None,
+            sleep_runtime_sha256: None,
+            print_run_signature: false,
         }
+    }
+
+    #[test]
+    fn curriculum_composition_cli_requires_config_output_and_work_directory() {
+        let cli = Cli::try_parse_from([
+            "hermes-train",
+            "compose-curriculum",
+            "--config",
+            "mixture.json",
+            "--output",
+            "corpus",
+            "--work-directory",
+            "work",
+        ])
+        .unwrap();
+        let Command::ComposeCurriculum(args) = cli.command else {
+            panic!("wrong parsed command");
+        };
+        assert_eq!(args.config, Path::new("mixture.json"));
+        assert_eq!(args.output, Path::new("corpus"));
+        assert_eq!(args.work_directory, Path::new("work"));
+
+        assert!(
+            Cli::try_parse_from([
+                "hermes-train",
+                "compose-curriculum",
+                "--config",
+                "mixture.json",
+                "--output",
+                "corpus",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_metrics_require_a_run_id_and_parse_as_a_pair() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let cli = Cli::try_parse_from([
+            "hermes-train",
+            "run-workflow",
+            "--workflow",
+            "workflow.json",
+            "--executor",
+            "./worker",
+            "--executor-sha256",
+            &digest,
+            "--metrics",
+            "metrics.jsonl",
+            "--run-id",
+            "run-42",
+        ])
+        .unwrap();
+        let Command::RunWorkflow(args) = cli.command else {
+            panic!("wrong parsed command");
+        };
+        assert_eq!(args.metrics.as_deref(), Some(Path::new("metrics.jsonl")));
+        assert_eq!(args.run_id.as_deref(), Some("run-42"));
+
+        assert!(
+            Cli::try_parse_from([
+                "hermes-train",
+                "run-workflow",
+                "--workflow",
+                "workflow.json",
+                "--executor",
+                "./worker",
+                "--executor-sha256",
+                &digest,
+                "--metrics",
+                "metrics.jsonl",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checked_in_workflow_examples_remain_strictly_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "workflow.example.json",
+            "workflow.sleep.example.json",
+            "workflow.education.example.json",
+        ] {
+            load_workflow_v2(&root.join(name))
+                .unwrap_or_else(|error| panic!("{name} is invalid: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn education_workflow_matches_declared_sleep_mal_and_reserve_topology() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workflow_path = root.join("workflow.education.example.json");
+        let model_path = root.join("../hermes-mal/well-known/retriever_300m_moe_sleep.mal");
+        let workflow = load_workflow_v2(&workflow_path).unwrap();
+        let model = load_config(&model_path).unwrap();
+
+        validate_workflow_for_model(&workflow, &model).unwrap();
+        let optimizer_phases = workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.kind.uses_optimizer())
+            .collect::<Vec<_>>();
+        assert!(!optimizer_phases.is_empty());
+        assert!(
+            optimizer_phases
+                .iter()
+                .all(|phase| phase.periodic_sleep.is_some())
+        );
+        assert!(
+            optimizer_phases
+                .windows(2)
+                .all(|pair| { pair[0].periodic_sleep.as_ref() == pair[1].periodic_sleep.as_ref() })
+        );
+        assert!(
+            workflow
+                .phases
+                .iter()
+                .filter(|phase| !phase.kind.uses_optimizer())
+                .all(|phase| phase.periodic_sleep.is_none())
+        );
+
+        let mut wrong_capacity = workflow.clone();
+        for phase in wrong_capacity
+            .phases
+            .iter_mut()
+            .filter(|phase| phase.kind.uses_optimizer())
+        {
+            phase.periodic_sleep.as_mut().unwrap().schedule.tiers[1].reserve_slots += 1;
+        }
+        let error = validate_workflow_for_model(&wrong_capacity, &model)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("preallocates") && error.contains("medium"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn education_qat_warmup_starts_at_its_global_phase_boundary() {
+        let workflow = load_workflow_v2(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.education.example.json"),
+        )
+        .unwrap();
+        let qat_index = workflow
+            .phases
+            .iter()
+            .position(|phase| phase.name == "binary-qat")
+            .unwrap();
+        let preceding_steps = workflow.phases[..qat_index]
+            .iter()
+            .filter(|phase| phase.kind.updates_model())
+            .filter_map(|phase| phase.steps)
+            .sum::<usize>();
+        let quantization = workflow.phases[qat_index].quantization.as_ref().unwrap();
+        assert_eq!(quantization.start_step, preceding_steps);
+        let plan = WorkflowQuantizationPlan::from_workflow(quantization).unwrap();
+        assert_eq!(
+            plan.format_at(preceding_steps as u64),
+            Some(UltraQuantFormat::TernaryG128)
+        );
+        assert_eq!(
+            plan.format_at(preceding_steps as u64 + 400),
+            Some(UltraQuantFormat::BinaryG128)
+        );
+    }
+
+    #[test]
+    fn stock_workflow_cli_rejects_native_sleep_before_runtime_state_creation() {
+        let workflow = load_workflow_v2(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.sleep.example.json"),
+        )
+        .unwrap();
+        let registry = NativeSleepContextRegistry::new();
+        let error = validate_cli_native_sleep_adapters(&workflow, &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("NativeSleepPhaseContextFactory")
+                || error.contains("NativePeriodicWakeExecutor"),
+            "{error}"
+        );
+        assert!(error.contains("stock run-workflow CLI"), "{error}");
+    }
+
+    fn sleep_memory_test_model() -> ModelDef {
+        hermes_llm::parse_mal(
+            r#"
+            ffn base { hidden_dim: 12 activation: swiglu dropout: 0.0 }
+            memory cms {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+                tier medium {
+                    ffn: base residual_init: zero
+                    reserve_experts { capacity: 4 rank: 3 top_k: 1 }
+                }
+                tier slow {
+                    ffn: base residual_init: zero
+                    reserve_experts { capacity: 8 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 32 max_seq_len: 4096 hidden_size: 8 num_layers: 1
+                block: {
+                    attention: { num_heads: 1 dropout: 0.0 position_encoding: none }
+                    memory: cms
+                    dropout: 0.0
+                }
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    fn write_wake_only_sleep_workflow(
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> (tempfile::TempDir, ResolvedWakePlan) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.sleep.example.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        json["phases"].as_array_mut().unwrap().truncate(1);
+        mutate(&mut json);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workflow.json");
+        fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let workflow = load_wake_plan(&path).unwrap();
+        (directory, workflow)
+    }
+
+    #[test]
+    fn stock_memory_trainer_rejects_model_token_sleep_boundaries() {
+        let (_directory, workflow) = write_wake_only_sleep_workflow(|json| {
+            json["phases"][0]["periodic_sleep"]["schedule"]["clock"] =
+                serde_json::json!("model_tokens");
+        });
+        let error = validate_model_wake_plan(&sleep_memory_test_model(), &workflow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("optimizer_steps"), "{error}");
+        assert!(error.contains("multiple memory boundaries"), "{error}");
+    }
+
+    #[test]
+    fn memory_training_requires_identical_periodic_configs_in_every_phase() {
+        let (_directory, workflow) = write_wake_only_sleep_workflow(|json| {
+            let mut second = json["phases"][0].clone();
+            second["name"] = serde_json::json!("wake-two");
+            second["data"] = serde_json::json!("corpus/wake-two.jsonl.zst");
+            second["periodic_sleep"]["receiver_learning_rate"] = serde_json::json!(0.0002);
+            json["phases"].as_array_mut().unwrap().push(second);
+        });
+        let error = validate_model_wake_plan(&sleep_memory_test_model(), &workflow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identical periodic_sleep"), "{error}");
     }
 
     #[test]
     fn invalid_numeric_training_arguments_fail_before_loading_files() {
         type Invalidate = fn(&mut TrainArgs);
-        let cases: [(&str, Invalidate); 3] = [
+        let cases: [(&str, Invalidate); 5] = [
             ("lr", |args| args.lr = f64::NAN),
             ("weight_decay", |args| args.weight_decay = -0.1),
             ("grad_clip", |args| args.grad_clip = f32::INFINITY),
+            ("gpu_metrics_interval_ms", |args| {
+                args.gpu_metrics_interval_ms = 99
+            }),
+            ("physical GPU selector", |args| {
+                args.gpu_physical_device = "0,1".into()
+            }),
         ];
         for (field, invalidate) in cases {
             let mut args = valid_train_args();
@@ -564,6 +1726,158 @@ mod tests {
             let err = validate_train_args(&args).unwrap_err().to_string();
             assert!(err.contains(field), "{field}: {err}");
         }
+    }
+
+    #[test]
+    fn training_cli_parses_explicit_physical_gpu_telemetry() {
+        let cli = Cli::try_parse_from([
+            "hermes-train",
+            "train",
+            "--config",
+            "model.mal",
+            "--tokenizer",
+            "tokenizer.json",
+            "--workflow",
+            "workflow.json",
+            "--gpu-metrics-interval-ms",
+            "2500",
+            "--gpu-physical-device",
+            "GPU-1234-abcd",
+        ])
+        .unwrap();
+        let Command::Train(args) = cli.command else {
+            panic!("wrong parsed command");
+        };
+        assert_eq!(args.gpu_metrics_interval_ms, 2500);
+        assert_eq!(args.gpu_physical_device, "GPU-1234-abcd");
+        validate_train_args(&args).unwrap();
+    }
+
+    #[test]
+    fn gpu_telemetry_configuration_is_part_of_resume_identity() {
+        let workflow = ResolvedWakePlan {
+            version: 2,
+            phases: Vec::new(),
+        };
+        let model = small_hybrid();
+        let signature = |args: &TrainArgs| {
+            let encoded = serde_json::to_vec(&RunSignature {
+                version: TRAINING_STATE_VERSION,
+                workflow: &workflow,
+                model: &model,
+                initial_checkpoint: None,
+                tokenizer: format!("sha256:{}", "1".repeat(64)),
+                data_manifests: &[],
+                seed: args.seed,
+                learning_rate: args.lr,
+                weight_decay: args.weight_decay,
+                gradient_clip: args.grad_clip,
+                warmup_steps: args.warmup_steps,
+                schedule: args.schedule,
+                muon_learning_rate_scale: MUON_LR_SCALE,
+                gpu_metrics_interval_ms: args.gpu_metrics_interval_ms,
+                gpu_physical_device: &args.gpu_physical_device,
+            })
+            .unwrap();
+            format!("sha256:{:x}", Sha256::digest(encoded))
+        };
+        let baseline = valid_train_args();
+        let mut interval = valid_train_args();
+        interval.gpu_metrics_interval_ms = 1000;
+        let mut device = valid_train_args();
+        device.gpu_physical_device = "GPU-1234".into();
+        assert_ne!(signature(&baseline), signature(&interval));
+        assert_ne!(signature(&baseline), signature(&device));
+    }
+
+    #[test]
+    fn queued_and_resumed_device_samples_keep_exact_and_monotonic_timestamps() {
+        fn sample(timestamp: u64) -> hermes_train::device_sampler::DeviceSample {
+            hermes_train::device_sampler::DeviceSample {
+                collected_at_unix_ms: timestamp,
+                metrics: hermes_train::metrics::DeviceUtilizationMetrics {
+                    sampled_at_unix_ms: timestamp,
+                    device_index: 0,
+                    sample_window_seconds: 1.0,
+                    gpu_utilization_percent: 75.0,
+                    sm_active_percent: None,
+                    tensor_core_active_percent: None,
+                    memory_bandwidth_percent: None,
+                    memory_used_bytes: 1,
+                    memory_total_bytes: 2,
+                    power_watts: Some(100.0),
+                    temperature_celsius: Some(50.0),
+                },
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let context = MetricContext {
+            global_step: 4,
+            phase: MetricPhase {
+                index: 0,
+                name: "pretrain".into(),
+                kind: MetricPhaseKind::Pretrain,
+            },
+            checkpoint_hash: None,
+        };
+        let mut writer = MetricWriter::create(&path, "telemetry-run").unwrap();
+        emit_device_sampler_drain(
+            DeviceSamplerDrain {
+                samples: vec![sample(1000)],
+                diagnostics: Vec::new(),
+            },
+            &mut writer,
+            &context,
+        )
+        .unwrap();
+        emit_device_sampler_drain(
+            DeviceSamplerDrain {
+                samples: vec![sample(1200), sample(1100)],
+                diagnostics: Vec::new(),
+            },
+            &mut writer,
+            &context,
+        )
+        .unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let mut writer =
+            MetricWriter::resume_from_checkpoint(&path, "telemetry-run", 3, 4).unwrap();
+        // Simulate a wall-clock correction after resume. The payload keeps
+        // the exact collection time while the record stays monotonic.
+        emit_device_sampler_drain(
+            DeviceSamplerDrain {
+                samples: vec![sample(950)],
+                diagnostics: Vec::new(),
+            },
+            &mut writer,
+            &context,
+        )
+        .unwrap();
+        writer.sync_all().unwrap();
+
+        let records = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let emitted = records
+            .iter()
+            .map(|record| record["emitted_at_unix_ms"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        let sampled = records
+            .iter()
+            .map(|record| {
+                record["event"]["values"]["sampled_at_unix_ms"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emitted, [1000, 1100, 1200, 1200]);
+        assert_eq!(sampled, [1000, 1100, 1200, 950]);
     }
 
     #[test]
@@ -575,14 +1889,100 @@ mod tests {
         let path = dir.path().join("artifact");
         fs::write(&path, b"hello").unwrap();
         assert_eq!(
-            file_fingerprint(&path).unwrap(),
-            "fnv1a64:a430d84680aabd0b:5"
+            file_sha256(&path).unwrap(),
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
 
     #[test]
-    fn training_decreases_loss_and_checkpoint_roundtrips() {
+    fn quantization_distillation_masks_structured_prompts_and_freezes_teacher() {
         let config = small_hybrid();
+        let device = hermes_llm::default_device().autodiff();
+        device.seed(11);
+        let teacher = Transformer::new(&config, &device).unwrap();
+        device.seed(29);
+        let student = Transformer::new(&config, &device).unwrap();
+        let input_ids = Tensor::<2, Int>::from_data([[1, 2, 3, 4]], &device);
+        let positions = Tensor::<1, Int>::from_data([2], &device);
+        let batch = make_batch(
+            &[TrainingSample::Supervised {
+                tokens: vec![1, 2, 3, 4, 5],
+                loss_positions: vec![2],
+                truncated_tokens: 0,
+            }],
+            4,
+            &device,
+        )
+        .unwrap();
+        let objective = ObjectiveConfig::Summarization {
+            instruction: "summarize".into(),
+        };
+        let loss = quantization_forward_kl(&student, &teacher, &batch, &objective, 1.0).unwrap();
+        let expected = forward_kl_distillation_tensor(
+            teacher.forward_selected_logits(input_ids.clone(), positions.clone()),
+            student.forward_selected_logits(input_ids, positions),
+            1.0,
+            true,
+        )
+        .unwrap();
+        let actual_value = scalar_value(loss.clone()).unwrap();
+        let expected_value = scalar_value(expected).unwrap();
+        assert!((actual_value - expected_value).abs() < 1e-6);
+
+        let mut gradients = loss.backward();
+        let teacher_gradients = GradientsParams::from_module(&mut gradients, &teacher);
+        let student_gradients = GradientsParams::from_module(&mut gradients, &student);
+        assert!(teacher_gradients.is_empty());
+        assert!(!student_gradients.is_empty());
+    }
+
+    #[test]
+    fn clipping_uses_one_norm_and_scale_for_wake_and_tier_gradients() {
+        let config = small_hybrid();
+        let device = hermes_llm::default_device().autodiff();
+        device.seed(37);
+        let model = Transformer::new(&config, &device).unwrap();
+        let muon_ids = model.muon_parameter_ids();
+        let input = Tensor::<2, Int>::from_data([[1, 2, 3, 4]], &device);
+        let target = Tensor::<2, Int>::from_data([[2, 3, 4, 5]], &device);
+        let mut gradients = model.forward_loss(input, target).backward();
+        let mut muon = GradientsParams::from_params(&mut gradients, &model, &muon_ids);
+        let tier = GradientsParams::from_module(&mut gradients, &model);
+        let mut wake = GradientsParams::new();
+        let mut tiers = vec![tier];
+        let expected = scalar_value(
+            sum_optional_tensors(
+                squared_gradient_norm(&model, &muon),
+                squared_gradient_norm(&model, &tiers[0]),
+            )
+            .unwrap()
+            .sqrt(),
+        )
+        .unwrap();
+        let max_norm = expected * 0.25;
+        let observed =
+            gradient_norm_and_clip(&model, &mut muon, &mut wake, &mut tiers, max_norm).unwrap();
+        assert!((observed - expected).abs() <= expected * 1e-5);
+        let clipped = scalar_value(
+            sum_optional_tensors(
+                squared_gradient_norm(&model, &muon),
+                squared_gradient_norm(&model, &tiers[0]),
+            )
+            .unwrap()
+            .sqrt(),
+        )
+        .unwrap();
+        assert!((clipped - max_norm).abs() <= max_norm * 1e-4);
+    }
+
+    #[test]
+    fn training_decreases_loss_and_checkpoint_roundtrips() {
+        let mut config = small_hybrid();
+        for block in config.pattern.as_mut().unwrap() {
+            block.dropout = 0.1;
+            block.attention.dropout = 0.1;
+            block.ffn.dropout = 0.1;
+        }
         let device = hermes_llm::default_device().autodiff();
         device.seed(41);
         let mut model = Transformer::new(&config, &device).unwrap();
@@ -605,7 +2005,8 @@ mod tests {
         };
 
         let mut losses = Vec::new();
-        for _ in 0..20 {
+        for microbatch in 0..20 {
+            device.seed(model_microbatch_seed(41, microbatch));
             let (input, target) = batch();
             let loss = model.forward_loss(input, target);
             losses.push(scalar_value(loss.clone()).unwrap());
@@ -614,12 +2015,14 @@ mod tests {
                 GradientsParams::from_params(&mut grads, &model, &muon_parameter_ids);
             let mut adamw_grads = GradientsParams::from_module(&mut grads, &model);
             if losses.len() == 1 {
-                let layer_norms = layer_gradient_norms(&model, &muon_grads, &adamw_grads).unwrap();
+                let layer_norms =
+                    layer_gradient_norms(&model, &muon_grads, &adamw_grads, &[]).unwrap();
                 assert_eq!(layer_norms.len(), config.num_layers);
                 assert!(layer_norms.into_iter().all(f32::is_finite));
             }
             let norm =
-                gradient_norm_and_clip(&model, &mut muon_grads, &mut adamw_grads, 1.0).unwrap();
+                gradient_norm_and_clip(&model, &mut muon_grads, &mut adamw_grads, &mut [], 1.0)
+                    .unwrap();
             assert!(norm.is_finite());
             model = muon_optimizer.step(2e-2, model, muon_grads).unwrap();
             model = adamw_optimizer.step(1e-3.into(), model, adamw_grads);
@@ -632,23 +2035,103 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = TrainingState {
             version: TRAINING_STATE_VERSION,
-            step: 20,
-            stage: 1,
+            global_step: 20,
+            phase: 1,
+            phase_id: "sft".into(),
+            phase_kind: "sft".into(),
             epoch: 2,
-            samples_in_stage: 640,
-            steps_in_stage: 10,
+            records_in_phase: 640,
+            steps_in_phase: 10,
             tokens_seen: 12_800,
-            curriculum_signature: "test-curriculum".to_owned(),
+            metric_records: 1,
+            workflow_signature: format!("sha256:{}", "0".repeat(64)),
+            data_manifest_hash: Some(format!("sha256:{}", "1".repeat(64))),
             parameter_ids: parameter_ids(&model),
+            optimizer_states: vec![OptimizerStateRef {
+                scope: "wake".into(),
+                adamw: "adamw-state.bpk".into(),
+                muon: "muon-state.bpk".into(),
+                gradient_accumulator: None,
+                update_clock: 20,
+            }],
+            sleep: None,
+            artifacts: Vec::new(),
+            evaluator_hashes: Vec::new(),
+            rng_streams: vec![
+                RngStreamState {
+                    name: DATA_RNG_STREAM.into(),
+                    seed: 0,
+                    counter: 640,
+                },
+                RngStreamState {
+                    name: MODEL_RNG_STREAM.into(),
+                    seed: 41,
+                    counter: 20,
+                },
+            ],
+            wake_context_buffer: Vec::new(),
+            quantization: None,
         };
-        save_training_checkpoint(
+        let mut metrics =
+            MetricWriter::create(dir.path().join("metrics.jsonl"), "test-run").unwrap();
+        metrics
+            .append_at(
+                MetricContext {
+                    global_step: 20,
+                    phase: MetricPhase {
+                        index: 1,
+                        name: "sft".into(),
+                        kind: MetricPhaseKind::Sft,
+                    },
+                    checkpoint_hash: None,
+                },
+                MetricEvent::Throughput(ThroughputMetrics {
+                    optimizer_steps: 20,
+                    compute_tokens: 12_800,
+                    supervised_tokens: 12_800,
+                    examples: 640,
+                    elapsed_seconds: 2.0,
+                    tokens_per_second: 6_400.0,
+                    examples_per_second: 320.0,
+                    input_wait_seconds: 0.1,
+                    host_to_device_seconds: 0.05,
+                    gpu_busy_seconds: 1.8,
+                }),
+                1,
+            )
+            .unwrap();
+        let publication = save_training_checkpoint_with_evidence(
             &model,
             &adamw_optimizer,
             &muon_optimizer,
             &state,
+            &mut metrics,
             dir.path(),
         )
         .unwrap();
+        assert!(publication.checkpoint_manifest.is_file());
+        assert!(publication.training_evidence.is_file());
+        let evidence: hermes_train::training_accounting::TrainingEvidence =
+            serde_json::from_slice(&fs::read(&publication.training_evidence).unwrap()).unwrap();
+        assert_eq!(
+            evidence.checkpoint_manifest_sha256,
+            publication.checkpoint_manifest_sha256
+        );
+        assert_eq!(evidence.parameters, model.num_parameters() as u64);
+        assert_eq!(evidence.routed_active_parameters, evidence.parameters);
+        assert_eq!(
+            evidence.stored_bytes,
+            fs::metadata(
+                publication
+                    .checkpoint_manifest
+                    .parent()
+                    .unwrap()
+                    .join("weights.safetensors")
+            )
+            .unwrap()
+            .len()
+        );
+        assert!((evidence.training_gpu_hours - 2.0 / 3600.0).abs() < 1e-15);
 
         let mut resumed = Transformer::new(&config, &device).unwrap();
         let mut resumed_ids = resumed.muon_parameter_ids();
@@ -666,16 +2149,13 @@ mod tests {
             &device,
         )
         .unwrap();
-        assert_eq!(resumed_state.step, state.step);
-        assert_eq!(resumed_state.stage, state.stage);
+        assert_eq!(resumed_state.global_step, state.global_step);
+        assert_eq!(resumed_state.phase, state.phase);
         assert_eq!(resumed_state.epoch, state.epoch);
-        assert_eq!(resumed_state.samples_in_stage, state.samples_in_stage);
-        assert_eq!(resumed_state.steps_in_stage, state.steps_in_stage);
+        assert_eq!(resumed_state.records_in_phase, state.records_in_phase);
+        assert_eq!(resumed_state.steps_in_phase, state.steps_in_phase);
         assert_eq!(resumed_state.tokens_seen, state.tokens_seen);
-        assert_eq!(
-            resumed_state.curriculum_signature,
-            state.curriculum_signature
-        );
+        assert_eq!(resumed_state.workflow_signature, state.workflow_signature);
         let restored_ids = resumed.muon_parameter_ids();
         assert_ne!(resumed_ids, restored_ids);
         assert_eq!(muon_parameter_ids, restored_ids);
@@ -685,6 +2165,7 @@ mod tests {
                        muon: &mut BatchedMuon,
                        adamw: &mut AdamWOptimizer,
                        muon_ids: &[ParamId]| {
+            device.seed(model_microbatch_seed(41, 20));
             let (input, target) = batch();
             let mut grads = model.forward_loss(input, target).backward();
             let muon_grads = GradientsParams::from_params(&mut grads, &model, muon_ids);

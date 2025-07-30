@@ -1,0 +1,125 @@
+# Experimental sleep-capable variant of retriever-300m-moe.
+#
+# The existing 300M definition is intentionally untouched.  Tier zero has the
+# exact original FFN/MoE shape so `upgrade_safetensors_to_memory` can remap an
+# existing checkpoint without changing logits.  Medium and slow tiers start as
+# residual no-ops; their tiny base FFNs keep wake overhead bounded while their
+# fixed low-rank reserves provide consolidation capacity without tensor growth.
+
+attention retr_attn {
+    num_heads: 8
+    num_kv_heads: 4
+    bias: false
+    qk_norm: true
+    position_encoding: rope { theta: 100000.0 }
+}
+
+ssm retr_ssm {
+    state_dim: 16
+    conv_kernel: 4
+    expand: 2
+}
+
+ffn retr_dense_ffn {
+    hidden_dim: 1536
+    activation: swiglu
+    bias: false
+}
+
+ffn retr_moe_ffn {
+    hidden_dim: 768
+    activation: swiglu
+    bias: false
+    moe {
+        experts: 15
+        top_k: 2
+        shared_experts: 0
+        load_balance_loss_weight: 0.01
+        router_z_loss_weight: 0.001
+    }
+}
+
+ffn retr_stable_memory_ffn {
+    hidden_dim: 16
+    activation: swiglu
+    bias: false
+}
+
+memory retr_dense_memory {
+    tier fast {
+        ffn: retr_dense_ffn
+        reserve_experts { capacity: 2 rank: 32 top_k: 1 }
+    }
+    tier medium {
+        ffn: retr_stable_memory_ffn
+        reserve_experts { capacity: 4 rank: 32 top_k: 1 }
+        residual_init: zero
+    }
+    tier slow {
+        ffn: retr_stable_memory_ffn
+        reserve_experts { capacity: 8 rank: 32 top_k: 1 }
+        residual_init: zero
+    }
+}
+
+memory retr_moe_memory {
+    tier fast {
+        ffn: retr_moe_ffn
+        reserve_experts { capacity: 2 rank: 32 top_k: 1 }
+    }
+    tier medium {
+        ffn: retr_stable_memory_ffn
+        reserve_experts { capacity: 4 rank: 32 top_k: 1 }
+        residual_init: zero
+    }
+    tier slow {
+        ffn: retr_stable_memory_ffn
+        reserve_experts { capacity: 8 rank: 32 top_k: 1 }
+        residual_init: zero
+    }
+}
+
+block attn_dense_memory_block {
+    attention: retr_attn
+    memory: retr_dense_memory
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+block attn_moe_memory_block {
+    attention: retr_attn
+    memory: retr_moe_memory
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+block mamba_dense_memory_block {
+    ssm: retr_ssm
+    memory: retr_dense_memory
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+block mamba_moe_memory_block {
+    ssm: retr_ssm
+    memory: retr_moe_memory
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+model retriever-300m-moe-sleep {
+    description: "Experimental 300M-backbone hybrid MoE retriever with fast-to-slow sleep memory"
+    vocab_size: 50277
+    max_seq_len: 8192
+    hidden_size: 512
+    num_layers: 24
+    block: attn_dense_memory_block
+    pattern: [mamba_dense_memory_block, mamba_moe_memory_block, attn_dense_memory_block, mamba_moe_memory_block, mamba_dense_memory_block, attn_moe_memory_block]
+    embeddings {
+        tie_weights: true
+    }
+}

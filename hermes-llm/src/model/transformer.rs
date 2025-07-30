@@ -1,6 +1,8 @@
 //! Full language model assembled from the MAL definition.
 
-use anyhow::{Result, bail};
+use std::ops::Range;
+
+use anyhow::{Context, Result, bail, ensure};
 use burn::module::{Initializer, ModuleVisitor, Param, ParamId};
 use burn::prelude::*;
 use burn::tensor::{DType, Int};
@@ -11,7 +13,7 @@ use crate::mal::{BlockDef, ModelDef, NormConfig, PositionEncoding};
 
 use super::linear_cross_entropy::linear_cross_entropy;
 use super::matmul::{matmul_2, matmul_input, prepare_linear_for_inference, stream_cast};
-use super::{InferenceState, Norm, TransformerBlock};
+use super::{InferenceState, MemoryRouting, MemorySlotStatus, Norm, TransformerBlock};
 
 pub(crate) struct RawLayerDiagnostic {
     pub activation: Tensor<3>,
@@ -24,6 +26,72 @@ pub(crate) struct RawModelDiagnostic {
     pub embedding: Tensor<3>,
     pub layers: Vec<RawLayerDiagnostic>,
     pub final_norm: Tensor<3>,
+}
+
+/// Exact stored and ordinary wake-routed model capacity.
+///
+/// `routed_active_parameters` is the conventional per-token parameter
+/// equivalent: it includes every non-expert parameter, complete MoE routers,
+/// shared experts, and only each sparse layer's ordinary `top_k` experts.
+/// Dream-only exploration is excluded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WakeParameterAccounting {
+    pub stored_parameters: u64,
+    pub routed_active_parameters: u64,
+}
+
+/// Reusable hidden states for chunked teacher/student distribution losses.
+///
+/// Constructing this value runs the backbone exactly once. Callers can then
+/// project small position ranges to vocabulary logits without retaining a
+/// full `[batch, sequence, vocabulary]` tensor or rerunning the backbone for
+/// every chunk.
+pub struct SelectedLogitProjector<'a> {
+    model: &'a Transformer,
+    hidden: Tensor<2>,
+    positions: Tensor<1, Int>,
+    selected: usize,
+}
+
+impl SelectedLogitProjector<'_> {
+    pub fn len(&self) -> usize {
+        self.selected
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selected == 0
+    }
+
+    /// Final-normalized hidden features consumed by the logical LM head for
+    /// the selected positions.
+    ///
+    /// The returned rows come from the same retained backbone pass as
+    /// [`Self::logits`].  This is primarily useful for training an isolated
+    /// output-projection adapter while keeping the base Transformer frozen.
+    pub fn hidden(&self, range: Range<usize>) -> Tensor<2> {
+        assert!(
+            range.start < range.end && range.end <= self.selected,
+            "selected-hidden range {}..{} is outside 0..{}",
+            range.start,
+            range.end,
+            self.selected
+        );
+        let positions = self.positions.clone().slice([range]);
+        self.hidden.clone().select(0, positions)
+    }
+
+    pub fn logits(&self, range: Range<usize>) -> Tensor<2> {
+        assert!(
+            range.start < range.end && range.end <= self.selected,
+            "selected-logit range {}..{} is outside 0..{}",
+            range.start,
+            range.end,
+            self.selected
+        );
+        let positions = self.positions.clone().slice([range.clone()]);
+        self.model
+            .project_flat_hidden(self.hidden.clone().select(0, positions), range.len())
+    }
 }
 
 const EMBEDDING_STD: f64 = 0.02;
@@ -65,43 +133,90 @@ fn validate_config(config: &ModelDef) -> Result<()> {
 
     for i in 0..config.num_layers {
         let block = config.block_for_layer(i);
+        let sleep_memory = block.memory.is_some();
         for (name, dropout) in [
             ("block", block.dropout),
             ("attention", block.attention.dropout),
-            ("ffn", block.ffn.dropout),
         ] {
             if !(0.0..1.0).contains(&dropout) {
                 bail!("layer {i} {name} dropout must be in [0, 1), got {dropout}");
             }
         }
         validate_norm(&format!("layer {i} norm"), &block.norm)?;
-        let intermediate = match block.ffn.hidden_dim {
-            Some(size) => size,
-            None => config
-                .hidden_size
-                .checked_mul(4)
-                .ok_or_else(|| anyhow::anyhow!("layer {i} default FFN size overflows usize"))?,
-        };
-        if intermediate == 0 {
-            bail!("layer {i} FFN hidden_dim must be positive");
-        }
-        if let Some(moe) = &block.ffn.moe {
-            if moe.experts < 2 {
-                bail!("layer {i} MoE experts must be at least 2");
+        let ffns = match &block.memory {
+            Some(memory) => {
+                if block.ffn != crate::mal::FfnDef::default() {
+                    bail!("layer {i} cannot configure both ffn and memory");
+                }
+                if memory.tiers.is_empty() {
+                    bail!("layer {i} memory must contain at least one tier");
+                }
+                let mut names = std::collections::HashSet::new();
+                for tier in &memory.tiers {
+                    if !names.insert(&tier.name) {
+                        bail!("layer {i} memory tier names must be unique");
+                    }
+                    let reserve = &tier.reserve_experts;
+                    if reserve.capacity == 0 || reserve.rank == 0 {
+                        bail!(
+                            "layer {i} memory tier '{}' reserve capacity and rank must be positive",
+                            tier.name
+                        );
+                    }
+                    if reserve.top_k != 1 {
+                        bail!(
+                            "layer {i} memory tier '{}' reserve top_k must be 1 so wake active compute stays constant as stored capacity activates",
+                            tier.name
+                        );
+                    }
+                }
+                memory
+                    .tiers
+                    .iter()
+                    .map(|tier| (format!("memory tier '{}'", tier.name), &tier.ffn))
+                    .collect::<Vec<_>>()
             }
-            if moe.top_k == 0 || moe.top_k > moe.experts {
+            None => vec![("ffn".to_string(), &block.ffn)],
+        };
+        for (name, ffn) in ffns {
+            if !(0.0..1.0).contains(&ffn.dropout) {
                 bail!(
-                    "layer {i} MoE top_k must be in 1..={}, got {}",
-                    moe.experts,
-                    moe.top_k
+                    "layer {i} {name} dropout must be in [0, 1), got {}",
+                    ffn.dropout
                 );
             }
-            for (name, weight) in [
-                ("load_balance_loss_weight", moe.load_balance_loss_weight),
-                ("router_z_loss_weight", moe.router_z_loss_weight),
-            ] {
-                if !weight.is_finite() || weight < 0.0 {
-                    bail!("layer {i} MoE {name} must be finite and non-negative");
+            let intermediate = match ffn.hidden_dim {
+                Some(size) => size,
+                None => config.hidden_size.checked_mul(4).ok_or_else(|| {
+                    anyhow::anyhow!("layer {i} default {name} size overflows usize")
+                })?,
+            };
+            if intermediate == 0 {
+                bail!("layer {i} {name} hidden_dim must be positive");
+            }
+            if let Some(moe) = &ffn.moe {
+                if moe.experts < 2 {
+                    bail!("layer {i} {name} MoE experts must be at least 2");
+                }
+                if moe.top_k == 0 || moe.top_k > moe.experts {
+                    bail!(
+                        "layer {i} {name} MoE top_k must be in 1..={}, got {}",
+                        moe.experts,
+                        moe.top_k
+                    );
+                }
+                if sleep_memory && moe.top_k == moe.experts {
+                    bail!(
+                        "layer {i} {name} persistent MoE experts must exceed top_k so Dreaming can add one distinct exploration expert"
+                    );
+                }
+                for (loss_name, weight) in [
+                    ("load_balance_loss_weight", moe.load_balance_loss_weight),
+                    ("router_z_loss_weight", moe.router_z_loss_weight),
+                ] {
+                    if !weight.is_finite() || weight < 0.0 {
+                        bail!("layer {i} {name} MoE {loss_name} must be finite and non-negative");
+                    }
                 }
             }
         }
@@ -214,6 +329,8 @@ fn pad_output_linear(mut output: Linear, stored_vocab_size: usize) -> Linear {
     output
 }
 
+/// Shared MAL-assembled language model used for training, retrieval, and
+/// cached autoregressive inference.
 #[derive(Module, Debug)]
 pub struct Transformer {
     embedding: Embedding,
@@ -232,11 +349,31 @@ pub struct Transformer {
     embedding_scale: Option<f64>,
     #[module(skip)]
     config: ModelDef,
+    /// Whether at least one persistent FFN MoE can supply a route outside its
+    /// ordinary top-k. Reserve-memory routers are intentionally excluded.
+    #[module(skip)]
+    dream_routing_supported: bool,
 }
 
 impl Transformer {
     pub fn new(config: &ModelDef, device: &Device) -> Result<Self> {
         validate_config(config)?;
+        let dream_routing_supported = (0..config.num_layers).any(|layer| {
+            let block = config.block_for_layer(layer);
+            match &block.memory {
+                Some(memory) => memory.tiers.iter().any(|tier| {
+                    tier.ffn
+                        .moe
+                        .as_ref()
+                        .is_some_and(|moe| moe.experts > moe.top_k)
+                }),
+                None => block
+                    .ffn
+                    .moe
+                    .as_ref()
+                    .is_some_and(|moe| moe.experts > moe.top_k),
+            }
+        });
 
         let attn_blocks: Vec<&BlockDef> = (0..config.num_layers)
             .map(|i| config.block_for_layer(i))
@@ -326,7 +463,17 @@ impl Transformer {
             rope,
             embedding_scale: config.embeddings.scale,
             config: config.clone(),
+            dream_routing_supported,
         })
+    }
+
+    fn assert_dream_routing_supported(&self, routing: MemoryRouting) {
+        if matches!(routing, MemoryRouting::Dream { .. }) {
+            assert!(
+                self.dream_routing_supported,
+                "dream generation requires a persistent FFN MoE with at least one expert outside ordinary top-k"
+            );
+        }
     }
 
     fn embed(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
@@ -340,6 +487,38 @@ impl Transformer {
 
     pub fn forward(&self, input_ids: Tensor<2, Int>, start_pos: usize) -> Tensor<3> {
         self.project_logits(self.forward_hidden(input_ids, start_pos))
+    }
+
+    /// Full-sequence logits with dream-only random expert routing enabled.
+    /// Wake execution must continue to use [`Self::forward`].
+    pub fn forward_with_memory_routing(
+        &self,
+        input_ids: Tensor<2, Int>,
+        start_pos: usize,
+        routing: MemoryRouting,
+    ) -> Tensor<3> {
+        self.project_logits(self.forward_hidden_with_memory_routing(input_ids, start_pos, routing))
+    }
+
+    fn forward_hidden_with_memory_routing(
+        &self,
+        input_ids: Tensor<2, Int>,
+        start_pos: usize,
+        routing: MemoryRouting,
+    ) -> Tensor<3> {
+        self.assert_dream_routing_supported(routing);
+        let [_, seq_len] = input_ids.dims();
+        assert!(start_pos + seq_len <= self.config.max_seq_len);
+        let mut hidden = stream_cast(self.embed(input_ids));
+        for (index, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_with_routing(
+                hidden,
+                &self.rope,
+                start_pos,
+                routing.salted(index as u64),
+            );
+        }
+        self.final_norm.forward(hidden)
     }
 
     fn forward_hidden(&self, input_ids: Tensor<2, Int>, start_pos: usize) -> Tensor<3> {
@@ -467,6 +646,85 @@ impl Transformer {
         (loss, router_loss)
     }
 
+    /// Vocabulary logits only for selected row-major token positions.
+    ///
+    /// Knowledge-seeding callers can chunk `positions` to avoid materializing
+    /// a `[batch, sequence, vocabulary]` tensor for teacher/student divergence.
+    pub fn forward_selected_logits(
+        &self,
+        input_ids: Tensor<2, Int>,
+        positions: Tensor<1, Int>,
+    ) -> Tensor<2> {
+        let projector = self.prepare_selected_logits(input_ids, positions);
+        projector.logits(0..projector.len())
+    }
+
+    /// Run the backbone once and retain its flattened hidden states for
+    /// chunked selected-position projection.
+    pub fn prepare_selected_logits(
+        &self,
+        input_ids: Tensor<2, Int>,
+        positions: Tensor<1, Int>,
+    ) -> SelectedLogitProjector<'_> {
+        let [batch, sequence] = input_ids.dims();
+        let [selected] = positions.dims();
+        assert!(
+            selected > 0,
+            "selected logits require at least one position"
+        );
+        let hidden = self
+            .forward_hidden_through(input_ids, 0, self.layers.len())
+            .reshape([batch * sequence, self.config.hidden_size]);
+        SelectedLogitProjector {
+            model: self,
+            hidden,
+            positions,
+            selected,
+        }
+    }
+
+    /// Run the backbone once with an explicit memory routing mode and retain
+    /// only the requested rows for hidden-state inspection and vocabulary
+    /// projection. Dreaming uses this to apply its isolated generation-policy
+    /// adapter without materializing logits for every prefix position.
+    pub fn prepare_selected_logits_with_memory_routing(
+        &self,
+        input_ids: Tensor<2, Int>,
+        positions: Tensor<1, Int>,
+        routing: MemoryRouting,
+    ) -> SelectedLogitProjector<'_> {
+        let [batch, sequence] = input_ids.dims();
+        let [selected] = positions.dims();
+        assert!(
+            selected > 0,
+            "selected logits require at least one position"
+        );
+        let hidden = self
+            .forward_hidden_with_memory_routing(input_ids, 0, routing)
+            .reshape([batch * sequence, self.config.hidden_size]);
+        SelectedLogitProjector {
+            model: self,
+            hidden,
+            positions,
+            selected,
+        }
+    }
+
+    fn project_flat_hidden(&self, hidden: Tensor<2>, selected: usize) -> Tensor<2> {
+        let stored_vocab = self.config.padded_vocab_size();
+        let (weight, bias) = self.output_parameters();
+        let logits = matmul_2(hidden, weight.transpose());
+        let logits = match bias {
+            Some(bias) => logits + bias.reshape([1, stored_vocab]),
+            None => logits,
+        };
+        if stored_vocab == self.config.vocab_size {
+            logits
+        } else {
+            logits.slice([0..selected, 0..self.config.vocab_size])
+        }
+    }
+
     /// L2-normalized last-meaningful-token embeddings for retrieval training.
     ///
     /// `end_positions` contains one row-major index into the flattened
@@ -588,6 +846,37 @@ impl Transformer {
         self.num_params()
     }
 
+    /// Measure ordinary wake capacity from the instantiated module tree.
+    ///
+    /// Memory hierarchies use their synchronized checkpoint active-slot masks.
+    /// A dormant reserve executes the fixed, non-parameter zero fallback lane,
+    /// so its routed parameter-equivalent remains constant as slots activate.
+    pub fn wake_parameter_accounting(&self) -> Result<WakeParameterAccounting> {
+        let stored = self.num_parameters();
+        let mut dormant = 0_usize;
+        for (layer, block) in self.layers.iter().enumerate() {
+            let (block_stored, block_routed) = block
+                .wake_parameter_counts()
+                .with_context(|| format!("cannot account wake parameters for layer {layer}"))?;
+            dormant = dormant
+                .checked_add(block_stored.checked_sub(block_routed).with_context(|| {
+                    format!("layer {layer} routed parameter count exceeds stored count")
+                })?)
+                .context("model dormant parameter count overflows usize")?;
+        }
+        let routed = stored
+            .checked_sub(dormant)
+            .context("model routed parameter count exceeds stored count")?;
+        Ok(WakeParameterAccounting {
+            stored_parameters: stored
+                .try_into()
+                .context("stored parameter count exceeds u64")?,
+            routed_active_parameters: routed
+                .try_into()
+                .context("routed parameter count exceeds u64")?,
+        })
+    }
+
     /// Parameter IDs optimized by Muon during training.
     ///
     /// Every 2D parameter inside a transformer block uses Muon. Embeddings, the
@@ -597,13 +886,41 @@ impl Transformer {
         for layer in &self.layers {
             layer.visit(&mut visitor);
         }
-        let router_ids = self
+        let non_muon_ids = self
             .layers
             .iter()
-            .filter_map(TransformerBlock::router_parameter_id)
+            .flat_map(TransformerBlock::non_muon_parameter_ids)
             .collect::<Vec<_>>();
-        visitor.ids.retain(|id| !router_ids.contains(id));
+        visitor.ids.retain(|id| !non_muon_ids.contains(id));
         visitor.ids
+    }
+
+    /// Parameter IDs whose stored tensors are encoded by the ultra-low-bit
+    /// archive and replaced by fake-quantized values during QAT.  Keeping the
+    /// selection in the model makes the training forward and archive export
+    /// agree without relying on fragile serialized parameter names.
+    pub fn ultra_quant_parameter_ids(
+        &self,
+        quantize_embeddings: bool,
+        quantize_lm_head: bool,
+    ) -> Result<Vec<ParamId>> {
+        ensure!(
+            !self.config.embeddings.tie_weights || quantize_embeddings == quantize_lm_head,
+            "tied embedding/output weights cannot use different quantization policies"
+        );
+        let mut visitor = StoredMatrixParameterVisitor::default();
+        self.visit(&mut visitor);
+        if !quantize_embeddings {
+            visitor.ids.retain(|id| *id != self.embedding.weight.id);
+        }
+        if !quantize_lm_head && let Some(head) = &self.lm_head {
+            visitor.ids.retain(|id| *id != head.weight.id);
+        }
+        ensure!(
+            !visitor.ids.is_empty(),
+            "quantization policy selected no rank-two-or-higher parameters"
+        );
+        Ok(visitor.ids)
     }
 
     /// Visit one transformer block without exposing its module fields. This is
@@ -707,11 +1024,33 @@ impl Transformer {
         self.project_last_logits(self.forward_hidden_with_state(input_ids, state))
     }
 
+    /// Cached generation with optional dream-only random expert routing.
+    pub fn forward_next_logits_with_state_and_memory_routing(
+        &self,
+        input_ids: Tensor<2, Int>,
+        state: &mut InferenceState,
+        routing: MemoryRouting,
+    ) -> Tensor<2> {
+        self.project_last_logits(
+            self.forward_hidden_with_state_and_routing(input_ids, state, routing),
+        )
+    }
+
     fn forward_hidden_with_state(
         &self,
         input_ids: Tensor<2, Int>,
         state: &mut InferenceState,
     ) -> Tensor<3> {
+        self.forward_hidden_with_state_and_routing(input_ids, state, MemoryRouting::Wake)
+    }
+
+    fn forward_hidden_with_state_and_routing(
+        &self,
+        input_ids: Tensor<2, Int>,
+        state: &mut InferenceState,
+        routing: MemoryRouting,
+    ) -> Tensor<3> {
+        self.assert_dream_routing_supported(routing);
         let [batch, seq_len] = input_ids.dims();
         assert!(
             batch > 0 && seq_len > 0,
@@ -730,18 +1069,230 @@ impl Transformer {
             "inference state belongs to a model with a different layer count"
         );
 
+        // Autoregressive dreaming normally calls this path once per token.
+        // Include the absolute position in the exploration seed so its random
+        // extra expert does not stay fixed for an entire generated sequence.
+        let routing = routing.salted(state.pos as u64);
         let mut x = self.embed(input_ids);
-        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
-            x = layer.forward_with_state(x, &self.rope, state.pos, layer_state);
+        for (index, (layer, layer_state)) in
+            self.layers.iter().zip(state.layers.iter_mut()).enumerate()
+        {
+            x = layer.forward_with_state_and_routing(
+                x,
+                &self.rope,
+                state.pos,
+                layer_state,
+                routing.salted(index as u64),
+            );
         }
         state.pos += seq_len;
         self.final_norm.forward(x)
+    }
+
+    /// Refresh runtime mirrors from checkpointed memory masks. Strict Hermes
+    /// loaders call this automatically; call it after applying snapshots with
+    /// Burn APIs directly.
+    pub fn sync_memory_state(&mut self) {
+        for layer in &mut self.layers {
+            layer.sync_memory_state();
+        }
+    }
+
+    pub(crate) fn prepare_memory_upgrade_state(&mut self) {
+        for layer in &mut self.layers {
+            layer.prepare_memory_upgrade_state();
+        }
+    }
+
+    pub fn memory_slot_statuses(&self) -> Vec<MemorySlotStatus> {
+        self.layers
+            .iter()
+            .enumerate()
+            .flat_map(|(index, layer)| layer.memory_statuses(index))
+            .collect()
+    }
+
+    /// Activate one preallocated low-rank reserve slot.
+    pub fn activate_memory_slot(&mut self, layer: usize, tier: usize, slot: usize) -> Result<()> {
+        self.layers
+            .get_mut(layer)
+            .ok_or_else(|| anyhow::anyhow!("layer {layer} does not exist"))?
+            .activate_memory_slot(tier, slot)
+    }
+
+    /// Activate the same logical reserve slot in every block that owns the
+    /// requested memory tier. Consolidation treats these per-block tensors as
+    /// one model-wide slot, so preflight validation happens before mutation.
+    pub fn activate_memory_slot_all_layers(
+        &mut self,
+        tier: usize,
+        slot: usize,
+    ) -> Result<Vec<ParamId>> {
+        let targets = self
+            .memory_slot_statuses()
+            .into_iter()
+            .filter(|status| status.tier == tier && status.slot == slot)
+            .collect::<Vec<_>>();
+        ensure!(
+            !targets.is_empty(),
+            "memory tier {tier} slot {slot} does not exist"
+        );
+        ensure!(
+            targets.iter().all(|status| !status.active),
+            "memory tier {tier} slot {slot} is active in at least one layer"
+        );
+        ensure!(
+            targets
+                .windows(2)
+                .all(|pair| pair[0].generation == pair[1].generation),
+            "memory tier {tier} slot {slot} generations differ across layers"
+        );
+        let mut parameter_ids = Vec::new();
+        for target in targets {
+            parameter_ids.extend(target.parameter_ids);
+            self.layers[target.layer].activate_memory_slot(tier, slot)?;
+        }
+        Ok(parameter_ids)
+    }
+
+    /// Deactivate a reserve slot without modifying its learned tensors.
+    /// Transaction rollback can use this; capacity reclamation should use
+    /// [`Self::reset_memory_slot`] instead.
+    pub fn deactivate_memory_slot(&mut self, layer: usize, tier: usize, slot: usize) -> Result<()> {
+        self.layers
+            .get_mut(layer)
+            .ok_or_else(|| anyhow::anyhow!("layer {layer} does not exist"))?
+            .deactivate_memory_slot(tier, slot)
+    }
+
+    /// Reset a reclaimed slot to a dormant no-op and advance its serialized
+    /// generation. Optimizer moments for the returned parameter IDs must be
+    /// cleared by the trainer in the same transaction.
+    pub fn reset_memory_slot(
+        &mut self,
+        layer_index: usize,
+        tier: usize,
+        slot: usize,
+        seed: u64,
+    ) -> Result<Vec<ParamId>> {
+        let layer = self
+            .layers
+            .get_mut(layer_index)
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_index} does not exist"))?;
+        layer.reset_memory_slot(tier, slot, seed)?;
+        Ok(layer
+            .memory_statuses(layer_index)
+            .into_iter()
+            .find(|status| status.tier == tier && status.slot == slot)
+            .expect("reset slot remains allocated")
+            .parameter_ids)
+    }
+
+    /// Reclaim the same logical slot in every memory-bearing layer. The seed
+    /// is salted by layer while the serialized generation remains aligned.
+    pub fn reset_memory_slot_all_layers(
+        &mut self,
+        tier: usize,
+        slot: usize,
+        seed: u64,
+    ) -> Result<Vec<ParamId>> {
+        let targets = self
+            .memory_slot_statuses()
+            .into_iter()
+            .filter(|status| status.tier == tier && status.slot == slot)
+            .collect::<Vec<_>>();
+        ensure!(
+            !targets.is_empty(),
+            "memory tier {tier} slot {slot} does not exist"
+        );
+        ensure!(
+            targets.iter().all(|status| status.active),
+            "memory tier {tier} slot {slot} is dormant in at least one layer"
+        );
+        ensure!(
+            targets
+                .windows(2)
+                .all(|pair| pair[0].generation == pair[1].generation),
+            "memory tier {tier} slot {slot} generations differ across layers"
+        );
+        let mut parameter_ids = Vec::new();
+        for target in targets {
+            parameter_ids.extend(self.reset_memory_slot(
+                target.layer,
+                tier,
+                slot,
+                seed ^ (target.layer as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            )?);
+        }
+        Ok(parameter_ids)
+    }
+
+    /// Float parameters belonging to a complete memory tier.
+    pub fn memory_tier_parameter_ids(&self, layer: usize, tier: usize) -> Result<Vec<ParamId>> {
+        self.layers
+            .get(layer)
+            .ok_or_else(|| anyhow::anyhow!("layer {layer} does not exist"))?
+            .memory_tier_parameter_ids(tier)
+    }
+
+    /// Float parameters for one logical tier across all memory-bearing layers.
+    pub fn memory_tier_parameter_ids_all_layers(&self, tier: usize) -> Result<Vec<ParamId>> {
+        let layers = self
+            .memory_slot_statuses()
+            .into_iter()
+            .filter(|status| status.tier == tier)
+            .map(|status| status.layer)
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(!layers.is_empty(), "memory tier {tier} does not exist");
+        let mut ids = Vec::new();
+        for layer in layers {
+            ids.extend(self.memory_tier_parameter_ids(layer, tier)?);
+        }
+        Ok(ids)
+    }
+
+    /// Persistent base FFN/MoE parameters for one memory tier across every
+    /// memory-bearing layer. Reserve expert tensors are deliberately excluded.
+    pub fn memory_tier_base_parameter_ids_all_layers(&self, tier: usize) -> Result<Vec<ParamId>> {
+        let layers = self
+            .memory_slot_statuses()
+            .into_iter()
+            .filter(|status| status.tier == tier)
+            .map(|status| status.layer)
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(!layers.is_empty(), "memory tier {tier} does not exist");
+        let mut ids = Vec::new();
+        for layer in layers {
+            ids.extend(
+                self.layers[layer]
+                    .memory_tier_base_parameter_ids(tier)
+                    .with_context(|| format!("reading layer {layer} memory tier {tier} base"))?,
+            );
+        }
+        ensure!(
+            !ids.is_empty(),
+            "memory tier {tier} base has no float parameters"
+        );
+        Ok(ids)
     }
 }
 
 #[derive(Default)]
 struct MatrixParameterVisitor {
     ids: Vec<ParamId>,
+}
+
+#[derive(Default)]
+struct StoredMatrixParameterVisitor {
+    ids: Vec<ParamId>,
+}
+
+impl ModuleVisitor for StoredMatrixParameterVisitor {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        if D >= 2 {
+            self.ids.push(param.id);
+        }
+    }
 }
 
 impl ModuleVisitor for MatrixParameterVisitor {
@@ -755,6 +1306,83 @@ impl ModuleVisitor for MatrixParameterVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_parameter_accounting_is_exact_for_dense_and_sparse_ffns() {
+        let dense_config = crate::mal::parse_mal(
+            r#"
+            ffn dense { hidden_dim: 12 activation: swiglu bias: false }
+            model dense_test {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } ffn: dense }
+            }
+            "#,
+        )
+        .unwrap();
+        let dense = Transformer::new(&dense_config, &Device::ndarray()).unwrap();
+        let dense_accounting = dense.wake_parameter_accounting().unwrap();
+        assert_eq!(
+            dense_accounting.stored_parameters,
+            dense.num_parameters() as u64
+        );
+        assert_eq!(
+            dense_accounting.routed_active_parameters,
+            dense_accounting.stored_parameters
+        );
+
+        let sparse_config = crate::mal::parse_mal(
+            r#"
+            ffn routed {
+                hidden_dim: 12 activation: swiglu bias: false
+                moe { experts: 4 top_k: 2 shared_experts: 1 }
+            }
+            model sparse_test {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } ffn: routed }
+            }
+            "#,
+        )
+        .unwrap();
+        let sparse = Transformer::new(&sparse_config, &Device::ndarray()).unwrap();
+        let sparse_accounting = sparse.wake_parameter_accounting().unwrap();
+        // Two of four routed experts are dormant. A gated 8 -> 12 -> 8
+        // bias-free expert stores (8 * 24) + (12 * 8) parameters.
+        let one_expert = 8_u64 * 24 + 12 * 8;
+        assert_eq!(
+            sparse_accounting.stored_parameters - sparse_accounting.routed_active_parameters,
+            2 * one_expert
+        );
+    }
+
+    #[test]
+    fn memory_accounting_uses_fixed_mask_aware_reserve_lane() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn base { hidden_dim: 12 activation: swiglu }
+            memory cms {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } memory: cms }
+            }
+            "#,
+        )
+        .unwrap();
+        let mut model = Transformer::new(&config, &Device::ndarray()).unwrap();
+        let dormant = model.wake_parameter_accounting().unwrap();
+        assert_eq!(dormant.stored_parameters, model.num_parameters() as u64);
+        model.activate_memory_slot(0, 0, 0).unwrap();
+        let active = model.wake_parameter_accounting().unwrap();
+        assert_eq!(active.stored_parameters, dormant.stored_parameters);
+        assert_eq!(
+            active.routed_active_parameters, dormant.routed_active_parameters,
+            "activating a preallocated reserve must replace, not add, the fixed route lane"
+        );
+    }
     use crate::mal::get_builtin_model;
     use burn::tensor::TensorData;
 
@@ -997,6 +1625,50 @@ mod tests {
     }
 
     #[test]
+    fn selected_logits_match_materialized_positions() {
+        let mut config = get_builtin_model("tiny").unwrap();
+        config.vocab_size = 32;
+        config.hidden_size = 8;
+        config.num_layers = 1;
+        config.max_seq_len = 8;
+        config.block.attention.num_heads = Some(2);
+        config.block.attention.num_kv_heads = Some(1);
+        config.block.attention.head_dim = Some(4);
+        config.block.ffn.hidden_dim = Some(16);
+        let device = Device::ndarray();
+        device.seed(41);
+        let model = Transformer::new(&config, &device).unwrap();
+        let ids = vec![1_i64, 2, 3, 4, 5, 6, 7, 8];
+        let input = || Tensor::<2, Int>::from_data(TensorData::new(ids.clone(), [2, 4]), &device);
+        let positions = Tensor::<1, Int>::from_data([0_i64, 3, 5], &device);
+        let expected = model
+            .forward(input(), 0)
+            .reshape([8, config.vocab_size])
+            .select(0, positions.clone());
+        let selected = model.forward_selected_logits(input(), positions.clone());
+        let maximum: f32 = (expected.clone() - selected).abs().max().into_scalar();
+        assert!(maximum < 1e-6, "selected logits differ by {maximum}");
+
+        let projector = model.prepare_selected_logits(input(), positions);
+        assert_eq!(projector.len(), 3);
+        assert!(!projector.is_empty());
+        let hidden = projector.hidden(0..3);
+        assert_eq!(hidden.dims(), [3, config.hidden_size]);
+        let chunked_hidden = Tensor::cat(vec![projector.hidden(0..1), projector.hidden(1..3)], 0);
+        let maximum: f32 = (hidden - chunked_hidden).abs().max().into_scalar();
+        assert!(
+            maximum < 1e-6,
+            "chunked selected hidden features differ by {maximum}"
+        );
+        let chunked = Tensor::cat(vec![projector.logits(0..1), projector.logits(1..3)], 0);
+        let maximum: f32 = (expected - chunked).abs().max().into_scalar();
+        assert!(
+            maximum < 1e-6,
+            "chunked selected logits differ by {maximum}"
+        );
+    }
+
+    #[test]
     fn retrieval_embeddings_use_requested_layer_and_unit_normalization() {
         let mut config = get_builtin_model("hybrid-tiny").unwrap();
         config.vocab_size = 32;
@@ -1115,5 +1787,207 @@ mod tests {
         }
         assert!(attention_layers > 0);
         assert!(mamba_layers > 0);
+    }
+
+    #[test]
+    fn logical_memory_slots_stay_aligned_across_layers() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn base { hidden_dim: 12 activation: swiglu }
+            memory cms {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+                tier slow {
+                    ffn: base residual_init: zero
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 2
+                block: { attention: { num_heads: 1 } memory: cms }
+            }
+            "#,
+        )
+        .unwrap();
+        let device = Device::ndarray();
+        let mut model = Transformer::new(&config, &device).unwrap();
+        let ids = model.activate_memory_slot_all_layers(1, 0).unwrap();
+        assert!(!ids.is_empty());
+        let base_ids = model.memory_tier_base_parameter_ids_all_layers(1).unwrap();
+        let all_tier_ids = model.memory_tier_parameter_ids_all_layers(1).unwrap();
+        assert!(!base_ids.is_empty());
+        assert!(base_ids.iter().all(|id| all_tier_ids.contains(id)));
+        assert!(base_ids.iter().all(|id| !ids.contains(id)));
+        let active = model
+            .memory_slot_statuses()
+            .into_iter()
+            .filter(|status| status.tier == 1 && status.slot == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 2);
+        assert!(
+            active
+                .iter()
+                .all(|status| status.active && status.generation == 1)
+        );
+        assert!(model.activate_memory_slot_all_layers(1, 0).is_err());
+
+        let reset_ids = model.reset_memory_slot_all_layers(1, 0, 17).unwrap();
+        assert_eq!(reset_ids.len(), ids.len());
+        let reset = model
+            .memory_slot_statuses()
+            .into_iter()
+            .filter(|status| status.tier == 1 && status.slot == 0)
+            .collect::<Vec<_>>();
+        assert!(
+            reset
+                .iter()
+                .all(|status| !status.active && status.generation == 2)
+        );
+        assert!(
+            !model
+                .memory_tier_parameter_ids_all_layers(1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn memory_reserve_rejects_growing_top_k_compute() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn base { hidden_dim: 12 activation: swiglu }
+            memory cms {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 2 rank: 3 top_k: 2 }
+                }
+                tier slow {
+                    ffn: base residual_init: zero
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } memory: cms }
+            }
+            "#,
+        )
+        .unwrap();
+        let error = Transformer::new(&config, &Device::ndarray())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserve top_k must be 1"), "{error}");
+    }
+
+    #[test]
+    fn first_active_reserve_keeps_dream_exploration_on_persistent_moe() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn routed {
+                hidden_dim: 12
+                moe { experts: 3 top_k: 1 }
+            }
+            memory cms {
+                tier fast {
+                    ffn: routed
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } memory: cms }
+            }
+            "#,
+        )
+        .unwrap();
+        let device = Device::ndarray();
+        device.seed(91);
+        let mut model = Transformer::new(&config, &device).unwrap();
+        model.activate_memory_slot_all_layers(0, 0).unwrap();
+        assert_eq!(
+            model
+                .memory_slot_statuses()
+                .iter()
+                .filter(|status| status.active)
+                .count(),
+            1
+        );
+
+        let input = Tensor::<2, Int>::from_data([[1_i64, 2, 3]], &device);
+        let wake = model.forward(input.clone(), 0);
+        let dream = model.forward_with_memory_routing(
+            input.clone(),
+            0,
+            MemoryRouting::Dream { seed: 0x1234 },
+        );
+        let selected = model
+            .prepare_selected_logits_with_memory_routing(
+                input,
+                Tensor::<1, Int>::from_data([2_i64], &device),
+                MemoryRouting::Dream { seed: 0x1234 },
+            )
+            .logits(0..1);
+        let selected_difference: f32 = (selected
+            - dream
+                .clone()
+                .slice([0..1, 2..3, 0..config.vocab_size])
+                .reshape([1, config.vocab_size]))
+        .abs()
+        .max()
+        .into_scalar();
+        assert!(selected_difference < 1e-6);
+        let difference: f32 = (dream - wake).abs().max().into_scalar();
+        assert!(
+            difference > 0.0,
+            "persistent MoE exploration should remain active with one receiver slot"
+        );
+    }
+
+    #[test]
+    fn sleep_memory_rejects_persistent_moe_without_dream_capacity() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn routed { hidden_dim: 12 moe { experts: 2 top_k: 2 } }
+            memory cms {
+                tier fast {
+                    ffn: routed
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } memory: cms }
+            }
+            "#,
+        )
+        .unwrap();
+        let error = Transformer::new(&config, &Device::ndarray())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("persistent MoE experts must exceed top_k"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "dream generation requires a persistent FFN MoE")]
+    fn dense_model_rejects_dream_expert_routing() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn dense { hidden_dim: 12 }
+            model dense {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } ffn: dense }
+            }
+            "#,
+        )
+        .unwrap();
+        let device = Device::ndarray();
+        let model = Transformer::new(&config, &device).unwrap();
+        let input = Tensor::<2, Int>::from_data([[1_i64, 2]], &device);
+        let _ = model.forward_with_memory_routing(input, 0, MemoryRouting::Dream { seed: 1 });
     }
 }

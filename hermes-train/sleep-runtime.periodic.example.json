@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "workflow_signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "model_mal": {
+    "path": "../hermes-mal/well-known/retriever_300m_moe_sleep.mal",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "semantic_judge": {
+    "path": "artifacts/sleep/token-semantic-judge.json",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "retention_evaluator": {
+    "path": "artifacts/sleep/likelihood-retention-evaluator.json",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "retention_suite": {
+    "path": "benchmarks/retention.sealed.json",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "rollouts": {
+    "max_context_tokens": 512,
+    "continuation_tokens": 128,
+    "temperature": 0.8,
+    "top_k": 32,
+    "repetition_penalty": 1.05,
+    "imitation_groups": 4
+  },
+  "tier_optimizer": {
+    "learning_rate": 0.0003,
+    "beta_1": 0.9,
+    "beta_2": 0.95,
+    "epsilon": 1e-8,
+    "weight_decay": 0.1
+  },
+  "dreaming": {
+    "artifact_directory": "sleep-state/dreams",
+    "reference_set": {
+      "path": "artifacts/sleep/dream-reference-set.json",
+      "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "independent_evaluation_set": {
+      "path": "artifacts/sleep/dream-independent-evaluation-set.json",
+      "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "max_new_tokens": 32,
+    "gradient_dimensions": 256,
+    "lora_steps": 8,
+    "lora_learning_rate": 0.001,
+    "restem_learning_rate": 0.1,
+    "generation_temperature": 0.8,
+    "generation_policy_rank": 64,
+    "generation_policy_alpha": 128
+  },
+  "tensor_transaction_directory": "sleep-state/tensor-transactions",
+  "prospective_directory": "sleep-state/prospective-updates",
+  "tier_optimizer_directory": "sleep-state/tier-optimizers",
+  "candidate_directory": "candidates",
+  "rejection_report_directory": "sleep-state/rejections",
+  "max_wake_context_records": 64,
+  "rng_streams": 4
+}

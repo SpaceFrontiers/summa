@@ -48,7 +48,7 @@
 file = { SOI ~ definition+ ~ EOI }
 
 // Top-level definitions
-definition = { attention_def | ffn_def | ssm_def | block_def | model_def }
+definition = { attention_def | ffn_def | ssm_def | memory_def | block_def | model_def }
 
 // ============================================================================
 // ATTENTION DEFINITION
@@ -129,6 +129,23 @@ load_balance_loss_weight_prop = { "load_balance_loss_weight" ~ ":" ~ number }
 router_z_loss_weight_prop = { "router_z_loss_weight" ~ ":" ~ number }
 
 // ============================================================================
+// CONTINUUM MEMORY DEFINITION
+// ============================================================================
+// A memory replaces a block's single FFN with an ordered residual chain.  Each
+// tier owns a normal FFN plus fixed-capacity, initially dormant low-rank expert
+// slots that sleep-time consolidation can activate without resizing tensors.
+memory_def = { "memory" ~ identifier ~ "{" ~ memory_tier+ ~ "}" }
+memory_tier = { "tier" ~ identifier ~ "{" ~ memory_tier_prop* ~ "}" }
+memory_tier_prop = { memory_ffn_prop | reserve_experts_prop | residual_init_prop }
+memory_ffn_prop = { "ffn" ~ ":" ~ (identifier | inline_ffn) }
+reserve_experts_prop = { "reserve_experts" ~ "{" ~ reserve_experts_param* ~ "}" }
+reserve_experts_param = { capacity_prop | rank_prop | top_k_prop }
+capacity_prop = { "capacity" ~ ":" ~ integer }
+rank_prop = { "rank" ~ ":" ~ integer }
+residual_init_prop = { "residual_init" ~ ":" ~ residual_init_type }
+residual_init_type = { "default" | "zero" }
+
+// ============================================================================
 // SSM (MAMBA) DEFINITION
 // ============================================================================
 // Defines a selective state-space (Mamba) mixer
@@ -156,6 +173,7 @@ block_prop = {
     attention_ref_prop |
     ssm_ref_prop |
     ffn_ref_prop |
+    memory_ref_prop |
     norm_prop |
     norm_position_prop |
     residual_prop |
@@ -166,11 +184,13 @@ block_prop = {
 attention_ref_prop = { "attention" ~ ":" ~ (identifier | inline_attention) }
 ssm_ref_prop = { "ssm" ~ ":" ~ (identifier | inline_ssm) }
 ffn_ref_prop = { "ffn" ~ ":" ~ (identifier | inline_ffn) }
+memory_ref_prop = { "memory" ~ ":" ~ (identifier | inline_memory) }
 
 // Inline definitions (anonymous)
 inline_attention = { "{" ~ attention_prop* ~ "}" }
 inline_ssm = { "{" ~ ssm_prop* ~ "}" }
 inline_ffn = { "{" ~ ffn_prop* ~ "}" }
+inline_memory = { "{" ~ memory_tier+ ~ "}" }
 
 // Normalization configuration
 norm_prop = { "norm" ~ ":" ~ norm_config }

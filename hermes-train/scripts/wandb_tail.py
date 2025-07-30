@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Weights & Biases sidecar for hermes-train.
 
-Follows a training run's `metrics.jsonl` and mirrors every optimizer step
-to W&B — the same contract the pre-Burn trainer had: `WANDB_API_KEY` set
+Follows a training run's schema-v2 `metrics.jsonl` and mirrors every typed event
+to W&B: `WANDB_API_KEY` set
 means live curves (project `hermes-retriever` unless `WANDB_PROJECT`
 overrides, run name from `WANDB_NAME`); no key means the sidecar exits
 quietly and training is untouched. Because it replays the file from the
@@ -21,22 +21,77 @@ import threading
 
 
 def wandb_payload(record: dict) -> dict:
-    """Expand lab-only layer arrays into scalar W&B metric series."""
-    payload = record.copy()
-    layer_norms = payload.pop("layer_grad_norms", None)
+    """Flatten one strict schema-v2 event for W&B."""
+    if not isinstance(record, dict):
+        raise ValueError("metric record must be an object")
+    if record.get("schema_version") != 2:
+        raise ValueError("unsupported metric schema_version")
+    sequence = record.get("sequence")
+    global_step = record.get("global_step")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise ValueError("sequence must be a non-negative integer")
+    if (
+        not isinstance(global_step, int)
+        or isinstance(global_step, bool)
+        or global_step < 0
+    ):
+        raise ValueError("global_step must be a non-negative integer")
+    event = record.get("event")
+    phase = record.get("phase")
+    if not isinstance(event, dict) or not isinstance(event.get("values"), dict):
+        raise ValueError("event must contain typed values")
+    if not isinstance(phase, dict):
+        raise ValueError("phase must be an object")
+    if not isinstance(event.get("type"), str) or not event["type"]:
+        raise ValueError("event type must be a non-empty string")
+    if (
+        not isinstance(phase.get("index"), int)
+        or isinstance(phase["index"], bool)
+        or phase["index"] < 0
+        or not isinstance(phase.get("name"), str)
+        or not phase["name"]
+        or not isinstance(phase.get("kind"), str)
+        or not phase["kind"]
+    ):
+        raise ValueError("phase coordinates are invalid")
+    payload = event["values"].copy()
+    payload.update(
+        {
+            "global_step": global_step,
+            "metric_sequence": sequence,
+            "event_type": event["type"],
+            "phase/index": phase["index"],
+            "phase/name": phase["name"],
+            "phase/kind": phase["kind"],
+        }
+    )
+    layer_norms = payload.pop("layer_gradient_norms", None)
     if layer_norms is None:
         return payload
     if not isinstance(layer_norms, list) or not layer_norms:
-        raise ValueError("layer_grad_norms must be a non-empty array")
+        raise ValueError("layer_gradient_norms must be a non-empty array")
     for index, value in enumerate(layer_norms, start=1):
         if (
             not isinstance(value, (int, float))
             or isinstance(value, bool)
             or not math.isfinite(value)
         ):
-            raise ValueError(f"layer_grad_norms[{index - 1}] is not finite")
+            raise ValueError(f"layer_gradient_norms[{index - 1}] is not finite")
         payload[f"layer_grad_norm/layer_{index}"] = value
     return payload
+
+
+def remote_sequence_floor(last_history_step) -> int:
+    """Return the last durable W&B sequence, preserving a fresh sequence 0."""
+    if last_history_step is None:
+        return -1
+    if (
+        not isinstance(last_history_step, int)
+        or isinstance(last_history_step, bool)
+        or last_history_step < -1
+    ):
+        raise ValueError("W&B lastHistoryStep is invalid")
+    return last_history_step
 
 
 def main() -> int:
@@ -51,8 +106,8 @@ def main() -> int:
     import wandb  # deferred so a missing package never blocks training setup
 
     project = os.environ.get("WANDB_PROJECT", "hermes-retriever")
-    name = os.environ.get("WANDB_NAME", "retriever-100m")
-    run_id = os.environ.get("WANDB_RUN_ID", f"{name}-stage1")
+    name = os.environ.get("WANDB_NAME", "hermes-train")
+    run_id = os.environ.get("WANDB_RUN_ID", f"{name}-workflow-v2")
     run = wandb.init(
         project=project,
         name=name,
@@ -60,11 +115,17 @@ def main() -> int:
         resume="allow",
     )
 
-    # `run.step` starts from zero in some W&B SDK versions even when attaching
-    # to an existing run. The public run record is authoritative and prevents
-    # a resumed reporter from attempting to emit thousands of duplicate steps.
+    # `run.step` is the *next* client step in some SDK versions and starts at
+    # zero for an empty run. The public history record is authoritative; using
+    # `run.step` here would skip sequence zero on a new run and the newest
+    # sequence after a resume.
     remote_run = wandb.Api().run(f"{run.entity}/{project}/{run_id}")
-    last_step = max(run.step or 0, remote_run.lastHistoryStep or 0)
+    try:
+        last_sequence = remote_sequence_floor(remote_run.lastHistoryStep)
+    except ValueError as error:
+        print(f"wandb_tail: {error}", file=sys.stderr)
+        run.finish()
+        return 1
     position = 0
     identity = None
     stop = threading.Event()
@@ -104,22 +165,24 @@ def main() -> int:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    raw_step = record.get("step")
-                    if not isinstance(raw_step, int) or isinstance(raw_step, bool):
+                    raw_sequence = record.get("sequence")
+                    if not isinstance(raw_sequence, int) or isinstance(
+                        raw_sequence, bool
+                    ):
                         continue
-                    step = raw_step
-                    if step <= last_step:
+                    sequence = raw_sequence
+                    if sequence <= last_sequence:
                         continue  # already logged before a resume/backfill overlap
                     try:
                         payload = wandb_payload(record)
                     except ValueError as error:
                         print(
-                            f"wandb_tail: invalid metrics at step {step}: {error}",
+                            f"wandb_tail: invalid metrics at sequence {sequence}: {error}",
                             file=sys.stderr,
                         )
                         continue
-                    wandb.log(payload, step=step)
-                    last_step = step
+                    wandb.log(payload, step=sequence)
+                    last_sequence = sequence
             stop.wait(5)
     finally:
         run.finish()

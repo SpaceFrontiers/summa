@@ -40,11 +40,29 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Require official accelerator repositories
+        shell: bash
+        run: |
+          unexpected=$(git grep -nE 'github\.com/[^/]+/(burn|cubecl|cubek)' -- '*Cargo.toml' Cargo.lock \
+            | grep -v 'github.com/tracel-ai/' || true)
+          if [[ -n "$unexpected" ]]; then
+            echo "Accelerator dependencies must use their official repositories:"
+            echo "$unexpected"
+            exit 1
+          fi
+          if git grep -nE '^\[patch\..*(burn|cubecl|cubek)' -- '*Cargo.toml'; then
+            echo "Use an immutable official-repository dependency revision, not a Cargo patch"
+            exit 1
+          fi
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Hermes Core native-without-sync boundary
         run: cargo check -p hermes-core --no-default-features --features native --all-targets
+
+      - name: CUDA training compile boundary
+        run: cargo check -p hermes-train --features cuda --all-targets
 
       - name: API documentation
         env:
@@ -53,6 +71,18 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Validate model-bound training workflows
+        run: |
+          cargo run -p hermes-train -- validate-workflow \
+            --workflow hermes-train/workflow.example.json \
+            --config hermes-mal/well-known/retriever_300m_moe.mal >/dev/null
+          cargo run -p hermes-train -- validate-workflow \
+            --workflow hermes-train/workflow.sleep.example.json \
+            --config hermes-mal/well-known/retriever_300m_moe_sleep.mal >/dev/null
+          cargo run -p hermes-train -- validate-workflow \
+            --workflow hermes-train/workflow.education.example.json \
+            --config hermes-mal/well-known/retriever_300m_moe_sleep.mal >/dev/null
 
       - name: Build
         run: cargo build --workspace --release
@@ -69,13 +99,23 @@ jobs:
       - name: Check shell scripts and test relaunch supervisor
         run: |
           git ls-files '*.sh' -z | xargs -0 shellcheck -x -e SC1091
-          python3 -m py_compile \
-            hermes-train/scripts/wandb_tail.py \
-            hermes-train/scripts/education_curriculum.py \
-            hermes-train/scripts/build_education_curriculum.py
-          python3 hermes-train/scripts/test_education_curriculum.py
+          python3 -m py_compile hermes-train/scripts/*.py
           python3 hermes-train/scripts/test_wandb_tail.py
           hermes-train/scripts/relaunch_test.sh
+
+      - name: Check training configuration JSON
+        run: |
+          for config in \
+            hermes-train/workflow.example.json \
+            hermes-train/workflow.sleep.example.json \
+            hermes-train/workflow.education.example.json \
+            hermes-train/sleep-runtime.periodic.example.json \
+            hermes-train/sleep-runtime.standalone.example.json \
+            hermes-train/corpus.production.example.json \
+            hermes-train/curriculum-composition.example.json
+          do
+            python3 -m json.tool "$config" >/dev/null
+          done
 
   # Security audit - check for known vulnerabilities
   audit:

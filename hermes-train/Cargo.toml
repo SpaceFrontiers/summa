@@ -11,16 +11,25 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-burn = { package = "burn-core", git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std", "extension", "ndarray", "autodiff"] }
-burn-nn = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std"] }
-burn-optim = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std"] }
-burn-pack = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std"] }
+burn = { package = "burn-core", git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std", "extension", "ndarray", "autodiff"] }
+burn-nn = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-optim = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-pack = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
 clap.workspace = true
+half = { version = "2.7", features = ["std"] }
 hermes-llm.workspace = true
+libc = "0.2"
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+ureq = { version = "2.12", features = ["json"] }
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+native-tls = "0.2"
+postgres-native-tls = "0.5"
+rusqlite = "0.40"
+safetensors = "0.7"
+sha2 = "0.10"
 zstd.workspace = true
 
 [dev-dependencies]

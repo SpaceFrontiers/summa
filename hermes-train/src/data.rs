@@ -11,17 +11,20 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use hermes_llm::Tokenizer;
+use hermes_train::corpus::CorpusManifest;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::curriculum::ObjectiveConfig;
+use crate::wake::ObjectiveConfig;
 
 mod batch;
 mod structured;
 
-pub(crate) use batch::{BatchStats, LanguageBatch, RetrievalBatch, TrainingBatch, make_batch};
-use batch::{EncodedText, TrainingSample};
+use batch::EncodedText;
+pub(crate) use batch::{
+    BatchStats, LanguageBatch, RetrievalBatch, TrainingBatch, TrainingSample, make_batch,
+};
 use structured::visit_structured_samples;
 
 const TOKENIZE_BATCH: usize = 1_000;
@@ -272,6 +275,80 @@ fn is_jsonl(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
 }
 
+fn causal_data_paths(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let manifest_path = if path.is_dir() {
+        Some(path.join("manifest.json"))
+    } else if path.file_name().is_some_and(|name| name == "manifest.json") {
+        Some(path.to_owned())
+    } else {
+        None
+    };
+    let Some(manifest_path) = manifest_path else {
+        return Ok(vec![path.to_owned()]);
+    };
+    let manifest: CorpusManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .with_context(|| format!("invalid corpus manifest {}", manifest_path.display()))?;
+    ensure!(
+        !manifest.build.shards.is_empty(),
+        "corpus manifest has no shards"
+    );
+    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    manifest
+        .build
+        .shards
+        .iter()
+        .map(|shard| {
+            let shard_path = root.join(&shard.path);
+            ensure!(
+                shard_path.is_file(),
+                "corpus shard {} is missing",
+                shard_path.display()
+            );
+            Ok(shard_path)
+        })
+        .collect()
+}
+
+fn token_array(
+    value: &serde_json::Value,
+    path: &Path,
+    line_number: usize,
+) -> Result<Option<Vec<u32>>> {
+    let Some(tokens) = value.get("tokens") else {
+        return Ok(None);
+    };
+    let tokens = tokens.as_array().with_context(|| {
+        format!(
+            "`tokens` at {}:{line_number} must be an array",
+            path.display()
+        )
+    })?;
+    ensure!(
+        !tokens.is_empty(),
+        "`tokens` at {}:{line_number} is empty",
+        path.display()
+    );
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            let token = token.as_u64().with_context(|| {
+                format!(
+                    "`tokens[{index}]` at {}:{line_number} is not an unsigned integer",
+                    path.display()
+                )
+            })?;
+            u32::try_from(token).with_context(|| {
+                format!(
+                    "`tokens[{index}]` at {}:{line_number} exceeds u32",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 fn visit_causal_samples(
     path: &Path,
     tokenizer: &Tokenizer,
@@ -302,71 +379,102 @@ fn visit_causal_samples(
     if !keep_going {
         return Ok(count);
     }
-    let mut reader = open_data(path)?;
-    if is_jsonl(path) {
-        let mut documents = Vec::with_capacity(TOKENIZE_BATCH);
-        let mut line = String::new();
-        let mut line_number = 0usize;
-        let mut document_number = 0usize;
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
+    let mut document_number = 0usize;
+    let mut documents = Vec::with_capacity(TOKENIZE_BATCH);
+    for source_path in causal_data_paths(path)? {
+        let mut reader = open_data(&source_path)?;
+        if is_jsonl(&source_path) {
+            let mut line = String::new();
+            let mut line_number = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    break;
+                }
+                line_number = line_number
+                    .checked_add(1)
+                    .context("JSONL line count overflows usize")?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                document_number = document_number
+                    .checked_add(1)
+                    .context("JSONL document count overflows usize")?;
+                if document_number <= cached_documents {
+                    continue;
+                }
+                let value: serde_json::Value = serde_json::from_str(&line).with_context(|| {
+                    format!("invalid JSONL at {}:{line_number}", source_path.display())
+                })?;
+                if let Some(tokens) = token_array(&value, &source_path, line_number)? {
+                    ensure!(
+                        tokens
+                            .iter()
+                            .all(|token| (*token as usize) < tokenizer.vocab_size()),
+                        "tokenized corpus row at {}:{line_number} contains a token outside vocabulary size {}",
+                        source_path.display(),
+                        tokenizer.vocab_size()
+                    );
+                    if !push_documents(
+                        &mut documents,
+                        tokenizer,
+                        &mut packer,
+                        &mut count,
+                        &mut visit,
+                        &mut cache,
+                    )? {
+                        return Ok(count);
+                    }
+                    if let Some(cache) = &mut cache {
+                        cache.append(&tokens)?;
+                    }
+                    if !packer.push(
+                        tokens
+                            .into_iter()
+                            .map(i64::from)
+                            .chain(std::iter::once(i64::from(tokenizer.eos_token_id()))),
+                        &mut count,
+                        &mut visit,
+                    )? {
+                        return Ok(count);
+                    }
+                } else {
+                    let document = required_string(&value, "text", &source_path, line_number)?;
+                    documents.push(document.to_owned());
+                    if documents.len() == TOKENIZE_BATCH
+                        && !push_documents(
+                            &mut documents,
+                            tokenizer,
+                            &mut packer,
+                            &mut count,
+                            &mut visit,
+                            &mut cache,
+                        )?
+                    {
+                        return Ok(count);
+                    }
+                }
             }
-            line_number = line_number
-                .checked_add(1)
-                .context("JSONL line count overflows usize")?;
-            if line.trim().is_empty() {
-                continue;
-            }
+        } else {
             document_number = document_number
                 .checked_add(1)
-                .context("JSONL document count overflows usize")?;
-            if document_number <= cached_documents {
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_str(&line)
-                .with_context(|| format!("invalid JSONL at {}:{line_number}", path.display()))?;
-            let document = required_string(&value, "text", path, line_number)?;
-            documents.push(document.to_owned());
-            if documents.len() == TOKENIZE_BATCH
-                && !push_documents(
-                    &mut documents,
-                    tokenizer,
-                    &mut packer,
-                    &mut count,
-                    &mut visit,
-                    &mut cache,
-                )?
-            {
-                return Ok(count);
+                .context("document count overflows usize")?;
+            if document_number > cached_documents {
+                let mut document = String::new();
+                reader.read_to_string(&mut document)?;
+                documents.push(document);
             }
         }
-        if !push_documents(
-            &mut documents,
-            tokenizer,
-            &mut packer,
-            &mut count,
-            &mut visit,
-            &mut cache,
-        )? {
-            return Ok(count);
-        }
-    } else {
-        if cached_documents == 0 {
-            let mut document = String::new();
-            reader.read_to_string(&mut document)?;
-            if !push_documents(
-                &mut vec![document],
-                tokenizer,
-                &mut packer,
-                &mut count,
-                &mut visit,
-                &mut cache,
-            )? {
-                return Ok(count);
-            }
-        }
+    }
+    if !push_documents(
+        &mut documents,
+        tokenizer,
+        &mut packer,
+        &mut count,
+        &mut visit,
+        &mut cache,
+    )? {
+        return Ok(count);
     }
     if let Some(cache) = &mut cache {
         cache.flush()?;
@@ -613,6 +721,21 @@ mod tests {
         assert!(keep_going);
         assert!(writer.is_some());
         assert_eq!(fs::read(path).unwrap(), TOKEN_CACHE_MAGIC);
+    }
+
+    #[test]
+    fn prepared_corpus_token_rows_are_strictly_decoded() {
+        let path = Path::new("shard-00000.tokens.jsonl");
+        assert_eq!(
+            token_array(&serde_json::json!({"tokens": [1, 2, 3]}), path, 7).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert!(token_array(&serde_json::json!({"tokens": []}), path, 7).is_err());
+        assert!(token_array(&serde_json::json!({"tokens": [-1]}), path, 7).is_err());
+        assert_eq!(
+            token_array(&serde_json::json!({"text": "raw"}), path, 7).unwrap(),
+            None
+        );
     }
 
     #[test]

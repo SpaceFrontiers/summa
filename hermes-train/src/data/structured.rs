@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use hermes_llm::Tokenizer;
 
 use super::{EncodedText, TrainingSample, is_jsonl, open_data, required_string};
-use crate::curriculum::ObjectiveConfig;
+use crate::wake::ObjectiveConfig;
 
 fn optional_string<'a>(
     value: &'a serde_json::Value,
@@ -212,6 +212,62 @@ fn structured_sample(
                 plan,
                 seq_len,
                 context.is_some(),
+            )
+            .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
+        }
+        ObjectiveConfig::InstructionTuning { instruction } => {
+            let prompt = required_string(value, "instruction", path, line_number)?;
+            let response = required_string(value, "response", path, line_number)?;
+            let system = optional_string(value, "system", path, line_number)?;
+            let input = optional_string(value, "input", path, line_number)?;
+            let mut prefix = String::new();
+            if let Some(system) = system {
+                prefix.push_str("System:\n");
+                prefix.push_str(system);
+                prefix.push_str("\n\n");
+            }
+            prefix.push_str(instruction);
+            prefix.push_str("\n\nInstruction:\n");
+            prefix.push_str(prompt);
+            let (suffix, source_required) = match input {
+                Some(_) => ("\n\nResponse:\n", true),
+                None => ("\nResponse:\n", false),
+            };
+            make_supervised_sample(
+                tokenizer,
+                &prefix,
+                input.unwrap_or(""),
+                suffix,
+                response,
+                seq_len,
+                source_required,
+            )
+            .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
+        }
+        ObjectiveConfig::QaReasoning {
+            instruction,
+            require_reasoning,
+        } => {
+            let question = required_string(value, "question", path, line_number)?;
+            let answer = required_string(value, "answer", path, line_number)?;
+            let reasoning = optional_string(value, "reasoning", path, line_number)?;
+            ensure!(
+                !*require_reasoning || reasoning.is_some(),
+                "qa_reasoning at {}:{line_number} requires `reasoning`",
+                path.display()
+            );
+            let target = match reasoning {
+                Some(reasoning) => format!("Reasoning:\n{reasoning}\n\nAnswer:\n{answer}"),
+                None => answer.to_owned(),
+            };
+            make_supervised_sample(
+                tokenizer,
+                &format!("{instruction}\n\nQuestion:\n"),
+                question,
+                "\n\nResponse:\n",
+                &target,
+                seq_len,
+                true,
             )
             .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
         }

@@ -301,8 +301,8 @@ cargo test --workspace
 ```
 
 LLM contributors should start with the [inference and training code map](docs/llm-code-map.md).
-Temporary GPU dependency forks and their upstream removal criteria are listed
-in [the fork register](docs/forked-dependencies.md). Backend-specific Metal and
+Temporary official-repository GPU revisions and their release exit criteria are
+listed in [the upstream dependency register](docs/upstream-dependencies.md). Backend-specific Metal and
 CUDA checks are documented in those guides; enabling every backend at once is
 not the portable test configuration.
 

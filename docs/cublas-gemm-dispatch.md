@@ -8,11 +8,13 @@ grad-accum 8, steady-state steps 5–8.
 
 ## Prototype
 
-- CubeCL fork (`ppodolsky/cubecl` @ `463c2952`, fast-forward of the production
-  `73bd0ea3` pin): asynchronous cuBLAS BF16 GEMM server dispatch
+- CubeCL [upstream PR #1440](https://github.com/tracel-ai/cubecl/pull/1440)
+  (the prototype was measured at `463c2952`; Hermes now pins the PR head
+  `c0efe74d` from the official repository): asynchronous cuBLAS BF16 GEMM server dispatch
   (`GemmDescriptor`/`GemmMatrix` server API), hardened contracts (rejects
   foreign-stream outputs, buffer overlap, non-empty zero-K problems).
-- Burn fork (production pin `bd6e8fa2f` + BF16 dispatch in
+- Burn [upstream PR #5190](https://github.com/tracel-ai/burn/pull/5190)
+  (Hermes pins `973605c4` from the official repository) adds BF16 dispatch in
   `burn-cubecl::kernel::matmul` + zero-contract fallback + backport of
   upstream `f31e7513a` "drop from foreign stream drains home stream").
 
@@ -67,10 +69,9 @@ whichever wins on that shape:
 | autotuned cuBLAS, B16 / B20                 | **34,139 / 34,984 (+15.6% / +14.8%)** |
 
 Loss and gradient norms are identical to five decimals between the paired
-builds. The Burn-side change is two commits on the pinned fork: the
-`kernel/matmul` server-GEMM dispatch, and the `f31e7513a` foreign-drop
-backport (`.context/burn-cublas`, tip `e2fe66511`); the CubeCL side is the
-async cuBLAS server GEMM (`463c2952`, fast-forward of the production pin).
+builds. The Burn-side change is the `kernel/matmul` server-GEMM dispatch plus
+the `f31e7513a` foreign-drop prerequisite, now carried by upstream PR #5190;
+the CubeCL side is the async cuBLAS server GEMM in upstream PR #1440.
 
 F16 prepared-weight decode dispatch (M=1, N≈50304) remains unevaluated — it
 targets inference decode, not training, and needs the F16 dtype mapping first.
@@ -80,7 +81,8 @@ targets inference decode, not training, and needs the F16 dtype mapping first.
 The dispatch now goes through `cublasLtMatmul` with a per-shape cached
 execution plan: descriptor + layouts + the algorithm
 `cublasLtMatmulAlgoGetHeuristic` selects with a 32 MiB per-stream workspace
-(fork branch `cublaslt`, rev bda6a68d). This is the same machinery PyTorch's
+(introduced on the upstream PR branch and now included in its pinned head).
+This is the same machinery PyTorch's
 linear uses, replacing `cublasGemmEx` + `CUBLAS_GEMM_DEFAULT_TENSOR_OP`.
 
 Measured (A100, retriever-100m, T1024/ga8, 2026-07-17): 43,214 → 43,217

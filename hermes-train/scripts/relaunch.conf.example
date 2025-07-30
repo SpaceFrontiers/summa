@@ -4,16 +4,22 @@
 
 HERMES_TRAIN_OUTPUT=/opt/hermes-run/checkpoint
 HERMES_TRAIN_STATE_DIR=/opt/hermes-run/relaunch-state
-HERMES_TRAIN_REMOTE_URL=gs://example-training-bucket/retriever-100m-stage1
+HERMES_TRAIN_REMOTE_URL=gs://example-training-bucket/retriever-300m-moe
 
 # `--output` and `--resume` are owned by relaunch.sh and must not appear here.
+# This supervisor wraps the built-in wake trainer, including periodic sleep for
+# a memory-enabled MAL when the command also supplies the two pinned runtime
+# arguments below. Lifecycle-only phases use `run-workflow` under their service
+# supervisor.
 HERMES_TRAIN_COMMAND=(
   /opt/hermes-run/bin/hermes-train
   train
-  --config /opt/hermes-run/retriever-100m.json
+  --config /opt/hermes-run/retriever_300m_moe.mal
   --tokenizer /opt/hermes-run/tokenizer.json
-  --curriculum /opt/hermes-run/curriculum.json
+  --workflow /opt/hermes-run/workflow.wake.json
   --checkpoint-every 500
+  # --sleep-runtime /opt/hermes-run/sleep-runtime.json
+  # --sleep-runtime-sha256 sha256:replace-with-the-runtime-file-digest
 )
 
 # A failed trainer is resumed indefinitely by default. Set a positive value to
@@ -21,8 +27,19 @@ HERMES_TRAIN_COMMAND=(
 HERMES_TRAIN_RESTART_DELAY=30
 HERMES_TRAIN_MAX_RESTARTS=0
 
-# A complete checkpoint is published under checkpoints/<step>/ and latest.json
-# is updated last. The interval also controls retries after a cloud error.
+# The referenced immutable generations/sha256-*/ directory and the exact
+# generated-artifact closure derived from its sealed training-state.json are
+# uploaded and verified before current.json is published last. Artifact payloads
+# are deduplicated in checkpoint-objects/sha256/ and each generation has an
+# immutable checkpoint-artifacts/<generation>/artifact-manifest.json. Keep all
+# paths supplied by HERMES_TRAIN_COMMAND stable across VM replacements so the
+# verified closure can be restored to the same semantic roots. A configured
+# external Dreaming initial_policy is deployment-owned and must exist at its
+# pinned path with the same digest after replacement. Remote current.json binds
+# the closure plus the exact committed metric prefix at
+# checkpoint-metrics/<generation>/metrics.jsonl; compare-and-swap publication
+# cannot rewind steps and rejects equal-step generation forks. The interval also
+# controls retries after a cloud error.
 HERMES_TRAIN_SYNC_INTERVAL=900
 
 # Install W&B once in this virtual environment; relaunch.sh deliberately never
@@ -34,5 +51,5 @@ HERMES_TRAIN_WANDB_PYTHON=/opt/hermes-run/wandb-venv/bin/python
 # WANDB_API_KEY=replace-me
 # WANDB_ENTITY=space-frontiers
 # WANDB_PROJECT=hermes-retriever
-# WANDB_NAME=retriever-100m
-# WANDB_RUN_ID=retriever-100m-stage1
+# WANDB_NAME=retriever-300m-moe
+# WANDB_RUN_ID=retriever-300m-moe-workflow-v2

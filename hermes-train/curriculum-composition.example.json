@@ -1,0 +1,113 @@
+{
+  "version": 2,
+  "build_id": "education-curriculum-2026-08",
+  "source_manifest": "corpus/retrieval-curriculum-2026-08/manifest.json",
+  "source_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "seed": 20260801,
+  "stages": [
+    {
+      "name": "foundation",
+      "when": { "difficulties": ["foundation"] },
+      "unmatched": "error",
+      "token_target": {
+        "minimum": 1900000000,
+        "desired": 2000000000,
+        "maximum": 2010000000
+      },
+      "sharding": { "max_tokens_per_shard": 10000000 },
+      "max_fraction_deviation": 0.01,
+      "strata": [
+        {
+          "name": "language",
+          "weight": 55,
+          "when": { "topics": ["language"] }
+        },
+        { "name": "stem", "weight": 20, "when": { "topics": ["stem"] } },
+        {
+          "name": "humanities",
+          "weight": 15,
+          "when": { "topics": ["humanities"] }
+        },
+        { "name": "general", "weight": 10, "when": { "topics": ["general"] } }
+      ]
+    },
+    {
+      "name": "school",
+      "when": { "difficulties": ["school"] },
+      "unmatched": "error",
+      "token_target": {
+        "minimum": 3400000000,
+        "desired": 3500000000,
+        "maximum": 3510000000
+      },
+      "sharding": { "max_tokens_per_shard": 10000000 },
+      "max_fraction_deviation": 0.01,
+      "strata": [
+        {
+          "name": "language",
+          "weight": 20,
+          "when": { "topics": ["language"] }
+        },
+        { "name": "stem", "weight": 40, "when": { "topics": ["stem"] } },
+        {
+          "name": "humanities",
+          "weight": 25,
+          "when": { "topics": ["humanities"] }
+        },
+        { "name": "general", "weight": 15, "when": { "topics": ["general"] } }
+      ]
+    },
+    {
+      "name": "university",
+      "when": { "difficulties": ["university"] },
+      "unmatched": "error",
+      "token_target": {
+        "minimum": 5400000000,
+        "desired": 5500000000,
+        "maximum": 5510000000
+      },
+      "sharding": { "max_tokens_per_shard": 10000000 },
+      "max_fraction_deviation": 0.01,
+      "strata": [
+        {
+          "name": "language",
+          "weight": 10,
+          "when": { "topics": ["language"] }
+        },
+        { "name": "stem", "weight": 50, "when": { "topics": ["stem"] } },
+        {
+          "name": "humanities",
+          "weight": 25,
+          "when": { "topics": ["humanities"] }
+        },
+        { "name": "general", "weight": 15, "when": { "topics": ["general"] } }
+      ]
+    },
+    {
+      "name": "scholarly",
+      "when": { "difficulties": ["scholarly"] },
+      "unmatched": "error",
+      "token_target": {
+        "minimum": 2900000000,
+        "desired": 3000000000,
+        "maximum": 3010000000
+      },
+      "sharding": { "max_tokens_per_shard": 10000000 },
+      "max_fraction_deviation": 0.01,
+      "strata": [
+        {
+          "name": "language",
+          "weight": 10,
+          "when": { "topics": ["language"] }
+        },
+        { "name": "stem", "weight": 45, "when": { "topics": ["stem"] } },
+        {
+          "name": "humanities",
+          "weight": 30,
+          "when": { "topics": ["humanities"] }
+        },
+        { "name": "general", "weight": 15, "when": { "topics": ["general"] } }
+      ]
+    }
+  ]
+}

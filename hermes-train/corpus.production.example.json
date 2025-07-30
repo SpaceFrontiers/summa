@@ -1,0 +1,235 @@
+{
+  "corpus": {
+    "version": 2,
+    "build_id": "retrieval-curriculum-2026-08",
+    "discovery": {
+      "materialization_batch_size": 500,
+      "queries": [
+        {
+          "name": "language-foundations",
+          "text": "alphabet reading grammar vocabulary children's language textbook",
+          "limit": 2000000,
+          "parameters": {
+            "document_types": ["book", "textbook"]
+          }
+        },
+        {
+          "name": "school-fundamentals",
+          "text": "school textbook mathematics science history geography reasoning",
+          "limit": 5000000,
+          "parameters": {
+            "document_types": ["book", "textbook"]
+          }
+        },
+        {
+          "name": "university-material",
+          "text": "university handbook textbook computer science mathematics engineering humanities",
+          "limit": 8000000,
+          "parameters": {
+            "document_types": ["book", "textbook", "thesis"]
+          }
+        },
+        {
+          "name": "scholarly-material",
+          "text": "scholarly research paper advanced textbook multi-step reasoning retrieval",
+          "limit": 10000000,
+          "parameters": {
+            "document_types": ["article", "paper", "thesis", "book"]
+          }
+        }
+      ]
+    },
+    "normalization": {
+      "trim": true,
+      "normalize_newlines": true,
+      "collapse_horizontal_whitespace": true,
+      "max_consecutive_blank_lines": 2,
+      "reject_replacement_character": true,
+      "minimum_characters": 200
+    },
+    "deduplication": {
+      "by_record_key": true,
+      "by_normalized_text": true
+    },
+    "classification": {
+      "topic_rules": [
+        {
+          "label": "language",
+          "any_terms": ["grammar", "alphabet", "vocabulary"]
+        },
+        {
+          "label": "stem",
+          "any_terms": ["mathematics", "science", "engineering", "computer"]
+        },
+        {
+          "label": "humanities",
+          "any_terms": ["history", "literature", "philosophy"]
+        }
+      ],
+      "difficulty_rules": [
+        {
+          "label": "foundation",
+          "priority": 40,
+          "any_terms": [
+            "alphabet",
+            "phonics",
+            "early reader",
+            "basic grammar",
+            "primary reader"
+          ]
+        },
+        {
+          "label": "school",
+          "priority": 30,
+          "any_terms": [
+            "school textbook",
+            "secondary school",
+            "high school",
+            "grade lesson"
+          ]
+        },
+        {
+          "label": "university",
+          "priority": 20,
+          "any_terms": [
+            "university textbook",
+            "undergraduate",
+            "graduate course",
+            "university handbook"
+          ]
+        },
+        {
+          "label": "scholarly",
+          "priority": 10,
+          "any_terms": [
+            "abstract",
+            "methodology",
+            "references",
+            "doi:",
+            "theorem",
+            "proof"
+          ]
+        }
+      ],
+      "default_topic": "general",
+      "default_difficulty": "unclassified"
+    },
+    "transformations": [
+      {
+        "name": "controlled-study-view",
+        "template": "Topic: ${topic}\nDifficulty: ${difficulty}\n\n${text}",
+        "copies": 1,
+        "when": {
+          "metadata_equals": { "emit_study_view": true }
+        }
+      }
+    ],
+    "repetition": {
+      "base_copies": 1,
+      "max_copies_per_record": 2,
+      "topic_copies": {},
+      "difficulty_copies": {}
+    },
+    "token_target": {
+      "minimum": 10000000000,
+      "desired": 15000000000,
+      "maximum": 20000000000
+    },
+    "sharding": {
+      "max_tokens_per_shard": 10000000
+    }
+  },
+  "search_api": {
+    "endpoint": "http://65.xx.xx.xx/internal/v2/search/",
+    "request_template": {
+      "query": "",
+      "index_names": ["documents"],
+      "mode": "hybrid",
+      "limit": 50,
+      "offset": 0,
+      "rerank": false,
+      "cross_rerank": false,
+      "deduplicate": true,
+      "return_documents": false,
+      "snapshot_revision": "",
+      "filter_types": [],
+      "fusion": {
+        "sparse": {
+          "operator": "sparse",
+          "field": "content_sparse_vectors"
+        },
+        "dense": {
+          "operator": "dense",
+          "field": "dense_vectors"
+        }
+      }
+    },
+    "request_mapping": {
+      "query_pointer": "/query",
+      "offset_pointer": "/offset",
+      "limit_pointer": "/limit",
+      "parameter_pointers": {
+        "document_types": "/filter_types"
+      },
+      "disabled_reranker_pointers": ["/rerank", "/cross_rerank"],
+      "return_documents_pointer": "/return_documents"
+    },
+    "response_mapping": {
+      "hits_pointer": "/hits",
+      "total_hits_pointer": "/total_hits",
+      "record_key_pointer": "/id",
+      "score_pointer": "/score",
+      "uris_pointer": "/document/uris",
+      "inline_text_pointer": null,
+      "metadata_pointers": {}
+    },
+    "fusion": {
+      "marker_pointer": "/mode",
+      "marker_value": "hybrid",
+      "sparse": {
+        "clause_pointer": "/fusion/sparse",
+        "vector_field_pointer": "/fusion/sparse/field",
+        "vector_field": "content_sparse_vectors"
+      },
+      "dense": {
+        "clause_pointer": "/fusion/dense",
+        "vector_field_pointer": "/fusion/dense/field",
+        "vector_field": "dense_vectors"
+      }
+    },
+    "snapshot": {
+      "provider": "search_api:documents",
+      "revision": "REPLACE_WITH_PINNED_INDEX_GENERATION",
+      "request_revision_pointer": "/snapshot_revision",
+      "response_provider_pointer": "/snapshot/provider",
+      "response_revision_pointer": "/snapshot/revision"
+    },
+    "page_size": 500,
+    "timeout_seconds": 180,
+    "max_retries": 3,
+    "retry_initial_ms": 1000,
+    "retry_max_ms": 30000,
+    "auth": null
+  },
+  "postgres": {
+    "connection_environment": "CORPUS_POSTGRES_DSN",
+    "statement": "SELECT id::text AS corpus_key, concat_ws(E'\\n\\n', blob->>'title', blob->>'abstract', blob->>'content') AS corpus_text, to_jsonb(uris) AS corpus_uris, jsonb_build_object('document_type', type) AS corpus_metadata FROM public.documents_assembled WHERE id = ANY($1::text[]) AND is_retracted = FALSE",
+    "columns": {
+      "record_key": "corpus_key",
+      "text": "corpus_text",
+      "uris": "corpus_uris",
+      "metadata": "corpus_metadata"
+    },
+    "snapshot_statement": "SELECT revision::text FROM public.corpus_generations WHERE corpus_name = 'documents' AND active = TRUE",
+    "transport_security": {
+      "mode": "verified_tls",
+      "server_names": ["postgres.example.invalid"],
+      "trust": {
+        "source": "pinned_pem",
+        "certificate_pem_environment": "CORPUS_POSTGRES_ROOT_CERT_PEM",
+        "certificate_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "require_every_record": true
+  }
+}

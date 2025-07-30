@@ -6,8 +6,9 @@
 //! shared model and everything needed for inference:
 //!
 //! - **Model Architecture Language (MAL)**: Define any transformer architecture using a composable DSL
-//! - **Generation**: Text generation with temperature, top-k sampling
-//! - **Tokenization**: HuggingFace `tokenizer.json` loading
+//! - **Generation**: Cached text generation with temperature, top-k sampling,
+//!   and repetition penalties
+//! - **Tokenization**: Native `hermes-tokenizer` loading of `tokenizer.json`
 //! - **Export**: MAL → JSON model config
 //!
 //! Checkpoints are safetensors written directly from the same
@@ -68,8 +69,9 @@ pub mod trace;
 
 // Core types
 pub use model::{
-    Device, InferenceState, MambaBackend, Transformer, default_device, load_safetensors,
-    save_safetensors,
+    Device, InferenceState, MambaBackend, MemoryRouting, MemorySlotStatus, SelectedLogitProjector,
+    Transformer, WakeParameterAccounting, default_device, load_safetensors, save_safetensors,
+    upgrade_safetensors_to_memory,
 };
 
 // Generation
@@ -78,9 +80,9 @@ pub use trace::{TraceGeneration, TraceOptions, TraceRequest, VisualizationBundle
 
 // Model Architecture Language (MAL)
 pub use mal::{
-    Activation, AttentionDef, BlockDef, FfnDef, MalFile, ModelDef, NormPosition, NormType,
-    PositionEncoding, get_builtin_model, get_wellknown_mal, list_wellknown_models, parse_mal,
-    parse_mal_file, parse_mal_full,
+    Activation, AttentionDef, BlockDef, FfnDef, MalFile, MemoryDef, MemoryTierDef, MemoryTierInit,
+    ModelDef, NormPosition, NormType, PositionEncoding, ReserveExpertsDef, get_builtin_model,
+    get_wellknown_mal, list_wellknown_models, parse_mal, parse_mal_file, parse_mal_full,
 };
 
 // Tokenization

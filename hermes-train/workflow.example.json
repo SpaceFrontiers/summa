@@ -1,10 +1,11 @@
 {
-  "version": 1,
-  "stages": [
+  "version": 2,
+  "phases": [
     {
       "name": "foundation-1024",
+      "type": "pretrain",
       "data": "corpus/foundation.jsonl.zst",
-      "objective": {
+      "task": {
         "type": "causal_lm"
       },
       "sequence_length": 1024,
@@ -15,8 +16,9 @@
     },
     {
       "name": "foundation-4096",
+      "type": "continued_pretrain",
       "data": "corpus/foundation-long.jsonl.zst",
-      "objective": {
+      "task": {
         "type": "causal_lm"
       },
       "sequence_length": 4096,
@@ -27,9 +29,10 @@
     },
     {
       "name": "retrieval",
+      "type": "continued_pretrain",
       "data": "corpus/retrieval.jsonl.zst",
-      "objective": {
-        "type": "contrastive_retrieval",
+      "task": {
+        "type": "retrieval_representation",
         "temperature": 0.05,
         "layer": 24
       },
@@ -42,8 +45,9 @@
     },
     {
       "name": "summarization",
+      "type": "sft",
       "data": "corpus/summaries.jsonl.zst",
-      "objective": {
+      "task": {
         "type": "summarization"
       },
       "sequence_length": 2048,
@@ -55,8 +59,9 @@
     },
     {
       "name": "retrieval-planning",
+      "type": "sft",
       "data": "corpus/retrieval-plans.jsonl.zst",
-      "objective": {
+      "task": {
         "type": "retrieval_planning"
       },
       "sequence_length": 2048,
@@ -68,9 +73,10 @@
     },
     {
       "name": "retrieval-refresh",
+      "type": "continued_pretrain",
       "data": "corpus/retrieval.jsonl.zst",
-      "objective": {
-        "type": "contrastive_retrieval",
+      "task": {
+        "type": "retrieval_representation",
         "temperature": 0.04,
         "layer": 24
       },

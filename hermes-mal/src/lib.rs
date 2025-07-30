@@ -17,6 +17,31 @@
 //! }
 //! ```
 //!
+//! # Optional continuum memory
+//!
+//! A block can replace its ordinary `ffn` with an ordered, fast-to-slow
+//! residual memory chain. Reserve experts are fixed-capacity architecture;
+//! their active masks live in checkpoints.
+//!
+//! ```text
+//! memory cms {
+//!     tier fast {
+//!         ffn: fast_ffn
+//!         reserve_experts { capacity: 2 rank: 32 top_k: 1 }
+//!     }
+//!     tier slow {
+//!         ffn: slow_ffn
+//!         reserve_experts { capacity: 8 rank: 32 top_k: 1 }
+//!         residual_init: zero
+//!     }
+//! }
+//!
+//! block remembered {
+//!     attention: gqa
+//!     memory: cms
+//! }
+//! ```
+//!
 //! # Example MAL - Composable style
 //!
 //! ```text
@@ -181,7 +206,7 @@ impl Default for SsmDef {
 }
 
 /// Feed-forward network definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FfnDef {
     pub name: String,
     pub hidden_dim: Option<usize>,
@@ -199,7 +224,7 @@ pub struct FfnDef {
 /// `experts` are routed experts; `shared_experts` are always active. Router
 /// regularization belongs to the architecture config so every training entry
 /// point applies the same stable objective.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoeDef {
     pub experts: usize,
     pub top_k: usize,
@@ -209,6 +234,47 @@ pub struct MoeDef {
     pub load_balance_loss_weight: f64,
     #[serde(default)]
     pub router_z_loss_weight: f64,
+}
+
+/// Fixed-capacity low-rank experts available for sleep-time consolidation.
+///
+/// Slots are allocated with the model but start dormant. Their activation mask
+/// and generation counters are checkpoint state rather than architecture
+/// fields, so activating a slot never changes tensor shapes. Hermes executes a
+/// separate untrainable rank-matched zero fallback while all slots are dormant;
+/// it is not reserve capacity and keeps the configured top-1 route cost fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReserveExpertsDef {
+    pub capacity: usize,
+    pub rank: usize,
+    pub top_k: usize,
+}
+
+/// Initial behavior of a memory tier's ordinary FFN branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MemoryTierInit {
+    #[default]
+    Default,
+    /// Zero the FFN output projection so the residual tier is initially a
+    /// strict no-op. This is used by checkpoint-compatible memory upgrades.
+    ResidualZero,
+}
+
+/// One level in a fast-to-slow continuum memory chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTierDef {
+    pub name: String,
+    pub ffn: FfnDef,
+    pub reserve_experts: ReserveExpertsDef,
+    #[serde(default)]
+    pub residual_init: MemoryTierInit,
+}
+
+/// Ordered fast-to-slow FFN/MoE memory levels following a sequence mixer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryDef {
+    pub name: String,
+    pub tiers: Vec<MemoryTierDef>,
 }
 
 impl Default for FfnDef {
@@ -236,6 +302,10 @@ pub struct BlockDef {
     #[serde(default)]
     pub ssm: Option<SsmDef>,
     pub ffn: FfnDef,
+    /// Optional fast-to-slow memory chain replacing the ordinary FFN branch.
+    /// Omission preserves the historical model and checkpoint topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryDef>,
     pub norm: NormConfig,
     pub norm_position: NormPosition,
     pub residual: bool,
@@ -313,6 +383,7 @@ impl Default for BlockDef {
             attention: AttentionDef::default(),
             ssm: None,
             ffn: FfnDef::default(),
+            memory: None,
             norm: NormConfig {
                 norm_type: NormType::RmsNorm,
                 eps: 1e-5,
@@ -553,21 +624,35 @@ impl ModelDef {
                     weights + bias + qk_norm
                 }
             };
-            let intermediate = block.intermediate_size(h);
-            let projections = if block.ffn.gate { 3 } else { 2 };
-            let expert_count = block
-                .ffn
-                .moe
-                .as_ref()
-                .map_or(1, |moe| moe.experts + moe.shared_experts);
-            let ff_weights = expert_count * projections * h * intermediate;
-            let ff_bias = if block.ffn.bias {
-                expert_count * ((if block.ffn.gate { 2 } else { 1 }) * intermediate + h)
-            } else {
-                0
+            let ffn_params = |ffn: &FfnDef| {
+                let intermediate = ffn.hidden_dim.unwrap_or(h * 4);
+                let projections = if ffn.gate { 3 } else { 2 };
+                let expert_count = ffn
+                    .moe
+                    .as_ref()
+                    .map_or(1, |moe| moe.experts + moe.shared_experts);
+                let weights = expert_count * projections * h * intermediate;
+                let bias = if ffn.bias {
+                    expert_count * ((if ffn.gate { 2 } else { 1 }) * intermediate + h)
+                } else {
+                    0
+                };
+                let router = ffn.moe.as_ref().map_or(0, |moe| h * moe.experts);
+                weights + bias + router
             };
-            let router = block.ffn.moe.as_ref().map_or(0, |moe| h * moe.experts);
-            layer_params += mixer + ff_weights + ff_bias + router + 2 * norm_params(&block.norm);
+            let feed_forward = match &block.memory {
+                Some(memory) => memory
+                    .tiers
+                    .iter()
+                    .map(|tier| {
+                        let reserve =
+                            tier.reserve_experts.capacity * (2 * h * tier.reserve_experts.rank + h);
+                        ffn_params(&tier.ffn) + reserve
+                    })
+                    .sum(),
+                None => ffn_params(&block.ffn),
+            };
+            layer_params += mixer + feed_forward + 2 * norm_params(&block.norm);
         }
 
         let final_norm = self
@@ -600,6 +685,7 @@ pub struct MalFile {
     pub attentions: HashMap<String, AttentionDef>,
     pub ssms: HashMap<String, SsmDef>,
     pub ffns: HashMap<String, FfnDef>,
+    pub memories: HashMap<String, MemoryDef>,
     pub blocks: HashMap<String, BlockDef>,
     pub models: HashMap<String, ModelDef>,
 }
@@ -836,6 +922,15 @@ pub fn parse_mal_full(input: &str) -> Result<MalFile> {
                             Rule::ffn_def => {
                                 let ffn = parse_ffn_def(def)?;
                                 insert_unique(&mut file.ffns, "ffn", ffn.name.clone(), ffn)?;
+                            }
+                            Rule::memory_def => {
+                                let memory = parse_memory_def(def, &file)?;
+                                insert_unique(
+                                    &mut file.memories,
+                                    "memory",
+                                    memory.name.clone(),
+                                    memory,
+                                )?;
                             }
                             Rule::block_def => {
                                 let block = parse_block_def(def, &file)?;
@@ -1142,6 +1237,111 @@ fn parse_ffn_prop(pair: pest::iterators::Pair<Rule>, def: &mut FfnDef) -> Result
     Ok(())
 }
 
+fn parse_memory_tier(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<MemoryTierDef> {
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .ok_or_else(|| anyhow!("memory tier is missing a name"))?
+        .as_str()
+        .to_string();
+    let mut ffn = None;
+    let mut reserve_experts = None;
+    let mut residual_init = MemoryTierInit::Default;
+
+    for property in inner {
+        if property.as_rule() != Rule::memory_tier_prop {
+            continue;
+        }
+        let Some(property) = property.into_inner().next() else {
+            continue;
+        };
+        match property.as_rule() {
+            Rule::memory_ffn_prop => {
+                for child in property.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let ffn_name = child.as_str();
+                            ffn = Some(
+                                file.ffns
+                                    .get(ffn_name)
+                                    .ok_or_else(|| anyhow!("undefined ffn '{ffn_name}'"))?
+                                    .clone(),
+                            );
+                        }
+                        Rule::inline_ffn => {
+                            let mut inline = FfnDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::ffn_prop {
+                                    parse_ffn_prop(prop, &mut inline)?;
+                                }
+                            }
+                            ffn = Some(inline);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::reserve_experts_prop => {
+                let mut capacity = None;
+                let mut rank = None;
+                let mut top_k = None;
+                for parameter in property.into_inner() {
+                    let Some(parameter) = parameter.into_inner().next() else {
+                        continue;
+                    };
+                    let value: usize = parameter
+                        .clone()
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| anyhow!("reserve expert parameter is missing a value"))?
+                        .as_str()
+                        .parse()?;
+                    match parameter.as_rule() {
+                        Rule::capacity_prop => capacity = Some(value),
+                        Rule::rank_prop => rank = Some(value),
+                        Rule::top_k_prop => top_k = Some(value),
+                        _ => {}
+                    }
+                }
+                reserve_experts = Some(ReserveExpertsDef {
+                    capacity: capacity.unwrap_or(0),
+                    rank: rank.unwrap_or(0),
+                    top_k: top_k.unwrap_or(0),
+                });
+            }
+            Rule::residual_init_prop => {
+                residual_init = match property.into_inner().next().map(|v| v.as_str()) {
+                    Some("zero") => MemoryTierInit::ResidualZero,
+                    _ => MemoryTierInit::Default,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Ok(MemoryTierDef {
+        name,
+        ffn: ffn.ok_or_else(|| anyhow!("memory tier requires an ffn"))?,
+        reserve_experts: reserve_experts
+            .ok_or_else(|| anyhow!("memory tier requires reserve_experts"))?,
+        residual_init,
+    })
+}
+
+fn parse_memory_def(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<MemoryDef> {
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .ok_or_else(|| anyhow!("memory definition is missing a name"))?
+        .as_str()
+        .to_string();
+    let tiers = inner
+        .filter(|pair| pair.as_rule() == Rule::memory_tier)
+        .map(|tier| parse_memory_tier(tier, file))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MemoryDef { name, tiers })
+}
+
 /// Parse a block definition
 fn parse_block_def(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<BlockDef> {
     let mut def = BlockDef::default();
@@ -1237,6 +1437,33 @@ fn parse_block_prop(
                                 }
                             }
                             def.ffn = ffn;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::memory_ref_prop => {
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            def.memory = Some(
+                                file.memories
+                                    .get(name)
+                                    .ok_or_else(|| anyhow!("undefined memory '{name}'"))?
+                                    .clone(),
+                            );
+                        }
+                        Rule::inline_memory => {
+                            let tiers = child
+                                .into_inner()
+                                .filter(|pair| pair.as_rule() == Rule::memory_tier)
+                                .map(|tier| parse_memory_tier(tier, file))
+                                .collect::<Result<Vec<_>>>()?;
+                            def.memory = Some(MemoryDef {
+                                name: "inline".to_string(),
+                                tiers,
+                            });
                         }
                         _ => {}
                     }
@@ -1450,6 +1677,76 @@ mod tests {
     }
 
     #[test]
+    fn memory_preserves_tier_order_and_reserve_shape() {
+        let model = parse_mal(
+            r#"
+            ffn fast_ffn { hidden_dim: 32 activation: swiglu }
+            memory sleep_chain {
+                tier fast {
+                    ffn: fast_ffn
+                    reserve_experts { capacity: 2 rank: 4 top_k: 1 }
+                }
+                tier medium {
+                    ffn: { hidden_dim: 16 activation: silu }
+                    reserve_experts { capacity: 4 rank: 2 top_k: 1 }
+                    residual_init: zero
+                }
+            }
+            block remembered {
+                attention: { num_heads: 2 }
+                memory: sleep_chain
+            }
+            model sleeper {
+                vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1
+                block: remembered
+            }
+            "#,
+        )
+        .unwrap();
+
+        let memory = model.block.memory.as_ref().unwrap();
+        assert_eq!(memory.tiers.len(), 2);
+        assert_eq!(memory.tiers[0].name, "fast");
+        assert_eq!(memory.tiers[1].name, "medium");
+        assert_eq!(memory.tiers[0].reserve_experts.capacity, 2);
+        assert_eq!(memory.tiers[1].reserve_experts.rank, 2);
+        assert!(matches!(
+            memory.tiers[1].residual_init,
+            MemoryTierInit::ResidualZero
+        ));
+    }
+
+    #[test]
+    fn inline_memory_and_undefined_memory_are_explicit() {
+        let inline = parse_mal(
+            r#"
+            model sleeper {
+                vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1
+                block: {
+                    attention: { num_heads: 2 }
+                    memory: {
+                        tier fast {
+                            ffn: { hidden_dim: 16 }
+                            reserve_experts { capacity: 1 rank: 2 top_k: 1 }
+                        }
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(inline.block.memory.unwrap().tiers[0].name, "fast");
+
+        let error = parse_mal(
+            "model sleeper { vocab_size: 64 hidden_size: 8 num_layers: 1 \
+             block: { attention: { num_heads: 2 } memory: absent } }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("undefined memory 'absent'"), "{error}");
+    }
+
+    #[test]
     fn retriever_200m_moe_has_the_intended_sparse_budget() {
         let model = get_builtin_model("retriever-200m-moe").unwrap();
         assert_eq!(model.estimated_params(), 200_795_648);
@@ -1481,6 +1778,36 @@ mod tests {
         assert!(moe_layers.iter().all(|moe| moe.top_k == 2));
         assert!(moe_layers.iter().all(|moe| moe.shared_experts == 0));
         assert_eq!(model.block_for_layer(23).name, "attn_moe_block");
+    }
+
+    #[test]
+    fn retriever_300m_sleep_is_additive_and_upgrade_shaped() {
+        let original = get_builtin_model("retriever-300m-moe").unwrap();
+        let sleep = get_builtin_model("retriever-300m-moe-sleep").unwrap();
+        assert_eq!(sleep.num_layers, original.num_layers);
+        assert_eq!(sleep.estimated_params(), 312_290_816);
+        for layer in 0..sleep.num_layers {
+            let source = original.block_for_layer(layer);
+            let memory = sleep.block_for_layer(layer).memory.as_ref().unwrap();
+            assert_eq!(memory.tiers.len(), 3);
+            assert_eq!(memory.tiers[0].name, "fast");
+            assert_eq!(memory.tiers[0].ffn.hidden_dim, source.ffn.hidden_dim);
+            assert_eq!(
+                memory.tiers[0].ffn.moe.as_ref().map(|moe| moe.experts),
+                source.ffn.moe.as_ref().map(|moe| moe.experts)
+            );
+            assert!(
+                memory.tiers[1..]
+                    .iter()
+                    .all(|tier| tier.residual_init == MemoryTierInit::ResidualZero)
+            );
+            assert!(
+                memory
+                    .tiers
+                    .iter()
+                    .all(|tier| tier.reserve_experts.top_k == 1)
+            );
+        }
     }
 
     #[test]

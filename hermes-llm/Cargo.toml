@@ -14,20 +14,20 @@ publish = false
 [dependencies]
 # Burn is the sole inference runtime. CPU uses ndarray; GPU backends and the
 # custom selective-scan op use Burn's CubeCL tensor/runtime directly.
-burn = { package = "burn-core", git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std", "extension", "ndarray", "autodiff"] }
-burn-autodiff = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std"] }
-burn-nn = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std"] }
-burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = ["std"] }
-burn-wgpu = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", optional = true, default-features = false, features = ["std", "metal", "autotune"] }
-burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", default-features = false, features = [
+burn = { package = "burn-core", git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std", "extension", "ndarray", "autodiff"] }
+burn-autodiff = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-nn = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-wgpu = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std", "metal", "autotune"] }
+burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = [
     "safetensors",
     "std",
 ] }
-burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", optional = true, default-features = false, features = ["std"] }
-burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", optional = true, default-features = false, features = ["std"] }
-burn-ir = { git = "https://github.com/tracel-ai/burn.git", rev = "c1e987d6a6eeda661a34f71b07c42a25dd2b4eba", optional = true, default-features = false, features = ["std"] }
-cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "c544dc74625faf3c818a4ab7f8f8bdb5f3338326", optional = true, default-features = false, features = ["std"] }
-cubek = { git = "https://github.com/tracel-ai/cubek", rev = "e6c291ad3bdccc77257417d7ac16f4866f49628c", optional = true, default-features = false, features = ["attention", "stdlib"] }
+burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std"] }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std"] }
+burn-ir = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std"] }
+cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "c0efe74d3d4b820fbf992dbbe443ed7125c5205c", optional = true, default-features = false, features = ["std"] }
+cubek = { git = "https://github.com/tracel-ai/cubek", rev = "7b26a4bdc68c092ecd77ee6ee8a2cd39d61d4a90", optional = true, default-features = false, features = ["attention", "stdlib"] }
 half = { version = "2", optional = true, default-features = false }
 
 # Stable-Rust byte-level BPE shared by training and inference.

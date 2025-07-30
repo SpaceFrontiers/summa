@@ -73,8 +73,8 @@ cargo test --workspace
 | **hermes-train**             | Autodiff training for the same `hermes-llm` model and safetensors checkpoints              |
 
 For a deeper look at the core architecture, see `CLAUDE.md`. The shared LLM
-stack is mapped in `docs/llm-code-map.md`; temporary GPU forks and their
-upstream exit criteria live in `docs/forked-dependencies.md`.
+stack is mapped in `docs/llm-code-map.md`; temporary official GPU revisions and
+their release exit criteria live in `docs/upstream-dependencies.md`.
 
 ## Submitting Pull Requests
 

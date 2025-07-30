@@ -40,7 +40,10 @@ futures = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# Checkpoint JSON carries exact f32/f64 trainer state. The default fast parser
+# may round a serialized float by one ULP, changing content-addressed resume
+# artifacts after a load/save cycle.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 sonic-rs = "0.5"
 byteorder = "1.5"
 bincode = "2.0"
@@ -105,37 +108,3 @@ lasso = { version = "0.7", features = ["multi-threaded"] }
 hashbrown = "0.17"
 memmap2 = "0.9"
 uuid = { version = "1.19", features = ["v4"] }
-
-# Forward softmax-LSE emission used by Hermes attention training. Upstream:
-# https://github.com/tracel-ai/cubek/pull/428
-[patch."https://github.com/tracel-ai/cubek"]
-cubek = { git = "https://github.com/ppodolsky/cubek", rev = "7b26a4bdc68c092ecd77ee6ee8a2cd39d61d4a90" }
-
-# Allocation retry plus asynchronous cuBLASLt BF16 GEMM and grouped-GEMM dispatch.
-# Consolidated upstream:
-# https://github.com/tracel-ai/cubecl/pull/1440
-[patch."https://github.com/tracel-ai/cubecl"]
-cubecl = { git = "https://github.com/ppodolsky/cubecl", rev = "c0efe74d3d4b820fbf992dbbe443ed7125c5205c" }
-cubecl-common = { git = "https://github.com/ppodolsky/cubecl", rev = "c0efe74d3d4b820fbf992dbbe443ed7125c5205c" }
-cubecl-environment = { git = "https://github.com/ppodolsky/cubecl", rev = "c0efe74d3d4b820fbf992dbbe443ed7125c5205c" }
-cubecl-zspace = { git = "https://github.com/ppodolsky/cubecl", rev = "c0efe74d3d4b820fbf992dbbe443ed7125c5205c" }
-
-# Route every Burn crate to the pinned fork rebased on upstream `c1e987d6` plus the
-# BF16 native-GEMM matmul dispatch (autotune-arbitrated against fused CubeK)
-# and the now-upstream foreign-stream drop-ordering fix. Native GEMM upstream:
-# https://github.com/tracel-ai/burn/pull/5190
-# Measured on A100: +15.6%/+14.8% training tokens/s at batch 16/20 with
-# identical losses (docs/cublas-gemm-dispatch.md).
-[patch."https://github.com/tracel-ai/burn"]
-burn-core = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-autodiff = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-nn = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-ndarray = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-wgpu = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-cuda = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-store = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-cubecl = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-fusion = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-ir = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-optim = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
-burn-pack = { git = "https://github.com/ppodolsky/burn", rev = "ef8f82ba164df50ef7b20605b0a87617f0ecc378" }
