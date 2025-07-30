@@ -1,6 +1,89 @@
 //! Objective-aware streaming optimization loop.
 
 use super::*;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+const TRAINER_LOCK_FILE: &str = ".trainer.lock";
+
+/// Process-lifetime ownership of one mutable training output root.
+///
+/// The relaunch supervisor has its own orchestration lock, but direct trainer
+/// invocations must obey the same single-writer invariant. Without this lock,
+/// two metric writers can truncate/append the same journal and produce
+/// duplicated sequences or sparse NUL-filled holes.
+struct TrainingOutputLock {
+    file: fs::File,
+}
+
+impl TrainingOutputLock {
+    fn acquire(output: &Path) -> Result<Self> {
+        fs::create_dir_all(output)
+            .with_context(|| format!("creating training output {}", output.display()))?;
+        let output_metadata = fs::symlink_metadata(output)
+            .with_context(|| format!("inspecting training output {}", output.display()))?;
+        ensure!(
+            output_metadata.is_dir() && !output_metadata.file_type().is_symlink(),
+            "training output {} must be a real directory",
+            output.display()
+        );
+        let path = output.join(TRAINER_LOCK_FILE);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("opening trainer output lock {}", path.display()))?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "trainer output lock {} is not a regular file",
+            path.display()
+        );
+
+        #[cfg(unix)]
+        {
+            // SAFETY: `file` owns a valid descriptor for the lifetime of this
+            // guard. LOCK_NB makes contention fail instead of hanging a boot
+            // supervisor indefinitely.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+                {
+                    bail!(
+                        "another hermes-train process already owns output {}",
+                        output.display()
+                    );
+                }
+                return Err(error)
+                    .with_context(|| format!("locking trainer output root {}", output.display()));
+            }
+        }
+        #[cfg(not(unix))]
+        bail!("exclusive trainer output locks are not implemented on this platform");
+
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        file.sync_data()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for TrainingOutputLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: the descriptor stays valid until after Drop returns.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 fn publish_sleep_model(
     model: &Transformer,
@@ -135,6 +218,34 @@ struct PeriodicTrainingRuntime {
     journal_store: PathBuf,
     config_path: PathBuf,
     config_sha256: String,
+}
+
+/// Fake-quantized parameter leaves shared by the microbatches that contribute
+/// to one master-weight update. A window must never cross an optimizer step.
+struct StagedQuantizationWindow {
+    format: UltraQuantFormat,
+    model: Transformer,
+    tensor_count: u64,
+}
+
+enum PrefetchedSample {
+    CursorReady,
+    Sample(data::TrainingSample),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeCursorAction {
+    Skip,
+    CursorReady,
+    Emit,
+}
+
+fn resume_cursor_action(visited: usize, records_to_skip: usize) -> ResumeCursorAction {
+    match visited.cmp(&records_to_skip) {
+        std::cmp::Ordering::Less => ResumeCursorAction::Skip,
+        std::cmp::Ordering::Equal => ResumeCursorAction::CursorReady,
+        std::cmp::Ordering::Greater => ResumeCursorAction::Emit,
+    }
 }
 
 impl PeriodicTrainingRuntime {
@@ -754,6 +865,20 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
     let mut config = load_config(&args.config)?;
     config.vocab_size = tokenizer.vocab_size();
     validate_model_wake_plan(&config, &workflow)?;
+
+    // A signature-only invocation remains read-only and hardware-independent.
+    // Real training, however, claims its output and initializes the selected
+    // accelerator before hashing a potentially multi-billion-token corpus.
+    // This both avoids duplicate startup work and reports a missing CUDA
+    // driver immediately instead of after a long CPU-only verification pass.
+    let training_runtime = if args.print_run_signature {
+        None
+    } else {
+        let output_lock = TrainingOutputLock::acquire(&args.output)?;
+        let device = hermes_llm::default_device().autodiff();
+        device.seed(args.seed);
+        Some((output_lock, device))
+    };
     let data_manifests = workflow
         .phases
         .iter()
@@ -771,22 +896,24 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         println!("{signature}");
         return Ok(());
     }
-    fs::create_dir_all(&args.output)?;
-    let token_cache_root = args
-        .output
-        .join(".token-cache")
-        .join(stable_cache_id(&signature));
+    let (_output_lock, device) = training_runtime
+        .expect("non-signature training initialized its output lock and accelerator");
+    let token_cache_root = args.output.join(".token-cache");
     fs::create_dir_all(&token_cache_root)?;
-    let (phase_plan, total_steps) = plan_training(&workflow, &tokenizer, &token_cache_root)?;
+    let token_cache_paths = data_manifests
+        .iter()
+        .zip(&workflow.phases)
+        .map(|(data, phase)| {
+            token_cache_path(&token_cache_root, data, &phase.data, &tokenizer_hash)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (phase_plan, total_steps) = plan_training(&workflow, &tokenizer, &token_cache_paths)?;
     ensure!(
         total_steps > 0,
         "training has zero complete optimizer steps"
     );
     let run_id = stable_cache_id(&signature);
     let metrics_path = args.output.join("metrics.jsonl");
-
-    let device = hermes_llm::default_device().autodiff();
-    device.seed(args.seed);
     let mut initial_model = Transformer::new(&config, &device)?;
     if let Some(path) = &args.checkpoint {
         load_safetensors(&mut initial_model, path)?;
@@ -916,6 +1043,13 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 .is_none_or(|state| state.sleep.is_none()),
             "ordinary-model checkpoint unexpectedly contains native sleep state"
         );
+    }
+    if let Some(state) = &resume_state {
+        // Periodic-memory workflows narrow the global Muon selection to the
+        // exact wake scope above. Validate archive geometry only after that
+        // scope is known; validating against every model matrix would reject
+        // correct checkpoints whose tier matrices use independent optimizers.
+        muon_optimizer.validate_for_model(&initial_model, state.global_step == 0)?;
     }
     let mut metrics = if let Some(state) = &resume_state {
         MetricWriter::resume_from_checkpoint(
@@ -1167,7 +1301,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 .as_ref()
                 .filter(|state| state.phase == phase_index && state.epoch == epoch)
                 .map_or(0, |state| state.records_in_phase);
-            let mut records_in_phase = 0;
+            let mut records_in_phase = records_to_skip;
             let model_rng = rng_stream(&training_state, MODEL_RNG_STREAM)?.clone();
             let mut native_sleep = training_state.sleep.clone();
             if let Some(cursor) = &mut native_sleep {
@@ -1208,7 +1342,8 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     RngStreamState {
                         name: DATA_RNG_STREAM.into(),
                         seed: shuffle_seed(args.seed, phase_index, epoch),
-                        counter: 0,
+                        counter: u64::try_from(records_to_skip)
+                            .context("resume sample cursor exceeds u64")?,
                     },
                     model_rng,
                 ],
@@ -1231,10 +1366,18 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 }),
             };
             let mut batch = Vec::with_capacity(phase.batch_size);
+            // Master weights are immutable throughout one gradient-accumulation
+            // window. Keep one fake-quantized leaf model for that whole window
+            // instead of re-quantizing every matrix for every microbatch.
+            // Parameter IDs are retained by `fake_quantized_transformer`, so
+            // each backward pass still accumulates directly into the master
+            // optimizer slots. The staged leaves are discarded immediately
+            // after the master update.
+            let mut quantized_window: Option<StagedQuantizationWindow> = None;
             let shuffle_seed = shuffle_seed(args.seed, phase_index, epoch);
             let tokenizer_ref = &tokenizer;
             let objective = phase.objective.clone();
-            let token_cache_path = token_cache_root.join(format!("phase-{phase_index:03}.tokens"));
+            let token_cache_path = token_cache_paths[phase_index].clone();
             std::thread::scope(|threads| -> Result<()> {
                 let prefetch_capacity = phase
                     .batch_size
@@ -1242,7 +1385,15 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     .and_then(|capacity| capacity.checked_mul(2))
                     .context("training prefetch capacity overflows usize")?;
                 let (sender, receiver) = std::sync::mpsc::sync_channel(prefetch_capacity);
-                let reader = threads.spawn(move || {
+                let reader = threads.spawn(move || -> Result<()> {
+                    let mut visited = 0usize;
+                    let mut cursor_ready = false;
+                    if records_to_skip == 0 {
+                        if sender.send(PrefetchedSample::CursorReady).is_err() {
+                            return Ok(());
+                        }
+                        cursor_ready = true;
+                    }
                     visit_samples(
                         &phase.data,
                         &objective,
@@ -1253,13 +1404,53 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             seed: shuffle_seed,
                             token_cache: Some(&token_cache_path),
                         },
-                        |sample| Ok(sender.send(sample).is_ok()),
-                    )
+                        |sample| {
+                            visited = visited
+                                .checked_add(1)
+                                .context("sample-reader cursor overflows usize")?;
+                            match resume_cursor_action(visited, records_to_skip) {
+                                ResumeCursorAction::Skip => return Ok(true),
+                                ResumeCursorAction::CursorReady => {
+                                    cursor_ready = sender
+                                        .send(PrefetchedSample::CursorReady)
+                                        .is_ok();
+                                    return Ok(cursor_ready);
+                                }
+                                ResumeCursorAction::Emit => {}
+                            }
+                            debug_assert!(cursor_ready);
+                            Ok(sender.send(PrefetchedSample::Sample(sample)).is_ok())
+                        },
+                    )?;
+                    ensure!(
+                        visited >= records_to_skip,
+                        "workflow phase `{}` epoch {} has only {visited} samples, fewer than resume cursor {records_to_skip}",
+                        phase.name,
+                        epoch + 1
+                    );
+                    Ok(())
                 });
+                let mut cursor_ready = false;
                 loop {
                     let input_wait_started = Instant::now();
                     let sample = match receiver.recv() {
-                        Ok(sample) => sample,
+                        Ok(PrefetchedSample::CursorReady) => {
+                            ensure!(
+                                !cursor_ready,
+                                "sample reader emitted duplicate cursor readiness"
+                            );
+                            cursor_ready = true;
+                            optimizer_step_started = Instant::now();
+                            step_input_wait_seconds = 0.0;
+                            continue;
+                        }
+                        Ok(PrefetchedSample::Sample(sample)) => {
+                            ensure!(
+                                cursor_ready,
+                                "sample reader emitted data before resume catch-up"
+                            );
+                            sample
+                        }
                         Err(_) => break,
                     };
                     step_input_wait_seconds += input_wait_started.elapsed().as_secs_f64();
@@ -1269,11 +1460,6 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     training_state.records_in_phase = records_in_phase;
                     rng_stream_mut(&mut training_state, DATA_RNG_STREAM)?.counter =
                         records_in_phase as u64;
-                    if records_in_phase <= records_to_skip {
-                        optimizer_step_started = Instant::now();
-                        step_input_wait_seconds = 0.0;
-                        continue;
-                    }
                     batch.push(sample);
                     if batch.len() < phase.batch_size {
                         continue;
@@ -1297,30 +1483,39 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         .checked_add(1)
                         .context("model RNG counter overflows u64")?;
                     let current = model.as_ref().unwrap();
-                    let quantized = phase
+                    let quantization_format = phase
                         .quantization
                         .as_ref()
-                        .and_then(|plan| plan.format_at(step as u64))
-                        .map(|format| {
-                            fake_quantized_transformer(
-                                current,
-                                format,
-                                phase
-                                    .quantization
-                                    .as_ref()
-                                    .expect("format came from plan")
-                                    .recipe
-                                    .quantize_embeddings,
-                                phase
-                                    .quantization
-                                    .as_ref()
-                                    .expect("format came from plan")
-                                    .recipe
-                                    .quantize_lm_head,
-                            )
-                        })
-                        .transpose()?;
-                    let forward_model = quantized.as_ref().map_or(current, |(staged, _)| staged);
+                        .and_then(|plan| plan.format_at(step as u64));
+                    if let Some(format) = quantization_format
+                        && quantized_window.is_none()
+                    {
+                        let recipe = &phase
+                            .quantization
+                            .as_ref()
+                            .expect("format came from plan")
+                            .recipe;
+                        let (staged, tensors) = fake_quantized_transformer(
+                            current,
+                            format,
+                            recipe.quantize_embeddings,
+                            recipe.quantize_lm_head,
+                        )?;
+                        quantized_window = Some(StagedQuantizationWindow {
+                            format,
+                            model: staged,
+                            tensor_count: tensors as u64,
+                        });
+                    }
+                    ensure!(
+                        quantized_window
+                            .as_ref()
+                            .is_none_or(|window| Some(window.format) == quantization_format),
+                        "quantization format changed inside a gradient-accumulation window"
+                    );
+                    let forward_model = quantized_window
+                        .as_ref()
+                        .map_or(current, |window| &window.model);
                     let accelerator_started = Instant::now();
                     let distillation_loss = quantization_teacher
                         .as_ref()
@@ -1494,6 +1689,12 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         let current = model.take().unwrap();
                         let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
                         model = Some(adamw_optimizer.step(lr.into(), current, adamw_grads));
+                        let step_quantized_tensors = quantized_window
+                            .as_ref()
+                            .map_or(0, |window| window.tensor_count);
+                        // The authoritative model has changed. Never reuse a
+                        // staged QAT leaf across optimizer-step boundaries.
+                        quantized_window = None;
                         step_accelerator_seconds += accelerator_started.elapsed().as_secs_f64();
                         step += 1;
                         steps_in_phase = steps_in_phase
@@ -1583,8 +1784,6 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         )?;
                         if let Some(plan) = &phase.quantization {
                             let active_format = plan.format_at((step - 1) as u64);
-                            let quantized_tensors =
-                                quantized.as_ref().map_or(0, |(_, tensors)| *tensors as u64);
                             metrics.append(
                                 context.clone(),
                                 MetricEvent::Quantization(QuantizationMetrics {
@@ -1599,7 +1798,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                                     group_size: plan.recipe.group_size as u32,
                                     progress_fraction: steps_in_phase as f64
                                         / phase_plan[phase_index].steps as f64,
-                                    tensors_quantized: quantized_tensors,
+                                    tensors_quantized: step_quantized_tensors,
                                     // Exact element and codec-error accounting is
                                     // emitted by the archive export pass.
                                     weights_quantized: 0,
@@ -1846,6 +2045,58 @@ fn print_checkpoint_publication(label: &str, publication: &CheckpointPublication
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_cursor_filter_preserves_exact_shuffled_suffix() {
+        let shuffled = [7, 2, 9, 1, 5, 8, 0, 6, 3, 4];
+        let cursor = 4;
+        let actions = (1..=shuffled.len())
+            .map(|visited| resume_cursor_action(visited, cursor))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions[..cursor],
+            [
+                ResumeCursorAction::Skip,
+                ResumeCursorAction::Skip,
+                ResumeCursorAction::Skip,
+                ResumeCursorAction::CursorReady,
+            ]
+        );
+        let resumed = shuffled
+            .into_iter()
+            .zip(actions)
+            .filter_map(|(sample, action)| (action == ResumeCursorAction::Emit).then_some(sample))
+            .collect::<Vec<_>>();
+        assert_eq!(resumed, shuffled[cursor..]);
+        assert!(
+            (1..=shuffled.len()).all(|visited| resume_cursor_action(visited, shuffled.len() + 1)
+                == ResumeCursorAction::Skip)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn training_output_lock_rejects_a_second_writer_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = TrainingOutputLock::acquire(directory.path()).unwrap();
+        let error = TrainingOutputLock::acquire(directory.path())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("already owns output"), "{error}");
+
+        drop(first);
+        TrainingOutputLock::acquire(directory.path()).unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let link = parent.path().join("linked-output");
+        std::os::unix::fs::symlink(directory.path(), &link).unwrap();
+        let error = TrainingOutputLock::acquire(&link)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("real directory"), "{error}");
+    }
 
     #[test]
     fn periodic_runtime_artifact_is_write_once_and_exact_on_resume() {

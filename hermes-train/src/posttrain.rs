@@ -672,17 +672,20 @@ pub fn grpo_loss(
     let rewards: Vec<f64> = rollouts.iter().map(|rollout| rollout.reward).collect();
     ensure_finite(&rewards, "GRPO rewards")?;
     let mean_reward = rewards.iter().sum::<f64>() / rewards.len() as f64;
+    ensure!(mean_reward.is_finite(), "GRPO reward mean overflowed");
     let variance = rewards
         .iter()
         .map(|reward| (reward - mean_reward).powi(2))
         .sum::<f64>()
         / rewards.len() as f64;
+    ensure!(variance.is_finite(), "GRPO reward normalization overflowed");
     let reward_stddev = variance.sqrt();
     let denominator = reward_stddev.max(advantage_epsilon);
     let advantages: Vec<f64> = rewards
         .iter()
         .map(|reward| (reward - mean_reward) / denominator)
         .collect();
+    ensure_finite(&advantages, "GRPO normalized advantages")?;
 
     let group_scale = 1.0 / rollouts.len() as f64;
     let lower = 1.0 - clip_epsilon;
@@ -732,7 +735,7 @@ pub fn grpo_loss(
             let behavior = rollout.behavior_token_log_probs[token_index];
             let log_ratio = current - behavior;
             ensure!(
-                log_ratio <= 80.0,
+                log_ratio.is_finite() && log_ratio <= 80.0,
                 "GRPO rollout {rollout_index} token {token_index} has an unsafe importance ratio"
             );
             let ratio = log_ratio.exp();
@@ -748,7 +751,7 @@ pub fn grpo_loss(
                 Some(reference) => {
                     let log_ref_minus_policy = reference[token_index] - current;
                     ensure!(
-                        log_ref_minus_policy <= 80.0,
+                        log_ref_minus_policy.is_finite() && log_ref_minus_policy <= 80.0,
                         "GRPO rollout {rollout_index} token {token_index} has an unsafe KL ratio"
                     );
                     let ref_over_policy = log_ref_minus_policy.exp();
@@ -772,6 +775,14 @@ pub fn grpo_loss(
             row_gradients.push(token_scale * (-d_surrogate + kl_coefficient * d_kl));
         }
         gradients.push(row_gradients);
+    }
+
+    ensure!(
+        objective.is_finite() && total_kl.is_finite(),
+        "GRPO objective overflowed"
+    );
+    for row in &gradients {
+        ensure_finite(row, "GRPO current log-probability gradients")?;
     }
 
     Ok(GrpoLoss {
@@ -854,28 +865,96 @@ pub fn grpo_loss_tensor(
     );
 
     let rewards = rewards.detach();
+    let behavior_token_log_probs = behavior_token_log_probs.detach();
+    let reference_token_log_probs = reference_token_log_probs.map(Tensor::detach);
+    let log_importance_ratio =
+        current_token_log_probs.clone().detach() - behavior_token_log_probs.clone();
     let reward_mean = rewards.clone().mean();
-    let reward_stddev = (rewards.clone() - reward_mean.clone())
-        .powi_scalar(2)
-        .mean()
-        .sqrt()
-        .clamp_min(advantage_epsilon);
-    let advantages = ((rewards - reward_mean) / reward_stddev).reshape([group, 1]);
-    let ratio = (current_token_log_probs.clone() - behavior_token_log_probs.detach()).exp();
+    let centered_rewards = rewards.clone() - reward_mean.clone();
+    let reward_variance = centered_rewards.clone().powi_scalar(2).mean();
+    let reward_stddev = reward_variance.clone().sqrt().clamp_min(advantage_epsilon);
+
+    // Build the differentiable objective before materializing validation
+    // flags. This lets the same single device read that validates the inputs
+    // also reject overflow introduced by exp/KL scaling before callers can
+    // backpropagate a non-finite loss.
+    let advantages =
+        ((rewards.clone() - reward_mean.clone()) / reward_stddev.clone()).reshape([group, 1]);
+    let ratio = (current_token_log_probs.clone() - behavior_token_log_probs.clone()).exp();
     let clipped_ratio = ratio.clone().clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon);
     let surrogate = (ratio * advantages.clone()).min_pair(clipped_ratio * advantages);
-    let mask = active_mask.detach();
+    let mask = active_mask.clone().detach();
     let active_per_rollout = mask.clone().sum_dim(1);
-    let token_objective = match reference_token_log_probs {
+    let token_objective = match &reference_token_log_probs {
         Some(reference) => {
-            let log_ref_minus_policy = reference.detach() - current_token_log_probs;
+            let log_ref_minus_policy = reference.clone() - current_token_log_probs.clone();
             let kl = log_ref_minus_policy.clone().exp() - log_ref_minus_policy - 1;
             surrogate - kl.mul_scalar(kl_coefficient)
         }
         None => surrogate,
     };
     let sequence_objective = (token_objective * mask).sum_dim(1) / active_per_rollout;
-    Ok(sequence_objective.mean().neg())
+    let loss = sequence_objective.mean().neg();
+
+    // Collapse every device-side precondition into one tiny transfer instead
+    // of synchronizing the accelerator once per check. The ordered labels
+    // preserve precise diagnostics while keeping validation overhead bounded.
+    let mut validation_names = vec![
+        "GRPO rewards contain a non-finite value",
+        "GRPO current log probabilities contain a non-finite value",
+        "GRPO behavior log probabilities contain a non-finite value",
+        "GRPO active_mask must contain only binary zero/one values",
+        "GRPO active_mask must contain at least one active token in every rollout",
+        "GRPO importance log-ratio is non-finite",
+        "GRPO importance log-ratio exceeds the safe exponential domain",
+        "GRPO reward normalization overflowed",
+        "GRPO tensor objective overflowed",
+    ];
+    let mut validation_tensors = vec![
+        rewards.clone().is_finite().all(),
+        current_token_log_probs.clone().is_finite().all(),
+        behavior_token_log_probs.clone().is_finite().all(),
+        active_mask
+            .clone()
+            .equal_elem(0.0)
+            .bool_or(active_mask.clone().equal_elem(1.0))
+            .all(),
+        active_mask.clone().sum_dim(1).greater_elem(0.0).all(),
+        log_importance_ratio.clone().is_finite().all(),
+        log_importance_ratio.clone().lower_equal_elem(80.0).all(),
+        centered_rewards
+            .clone()
+            .is_finite()
+            .all()
+            .bool_and(reward_variance.clone().is_finite().all()),
+        loss.clone().detach().is_finite().all(),
+    ];
+    if let Some(reference) = &reference_token_log_probs {
+        let log_reference_ratio = reference.clone() - current_token_log_probs.clone().detach();
+        validation_names.extend([
+            "GRPO reference log probabilities contain a non-finite value",
+            "GRPO reference log-ratio is non-finite",
+            "GRPO reference log-ratio exceeds the safe exponential domain",
+        ]);
+        validation_tensors.extend([
+            reference.clone().is_finite().all(),
+            log_reference_ratio.clone().is_finite().all(),
+            log_reference_ratio.lower_equal_elem(80.0).all(),
+        ]);
+    }
+    let validation_values = Tensor::cat(validation_tensors, 0)
+        .into_data()
+        .to_vec::<bool>()
+        .context("reading GRPO tensor validation flags")?;
+    ensure!(
+        validation_values.len() == validation_names.len(),
+        "GRPO backend returned an incomplete validation result"
+    );
+    for (valid, message) in validation_values.into_iter().zip(validation_names) {
+        ensure!(valid, message);
+    }
+
+    Ok(loss)
 }
 
 /// Request sent to an executor-owned rollout generator.
@@ -1039,627 +1118,6 @@ pub struct PostTrainingPhaseReport {
     pub metrics: BTreeMap<String, f64>,
 }
 
-#[derive(Default)]
-struct ReportAccumulator {
-    examples: usize,
-    optimizer_steps: usize,
-    loss_sum: f64,
-    metrics: BTreeMap<String, f64>,
-}
-
-impl ReportAccumulator {
-    fn add_metric(&mut self, name: &str, value: f64) {
-        *self.metrics.entry(name.to_owned()).or_default() += value;
-    }
-
-    fn finish(
-        mut self,
-        phase: &PhaseV2,
-        algorithm: &str,
-        trainable_model_identity: String,
-        frozen_model_identity: Option<String>,
-    ) -> Result<PostTrainingPhaseReport> {
-        ensure!(
-            self.examples > 0 && self.optimizer_steps > 0,
-            "post-training phase `{}` produced no optimizer steps",
-            phase.name
-        );
-        for value in self.metrics.values_mut() {
-            *value /= self.examples as f64;
-        }
-        Ok(PostTrainingPhaseReport {
-            phase: phase.name.clone(),
-            algorithm: algorithm.to_owned(),
-            examples: self.examples,
-            optimizer_steps: self.optimizer_steps,
-            trainable_model_identity,
-            frozen_model_identity,
-            mean_loss: self.loss_sum / self.examples as f64,
-            metrics: self.metrics,
-        })
-    }
-}
-
-/// Execute a complete preference, distillation, or verifiable-RL phase with
-/// injected model adapters. Epochs, optimizer geometry, step caps, loss
-/// weight, and learning-rate scale are honored. Unsupported hooks and raw
-/// parameters are rejected rather than ignored.
-pub fn execute_post_training_phase(
-    phase: &PhaseV2,
-    adapters: PostTrainingPhaseAdapters<'_>,
-) -> Result<PostTrainingPhaseReport> {
-    let task = phase
-        .task
-        .as_ref()
-        .with_context(|| format!("post-training phase `{}` has no task", phase.name))?;
-    let data = phase
-        .data
-        .as_deref()
-        .with_context(|| format!("post-training phase `{}` has no data", phase.name))?;
-    let sequence_length = phase.sequence_length.with_context(|| {
-        format!(
-            "post-training phase `{}` has no sequence_length",
-            phase.name
-        )
-    })?;
-    let update_examples = phase
-        .batch_size
-        .with_context(|| format!("post-training phase `{}` has no batch_size", phase.name))?
-        .checked_mul(phase.gradient_accumulation.with_context(|| {
-            format!(
-                "post-training phase `{}` has no gradient_accumulation",
-                phase.name
-            )
-        })?)
-        .context("post-training optimizer example count overflows usize")?;
-    ensure!(
-        update_examples > 0,
-        "post-training optimizer batch is empty"
-    );
-    ensure!(
-        phase.shuffle_buffer.is_none(),
-        "post-training phase `{}` requests shuffle_buffer, but this deterministic executor requires an injected ordering adapter",
-        phase.name
-    );
-    ensure!(
-        phase.periodic_sleep.is_none(),
-        "post-training phase `{}` has periodic_sleep; WorkflowV2 orchestration must own the sleep boundary",
-        phase.name
-    );
-    ensure!(
-        phase.parameters.is_empty(),
-        "post-training phase `{}` has unconsumed raw parameters; move algorithm settings into `post_training`",
-        phase.name
-    );
-    task.validate()?;
-    let config = phase.post_training.as_ref().with_context(|| {
-        format!(
-            "post-training phase `{}` has no typed post_training settings",
-            phase.name
-        )
-    })?;
-    config.validate()?;
-    if let PostTrainingConfig::Grpo { sampling, .. } = config {
-        ensure!(
-            sampling.max_new_tokens <= sequence_length,
-            "post-training phase `{}` GRPO max_new_tokens exceeds sequence_length",
-            phase.name
-        );
-    }
-
-    match (phase.kind, config, adapters) {
-        (
-            PhaseKind::Preference,
-            PostTrainingConfig::Dpo {
-                reference: reference_spec,
-                beta,
-                label_smoothing,
-                sequence_reduction,
-            },
-            PostTrainingPhaseAdapters::Dpo { policy, reference },
-        ) => execute_dpo_phase(
-            phase,
-            task,
-            data,
-            sequence_length,
-            update_examples,
-            reference_spec,
-            *beta,
-            *label_smoothing,
-            *sequence_reduction,
-            policy,
-            reference,
-        ),
-        (
-            PhaseKind::Distillation,
-            PostTrainingConfig::ForwardKl {
-                teacher: teacher_spec,
-                temperature,
-                scale_by_temperature_squared,
-            },
-            PostTrainingPhaseAdapters::ForwardKl { policy, teacher },
-        ) => execute_distillation_phase(
-            phase,
-            task,
-            data,
-            sequence_length,
-            update_examples,
-            teacher_spec,
-            *temperature,
-            *scale_by_temperature_squared,
-            policy,
-            teacher,
-        ),
-        (
-            PhaseKind::Rl,
-            PostTrainingConfig::Grpo {
-                group_size,
-                clip_epsilon,
-                advantage_epsilon,
-                kl_coefficient,
-                reference: reference_spec,
-                sampling,
-            },
-            PostTrainingPhaseAdapters::Grpo {
-                policy,
-                reference,
-                verifier,
-            },
-        ) => execute_grpo_phase(
-            phase,
-            task,
-            data,
-            sequence_length,
-            update_examples,
-            *group_size,
-            *clip_epsilon,
-            *advantage_epsilon,
-            *kl_coefficient,
-            reference_spec.as_ref(),
-            sampling,
-            policy,
-            reference,
-            verifier,
-        ),
-        (kind, config, _) => bail!(
-            "post-training phase `{}` type `{}` / algorithm `{}` / adapter set do not match",
-            phase.name,
-            kind.name(),
-            post_training_algorithm_name(config)
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_dpo_phase(
-    phase: &PhaseV2,
-    task: &TaskConfig,
-    data: &Path,
-    sequence_length: usize,
-    update_examples: usize,
-    reference_spec: &FrozenModelSpec,
-    beta: f64,
-    label_smoothing: f64,
-    reduction: SequenceReduction,
-    policy: &mut dyn PreferencePolicy,
-    reference: &mut dyn SequenceLogProbabilityProvider,
-) -> Result<PostTrainingPhaseReport> {
-    validate_frozen_provider(
-        reference_spec,
-        reference.identity(),
-        reference.tokenizer_identity(),
-        policy.tokenizer_identity(),
-    )?;
-    let policy_identity = policy.identity().to_owned();
-    let frozen_identity = reference.identity().to_owned();
-    let mut report = ReportAccumulator::default();
-    let mut pending = Vec::with_capacity(update_examples);
-    let max_steps = phase.steps.unwrap_or(usize::MAX);
-    for _ in 0..phase.epochs_or_default() {
-        if report.optimizer_steps >= max_steps {
-            break;
-        }
-        visit_task_examples_while(data, task, |example| {
-            pending.push(example);
-            if pending.len() == update_examples {
-                process_dpo_update(
-                    &mut pending,
-                    sequence_length,
-                    beta,
-                    label_smoothing,
-                    reduction,
-                    phase.loss_weight_or_default(),
-                    phase.learning_rate_scale_or_default(),
-                    policy,
-                    reference,
-                    &mut report,
-                )?;
-            }
-            Ok(report.optimizer_steps < max_steps)
-        })?;
-    }
-    if !pending.is_empty() && report.optimizer_steps < max_steps {
-        process_dpo_update(
-            &mut pending,
-            sequence_length,
-            beta,
-            label_smoothing,
-            reduction,
-            phase.loss_weight_or_default(),
-            phase.learning_rate_scale_or_default(),
-            policy,
-            reference,
-            &mut report,
-        )?;
-    }
-    report.finish(phase, "dpo", policy_identity, Some(frozen_identity))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_dpo_update(
-    pending: &mut Vec<TaskExample>,
-    sequence_length: usize,
-    beta: f64,
-    label_smoothing: f64,
-    reduction: SequenceReduction,
-    loss_weight: f64,
-    learning_rate_scale: f64,
-    policy: &mut dyn PreferencePolicy,
-    reference: &mut dyn SequenceLogProbabilityProvider,
-    report: &mut ReportAccumulator,
-) -> Result<()> {
-    let batch_scale = loss_weight / pending.len() as f64;
-    for example in pending.iter() {
-        let TaskExample::PairwisePreference {
-            prompt,
-            chosen,
-            rejected,
-        } = example
-        else {
-            bail!("DPO executor received a non-pairwise task example");
-        };
-        let policy_chosen = policy.continuation_log_probs(prompt, chosen, sequence_length)?;
-        let policy_rejected = policy.continuation_log_probs(prompt, rejected, sequence_length)?;
-        let reference_chosen = reference.continuation_log_probs(prompt, chosen, sequence_length)?;
-        let reference_rejected =
-            reference.continuation_log_probs(prompt, rejected, sequence_length)?;
-        let objective = dpo_loss(
-            PairwiseLogProbabilities {
-                policy_chosen: reduce_sequence_log_probs(&policy_chosen, reduction)?,
-                policy_rejected: reduce_sequence_log_probs(&policy_rejected, reduction)?,
-                reference_chosen: reduce_sequence_log_probs(&reference_chosen, reduction)?,
-                reference_rejected: reduce_sequence_log_probs(&reference_rejected, reduction)?,
-            },
-            beta,
-            label_smoothing,
-        )?;
-        let chosen_gradient = distribute_sequence_gradient(
-            objective.d_policy_chosen * batch_scale,
-            policy_chosen.len(),
-            reduction,
-        );
-        let rejected_gradient = distribute_sequence_gradient(
-            objective.d_policy_rejected * batch_scale,
-            policy_rejected.len(),
-            reduction,
-        );
-        policy.backward_pairwise_log_probs(example, &chosen_gradient, &rejected_gradient)?;
-        report.loss_sum += objective.loss;
-        report.add_metric(
-            "preference_accuracy",
-            f64::from(objective.preference_correct),
-        );
-        report.add_metric("implicit_reward_margin", objective.implicit_reward_margin);
-        report.examples += 1;
-    }
-    policy.optimizer_step(learning_rate_scale)?;
-    report.optimizer_steps += 1;
-    pending.clear();
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_distillation_phase(
-    phase: &PhaseV2,
-    task: &TaskConfig,
-    data: &Path,
-    sequence_length: usize,
-    update_examples: usize,
-    teacher_spec: &FrozenModelSpec,
-    temperature: f64,
-    scale_by_temperature_squared: bool,
-    policy: &mut dyn DistillationPolicy,
-    teacher: &mut dyn TeacherDistributionProvider,
-) -> Result<PostTrainingPhaseReport> {
-    validate_frozen_provider(
-        teacher_spec,
-        teacher.identity(),
-        teacher.tokenizer_identity(),
-        policy.tokenizer_identity(),
-    )?;
-    let policy_identity = policy.identity().to_owned();
-    let frozen_identity = teacher.identity().to_owned();
-    let mut report = ReportAccumulator::default();
-    let mut pending = Vec::with_capacity(update_examples);
-    let max_steps = phase.steps.unwrap_or(usize::MAX);
-    for _ in 0..phase.epochs_or_default() {
-        if report.optimizer_steps >= max_steps {
-            break;
-        }
-        visit_task_examples_while(data, task, |example| {
-            pending.push(example);
-            if pending.len() == update_examples {
-                process_distillation_update(
-                    &mut pending,
-                    sequence_length,
-                    temperature,
-                    scale_by_temperature_squared,
-                    phase.loss_weight_or_default(),
-                    phase.learning_rate_scale_or_default(),
-                    policy,
-                    teacher,
-                    &mut report,
-                )?;
-            }
-            Ok(report.optimizer_steps < max_steps)
-        })?;
-    }
-    if !pending.is_empty() && report.optimizer_steps < max_steps {
-        process_distillation_update(
-            &mut pending,
-            sequence_length,
-            temperature,
-            scale_by_temperature_squared,
-            phase.loss_weight_or_default(),
-            phase.learning_rate_scale_or_default(),
-            policy,
-            teacher,
-            &mut report,
-        )?;
-    }
-    report.finish(phase, "forward_kl", policy_identity, Some(frozen_identity))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_distillation_update(
-    pending: &mut Vec<TaskExample>,
-    sequence_length: usize,
-    temperature: f64,
-    scale_by_temperature_squared: bool,
-    loss_weight: f64,
-    learning_rate_scale: f64,
-    policy: &mut dyn DistillationPolicy,
-    teacher: &mut dyn TeacherDistributionProvider,
-    report: &mut ReportAccumulator,
-) -> Result<()> {
-    let batch_scale = loss_weight / pending.len() as f64;
-    for example in pending.iter() {
-        let teacher_logits = teacher.token_logits(example, sequence_length)?;
-        let student_logits = policy.student_token_logits(example, sequence_length)?;
-        ensure!(
-            teacher_logits.len() == student_logits.len(),
-            "teacher/student target-token row counts differ"
-        );
-        let tokens: Vec<_> = teacher_logits
-            .iter()
-            .zip(&student_logits)
-            .map(|(teacher_logits, student_logits)| DistillationToken {
-                teacher_logits,
-                student_logits,
-                weight: 1.0,
-            })
-            .collect();
-        let objective =
-            forward_kl_distillation(&tokens, temperature, scale_by_temperature_squared)?;
-        let mut gradients = objective.student_gradients;
-        for row in &mut gradients {
-            for value in row {
-                *value *= batch_scale;
-            }
-        }
-        policy.backward_student_logits(example, &gradients)?;
-        report.loss_sum += objective.loss;
-        report.add_metric("forward_kl", objective.mean_forward_kl);
-        report.add_metric("teacher_entropy", objective.teacher_entropy);
-        report.add_metric("top1_agreement", objective.top1_agreement);
-        report.examples += 1;
-    }
-    policy.optimizer_step(learning_rate_scale)?;
-    report.optimizer_steps += 1;
-    pending.clear();
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_grpo_phase(
-    phase: &PhaseV2,
-    task: &TaskConfig,
-    data: &Path,
-    sequence_length: usize,
-    update_examples: usize,
-    group_size: usize,
-    clip_epsilon: f64,
-    advantage_epsilon: f64,
-    kl_coefficient: f64,
-    reference_spec: Option<&FrozenModelSpec>,
-    sampling: &RolloutSampling,
-    policy: &mut dyn GrpoPolicy,
-    mut reference: Option<&mut dyn AlignedReferencePolicy>,
-    verifier: &dyn RewardVerifier,
-) -> Result<PostTrainingPhaseReport> {
-    match (reference_spec, reference.as_deref()) {
-        (Some(spec), Some(provider)) => validate_frozen_provider(
-            spec,
-            provider.identity(),
-            provider.tokenizer_identity(),
-            policy.tokenizer_identity(),
-        )?,
-        (Some(_), None) => bail!("GRPO phase requires its configured frozen reference adapter"),
-        (None, Some(_)) => bail!("GRPO adapter set supplied an unconfigured frozen reference"),
-        (None, None) => ensure!(
-            kl_coefficient == 0.0,
-            "GRPO without a frozen reference requires zero kl_coefficient"
-        ),
-    }
-    let policy_identity = policy.identity().to_owned();
-    let frozen_identity = reference
-        .as_deref()
-        .map(|provider| provider.identity().to_owned());
-    let mut report = ReportAccumulator::default();
-    let mut pending = Vec::with_capacity(update_examples);
-    let max_steps = phase.steps.unwrap_or(usize::MAX);
-    for _ in 0..phase.epochs_or_default() {
-        if report.optimizer_steps >= max_steps {
-            break;
-        }
-        visit_task_examples_while(data, task, |example| {
-            pending.push(example);
-            if pending.len() == update_examples {
-                process_grpo_update(
-                    &mut pending,
-                    task,
-                    sequence_length,
-                    group_size,
-                    clip_epsilon,
-                    advantage_epsilon,
-                    kl_coefficient,
-                    sampling,
-                    phase.loss_weight_or_default(),
-                    phase.learning_rate_scale_or_default(),
-                    policy,
-                    &mut reference,
-                    verifier,
-                    &mut report,
-                )?;
-            }
-            Ok(report.optimizer_steps < max_steps)
-        })?;
-    }
-    if !pending.is_empty() && report.optimizer_steps < max_steps {
-        process_grpo_update(
-            &mut pending,
-            task,
-            sequence_length,
-            group_size,
-            clip_epsilon,
-            advantage_epsilon,
-            kl_coefficient,
-            sampling,
-            phase.loss_weight_or_default(),
-            phase.learning_rate_scale_or_default(),
-            policy,
-            &mut reference,
-            verifier,
-            &mut report,
-        )?;
-    }
-    report.finish(phase, "grpo", policy_identity, frozen_identity)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_grpo_update(
-    pending: &mut Vec<TaskExample>,
-    task: &TaskConfig,
-    sequence_length: usize,
-    group_size: usize,
-    clip_epsilon: f64,
-    advantage_epsilon: f64,
-    kl_coefficient: f64,
-    sampling: &RolloutSampling,
-    loss_weight: f64,
-    learning_rate_scale: f64,
-    policy: &mut dyn GrpoPolicy,
-    reference: &mut Option<&mut dyn AlignedReferencePolicy>,
-    verifier: &dyn RewardVerifier,
-    report: &mut ReportAccumulator,
-) -> Result<()> {
-    let batch_scale = loss_weight / pending.len() as f64;
-    for example in pending.iter() {
-        let TaskExample::VerifiableRollout { prompt, .. } = example else {
-            bail!("GRPO executor received a non-verifiable task example");
-        };
-        let generated = policy.generate(RolloutRequest {
-            prompt,
-            count: group_size,
-            max_sequence_tokens: sequence_length,
-            sampling,
-            rng_seed: 0,
-            rng_counter: u64::try_from(report.examples)
-                .context("GRPO example count exceeds u64")?
-                .checked_mul(u64::try_from(group_size).context("GRPO group size exceeds u64")?)
-                .context("GRPO compatibility RNG counter overflows u64")?,
-        })?;
-        ensure!(
-            generated.len() == group_size,
-            "rollout generator returned {} candidates, expected {group_size}",
-            generated.len()
-        );
-        let mut rewards = Vec::with_capacity(group_size);
-        let mut current_scores = Vec::with_capacity(group_size);
-        let mut reference_scores = Vec::with_capacity(group_size);
-        for (index, rollout) in generated.iter().enumerate() {
-            ensure!(
-                !rollout.text.trim().is_empty(),
-                "rollout {index} completion is empty"
-            );
-            ensure!(
-                !rollout.token_ids.is_empty()
-                    && rollout.token_ids.len() == rollout.behavior_token_log_probs.len(),
-                "rollout {index} token ids and behavior log-probs are not aligned"
-            );
-            ensure_finite(
-                &rollout.behavior_token_log_probs,
-                "rollout behavior log probabilities",
-            )?;
-            rewards.push(verify_rollout(task, example, verifier, &rollout.text)?.reward);
-            current_scores.push(policy.current_token_log_probs(
-                prompt,
-                rollout,
-                sequence_length,
-            )?);
-            reference_scores.push(match reference.as_deref_mut() {
-                Some(reference) => {
-                    Some(reference.rollout_token_log_probs(prompt, rollout, sequence_length)?)
-                }
-                None => None,
-            });
-        }
-        let scalar_rollouts: Vec<_> = generated
-            .iter()
-            .enumerate()
-            .map(|(index, rollout)| GrpoRollout {
-                reward: rewards[index],
-                current_token_log_probs: &current_scores[index],
-                behavior_token_log_probs: &rollout.behavior_token_log_probs,
-                reference_token_log_probs: reference_scores[index].as_deref(),
-            })
-            .collect();
-        let objective = grpo_loss(
-            &scalar_rollouts,
-            clip_epsilon,
-            advantage_epsilon,
-            kl_coefficient,
-        )?;
-        for (index, rollout) in generated.iter().enumerate() {
-            let gradients: Vec<f64> = objective.current_log_prob_gradients[index]
-                .iter()
-                .map(|gradient| gradient * batch_scale)
-                .collect();
-            policy.backward_rollout_log_probs(prompt, rollout, &gradients)?;
-        }
-        report.loss_sum += objective.loss;
-        report.add_metric("mean_reward", objective.mean_reward);
-        report.add_metric("reward_stddev", objective.reward_stddev);
-        report.add_metric("mean_kl", objective.mean_kl);
-        report.add_metric("clipped_fraction", objective.clipped_fraction);
-        report.examples += 1;
-    }
-    policy.optimizer_step(learning_rate_scale)?;
-    report.optimizer_steps += 1;
-    pending.clear();
-    Ok(())
-}
-
 fn validate_frozen_provider(
     spec: &FrozenModelSpec,
     provider_identity: &str,
@@ -1769,6 +1227,26 @@ impl PostTrainingClockReceipt {
             UpdateClock::ModelTokens => self.model_tokens,
         }
     }
+}
+
+fn validate_periodic_sleep_clock_window(
+    config: &InModelSleepConfig,
+    before: &PostTrainingClockReceipt,
+    after: PostTrainingClockValues,
+) -> Result<()> {
+    config.schedule.validate()?;
+    let start = before.selected(config.schedule.clock);
+    let end = after.selected(config.schedule.clock);
+    ensure!(end >= start, "periodic sleep clock cannot move backwards");
+    for tier in &config.schedule.tiers {
+        let crossed = end / tier.update_period - start / tier.update_period;
+        ensure!(
+            crossed <= 1,
+            "periodic sleep clock advance from {start} to {end} crosses {crossed} `{}` boundaries; one tier gradient accumulator cannot supply multiple updates, so reduce the per-update token budget or increase its update_period",
+            tier.id,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1997,6 +1475,15 @@ pub struct PreparedPostTrainingUpdate {
 pub struct PostTrainingClockValues {
     pub optimizer_steps: u64,
     pub model_tokens: u64,
+}
+
+impl PostTrainingClockValues {
+    fn selected(self, clock: UpdateClock) -> u64 {
+        match clock {
+            UpdateClock::OptimizerSteps => self.optimizer_steps,
+            UpdateClock::ModelTokens => self.model_tokens,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2481,6 +1968,11 @@ impl<R: NativePostTrainingSleepRuntime> PostTrainingBoundaryHook
                 && request.clock_after.model_tokens > request.clock_before.model_tokens,
             "post-training sleep target clock does not advance exactly one optimizer update"
         );
+        validate_periodic_sleep_clock_window(
+            request.config,
+            request.clock_before,
+            request.clock_after,
+        )?;
 
         let resumed = resume.is_some();
         let mut checkpoint = match resume {
@@ -2507,21 +1999,14 @@ impl<R: NativePostTrainingSleepRuntime> PostTrainingBoundaryHook
             );
         }
         ensure!(
-            checkpoint.sleep.clock
-                <= match request.config.schedule.clock {
-                    UpdateClock::OptimizerSteps => request.clock_after.optimizer_steps,
-                    UpdateClock::ModelTokens => request.clock_after.model_tokens,
-                },
+            checkpoint.sleep.clock <= request.clock_after.selected(request.config.schedule.clock),
             "resumed post-training sleep cursor is ahead of its target clock"
         );
 
         let state = self
             .runtime
             .advance_and_drain(request, &mut checkpoint, progress)?;
-        let target = match request.config.schedule.clock {
-            UpdateClock::OptimizerSteps => request.clock_after.optimizer_steps,
-            UpdateClock::ModelTokens => request.clock_after.model_tokens,
-        };
+        let target = request.clock_after.selected(request.config.schedule.clock);
         ensure!(
             checkpoint.sleep.clock == target
                 && checkpoint.sleep.phase == SleepPhase::Wake
@@ -2987,11 +2472,7 @@ impl PostTrainingBoundaryInFlight {
             native.sleep.validate_resume()?;
             ensure!(
                 native.sleep.clock >= before.selected(config.schedule.clock)
-                    && native.sleep.clock
-                        <= match config.schedule.clock {
-                            UpdateClock::OptimizerSteps => after.optimizer_steps,
-                            UpdateClock::ModelTokens => after.model_tokens,
-                        },
+                    && native.sleep.clock <= after.selected(config.schedule.clock),
                 "in-flight native sleep cursor is outside its clock interval"
             );
         }
@@ -3347,6 +2828,18 @@ pub fn drive_resumable_post_training_phase(
             cursor.clock.clone(),
             prepared_computation.summary,
         )?;
+        if let Some(config) = phase.periodic_sleep.as_ref() {
+            validate_periodic_sleep_clock_window(
+                config,
+                expected
+                    .clock_before
+                    .as_ref()
+                    .context("periodic update has no starting clock")?,
+                expected
+                    .clock_after
+                    .context("periodic update has no target clock")?,
+            )?;
+        }
         match &cursor.pending {
             Some(saved) => ensure!(
                 saved == &expected,
@@ -4880,6 +4373,158 @@ mod tests {
     }
 
     #[test]
+    fn grpo_tensor_rejects_fractional_and_empty_masks() {
+        let device = Device::ndarray();
+        for (mask, expected) in [
+            ([[1.0, 0.5], [1.0, 0.0]], "binary zero/one"),
+            ([[1.0, 0.0], [0.0, 0.0]], "at least one active token"),
+        ] {
+            let error = grpo_loss_tensor(
+                Tensor::<1>::from_floats([1.0, 0.0], &device),
+                Tensor::<2>::from_floats([[0.0, 0.0], [0.0, 0.0]], &device),
+                Tensor::<2>::from_floats([[0.0, 0.0], [0.0, 0.0]], &device),
+                None,
+                Tensor::<2>::from_floats(mask, &device),
+                0.2,
+                1e-6,
+                0.0,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn grpo_tensor_rejects_non_finite_and_unsafe_exponent_inputs() {
+        let device = Device::ndarray();
+        let error = grpo_loss_tensor(
+            Tensor::<1>::from_floats([1.0, 0.0], &device),
+            Tensor::<2>::from_floats([[f32::NAN], [0.0]], &device),
+            Tensor::<2>::from_floats([[0.0], [0.0]], &device),
+            None,
+            Tensor::<2>::from_floats([[1.0], [1.0]], &device),
+            0.2,
+            1e-6,
+            0.0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("current log probabilities"), "{error}");
+
+        let error = grpo_loss_tensor(
+            Tensor::<1>::from_floats([1.0, 0.0], &device),
+            Tensor::<2>::from_floats([[81.0], [0.0]], &device),
+            Tensor::<2>::from_floats([[0.0], [0.0]], &device),
+            None,
+            Tensor::<2>::from_floats([[1.0], [1.0]], &device),
+            0.2,
+            1e-6,
+            0.0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("importance log-ratio"), "{error}");
+
+        let error = grpo_loss_tensor(
+            Tensor::<1>::from_floats([1.0, 0.0], &device),
+            Tensor::<2>::from_floats([[0.0], [0.0]], &device),
+            Tensor::<2>::from_floats([[0.0], [0.0]], &device),
+            Some(Tensor::<2>::from_floats([[81.0], [0.0]], &device)),
+            Tensor::<2>::from_floats([[1.0], [1.0]], &device),
+            0.2,
+            1e-6,
+            0.1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("reference log-ratio"), "{error}");
+    }
+
+    #[test]
+    fn grpo_tensor_rejects_finite_inputs_that_overflow_the_objective() {
+        let device = Device::ndarray();
+        let error = grpo_loss_tensor(
+            Tensor::<1>::from_floats([1.0, 0.0], &device),
+            Tensor::<2>::from_floats([[-80.0], [-80.0]], &device),
+            Tensor::<2>::from_floats([[-80.0], [-80.0]], &device),
+            Some(Tensor::<2>::from_floats([[0.0], [0.0]], &device)),
+            Tensor::<2>::from_floats([[1.0], [1.0]], &device),
+            0.2,
+            1e-6,
+            1.0e10,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("tensor objective overflowed"), "{error}");
+    }
+
+    #[test]
+    fn grpo_scalar_rejects_finite_inputs_that_overflow_derived_values() {
+        let zero = [0.0];
+        let reward_overflow = [
+            GrpoRollout {
+                reward: f64::MAX,
+                current_token_log_probs: &zero,
+                behavior_token_log_probs: &zero,
+                reference_token_log_probs: None,
+            },
+            GrpoRollout {
+                reward: -f64::MAX,
+                current_token_log_probs: &zero,
+                behavior_token_log_probs: &zero,
+                reference_token_log_probs: None,
+            },
+        ];
+        let error = grpo_loss(&reward_overflow, 0.2, 1e-6, 0.0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reward normalization overflowed"), "{error}");
+
+        let current = [-f64::MAX];
+        let behavior = [f64::MAX];
+        let unsafe_ratio = [
+            GrpoRollout {
+                reward: 1.0,
+                current_token_log_probs: &current,
+                behavior_token_log_probs: &behavior,
+                reference_token_log_probs: None,
+            },
+            GrpoRollout {
+                reward: 0.0,
+                current_token_log_probs: &zero,
+                behavior_token_log_probs: &zero,
+                reference_token_log_probs: None,
+            },
+        ];
+        let error = grpo_loss(&unsafe_ratio, 0.2, 1e-6, 0.0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsafe importance ratio"), "{error}");
+
+        let low = [-80.0];
+        let reference = [0.0];
+        let objective_overflow = [
+            GrpoRollout {
+                reward: 1.0,
+                current_token_log_probs: &low,
+                behavior_token_log_probs: &low,
+                reference_token_log_probs: Some(&reference),
+            },
+            GrpoRollout {
+                reward: 0.0,
+                current_token_log_probs: &low,
+                behavior_token_log_probs: &low,
+                reference_token_log_probs: Some(&reference),
+            },
+        ];
+        let error = grpo_loss(&objective_overflow, 0.2, 1e-6, f64::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GRPO objective overflowed"), "{error}");
+    }
+
+    #[test]
     fn grpo_rejects_missing_reference_instead_of_dropping_kl() {
         let values = [0.0];
         let error = grpo_loss(
@@ -5077,63 +4722,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn typed_dpo_phase_executor_runs_records_and_optimizer_geometry() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join("reference.safetensors");
-        std::fs::write(&artifact, b"abc").unwrap();
-        let data = dir.path().join("preference.jsonl");
-        std::fs::write(
-            &data,
-            concat!(
-                "{\"prompt\":\"p1\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n",
-                "{\"prompt\":\"p2\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n"
-            ),
-        )
-        .unwrap();
-        let phase: PhaseV2 = serde_json::from_value(json!({
-            "name": "preference",
-            "type": "preference",
-            "task": {"type": "pairwise_preference"},
-            "data": data,
-            "sequence_length": 128,
-            "batch_size": 1,
-            "gradient_accumulation": 2,
-            "steps": 1,
-            "learning_rate_scale": 0.5,
-            "post_training": {
-                "algorithm": "dpo",
-                "reference": {
-                    "adapter": "test",
-                    "artifact": artifact,
-                    "sha256": ABC_SHA256
-                }
-            }
-        }))
-        .unwrap();
-        let mut policy = TestSequencePolicy {
-            identity: "candidate:one".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut reference = TestReference;
-        let report = execute_post_training_phase(
-            &phase,
-            PostTrainingPhaseAdapters::Dpo {
-                policy: &mut policy,
-                reference: &mut reference,
-            },
-        )
-        .unwrap();
-        assert_eq!(report.algorithm, "dpo");
-        assert_eq!(report.examples, 2);
-        assert_eq!(report.optimizer_steps, 1);
-        assert_eq!(policy.backward_calls, 2);
-        assert_eq!(policy.optimizer_steps, 1);
-        close(report.metrics["preference_accuracy"], 1.0);
-    }
-
     struct TestStudent {
         gradients: Vec<Vec<Vec<f64>>>,
         optimizer_steps: usize,
@@ -5196,53 +4784,6 @@ mod tests {
         ) -> Result<Vec<Vec<f64>>> {
             Ok(vec![vec![3.0_f64.ln(), 0.0]])
         }
-    }
-
-    #[test]
-    fn typed_distillation_phase_executor_applies_teacher_kl_gradients() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join("teacher.safetensors");
-        std::fs::write(&artifact, b"abc").unwrap();
-        let data = dir.path().join("distill.txt");
-        std::fs::write(&data, "student input\n").unwrap();
-        let phase: PhaseV2 = serde_json::from_value(json!({
-            "name": "distill",
-            "type": "distillation",
-            "task": {"type": "causal_lm"},
-            "data": data,
-            "sequence_length": 128,
-            "batch_size": 1,
-            "gradient_accumulation": 1,
-            "steps": 1,
-            "post_training": {
-                "algorithm": "forward_kl",
-                "teacher": {
-                    "adapter": "test",
-                    "artifact": artifact,
-                    "sha256": ABC_SHA256
-                }
-            }
-        }))
-        .unwrap();
-        let mut policy = TestStudent {
-            gradients: Vec::new(),
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut teacher = TestTeacher;
-        let report = execute_post_training_phase(
-            &phase,
-            PostTrainingPhaseAdapters::ForwardKl {
-                policy: &mut policy,
-                teacher: &mut teacher,
-            },
-        )
-        .unwrap();
-        assert_eq!(report.examples, 1);
-        assert_eq!(policy.optimizer_steps, 1);
-        close(policy.gradients[0][0][0], -0.25);
-        close(policy.gradients[0][0][1], 0.25);
-        assert!(report.metrics["forward_kl"] > 0.0);
     }
 
     struct TestGrpoPolicy {
@@ -5313,57 +4854,6 @@ mod tests {
             self.optimizer_steps += 1;
             Ok(())
         }
-    }
-
-    #[test]
-    fn typed_grpo_phase_executor_generates_verifies_and_backpropagates() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("rl.jsonl");
-        std::fs::write(
-            &data,
-            "{\"prompt\":\"answer\",\"verifier_payload\":{},\"reference_answer\":\"ok\"}\n",
-        )
-        .unwrap();
-        let phase: PhaseV2 = serde_json::from_value(json!({
-            "name": "rl",
-            "type": "rl",
-            "task": {
-                "type": "verifiable_rl",
-                "verifier": {"adapter": "exact_answer"}
-            },
-            "data": data,
-            "sequence_length": 128,
-            "batch_size": 1,
-            "gradient_accumulation": 1,
-            "steps": 1,
-            "post_training": {
-                "algorithm": "grpo",
-                "group_size": 2,
-                "kl_coefficient": 0.0,
-                "sampling": {"max_new_tokens": 32}
-            }
-        }))
-        .unwrap();
-        let mut policy = TestGrpoPolicy {
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let report = execute_post_training_phase(
-            &phase,
-            PostTrainingPhaseAdapters::Grpo {
-                policy: &mut policy,
-                reference: None,
-                verifier: &ExactAnswerVerifier,
-            },
-        )
-        .unwrap();
-        assert_eq!(report.examples, 1);
-        assert_eq!(report.optimizer_steps, 1);
-        assert_eq!(policy.backward_calls, 2);
-        assert_eq!(policy.optimizer_steps, 1);
-        close(report.metrics["mean_reward"], 0.5);
-        close(report.mean_loss, 0.0);
     }
 
     #[test]
@@ -5652,10 +5142,7 @@ mod tests {
                 Some(cursor) => cursor,
                 None => test_native_sleep_cursor(request)?,
             };
-            let target = match request.config.schedule.clock {
-                UpdateClock::OptimizerSteps => request.clock_after.optimizer_steps,
-                UpdateClock::ModelTokens => request.clock_after.model_tokens,
-            };
+            let target = request.clock_after.selected(request.config.schedule.clock);
             if cursor.sleep.clock < target {
                 cursor
                     .sleep
@@ -5731,10 +5218,7 @@ mod tests {
             checkpoint: &mut NativeSleepCheckpoint,
             progress: &mut dyn NativeSleepProgressSink,
         ) -> Result<PostTrainingCommittedState> {
-            let target = match request.config.schedule.clock {
-                UpdateClock::OptimizerSteps => request.clock_after.optimizer_steps,
-                UpdateClock::ModelTokens => request.clock_after.model_tokens,
-            };
+            let target = request.clock_after.selected(request.config.schedule.clock);
             if checkpoint.sleep.clock < target {
                 checkpoint
                     .sleep
@@ -6358,7 +5842,7 @@ mod tests {
     }
 
     #[test]
-    fn model_token_jump_drains_every_crossed_boundary_fastest_to_slowest() {
+    fn model_token_jump_rejects_before_publishing_one_update_for_multiple_boundaries() {
         let (_dir, mut request) = test_request(TestPostTrainingAlgorithm::Grpo);
         request.phase.steps = Some(1);
         install_periodic_sleep(&mut request);
@@ -6399,7 +5883,7 @@ mod tests {
             verifier: &ExactAnswerVerifier,
         };
         let mut hook: Option<&mut dyn PostTrainingBoundaryHook> = Some(&mut controller);
-        let outcome = drive_resumable_post_training_phase(
+        let error = drive_resumable_post_training_phase(
             &test_sha("coarse-model-token-workflow"),
             &request,
             &mut adapters,
@@ -6410,15 +5894,11 @@ mod tests {
             usize::MAX,
             &mut TestPhaseProgress::default(),
         )
-        .unwrap();
-        let ResumablePostTrainingOutcome::Complete { cursor, .. } = outcome else {
-            panic!("coarse model-token phase did not complete");
-        };
-        assert_eq!(cursor.clock.as_ref().unwrap().model_tokens, 4);
-        assert_eq!(
-            &*due.borrow(),
-            &[(1, 0), (2, 0), (2, 1), (3, 0), (4, 0), (4, 1), (4, 2),]
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("crosses 4 `fast` boundaries"), "{error}");
+        assert_eq!(policy.optimizer_steps, 0);
+        assert!(due.borrow().is_empty());
     }
 
     #[test]

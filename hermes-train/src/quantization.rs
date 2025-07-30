@@ -2633,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn transformer_qat_clone_keeps_parameter_ids_and_backpropagates() {
+    fn transformer_qat_clone_keeps_parameter_ids_and_supports_an_accumulation_window() {
         let device = Device::default().autodiff();
         let mut config = hermes_llm::get_builtin_model("hybrid-tiny").unwrap();
         config.vocab_size = 32;
@@ -2659,20 +2659,27 @@ mod tests {
         assert!(tensors > 0);
         assert_eq!(burn::module::list_param_ids(&staged), before);
 
-        let input = Tensor::<2, Int>::from_data([[1, 2, 3, 4]], &device);
-        let target = Tensor::<2, Int>::from_data([[2, 3, 4, 5]], &device);
-        let mut gradients = staged.forward_loss(input, target).backward();
-        let gradients = burn_optim::GradientsParams::from_module(&mut gradients, &staged);
-        assert!(!gradients.is_empty());
-        let missing_muon = master
-            .muon_parameter_ids()
-            .into_iter()
-            .filter(|id| gradients.get::<2>(*id).is_none())
-            .collect::<Vec<_>>();
-        assert!(
-            missing_muon.is_empty(),
-            "fake-quantized forward omitted Muon gradients: {missing_muon:?}"
-        );
+        // A staged leaf model is reused for every microbatch until the master
+        // update. Repeated backwards must keep producing gradients for the
+        // original parameter IDs; otherwise window-level staging would drop
+        // all but the first microbatch.
+        for offset in 0..2 {
+            let input =
+                Tensor::<2, Int>::from_data([[1 + offset, 2 + offset, 3 + offset, 4]], &device);
+            let target = Tensor::<2, Int>::from_data([[2 + offset, 3 + offset, 4, 5]], &device);
+            let mut gradients = staged.forward_loss(input, target).backward();
+            let gradients = burn_optim::GradientsParams::from_module(&mut gradients, &staged);
+            assert!(!gradients.is_empty());
+            let missing_muon = master
+                .muon_parameter_ids()
+                .into_iter()
+                .filter(|id| gradients.get::<2>(*id).is_none())
+                .collect::<Vec<_>>();
+            assert!(
+                missing_muon.is_empty(),
+                "fake-quantized forward omitted Muon gradients: {missing_muon:?}"
+            );
+        }
     }
 
     #[test]

@@ -2721,14 +2721,15 @@ mod tests {
     }
 
     #[test]
-    fn periodic_controller_drains_every_crossed_boundary_in_clock_and_tier_order() {
+    fn periodic_controller_rejects_coarse_clock_and_drains_split_boundaries_in_order() {
         let model = model();
         let (directory, mut checkpoint) = checkpoint(&model);
         let config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
         let mut driver = RollbackBoundaryDriver::default();
         let mut sink = CountingSink::default();
 
-        drain_periodic_sleep_before_wake_step(
+        let before = checkpoint.clone();
+        let error = drain_periodic_sleep_before_wake_step(
             &mut checkpoint,
             &model,
             &config,
@@ -2736,7 +2737,23 @@ mod tests {
             &mut driver,
             &mut sink,
         )
-        .unwrap();
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("one tier gradient accumulator"), "{error}");
+        assert_eq!(checkpoint, before);
+        assert!(driver.0.is_empty());
+
+        for clock in [100, 200, 300, 400] {
+            drain_periodic_sleep_before_wake_step(
+                &mut checkpoint,
+                &model,
+                &config,
+                clock,
+                &mut driver,
+                &mut sink,
+            )
+            .unwrap();
+        }
 
         assert_eq!(
             driver.0,

@@ -28,7 +28,8 @@ use hermes_train::device_sampler::{
 use hermes_train::metrics::{
     MetricContext, MetricEvent, MetricPhase, MetricPhaseKind, MetricWriter, OptimizationMetrics,
     PhaseBoundary, PhaseTimingMetrics, QuantizationFormat as MetricQuantizationFormat,
-    QuantizationMetrics, QuantizationStage, ThroughputMetrics,
+    QuantizationMetrics, QuantizationStage, ThroughputMetrics, validate_metric_prefix_for_run,
+    validate_metric_snapshot_for_run,
 };
 use hermes_train::native_sleep::{
     NativeSleepCheckpoint, NativeSleepContextRegistry, NativeSleepPhaseExecutor,
@@ -64,11 +65,13 @@ use checkpoint::{
     AdamWOptimizer, ArtifactRef, CheckpointPublication, OptimizerStateRef,
     QuantizationTrainingState, RngStreamState, TRAINING_STATE_VERSION, TrainingState,
     load_training_state, parameter_ids, save_training_checkpoint_with_evidence,
+    verify_checkpoint_generation, verify_checkpoint_root,
 };
 #[cfg(test)]
 use data::TrainingSample;
 use data::{
-    BatchStats, SampleStreamConfig, TrainingBatch, count_samples, make_batch, visit_samples,
+    BatchStats, SampleStreamConfig, TrainingBatch, count_samples, indexed_causal_sample_count,
+    make_batch, visit_samples,
 };
 use muon::BatchedMuon;
 use wake::{ObjectiveConfig, ResolvedWakePlan, load_wake_plan};
@@ -93,6 +96,8 @@ enum Command {
     Train(TrainArgs),
     /// Validate and resolve a strict WorkflowV2 file.
     ValidateWorkflow(ValidateWorkflowArgs),
+    /// Verify an exact-resume checkpoint with the trainer's strict schema.
+    VerifyCheckpoint(VerifyCheckpointArgs),
     /// Build an immutable corpus using configured search and record adapters.
     PrepareCorpus(PrepareCorpusArgs),
     /// Compose classified corpus rows into fixed, stratified curriculum stages.
@@ -192,6 +197,38 @@ struct ValidateWorkflowArgs {
     /// runtime, without creating or advancing runtime state.
     #[arg(long)]
     signature_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CheckpointVerificationFormat {
+    Json,
+    Tsv,
+}
+
+#[derive(clap::Args)]
+struct VerifyCheckpointArgs {
+    /// Checkpoint output root containing current.json and generations/.
+    #[arg(long, conflicts_with = "generation")]
+    root: Option<PathBuf>,
+    /// A materialized immutable generation directory.
+    #[arg(long, conflicts_with = "root")]
+    generation: Option<PathBuf>,
+    /// Content-addressed sha256-... generation name.
+    #[arg(long, requires = "generation")]
+    generation_name: Option<String>,
+    /// Lowercase SHA-256 of generation-manifest.json.
+    #[arg(long, requires = "generation")]
+    manifest_sha256: Option<String>,
+    /// Metric journal whose committed checkpoint prefix must be valid.
+    #[arg(long)]
+    metrics: Option<PathBuf>,
+    /// Require the metric file to end exactly at the committed prefix.
+    #[arg(long, requires = "metrics")]
+    exact_metrics: bool,
+    /// Stable output for automation. TSV fields are step, generation,
+    /// manifest digest, and committed metric records.
+    #[arg(long, value_enum, default_value_t = CheckpointVerificationFormat::Json)]
+    format: CheckpointVerificationFormat,
 }
 
 #[derive(clap::Args)]
@@ -560,23 +597,52 @@ struct PhasePlan {
     steps: usize,
 }
 
+fn planned_sample_count(
+    data: &Path,
+    objective: &ObjectiveConfig,
+    tokenizer: &Tokenizer,
+    sequence_length: usize,
+    token_cache: &Path,
+) -> Result<usize> {
+    if matches!(objective, ObjectiveConfig::CausalLm)
+        && let Some(samples) = indexed_causal_sample_count(token_cache, sequence_length)?
+    {
+        println!(
+            "token_cache={} indexed_samples={samples}",
+            token_cache.display()
+        );
+        return Ok(samples);
+    }
+    count_samples(
+        data,
+        objective,
+        tokenizer,
+        sequence_length,
+        Some(token_cache),
+    )
+}
+
 fn plan_training(
     workflow: &ResolvedWakePlan,
     tokenizer: &Tokenizer,
-    token_cache_root: &Path,
+    token_cache_paths: &[PathBuf],
 ) -> Result<(Vec<PhasePlan>, usize)> {
+    ensure!(
+        token_cache_paths.len() == workflow.phases.len(),
+        "every workflow phase must have one resolved token-cache path"
+    );
     let mut total_steps = 0usize;
     let mut plan = Vec::with_capacity(workflow.phases.len());
     for (phase_index, phase) in workflow.phases.iter().enumerate() {
         let (samples, steps) = match phase.steps {
             Some(steps) => (None, steps),
             None => {
-                let samples = count_samples(
+                let samples = planned_sample_count(
                     &phase.data,
                     &phase.objective,
                     tokenizer,
                     phase.sequence_length,
-                    Some(&token_cache_root.join(format!("phase-{phase_index:03}.tokens"))),
+                    &token_cache_paths[phase_index],
                 )?;
                 let steps_per_epoch =
                     (samples / phase.batch_size).div_euclid(phase.gradient_accumulation);
@@ -635,6 +701,26 @@ fn file_sha256(path: &Path) -> Result<String> {
 
 fn stable_cache_id(value: &str) -> String {
     format!("{:016x}", fnv1a64(value.as_bytes()))
+}
+
+#[derive(Serialize)]
+struct TokenCacheIdentity<'a> {
+    /// Bump whenever the document-token cache encoding or replay semantics
+    /// change. This prevents a new trainer from interpreting an old cache.
+    version: u32,
+    data: &'a str,
+    source: &'a Path,
+    tokenizer: &'a str,
+}
+
+fn token_cache_path(root: &Path, data: &str, source: &Path, tokenizer: &str) -> Result<PathBuf> {
+    let identity = serde_json::to_vec(&TokenCacheIdentity {
+        version: 1,
+        data,
+        source,
+        tokenizer,
+    })?;
+    Ok(root.join(format!("{:x}.tokens", Sha256::digest(identity))))
 }
 
 fn shuffle_seed(seed: u64, phase: usize, epoch: usize) -> u64 {
@@ -1139,6 +1225,66 @@ fn validate_workflow_command(args: ValidateWorkflowArgs) -> Result<()> {
     Ok(())
 }
 
+fn verify_checkpoint_command(args: VerifyCheckpointArgs) -> Result<()> {
+    let verified = match (
+        args.root,
+        args.generation,
+        args.generation_name,
+        args.manifest_sha256,
+    ) {
+        (Some(root), None, None, None) => verify_checkpoint_root(&root)?,
+        (None, Some(generation), Some(name), Some(manifest_sha256)) => {
+            verify_checkpoint_generation(&generation, &name, &manifest_sha256)?
+        }
+        (None, Some(_), _, _) => {
+            bail!("--generation requires both --generation-name and --manifest-sha256")
+        }
+        _ => bail!(
+            "provide either --root, or --generation with --generation-name and --manifest-sha256"
+        ),
+    };
+    if let Some(metrics) = args.metrics {
+        validate_checkpoint_metrics(&verified, metrics, args.exact_metrics)?;
+    }
+    match args.format {
+        CheckpointVerificationFormat::Json => {
+            println!("{}", serde_json::to_string(&verified)?);
+        }
+        CheckpointVerificationFormat::Tsv => println!(
+            "{}\t{}\t{}\t{}",
+            verified.global_step,
+            verified.generation,
+            verified.manifest_sha256,
+            verified.metric_records
+        ),
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_metrics(
+    verified: &checkpoint::VerifiedCheckpoint,
+    metrics: impl AsRef<Path>,
+    exact: bool,
+) -> Result<()> {
+    let expected_run_id = stable_cache_id(&verified.workflow_signature);
+    if exact {
+        validate_metric_snapshot_for_run(
+            metrics,
+            &expected_run_id,
+            verified.metric_records,
+            verified.global_step as u64,
+        )?;
+    } else {
+        validate_metric_prefix_for_run(
+            metrics,
+            &expected_run_id,
+            verified.metric_records,
+            verified.global_step as u64,
+        )?;
+    }
+    Ok(())
+}
+
 fn prepare_corpus_command(args: PrepareCorpusArgs) -> Result<()> {
     let recipe = SearchApiPostgresCorpusRecipe::load(&args.recipe)?;
     let tokenizer = Tokenizer::from_file(&args.tokenizer)?;
@@ -1326,6 +1472,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Train(args) => trainer::train(args),
         Command::ValidateWorkflow(args) => validate_workflow_command(args),
+        Command::VerifyCheckpoint(args) => verify_checkpoint_command(args),
         Command::PrepareCorpus(args) => prepare_corpus_command(args),
         Command::ComposeCurriculum(args) => compose_curriculum_command(args),
         Command::Quantize(args) => quantize_command(args),
@@ -1342,6 +1489,55 @@ mod tests {
     use hermes_llm::get_builtin_model;
 
     use super::*;
+
+    #[cfg(unix)]
+    struct GenerationSwapGuard {
+        original: PathBuf,
+        replacement: PathBuf,
+        parked_original: PathBuf,
+        active: bool,
+    }
+
+    #[cfg(unix)]
+    impl GenerationSwapGuard {
+        fn new(original: PathBuf, replacement: PathBuf) -> Self {
+            let parked_original =
+                original.with_extension(format!("resume-aba-{}", std::process::id()));
+            Self {
+                original,
+                replacement,
+                parked_original,
+                active: false,
+            }
+        }
+
+        fn swap(&mut self) -> Result<()> {
+            fs::rename(&self.original, &self.parked_original)?;
+            if let Err(error) = fs::rename(&self.replacement, &self.original) {
+                let _ = fs::rename(&self.parked_original, &self.original);
+                return Err(error.into());
+            }
+            self.active = true;
+            Ok(())
+        }
+
+        fn restore(&mut self) -> Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+            fs::rename(&self.original, &self.replacement)?;
+            fs::rename(&self.parked_original, &self.original)?;
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GenerationSwapGuard {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
 
     #[test]
     fn quantization_teacher_disables_every_dropout_without_mutating_student() {
@@ -1892,6 +2088,88 @@ mod tests {
             file_sha256(&path).unwrap(),
             "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+
+        let cache_root = dir.path().join("cache");
+        let source = Path::new("corpus.jsonl.zst");
+        let first =
+            token_cache_path(&cache_root, "sha256:data", source, "sha256:tokenizer").unwrap();
+        assert_eq!(
+            first,
+            token_cache_path(&cache_root, "sha256:data", source, "sha256:tokenizer").unwrap()
+        );
+        assert_ne!(
+            first,
+            token_cache_path(&cache_root, "sha256:other-data", source, "sha256:tokenizer").unwrap()
+        );
+        assert_ne!(
+            first,
+            token_cache_path(&cache_root, "sha256:data", source, "sha256:other-tokenizer").unwrap()
+        );
+        assert_ne!(
+            first,
+            token_cache_path(
+                &cache_root,
+                "sha256:data",
+                Path::new("corpus.txt.zst"),
+                "sha256:tokenizer"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            first.extension().and_then(|value| value.to_str()),
+            Some("tokens")
+        );
+    }
+
+    #[test]
+    fn checkpoint_metric_verification_rejects_a_swapped_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let mut writer = MetricWriter::create(&path, "different-run").unwrap();
+        writer
+            .append_at(
+                MetricContext {
+                    global_step: 7,
+                    phase: MetricPhase {
+                        index: 0,
+                        name: "pretrain".into(),
+                        kind: MetricPhaseKind::Pretrain,
+                    },
+                    checkpoint_hash: None,
+                },
+                MetricEvent::Throughput(ThroughputMetrics {
+                    optimizer_steps: 1,
+                    compute_tokens: 8,
+                    supervised_tokens: 8,
+                    examples: 1,
+                    elapsed_seconds: 1.0,
+                    tokens_per_second: 8.0,
+                    examples_per_second: 1.0,
+                    input_wait_seconds: 0.0,
+                    host_to_device_seconds: 0.0,
+                    gpu_busy_seconds: 1.0,
+                }),
+                1,
+            )
+            .unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let workflow_signature = format!("sha256:{}", "0".repeat(64));
+        let verified = checkpoint::VerifiedCheckpoint {
+            version: 1,
+            generation: format!("sha256-{}", "1".repeat(64)),
+            manifest_sha256: "1".repeat(64),
+            global_step: 7,
+            metric_records: 1,
+            workflow_signature,
+        };
+        let error = validate_checkpoint_metrics(&verified, &path, false).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("run_id"), "{error}");
+        let error = validate_checkpoint_metrics(&verified, &path, true).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("run_id"), "{error}");
     }
 
     #[test]
@@ -2197,5 +2475,243 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
         assert!(max_diff < 1e-6, "checkpoint max diff: {max_diff}");
+
+        #[cfg(unix)]
+        {
+            let current_pointer = dir.path().join("current.json");
+            let pointer_a = fs::read(&current_pointer).unwrap();
+            let generation_a = publication
+                .checkpoint_manifest
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let weights_a = fs::read(generation_a.join("weights.safetensors")).unwrap();
+            let muon_a = fs::read(generation_a.join("muon-state.bpk")).unwrap();
+            let adamw_a = fs::read(generation_a.join("adamw-state.bpk")).unwrap();
+
+            metrics
+                .append_at(
+                    MetricContext {
+                        global_step: 21,
+                        phase: MetricPhase {
+                            index: 1,
+                            name: "sft".into(),
+                            kind: MetricPhaseKind::Sft,
+                        },
+                        checkpoint_hash: None,
+                    },
+                    MetricEvent::Throughput(ThroughputMetrics {
+                        optimizer_steps: 1,
+                        compute_tokens: 640,
+                        supervised_tokens: 640,
+                        examples: 32,
+                        elapsed_seconds: 0.1,
+                        tokens_per_second: 6_400.0,
+                        examples_per_second: 320.0,
+                        input_wait_seconds: 0.005,
+                        host_to_device_seconds: 0.002,
+                        gpu_busy_seconds: 0.09,
+                    }),
+                    2,
+                )
+                .unwrap();
+            let mut state_b = state.clone();
+            state_b.global_step = 21;
+            state_b.records_in_phase = 672;
+            state_b.steps_in_phase = 11;
+            state_b.tokens_seen = 13_440;
+            state_b.metric_records = 2;
+            state_b.optimizer_states[0].update_clock = 21;
+            for stream in &mut state_b.rng_streams {
+                match stream.name.as_str() {
+                    DATA_RNG_STREAM => stream.counter = 672,
+                    MODEL_RNG_STREAM => stream.counter = 21,
+                    _ => {}
+                }
+            }
+            let publication_b = save_training_checkpoint_with_evidence(
+                &model,
+                &adamw_optimizer,
+                &muon_optimizer,
+                &state_b,
+                &mut metrics,
+                dir.path(),
+            )
+            .unwrap();
+            let generation_b = publication_b
+                .checkpoint_manifest
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let weights_b = fs::read(generation_b.join("weights.safetensors")).unwrap();
+            let muon_b = fs::read(generation_b.join("muon-state.bpk")).unwrap();
+            let adamw_b = fs::read(generation_b.join("adamw-state.bpk")).unwrap();
+            assert_ne!(
+                weights_a, weights_b,
+                "ABA generations need distinct weights"
+            );
+            assert_ne!(muon_a, muon_b, "ABA generations need distinct Muon state");
+            assert_ne!(
+                adamw_a, adamw_b,
+                "ABA generations need distinct AdamW state"
+            );
+
+            // Point at A, authenticate it, replace its pathname with the valid
+            // same-topology generation B, then restore A before the final
+            // pointer check. Path-based loaders accept this ABA sequence; the
+            // retained generation handle must still load only A's bytes.
+            fs::write(&current_pointer, &pointer_a).unwrap();
+            let mut aba_model = Transformer::new(&config, &device).unwrap();
+            let mut aba_muon = BatchedMuon::new(aba_model.muon_parameter_ids());
+            let aba_adamw = AdamWConfig::new()
+                .with_beta_2(0.95)
+                .with_epsilon(1e-8)
+                .with_weight_decay(0.0)
+                .init();
+            let mut swap = GenerationSwapGuard::new(generation_a.clone(), generation_b);
+            let (aba_adamw, aba_state) = checkpoint::load_training_state_with_hook(
+                &mut aba_model,
+                aba_adamw,
+                &mut aba_muon,
+                dir.path(),
+                &device,
+                |stage, _| match stage {
+                    checkpoint::ResumeLoadStage::AfterInitialVerify => swap.swap(),
+                    checkpoint::ResumeLoadStage::AfterStagedLoad => swap.restore(),
+                },
+            )
+            .unwrap();
+            assert_eq!(aba_state.global_step, state.global_step);
+
+            let aba_artifacts = tempfile::tempdir().unwrap();
+            let loaded_weights = aba_artifacts.path().join("weights.safetensors");
+            let loaded_muon = aba_artifacts.path().join("muon-state.bpk");
+            save_safetensors(&aba_model, &loaded_weights).unwrap();
+            aba_muon.save(&loaded_muon).unwrap();
+            let loaded_adamw =
+                hermes_train::optimizer_artifact::canonical_module_optimizer_bytes(&aba_adamw)
+                    .unwrap();
+            assert_eq!(fs::read(loaded_weights).unwrap(), weights_a);
+            assert_eq!(fs::read(loaded_muon).unwrap(), muon_a);
+            assert_eq!(&*loaded_adamw, adamw_a.as_slice());
+
+            let malformed_generation =
+                checkpoint::rewrite_current_generation_for_test(dir.path(), |staging| {
+                    let path = staging.join("adamw-state.bpk");
+                    let reader = burn_pack::Reader::from_file(&path)?;
+                    let metadata = reader.metadata().clone();
+                    let scalars = reader.scalars().clone();
+                    let mut tensors = reader.into_tensors()?;
+                    ensure!(
+                        tensors.len() > 1,
+                        "one-step AdamW fixture has too little state"
+                    );
+                    tensors.remove(0);
+                    let mut writer = burn_pack::Writer::new(tensors);
+                    for (key, value) in scalars {
+                        writer = writer.with_scalar(&key, value);
+                    }
+                    for (key, value) in metadata {
+                        writer = writer.with_metadata(&key, &value);
+                    }
+                    let replacement = staging.join("adamw-state-malformed.tmp");
+                    writer.write_to_file(&replacement)?;
+                    fs::rename(replacement, path)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_ne!(malformed_generation, generation_a);
+            verify_checkpoint_root(dir.path()).unwrap();
+
+            let mut rejected_model = aba_model.clone();
+            let mut rejected_muon = aba_muon.clone();
+            let rejected_artifacts = tempfile::tempdir().unwrap();
+            let rejected_model_before = rejected_artifacts.path().join("model-before.safetensors");
+            let rejected_model_after = rejected_artifacts.path().join("model-after.safetensors");
+            let rejected_muon_before = rejected_artifacts.path().join("muon-before.bpk");
+            let rejected_muon_after = rejected_artifacts.path().join("muon-after.bpk");
+            save_safetensors(&rejected_model, &rejected_model_before).unwrap();
+            rejected_muon.save(&rejected_muon_before).unwrap();
+            let rejected_adamw = AdamWConfig::new()
+                .with_beta_2(0.95)
+                .with_epsilon(1e-8)
+                .with_weight_decay(0.0)
+                .init();
+            let error = load_training_state(
+                &mut rejected_model,
+                rejected_adamw,
+                &mut rejected_muon,
+                dir.path(),
+                &device,
+            )
+            .err()
+            .expect("AdamW state with a missing moment tensor must be rejected");
+            assert!(
+                format!("{error:#}").contains("lossless reconstruction"),
+                "{error:#}"
+            );
+            save_safetensors(&rejected_model, &rejected_model_after).unwrap();
+            rejected_muon.save(&rejected_muon_after).unwrap();
+            assert_eq!(
+                fs::read(rejected_model_before).unwrap(),
+                fs::read(rejected_model_after).unwrap()
+            );
+            assert_eq!(
+                fs::read(rejected_muon_before).unwrap(),
+                fs::read(rejected_muon_after).unwrap()
+            );
+            fs::write(&current_pointer, &pointer_a).unwrap();
+        }
+
+        let snapshots = tempfile::tempdir().unwrap();
+        let mut raced_model = resumed.clone();
+        let raced_model_ids = parameter_ids(&raced_model);
+        let mut raced_muon = resumed_muon.clone();
+        let model_before = snapshots.path().join("model-before.safetensors");
+        let model_after = snapshots.path().join("model-after.safetensors");
+        let muon_before = snapshots.path().join("muon-before.bpk");
+        let muon_after = snapshots.path().join("muon-after.bpk");
+        save_safetensors(&raced_model, &model_before).unwrap();
+        raced_muon.save(&muon_before).unwrap();
+
+        let raced_adamw = AdamWConfig::new()
+            .with_beta_2(0.95)
+            .with_epsilon(1e-8)
+            .with_weight_decay(0.0)
+            .init();
+        let error = checkpoint::load_training_state_with_hook(
+            &mut raced_model,
+            raced_adamw,
+            &mut raced_muon,
+            dir.path(),
+            &device,
+            |stage, generation| {
+                if stage == checkpoint::ResumeLoadStage::AfterStagedLoad {
+                    fs::write(
+                        generation.join("weights.safetensors"),
+                        b"changed after load",
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .err()
+        .expect("checkpoint mutation should fail staged resume loading");
+        assert!(
+            format!("{error:#}").contains("contents do not match"),
+            "{error:#}"
+        );
+
+        save_safetensors(&raced_model, &model_after).unwrap();
+        raced_muon.save(&muon_after).unwrap();
+        assert_eq!(parameter_ids(&raced_model), raced_model_ids);
+        assert_eq!(
+            fs::read(model_after).unwrap(),
+            fs::read(model_before).unwrap()
+        );
+        assert_eq!(
+            fs::read(muon_after).unwrap(),
+            fs::read(muon_before).unwrap()
+        );
     }
 }

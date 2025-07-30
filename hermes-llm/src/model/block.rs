@@ -366,6 +366,13 @@ impl TransformerBlock {
         }
     }
 
+    pub(crate) fn validate_memory_checkpoint_state(&self) -> anyhow::Result<()> {
+        if let Some(memory) = &self.memory {
+            memory.validate_checkpoint_state()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_memory_upgrade_state(&mut self) {
         if let Some(memory) = &mut self.memory {
             memory.prepare_upgrade_state();

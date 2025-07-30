@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use burn::module::{Module, ModuleMapper, Param, ParamId};
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 #[cfg(feature = "cuda")]
 use burn::tensor::FloatDType;
 use burn::tensor::{Device, Tensor, TensorData};
 use burn_optim::GradientsParams;
-use burn_pack::{Reader, Tensor as PackedTensor, Writer};
+use burn_pack::{Bytes, DType, Reader, Tensor as PackedTensor, Writer};
 
 const MOMENTUM: f64 = 0.95;
 const NS_COEFFICIENTS: (f64, f64, f64) = (3.4445, -4.775, 2.0315);
@@ -21,6 +21,7 @@ const EPSILON: f64 = 1e-7;
 /// avoids thousands of tiny GPU launches without changing optimizer state or
 /// hyperparameters. CUDA runs Newton-Schulz in BF16, its intended stable
 /// compute dtype, while parameters and momentum remain FP32.
+#[derive(Clone)]
 pub struct BatchedMuon {
     parameter_ids: Vec<ParamId>,
     velocities: BTreeMap<[usize; 2], Tensor<3>>,
@@ -59,27 +60,120 @@ impl BatchedMuon {
         Ok(())
     }
 
-    pub fn load(&mut self, path: impl AsRef<Path>, device: &Device) -> Result<()> {
-        self.velocities.clear();
-        for tensor in Reader::from_file(path)
-            .context("failed to open Muon state")?
-            .into_tensors()
-            .context("failed to read Muon state")?
-        {
+    /// Load Muon state from a byte buffer already authenticated by the
+    /// checkpoint layer.
+    pub fn load_bytes(&mut self, bytes: Vec<u8>, device: &Device) -> Result<()> {
+        let reader = Reader::from_bytes(Bytes::from_bytes_vec(bytes))
+            .context("failed to open authenticated Muon state")?;
+        self.load_reader(reader, device)
+    }
+
+    fn load_reader(&mut self, reader: Reader, device: &Device) -> Result<()> {
+        ensure!(
+            reader.metadata().is_empty() && reader.scalars().is_empty(),
+            "Muon checkpoint contains unsupported metadata or scalar state"
+        );
+        let mut velocities = BTreeMap::new();
+        for tensor in reader.into_tensors().context("failed to read Muon state")? {
             ensure!(
                 tensor.shape.rank() == 3,
                 "Muon velocity {} has rank {}, expected 3",
                 tensor.name,
                 tensor.shape.rank()
             );
+            let [batch, rows, columns] = tensor.shape.dims::<3>();
+            ensure!(
+                batch > 0 && rows > 0 && columns > 0,
+                "Muon velocity {} has a zero dimension",
+                tensor.name
+            );
+            ensure!(
+                tensor.dtype == DType::F32,
+                "Muon velocity {} has dtype {:?}, expected F32",
+                tensor.name,
+                tensor.dtype
+            );
+            ensure!(
+                tensor.param_id.is_none(),
+                "Muon velocity {} must not carry a parameter ID",
+                tensor.name
+            );
+            ensure!(
+                tensor.name == format!("{rows}x{columns}"),
+                "Muon velocity {} does not match its canonical {rows}x{columns} shape name",
+                tensor.name
+            );
             let velocity = Tensor::<3>::from_data(
                 TensorData::from_bytes(tensor.bytes, tensor.shape, tensor.dtype),
                 device,
             );
-            let [_, rows, columns] = velocity.dims();
             ensure!(
-                self.velocities.insert([rows, columns], velocity).is_none(),
+                velocities.insert([rows, columns], velocity).is_none(),
                 "Muon checkpoint contains duplicate {rows}x{columns} velocity groups"
+            );
+        }
+        self.velocities = velocities;
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.velocities.is_empty()
+    }
+
+    /// Validate that every serialized velocity batch corresponds exactly to
+    /// the selected matrix parameters in the restored model.
+    pub fn validate_for_model<M: Module>(&self, model: &M, allow_empty: bool) -> Result<()> {
+        let remaining = self
+            .parameter_ids
+            .iter()
+            .map(|id| id.val())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            remaining.len() == self.parameter_ids.len(),
+            "Muon parameter selection repeats an ID"
+        );
+        let mut visitor = MuonShapeVisitor {
+            remaining,
+            groups: BTreeMap::new(),
+            non_matrix: Vec::new(),
+        };
+        model.visit(&mut visitor);
+        ensure!(
+            visitor.remaining.is_empty(),
+            "Muon selects {} parameters absent from the restored model",
+            visitor.remaining.len()
+        );
+        ensure!(
+            visitor.non_matrix.is_empty(),
+            "Muon selects non-matrix parameters {:?}",
+            visitor.non_matrix
+        );
+        if self.velocities.is_empty() {
+            ensure!(
+                allow_empty,
+                "Muon checkpoint has no velocities after optimizer progress"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.velocities.len() == visitor.groups.len(),
+            "Muon checkpoint has {} velocity groups, restored model requires {}",
+            self.velocities.len(),
+            visitor.groups.len()
+        );
+        for (shape, expected_batch) in visitor.groups {
+            let velocity = self.velocities.get(&shape).with_context(|| {
+                format!(
+                    "Muon checkpoint is missing the {}x{} velocity group",
+                    shape[0], shape[1]
+                )
+            })?;
+            let [actual_batch, rows, columns] = velocity.dims();
+            ensure!(
+                [rows, columns] == shape && actual_batch == expected_batch,
+                "Muon {}x{} velocity batch has {actual_batch} matrices, restored model requires {expected_batch}",
+                shape[0],
+                shape[1]
             );
         }
         Ok(())
@@ -137,6 +231,26 @@ impl BatchedMuon {
             updates.len()
         );
         Ok(model)
+    }
+}
+
+struct MuonShapeVisitor {
+    remaining: BTreeSet<u64>,
+    groups: BTreeMap<[usize; 2], usize>,
+    non_matrix: Vec<u64>,
+}
+
+impl ModuleVisitor for MuonShapeVisitor {
+    fn visit_float<const D: usize>(&mut self, parameter: &Param<Tensor<D>>) {
+        if !self.remaining.remove(&parameter.id.val()) {
+            return;
+        }
+        if D != 2 {
+            self.non_matrix.push(parameter.id.val());
+            return;
+        }
+        let shape = parameter.shape().dims::<D>();
+        *self.groups.entry([shape[0], shape[1]]).or_default() += 1;
     }
 }
 
@@ -217,6 +331,23 @@ mod tests {
 
     use super::*;
 
+    fn packed_velocity(
+        name: &str,
+        shape: [usize; 3],
+        dtype: DType,
+        param_id: Option<u64>,
+    ) -> Vec<u8> {
+        let elements = shape.into_iter().product::<usize>();
+        let tensor = PackedTensor::new(
+            name.into(),
+            dtype,
+            shape.to_vec(),
+            param_id,
+            Bytes::from_bytes_vec(vec![0; elements * dtype.size()]),
+        );
+        Writer::new(vec![tensor]).into_bytes().unwrap().to_vec()
+    }
+
     #[derive(Module, Debug)]
     struct MatrixPair {
         first: Param<Tensor<2>>,
@@ -286,5 +417,87 @@ mod tests {
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0, f32::max);
         assert!(max_diff < 2e-5, "Muon parameter max diff: {max_diff}");
+    }
+
+    #[test]
+    fn muon_archive_validation_is_strict_and_failure_atomic() {
+        let device = hermes_llm::default_device();
+        let mut muon = BatchedMuon::new(Vec::new());
+        muon.velocities.insert(
+            [2, 2],
+            Tensor::<3>::ones([1, 2, 2], &device.clone().inner()),
+        );
+        let before = muon.velocities[&[2, 2]].clone().into_data();
+
+        let error = muon
+            .load_bytes(
+                packed_velocity("not-a-shape", [1, 2, 2], DType::F32, None),
+                &device.clone().inner(),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("canonical 2x2 shape name"));
+        assert_eq!(
+            muon.velocities[&[2, 2]].clone().into_data(),
+            before,
+            "a rejected archive changed existing Muon state"
+        );
+
+        for (bytes, message) in [
+            (
+                packed_velocity("2x2", [0, 2, 2], DType::F32, None),
+                "zero dimension",
+            ),
+            (
+                packed_velocity("2x2", [1, 2, 2], DType::F16, None),
+                "expected F32",
+            ),
+            (
+                packed_velocity("2x2", [1, 2, 2], DType::F32, Some(7)),
+                "must not carry a parameter ID",
+            ),
+        ] {
+            let error = BatchedMuon::new(Vec::new())
+                .load_bytes(bytes, &device.clone().inner())
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn muon_velocity_batches_match_selected_model_shapes() {
+        let device = hermes_llm::default_device();
+        let matrix = || {
+            Param::from_tensor(Tensor::<2>::zeros(
+                [4, 6],
+                &device.clone().autodiff().inner(),
+            ))
+        };
+        let model = MatrixPair {
+            first: matrix(),
+            second: matrix(),
+        };
+        let duplicate = BatchedMuon::new(vec![model.first.id, model.first.id]);
+        let error = duplicate.validate_for_model(&model, true).unwrap_err();
+        assert!(format!("{error:#}").contains("repeats an ID"), "{error:#}");
+
+        let ids = vec![model.first.id, model.second.id];
+        let mut muon = BatchedMuon::new(ids);
+
+        assert!(muon.validate_for_model(&model, true).is_ok());
+        assert!(
+            format!("{:#}", muon.validate_for_model(&model, false).unwrap_err())
+                .contains("no velocities")
+        );
+        muon.velocities.insert(
+            [4, 6],
+            Tensor::<3>::zeros([1, 4, 6], &device.clone().inner()),
+        );
+        let error = muon.validate_for_model(&model, false).unwrap_err();
+        assert!(format!("{error:#}").contains("requires 2"), "{error:#}");
+        muon.velocities.insert(
+            [4, 6],
+            Tensor::<3>::zeros([2, 4, 6], &device.clone().inner()),
+        );
+        muon.validate_for_model(&model, false).unwrap();
     }
 }

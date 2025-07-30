@@ -17,7 +17,33 @@ static ATOMIC_SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Load strictly: missing, unexpected, and shape-mismatched tensors are errors.
 pub fn load_safetensors(model: &mut Transformer, path: impl AsRef<Path>) -> Result<ApplyResult> {
     let path = path.as_ref();
-    let mut store = SafetensorsStore::from_file(path).skip_enum_variants(true);
+    load_safetensors_store(
+        model,
+        SafetensorsStore::from_file(path),
+        &format!("checkpoint {}", path.display()),
+    )
+}
+
+/// Load a strictly validated SafeTensors checkpoint from authenticated bytes.
+///
+/// This is used by crash-safe resume code after it has read and hashed an
+/// immutable checkpoint artifact through an already-authenticated directory
+/// handle. Keeping the byte buffer as the store's source prevents a later
+/// pathname replacement from changing what Burn applies to the model.
+pub fn load_safetensors_bytes(
+    model: &mut Transformer,
+    bytes: Vec<u8>,
+    label: &str,
+) -> Result<ApplyResult> {
+    load_safetensors_store(model, SafetensorsStore::from_bytes(Some(bytes)), label)
+}
+
+fn load_safetensors_store(
+    model: &mut Transformer,
+    store: SafetensorsStore,
+    label: &str,
+) -> Result<ApplyResult> {
+    let mut store = store.skip_enum_variants(true);
     // `ModuleSnapshot::load_from` may successfully apply the tensors it can
     // match and report the rest through `ApplyResult`.  Load into a private
     // clone so either the complete checkpoint is accepted or the caller's
@@ -25,12 +51,12 @@ pub fn load_safetensors(model: &mut Transformer, path: impl AsRef<Path>) -> Resu
     let mut loaded = model.clone();
     let result = loaded
         .load_from(&mut store)
-        .with_context(|| format!("failed to load weights from {}", path.display()))?;
+        .with_context(|| format!("failed to load weights from {label}"))?;
     ensure!(
         result.errors.is_empty() && result.missing.is_empty() && result.unused.is_empty(),
-        "checkpoint {} does not match the model topology:\n{result}",
-        path.display()
+        "{label} does not match the model topology:\n{result}"
     );
+    loaded.validate_memory_checkpoint_state()?;
     loaded.sync_memory_state();
     *model = loaded;
     Ok(result)
@@ -155,6 +181,7 @@ pub fn upgrade_safetensors_to_memory(
             unexpected_missing.join(", ")
         );
     }
+    upgraded.validate_memory_checkpoint_state()?;
     upgraded.sync_memory_state();
     if upgraded
         .memory_slot_statuses()
@@ -659,13 +686,38 @@ mod tests {
                 .all(|slot| !slot.active)
         );
 
+        let dormant_parameters = target.num_params();
         target.activate_memory_slot(0, 1, 0).unwrap();
+        let active_parameters = target.num_params();
+        assert_eq!(active_parameters, dormant_parameters);
+        let active_input = Tensor::<2, Int>::from_data([[2, 4, 6, 8]], &device);
+        let active_logits = target.forward(active_input.clone(), 0).into_data();
         save_safetensors(&target, &active_target_path).unwrap();
         let mut reloaded = Transformer::new(&target_config, &device).unwrap();
         load_safetensors(&mut reloaded, &active_target_path).unwrap();
+        assert_eq!(reloaded.num_params(), active_parameters);
+        assert!(
+            tensor_state(&reloaded).iter().all(|(path, _)| {
+                !path.contains("routing_mask") && !path.contains("global_to_local")
+            }),
+            "derived routing caches must not enter checkpoint state"
+        );
         let statuses = reloaded.memory_slot_statuses();
         assert!(statuses.iter().any(|slot| slot.tier == 1 && slot.active));
         assert!(statuses.iter().all(|slot| slot.tier == 1 || !slot.active));
+        let reloaded_logits = reloaded.forward(active_input, 0).into_data();
+        let maximum = active_logits
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .zip(reloaded_logits.convert::<f32>().to_vec::<f32>().unwrap())
+            .map(|(active, reloaded)| (active - reloaded).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            maximum < 1e-6,
+            "active memory logits changed by {maximum} after roundtrip"
+        );
     }
 
     #[test]

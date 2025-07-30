@@ -1089,13 +1089,21 @@ impl Transformer {
         self.final_norm.forward(x)
     }
 
-    /// Refresh runtime mirrors from checkpointed memory masks. Strict Hermes
-    /// loaders call this automatically; call it after applying snapshots with
-    /// Burn APIs directly.
+    /// Refresh runtime mirrors and device-local routing caches from
+    /// checkpointed memory masks. Strict Hermes loaders call this
+    /// automatically; call it after applying snapshots or moving a model with
+    /// Burn module APIs directly.
     pub fn sync_memory_state(&mut self) {
         for layer in &mut self.layers {
             layer.sync_memory_state();
         }
+    }
+
+    pub(crate) fn validate_memory_checkpoint_state(&self) -> Result<()> {
+        for layer in &self.layers {
+            layer.validate_memory_checkpoint_state()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_memory_upgrade_state(&mut self) {

@@ -9,7 +9,7 @@
 //! step cannot silently produce a misleading history.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -459,6 +459,103 @@ pub struct MetricLogDigests {
     pub last_global_step: Option<u64>,
 }
 
+/// Identity and mutation generation captured from an opened metric file.
+///
+/// Unix exposes a stable device/inode identity plus nanosecond mtime/ctime.
+/// Other platforms retain the same fail-closed call structure using the
+/// strongest portable metadata available from `std`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetricFileStamp {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(not(unix))]
+    modified: Option<SystemTime>,
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
+}
+
+impl MetricFileStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                len: metadata.len(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                mtime: metadata.mtime(),
+                mtime_nsec: metadata.mtime_nsec(),
+                ctime: metadata.ctime(),
+                ctime_nsec: metadata.ctime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+            }
+        }
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.dev == other.dev && self.ino == other.ino
+        }
+        #[cfg(not(unix))]
+        {
+            match (self.created, other.created) {
+                (Some(left), Some(right)) => left == right,
+                _ => self.same_version(other),
+            }
+        }
+    }
+
+    fn same_version(&self, other: &Self) -> bool {
+        if !self.same_file_without_version_fallback(other) || self.len != other.len {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            self.mtime == other.mtime
+                && self.mtime_nsec == other.mtime_nsec
+                && self.ctime == other.ctime
+                && self.ctime_nsec == other.ctime_nsec
+        }
+        #[cfg(not(unix))]
+        {
+            self.modified == other.modified
+        }
+    }
+
+    fn same_file_without_version_fallback(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.dev == other.dev && self.ino == other.ino
+        }
+        #[cfg(not(unix))]
+        {
+            match (self.created, other.created) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+        }
+    }
+}
+
 /// Append-only writer that owns sequencing and validates every event.
 pub struct MetricWriter {
     path: PathBuf,
@@ -480,13 +577,7 @@ impl MetricWriter {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create metric directory {}", parent.display()))?;
         }
-        reject_symlink_if_present(path, "metric log")?;
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .with_context(|| format!("create metric log {}", path.display()))?;
+        let file = create_empty_metric_file(path, "metric log")?;
         Ok(Self {
             path: path.to_owned(),
             run_id,
@@ -500,14 +591,11 @@ impl MetricWriter {
         let path = path.as_ref();
         let run_id = run_id.into();
         validate_identifier("run_id", &run_id)?;
-        ensure_regular_non_symlink(path, "metric log")?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("open metric log {} for resume", path.display()))?;
-        let state = validate_open_log(&mut file, Some(&run_id))
+        let mut file = open_existing_metric_file(path, "metric log", true)?;
+        let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, "metric log")?;
+        let state = validate_log_bytes(&bytes, Some(&run_id))
             .with_context(|| format!("validate metric log {}", path.display()))?;
+        ensure_open_metric_file_unchanged(&file, path, &stamp, "metric log")?;
         Ok(Self {
             path: path.to_owned(),
             run_id,
@@ -529,40 +617,16 @@ impl MetricWriter {
         let path = path.as_ref();
         let run_id = run_id.into();
         validate_identifier("run_id", &run_id)?;
-        let bytes = fs::read(path)
-            .with_context(|| format!("read metric log {} for checkpoint resume", path.display()))?;
         let committed_records = usize::try_from(committed_records)
             .context("committed metric record count exceeds usize")?;
-        let end = if committed_records == 0 {
-            0
-        } else {
-            bytes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
-                .nth(committed_records - 1)
-                .context("metric log has fewer records than the training checkpoint")?
-        };
-        let state = validate_log_bytes(&bytes[..end], Some(&run_id))
-            .with_context(|| format!("validate committed metric prefix in {}", path.display()))?;
-        ensure!(
-            state.records == committed_records as u64,
-            "committed metric prefix record count is inconsistent"
-        );
         let expected_last_step = (committed_records > 0).then_some(committed_global_step);
-        ensure!(
-            state.last_global_step == expected_last_step,
-            "committed metric prefix does not end at checkpoint global step"
-        );
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open metric log {} for truncation", path.display()))?;
-        file.set_len(end as u64)?;
-        file.sync_all()?;
-        drop(file);
-        Self::resume(path, run_id)
+        Self::resume_validated_prefix(
+            path,
+            run_id,
+            committed_records,
+            expected_last_step,
+            "checkpoint resume",
+        )
     }
 
     /// Resume an external runtime at an exact committed metric prefix. Unlike
@@ -578,30 +642,58 @@ impl MetricWriter {
         let path = path.as_ref();
         let run_id = run_id.into();
         validate_identifier("run_id", &run_id)?;
-        let bytes = fs::read(path)
-            .with_context(|| format!("read metric log {} for exact resume", path.display()))?;
         let committed_records = usize::try_from(committed_records)
             .context("committed metric record count exceeds usize")?;
-        let end = committed_prefix_end(&bytes, committed_records)?;
-        let state = validate_log_bytes(&bytes[..end], Some(&run_id))
-            .with_context(|| format!("validate committed metric prefix in {}", path.display()))?;
+        Self::resume_validated_prefix(
+            path,
+            run_id,
+            committed_records,
+            committed_last_global_step,
+            "exact resume",
+        )
+    }
+
+    fn resume_validated_prefix(
+        path: &Path,
+        run_id: String,
+        committed_records: usize,
+        committed_last_global_step: Option<u64>,
+        operation: &str,
+    ) -> Result<Self> {
+        let mut file = open_existing_metric_file(path, "metric log", true)
+            .with_context(|| format!("open metric log {} for {operation}", path.display()))?;
+        let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, "metric log")
+            .with_context(|| format!("read metric log {} for {operation}", path.display()))?;
+        let (end, state) = validate_committed_prefix_bytes(
+            &bytes,
+            path,
+            committed_records,
+            committed_last_global_step,
+            Some(&run_id),
+        )?;
+
+        // JSON validation can be substantial for a long journal. Reinspect
+        // both the descriptor and its pathname after validation so an
+        // in-place writer or path replacement cannot make us truncate bytes
+        // other than the exact generation that was parsed above.
+        ensure_open_metric_file_unchanged(&file, path, &stamp, "metric log")?;
+        file.set_len(end as u64)
+            .with_context(|| format!("truncate metric log {} for {operation}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync metric log {} after {operation}", path.display()))?;
+        let truncated = opened_metric_file_stamp(&file, "metric log")?;
         ensure!(
-            state.records == committed_records as u64,
-            "committed metric prefix record count is inconsistent"
+            truncated.same_file(&stamp) && truncated.len == end as u64,
+            "metric log changed while its committed prefix was truncated"
         );
-        ensure!(
-            state.last_global_step == committed_last_global_step,
-            "committed metric prefix global step is inconsistent"
-        );
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open metric log {} for truncation", path.display()))?;
-        file.set_len(end as u64)?;
-        file.sync_all()?;
-        drop(file);
-        Self::resume(path, run_id)
+        ensure_metric_path_matches_stamp(path, &truncated, "metric log", true)?;
+
+        Ok(Self {
+            path: path.to_owned(),
+            run_id,
+            output: BufWriter::new(file),
+            state,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -729,6 +821,45 @@ fn committed_prefix_end(bytes: &[u8], committed_records: usize) -> Result<usize>
         .context("metric log has fewer records than the runtime checkpoint")
 }
 
+fn validate_committed_prefix_bytes(
+    bytes: &[u8],
+    path: &Path,
+    committed_records: usize,
+    committed_last_global_step: Option<u64>,
+    expected_run_id: Option<&str>,
+) -> Result<(usize, MetricLogState)> {
+    validate_committed_prefix_bytes_with(
+        bytes,
+        path,
+        committed_records,
+        committed_last_global_step,
+        expected_run_id,
+        |_| Ok(()),
+    )
+}
+
+fn validate_committed_prefix_bytes_with(
+    bytes: &[u8],
+    path: &Path,
+    committed_records: usize,
+    committed_last_global_step: Option<u64>,
+    expected_run_id: Option<&str>,
+    visitor: impl FnMut(&MetricRecord) -> Result<()>,
+) -> Result<(usize, MetricLogState)> {
+    let end = committed_prefix_end(bytes, committed_records)?;
+    let state = visit_validated_records(&bytes[..end], expected_run_id, visitor)
+        .with_context(|| format!("validate committed metric prefix in {}", path.display()))?;
+    ensure!(
+        state.records == committed_records as u64,
+        "committed metric prefix record count is inconsistent"
+    );
+    ensure!(
+        state.last_global_step == committed_last_global_step,
+        "committed metric prefix global step is inconsistent"
+    );
+    Ok((end, state))
+}
+
 /// Validate a metric log without opening it for append.
 pub fn validate_metric_log(
     path: impl AsRef<Path>,
@@ -738,11 +869,118 @@ pub fn validate_metric_log(
         validate_identifier("expected run_id", run_id)?;
     }
     let path = path.as_ref();
-    ensure_regular_non_symlink(path, "metric log")?;
-    let mut file = File::open(path)
-        .with_context(|| format!("open metric log {} for validation", path.display()))?;
-    validate_open_log(&mut file, expected_run_id)
-        .with_context(|| format!("validate metric log {}", path.display()))
+    let mut file = open_existing_metric_file(path, "metric log", false)?;
+    let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, "metric log")?;
+    let state = validate_log_bytes(&bytes, expected_run_id)
+        .with_context(|| format!("validate metric log {}", path.display()))?;
+    ensure_open_metric_file_unchanged(&file, path, &stamp, "metric log")?;
+    Ok(state)
+}
+
+/// Validate the exact journal prefix committed by a training checkpoint
+/// without truncating or otherwise mutating the live journal.
+pub fn validate_metric_prefix(
+    path: impl AsRef<Path>,
+    committed_records: u64,
+    committed_global_step: u64,
+) -> Result<MetricLogState> {
+    validate_metric_prefix_impl(
+        path.as_ref(),
+        committed_records,
+        committed_global_step,
+        None,
+    )
+}
+
+/// Validate a committed journal prefix and bind every record to one run.
+pub fn validate_metric_prefix_for_run(
+    path: impl AsRef<Path>,
+    expected_run_id: &str,
+    committed_records: u64,
+    committed_global_step: u64,
+) -> Result<MetricLogState> {
+    validate_identifier("expected run_id", expected_run_id)?;
+    validate_metric_prefix_impl(
+        path.as_ref(),
+        committed_records,
+        committed_global_step,
+        Some(expected_run_id),
+    )
+}
+
+fn validate_metric_prefix_impl(
+    path: &Path,
+    committed_records: u64,
+    committed_global_step: u64,
+    expected_run_id: Option<&str>,
+) -> Result<MetricLogState> {
+    let bytes = read_regular_file_stable(path, "metric log")?;
+    let committed_records = usize::try_from(committed_records)
+        .context("committed metric record count exceeds usize")?;
+    let expected_last_step = (committed_records > 0).then_some(committed_global_step);
+    let (_, state) = validate_committed_prefix_bytes(
+        &bytes,
+        path,
+        committed_records,
+        expected_last_step,
+        expected_run_id,
+    )?;
+    Ok(state)
+}
+
+/// Validate an immutable metric snapshot that contains exactly the records
+/// committed by its checkpoint, with no live-journal tail.
+pub fn validate_metric_snapshot(
+    path: impl AsRef<Path>,
+    committed_records: u64,
+    committed_global_step: u64,
+) -> Result<MetricLogState> {
+    validate_metric_snapshot_impl(
+        path.as_ref(),
+        committed_records,
+        committed_global_step,
+        None,
+    )
+}
+
+/// Validate an immutable metric snapshot and bind every record to one run.
+pub fn validate_metric_snapshot_for_run(
+    path: impl AsRef<Path>,
+    expected_run_id: &str,
+    committed_records: u64,
+    committed_global_step: u64,
+) -> Result<MetricLogState> {
+    validate_identifier("expected run_id", expected_run_id)?;
+    validate_metric_snapshot_impl(
+        path.as_ref(),
+        committed_records,
+        committed_global_step,
+        Some(expected_run_id),
+    )
+}
+
+fn validate_metric_snapshot_impl(
+    path: &Path,
+    committed_records: u64,
+    committed_global_step: u64,
+    expected_run_id: Option<&str>,
+) -> Result<MetricLogState> {
+    let bytes = read_regular_file_stable(path, "metric snapshot")?;
+    let committed_records = usize::try_from(committed_records)
+        .context("committed metric record count exceeds usize")?;
+    let expected_last_step = (committed_records > 0).then_some(committed_global_step);
+    let (end, state) = validate_committed_prefix_bytes(
+        &bytes,
+        path,
+        committed_records,
+        expected_last_step,
+        expected_run_id,
+    )?;
+    ensure!(
+        end == bytes.len(),
+        "immutable metric snapshot contains an uncommitted tail"
+    );
+    Ok(state)
 }
 
 /// Measure committed single-accelerator work from a validated metric prefix.
@@ -758,54 +996,44 @@ pub fn summarize_committed_training_time(
 ) -> Result<CommittedTrainingTime> {
     validate_identifier("expected run_id", expected_run_id)?;
     let path = path.as_ref();
-    ensure_regular_non_symlink(path, "metric log")?;
     let bytes = read_regular_file_stable(path, "metric log for training evidence")?;
     let committed_records_usize = usize::try_from(committed_records)
         .context("committed metric record count exceeds usize")?;
-    let end = committed_prefix_end(&bytes, committed_records_usize)?;
-    let prefix = &bytes[..end];
-    let state = validate_log_bytes(prefix, Some(expected_run_id)).with_context(|| {
-        format!(
-            "validate committed metric prefix for training evidence in {}",
-            path.display()
-        )
-    })?;
-    ensure!(
-        state.records == committed_records,
-        "committed metric prefix record count is inconsistent"
-    );
-    ensure!(
-        state.last_global_step == Some(committed_global_step),
-        "committed metric prefix does not end at checkpoint global step"
-    );
-
     let mut optimizer_steps = 0_u64;
     let mut elapsed_nanoseconds = 0_u64;
-    for record in decode_validated_records(prefix)? {
-        let elapsed = match record.event {
-            MetricEvent::Throughput(metric) => {
-                optimizer_steps = optimizer_steps
-                    .checked_add(metric.optimizer_steps)
-                    .context("measured optimizer-step count overflows u64")?;
-                Some(metric.elapsed_seconds)
+    let (_, _) = validate_committed_prefix_bytes_with(
+        &bytes,
+        path,
+        committed_records_usize,
+        Some(committed_global_step),
+        Some(expected_run_id),
+        |record| {
+            let elapsed = match &record.event {
+                MetricEvent::Throughput(metric) => {
+                    optimizer_steps = optimizer_steps
+                        .checked_add(metric.optimizer_steps)
+                        .context("measured optimizer-step count overflows u64")?;
+                    Some(metric.elapsed_seconds)
+                }
+                MetricEvent::PhaseTiming(metric)
+                    if matches!(
+                        record.phase.kind,
+                        MetricPhaseKind::Sleep | MetricPhaseKind::Quantization
+                    ) && metric.boundary == PhaseBoundary::Completed =>
+                {
+                    Some(metric.elapsed_seconds)
+                }
+                _ => None,
+            };
+            if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed > 0.0) {
+                let nanoseconds = seconds_to_nanoseconds(elapsed)?;
+                elapsed_nanoseconds = elapsed_nanoseconds
+                    .checked_add(nanoseconds)
+                    .context("measured training duration overflows u64 nanoseconds")?;
             }
-            MetricEvent::PhaseTiming(metric)
-                if matches!(
-                    record.phase.kind,
-                    MetricPhaseKind::Sleep | MetricPhaseKind::Quantization
-                ) && metric.boundary == PhaseBoundary::Completed =>
-            {
-                Some(metric.elapsed_seconds)
-            }
-            _ => None,
-        };
-        if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed > 0.0) {
-            let nanoseconds = seconds_to_nanoseconds(elapsed)?;
-            elapsed_nanoseconds = elapsed_nanoseconds
-                .checked_add(nanoseconds)
-                .context("measured training duration overflows u64 nanoseconds")?;
-        }
-    }
+            Ok(())
+        },
+    )?;
     ensure!(
         optimizer_steps == committed_global_step,
         "throughput metrics account for {optimizer_steps} optimizer steps, checkpoint records {committed_global_step}"
@@ -835,7 +1063,6 @@ pub fn metric_log_digests(
         validate_identifier("expected run_id", run_id)?;
     }
     let path = path.as_ref();
-    ensure_regular_non_symlink(path, "metric log")?;
     let bytes = read_regular_file_stable(path, "metric log for digest")?;
     metric_log_digests_from_bytes(&bytes, expected_run_id)
         .with_context(|| format!("validate metric log {} for digest", path.display()))
@@ -851,16 +1078,14 @@ pub(crate) fn metric_log_digests_from_bytes(
     if let Some(run_id) = expected_run_id {
         validate_identifier("expected run_id", run_id)?;
     }
-    let state = validate_log_bytes(bytes, expected_run_id)?;
-
     let mut semantic = Sha256::new();
-    for record in decode_validated_records(bytes)? {
-        let Some(value) = semantic_record(&record)? else {
-            continue;
-        };
-        semantic.update(serde_json::to_vec(&canonicalize_json(value))?);
-        semantic.update(b"\n");
-    }
+    let state = visit_validated_records(bytes, expected_run_id, |record| {
+        if let Some(value) = semantic_record(record)? {
+            semantic.update(serde_json::to_vec(&canonicalize_json(value))?);
+            semantic.update(b"\n");
+        }
+        Ok(())
+    })?;
     Ok(MetricLogDigests {
         raw_sha256: hex_sha256(bytes),
         semantic_progress_sha256: format!("{:x}", semantic.finalize()),
@@ -870,63 +1095,205 @@ pub(crate) fn metric_log_digests_from_bytes(
 }
 
 fn read_regular_file_stable(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let before = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect {label} {}", path.display()))?;
-    ensure!(
-        before.is_file() && !before.file_type().is_symlink(),
-        "{label} {} must be a regular non-symlink file",
-        path.display()
-    );
-    let mut file = File::open(path).with_context(|| format!("open {label} {}", path.display()))?;
-    let opened = file.metadata()?;
-    ensure!(opened.is_file(), "{label} must open as a regular file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ensure!(
-            before.dev() == opened.dev() && before.ino() == opened.ino(),
-            "{label} changed while it was opened"
-        );
-    }
-    let after = fs::symlink_metadata(path)?;
-    ensure!(
-        after.is_file() && !after.file_type().is_symlink(),
-        "{label} became a symlink or non-file while it was opened"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ensure!(
-            after.dev() == opened.dev() && after.ino() == opened.ino(),
-            "{label} changed while it was opened"
-        );
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let final_metadata = file.metadata()?;
-    ensure!(
-        final_metadata.len() == bytes.len() as u64,
-        "{label} changed length while it was read"
-    );
+    let mut file = open_existing_metric_file(path, label, false)?;
+    let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, label)?;
+    ensure_open_metric_file_unchanged(&file, path, &stamp, label)?;
     Ok(bytes)
 }
 
-fn decode_validated_records(bytes: &[u8]) -> Result<Vec<MetricRecord>> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
+fn create_empty_metric_file(path: &Path, label: &str) -> Result<File> {
+    let existing = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure_regular_metric_metadata(&metadata, path, label)?;
+            Some(MetricFileStamp::from_metadata(&metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {label} {}", path.display()));
+        }
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if existing.is_none() {
+        options.create_new(true);
     }
+    harden_metric_open_options(&mut options, true);
+    let file = options
+        .open(path)
+        .with_context(|| format!("open {label} {} for initialization", path.display()))?;
+    let opened = opened_metric_file_stamp(&file, label)?;
+    if let Some(existing) = existing {
+        ensure!(
+            opened.same_version(&existing),
+            "{label} {} changed while it was opened for initialization",
+            path.display()
+        );
+    }
+    ensure_metric_path_matches_stamp(path, &opened, label, true)?;
+
+    // Truncate only after the opened descriptor is proven to be the exact
+    // regular file inspected above. A path swap can therefore make creation
+    // fail, but can never redirect truncation into the replacement.
+    ensure_open_metric_file_unchanged(&file, path, &opened, label)?;
+    file.set_len(0)
+        .with_context(|| format!("truncate {label} {}", path.display()))?;
+    let empty = opened_metric_file_stamp(&file, label)?;
     ensure!(
-        bytes.last() == Some(&b'\n'),
-        "metric log ends with a partial record"
+        empty.same_file(&opened) && empty.len == 0,
+        "{label} changed while it was initialized"
     );
-    bytes[..bytes.len() - 1]
-        .split(|byte| *byte == b'\n')
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_slice(line)
-                .with_context(|| format!("decode metric record at line {}", index + 1))
-        })
-        .collect()
+    ensure_metric_path_matches_stamp(path, &empty, label, true)?;
+    into_append_metric_file(file, path, label)
+}
+
+fn open_existing_metric_file(path: &Path, label: &str, append: bool) -> Result<File> {
+    let before = metric_path_stamp(path, label)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if append {
+        options.append(true);
+    }
+    harden_metric_open_options(&mut options, false);
+    let file = options
+        .open(path)
+        .with_context(|| format!("open {label} {}", path.display()))?;
+    let opened = opened_metric_file_stamp(&file, label)?;
+    ensure!(
+        opened.same_version(&before),
+        "{label} {} changed while it was opened",
+        path.display()
+    );
+    ensure_metric_path_matches_stamp(path, &opened, label, true)?;
+    Ok(file)
+}
+
+fn read_open_metric_file_stable(
+    file: &mut File,
+    path: &Path,
+    label: &str,
+) -> Result<(Vec<u8>, MetricFileStamp)> {
+    let before = opened_metric_file_stamp(file, label)?;
+    ensure_metric_path_matches_stamp(path, &before, label, true)?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind opened {label} {}", path.display()))?;
+    let capacity = usize::try_from(before.len).context("metric file length exceeds usize")?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read opened {label} {}", path.display()))?;
+    ensure!(
+        bytes.len() as u64 == before.len,
+        "{label} changed length while it was read"
+    );
+    ensure_open_metric_file_unchanged(file, path, &before, label)?;
+    Ok((bytes, before))
+}
+
+fn ensure_open_metric_file_unchanged(
+    file: &File,
+    path: &Path,
+    expected: &MetricFileStamp,
+    label: &str,
+) -> Result<()> {
+    ensure_metric_path_matches_stamp(path, expected, label, false)?;
+    let current = opened_metric_file_stamp(file, label)?;
+    ensure!(
+        current.same_version(expected),
+        "{label} changed in place while it was being verified"
+    );
+    ensure_metric_path_matches_stamp(path, &current, label, true)
+}
+
+fn metric_path_stamp(path: &Path, label: &str) -> Result<MetricFileStamp> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    ensure_regular_metric_metadata(&metadata, path, label)?;
+    Ok(MetricFileStamp::from_metadata(&metadata))
+}
+
+fn opened_metric_file_stamp(file: &File, label: &str) -> Result<MetricFileStamp> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect opened {label}"))?;
+    ensure!(metadata.is_file(), "opened {label} must be a regular file");
+    Ok(MetricFileStamp::from_metadata(&metadata))
+}
+
+fn ensure_regular_metric_metadata(metadata: &fs::Metadata, path: &Path, label: &str) -> Result<()> {
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{label} {} must be a regular non-symlink file",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_metric_path_matches_stamp(
+    path: &Path,
+    expected: &MetricFileStamp,
+    label: &str,
+    require_same_version: bool,
+) -> Result<()> {
+    let current = metric_path_stamp(path, label)?;
+    ensure!(
+        current.same_file(expected),
+        "{label} {} was replaced while it was open",
+        path.display()
+    );
+    if require_same_version {
+        ensure!(
+            current.same_version(expected),
+            "{label} {} changed in place while it was open",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn harden_metric_open_options(options: &mut OpenOptions, creating: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        if creating {
+            options.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = creating;
+}
+
+#[cfg(unix)]
+fn into_append_metric_file(file: File, path: &Path, label: &str) -> Result<File> {
+    use std::os::fd::AsRawFd;
+
+    let initialized = opened_metric_file_stamp(&file, label)?;
+    ensure_metric_path_matches_stamp(path, &initialized, label, true)?;
+    // SAFETY: `file` owns this descriptor throughout both fcntl calls. F_GETFL
+    // and F_SETFL do not consume it; O_APPEND is a supported status flag.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("read opened {label} descriptor flags"));
+    }
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_APPEND) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("set opened {label} descriptor append-only"));
+    }
+    ensure_open_metric_file_unchanged(&file, path, &initialized, label)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn into_append_metric_file(file: File, path: &Path, label: &str) -> Result<File> {
+    let initialized = opened_metric_file_stamp(&file, label)?;
+    let appended = open_existing_metric_file(path, label, true)?;
+    let reopened = opened_metric_file_stamp(&appended, label)?;
+    ensure!(
+        reopened.same_version(&initialized),
+        "{label} changed while it was reopened for append"
+    );
+    Ok(appended)
 }
 
 fn seconds_to_nanoseconds(seconds: f64) -> Result<u64> {
@@ -1016,13 +1383,15 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_open_log(file: &mut File, expected_run_id: Option<&str>) -> Result<MetricLogState> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).context("read metric log")?;
-    validate_log_bytes(&bytes, expected_run_id)
+fn validate_log_bytes(bytes: &[u8], expected_run_id: Option<&str>) -> Result<MetricLogState> {
+    visit_validated_records(bytes, expected_run_id, |_| Ok(()))
 }
 
-fn validate_log_bytes(bytes: &[u8], expected_run_id: Option<&str>) -> Result<MetricLogState> {
+fn visit_validated_records(
+    bytes: &[u8],
+    expected_run_id: Option<&str>,
+    mut visitor: impl FnMut(&MetricRecord) -> Result<()>,
+) -> Result<MetricLogState> {
     if bytes.is_empty() {
         return Ok(MetricLogState::default());
     }
@@ -1054,6 +1423,8 @@ fn validate_log_bytes(bytes: &[u8], expected_run_id: Option<&str>) -> Result<Met
                 record.run_id
             );
         }
+        visitor(&record)
+            .with_context(|| format!("process metric record at line {}", line_index + 1))?;
         advance_state(&mut state, &record)?;
     }
     Ok(state)
@@ -1561,32 +1932,6 @@ fn validate_sha256(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_symlink_if_present(path: &Path, label: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(
-                !metadata.file_type().is_symlink(),
-                "{label} {} must not be a symlink",
-                path.display()
-            );
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("inspect {label} {}", path.display())),
-    }
-}
-
-fn ensure_regular_non_symlink(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect {label} {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} {} must be a regular non-symlink file",
-        path.display()
-    );
-    Ok(())
-}
-
 fn finite(name: &str, value: f64) -> Result<()> {
     ensure!(value.is_finite(), "{name} must be finite");
     Ok(())
@@ -1771,8 +2116,64 @@ mod tests {
 
         assert!(MetricWriter::create(&link, "run-a").is_err());
         assert!(MetricWriter::resume(&link, "run-a").is_err());
+        assert!(MetricWriter::resume_from_checkpoint(&link, "run-a", 0, 0).is_err());
+        assert!(MetricWriter::resume_exact_prefix(&link, "run-a", 0, None).is_err());
         assert!(validate_metric_log(&link, None).is_err());
+        assert!(validate_metric_prefix(&link, 0, 0).is_err());
+        assert!(validate_metric_snapshot(&link, 0, 0).is_err());
         assert!(fs::read(&target).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_metric_handle_detects_path_replacement_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        {
+            let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+            writer.append_at(context(1), throughput(), 100).unwrap();
+            writer.sync_all().unwrap();
+        }
+
+        let mut opened = open_existing_metric_file(&path, "metric log", true).unwrap();
+        let (verified, stamp) =
+            read_open_metric_file_stable(&mut opened, &path, "metric log").unwrap();
+        let displaced = directory.path().join("displaced.jsonl");
+        fs::rename(&path, &displaced).unwrap();
+        fs::write(&path, &verified).unwrap();
+        let replacement_before = fs::read(&path).unwrap();
+
+        let error = ensure_open_metric_file_unchanged(&opened, &path, &stamp, "metric log")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("replaced"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), replacement_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_metric_handle_detects_same_length_in_place_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        {
+            let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+            writer.append_at(context(1), throughput(), 100).unwrap();
+            writer.sync_all().unwrap();
+        }
+
+        let mut opened = open_existing_metric_file(&path, "metric log", true).unwrap();
+        let (verified, stamp) =
+            read_open_metric_file_stable(&mut opened, &path, "metric log").unwrap();
+        let mut mutator = OpenOptions::new().write(true).open(&path).unwrap();
+        mutator.seek(SeekFrom::Start(0)).unwrap();
+        mutator.write_all(b"[").unwrap();
+        mutator.sync_all().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), verified.len() as u64);
+
+        let error = ensure_open_metric_file_unchanged(&opened, &path, &stamp, "metric log")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed in place"), "{error}");
     }
 
     #[test]
@@ -1799,6 +2200,97 @@ mod tests {
             validate_metric_log(&path, Some("run-a")).unwrap().records,
             2
         );
+    }
+
+    #[test]
+    fn read_only_checkpoint_prefix_validation_rejects_nul_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        {
+            let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+            writer.append_at(context(1), throughput(), 100).unwrap();
+            writer.sync_all().unwrap();
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] = 0;
+        fs::write(&path, bytes).unwrap();
+
+        assert!(validate_metric_prefix(&path, 1, 1).is_err());
+    }
+
+    #[test]
+    fn immutable_metric_snapshot_rejects_uncommitted_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        {
+            let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+            writer.append_at(context(1), throughput(), 100).unwrap();
+            writer.append_at(context(2), throughput(), 101).unwrap();
+            writer.sync_all().unwrap();
+        }
+
+        validate_metric_prefix(&path, 1, 1).unwrap();
+        let error = validate_metric_snapshot(&path, 1, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uncommitted tail"), "{error}");
+        validate_metric_snapshot(&path, 2, 2).unwrap();
+    }
+
+    #[test]
+    fn committed_prefix_and_snapshot_can_be_bound_to_the_expected_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        {
+            let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+            writer.append_at(context(1), throughput(), 100).unwrap();
+            writer.sync_all().unwrap();
+        }
+
+        validate_metric_prefix_for_run(&path, "run-a", 1, 1).unwrap();
+        validate_metric_snapshot_for_run(&path, "run-a", 1, 1).unwrap();
+        let prefix_error = format!(
+            "{:#}",
+            validate_metric_prefix_for_run(&path, "run-b", 1, 1).unwrap_err()
+        );
+        assert!(
+            prefix_error.contains("does not match requested"),
+            "{prefix_error}"
+        );
+        let snapshot_error = format!(
+            "{:#}",
+            validate_metric_snapshot_for_run(&path, "run-b", 1, 1).unwrap_err()
+        );
+        assert!(
+            snapshot_error.contains("does not match requested"),
+            "{snapshot_error}"
+        );
+    }
+
+    #[test]
+    fn stale_initial_writer_cannot_create_a_sparse_hole_after_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let mut stale = MetricWriter::create(&path, "run-a").unwrap();
+        stale.append_at(context(1), throughput(), 100).unwrap();
+        stale.sync_all().unwrap();
+
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        stale.append_at(context(2), throughput(), 101).unwrap();
+        stale.sync_all().unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            !bytes.contains(&0),
+            "stale descriptor created a sparse hole"
+        );
+        assert_eq!(bytes.first(), Some(&b'{'));
     }
 
     #[test]

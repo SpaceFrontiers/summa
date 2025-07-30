@@ -21,6 +21,10 @@ HERMES_TRAIN_COMMAND=(
   # --sleep-runtime /opt/hermes-run/sleep-runtime.json
   # --sleep-runtime-sha256 sha256:replace-with-the-runtime-file-digest
 )
+# The supervisor runs `<binary> verify-checkpoint` before trusting any local or
+# downloaded generation. This defaults to HERMES_TRAIN_COMMAND[0]; set it only
+# when the training command starts through a wrapper such as `env` or `cargo`.
+# HERMES_TRAIN_CHECKPOINT_VERIFIER_BIN=/opt/hermes-run/bin/hermes-train
 
 # A failed trainer is resumed indefinitely by default. Set a positive value to
 # stop after that many retries so a boot-time service can apply its own policy.

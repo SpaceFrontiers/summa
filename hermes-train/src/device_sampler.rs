@@ -643,7 +643,11 @@ mod tests {
         let started = Instant::now();
         let mut sampler =
             NvidiaSmiSampler::start_with_program(config, program.as_os_str()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Full workspace runs exercise several CPU-heavy index tests in
+        // parallel. Allow scheduler contention without weakening the hang
+        // check: the deliberately stuck helper sleeps for 30 seconds.
+        let timeout = Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
         loop {
             let drain = sampler.drain();
             if drain.diagnostics.iter().any(|diagnostic| {
@@ -658,7 +662,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         drop(sampler);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < timeout);
     }
 
     #[cfg(unix)]

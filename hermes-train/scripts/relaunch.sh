@@ -21,6 +21,7 @@ readonly -a OBSOLETE_FLAT_CHECKPOINT_FILES=(
   adamw-state.bpk
   muon-state.bpk
   training-state.json
+  training-accounting.json
 )
 
 log() {
@@ -82,6 +83,7 @@ readonly WANDB_PYTHON=${HERMES_TRAIN_WANDB_PYTHON:-python3}
 readonly WANDB_SCRIPT=${HERMES_TRAIN_WANDB_SCRIPT:-"$RELAUNCH_SCRIPT_DIR/wandb_tail.py"}
 readonly WANDB_RESTART_DELAY=${HERMES_TRAIN_WANDB_RESTART_DELAY:-15}
 readonly WANDB_FLUSH_DELAY=${HERMES_TRAIN_WANDB_FLUSH_DELAY:-6}
+readonly CHECKPOINT_VERIFIER_BIN=${HERMES_TRAIN_CHECKPOINT_VERIFIER_BIN:-${HERMES_TRAIN_COMMAND[0]}}
 
 is_nonnegative_integer() {
   [[ $1 =~ ^[0-9]+$ ]]
@@ -117,6 +119,8 @@ fi
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python is required: $PYTHON_BIN"
 command -v "${HERMES_TRAIN_COMMAND[0]}" >/dev/null 2>&1 \
   || die "trainer is unavailable: ${HERMES_TRAIN_COMMAND[0]}"
+command -v "$CHECKPOINT_VERIFIER_BIN" >/dev/null 2>&1 \
+  || die "checkpoint verifier is unavailable: $CHECKPOINT_VERIFIER_BIN"
 if [[ -n "$REMOTE" && $REMOTE != file://* ]]; then
   [[ $REMOTE == gs://* ]] || die "remote URL must use gs:// or file://"
   command -v "$GCLOUD_BIN" >/dev/null 2>&1 || die "gcloud is required for $REMOTE"
@@ -139,11 +143,15 @@ elif ! shlock -f "$LOCK_FILE" -p "$$"; then
 fi
 printf '%s\n' "$$" >"$STATE_DIR/supervisor.pid"
 
-# Keep checkpoint parsing and hashing in one implementation. Commands print only
-# path-safe, whitespace-free descriptors for Bash to consume.
+# This helper owns transport envelopes, safe paths, immutable copying, and
+# hashing. The trainer's `verify-checkpoint` command remains the authority for
+# exact-resume checkpoint contents. Commands print only path-safe,
+# whitespace-free descriptors for Bash to consume.
 checkpoint_tool() {
   "$PYTHON_BIN" - "$@" <<'PY'
 import hashlib
+import errno
+import fcntl
 import json
 import os
 import secrets
@@ -163,21 +171,7 @@ REMOTE_POINTER_KEYS = {
     "artifact_manifest_bytes",
     "artifact_manifest_sha256",
 }
-MANIFEST_KEYS = {
-    "version",
-    "training_state_version",
-    "global_step",
-    "phase",
-    "phase_id",
-    "files",
-}
 FILE_KEYS = {"path", "bytes", "sha256"}
-REQUIRED_FILES = {
-    "weights.safetensors",
-    "adamw-state.bpk",
-    "muon-state.bpk",
-    "training-state.json",
-}
 ARTIFACT_ROOT_SPEC_KEYS = {
     "version",
     "sleep_runtime_sha256",
@@ -278,25 +272,11 @@ def real_directory(path, label):
 
 
 def load_json_file(path, label):
-    regular_file(path, label)
-    try:
-        with open(path, "rb") as handle:
-            raw = handle.read()
-        def unique_object(pairs):
-            value = {}
-            for key, item in pairs:
-                if key in value:
-                    fail(f"{label} repeats JSON field {key!r}")
-                value[key] = item
-            return value
-
-        return json.loads(raw, object_pairs_hook=unique_object), raw
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f"{label} is invalid JSON: {error}")
+    _, _, raw = read_stable_regular_file(path, label, capture=True)
+    return load_unique_json_bytes(raw, label), raw
 
 
-def read_pointer(path, remote=False):
-    pointer, _ = load_json_file(path, "checkpoint current pointer")
+def parse_pointer(pointer, remote=False):
     expected_keys = REMOTE_POINTER_KEYS if remote else LOCAL_POINTER_KEYS
     if not isinstance(pointer, dict) or set(pointer) != expected_keys:
         fail("checkpoint current pointer has an invalid schema")
@@ -343,65 +323,50 @@ def read_pointer(path, remote=False):
     )
 
 
-def read_manifest(path, generation, expected_digest):
+def read_pointer(path, remote=False):
+    pointer, _ = load_json_file(path, "checkpoint current pointer")
+    return parse_pointer(pointer, remote=remote)
+
+
+def read_manifest_transport(path, generation, expected_digest):
+    """Extract only safe download paths from a content-addressed manifest.
+
+    The Rust verifier owns the checkpoint schema and authenticates every
+    materialized file. This parser deliberately knows only the transport
+    envelope needed to fetch those files without path traversal.
+    """
     manifest, raw = load_json_file(path, "checkpoint generation manifest")
     actual_digest = hashlib.sha256(raw).hexdigest()
     if actual_digest != expected_digest:
         fail("checkpoint generation manifest digest mismatch")
     if generation != "sha256-" + actual_digest:
         fail("checkpoint generation name and manifest digest differ")
-    if not isinstance(manifest, dict) or set(manifest) != MANIFEST_KEYS:
-        fail("checkpoint generation manifest has an invalid schema")
-    version(manifest["version"], 1, "checkpoint generation manifest")
-    version(
-        manifest["training_state_version"],
-        2,
-        "checkpoint generation training state",
-    )
-    integer(manifest["global_step"], "checkpoint manifest global_step")
-    integer(manifest["phase"], "checkpoint manifest phase")
-    if not isinstance(manifest["phase_id"], str) or not manifest["phase_id"].strip():
-        fail("checkpoint manifest phase_id is empty")
-    entries = manifest["files"]
+    if not isinstance(manifest, dict):
+        fail("checkpoint generation manifest is not an object")
+    entries = manifest.get("files")
     if not isinstance(entries, list):
         fail("checkpoint manifest files is not an array")
     paths = []
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != FILE_KEYS:
-            fail("checkpoint manifest file has an invalid schema")
-        path_value = safe_path(entry["path"])
+        if not isinstance(entry, dict):
+            fail("checkpoint manifest file is not an object")
+        path_value = safe_path(entry.get("path"))
         if path_value == "generation-manifest.json":
             fail("checkpoint manifest cannot list itself")
-        integer(entry["bytes"], f"checkpoint file {path_value!r} size")
-        digest(entry["sha256"], f"checkpoint file {path_value!r} digest")
         paths.append(path_value)
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         fail("checkpoint manifest file paths are not unique and sorted")
-    missing = sorted(REQUIRED_FILES.difference(paths))
-    if missing:
-        fail(f"checkpoint generation is missing required file {missing[0]!r}")
-    return manifest
+    return paths
 
 
-def hash_file(path):
-    hasher = hashlib.sha256()
-    length = 0
-    with open(path, "rb") as handle:
-        while True:
-            block = handle.read(1024 * 1024)
-            if not block:
-                break
-            length += len(block)
-            hasher.update(block)
-    return length, hasher.hexdigest()
-
-
-def stable_file_descriptor(path, label):
-    """Hash a regular file while rejecting replacement or in-place mutation."""
+def read_stable_regular_file(path, label, capture=False):
+    """Read/hash one opened regular file while rejecting path or byte races."""
     metadata = regular_file(path, label)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -410,33 +375,41 @@ def stable_file_descriptor(path, label):
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             fail(f"{label} is not a regular file")
-        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(opened) != identity(metadata):
             fail(f"{label} changed while it was opened")
         hasher = hashlib.sha256()
         length = 0
+        chunks = [] if capture else None
         while True:
             block = os.read(descriptor, 1024 * 1024)
             if not block:
                 break
             length += len(block)
             hasher.update(block)
+            if chunks is not None:
+                chunks.append(block)
         after = os.fstat(descriptor)
         current = regular_file(path, label)
-        identity = (opened.st_dev, opened.st_ino)
-        if identity != (after.st_dev, after.st_ino) or identity != (
-            current.st_dev,
-            current.st_ino,
-        ):
-            fail(f"{label} was replaced while it was hashed")
-        if (
-            opened.st_size != after.st_size
-            or opened.st_mtime_ns != after.st_mtime_ns
-            or length != after.st_size
-        ):
+        if identity(opened) != identity(after) or identity(opened) != identity(current):
             fail(f"{label} changed while it was hashed")
-        return length, hasher.hexdigest()
+        if length != after.st_size:
+            fail(f"{label} changed while it was hashed")
+        return length, hasher.hexdigest(), None if chunks is None else b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def stable_file_descriptor(path, label):
+    length, sha256, _ = read_stable_regular_file(path, label)
+    return length, sha256
 
 
 def load_unique_json_bytes(raw, label):
@@ -452,6 +425,656 @@ def load_unique_json_bytes(raw, label):
         return json.loads(raw, object_pairs_hook=unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"{label} is invalid JSON: {error}")
+
+
+def file_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def retained_directory_fd(value, label="file remote root"):
+    try:
+        inherited = int(value)
+    except (TypeError, ValueError):
+        fail(f"{label} descriptor is invalid")
+    try:
+        descriptor = os.dup(inherited)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        fail(f"{label} descriptor is unavailable: {error}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        fail(f"{label} descriptor is not a directory")
+    return descriptor
+
+
+def directory_open_flags():
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    return flags
+
+
+def regular_open_flags():
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    return flags
+
+
+def open_child_directory(parent, name, label):
+    try:
+        descriptor = os.open(name, directory_open_flags(), dir_fd=parent)
+    except OSError as error:
+        fail(f"{label} is unavailable or unsafe: {error}")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        fail(f"{label} is not a real directory")
+    return descriptor
+
+
+def open_anchored_parent(root, relative, create=False):
+    relative = safe_path(relative)
+    parts = relative.split("/")
+    current = os.dup(root)
+    try:
+        for index, component in enumerate(parts[:-1]):
+            label = "/".join(parts[: index + 1])
+            try:
+                child = os.open(
+                    component,
+                    directory_open_flags(),
+                    dir_fd=current,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current)
+                    os.fsync(current)
+                except FileExistsError:
+                    pass
+                child = open_child_directory(current, component, label)
+            except OSError as error:
+                fail(f"file remote directory {label!r} is unsafe: {error}")
+            metadata = os.fstat(child)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(child)
+                fail(f"file remote directory {label!r} is not a real directory")
+            os.close(current)
+            current = child
+        return current, parts[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def ensure_anchored_directory(root, relative):
+    parent, leaf = open_anchored_parent(root, relative, create=True)
+    try:
+        try:
+            descriptor = os.open(leaf, directory_open_flags(), dir_fd=parent)
+        except FileNotFoundError:
+            try:
+                os.mkdir(leaf, 0o700, dir_fd=parent)
+                os.fsync(parent)
+            except FileExistsError:
+                pass
+            descriptor = open_child_directory(parent, leaf, relative)
+        except OSError as error:
+            fail(f"file remote directory {relative!r} is unsafe: {error}")
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            fail(f"file remote directory {relative!r} is not a real directory")
+        return descriptor
+    finally:
+        os.close(parent)
+
+
+def anchored_entry_metadata(root, relative):
+    parent, leaf = open_anchored_parent(root, relative)
+    try:
+        try:
+            return os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+    finally:
+        os.close(parent)
+
+
+def anchored_entry_kind(root, relative):
+    metadata = anchored_entry_metadata(root, relative)
+    if metadata is None:
+        return "missing"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "symlink"
+    if stat.S_ISREG(metadata.st_mode):
+        return "file"
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    return "other"
+
+
+def open_anchored_regular(root, relative, label):
+    parent, leaf = open_anchored_parent(root, relative)
+    try:
+        before = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        os.close(parent)
+        fail(f"{label} is unavailable")
+    if not stat.S_ISREG(before.st_mode):
+        os.close(parent)
+        fail(f"{label} is not a regular file")
+    try:
+        descriptor = os.open(leaf, regular_open_flags(), dir_fd=parent)
+    except OSError as error:
+        os.close(parent)
+        fail(f"{label} cannot be opened safely: {error}")
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or file_identity(opened) != file_identity(before):
+        os.close(descriptor)
+        os.close(parent)
+        fail(f"{label} changed while it was opened")
+    return parent, leaf, descriptor, opened
+
+
+def read_anchored_regular(root, relative, label):
+    parent, leaf, descriptor, opened = open_anchored_regular(root, relative, label)
+    try:
+        chunks = []
+        hasher = hashlib.sha256()
+        length = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+            hasher.update(block)
+            length += len(block)
+        after = os.fstat(descriptor)
+        current = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if file_identity(after) != file_identity(opened) or file_identity(current) != file_identity(opened):
+            fail(f"{label} changed while it was read")
+        if length != after.st_size:
+            fail(f"{label} changed while it was read")
+        return b"".join(chunks), length, hasher.hexdigest()
+    finally:
+        os.close(descriptor)
+        os.close(parent)
+
+
+def write_all(descriptor, block):
+    offset = 0
+    while offset < len(block):
+        offset += os.write(descriptor, block[offset:])
+
+
+def copy_open_regular(source, destination, label):
+    hasher = hashlib.sha256()
+    length = 0
+    while True:
+        block = os.read(source, 1024 * 1024)
+        if not block:
+            break
+        write_all(destination, block)
+        hasher.update(block)
+        length += len(block)
+    return length, hasher.hexdigest()
+
+
+def local_atomic_destination(destination, writer):
+    parent_path = os.path.dirname(destination)
+    real_directory(parent_path, "local copy destination directory")
+    temporary = os.path.join(
+        parent_path,
+        f".hermes-fd-copy-{os.getpid()}-{secrets.token_hex(8)}.tmp",
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        writer(descriptor)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, destination)
+        parent = os.open(parent_path, directory_open_flags())
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def copy_anchored_out(root, relative, destination):
+    label = f"file remote object {relative!r}"
+    parent, leaf, source, opened = open_anchored_regular(root, relative, label)
+    try:
+        observed = None
+
+        def writer(output):
+            nonlocal observed
+            observed = copy_open_regular(source, output, label)
+            after = os.fstat(source)
+            current = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+            if file_identity(after) != file_identity(opened) or file_identity(current) != file_identity(opened):
+                fail(f"{label} changed while it was copied")
+            if observed[0] != after.st_size:
+                fail(f"{label} changed while it was copied")
+
+        local_atomic_destination(destination, writer)
+        if observed is None:
+            fail(f"{label} was not copied")
+    finally:
+        os.close(source)
+        os.close(parent)
+
+
+def open_stable_source(path, label):
+    before = regular_file(path, label)
+    try:
+        descriptor = os.open(path, regular_open_flags())
+    except OSError as error:
+        fail(f"{label} cannot be opened safely: {error}")
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or file_identity(opened) != file_identity(before):
+        os.close(descriptor)
+        fail(f"{label} changed while it was opened")
+    return descriptor, opened
+
+
+def create_anchored_temporary(parent, prefix):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for _attempt in range(128):
+        name = f".{prefix}-{os.getpid()}-{secrets.token_hex(8)}.tmp"
+        try:
+            return name, os.open(name, flags, 0o600, dir_fd=parent)
+        except FileExistsError:
+            continue
+    fail("cannot allocate an anchored temporary file")
+
+
+def hash_anchored_leaf(parent, leaf, label):
+    before = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        fail(f"{label} is not a regular file")
+    descriptor = os.open(leaf, regular_open_flags(), dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        if file_identity(opened) != file_identity(before):
+            fail(f"{label} changed while it was opened")
+        hasher = hashlib.sha256()
+        length = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            length += len(block)
+            hasher.update(block)
+        after = os.fstat(descriptor)
+        current = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if file_identity(after) != file_identity(opened) or file_identity(current) != file_identity(opened):
+            fail(f"{label} changed while it was hashed")
+        return length, hasher.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def copy_into_anchored(
+    root,
+    source_path,
+    relative,
+    immutable=False,
+    expected_bytes=None,
+    expected_sha256=None,
+):
+    label = f"file remote upload source {source_path!r}"
+    source, opened = open_stable_source(source_path, label)
+    parent, leaf = open_anchored_parent(root, relative, create=True)
+    temporary = None
+    temporary_descriptor = None
+    try:
+        temporary, temporary_descriptor = create_anchored_temporary(parent, "upload")
+        observed_bytes, observed_sha256 = copy_open_regular(source, temporary_descriptor, label)
+        after = os.fstat(source)
+        current = regular_file(source_path, label)
+        if file_identity(after) != file_identity(opened) or file_identity(current) != file_identity(opened):
+            fail(f"{label} changed while it was copied")
+        if observed_bytes != after.st_size:
+            fail(f"{label} changed while it was copied")
+        if expected_bytes is not None and (
+            observed_bytes != expected_bytes or observed_sha256 != expected_sha256
+        ):
+            fail("file remote upload source differs from its expected size or digest")
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
+
+        if immutable:
+            try:
+                existing = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if not stat.S_ISREG(existing.st_mode):
+                    fail(f"immutable file remote object {relative!r} is not a regular file")
+                length, digest_value = hash_anchored_leaf(
+                    parent, leaf, f"immutable file remote object {relative!r}"
+                )
+                if length != expected_bytes or digest_value != expected_sha256:
+                    fail(f"immutable file remote object {relative!r} contains different bytes")
+                return
+            try:
+                os.link(
+                    temporary,
+                    leaf,
+                    src_dir_fd=parent,
+                    dst_dir_fd=parent,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                length, digest_value = hash_anchored_leaf(
+                    parent, leaf, f"immutable file remote object {relative!r}"
+                )
+                if length != expected_bytes or digest_value != expected_sha256:
+                    fail(f"immutable file remote object {relative!r} raced with different bytes")
+        else:
+            os.replace(temporary, leaf, src_dir_fd=parent, dst_dir_fd=parent)
+            temporary = None
+        os.fsync(parent)
+    finally:
+        os.close(source)
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except OSError:
+                pass
+        os.close(parent)
+
+
+def remove_anchored_entry_at(parent, name):
+    try:
+        metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+        directory = open_child_directory(parent, name, f"removal directory {name!r}")
+        try:
+            for child in os.listdir(directory):
+                remove_anchored_entry_at(directory, child)
+        finally:
+            os.close(directory)
+        os.rmdir(name, dir_fd=parent)
+    else:
+        os.unlink(name, dir_fd=parent)
+
+
+def remove_anchored_entry(root, relative):
+    parent, leaf = open_anchored_parent(root, relative)
+    try:
+        remove_anchored_entry_at(parent, leaf)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def copy_regular_between_directories(source_parent, destination_parent, name, label):
+    before = os.stat(name, dir_fd=source_parent, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        fail(f"{label} is not a regular file")
+    source = os.open(name, regular_open_flags(), dir_fd=source_parent)
+    destination = None
+    try:
+        opened = os.fstat(source)
+        if file_identity(opened) != file_identity(before):
+            fail(f"{label} changed while it was opened")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        destination = os.open(name, flags, 0o600, dir_fd=destination_parent)
+        observed_bytes, _ = copy_open_regular(source, destination, label)
+        os.fsync(destination)
+        after = os.fstat(source)
+        current = os.stat(name, dir_fd=source_parent, follow_symlinks=False)
+        if file_identity(after) != file_identity(opened) or file_identity(current) != file_identity(opened):
+            fail(f"{label} changed while it was copied")
+        if observed_bytes != after.st_size:
+            fail(f"{label} changed while it was copied")
+    finally:
+        os.close(source)
+        if destination is not None:
+            os.close(destination)
+
+
+def copy_directory_tree(source, destination, label):
+    opened = os.fstat(source)
+    if not stat.S_ISDIR(opened.st_mode):
+        fail(f"{label} is not a directory")
+    names = sorted(os.listdir(source))
+    if not names:
+        fail(f"{label} contains an empty directory")
+    for name in names:
+        safe_path(name)
+        metadata = os.stat(name, dir_fd=source, follow_symlinks=False)
+        child_label = f"{label}/{name}"
+        if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+            os.mkdir(name, 0o700, dir_fd=destination)
+            source_child = open_child_directory(source, name, child_label)
+            destination_child = open_child_directory(destination, name, child_label)
+            try:
+                copy_directory_tree(source_child, destination_child, child_label)
+                os.fsync(destination_child)
+            finally:
+                os.close(source_child)
+                os.close(destination_child)
+        elif stat.S_ISREG(metadata.st_mode):
+            copy_regular_between_directories(source, destination, name, child_label)
+        else:
+            fail(f"{child_label} is not a regular file or real directory")
+    after = os.fstat(source)
+    if file_identity(after) != file_identity(opened):
+        fail(f"{label} changed while it was copied")
+
+
+def stage_anchored_tree(root, source_path, parent_relative):
+    source_metadata = os.stat(source_path, follow_symlinks=False)
+    if not stat.S_ISDIR(source_metadata.st_mode):
+        fail("file remote tree source is not a real directory")
+    source = os.open(source_path, directory_open_flags())
+    opened_source = os.fstat(source)
+    if file_identity(opened_source) != file_identity(source_metadata):
+        os.close(source)
+        fail("file remote tree source changed while it was opened")
+    parent = ensure_anchored_directory(root, parent_relative)
+    staging = None
+    staging_descriptor = None
+    try:
+        for _attempt in range(128):
+            candidate = f".upload-{os.getpid()}-{secrets.token_hex(8)}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent)
+                staging = candidate
+                break
+            except FileExistsError:
+                continue
+        if staging is None:
+            fail("cannot allocate file remote generation staging directory")
+        staging_descriptor = open_child_directory(parent, staging, "generation staging")
+        copy_directory_tree(source, staging_descriptor, "checkpoint generation source")
+        os.fsync(staging_descriptor)
+        current_source = os.stat(source_path, follow_symlinks=False)
+        if file_identity(current_source) != file_identity(opened_source):
+            fail("file remote tree source changed while it was copied")
+        os.fsync(parent)
+        return f"{safe_path(parent_relative)}/{staging}"
+    except BaseException:
+        if staging is not None:
+            remove_anchored_entry_at(parent, staging)
+            os.fsync(parent)
+        raise
+    finally:
+        os.close(source)
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+        os.close(parent)
+
+
+def rename_anchored_tree(root, source_relative, destination_relative, replace=False):
+    source_parent, source_leaf = open_anchored_parent(root, source_relative)
+    destination_parent, destination_leaf = open_anchored_parent(
+        root, destination_relative, create=True
+    )
+    quarantine = None
+    try:
+        source_metadata = os.stat(
+            source_leaf, dir_fd=source_parent, follow_symlinks=False
+        )
+        if not stat.S_ISDIR(source_metadata.st_mode):
+            fail("file remote staged generation is not a real directory")
+        destination_metadata = None
+        try:
+            destination_metadata = os.stat(
+                destination_leaf,
+                dir_fd=destination_parent,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        if destination_metadata is not None:
+            if not replace:
+                fail("file remote generation destination already exists")
+            quarantine = f".corrupt-{os.getpid()}-{secrets.token_hex(8)}"
+            os.rename(
+                destination_leaf,
+                quarantine,
+                src_dir_fd=destination_parent,
+                dst_dir_fd=destination_parent,
+            )
+        try:
+            os.rename(
+                source_leaf,
+                destination_leaf,
+                src_dir_fd=source_parent,
+                dst_dir_fd=destination_parent,
+            )
+        except BaseException:
+            if quarantine is not None:
+                os.rename(
+                    quarantine,
+                    destination_leaf,
+                    src_dir_fd=destination_parent,
+                    dst_dir_fd=destination_parent,
+                )
+                quarantine = None
+            raise
+        os.fsync(source_parent)
+        if destination_parent != source_parent:
+            os.fsync(destination_parent)
+        if quarantine is not None:
+            remove_anchored_entry_at(destination_parent, quarantine)
+            quarantine = None
+            os.fsync(destination_parent)
+    finally:
+        if quarantine is not None:
+            try:
+                remove_anchored_entry_at(destination_parent, quarantine)
+            except BaseException:
+                pass
+        os.close(source_parent)
+        os.close(destination_parent)
+
+
+def verify_retained_storage_root(root, path):
+    opened = os.fstat(root)
+    current = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISDIR(current.st_mode) or file_identity(opened) != file_identity(current):
+        fail("file remote root changed while its retained descriptor was opened")
+
+
+def read_anchored_json(root, relative, label):
+    raw, _, _ = read_anchored_regular(root, relative, label)
+    return load_unique_json_bytes(raw, label), raw
+
+
+def compare_remote_pointer_values(candidate, existing):
+    parse_pointer(candidate, remote=True)
+    parse_pointer(existing, remote=True)
+    candidate_step = integer(candidate["global_step"], "candidate remote step")
+    existing_step = integer(existing["global_step"], "existing remote step")
+    if existing_step > candidate_step:
+        return "newer"
+    if existing_step == candidate_step:
+        if existing["generation"] != candidate["generation"]:
+            fail(
+                "equal-step remote checkpoint fork: "
+                f"{existing['generation']} versus {candidate['generation']}"
+            )
+        if existing != candidate:
+            fail("same-generation remote release envelope differs from candidate")
+        return "same"
+    return "advance"
+
+
+def publish_anchored_remote_pointer(root, candidate_path):
+    candidate, _ = load_json_file(candidate_path, "candidate remote pointer")
+    parse_pointer(candidate, remote=True)
+    lock_flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        lock_flags |= os.O_NOFOLLOW
+    lock = os.open(".hermes-current.lock", lock_flags, 0o600, dir_fd=root)
+    try:
+        if not stat.S_ISREG(os.fstat(lock).st_mode):
+            fail("file remote pointer lock is not a regular file")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        kind = anchored_entry_kind(root, "current.json")
+        if kind != "missing":
+            if kind != "file":
+                fail("file remote current pointer is not a regular file")
+            existing, _ = read_anchored_json(
+                root, "current.json", "existing file remote pointer"
+            )
+            state = compare_remote_pointer_values(candidate, existing)
+            if state in ("newer", "same"):
+                return state
+        copy_into_anchored(root, candidate_path, "current.json")
+        published, _ = read_anchored_json(
+            root, "current.json", "published file remote pointer"
+        )
+        if published != candidate:
+            fail("published file remote pointer differs from its candidate")
+        return "published"
+    finally:
+        os.close(lock)
 
 
 def sha256_reference(value, label):
@@ -1512,95 +2135,26 @@ def restore_artifact_snapshot(spec, manifest, snapshot_root):
             install_immutable(source, destination, entry["bytes"], entry["sha256"])
 
 
-def actual_generation_paths(root):
-    paths = []
-    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
-        for name in names:
-            child = os.path.join(directory, name)
-            real_directory(child, f"checkpoint directory {child!r}")
-        for name in files:
-            child = os.path.join(directory, name)
-            regular_file(child, f"checkpoint file {child!r}")
-            relative = os.path.relpath(child, root).replace(os.sep, "/")
-            safe_path(relative)
-            if relative != "generation-manifest.json":
-                paths.append(relative)
-    return sorted(paths)
-
-
-def verify_generation(path, generation, expected_digest):
-    real_directory(path, f"checkpoint generation {generation!r}")
-    manifest = read_manifest(
-        os.path.join(path, "generation-manifest.json"), generation, expected_digest
-    )
-    declared = [entry["path"] for entry in manifest["files"]]
-    if actual_generation_paths(path) != declared:
-        fail("checkpoint generation contents do not match its manifest")
-    for entry in manifest["files"]:
-        file_path = os.path.join(path, *entry["path"].split("/"))
-        metadata = regular_file(file_path, f"checkpoint file {entry['path']!r}")
-        if metadata.st_size != entry["bytes"]:
-            fail(f"checkpoint file {entry['path']!r} has the wrong size")
-        length, actual_digest = hash_file(file_path)
-        if length != entry["bytes"] or actual_digest != entry["sha256"]:
-            fail(f"checkpoint file {entry['path']!r} has the wrong SHA-256")
-
-    state, _ = load_json_file(
-        os.path.join(path, "training-state.json"), "checkpoint training state"
-    )
-    if not isinstance(state, dict):
-        fail("checkpoint training state is not an object")
-    version(state.get("version"), 2, "training-state.json")
-    step = integer(state.get("global_step"), "training-state.json global_step")
-    records = integer(state.get("metric_records"), "training-state.json metric_records")
-    if step != manifest["global_step"]:
-        fail("checkpoint training state global_step differs from its manifest")
-    if "phase" in state and state["phase"] != manifest["phase"]:
-        fail("checkpoint training state phase differs from its manifest")
-    if "phase_id" in state and state["phase_id"] != manifest["phase_id"]:
-        fail("checkpoint training state phase_id differs from its manifest")
-
-    authenticated = set(declared)
-    optimizer_states = state.get("optimizer_states")
-    if optimizer_states is not None:
-        if not isinstance(optimizer_states, list):
-            fail("training-state.json optimizer_states is not an array")
-        referenced = []
-        scopes = []
-        for optimizer in optimizer_states:
-            if not isinstance(optimizer, dict):
-                fail("training-state.json has an invalid optimizer state")
-            scope = optimizer.get("scope")
-            if not isinstance(scope, str) or not scope.strip():
-                fail("training-state.json has an empty optimizer scope")
-            scopes.append(scope)
-            for key in ("adamw", "muon"):
-                reference = safe_path(optimizer.get(key))
-                if reference not in authenticated:
-                    fail(f"optimizer state {reference!r} is absent from the manifest")
-                referenced.append(reference)
-            reference = optimizer.get("gradient_accumulator")
-            if reference is not None:
-                reference = safe_path(reference)
-                if reference not in authenticated:
-                    fail(f"optimizer state {reference!r} is absent from the manifest")
-                referenced.append(reference)
-        if len(scopes) != len(set(scopes)) or len(referenced) != len(set(referenced)):
-            fail("training-state.json repeats an optimizer scope or state path")
-    return step, records
-
-
-def validate_metrics(path, committed_records):
-    regular_file(path, "checkpoint metric journal")
-    with open(path, "rb") as handle:
-        complete_records = sum(block.count(b"\n") for block in iter(lambda: handle.read(1024 * 1024), b""))
-    if complete_records < committed_records:
-        fail("metric journal has fewer records than the training checkpoint")
-
-
 def snapshot_metrics(source, committed_records, destination):
     committed_records = integer(committed_records, "committed metric records")
-    regular_file(source, "checkpoint metric journal")
+    source_metadata = regular_file(source, "checkpoint metric journal")
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        source_flags |= os.O_NONBLOCK
+    try:
+        source_descriptor = os.open(source, source_flags)
+    except OSError as error:
+        fail(f"checkpoint metric journal cannot be opened safely: {error}")
+    opened_source = os.fstat(source_descriptor)
+    if (
+        not stat.S_ISREG(opened_source.st_mode)
+        or (opened_source.st_dev, opened_source.st_ino)
+        != (source_metadata.st_dev, source_metadata.st_ino)
+    ):
+        os.close(source_descriptor)
+        fail("checkpoint metric journal changed while it was opened")
     parent = os.path.dirname(destination)
     real_directory(parent, "metric snapshot destination directory")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1608,27 +2162,57 @@ def snapshot_metrics(source, committed_records, destination):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(destination, flags, 0o600)
     copied = 0
+    copied_bytes = 0
+    copied_hasher = hashlib.sha256()
     try:
-        with open(source, "rb") as input_file, os.fdopen(descriptor, "wb") as output:
+        with os.fdopen(source_descriptor, "rb") as input_file, os.fdopen(
+            descriptor, "wb"
+        ) as output:
+            source_descriptor = None
             descriptor = None
             while copied < committed_records:
                 record = input_file.readline()
                 if not record or not record.endswith(b"\n"):
                     fail("metric journal has a missing or torn committed record")
                 output.write(record)
+                copied_bytes += len(record)
+                copied_hasher.update(record)
                 copied += 1
+            # Make the first copy observable/durable before validating it
+            # against a second read of the same opened source descriptor.
             output.flush()
             os.fsync(output.fileno())
+
+            input_file.seek(0)
+            verified_bytes = 0
+            verified_hasher = hashlib.sha256()
+            while verified_bytes < copied_bytes:
+                block = input_file.read(min(1024 * 1024, copied_bytes - verified_bytes))
+                if not block:
+                    fail("checkpoint metric journal was truncated while it was copied")
+                verified_bytes += len(block)
+                verified_hasher.update(block)
+            if (
+                verified_bytes != copied_bytes
+                or verified_hasher.digest() != copied_hasher.digest()
+            ):
+                fail("checkpoint committed metric prefix changed while it was copied")
+
+            after_source = os.fstat(input_file.fileno())
+            current_source = regular_file(source, "checkpoint metric journal")
+            opened_identity = (opened_source.st_dev, opened_source.st_ino)
+            if opened_identity != (after_source.st_dev, after_source.st_ino) or opened_identity != (
+                current_source.st_dev,
+                current_source.st_ino,
+            ):
+                fail("checkpoint metric journal was replaced while it was copied")
+            if after_source.st_size < opened_source.st_size:
+                fail("checkpoint metric journal was truncated while it was copied")
     finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
         if descriptor is not None:
             os.close(descriptor)
-
-
-def pointer_is_remote(path):
-    pointer, _ = load_json_file(path, "checkpoint current pointer")
-    if not isinstance(pointer, dict):
-        fail("checkpoint current pointer is not an object")
-    return pointer.get("version") == 2
 
 
 command = sys.argv[1]
@@ -1700,6 +2284,77 @@ elif command == "restore-artifact-snapshot":
 elif command == "file-descriptor":
     length, observed = stable_file_descriptor(sys.argv[2], "artifact file")
     print(length, observed, sep="\t")
+elif command == "verify-storage-fd":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        verify_retained_storage_root(root, sys.argv[3])
+    finally:
+        os.close(root)
+elif command == "fd-entry-kind":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        print(anchored_entry_kind(root, sys.argv[3]))
+    finally:
+        os.close(root)
+elif command == "fd-copy-out":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        copy_anchored_out(root, sys.argv[3], sys.argv[4])
+    finally:
+        os.close(root)
+elif command == "fd-copy-in":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        copy_into_anchored(root, sys.argv[3], sys.argv[4])
+    finally:
+        os.close(root)
+elif command == "fd-install-immutable":
+    root = retained_directory_fd(sys.argv[2])
+    expected_bytes = integer(int(sys.argv[5]), "immutable file remote size")
+    expected_sha256 = digest(sys.argv[6], "immutable file remote digest")
+    try:
+        copy_into_anchored(
+            root,
+            sys.argv[3],
+            sys.argv[4],
+            immutable=True,
+            expected_bytes=expected_bytes,
+            expected_sha256=expected_sha256,
+        )
+    finally:
+        os.close(root)
+elif command == "fd-stage-tree":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        print(stage_anchored_tree(root, sys.argv[3], sys.argv[4]))
+    finally:
+        os.close(root)
+elif command == "fd-remove-tree":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        remove_anchored_entry(root, sys.argv[3])
+    finally:
+        os.close(root)
+elif command == "fd-rename-tree":
+    root = retained_directory_fd(sys.argv[2])
+    mode = sys.argv[5]
+    if mode not in ("replace", "no-replace"):
+        fail(f"file remote rename mode {mode!r} is invalid")
+    try:
+        rename_anchored_tree(
+            root,
+            sys.argv[3],
+            sys.argv[4],
+            replace=(mode == "replace"),
+        )
+    finally:
+        os.close(root)
+elif command == "fd-publish-pointer":
+    root = retained_directory_fd(sys.argv[2])
+    try:
+        print(publish_anchored_remote_pointer(root, sys.argv[3]))
+    finally:
+        os.close(root)
 elif command == "verify-file":
     expected_bytes = integer(int(sys.argv[3]), "artifact file size")
     expected_digest = digest(sys.argv[4], "artifact file digest")
@@ -1755,74 +2410,10 @@ elif command == "make-local-pointer":
 elif command == "compare-remote-pointers":
     candidate, _ = load_json_file(sys.argv[2], "candidate remote pointer")
     existing, _ = load_json_file(sys.argv[3], "existing remote pointer")
-    read_pointer(sys.argv[2], remote=True)
-    read_pointer(sys.argv[3], remote=True)
-    candidate_step = integer(candidate["global_step"], "candidate remote step")
-    existing_step = integer(existing["global_step"], "existing remote step")
-    if existing_step > candidate_step:
-        print("newer")
-    elif existing_step == candidate_step:
-        if existing["generation"] != candidate["generation"]:
-            fail(
-                "equal-step remote checkpoint fork: "
-                f"{existing['generation']} versus {candidate['generation']}"
-            )
-        if existing != candidate:
-            fail("same-generation remote release envelope differs from candidate")
-        print("same")
-    else:
-        print("advance")
+    print(compare_remote_pointer_values(candidate, existing))
 elif command == "manifest-files":
-    manifest = read_manifest(sys.argv[2], sys.argv[3], sys.argv[4])
-    for entry in manifest["files"]:
-        print(entry["path"])
-elif command == "verify-generation":
-    step, records = verify_generation(sys.argv[2], sys.argv[3], sys.argv[4])
-    print(step, records, sep="\t")
-elif command == "verify-root":
-    root = sys.argv[2]
-    real_directory(root, "checkpoint root")
-    pointer_path = os.path.join(root, "current.json")
-    remote = pointer_is_remote(pointer_path)
-    pointer = read_pointer(pointer_path, remote=remote)
-    generation, manifest_digest = pointer[:2]
-    generations = os.path.join(root, "generations")
-    real_directory(generations, "checkpoint generations root")
-    step, records = verify_generation(
-        os.path.join(generations, generation), generation, manifest_digest
-    )
-    if remote:
-        (
-            _,
-            _,
-            pointer_step,
-            pointer_records,
-            metrics_path,
-            metrics_bytes,
-            metrics_sha256,
-            _,
-            _,
-        ) = pointer
-        if pointer_step != step or pointer_records != records:
-            fail("remote pointer step/metric count differs from its checkpoint generation")
-        metrics_file = os.path.join(root, *metrics_path.split("/"))
-        observed_bytes, observed_sha256 = stable_file_descriptor(
-            metrics_file, "remote checkpoint metric snapshot"
-        )
-        if observed_bytes != metrics_bytes or observed_sha256 != metrics_sha256:
-            fail("remote checkpoint metric snapshot differs from its pointer")
-        validate_metrics(metrics_file, records)
-        with open(metrics_file, "rb") as handle:
-            if sum(
-                block.count(b"\n")
-                for block in iter(lambda: handle.read(1024 * 1024), b"")
-            ) != records:
-                fail("remote checkpoint metric snapshot contains an uncommitted tail")
-    else:
-        validate_metrics(os.path.join(root, "metrics.jsonl"), records)
-    print(step, generation, manifest_digest, records, sep="\t")
-elif command == "metrics":
-    validate_metrics(sys.argv[2], integer(int(sys.argv[3]), "committed metric records"))
+    for path in read_manifest_transport(sys.argv[2], sys.argv[3], sys.argv[4]):
+        print(path)
 elif command == "snapshot-metrics":
     snapshot_metrics(sys.argv[2], int(sys.argv[3]), sys.argv[4])
 elif command == "atomic-copy":
@@ -1902,6 +2493,7 @@ rm -f -- "$artifact_root_spec_temporary"
 readonly ARTIFACT_ROOT_SPEC
 
 LOCAL_REMOTE_ROOT=
+LOCAL_REMOTE_FD=
 if [[ $REMOTE == file://* ]]; then
   raw_local_remote_root=${REMOTE#file://}
   [[ -n "$raw_local_remote_root" ]] || die "file remote root is empty"
@@ -1914,11 +2506,62 @@ if [[ $REMOTE == file://* ]]; then
   fi
   LOCAL_REMOTE_ROOT=$(checkpoint_tool canonical-storage-root "$raw_local_remote_root") \
     || die "cannot validate file remote root: $raw_local_remote_root"
+  exec 6<"$LOCAL_REMOTE_ROOT" \
+    || die "cannot retain file remote root: $LOCAL_REMOTE_ROOT"
+  LOCAL_REMOTE_FD=6
+  checkpoint_tool verify-storage-fd "$LOCAL_REMOTE_FD" "$LOCAL_REMOTE_ROOT" \
+    || die "file remote root changed while it was opened: $LOCAL_REMOTE_ROOT"
 fi
 readonly LOCAL_REMOTE_ROOT
+readonly LOCAL_REMOTE_FD
+
+trainer_generation_descriptor() {
+  local -a command=(
+    "$CHECKPOINT_VERIFIER_BIN" verify-checkpoint
+    --generation "$1"
+    --generation-name "$2"
+    --manifest-sha256 "$3"
+    --format tsv
+  )
+  [[ -z ${4:-} ]] || command+=(--metrics "$4")
+  [[ ${5:-false} != true ]] || command+=(--exact-metrics)
+  "${command[@]}"
+}
+
+verify_checkpoint_generation() {
+  local trainer step generation manifest_sha256 metric_records extra
+  trainer=$(trainer_generation_descriptor "$1" "$2" "$3") || return 1
+  [[ $trainer != *$'\n'* ]] || return 1
+  IFS=$'\t' read -r step generation manifest_sha256 metric_records extra <<<"$trainer"
+  is_nonnegative_integer "$step" \
+    && is_nonnegative_integer "$metric_records" \
+    && [[ $generation == "$2" && $manifest_sha256 == "$3" && -z $extra ]] \
+    || return 1
+  printf '%s\t%s\n' "$step" "$metric_records"
+}
 
 checkpoint_descriptor() {
-  checkpoint_tool verify-root "$1"
+  local root=$1 trainer
+  if trainer=$("$CHECKPOINT_VERIFIER_BIN" verify-checkpoint \
+    --root "$root" --metrics "$root/metrics.jsonl" --format tsv 2>/dev/null); then
+    printf '%s\n' "$trainer"
+    return 0
+  fi
+
+  local remote_pointer generation manifest_sha256 pointer_step pointer_records
+  local metrics_path metrics_bytes metrics_sha256 _artifact_bytes _artifact_sha256
+  remote_pointer=$(checkpoint_tool pointer-remote "$root/$CURRENT_POINTER") || return 1
+  IFS=$'\t' read -r generation manifest_sha256 pointer_step pointer_records \
+    metrics_path metrics_bytes metrics_sha256 _artifact_bytes _artifact_sha256 \
+    <<<"$remote_pointer"
+  checkpoint_tool verify-file "$root/$metrics_path" \
+    "$metrics_bytes" "$metrics_sha256" || return 1
+  trainer=$(trainer_generation_descriptor \
+    "$root/$GENERATIONS_DIRECTORY/$generation" \
+    "$generation" "$manifest_sha256" "$root/$metrics_path" true) || return 1
+  [[ $trainer == "$pointer_step"$'\t'"$generation"$'\t'"$manifest_sha256"$'\t'"$pointer_records" ]] \
+    || return 1
+  printf '%s\n' "$trainer"
 }
 
 checkpoint_artifacts_exist() {
@@ -1936,18 +2579,11 @@ remote_path() {
   printf '%s/%s' "${REMOTE%/}" "${1#/}"
 }
 
-local_remote_root() {
-  printf '%s' "$LOCAL_REMOTE_ROOT"
-}
-
 remote_download() {
   local relative=$1
   local destination=$2
   if [[ $REMOTE == file://* ]]; then
-    local source
-    source="$(local_remote_root)/$relative"
-    [[ -f "$source" && ! -L "$source" ]] || return 1
-    cp -- "$source" "$destination"
+    checkpoint_tool fd-copy-out "$LOCAL_REMOTE_FD" "$relative" "$destination"
   else
     "$GCLOUD_BIN" storage cp "$(remote_path "$relative")" "$destination"
   fi
@@ -1957,8 +2593,7 @@ remote_upload_file() {
   local source=$1
   local relative=$2
   if [[ $REMOTE == file://* ]]; then
-    mkdir -p -- "$(dirname -- "$(local_remote_root)/$relative")" || return 1
-    cp -- "$source" "$(local_remote_root)/$relative"
+    checkpoint_tool fd-copy-in "$LOCAL_REMOTE_FD" "$source" "$relative"
   else
     "$GCLOUD_BIN" storage cp "$source" "$(remote_path "$relative")"
   fi
@@ -1974,8 +2609,8 @@ remote_upload_immutable_file() {
   checkpoint_tool verify-file "$source" "$expected_bytes" "$expected_sha256" \
     || return 1
   if [[ $REMOTE == file://* ]]; then
-    checkpoint_tool install-immutable "$source" \
-      "$(local_remote_root)/$relative" "$expected_bytes" "$expected_sha256"
+    checkpoint_tool fd-install-immutable "$LOCAL_REMOTE_FD" "$source" \
+      "$relative" "$expected_bytes" "$expected_sha256"
     return
   fi
 
@@ -2011,44 +2646,7 @@ compare_remote_pointer_files() {
 
 publish_file_remote_pointer() (
   local candidate=$1
-  local destination
-  local existing state owner lock_owned=false
-  destination="$(local_remote_root)/$CURRENT_POINTER"
-  existing=$(mktemp "$STATE_DIR/existing-current.XXXXXX") || return 1
-  trap 'rm -f -- "$existing"; [[ $LOCK_TOOL != shlock || $lock_owned != true ]] || rm -f -- "$(local_remote_root)/.hermes-current.lock"' EXIT
-
-  if [[ $LOCK_TOOL == flock ]]; then
-    exec 7>"$(local_remote_root)/.hermes-current.lock"
-    flock 7 || return 1
-  else
-    owner=$(sh -c 'printf "%s" "$PPID"')
-    for _attempt in {1..100}; do
-      if shlock -f "$(local_remote_root)/.hermes-current.lock" -p "$owner"; then
-        lock_owned=true
-        break
-      fi
-      sleep 0.1
-    done
-    [[ $lock_owned == true ]] || return 1
-  fi
-
-  if [[ -e "$destination" || -L "$destination" ]]; then
-    [[ -f "$destination" && ! -L "$destination" ]] || return 1
-    cp -- "$destination" "$existing" || return 1
-    state=$(compare_remote_pointer_files "$candidate" "$existing") || return 1
-    case "$state" in
-      newer | same)
-        printf '%s\n' "$state"
-        return 0
-        ;;
-      advance) ;;
-      *) return 1 ;;
-    esac
-  fi
-  checkpoint_tool atomic-copy "$candidate" "$destination" || return 1
-  cp -- "$destination" "$existing" || return 1
-  [[ $(compare_remote_pointer_files "$candidate" "$existing") == same ]] || return 1
-  printf 'published\n'
+  checkpoint_tool fd-publish-pointer "$LOCAL_REMOTE_FD" "$candidate"
 )
 
 gcs_pointer_generation() {
@@ -2273,58 +2871,30 @@ remote_upload_generation() {
   local generation=$1
   local manifest_sha256=$2
   local source="$OUTPUT/$GENERATIONS_DIRECTORY/$generation"
-  local destination generation_root quarantine staging file plan upload_failed=false
+  local destination destination_kind staging file plan upload_failed=false
 
   if [[ $REMOTE == file://* ]]; then
-    generation_root="$(local_remote_root)/$GENERATIONS_DIRECTORY"
-    if [[ -e "$generation_root" || -L "$generation_root" ]]; then
-      [[ -d "$generation_root" && ! -L "$generation_root" ]] || return 1
-    else
-      mkdir -p -- "$generation_root" || return 1
-    fi
-    staging=$(mktemp -d "$generation_root/.upload.XXXXXX") || return 1
-    cp -R -- "$source/." "$staging/" || {
-      rm -rf -- "$staging"
+    staging=$(checkpoint_tool fd-stage-tree "$LOCAL_REMOTE_FD" \
+      "$source" "$GENERATIONS_DIRECTORY") || return 1
+    destination="$GENERATIONS_DIRECTORY/$generation"
+    destination_kind=$(checkpoint_tool fd-entry-kind \
+      "$LOCAL_REMOTE_FD" "$destination") || {
+      checkpoint_tool fd-remove-tree "$LOCAL_REMOTE_FD" "$staging" || true
       return 1
     }
-    checkpoint_tool verify-generation "$staging" \
-      "$generation" "$manifest_sha256" >/dev/null || {
-      rm -rf -- "$staging"
-      return 1
-    }
-    checkpoint_tool sync-tree "$staging" || {
-      rm -rf -- "$staging"
-      return 1
-    }
-    destination="$generation_root/$generation"
-    if [[ -e "$destination" || -L "$destination" ]]; then
-      if checkpoint_tool verify-generation "$destination" \
-        "$generation" "$manifest_sha256" >/dev/null 2>&1; then
-        rm -rf -- "$staging"
-        return 0
-      fi
-      quarantine=$(mktemp -d "$generation_root/.corrupt.XXXXXX") || {
-        rm -rf -- "$staging"
+    if [[ $destination_kind != missing ]]; then
+      checkpoint_tool fd-rename-tree "$LOCAL_REMOTE_FD" \
+        "$staging" "$destination" replace || {
+        checkpoint_tool fd-remove-tree "$LOCAL_REMOTE_FD" "$staging" || true
         return 1
       }
-      rmdir -- "$quarantine" || {
-        rm -rf -- "$staging" "$quarantine"
-        return 1
-      }
-      if ! mv -- "$destination" "$quarantine" \
-        || ! mv -- "$staging" "$destination"; then
-        [[ -e "$destination" || ! -e "$quarantine" ]] \
-          || mv -- "$quarantine" "$destination" 2>/dev/null || true
-        rm -rf -- "$staging"
-        return 1
-      fi
     else
-      mv -- "$staging" "$destination" || {
-        rm -rf -- "$staging"
+      checkpoint_tool fd-rename-tree "$LOCAL_REMOTE_FD" \
+        "$staging" "$destination" no-replace || {
+        checkpoint_tool fd-remove-tree "$LOCAL_REMOTE_FD" "$staging" || true
         return 1
       }
     fi
-    checkpoint_tool sync-directory "$generation_root"
     return
   fi
 
@@ -2354,11 +2924,6 @@ download_remote_generation() {
   local download_failed=false file plan
 
   mkdir -p -- "$destination" || return 1
-  if [[ $REMOTE == file://* ]]; then
-    checkpoint_tool verify-generation \
-      "$(local_remote_root)/$GENERATIONS_DIRECTORY/$generation" \
-      "$generation" "$manifest_sha256" >/dev/null || return 1
-  fi
   remote_download \
     "$GENERATIONS_DIRECTORY/$generation/$GENERATION_MANIFEST" \
     "$destination/$GENERATION_MANIFEST" >/dev/null || return 1
@@ -2379,7 +2944,7 @@ download_remote_generation() {
   done <"$plan"
   rm -f -- "$plan"
   [[ $download_failed == false ]] || return 1
-  checkpoint_tool verify-generation "$destination" \
+  verify_checkpoint_generation "$destination" \
     "$generation" "$manifest_sha256" >/dev/null
 }
 
@@ -2404,7 +2969,6 @@ download_remote_checkpoint() {
   local pointer descriptor generation manifest_sha256 step metric_records
   local pointer_step pointer_records metrics_path metrics_bytes metrics_sha256
   local closure_bytes closure_sha256
-  local direct_generation direct_manifest_sha256
 
   mkdir -p -- "$destination/$GENERATIONS_DIRECTORY" || return 1
   pointer="$destination/$CURRENT_POINTER"
@@ -2414,12 +2978,6 @@ download_remote_checkpoint() {
   IFS=$'\t' read -r generation manifest_sha256 pointer_step pointer_records \
     metrics_path metrics_bytes metrics_sha256 closure_bytes closure_sha256 <<<"$descriptor"
   [[ -n "$generation" && -n "$manifest_sha256" ]] || return 1
-  if [[ $REMOTE == file://* ]]; then
-    descriptor=$(checkpoint_descriptor "$(local_remote_root)") || return 1
-    IFS=$'\t' read -r _ direct_generation direct_manifest_sha256 _ <<<"$descriptor"
-    [[ $direct_generation == "$generation" \
-      && $direct_manifest_sha256 == "$manifest_sha256" ]] || return 1
-  fi
   download_remote_generation \
     "$destination/$GENERATIONS_DIRECTORY/$generation" \
     "$generation" "$manifest_sha256" || return 1
@@ -2427,7 +2985,7 @@ download_remote_checkpoint() {
     "$destination/$ARTIFACTS_DIRECTORY/$generation" \
     "$generation" "$manifest_sha256" \
     "$closure_bytes" "$closure_sha256" || return 1
-  descriptor=$(checkpoint_tool verify-generation \
+  descriptor=$(verify_checkpoint_generation \
     "$destination/$GENERATIONS_DIRECTORY/$generation" \
     "$generation" "$manifest_sha256") || return 1
   IFS=$'\t' read -r step metric_records <<<"$descriptor"
@@ -2455,10 +3013,11 @@ refresh_remote_checkpoint() {
   REMOTE_ARTIFACTS=false
   [[ -n "$REMOTE" ]] || return 1
   snapshot=$(mktemp -d "$STATE_DIR/remote-checkpoint.XXXXXX") || return 1
-  if [[ $REMOTE == file://* \
-    && ( -e "$(local_remote_root)/$CURRENT_POINTER" \
-      || -L "$(local_remote_root)/$CURRENT_POINTER" ) ]]; then
-    REMOTE_ARTIFACTS=true
+  if [[ $REMOTE == file://* ]]; then
+    local pointer_kind
+    pointer_kind=$(checkpoint_tool fd-entry-kind \
+      "$LOCAL_REMOTE_FD" "$CURRENT_POINTER") || return 1
+    [[ $pointer_kind == missing ]] || REMOTE_ARTIFACTS=true
   fi
   descriptor_file=$(mktemp "$STATE_DIR/remote-descriptor.XXXXXX") || {
     rm -rf -- "$snapshot"
@@ -2508,7 +3067,7 @@ restore_remote_checkpoint() {
     rm -rf -- "$staging"
     return 1
   }
-  checkpoint_tool verify-generation "$staging" \
+  verify_checkpoint_generation "$staging" \
     "$generation" "$manifest_sha256" >/dev/null || {
       rm -rf -- "$staging"
       return 1
@@ -2519,7 +3078,7 @@ restore_remote_checkpoint() {
   }
 
   if [[ -e "$destination" || -L "$destination" ]]; then
-    if checkpoint_tool verify-generation "$destination" \
+    if verify_checkpoint_generation "$destination" \
       "$generation" "$manifest_sha256" >/dev/null 2>&1; then
       rm -rf -- "$staging"
     else
@@ -2638,12 +3197,6 @@ verify_remote_generation() {
   local generation=$1
   local manifest_sha256=$2
   local verification
-  if [[ $REMOTE == file://* ]]; then
-    checkpoint_tool verify-generation \
-      "$(local_remote_root)/$GENERATIONS_DIRECTORY/$generation" \
-      "$generation" "$manifest_sha256" >/dev/null
-    return
-  fi
   verification=$(mktemp -d "$STATE_DIR/verify-upload.XXXXXX") || return 1
   if download_remote_generation "$verification" \
     "$generation" "$manifest_sha256"; then
@@ -2703,6 +3256,7 @@ sync_checkpoint_once() (
   fi
   clear_remote_snapshot
   if (( remote_step > step )); then
+    log "remote checkpoint advanced to step $remote_step; leaving local step $step unchanged"
     return 0
   fi
   if (( remote_step == step )); then
@@ -2728,6 +3282,11 @@ sync_checkpoint_once() (
   rm -f -- "$metrics_snapshot"
   checkpoint_tool snapshot-metrics "$OUTPUT/metrics.jsonl" \
     "$metric_records" "$metrics_snapshot" || return 1
+  descriptor=$(trainer_generation_descriptor \
+    "$OUTPUT/$GENERATIONS_DIRECTORY/$generation" \
+    "$generation" "$manifest_sha256" "$metrics_snapshot" true) || return 1
+  [[ $descriptor == "$step"$'\t'"$generation"$'\t'"$manifest_sha256"$'\t'"$metric_records" ]] \
+    || return 1
   descriptor=$(checkpoint_tool file-descriptor "$metrics_snapshot") || return 1
   IFS=$'\t' read -r metrics_bytes metrics_sha256 <<<"$descriptor"
   [[ -n "$metrics_bytes" && -n "$metrics_sha256" ]] || return 1
@@ -2783,6 +3342,7 @@ validate_wandb() {
 
 wandb_supervisor() {
   exec 9>&-
+  [[ -z "$LOCAL_REMOTE_FD" ]] || exec 6<&-
   local reporter_pid='' reporter_status
   trap '[[ -z $reporter_pid ]] || kill "$reporter_pid" 2>/dev/null; wait "$reporter_pid" 2>/dev/null || true; exit 0' TERM INT
   set -a
@@ -2898,6 +3458,7 @@ while true; do
 
   (
     exec 9>&-
+    [[ -z "$LOCAL_REMOTE_FD" ]] || exec 6<&-
     exec "${trainer[@]}"
   ) >>"$TRAIN_LOG" 2>&1 &
   TRAIN_PID=$!

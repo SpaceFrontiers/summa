@@ -423,6 +423,15 @@ including `generation-manifest.json`, then atomically replaces `current.json`.
 Every manifest file is size- and SHA-256-verified before resume. Unsupported
 checkpoint schema versions fail explicitly.
 
+`hermes-train verify-checkpoint --root CHECKPOINT --metrics
+CHECKPOINT/metrics.jsonl` exposes the same strict generation, training-state,
+accounting, optimizer-reference, and committed-metric-prefix checks for
+automation. The relaunch supervisor invokes this command for every local,
+downloaded, and pre-publication generation; its Python helper is limited to
+transport envelopes and immutable artifact copying. The built-in trainer also
+holds `.trainer.lock` for its full process lifetime, so a second direct trainer
+cannot mutate the same output root behind the supervisor.
+
 `metrics.jsonl` is a strict append-only schema-v2 stream. Typed events include
 optimization losses, throughput, phase timing, tier updates, active capacity,
 post-training update receipts, distillation divergence, imitation rewards,

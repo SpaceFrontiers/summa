@@ -820,8 +820,9 @@ impl NativeSleepPhaseContext for BuiltinStandaloneSleepContext {
                 let mut updates =
                     ProspectiveTierUpdate::new(bank.clone(), &self.runtime.prospective_directory)?;
                 let trigger_clock = cursor.sleep.due_clocks[0];
+                let transaction_id = cursor.sleep.next_transaction_id()?;
                 let plan = updates.prepare_consolidation(
-                    cursor.sleep.cycle + 1,
+                    transaction_id,
                     sender,
                     trigger_clock,
                     &teacher,
@@ -1286,8 +1287,9 @@ impl PeriodicSleepBoundaryDriver for BuiltinPeriodicSleepBoundaryDriver {
                 .context("periodic sleep has no due sender")?;
             let mut updates =
                 ProspectiveTierUpdate::new(self.bank.clone(), &self.runtime.prospective_directory)?;
+            let transaction_id = checkpoint.sleep.next_transaction_id()?;
             let plan = updates.prepare_consolidation(
-                checkpoint.sleep.cycle + 1,
+                transaction_id,
                 sender,
                 checkpoint.sleep.due_clocks[0],
                 &self.live,

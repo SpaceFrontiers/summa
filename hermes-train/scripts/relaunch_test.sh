@@ -16,8 +16,17 @@ fail() {
 fake_trainer=$TEST_ROOT/fake-trainer
 fake_wandb_python=$TEST_ROOT/fake-wandb-python
 fake_checkpoint_writer=$TEST_ROOT/write-checkpoint
+fake_checkpoint_verifier=$TEST_ROOT/verify-checkpoint
 fake_gcloud=$TEST_ROOT/fake-gcloud
 fake_artifact_writer=$TEST_ROOT/write-artifacts
+checkpoint_helper=$TEST_ROOT/checkpoint-helper.py
+
+awk '
+  /<<'\''PY'\''$/ { inside=1; next }
+  inside && /^PY$/ { exit }
+  inside { print }
+' "$TEST_SCRIPT_DIR/relaunch.sh" >"$checkpoint_helper"
+python3 -m py_compile "$checkpoint_helper"
 
 cat >"$fake_checkpoint_writer" <<'PY'
 #!/usr/bin/env python3
@@ -34,6 +43,16 @@ step = int(sys.argv[2])
 version = int(sys.argv[3]) if len(sys.argv) > 3 else 2
 tag = sys.argv[4] if len(sys.argv) > 4 else str(step)
 state_step = int(sys.argv[5]) if len(sys.argv) > 5 else step
+workflow_signature = "sha256:" + "0" * 64
+
+
+def stable_cache_id(value):
+    digest = 0xCBF29CE484222325
+    for byte in value.encode():
+        digest = ((digest ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{digest:016x}"
+
+
 root.mkdir(parents=True, exist_ok=True)
 generations = root / "generations"
 generations.mkdir(exist_ok=True)
@@ -41,20 +60,52 @@ staging = pathlib.Path(tempfile.mkdtemp(prefix=".fixture-", dir=generations))
 (staging / "weights.safetensors").write_text(f"weights-{tag}\n")
 (staging / "adamw-state.bpk").write_text(f"adamw-{tag}\n")
 (staging / "muon-state.bpk").write_text(f"muon-{tag}\n")
+weights = (staging / "weights.safetensors").read_bytes()
+(staging / "training-accounting.json").write_text(
+    json.dumps(
+        {
+            "version": 1,
+            "training_gpu_hours": 1.0,
+            "parameters": 2,
+            "routed_active_parameters": 2,
+            "weights_bytes": len(weights),
+            "weights_sha256": hashlib.sha256(weights).hexdigest(),
+        },
+        separators=(",", ":"),
+    )
+)
 state = {
     "version": version,
     "global_step": state_step,
     "phase": 0,
     "phase_id": "test",
+    "phase_kind": "pretrain",
+    "epoch": 0,
+    "records_in_phase": step,
+    "steps_in_phase": step,
+    "tokens_seen": max(step, 1),
     "metric_records": 1,
+    "workflow_signature": workflow_signature,
+    "data_manifest_hash": "sha256:" + "1" * 64,
+    "parameter_ids": [1, 2],
     "optimizer_states": [
         {
             "scope": "wake",
             "adamw": "adamw-state.bpk",
             "muon": "muon-state.bpk",
             "gradient_accumulator": None,
+            "update_clock": state_step,
         }
     ],
+    "sleep": None,
+    "artifacts": [],
+    "evaluator_hashes": [],
+    "rng_streams": [
+        {"name": "data", "seed": 0, "counter": step},
+        {"name": "model_dropout", "seed": 0, "counter": step},
+    ],
+    "wake_context_buffer": [],
+    "quantization": None,
 }
 if os.environ.get("TEST_CHECKPOINT_STATE_OVERLAY"):
     state.update(json.loads(pathlib.Path(os.environ["TEST_CHECKPOINT_STATE_OVERLAY"]).read_text()))
@@ -114,7 +165,7 @@ os.replace(pointer_temporary, root / "current.json")
             "schema_version": 2,
             "sequence": 0,
             "emitted_at_unix_ms": 1,
-            "run_id": "test",
+            "run_id": stable_cache_id(state["workflow_signature"]),
             "global_step": step,
             "phase": {"index": 0, "name": "test", "kind": "pretrain"},
             "event": {
@@ -139,6 +190,191 @@ os.replace(pointer_temporary, root / "current.json")
 )
 PY
 
+cat >"$fake_checkpoint_verifier" <<'PY'
+#!/usr/bin/env python3
+"""Test double for `hermes-train verify-checkpoint`'s stable CLI contract.
+
+Rust unit tests own the verifier semantics. The shell harness uses this small
+double so relaunch tests do not compile the CUDA-capable trainer binary.
+"""
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+
+def stable_cache_id(value):
+    digest = 0xCBF29CE484222325
+    for byte in value.encode():
+        digest = ((digest ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{digest:016x}"
+
+
+arguments = iter(sys.argv[1:])
+values = {}
+for argument in arguments:
+    if argument == "verify-checkpoint":
+        continue
+    if argument == "--exact-metrics":
+        values[argument] = True
+        continue
+    if argument.startswith("--"):
+        values[argument] = next(arguments)
+    else:
+        raise SystemExit(f"unexpected verifier argument {argument!r}")
+
+if "--root" in values:
+    root = pathlib.Path(values["--root"])
+    pointer = json.loads((root / "current.json").read_text())
+    if set(pointer) != {"version", "generation", "manifest_sha256"} or pointer["version"] != 1:
+        raise SystemExit("checkpoint current pointer has an invalid schema")
+    generation_name = pointer["generation"]
+    manifest_sha256 = pointer["manifest_sha256"]
+    generation = root / "generations" / generation_name
+elif "--generation" in values:
+    generation = pathlib.Path(values["--generation"])
+    generation_name = values["--generation-name"]
+    manifest_sha256 = values["--manifest-sha256"]
+else:
+    raise SystemExit("missing checkpoint target")
+
+if generation_name != "sha256-" + manifest_sha256:
+    raise SystemExit("checkpoint generation name and manifest digest differ")
+manifest_bytes = (generation / "generation-manifest.json").read_bytes()
+if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256:
+    raise SystemExit("checkpoint generation manifest digest mismatch")
+manifest = json.loads(manifest_bytes)
+manifest_keys = {
+    "version", "training_state_version", "global_step", "phase", "phase_id", "files",
+}
+if set(manifest) != manifest_keys or manifest["version"] != 1:
+    raise SystemExit("checkpoint generation manifest has an invalid strict schema")
+required = {
+    "weights.safetensors", "adamw-state.bpk", "muon-state.bpk",
+    "training-state.json", "training-accounting.json",
+}
+declared = []
+for entry in manifest["files"]:
+    if set(entry) != {"path", "bytes", "sha256"}:
+        raise SystemExit("checkpoint generation manifest file has an invalid schema")
+    relative = entry["path"]
+    parts = relative.split("/") if isinstance(relative, str) else []
+    if (
+        not parts or any(part in {"", ".", ".."} for part in parts)
+        or "\\" in relative or relative.startswith("/")
+    ):
+        raise SystemExit("checkpoint generation manifest contains an unsafe path")
+    if not isinstance(entry["bytes"], int) or isinstance(entry["bytes"], bool):
+        raise SystemExit("checkpoint generation manifest contains an invalid size")
+    if (
+        not isinstance(entry["sha256"], str) or len(entry["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in entry["sha256"])
+    ):
+        raise SystemExit("checkpoint generation manifest contains an invalid digest")
+    declared.append(relative)
+if declared != sorted(declared) or len(declared) != len(set(declared)):
+    raise SystemExit("checkpoint generation manifest paths are not unique and sorted")
+if not required.issubset(declared):
+    raise SystemExit("checkpoint generation is missing a required file")
+
+actual = []
+for directory, names, files in os.walk(generation, topdown=True, followlinks=False):
+    for name in names:
+        metadata = os.lstat(os.path.join(directory, name))
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise SystemExit("checkpoint generation contains an unsafe directory")
+    for name in files:
+        path = pathlib.Path(directory, name)
+        metadata = os.lstat(path)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise SystemExit("checkpoint generation contains an unsafe file")
+        relative = path.relative_to(generation).as_posix()
+        if relative != "generation-manifest.json":
+            actual.append(relative)
+if sorted(actual) != declared:
+    raise SystemExit("checkpoint generation contents differ from its manifest")
+for entry in manifest["files"]:
+    payload = (generation / entry["path"]).read_bytes()
+    if len(payload) != entry["bytes"] or hashlib.sha256(payload).hexdigest() != entry["sha256"]:
+        raise SystemExit("checkpoint generation file differs from its manifest")
+
+state = json.loads((generation / "training-state.json").read_text())
+state_keys = {
+    "version", "global_step", "phase", "phase_id", "phase_kind", "epoch",
+    "records_in_phase", "steps_in_phase", "tokens_seen", "metric_records",
+    "workflow_signature", "data_manifest_hash", "parameter_ids",
+    "optimizer_states", "sleep", "artifacts", "evaluator_hashes",
+    "rng_streams", "wake_context_buffer", "quantization",
+}
+if set(state) != state_keys or state["version"] != 2:
+    raise SystemExit("checkpoint training state has an invalid strict schema")
+if (
+    manifest["training_state_version"] != state["version"]
+    or state["global_step"] != manifest["global_step"]
+    or state["phase"] != manifest["phase"]
+    or state["phase_id"] != manifest["phase_id"]
+):
+    raise SystemExit("checkpoint training state does not match its generation manifest")
+authenticated = set(declared)
+references = []
+scopes = []
+for optimizer in state["optimizer_states"]:
+    scopes.append(optimizer["scope"])
+    references.extend([optimizer["adamw"], optimizer["muon"]])
+    if optimizer["gradient_accumulator"] is not None:
+        references.append(optimizer["gradient_accumulator"])
+if (
+    len(scopes) != len(set(scopes)) or len(references) != len(set(references))
+    or any(reference not in authenticated for reference in references)
+):
+    raise SystemExit("checkpoint optimizer state references are invalid")
+accounting = json.loads((generation / "training-accounting.json").read_text())
+if set(accounting) != {
+    "version", "training_gpu_hours", "parameters", "routed_active_parameters",
+    "weights_bytes", "weights_sha256",
+} or accounting["version"] != 1:
+    raise SystemExit("checkpoint training accounting has an invalid schema")
+weights = (generation / "weights.safetensors").read_bytes()
+if (
+    accounting["weights_bytes"] != len(weights)
+    or accounting["weights_sha256"] != hashlib.sha256(weights).hexdigest()
+):
+    raise SystemExit("checkpoint training accounting does not match its model weights")
+if "--metrics" in values:
+    lines = pathlib.Path(values["--metrics"]).read_bytes().splitlines(keepends=True)
+    committed = state["metric_records"]
+    if len(lines) < committed or any(not line.endswith(b"\n") for line in lines[:committed]):
+        raise SystemExit("metric journal has fewer complete committed records")
+    if "--exact-metrics" in values and len(lines) != committed:
+        raise SystemExit("immutable metric snapshot contains an uncommitted tail")
+    previous_step = None
+    run_id = stable_cache_id(state["workflow_signature"])
+    for sequence, line in enumerate(lines[:committed]):
+        try:
+            record = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SystemExit(f"invalid committed metric record: {error}") from error
+        if record.get("sequence") != sequence:
+            raise SystemExit("committed metric sequence is not contiguous")
+        if record.get("run_id") != run_id:
+            raise SystemExit("metric run does not match checkpoint workflow signature")
+        record_step = record.get("global_step")
+        if previous_step is not None and record_step < previous_step:
+            raise SystemExit("metric global step rewound")
+        previous_step = record_step
+    expected_step = state["global_step"] if committed else None
+    if previous_step != expected_step:
+        raise SystemExit("committed metric prefix ends at the wrong global step")
+if values.get("--format") != "tsv":
+    raise SystemExit("test verifier supports only --format tsv")
+print(
+    state["global_step"], generation_name, manifest_sha256,
+    state["metric_records"], sep="\t"
+)
+PY
+
 write_checkpoint() {
   "$fake_checkpoint_writer" "$@"
 }
@@ -158,6 +394,9 @@ checkpoint_file() {
 cat >"$fake_trainer" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == verify-checkpoint ]]; then
+  exec "$TEST_CHECKPOINT_VERIFIER" "$@"
+fi
 output=
 resume=false
 while (( $# > 0 )); do
@@ -594,8 +833,10 @@ if history_count:
 (runtime / f"expected-{tag}.json").write_bytes(canonical(expected))
 print(overlay_path)
 PY
-chmod +x "$fake_trainer" "$fake_wandb_python" "$fake_checkpoint_writer" "$fake_gcloud" "$fake_artifact_writer"
+chmod +x "$fake_trainer" "$fake_wandb_python" "$fake_checkpoint_writer" \
+  "$fake_checkpoint_verifier" "$fake_gcloud" "$fake_artifact_writer"
 export TEST_CHECKPOINT_WRITER=$fake_checkpoint_writer
+export TEST_CHECKPOINT_VERIFIER=$fake_checkpoint_verifier
 
 write_sleep_runtime() {
   local case_root=$1
@@ -863,6 +1104,122 @@ EOF
     || fail "remote root metric journal was not restored"
 }
 
+run_file_remote_root_fd_anchor_test() {
+  local case_root=$TEST_ROOT/file-remote-root-anchor
+  local config=$case_root/relaunch.conf
+  local configured_remote=$case_root/remote
+  local retained_remote=$case_root/retained-remote
+  local supervisor_pid published=false
+  mkdir -p -- "$configured_remote"
+  cat >"$config" <<EOF
+HERMES_TRAIN_OUTPUT=$case_root/output
+HERMES_TRAIN_STATE_DIR=$case_root/state
+HERMES_TRAIN_REMOTE_URL=file://$configured_remote
+HERMES_TRAIN_COMMAND=($fake_trainer train)
+HERMES_TRAIN_SYNC_INTERVAL=1
+HERMES_TRAIN_MAX_RESTARTS=0
+EOF
+  export TEST_CALLS=$case_root/calls
+  export TEST_READY=$case_root/ready
+  export TEST_RELEASE=$case_root/release
+  export TEST_BLOCK=true
+  export TEST_FAIL_ONCE=false
+  unset TEST_EXPECT_STEP TEST_WANDB_CALLS TEST_FAILURE_MARKER
+  "$TEST_SCRIPT_DIR/relaunch.sh" "$config" >"$case_root/log" 2>&1 &
+  supervisor_pid=$!
+  for _attempt in {1..400}; do
+    [[ -e $TEST_READY ]] && break
+    sleep 0.05
+  done
+  [[ -e $TEST_READY ]] || {
+    : >"$TEST_RELEASE"
+    wait "$supervisor_pid" || true
+    fail "file remote root-anchor trainer did not start"
+  }
+
+  mv -- "$configured_remote" "$retained_remote"
+  mkdir -p -- "$configured_remote"
+  write_checkpoint "$case_root/output" 70
+  for _attempt in {1..400}; do
+    if [[ -s $retained_remote/current.json ]]; then
+      published=true
+      break
+    fi
+    sleep 0.05
+  done
+  : >"$TEST_RELEASE"
+  wait "$supervisor_pid"
+  unset TEST_BLOCK TEST_READY TEST_RELEASE
+  [[ $published == true ]] || {
+    sed -n '1,160p' "$case_root/state/sync.log" >&2 || true
+    fail "retained file remote descriptor did not survive root entry replacement"
+  }
+  [[ $(current_generation "$retained_remote") == \
+    $(current_generation "$case_root/output") ]] \
+    || fail "root entry replacement redirected the retained file remote"
+  [[ ! -e $configured_remote/current.json \
+    && ! -e $configured_remote/generations \
+    && ! -e $configured_remote/checkpoint-artifacts ]] \
+    || fail "file remote operation escaped through the replacement root path"
+}
+
+run_file_remote_entry_swap_rejected_test() {
+  local case_root=$TEST_ROOT/file-remote-entry-swap
+  local config=$case_root/relaunch.conf
+  local remote=$case_root/remote
+  local attacker=$case_root/attacker
+  local supervisor_pid rejected=false
+  mkdir -p -- "$remote/generations" "$attacker"
+  cat >"$config" <<EOF
+HERMES_TRAIN_OUTPUT=$case_root/output
+HERMES_TRAIN_STATE_DIR=$case_root/state
+HERMES_TRAIN_REMOTE_URL=file://$remote
+HERMES_TRAIN_COMMAND=($fake_trainer train)
+HERMES_TRAIN_SYNC_INTERVAL=1
+HERMES_TRAIN_MAX_RESTARTS=0
+EOF
+  export TEST_CALLS=$case_root/calls
+  export TEST_READY=$case_root/ready
+  export TEST_RELEASE=$case_root/release
+  export TEST_BLOCK=true
+  export TEST_FAIL_ONCE=false
+  unset TEST_EXPECT_STEP TEST_WANDB_CALLS TEST_FAILURE_MARKER
+  "$TEST_SCRIPT_DIR/relaunch.sh" "$config" >"$case_root/log" 2>&1 &
+  supervisor_pid=$!
+  for _attempt in {1..400}; do
+    [[ -e $TEST_READY ]] && break
+    sleep 0.05
+  done
+  [[ -e $TEST_READY ]] || {
+    : >"$TEST_RELEASE"
+    wait "$supervisor_pid" || true
+    fail "file remote entry-swap trainer did not start"
+  }
+
+  mv -- "$remote/generations" "$remote/original-generations"
+  ln -s -- "$attacker" "$remote/generations"
+  write_checkpoint "$case_root/output" 71
+  for _attempt in {1..400}; do
+    if grep -Eq 'unsafe|not a real directory' \
+      "$case_root/state/sync.log" 2>/dev/null; then
+      rejected=true
+      break
+    fi
+    sleep 0.05
+  done
+  : >"$TEST_RELEASE"
+  wait "$supervisor_pid"
+  unset TEST_BLOCK TEST_READY TEST_RELEASE
+  [[ $rejected == true ]] || {
+    sed -n '1,160p' "$case_root/state/sync.log" >&2 || true
+    fail "file remote child entry replacement was not rejected"
+  }
+  [[ -z $(find "$attacker" -mindepth 1 -print -quit) ]] \
+    || fail "file remote traversal followed a swapped child entry"
+  [[ ! -e $remote/current.json ]] \
+    || fail "file remote pointer was published after child entry replacement"
+}
+
 run_newer_local_wins_test() {
   local case_root=$TEST_ROOT/local-wins
   local config=$case_root/relaunch.conf
@@ -967,6 +1324,156 @@ EOF
   [[ ! -e $TEST_CALLS ]] || fail "trainer launched with a modified generation"
   grep -q 'local checkpoint is incomplete' "$case_root/log" \
     || fail "modified generation failure was not explained"
+}
+
+run_strict_training_state_rejected_test() {
+  local case_root=$TEST_ROOT/strict-training-state
+  local config=$case_root/relaunch.conf
+  mkdir -p -- "$case_root"
+  printf '{"unexpected":true}\n' >"$case_root/overlay.json"
+  export TEST_CHECKPOINT_STATE_OVERLAY=$case_root/overlay.json
+  write_checkpoint "$case_root/output" 14
+  unset TEST_CHECKPOINT_STATE_OVERLAY
+  cat >"$config" <<EOF
+HERMES_TRAIN_OUTPUT=$case_root/output
+HERMES_TRAIN_STATE_DIR=$case_root/state
+HERMES_TRAIN_COMMAND=($fake_trainer train)
+HERMES_TRAIN_MAX_RESTARTS=0
+EOF
+  export TEST_CALLS=$case_root/calls
+  export TEST_FAIL_ONCE=false
+  unset TEST_EXPECT_STEP TEST_WANDB_CALLS TEST_FAILURE_MARKER TEST_BLOCK
+
+  if "$TEST_SCRIPT_DIR/relaunch.sh" "$config" >"$case_root/log" 2>&1; then
+    fail "non-strict training-state schema was accepted"
+  fi
+  [[ ! -e $TEST_CALLS ]] || fail "trainer launched with an invalid training-state schema"
+}
+
+run_corrupt_metric_prefix_rejected_test() {
+  local case_root=$TEST_ROOT/corrupt-metric-prefix
+  local config=$case_root/relaunch.conf
+  write_checkpoint "$case_root/output" 16
+  python3 - "$case_root/output/metrics.jsonl" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_bytes(b'\0{"sequence":0,"global_step":16}\n')
+PY
+  cat >"$config" <<EOF
+HERMES_TRAIN_OUTPUT=$case_root/output
+HERMES_TRAIN_STATE_DIR=$case_root/state
+HERMES_TRAIN_COMMAND=($fake_trainer train)
+HERMES_TRAIN_MAX_RESTARTS=0
+EOF
+  export TEST_CALLS=$case_root/calls
+  export TEST_FAIL_ONCE=false
+  unset TEST_EXPECT_STEP TEST_WANDB_CALLS TEST_FAILURE_MARKER TEST_BLOCK
+
+  if "$TEST_SCRIPT_DIR/relaunch.sh" "$config" >"$case_root/log" 2>&1; then
+    fail "corrupt committed metric prefix was accepted"
+  fi
+  [[ ! -e $TEST_CALLS ]] || fail "trainer launched with a corrupt metric prefix"
+}
+
+run_metric_snapshot_stability_test() {
+  local case_root=$TEST_ROOT/metric-snapshot-stability
+  local source=$case_root/metrics.jsonl
+  local snapshot=$case_root/snapshot.jsonl
+  local helper_log=$case_root/helper.log
+  local helper_pid payload_bytes=$((32 * 1024 * 1024))
+  mkdir -p -- "$case_root"
+
+  python3 - "$source" "$payload_bytes" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+length = int(sys.argv[2])
+path.write_bytes(b"A" * (length - 1) + b"\n")
+PY
+  python3 "$checkpoint_helper" snapshot-metrics \
+    "$source" 1 "$snapshot" >"$helper_log" 2>&1 &
+  helper_pid=$!
+  python3 - "$source" "$snapshot" "$payload_bytes" "$helper_pid" <<'PY'
+import os
+import pathlib
+import sys
+import time
+
+source = pathlib.Path(sys.argv[1])
+snapshot = pathlib.Path(sys.argv[2])
+expected = int(sys.argv[3])
+pid = int(sys.argv[4])
+for _ in range(20_000):
+    try:
+        if snapshot.stat().st_size == expected:
+            with source.open("r+b", buffering=0) as handle:
+                handle.seek(expected - 4096)
+                handle.write(b"B")
+                os.fsync(handle.fileno())
+            break
+    except FileNotFoundError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise SystemExit("snapshot helper exited before the mutation barrier")
+    time.sleep(0.0005)
+else:
+    raise SystemExit("snapshot mutation barrier timed out")
+PY
+  if wait "$helper_pid"; then
+    fail "committed metric prefix mutation was accepted"
+  fi
+  grep -q 'committed metric prefix changed' "$helper_log" \
+    || fail "committed metric prefix mutation failure was not explicit"
+
+  rm -f -- "$source" "$snapshot" "$helper_log"
+  python3 - "$source" "$payload_bytes" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+length = int(sys.argv[2])
+path.write_bytes(b"A" * (length - 1) + b"\n")
+PY
+  python3 "$checkpoint_helper" snapshot-metrics \
+    "$source" 1 "$snapshot" >"$helper_log" 2>&1 &
+  helper_pid=$!
+  python3 - "$source" "$snapshot" "$payload_bytes" "$helper_pid" <<'PY'
+import os
+import pathlib
+import sys
+import time
+
+source = pathlib.Path(sys.argv[1])
+snapshot = pathlib.Path(sys.argv[2])
+expected = int(sys.argv[3])
+pid = int(sys.argv[4])
+for _ in range(20_000):
+    try:
+        if snapshot.stat().st_size == expected:
+            with source.open("ab", buffering=0) as handle:
+                handle.write(b"append-only-tail\n")
+                os.fsync(handle.fileno())
+            break
+    except FileNotFoundError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise SystemExit("snapshot helper exited before the append barrier")
+    time.sleep(0.0005)
+else:
+    raise SystemExit("snapshot append barrier timed out")
+PY
+  wait "$helper_pid" || {
+    sed -n '1,80p' "$helper_log" >&2
+    fail "append-only metric tail growth was rejected"
+  }
+  [[ $(wc -c <"$snapshot") -eq $payload_bytes ]] \
+    || fail "metric snapshot copied an uncommitted append-only tail"
 }
 
 run_global_step_mismatch_rejected_test() {
@@ -1516,14 +2023,17 @@ run_concurrent_pointer_race_test() {
   local second_config=$case_root/second.conf
   local first_step second_step first_generation second_generation
   local first_pid second_pid delayed=false published=false observed_generation
+  local sync_result=false expected_sync_pattern
   case "$mode" in
     stale)
       first_step=61
       second_step=62
+      expected_sync_pattern='remote checkpoint advanced|leaving it unchanged'
       ;;
     fork)
       first_step=63
       second_step=63
+      expected_sync_pattern='equal-step remote checkpoint fork'
       ;;
     *) fail "unknown pointer race mode: $mode" ;;
   esac
@@ -1594,6 +2104,16 @@ EOF
     sleep 0.05
   done
   : >"$TEST_GCS_DELAY_RELEASE"
+  # Let the deliberately delayed sync observe the winning pointer before the
+  # trainers exit; supervisor cleanup otherwise has permission to stop it.
+  for _attempt in {1..400}; do
+    if grep -Eq "$expected_sync_pattern" \
+      "$case_root/first-state/sync.log" 2>/dev/null; then
+      sync_result=true
+      break
+    fi
+    sleep 0.05
+  done
   : >"$case_root/release-first"
   : >"$case_root/release-second"
   wait "$first_pid"
@@ -1604,18 +2124,10 @@ EOF
   [[ $published == true ]] || fail "$mode winning checkpoint was not published"
   [[ $(current_generation "$case_root/gcs/test-bucket/$mode") == "$second_generation" ]] \
     || fail "$mode delayed publisher rewound or replaced the winning checkpoint"
-  case "$mode" in
-    stale)
-      grep -Eq 'remote checkpoint advanced|leaving it unchanged' \
-        "$case_root/first-state/sync.log" \
-        || fail "stale concurrent publisher did not report the newer checkpoint"
-      ;;
-    fork)
-      grep -q 'equal-step remote checkpoint fork' \
-        "$case_root/first-state/sync.log" \
-        || fail "equal-step concurrent fork was not rejected explicitly"
-      ;;
-  esac
+  [[ $sync_result == true ]] || {
+    sed "s/^/$mode publisher: /" "$case_root/first-state/sync.log" >&2
+    fail "$mode delayed publisher did not observe the winning checkpoint"
+  }
 }
 
 run_cross_generation_cas_dedup_test() {
@@ -1660,10 +2172,15 @@ PY
 
 run_restart_and_reporting_test
 run_remote_restore_test
+run_file_remote_root_fd_anchor_test
+run_file_remote_entry_swap_rejected_test
 run_newer_local_wins_test
 run_idempotent_lock_test
 run_version_one_checkpoint_rejected_test
 run_modified_generation_rejected_test
+run_strict_training_state_rejected_test
+run_corrupt_metric_prefix_rejected_test
+run_metric_snapshot_stability_test
 run_global_step_mismatch_rejected_test
 run_unsafe_pointer_rejected_test
 run_unsafe_manifest_path_rejected_test

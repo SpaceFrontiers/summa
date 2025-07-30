@@ -249,6 +249,9 @@ pub struct ConsolidationTxn {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SleepState {
+    /// Highest consolidation attempt ID allocated so far. Successful and
+    /// rolled-back attempts both consume an ID so immutable receipts from a
+    /// rejected attempt can never alias a later transaction.
     pub cycle: u64,
     pub clock: u64,
     pub phase: SleepPhase,
@@ -724,8 +727,26 @@ impl SleepState {
                 tier.id
             );
         }
+        let due = self
+            .due_clocks
+            .iter()
+            .copied()
+            .zip(self.due_senders.iter().copied())
+            .collect::<Vec<_>>();
+        // A rejected terminal consolidation is retried before ordinary
+        // senders so no further transfer can fill its already-full reserve.
+        // That exceptional first entry may therefore precede an older due
+        // clock; the remainder always retains normal chronological ordering.
+        let terminal_retry_prefix = due.first().is_some_and(|(_, sender)| {
+            self.tiers.get(*sender).is_some_and(|tier| {
+                *sender + 1 == self.tiers.len() && tier.last_update_clock < tier.last_boundary_clock
+            })
+        });
+        let ordered_start = usize::from(terminal_retry_prefix);
+        let unique_due_senders = self.due_senders.iter().copied().collect::<BTreeSet<_>>();
         ensure!(
             self.due_senders.len() == self.due_clocks.len()
+                && unique_due_senders.len() == self.due_senders.len()
                 && self
                     .due_senders
                     .iter()
@@ -734,11 +755,7 @@ impl SleepState {
                     .due_clocks
                     .iter()
                     .all(|clock| *clock > 0 && *clock <= self.clock)
-                && self
-                    .due_clocks
-                    .iter()
-                    .zip(&self.due_senders)
-                    .collect::<Vec<_>>()
+                && due[ordered_start..]
                     .windows(2)
                     .all(|pair| pair[0] < pair[1]),
             "sleep checkpoint has an invalid due-boundary queue"
@@ -750,9 +767,12 @@ impl SleepState {
             validate_content_hash(manifest, "sleep artifact manifest")?;
         }
         validate_content_hash(&self.completed_chain_hash, "sleep completed-history hash")?;
+        let expected_completed_tail =
+            usize::try_from(self.completed_count.min(COMPLETED_TRANSACTION_TAIL as u64))
+                .context("sleep completed-transaction tail length exceeds usize")?;
         ensure!(
-            self.completed_transactions.len() <= COMPLETED_TRANSACTION_TAIL
-                && self.completed_count >= self.completed_transactions.len() as u64,
+            self.completed_count <= self.cycle
+                && self.completed_transactions.len() == expected_completed_tail,
             "sleep completed-transaction audit tail is inconsistent"
         );
         ensure!(
@@ -762,7 +782,9 @@ impl SleepState {
                 && self
                     .completed_transactions
                     .iter()
-                    .all(|txn| txn.committed && txn.candidate_hash.is_some()),
+                    .all(|txn| txn.id <= self.cycle
+                        && txn.committed
+                        && txn.candidate_hash.is_some()),
             "sleep completed-transaction audit tail is invalid"
         );
         match (self.phase, self.pending.as_ref()) {
@@ -805,6 +827,12 @@ impl SleepState {
                 ensure!(
                     txn.id == expected_id,
                     "sleep transaction id disagrees with cycle/commit state"
+                );
+                ensure!(
+                    self.completed_transactions
+                        .last()
+                        .is_none_or(|completed| completed.id < txn.id),
+                    "pending sleep transaction reuses a completed transaction id"
                 );
                 ensure!(
                     txn.terminal || txn.receiver_slot < self.tiers[txn.receiver].slots.len(),
@@ -1090,7 +1118,6 @@ impl SleepState {
             "sleep schedule topology differs from checkpoint state"
         );
         ensure!(clock >= self.clock, "sleep clock cannot move backwards");
-        self.clock = clock;
         let mut due = Vec::new();
         for (sender, tier) in schedule.tiers.iter().enumerate() {
             let last = self.tiers[sender].last_boundary_clock;
@@ -1099,22 +1126,93 @@ impl SleepState {
                 .and_then(|multiple| multiple.checked_add(1))
                 .and_then(|multiple| multiple.checked_mul(tier.update_period))
                 .context("sleep boundary clock overflow")?;
-            let mut boundary = first;
-            while boundary <= clock {
-                due.push((boundary, sender));
-                boundary = boundary
+            if first <= clock {
+                let second = first
                     .checked_add(tier.update_period)
                     .context("sleep boundary clock overflow")?;
+                ensure!(
+                    second > clock,
+                    "sleep clock advance from {} to {clock} crosses multiple `{}` boundaries ({first} and {second}); one tier gradient accumulator cannot supply multiple updates, so the host must split the advance at a boundary",
+                    self.clock,
+                    tier.id,
+                );
+                due.push((first, sender));
             }
         }
         due.sort_unstable();
+
+        // A failed terminal transfer leaves its active slots intact by
+        // design. Backpressure ordinary transfers until the next configured
+        // terminal boundary, then retry terminal first so capacity is either
+        // reclaimed before a new transfer or remains safely unchanged.
+        let terminal = self.tiers.len() - 1;
+        let terminal_retry_pending =
+            self.tiers[terminal].last_update_clock < self.tiers[terminal].last_boundary_clock;
+        if terminal_retry_pending {
+            if let Some(index) = due.iter().position(|(_, sender)| *sender == terminal) {
+                let retry = due.remove(index);
+                due.insert(0, retry);
+            } else {
+                // No terminal attempt is scheduled yet. Consume only the
+                // logical boundaries, not their accumulated gradients, so
+                // wake learning can continue without filling more reserves.
+                for (trigger_clock, sender) in &due {
+                    self.tiers[*sender].last_boundary_clock = *trigger_clock;
+                }
+                due.clear();
+            }
+        }
+
+        self.clock = clock;
         self.due_clocks = due.iter().map(|(clock, _)| *clock).collect();
         self.due_senders = due.into_iter().map(|(_, sender)| sender).collect();
         Ok(())
     }
 
+    pub fn next_due_boundary(&self) -> Option<(usize, u64)> {
+        self.due_senders
+            .first()
+            .copied()
+            .zip(self.due_clocks.first().copied())
+    }
+
     pub fn next_due_sender(&self) -> Option<usize> {
-        self.due_senders.first().copied()
+        self.next_due_boundary().map(|(sender, _)| sender)
+    }
+
+    fn ensure_next_due_boundary(
+        &self,
+        expected_sender: usize,
+        expected_clock: u64,
+        operation: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.next_due_boundary() == Some((expected_sender, expected_clock)),
+            "{operation} boundary ({expected_clock}, {expected_sender}) is not first in the due queue"
+        );
+        Ok(())
+    }
+
+    fn consume_next_due_boundary(
+        &mut self,
+        expected_sender: usize,
+        expected_clock: u64,
+        operation: &str,
+    ) -> Result<()> {
+        self.ensure_next_due_boundary(expected_sender, expected_clock, operation)?;
+        self.due_senders.remove(0);
+        self.due_clocks.remove(0);
+        Ok(())
+    }
+
+    /// Allocate the identifier that the next consolidation attempt must use.
+    /// Successful and rolled-back attempts both advance `cycle`, so callers
+    /// preparing immutable transaction-keyed artifacts must use this checked
+    /// helper rather than arithmetic on the checkpoint field.
+    pub fn next_transaction_id(&self) -> Result<u64> {
+        self.cycle
+            .checked_add(1)
+            .context("sleep consolidation transaction ID overflows u64")
     }
 
     pub fn begin(
@@ -1134,8 +1232,14 @@ impl SleepState {
             sender < self.tiers.len(),
             "sender tier {sender} is out of range"
         );
+        let (next_sender, trigger_clock) = self.next_due_boundary().with_context(|| {
+            format!(
+                "sender tier {sender} has no paired due boundary at sleep clock {}",
+                self.clock
+            )
+        })?;
         ensure!(
-            self.next_due_sender() == Some(sender),
+            next_sender == sender,
             "sender tier {sender} is not next at sleep clock {}",
             self.clock
         );
@@ -1168,12 +1272,10 @@ impl SleepState {
             .enumerate()
             .filter_map(|(index, slot)| slot.active.then_some(index))
             .collect();
+        let transaction_id = self.next_transaction_id()?;
         let txn = ConsolidationTxn {
-            id: self.cycle + 1,
-            trigger_clock: *self
-                .due_clocks
-                .first()
-                .context("sender has no paired due clock")?,
+            id: transaction_id,
+            trigger_clock,
             sender,
             receiver,
             receiver_slot,
@@ -1380,8 +1482,9 @@ impl SleepState {
         );
         let txn = self
             .pending
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("no consolidation transaction"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no consolidation transaction"))?
+            .clone();
         if txn.committed {
             return Ok(());
         }
@@ -1397,31 +1500,61 @@ impl SleepState {
                 .context("consolidation has no published candidate hash")?,
             "published candidate hash",
         )?;
+        // Validate the whole metadata transaction before changing any slot.
+        // Corrupt resume state and generation exhaustion must fail without a
+        // partially activated receiver or partially reclaimed sender.
+        self.ensure_next_due_boundary(txn.sender, txn.trigger_clock, "committed")?;
+        let sender_tier = self
+            .tiers
+            .get(txn.sender)
+            .context("committed sender tier is out of range")?;
+        if !txn.terminal {
+            let receiver_slot = self
+                .tiers
+                .get(txn.receiver)
+                .context("committed receiver tier is out of range")?
+                .slots
+                .get(txn.receiver_slot)
+                .context("committed receiver slot is out of range")?;
+            ensure!(!receiver_slot.active, "receiver slot is already active");
+            ensure!(
+                receiver_slot.generation < u64::MAX,
+                "receiver reserve generation overflows u64"
+            );
+        }
+        for &slot in &txn.sender_slots_to_reset {
+            let sender_slot = sender_tier
+                .slots
+                .get(slot)
+                .context("sender reset plan contains an out-of-range slot")?;
+            ensure!(
+                sender_slot.active,
+                "sender reset plan contains dormant slot"
+            );
+            ensure!(
+                sender_slot.generation < u64::MAX,
+                "sender reserve generation overflows u64"
+            );
+        }
+        self.consume_next_due_boundary(txn.sender, txn.trigger_clock, "committed")?;
+
         if !txn.terminal {
             let receiver_slot = &mut self.tiers[txn.receiver].slots[txn.receiver_slot];
-            ensure!(!receiver_slot.active, "receiver slot is already active");
             receiver_slot.active = true;
             receiver_slot.generation += 1;
         }
         for &slot in &txn.sender_slots_to_reset {
             let sender_slot = &mut self.tiers[txn.sender].slots[slot];
-            ensure!(
-                sender_slot.active,
-                "sender reset plan contains dormant slot"
-            );
             sender_slot.active = false;
             sender_slot.generation += 1;
         }
         self.tiers[txn.sender].last_update_clock = txn.trigger_clock;
         self.tiers[txn.sender].last_boundary_clock = txn.trigger_clock;
-        ensure!(
-            self.due_senders.first() == Some(&txn.sender),
-            "committed sender is not first in the due queue"
-        );
-        self.due_senders.remove(0);
-        self.due_clocks.remove(0);
         self.cycle = txn.id;
-        txn.committed = true;
+        self.pending
+            .as_mut()
+            .expect("transaction was validated above")
+            .committed = true;
         Ok(())
     }
 
@@ -1524,17 +1657,54 @@ impl SleepState {
     /// Roll back metadata.  The backend must restore the immutable teacher
     /// checkpoint before this method is persisted.
     pub fn rollback(&mut self) -> Result<ConsolidationTxn> {
+        let (sender, trigger_clock) = self
+            .pending
+            .as_ref()
+            .map(|txn| (txn.sender, txn.trigger_clock))
+            .ok_or_else(|| anyhow::anyhow!("no consolidation transaction"))?;
+        ensure!(
+            sender < self.tiers.len(),
+            "rolled-back sender tier is out of range"
+        );
+        let terminal = self
+            .pending
+            .as_ref()
+            .expect("pending transaction was checked above")
+            .terminal;
+        if terminal {
+            ensure!(
+                self.due_senders.len() == self.due_clocks.len()
+                    && self
+                        .due_senders
+                        .iter()
+                        .all(|queued_sender| *queued_sender < self.tiers.len()),
+                "rolled-back terminal boundary has an invalid trailing due queue"
+            );
+        }
+        self.consume_next_due_boundary(sender, trigger_clock, "rolled-back")?;
         let txn = self
             .pending
             .take()
-            .ok_or_else(|| anyhow::anyhow!("no consolidation transaction"))?;
-        ensure!(
-            self.due_senders.first() == Some(&txn.sender),
-            "rolled-back sender is not first in the due queue"
-        );
-        self.tiers[txn.sender].last_boundary_clock = txn.trigger_clock;
-        self.due_senders.remove(0);
-        self.due_clocks.remove(0);
+            .expect("transaction was validated before consuming its due boundary");
+        self.tiers[sender].last_boundary_clock = trigger_clock;
+        if terminal {
+            // A terminal retry has priority because its reserve may already
+            // be full. If it is rejected, do not attempt any transfers that
+            // were queued behind it in the same coarse host advance. Their
+            // gradient accumulators remain intact and will be consumed at a
+            // later boundary after terminal retention succeeds.
+            for (sender, trigger_clock) in self
+                .due_senders
+                .iter()
+                .copied()
+                .zip(self.due_clocks.iter().copied())
+            {
+                self.tiers[sender].last_boundary_clock = trigger_clock;
+            }
+            self.due_senders.clear();
+            self.due_clocks.clear();
+        }
+        self.cycle = txn.id;
         self.phase = SleepPhase::Wake;
         Ok(txn)
     }
@@ -1614,20 +1784,34 @@ pub fn validate_model_memory_state(
     );
     let mut expected = Vec::new();
     for (sender, tier) in schedule.tiers.iter().enumerate() {
-        let mut boundary = state.tiers[sender]
+        let boundary = state.tiers[sender]
             .last_boundary_clock
             .checked_div(tier.update_period)
             .and_then(|multiple| multiple.checked_add(1))
             .and_then(|multiple| multiple.checked_mul(tier.update_period))
             .context("sleep resume boundary clock overflow")?;
-        while boundary <= state.clock {
-            expected.push((boundary, sender));
-            boundary = boundary
+        if boundary <= state.clock {
+            let second = boundary
                 .checked_add(tier.update_period)
                 .context("sleep resume boundary clock overflow")?;
+            ensure!(
+                second > state.clock,
+                "sleep checkpoint crosses multiple `{}` boundaries ({boundary} and {second}) without consuming the tier accumulator",
+                tier.id,
+            );
+            expected.push((boundary, sender));
         }
     }
     expected.sort_unstable();
+    let terminal = schedule.tiers.len() - 1;
+    let terminal_retry_pending =
+        state.tiers[terminal].last_update_clock < state.tiers[terminal].last_boundary_clock;
+    if terminal_retry_pending
+        && let Some(index) = expected.iter().position(|(_, sender)| *sender == terminal)
+    {
+        let retry = expected.remove(index);
+        expected.insert(0, retry);
+    }
     let expected_clocks = expected.iter().map(|(clock, _)| *clock).collect::<Vec<_>>();
     let expected_due = expected
         .into_iter()
@@ -2432,6 +2616,17 @@ mod tests {
     }
 
     #[test]
+    fn resume_rejects_multiple_unconsumed_boundaries_for_one_sender() {
+        let mut state = SleepState::new(&schedule(), 1).unwrap();
+        state.clock = 4;
+        state.due_senders = vec![0, 0];
+        state.due_clocks = vec![2, 4];
+
+        let error = state.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("due-boundary queue"), "{error}");
+    }
+
+    #[test]
     fn immutable_identities_require_canonical_sha256() {
         let mut state = SleepState::new(&schedule(), 1).unwrap();
         state.advance_clock(&schedule(), 2).unwrap();
@@ -2637,6 +2832,67 @@ mod tests {
         assert_eq!(state.tiers[1].slots[0].generation, 1);
     }
 
+    #[test]
+    fn transaction_and_generation_exhaustion_fail_without_partial_mutation() {
+        let schedule = schedule();
+
+        let mut exhausted_id = SleepState::new(&schedule, 1).unwrap();
+        exhausted_id.cycle = u64::MAX;
+        exhausted_id.advance_clock(&schedule, 2).unwrap();
+        let before = exhausted_id.clone();
+        let error = exhausted_id
+            .begin(
+                0,
+                "teacher/id-overflow".into(),
+                test_hash('a'),
+                "student/id-overflow".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transaction ID overflows"), "{error}");
+        assert_eq!(exhausted_id, before);
+
+        let mut exhausted_generation = SleepState::new(&schedule, 1).unwrap();
+        exhausted_generation.tiers[0].slots[0].active = true;
+        exhausted_generation.tiers[0].slots[0].generation = u64::MAX;
+        exhausted_generation.advance_clock(&schedule, 2).unwrap();
+        exhausted_generation
+            .begin(
+                0,
+                "teacher/generation-overflow".into(),
+                test_hash('a'),
+                "student/generation-overflow".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        exhausted_generation
+            .transition(SleepPhase::KnowledgeSeeding)
+            .unwrap();
+        exhausted_generation
+            .transition(SleepPhase::Imitation)
+            .unwrap();
+        exhausted_generation
+            .transition(SleepPhase::RetentionValidation)
+            .unwrap();
+        exhausted_generation.transition(SleepPhase::Commit).unwrap();
+        exhausted_generation
+            .record_committed_candidate("candidate/generation-overflow".into(), test_hash('d'))
+            .unwrap();
+        let before = exhausted_generation.clone();
+        let error = exhausted_generation
+            .commit_consolidation()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("sender reserve generation overflows"),
+            "{error}"
+        );
+        assert_eq!(exhausted_generation, before);
+    }
+
     #[derive(Default)]
     struct MockBackend {
         calls: Vec<&'static str>,
@@ -2719,6 +2975,141 @@ mod tests {
     }
 
     #[test]
+    fn rollback_consumes_attempt_id_before_any_later_receipt_can_be_published() {
+        let schedule = schedule();
+        let mut state = SleepState::new(&schedule, 1).unwrap();
+        state.advance_clock(&schedule, 2).unwrap();
+        let first = state
+            .begin(
+                0,
+                "teacher/first".into(),
+                test_hash('a'),
+                "student/first".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        state.rollback().unwrap();
+        assert_eq!(state.cycle, first.id);
+
+        state.advance_clock(&schedule, 4).unwrap();
+        let second = state
+            .begin(
+                0,
+                "teacher/second".into(),
+                test_hash('a'),
+                "student/second".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        assert_eq!(second.id, first.id + 1);
+    }
+
+    #[test]
+    fn rollback_rejects_a_missing_due_clock_without_mutation_or_panic() {
+        let mut state = begun_state();
+        state.due_clocks.clear();
+        let before = state.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.rollback()));
+        let error = result
+            .expect("rollback panicked on a missing paired due clock")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("rolled-back boundary"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn rollback_rejects_a_mismatched_due_clock_without_mutation_or_panic() {
+        let mut state = begun_state();
+        state.due_clocks[0] += 1;
+        let before = state.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.rollback()));
+        let error = result
+            .expect("rollback panicked on a mismatched paired due clock")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("rolled-back boundary"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn terminal_rollback_rejects_an_invalid_trailing_queue_without_mutation() {
+        let mut state = begun_state();
+        state.pending.as_mut().unwrap().terminal = true;
+        state.due_senders.push(usize::MAX);
+        state.due_clocks.push(4);
+        let before = state.clone();
+
+        let error = state.rollback().unwrap_err().to_string();
+
+        assert!(error.contains("invalid trailing due queue"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn commit_rejects_an_invalid_receiver_slot_without_mutation_or_panic() {
+        let mut state = begun_state();
+        state.transition(SleepPhase::KnowledgeSeeding).unwrap();
+        state.transition(SleepPhase::Imitation).unwrap();
+        state.transition(SleepPhase::RetentionValidation).unwrap();
+        state.transition(SleepPhase::Commit).unwrap();
+        state
+            .record_committed_candidate("candidate/invalid-slot".into(), test_hash('d'))
+            .unwrap();
+        state.pending.as_mut().unwrap().receiver_slot = usize::MAX;
+        let before = state.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.commit_consolidation()
+        }));
+        let error = result
+            .expect("commit panicked on an invalid receiver slot")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("receiver slot is out of range"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn resume_rejects_completed_receipts_that_can_alias_attempt_ids() {
+        let mut finished = committed_state();
+        finished.transition(SleepPhase::Candidate).unwrap();
+        let completed = finished.finish_candidate().unwrap();
+        finished.validate_resume().unwrap();
+        assert_eq!(finished.cycle, completed.id);
+        assert_eq!(finished.completed_count, 1);
+
+        let mut future_receipt = finished.clone();
+        future_receipt.completed_transactions[0].id = future_receipt.cycle + 1;
+        let error = future_receipt.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("audit tail is invalid"), "{error}");
+
+        let mut dropped_receipt = finished.clone();
+        dropped_receipt.completed_transactions.clear();
+        let error = dropped_receipt.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("audit tail is inconsistent"), "{error}");
+
+        // A committed-but-not-finished transaction owns `cycle` already. Its
+        // immutable receipt key must not collide with a completed tail entry.
+        let mut duplicate_pending = committed_state();
+        duplicate_pending.completed_count = finished.completed_count;
+        duplicate_pending.completed_chain_hash = finished.completed_chain_hash.clone();
+        duplicate_pending.completed_transactions = finished.completed_transactions.clone();
+        let error = duplicate_pending.validate_resume().unwrap_err().to_string();
+        assert!(
+            error.contains("reuses a completed transaction id"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn failed_consolidation_restores_teacher() {
         let mut state = begun_state();
         let mut backend = MockBackend {
@@ -2762,38 +3153,138 @@ mod tests {
     }
 
     #[test]
-    fn coincident_boundary_queue_never_replays_a_completed_sender() {
+    fn coarse_clock_advance_fails_before_mutating_the_scheduler() {
         let schedule = schedule();
         let mut state = SleepState::new(&schedule, 1).unwrap();
+        let before = state.clone();
+        let error = state.advance_clock(&schedule, 4).unwrap_err().to_string();
+        assert!(
+            error.contains("crosses multiple `fast` boundaries"),
+            "{error}"
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn terminal_rejection_retries_before_the_next_transfer() {
+        let schedule = SleepSchedule {
+            clock: UpdateClock::OptimizerSteps,
+            terminal_consolidation: TerminalConsolidation::DistillIntoBaseV1,
+            tiers: vec![
+                MemoryTierSchedule {
+                    id: "fast".into(),
+                    update_period: 1,
+                    reserve_slots: 1,
+                },
+                MemoryTierSchedule {
+                    id: "slow".into(),
+                    update_period: 2,
+                    reserve_slots: 2,
+                },
+            ],
+        };
+        let mut state = SleepState::new(&schedule, 1).unwrap();
+
+        let finish = |state: &mut SleepState, sender: usize, suffix: &str| {
+            let txn = state
+                .begin(
+                    sender,
+                    format!("teacher/{suffix}"),
+                    test_hash('a'),
+                    format!("student/{suffix}"),
+                    test_hash('b'),
+                    test_hash('c'),
+                )
+                .unwrap();
+            state.transition(SleepPhase::KnowledgeSeeding).unwrap();
+            state.transition(SleepPhase::Imitation).unwrap();
+            state.transition(SleepPhase::RetentionValidation).unwrap();
+            state.transition(SleepPhase::Commit).unwrap();
+            state
+                .record_committed_candidate(format!("candidate/{suffix}"), test_hash('d'))
+                .unwrap();
+            state.commit_consolidation().unwrap();
+            state.transition(SleepPhase::Candidate).unwrap();
+            state.finish_candidate().unwrap();
+            txn
+        };
+
+        state.advance_clock(&schedule, 1).unwrap();
+        finish(&mut state, 0, "fast-1");
+        state.advance_clock(&schedule, 2).unwrap();
+        finish(&mut state, 0, "fast-2");
+        assert!(state.tiers[1].slots.iter().all(|slot| slot.active));
+
+        state
+            .begin(
+                1,
+                "teacher/terminal-2".into(),
+                test_hash('a'),
+                "student/terminal-2".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        let rejected_id = state.pending.as_ref().unwrap().id;
+        state.rollback().unwrap();
+        assert_eq!(state.cycle, rejected_id);
+
+        state.advance_clock(&schedule, 3).unwrap();
+        assert!(state.due_senders.is_empty());
+        assert_eq!(state.tiers[0].last_boundary_clock, 3);
+        let statuses = state
+            .tiers
+            .iter()
+            .enumerate()
+            .flat_map(|(tier, tier_state)| {
+                tier_state
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .map(move |(slot, slot_state)| MemorySlotStatus {
+                        layer: 0,
+                        tier,
+                        tier_name: tier_state.id.clone(),
+                        slot,
+                        active: slot_state.active,
+                        generation: slot_state.generation,
+                        parameter_ids: vec![ParamId::new()],
+                    })
+            })
+            .collect::<Vec<_>>();
+        validate_model_memory_state(&schedule, &state, &statuses).unwrap();
+
         state.advance_clock(&schedule, 4).unwrap();
-        assert_eq!(state.due_senders, vec![0, 0, 1]);
-        assert_eq!(state.due_clocks, vec![2, 4, 4]);
-        state
+        assert_eq!(state.due_senders, vec![1, 0]);
+        validate_model_memory_state(&schedule, &state, &statuses).unwrap();
+        let retry = state
             .begin(
-                0,
-                "teacher/fast".into(),
+                1,
+                "teacher/terminal-retry-4".into(),
                 test_hash('a'),
-                "student/fast".into(),
+                "student/terminal-retry-4".into(),
                 test_hash('b'),
                 test_hash('c'),
             )
             .unwrap();
-        let mut rejected = MockBackend::default();
-        assert!(!run_consolidation(&mut state, &mut rejected).unwrap());
-        assert_eq!(state.next_due_sender(), Some(0));
-        state
-            .begin(
-                0,
-                "teacher/fast-4".into(),
-                test_hash('a'),
-                "student/fast-4".into(),
-                test_hash('b'),
-                test_hash('c'),
-            )
-            .unwrap();
-        assert!(!run_consolidation(&mut state, &mut rejected).unwrap());
-        assert_eq!(state.next_due_sender(), Some(1));
-        assert!(state.advance_clock(&schedule, 4).is_err());
+        assert!(retry.id > rejected_id);
+        state.rollback().unwrap();
+        assert!(state.due_senders.is_empty());
+
+        // A repeated rejection backpressures the coincident fast boundary.
+        state.advance_clock(&schedule, 5).unwrap();
+        assert!(state.due_senders.is_empty());
+        state.advance_clock(&schedule, 6).unwrap();
+        assert_eq!(state.due_senders, vec![1, 0]);
+        let accepted_retry = finish(&mut state, 1, "terminal-retry-6");
+        assert!(accepted_retry.id > retry.id);
+        assert!(state.tiers[1].slots.iter().all(|slot| !slot.active));
+
+        // The coincident fast transfer now has reclaimed receiver capacity.
+        let transfer = finish(&mut state, 0, "fast-6");
+        assert!(!transfer.terminal);
+        assert_eq!(transfer.receiver_slot, 0);
+        assert!(state.tiers[1].slots[0].active);
     }
 
     #[test]
