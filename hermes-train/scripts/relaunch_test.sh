@@ -142,15 +142,6 @@ if destination.exists():
     shutil.rmtree(staging)
 else:
     os.replace(staging, destination)
-evidence_bytes = json.dumps(
-    {"version": 1, "checkpoint_manifest_sha256": manifest_sha256},
-    sort_keys=True,
-    separators=(",", ":"),
-).encode()
-evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
-evidence_root = root / "training-evidence"
-evidence_root.mkdir(exist_ok=True)
-(evidence_root / f"sha256-{evidence_sha256}.json").write_bytes(evidence_bytes)
 pointer = {
     "version": 1,
     "generation": generation,
@@ -946,7 +937,7 @@ prepare_artifact_checkpoint() {
   local case_root=$1
   local step=$2
   local tag=$3
-  local descriptor overlay generation manifest_sha256 evidence evidence_sha256
+  local descriptor overlay generation
   descriptor=$(write_sleep_runtime "$case_root")
   IFS=$'\t' read -r PREPARED_RUNTIME PREPARED_RUNTIME_SHA256 <<<"$descriptor"
   overlay=$(
@@ -956,30 +947,6 @@ prepare_artifact_checkpoint() {
   write_checkpoint "$case_root/seed-output" "$step"
   unset TEST_CHECKPOINT_STATE_OVERLAY
   generation=$(current_generation "$case_root/seed-output")
-  manifest_sha256=${generation#sha256-}
-  evidence=$(python3 - "$case_root/seed-output" "$manifest_sha256" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1]) / "training-evidence"
-root.mkdir(parents=True, exist_ok=True)
-payload = json.dumps(
-    {"version": 1, "checkpoint_manifest_sha256": sys.argv[2]},
-    sort_keys=True,
-    separators=(",", ":"),
-).encode()
-digest = hashlib.sha256(payload).hexdigest()
-path = root / f"sha256-{digest}.json"
-path.write_bytes(payload)
-print(path)
-PY
-  )
-  evidence_sha256=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$evidence")
-  [[ $(basename -- "$evidence") == sha256-$evidence_sha256.json ]] \
-    || fail "training-evidence fixture is not content addressed"
-
   # Simulate G+1 advancing convenience state after sealed checkpoint G. The G
   # closure must select its recorded immutable generation and never this file.
   printf '{"version":2,"generation":"future"}\n' \
@@ -1563,73 +1530,6 @@ EOF
     || fail "corrupt remote checkpoint failure was not explained"
 }
 
-run_training_evidence_rejected_test() {
-  local mode=$1
-  local case_root=$TEST_ROOT/training-evidence-$mode
-  local config=$case_root/relaunch.conf
-  local generation supervisor_pid observed=false
-  write_checkpoint "$case_root/output" 23 2 "evidence-$mode"
-  generation=$(current_generation "$case_root/output")
-  case "$mode" in
-    missing)
-      rm -rf -- "$case_root/output/training-evidence"
-      ;;
-    conflicting)
-      python3 - "$case_root/output" "${generation#sha256-}" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1]) / "training-evidence"
-payload = json.dumps(
-    {
-        "version": 1,
-        "checkpoint_manifest_sha256": sys.argv[2],
-        "conflicting_receipt": True,
-    },
-    sort_keys=True,
-    separators=(",", ":"),
-).encode()
-digest = hashlib.sha256(payload).hexdigest()
-(root / f"sha256-{digest}.json").write_bytes(payload)
-PY
-      ;;
-    *) fail "unknown training-evidence rejection mode: $mode" ;;
-  esac
-  cat >"$config" <<EOF
-HERMES_TRAIN_OUTPUT=$case_root/output
-HERMES_TRAIN_STATE_DIR=$case_root/state
-HERMES_TRAIN_REMOTE_URL=file://$case_root/remote
-HERMES_TRAIN_COMMAND=($fake_trainer train)
-HERMES_TRAIN_SYNC_INTERVAL=1
-HERMES_TRAIN_MAX_RESTARTS=0
-EOF
-  export TEST_CALLS=$case_root/calls
-  export TEST_READY=$case_root/ready
-  export TEST_RELEASE=$case_root/release
-  export TEST_BLOCK=true
-  export TEST_FAIL_ONCE=false
-  unset TEST_EXPECT_STEP TEST_WANDB_CALLS TEST_FAILURE_MARKER
-  "$TEST_SCRIPT_DIR/relaunch.sh" "$config" >"$case_root/log" 2>&1 &
-  supervisor_pid=$!
-  for _attempt in {1..200}; do
-    if grep -q 'checkpoint must have exactly one checkpoint-bound training-evidence artifact' \
-      "$case_root/state/sync.log" 2>/dev/null; then
-      observed=true
-      break
-    fi
-    sleep 0.05
-  done
-  : >"$TEST_RELEASE"
-  wait "$supervisor_pid"
-  unset TEST_BLOCK TEST_READY TEST_RELEASE
-  [[ $observed == true ]] \
-    || fail "$mode checkpoint-bound training-evidence failure was not explained"
-  [[ ! -e $case_root/remote/current.json ]] \
-    || fail "$mode checkpoint-bound training evidence was published"
-}
-
 run_sleep_and_qat_vm_loss_restore_test() {
   local case_root=$TEST_ROOT/artifact-vm-loss
   local config=$case_root/relaunch.conf
@@ -1692,8 +1592,6 @@ PY
   [[ $(cat "$case_root/runtime/stores/candidates/local-only/unrelated.bin") \
     == preserve-local-data ]] \
     || fail "restore overwrote an unrelated local generated artifact"
-  [[ $(find "$case_root/seed-output/training-evidence" -type f | wc -l) -eq 1 ]] \
-    || fail "generation-bound training evidence was not restored exactly"
 }
 
 run_equal_generation_release_rehydration_test() {
@@ -2185,8 +2083,6 @@ run_global_step_mismatch_rejected_test
 run_unsafe_pointer_rejected_test
 run_unsafe_manifest_path_rejected_test
 run_corrupt_remote_rejected_test
-run_training_evidence_rejected_test missing
-run_training_evidence_rejected_test conflicting
 run_sleep_and_qat_vm_loss_restore_test
 run_equal_generation_release_rehydration_test
 run_rewritten_closure_rejected_test

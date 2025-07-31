@@ -16,8 +16,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::pinned_executable::StagedExecutable;
-
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -27,7 +25,7 @@ pub(crate) enum ProtocolRead {
     Eof,
 }
 
-/// One child leader plus its nonblocking protocol pipes and staged executable.
+/// One child leader plus its nonblocking protocol pipes.
 ///
 /// The child must have been spawned as the leader of a fresh process group.
 /// `Drop` kills that group, closes both host pipe ends, and reaps the leader.
@@ -43,13 +41,11 @@ pub(crate) struct SupervisedProcess {
     process_group_terminated: bool,
     label: &'static str,
     max_message_bytes: usize,
-    _executable: StagedExecutable,
 }
 
 impl SupervisedProcess {
     pub(crate) fn new(
         mut child: Child,
-        executable: StagedExecutable,
         label: &'static str,
         max_message_bytes: usize,
     ) -> Result<Self> {
@@ -79,7 +75,6 @@ impl SupervisedProcess {
             process_group_terminated: false,
             label,
             max_message_bytes,
-            _executable: executable,
         })
     }
 

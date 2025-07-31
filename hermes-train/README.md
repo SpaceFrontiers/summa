@@ -151,7 +151,6 @@ positive/negative grouping.
 hermes-train run-workflow \
   --workflow hermes-train/workflow.example.json \
   --executor /opt/hermes/bin/phase-worker \
-  --executor-sha256 "sha256:$PHASE_WORKER_SHA256" \
   --state /data/run/workflow-runtime.json \
   --metrics /data/run/metrics.jsonl \
   --run-id workflow-seed-1 \
@@ -160,8 +159,8 @@ hermes-train run-workflow \
 ```
 
 If a worker yields, invoke the same command with `--resume` and without either
-initial-checkpoint option. The runtime verifies the workflow, worker digest,
-metric run id, and committed metric prefix before continuing. The concrete
+initial-checkpoint option. The runtime verifies the workflow, worker dispatch
+identity, metric run id, and committed metric prefix before continuing. The concrete
 post-training library implements DPO, forward `KL(teacher || student)`, clipped
 GRPO with a non-negative KL estimator, JSONL/zstd streaming, and an exact-answer
 verifier. Its native `PhaseExecutor` checkpoints a content-bound cursor before
@@ -189,8 +188,8 @@ model repositories cannot alias one another. Context factories should use
 
 The complete education recipe combines periodic sleep with phase kinds outside
 the wake trainer and therefore uses the public embedded host in `native_host`.
-An embedding application constructs `NativeWorkflowAdapters` and registers a
-pinned external worker for ordinary phases, a
+An embedding application constructs `NativeWorkflowAdapters` and registers an
+external worker for ordinary phases, a
 `NativePostTrainingContextFactory` for native DPO/KL/GRPO, a
 `NativePeriodicWakeExecutor` for periodic optimizer-bearing phases not handled
 by typed post-training, and a `NativeSleepPhaseContextFactory` when the

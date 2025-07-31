@@ -134,6 +134,23 @@ pub fn hash_open_file(
     capture_limit: Option<u64>,
     label: &str,
 ) -> Result<(u64, String, Option<Vec<u8>>)> {
+    let (observed, digest, captured) = consume_open_file(file, capture_limit, label, true)?;
+    Ok((
+        observed,
+        digest.context("hashed read did not produce a digest")?,
+        captured,
+    ))
+}
+
+/// Read an already-open regular file under the same growth, truncation, and
+/// identity checks as `hash_open_file`, digesting only when `digest` is set.
+/// Callers that just need bounded, race-checked bytes skip the hash entirely.
+fn consume_open_file(
+    file: &mut File,
+    capture_limit: Option<u64>,
+    label: &str,
+    digest: bool,
+) -> Result<(u64, Option<String>, Option<Vec<u8>>)> {
     let before = file
         .metadata()
         .with_context(|| format!("inspecting opened {label}"))?;
@@ -157,7 +174,7 @@ pub fn hash_open_file(
     };
     file.seek(SeekFrom::Start(0))
         .with_context(|| format!("rewinding opened {label}"))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = digest.then(Sha256::new);
     let mut observed = 0_u64;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
@@ -174,7 +191,9 @@ pub fn hash_open_file(
             observed <= before.len(),
             "opened {label} grew while it was read"
         );
-        hasher.update(&buffer[..read]);
+        if let Some(hasher) = &mut hasher {
+            hasher.update(&buffer[..read]);
+        }
         if let Some(captured) = &mut captured {
             captured.extend_from_slice(&buffer[..read]);
         }
@@ -186,7 +205,11 @@ pub fn hash_open_file(
         StableIdentity::from_metadata(&after) == identity && observed == after.len(),
         "opened {label} changed while it was read"
     );
-    Ok((observed, format!("{:x}", hasher.finalize()), captured))
+    Ok((
+        observed,
+        hasher.map(|hasher| format!("{:x}", hasher.finalize())),
+        captured,
+    ))
 }
 
 /// Stream-hash an opened file while requiring the length pinned by an earlier
@@ -221,13 +244,14 @@ pub fn hash_open_file_exact_length(
     Ok(digest)
 }
 
-fn read_hashed_path(
+fn consume_path(
     path: &Path,
     capture_limit: Option<u64>,
     label: &str,
-) -> Result<(u64, String, Option<Vec<u8>>)> {
+    digest: bool,
+) -> Result<(u64, Option<String>, Option<Vec<u8>>)> {
     let (mut file, identity) = open_regular(path, label)?;
-    let result = hash_open_file(&mut file, capture_limit, label)?;
+    let result = consume_open_file(&mut file, capture_limit, label, digest)?;
     let current = fs::symlink_metadata(path)
         .with_context(|| format!("reinspecting {label} {}", path.display()))?;
     ensure!(
@@ -238,13 +262,26 @@ fn read_hashed_path(
     Ok(result)
 }
 
+fn read_hashed_path(
+    path: &Path,
+    capture_limit: Option<u64>,
+    label: &str,
+) -> Result<(u64, String, Option<Vec<u8>>)> {
+    let (observed, digest, captured) = consume_path(path, capture_limit, label, true)?;
+    Ok((
+        observed,
+        digest.context("hashed read did not produce a digest")?,
+        captured,
+    ))
+}
+
 #[cfg(test)]
 fn read_regular(path: &Path) -> Result<Vec<u8>> {
     read_regular_bounded(path, u64::MAX, &format!("artifact {}", path.display()))
 }
 
 pub fn read_regular_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
-    read_hashed_path(path, Some(max_bytes), label)?
+    consume_path(path, Some(max_bytes), label, false)?
         .2
         .context("authenticated read did not capture bytes")
 }

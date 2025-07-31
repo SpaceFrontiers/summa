@@ -193,7 +193,6 @@ FIXED_ARTIFACT_ROOTS = (
     ("output.quantized-candidates", "quantized-candidates"),
     ("output.sleep-models", "sleep-models"),
     ("output.sleep-wake-contexts", "sleep-wake-contexts"),
-    ("output.training-evidence", "training-evidence"),
 )
 SLEEP_ARTIFACT_ROOT_FIELDS = (
     ("sleep.candidates", "candidate_directory"),
@@ -1823,51 +1822,6 @@ class ArtifactClosureCollector:
         ) is None:
             fail("tier optimizer manifest is outside its configured store")
 
-    def add_training_evidence(self, checkpoint_digest):
-        root = self.roots["output.training-evidence"]
-        if not os.path.lexists(root):
-            fail(
-                "checkpoint must have exactly one checkpoint-bound training-evidence "
-                "artifact, found 0"
-            )
-        real_directory(root, "training-evidence root")
-        try:
-            names = sorted(os.listdir(root))
-        except OSError as error:
-            fail(f"cannot enumerate training-evidence root: {error}")
-        matching = 0
-        for name in names:
-            if not name.startswith("sha256-") or not name.endswith(".json"):
-                continue
-            addressed = name[len("sha256-") : -len(".json")]
-            if len(addressed) != 64 or any(
-                character not in "0123456789abcdef" for character in addressed
-            ):
-                continue
-            path = os.path.join(root, name)
-            length, observed = stable_file_descriptor(path, "training evidence")
-            value = load_unique_json_bytes(
-                read_stable_bytes(path, "training evidence"), "training evidence"
-            )
-            if (
-                isinstance(value, dict)
-                and value.get("checkpoint_manifest_sha256") == checkpoint_digest
-            ):
-                matching += 1
-                if addressed != observed:
-                    fail("checkpoint-bound training evidence has the wrong content address")
-                added = self.add(path, observed, "training evidence")
-                if added is None:
-                    fail("checkpoint-bound training evidence escapes its configured store")
-                root_id, relative, _ = self._location(path)
-                if self.selected[root_id][relative]["bytes"] != length:
-                    fail("checkpoint-bound training evidence changed during closure")
-        if matching != 1:
-            fail(
-                "checkpoint must have exactly one checkpoint-bound training-evidence "
-                f"artifact, found {matching}"
-            )
-
     def manifest_roots(self):
         return [
             {"id": root_id, "files": list(sorted(files.values(), key=lambda item: item["path"]))}
@@ -1875,7 +1829,7 @@ class ArtifactClosureCollector:
         ]
 
 
-def build_artifact_closure(generation_path, spec, generation, checkpoint_digest):
+def build_artifact_closure(generation_path, spec, generation):
     state_path = os.path.join(generation_path, "training-state.json")
     state = load_unique_json_bytes(
         read_stable_bytes(state_path, "sealed training state"), "sealed training state"
@@ -1960,7 +1914,6 @@ def build_artifact_closure(generation_path, spec, generation, checkpoint_digest)
                 fail("training-state optimizer tier is not an object")
             collector.add_tier_optimizer_artifact(tier.get("artifact"))
 
-    collector.add_training_evidence(checkpoint_digest)
     return collector.manifest_roots()
 
 
@@ -2235,9 +2188,7 @@ elif command == "build-artifact-manifest":
             if specification["dream_initial_policy"] is None
             else specification["dream_initial_policy"]["sha256"]
         ),
-        "roots": build_artifact_closure(
-            sys.argv[5], specification, generation, manifest_digest
-        ),
+        "roots": build_artifact_closure(sys.argv[5], specification, generation),
     }
     print(json.dumps(closure, sort_keys=True, separators=(",", ":")))
 elif command == "artifact-plan":

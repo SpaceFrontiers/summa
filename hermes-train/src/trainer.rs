@@ -2336,11 +2336,9 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
 
 fn print_checkpoint_publication(label: &str, publication: &CheckpointPublication) {
     println!(
-        "{label} checkpoint_manifest={} checkpoint_manifest_sha256={} training_evidence={} training_evidence_sha256={}",
+        "{label} checkpoint_manifest={} checkpoint_manifest_sha256={}",
         publication.checkpoint_manifest.display(),
         publication.checkpoint_manifest_sha256,
-        publication.training_evidence.display(),
-        publication.training_evidence_sha256,
     );
 }
 

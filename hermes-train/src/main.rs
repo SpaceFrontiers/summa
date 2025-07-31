@@ -14,9 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hermes_llm::{
     BlockDef, ModelDef, Tokenizer, Transformer, save_safetensors, upgrade_safetensors_to_memory,
 };
-
 use hermes_train::artifact_io::hash_regular_file;
-
 use hermes_train::builtin_sleep_runtime::{
     BuiltinPeriodicSleepBoundaryDriver, BuiltinSleepPhaseContextFactory,
 };
@@ -48,7 +46,6 @@ use hermes_train::quantization::{
     BONSAI_GROUP_SIZE, QuantizationRecipe, UltraQuantFormat, WorkflowQuantizationPlan,
     WorkflowQuantizationTraining, export_safetensors_archive, fake_quantized_transformer,
 };
-
 use hermes_train::runtime::{
     ALL_PHASE_KINDS, ExecutorRegistry, ImmutableArtifact, ImmutableModelCheckpoint, RuntimeStatus,
     WorkflowRunState, run_until_yield_or_complete,
@@ -97,7 +94,6 @@ const FNV1A64_PRIME: u64 = 0x100000001b3;
 const DATA_RNG_STREAM: &str = "data";
 const MODEL_RNG_STREAM: &str = "model_dropout";
 const MODEL_RNG_DOMAIN: u64 = 0xd2b7_4407_b1ce_6e93;
-const MAX_CLI_CONTENT_ADDRESSED_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "hermes-train", about = "Hermes model training")]
@@ -122,7 +118,6 @@ enum Command {
     Quantize(QuantizeArgs),
     /// Upgrade an ordinary checkpoint into an explicit sleep-memory topology.
     UpgradeMemoryCheckpoint(UpgradeMemoryCheckpointArgs),
-
     /// Run WorkflowV2 with pinned workers and first-party native sleep.
     RunWorkflow(RunWorkflowArgs),
 }
@@ -328,9 +323,6 @@ struct RunWorkflowArgs {
     /// Local executable implementing the versioned phase-worker protocol.
     #[arg(long)]
     executor: PathBuf,
-    /// Exact content identity required before every worker launch.
-    #[arg(long)]
-    executor_sha256: String,
     #[arg(long = "executor-arg", allow_hyphen_values = true)]
     executor_arguments: Vec<OsString>,
     /// Hard wall-clock bound for each phase-worker process.
@@ -1671,12 +1663,8 @@ fn run_workflow_command(args: RunWorkflowArgs) -> Result<()> {
         "--sleep-runtime and --sleep-runtime-sha256 must be provided together"
     );
     validate_cli_native_sleep_selection(&workflow, args.sleep_runtime.is_some())?;
-    let executor = ExternalPhaseExecutor::new(
-        &args.executor,
-        args.executor_arguments,
-        &args.executor_sha256,
-    )?
-    .with_timeout(Duration::from_secs(args.executor_timeout_seconds))?;
+    let executor = ExternalPhaseExecutor::new(&args.executor, args.executor_arguments)?
+        .with_timeout(Duration::from_secs(args.executor_timeout_seconds))?;
     let dispatch_sha256 = run_workflow_dispatch_identity(
         &executor.execution_identity(),
         args.sleep_runtime_sha256.as_deref(),
@@ -1777,7 +1765,6 @@ fn main() -> Result<()> {
         Command::ComposeCurriculum(args) => compose_curriculum_command(args),
         Command::Quantize(args) => quantize_command(args),
         Command::UpgradeMemoryCheckpoint(args) => upgrade_memory_checkpoint_command(args),
-
         Command::RunWorkflow(args) => run_workflow_command(args),
     }
 }
@@ -2117,7 +2104,6 @@ mod tests {
 
     #[test]
     fn workflow_metrics_require_a_run_id_and_parse_as_a_pair() {
-        let digest = format!("sha256:{}", "a".repeat(64));
         let cli = Cli::try_parse_from([
             "hermes-train",
             "run-workflow",
@@ -2125,8 +2111,6 @@ mod tests {
             "workflow.json",
             "--executor",
             "./worker",
-            "--executor-sha256",
-            &digest,
             "--metrics",
             "metrics.jsonl",
             "--run-id",
@@ -2147,8 +2131,6 @@ mod tests {
                 "workflow.json",
                 "--executor",
                 "./worker",
-                "--executor-sha256",
-                &digest,
                 "--metrics",
                 "metrics.jsonl",
             ])
@@ -3089,28 +3071,24 @@ mod tests {
         )
         .unwrap();
         assert!(publication.checkpoint_manifest.is_file());
-        assert!(publication.training_evidence.is_file());
-        let evidence: hermes_train::training_accounting::TrainingEvidence =
-            serde_json::from_slice(&fs::read(&publication.training_evidence).unwrap()).unwrap();
-        assert_eq!(
-            evidence.checkpoint_manifest_sha256,
-            publication.checkpoint_manifest_sha256
-        );
-        assert_eq!(evidence.parameters, model.num_parameters() as u64);
-        assert_eq!(evidence.routed_active_parameters, evidence.parameters);
-        assert_eq!(
-            evidence.stored_bytes,
-            fs::metadata(
-                publication
-                    .checkpoint_manifest
-                    .parent()
-                    .unwrap()
-                    .join("weights.safetensors")
+        let generation = publication.checkpoint_manifest.parent().unwrap();
+        let accounting: hermes_train::training_accounting::TrainingAccounting =
+            serde_json::from_slice(
+                &fs::read(
+                    generation.join(hermes_train::training_accounting::TRAINING_ACCOUNTING_FILE),
+                )
+                .unwrap(),
             )
-            .unwrap()
-            .len()
+            .unwrap();
+        assert_eq!(accounting.parameters, model.num_parameters() as u64);
+        assert_eq!(accounting.routed_active_parameters, accounting.parameters);
+        assert_eq!(
+            accounting.weights_bytes,
+            fs::metadata(generation.join("weights.safetensors"))
+                .unwrap()
+                .len()
         );
-        assert!((evidence.training_gpu_hours - 2.0 / 3600.0).abs() < 1e-15);
+        assert!((accounting.training_gpu_hours - 2.0 / 3600.0).abs() < 1e-15);
 
         let mut mismatched_qat_state = state.clone();
         mismatched_qat_state.quantization = Some(QuantizationTrainingState {
@@ -3153,7 +3131,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             resumed_weights_sha256,
-            format!("sha256:{}", evidence.weights_sha256)
+            format!("sha256:{}", accounting.weights_sha256)
         );
         assert_eq!(resumed_state.global_step, state.global_step);
         assert_eq!(resumed_state.phase, state.phase);

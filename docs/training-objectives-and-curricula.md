@@ -74,7 +74,6 @@ accepted worker responses. New and resumed runs use:
 hermes-train run-workflow \
   --workflow hermes-train/workflow.example.json \
   --executor /opt/hermes/bin/phase-worker \
-  --executor-sha256 "sha256:$PHASE_WORKER_SHA256" \
   --state /data/run/workflow-runtime.json \
   --metrics /data/run/metrics.jsonl \
   --run-id workflow-seed-1 \
@@ -84,7 +83,6 @@ hermes-train run-workflow \
 hermes-train run-workflow \
   --workflow hermes-train/workflow.example.json \
   --executor /opt/hermes/bin/phase-worker \
-  --executor-sha256 "sha256:$PHASE_WORKER_SHA256" \
   --state /data/run/workflow-runtime.json \
   --metrics /data/run/metrics.jsonl \
   --run-id workflow-seed-1 \

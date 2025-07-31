@@ -1,6 +1,6 @@
 //! Versioned subprocess bridge for WorkflowV2 phase executors.
 //!
-//! The core runtime stays algorithm-neutral while a pinned worker executable
+//! The core runtime stays algorithm-neutral while a local worker executable
 //! can implement any phase/task combination. Requests and responses are JSONL;
 //! progress records are durably checkpointed as they arrive, and terminal
 //! products still pass the runtime's immutable-candidate rules.
@@ -30,9 +30,6 @@ use crate::artifact_io::{read_regular_bounded, validate_sha256_identity};
 #[cfg(test)]
 use crate::metrics::MetricPhaseKind;
 use crate::metrics::{MetricContext, MetricEvent, MetricLogState, MetricPhase, MetricWriter};
-use crate::pinned_executable::file_sha256 as hash_file_sha256;
-#[cfg(unix)]
-use crate::pinned_executable::{PinnedExecutable, StagedExecutable};
 #[cfg(unix)]
 use crate::protocol_process::{ProtocolRead, SupervisedProcess};
 use crate::runtime::{
@@ -55,7 +52,6 @@ const DEFAULT_PHASE_WORKER_TIMEOUT: Duration = Duration::from_secs(3_600);
 #[serde(deny_unknown_fields)]
 pub struct PhaseWorkerRequest {
     pub version: u32,
-    pub executor_sha256: String,
     pub phase_index: usize,
     pub phase: crate::workflow::PhaseV2,
     pub input_checkpoint: Option<ImmutableModelCheckpoint>,
@@ -82,30 +78,23 @@ pub enum PhaseWorkerMessage {
     },
 }
 
-/// A content-pinned local phase worker. No shell is involved: the executable
-/// and each argument are passed directly to `Command`.
+/// A local phase worker. No shell is involved: the executable and each
+/// argument are passed directly to `Command`.
 #[derive(Clone, Debug)]
 pub struct ExternalPhaseExecutor {
     executable: PathBuf,
     arguments: Vec<OsString>,
-    expected_sha256: String,
     timeout: Duration,
 }
 
 impl ExternalPhaseExecutor {
-    pub fn new(
-        executable: impl Into<PathBuf>,
-        arguments: Vec<OsString>,
-        expected_sha256: impl Into<String>,
-    ) -> Result<Self> {
+    pub fn new(executable: impl Into<PathBuf>, arguments: Vec<OsString>) -> Result<Self> {
         let executor = Self {
             executable: executable.into(),
             arguments,
-            expected_sha256: expected_sha256.into(),
             timeout: DEFAULT_PHASE_WORKER_TIMEOUT,
         };
         validate_worker_arguments(&executor.arguments)?;
-        executor.verify_identity()?;
         Ok(executor)
     }
 
@@ -118,13 +107,9 @@ impl ExternalPhaseExecutor {
         Ok(self)
     }
 
-    pub fn expected_sha256(&self) -> &str {
-        &self.expected_sha256
-    }
-
     /// Stable identity of all executable semantics owned by this adapter.
-    /// Runtime checkpoints bind this value, while worker requests continue to
-    /// carry the raw executable content hash expected by protocol v2.
+    /// Runtime checkpoints bind this value so that a resumed run cannot
+    /// silently change the program, arguments, or bound it dispatches.
     pub fn execution_identity(&self) -> String {
         let mut hasher = Sha256::new();
         hash_execution_part(&mut hasher, b"hermes-external-phase-executor");
@@ -135,7 +120,10 @@ impl ExternalPhaseExecutor {
         );
         hash_execution_part(&mut hasher, b"empty-environment");
         hash_execution_part(&mut hasher, b"working-directory:/");
-        hash_execution_part(&mut hasher, self.expected_sha256.as_bytes());
+        #[cfg(unix)]
+        hash_execution_part(&mut hasher, self.executable.as_os_str().as_bytes());
+        #[cfg(not(unix))]
+        hash_execution_part(&mut hasher, self.executable.to_string_lossy().as_bytes());
         hash_execution_part(&mut hasher, &self.timeout.as_nanos().to_le_bytes());
         hash_execution_part(&mut hasher, &(self.arguments.len() as u64).to_le_bytes());
         for argument in &self.arguments {
@@ -150,41 +138,9 @@ impl ExternalPhaseExecutor {
         format!("sha256:{:x}", hasher.finalize())
     }
 
-    pub fn verify_identity(&self) -> Result<()> {
-        validate_sha256_identity(&self.expected_sha256, "phase worker identity")?;
-        validate_worker_arguments(&self.arguments)?;
-        #[cfg(unix)]
-        {
-            PinnedExecutable::verify(&self.executable, &self.expected_sha256, "phase worker")
-        }
-        #[cfg(not(unix))]
-        {
-            let metadata = fs::symlink_metadata(&self.executable).with_context(|| {
-                format!("phase worker {} is unavailable", self.executable.display())
-            })?;
-            ensure!(
-                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-                "phase worker {} must be a regular non-symlink file",
-                self.executable.display()
-            );
-            ensure!(
-                file_sha256(&self.executable)? == self.expected_sha256,
-                "phase worker {} does not match its pinned SHA-256",
-                self.executable.display()
-            );
-            Ok(())
-        }
-    }
-
     #[cfg(unix)]
-    fn pinned_command(&self) -> Result<(Command, StagedExecutable)> {
-        let executable = PinnedExecutable::open(
-            &self.executable,
-            &self.expected_sha256,
-            "phase worker",
-            "phase-worker",
-        )?;
-        let mut command = executable.command();
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.executable);
         command
             .args(&self.arguments)
             .env_clear()
@@ -193,7 +149,7 @@ impl ExternalPhaseExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .process_group(0);
-        Ok((command, executable.into_staged()))
+        command
     }
 }
 
@@ -248,12 +204,8 @@ impl<C> PhaseExecutor<C> for ExternalPhaseExecutor {
         }
         #[cfg(unix)]
         {
-            // Open and hash one exact file generation immediately before every
-            // spawn. Unix executes a private materialization of those opened bytes,
-            // closing the path-replacement window between verification and exec.
             let wire_request = PhaseWorkerRequest {
                 version: PHASE_WORKER_PROTOCOL_VERSION,
-                executor_sha256: self.expected_sha256.clone(),
                 phase_index: request.phase_index,
                 phase: request.phase.clone(),
                 input_checkpoint: request.input_checkpoint.clone(),
@@ -266,16 +218,11 @@ impl<C> PhaseExecutor<C> for ExternalPhaseExecutor {
             );
             encoded_request.push(b'\n');
             let deadline = checked_worker_deadline(self.timeout)?;
-            let (mut command, staged_executable) = self.pinned_command()?;
-            let child = command.spawn().with_context(|| {
+            let child = self.command().spawn().with_context(|| {
                 format!("failed to start phase worker {}", self.executable.display())
             })?;
-            let mut child = SupervisedProcess::new(
-                child,
-                staged_executable,
-                "phase worker",
-                MAX_WORKER_MESSAGE_BYTES,
-            )?;
+            let mut child =
+                SupervisedProcess::new(child, "phase worker", MAX_WORKER_MESSAGE_BYTES)?;
             let mut written = 0_usize;
             let mut terminal = None;
             loop {
@@ -716,10 +663,6 @@ fn ensure_path_absent(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-pub fn file_sha256(path: &Path) -> Result<String> {
-    hash_file_sha256(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +680,11 @@ mod tests {
         fn metric(&mut self, _: MetricContext, _: MetricEvent) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// Stand-in dispatch identity for runtime checkpoints under test.
+    fn dispatch_identity() -> String {
+        format!("sha256:{:064x}", 1)
     }
 
     fn one_phase_workflow(directory: &Path) -> ResolvedWorkflow {
@@ -829,7 +777,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pinned_jsonl_worker_emits_metrics_across_progress_and_complete() {
+    fn jsonl_worker_emits_metrics_across_progress_and_complete() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
@@ -865,11 +813,10 @@ mod tests {
         let mut permissions = fs::metadata(&worker_path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&worker_path, permissions).unwrap();
-        let worker_hash = file_sha256(&worker_path).unwrap();
-        let worker = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash).unwrap();
+        let worker = ExternalPhaseExecutor::new(&worker_path, Vec::new()).unwrap();
         let state_path = directory.path().join("runtime.json");
         let metrics_path = directory.path().join("metrics.jsonl");
-        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, dispatch_identity()).unwrap();
         sink.configure_metrics(&metrics_path, "worker-run", false)
             .unwrap();
         let mut state = WorkflowRunState::new(&workflow, None).unwrap();
@@ -883,7 +830,7 @@ mod tests {
                 .unwrap();
         assert_eq!(status, RuntimeStatus::AlreadyComplete);
         drop(sink);
-        let mut reader = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+        let mut reader = AtomicRuntimeCheckpoint::new(&state_path, dispatch_identity()).unwrap();
         reader
             .configure_metrics(&metrics_path, "worker-run", true)
             .unwrap();
@@ -939,11 +886,10 @@ mod tests {
         let mut permissions = fs::metadata(&worker_path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&worker_path, permissions).unwrap();
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let state_path = directory.path().join("runtime.json");
         let metrics_path = directory.path().join("metrics.jsonl");
         {
-            let mut sink = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+            let mut sink = AtomicRuntimeCheckpoint::new(&state_path, dispatch_identity()).unwrap();
             sink.configure_metrics(&metrics_path, "yield-run", false)
                 .unwrap();
             let mut state = WorkflowRunState::new(&workflow, None).unwrap();
@@ -952,7 +898,7 @@ mod tests {
             registry
                 .register(
                     crate::workflow::PhaseKind::Pretrain,
-                    ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash).unwrap(),
+                    ExternalPhaseExecutor::new(&worker_path, Vec::new()).unwrap(),
                 )
                 .unwrap();
             let status = run_until_yield_or_complete(
@@ -1000,7 +946,7 @@ mod tests {
             2
         );
 
-        let mut resumed = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+        let mut resumed = AtomicRuntimeCheckpoint::new(&state_path, dispatch_identity()).unwrap();
         resumed
             .configure_metrics(&metrics_path, "yield-run", true)
             .unwrap();
@@ -1057,10 +1003,9 @@ mod tests {
         let mut permissions = fs::metadata(&worker_path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&worker_path, permissions).unwrap();
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let state_path = directory.path().join("runtime.json");
         let metrics_path = directory.path().join("metrics.jsonl");
-        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, dispatch_identity()).unwrap();
         sink.configure_metrics(&metrics_path, "invalid-run", false)
             .unwrap();
         let mut state = WorkflowRunState::new(&workflow, None).unwrap();
@@ -1069,7 +1014,7 @@ mod tests {
         registry
             .register(
                 crate::workflow::PhaseKind::Pretrain,
-                ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash).unwrap(),
+                ExternalPhaseExecutor::new(&worker_path, Vec::new()).unwrap(),
             )
             .unwrap();
         let error =
@@ -1127,7 +1072,6 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&worker_path, permissions).unwrap();
         let leaked_side_effect = directory.path().join("leaked-side-effect");
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let mut registry = ExecutorRegistry::new();
         registry
             .register(
@@ -1135,13 +1079,12 @@ mod tests {
                 ExternalPhaseExecutor::new(
                     &worker_path,
                     vec![leaked_side_effect.clone().into_os_string()],
-                    &worker_hash,
                 )
                 .unwrap(),
             )
             .unwrap();
         let state_path = directory.path().join("runtime.json");
-        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, dispatch_identity()).unwrap();
         let mut state = WorkflowRunState::new(&workflow, None).unwrap();
         sink.initialize(&state).unwrap();
 
@@ -1174,11 +1117,9 @@ mod tests {
                 "sleep 30\n"
             ),
         );
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let mut executor = ExternalPhaseExecutor::new(
             &worker_path,
             vec![leaked_side_effect.clone().into_os_string()],
-            &worker_hash,
         )
         .unwrap()
         .with_timeout(Duration::from_millis(150))
@@ -1218,14 +1159,12 @@ mod tests {
                 "/bin/sleep 30\n"
             ),
         );
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let mut executor = ExternalPhaseExecutor::new(
             &worker_path,
             vec![
                 python_with_setsid().into_os_string(),
                 detached_pid.clone().into_os_string(),
             ],
-            &worker_hash,
         )
         .unwrap()
         .with_timeout(Duration::from_secs(3))
@@ -1262,14 +1201,12 @@ mod tests {
                 "/bin/sleep 30\n"
             ),
         );
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let mut executor = ExternalPhaseExecutor::new(
             &worker_path,
             vec![
                 python_with_setsid().into_os_string(),
                 detached_pid.clone().into_os_string(),
             ],
-            &worker_hash,
         )
         .unwrap()
         .with_timeout(Duration::from_secs(3))
@@ -1303,8 +1240,7 @@ mod tests {
                 "echo '{\"type\":\"complete\",\"product\":{\"type\":\"model_candidate\",\"checkpoint\":{\"uri\":\"checkpoint://candidate\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n"
             ),
         );
-        let worker_hash = file_sha256(&worker_path).unwrap();
-        let mut executor = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash)
+        let mut executor = ExternalPhaseExecutor::new(&worker_path, Vec::new())
             .unwrap()
             .with_timeout(Duration::from_secs(5))
             .unwrap();
@@ -1340,14 +1276,12 @@ mod tests {
                 "echo '{\"type\":\"complete\",\"product\":{\"type\":\"model_candidate\",\"checkpoint\":{\"uri\":\"checkpoint://candidate\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n"
             ),
         );
-        let worker_hash = file_sha256(&worker_path).unwrap();
         let mut executor = ExternalPhaseExecutor::new(
             &worker_path,
             vec![
                 python_with_setsid().into_os_string(),
                 detached_pid.clone().into_os_string(),
             ],
-            &worker_hash,
         )
         .unwrap()
         .with_timeout(Duration::from_secs(2))
@@ -1370,25 +1304,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let worker_path = directory.path().join("worker.sh");
         write_executable(&worker_path, "#!/bin/sh\nexit 0\n");
-        let worker_hash = file_sha256(&worker_path).unwrap();
-        let baseline = ExternalPhaseExecutor::new(
-            &worker_path,
-            vec![OsString::from("argument")],
-            &worker_hash,
-        )
-        .unwrap();
-        let same = ExternalPhaseExecutor::new(
-            &worker_path,
-            vec![OsString::from("argument")],
-            &worker_hash,
-        )
-        .unwrap();
-        let changed_argument = ExternalPhaseExecutor::new(
-            &worker_path,
-            vec![OsString::from("different")],
-            &worker_hash,
-        )
-        .unwrap();
+        let baseline =
+            ExternalPhaseExecutor::new(&worker_path, vec![OsString::from("argument")]).unwrap();
+        let same =
+            ExternalPhaseExecutor::new(&worker_path, vec![OsString::from("argument")]).unwrap();
+        let changed_argument =
+            ExternalPhaseExecutor::new(&worker_path, vec![OsString::from("different")]).unwrap();
         let changed_timeout = same.clone().with_timeout(Duration::from_secs(60)).unwrap();
 
         assert_eq!(baseline.execution_identity(), same.execution_identity());
@@ -1419,8 +1340,7 @@ mod tests {
                 "echo '{\"type\":\"complete\",\"product\":{\"type\":\"model_candidate\",\"checkpoint\":{\"uri\":\"checkpoint://candidate\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n"
             ),
         );
-        let worker_hash = file_sha256(&worker_path).unwrap();
-        let mut executor = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash)
+        let mut executor = ExternalPhaseExecutor::new(&worker_path, Vec::new())
             .unwrap()
             .with_timeout(Duration::from_secs(2))
             .unwrap();
@@ -1433,49 +1353,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pinned_phase_worker_generation_survives_path_replacement_before_spawn() {
-        let directory = tempfile::tempdir().unwrap();
-        let worker_path = directory.path().join("worker.sh");
-        write_executable(&worker_path, "#!/bin/sh\nprintf 'pinned\\n'\n");
-        let worker_hash = file_sha256(&worker_path).unwrap();
-        let executor = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash).unwrap();
-        let (mut command, staged) = executor.pinned_command().unwrap();
-
-        let replacement = directory.path().join("replacement.sh");
-        write_executable(&replacement, "#!/bin/sh\nprintf 'replacement\\n'\n");
-        fs::rename(&replacement, &worker_path).unwrap();
-
-        command.stderr(Stdio::piped());
-        let output = command.output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"pinned\n");
-        drop(staged);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn phase_worker_arguments_are_canonical_and_bounded() {
         use std::os::unix::ffi::OsStringExt;
 
         let directory = tempfile::tempdir().unwrap();
         let worker_path = directory.path().join("worker.sh");
         write_executable(&worker_path, "#!/bin/sh\nexit 0\n");
-        let worker_hash = file_sha256(&worker_path).unwrap();
 
         let too_many = vec![OsString::from("x"); MAX_PHASE_WORKER_ARGUMENTS + 1];
-        let error = ExternalPhaseExecutor::new(&worker_path, too_many, &worker_hash)
+        let error = ExternalPhaseExecutor::new(&worker_path, too_many)
             .unwrap_err()
             .to_string();
         assert!(error.contains("more than"), "{error}");
 
         let oversized = OsString::from("x".repeat(MAX_PHASE_WORKER_ARGUMENT_BYTES + 1));
-        let error = ExternalPhaseExecutor::new(&worker_path, vec![oversized], &worker_hash)
+        let error = ExternalPhaseExecutor::new(&worker_path, vec![oversized])
             .unwrap_err()
             .to_string();
         assert!(error.contains("exceeds"), "{error}");
 
         let nul = OsString::from_vec(b"a\0b".to_vec());
-        let error = ExternalPhaseExecutor::new(&worker_path, vec![nul], &worker_hash)
+        let error = ExternalPhaseExecutor::new(&worker_path, vec![nul])
             .unwrap_err()
             .to_string();
         assert!(error.contains("NUL"), "{error}");

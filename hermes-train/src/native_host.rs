@@ -604,8 +604,7 @@ mod tests {
             permissions.set_mode(0o700);
             fs::set_permissions(path, permissions).unwrap();
         }
-        ExternalPhaseExecutor::new(path, Vec::new(), identity("native-host-test-worker-v1"))
-            .unwrap()
+        ExternalPhaseExecutor::new(path, Vec::new()).unwrap()
     }
 
     fn education_workflow() -> ResolvedWorkflow {

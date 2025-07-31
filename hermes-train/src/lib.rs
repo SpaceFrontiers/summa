@@ -14,7 +14,6 @@ pub mod metrics;
 pub mod native_host;
 pub mod native_sleep;
 pub mod optimizer_artifact;
-mod pinned_executable;
 pub mod posttrain;
 
 #[cfg(unix)]
