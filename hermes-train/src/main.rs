@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,24 +12,25 @@ use burn_nn::loss::CrossEntropyLossConfig;
 use burn_optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_llm::{
-    BlockDef, ModelDef, Tokenizer, Transformer, load_safetensors, save_safetensors,
-    upgrade_safetensors_to_memory,
+    BlockDef, ModelDef, Tokenizer, Transformer, save_safetensors, upgrade_safetensors_to_memory,
 };
+
+use hermes_train::artifact_io::hash_regular_file;
 
 use hermes_train::builtin_sleep_runtime::{
     BuiltinPeriodicSleepBoundaryDriver, BuiltinSleepPhaseContextFactory,
 };
 use hermes_train::corpus::{
-    CorpusManifest, CurriculumCompositionConfig, HermesCorpusTokenizer,
-    SearchApiPostgresCorpusRecipe,
+    CurriculumCompositionConfig, HermesCorpusTokenizer, SearchApiPostgresCorpusRecipe,
 };
 use hermes_train::device_sampler::{
     DeviceSamplerDrain, NvidiaSmiSampler, NvidiaSmiSamplerConfig, validate_physical_device_selector,
 };
 use hermes_train::metrics::{
-    MetricContext, MetricEvent, MetricPhase, MetricPhaseKind, MetricWriter, OptimizationMetrics,
-    PhaseBoundary, PhaseTimingMetrics, QuantizationFormat as MetricQuantizationFormat,
-    QuantizationMetrics, QuantizationStage, ThroughputMetrics, validate_metric_prefix_for_run,
+    MemoryTier as MetricMemoryTier, MetricContext, MetricEvent, MetricPhase, MetricPhaseKind,
+    MetricWriter, OptimizationMetrics, PhaseBoundary, PhaseTimingMetrics,
+    QuantizationFormat as MetricQuantizationFormat, QuantizationMetrics, QuantizationStage,
+    ThroughputMetrics, TierUpdateMetrics, TierUpdateOutcome, validate_metric_prefix_for_run,
     validate_metric_snapshot_for_run,
 };
 use hermes_train::native_sleep::{
@@ -36,20 +38,32 @@ use hermes_train::native_sleep::{
     drain_periodic_sleep_before_wake_step,
 };
 use hermes_train::posttrain::forward_kl_distillation_tensor;
-use hermes_train::qat_candidate::{open_qat_candidate, publish_qat_candidate};
+#[cfg(test)]
+use hermes_train::qat_candidate::open_qat_candidate;
+use hermes_train::qat_candidate::{
+    open_qat_candidate_addressed, publish_qat_candidate,
+    publish_qat_candidate_from_authenticated_source,
+};
 use hermes_train::quantization::{
     BONSAI_GROUP_SIZE, QuantizationRecipe, UltraQuantFormat, WorkflowQuantizationPlan,
     WorkflowQuantizationTraining, export_safetensors_archive, fake_quantized_transformer,
 };
 
 use hermes_train::runtime::{
-    ALL_PHASE_KINDS, ExecutorRegistry, ImmutableModelCheckpoint, RuntimeStatus, WorkflowRunState,
-    run_until_yield_or_complete, workflow_signature as runtime_workflow_signature,
+    ALL_PHASE_KINDS, ExecutorRegistry, ImmutableArtifact, ImmutableModelCheckpoint, RuntimeStatus,
+    WorkflowRunState, run_until_yield_or_complete,
+    workflow_signature as runtime_workflow_signature,
 };
-use hermes_train::tier_optimizer::TierOptimizerBank;
-use hermes_train::worker::{AtomicRuntimeCheckpoint, ExternalPhaseExecutor};
+use hermes_train::task::{TaskAdapter, TaskConfig};
+use hermes_train::tensor_sleep::TensorTransactionStore;
+use hermes_train::tier_optimizer::{
+    DurableTierOptimizerPublisher, TierOptimizerBank, WakeOnlyTierUpdate,
+};
+use hermes_train::worker::{
+    AtomicRuntimeCheckpoint, ExternalPhaseExecutor, PHASE_WORKER_PROTOCOL_VERSION,
+};
 use hermes_train::workflow::{
-    PhaseKind, ResolvedWorkflow, load_workflow as load_workflow_v2,
+    MemoryUpdateMode, PhaseKind, ResolvedWorkflow, load_workflow as load_workflow_v2,
     validate_sleep_schedule_for_model, validate_workflow_for_model,
 };
 use serde::Serialize;
@@ -63,25 +77,27 @@ mod wake;
 
 use checkpoint::{
     AdamWOptimizer, ArtifactRef, CheckpointPublication, OptimizerStateRef,
-    QuantizationTrainingState, RngStreamState, TRAINING_STATE_VERSION, TrainingState,
-    load_training_state, parameter_ids, save_training_checkpoint_with_evidence,
+    QuantizationTrainingState, RngStreamState, TRAINING_STATE_VERSION, TrainingMemoryUpdateState,
+    TrainingState, load_training_state, parameter_ids, save_training_checkpoint_with_evidence,
     verify_checkpoint_generation, verify_checkpoint_root,
 };
 #[cfg(test)]
 use data::TrainingSample;
 use data::{
-    BatchStats, SampleStreamConfig, TrainingBatch, count_samples, indexed_causal_sample_count,
-    make_batch, visit_samples,
+    BatchStats, PhaseDataBinding, SampleStreamConfig, TrainingBatch, count_samples,
+    indexed_causal_sample_count, make_batch, visit_samples,
 };
 use muon::BatchedMuon;
-use wake::{ObjectiveConfig, ResolvedWakePlan, load_wake_plan};
+use wake::{ResolvedWakePlan, load_wake_plan};
 
 const MUON_LR_SCALE: f64 = 20.0;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const RUN_WORKFLOW_DISPATCH_IDENTITY_VERSION: u32 = 1;
 const FNV1A64_PRIME: u64 = 0x100000001b3;
 const DATA_RNG_STREAM: &str = "data";
 const MODEL_RNG_STREAM: &str = "model_dropout";
 const MODEL_RNG_DOMAIN: u64 = 0xd2b7_4407_b1ce_6e93;
+const MAX_CLI_CONTENT_ADDRESSED_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "hermes-train", about = "Hermes model training")]
@@ -317,6 +333,9 @@ struct RunWorkflowArgs {
     executor_sha256: String,
     #[arg(long = "executor-arg", allow_hyphen_values = true)]
     executor_arguments: Vec<OsString>,
+    /// Hard wall-clock bound for each phase-worker process.
+    #[arg(long, default_value_t = 3_600)]
+    executor_timeout_seconds: u64,
     #[arg(long, default_value = "workflow-runtime.json")]
     state: PathBuf,
     /// Append-only typed JSONL metric journal emitted by the phase worker.
@@ -493,6 +512,71 @@ fn learning_rate(args: &TrainArgs, step: usize, total_steps: usize) -> f64 {
     min_lr + cosine * (args.lr - min_lr)
 }
 
+fn validate_wake_only_metric_schedule(schedule: &hermes_train::sleep::SleepSchedule) -> Result<()> {
+    let ids = schedule
+        .tiers
+        .iter()
+        .map(|tier| tier.id.as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        matches!(
+            ids.as_slice(),
+            ["fast", "slow"] | ["fast", "medium", "slow"]
+        ),
+        "the stock wake_only trainer emits typed tier metrics and therefore requires tier ids ordered as [fast, slow] or [fast, medium, slow]"
+    );
+    Ok(())
+}
+
+fn metric_memory_tier(id: &str) -> Result<MetricMemoryTier> {
+    match id {
+        "fast" => Ok(MetricMemoryTier::Fast),
+        "medium" => Ok(MetricMemoryTier::Medium),
+        "slow" => Ok(MetricMemoryTier::Slow),
+        _ => bail!("wake_only tier `{id}` has no typed metric representation"),
+    }
+}
+
+fn append_wake_only_tier_metrics(
+    metrics: &mut MetricWriter,
+    context: &MetricContext,
+    schedule: &hermes_train::sleep::SleepSchedule,
+    updates: &[WakeOnlyTierUpdate],
+) -> Result<()> {
+    validate_wake_only_metric_schedule(schedule)?;
+    ensure!(
+        updates.windows(2).all(|pair| pair[0].tier < pair[1].tier),
+        "wake_only tier update report is not ordered fastest-to-slowest"
+    );
+    for update in updates {
+        let configured = schedule
+            .tiers
+            .get(update.tier)
+            .context("wake_only tier update is outside the configured schedule")?;
+        ensure!(
+            configured.id == update.tier_id,
+            "wake_only tier update identity differs from the configured schedule"
+        );
+        metrics.append(
+            context.clone(),
+            MetricEvent::TierUpdate(TierUpdateMetrics {
+                transaction_id: update.prospective_update_sha256.clone(),
+                tier: metric_memory_tier(&update.tier_id)?,
+                receiver_tier: None,
+                tier_clock: update.trigger_clock,
+                update_period: configured.update_period,
+                accumulated_micro_steps: update.accumulated_optimizer_steps,
+                outcome: TierUpdateOutcome::Committed,
+                update_l2_norm: None,
+                reserve_slot: None,
+                reserve_generation: None,
+                optimizer_state_reset: false,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_train_args(args: &TrainArgs) -> Result<()> {
     ensure!(
         args.lr.is_finite() && args.lr > 0.0,
@@ -525,38 +609,85 @@ fn resolve_wake_plan(args: &TrainArgs) -> Result<ResolvedWakePlan> {
 }
 
 fn validate_model_wake_plan(config: &ModelDef, workflow: &ResolvedWakePlan) -> Result<()> {
-    let memory_enabled =
-        (0..config.num_layers).any(|layer| config.block_for_layer(layer).memory.is_some());
+    let memory_layers = (0..config.num_layers)
+        .filter(|&layer| config.block_for_layer(layer).memory.is_some())
+        .count();
+    ensure!(
+        memory_layers == 0 || memory_layers == config.num_layers,
+        "model mixes {memory_layers} memory layers with {} ordinary-FFN layers; the stock trainer requires one explicit topology across every layer",
+        config.num_layers - memory_layers
+    );
     let periodic = workflow
         .phases
         .iter()
         .filter_map(|phase| phase.periodic_sleep.as_ref())
         .collect::<Vec<_>>();
-    if memory_enabled {
+    let wake_only = workflow
+        .phases
+        .iter()
+        .filter_map(|phase| phase.memory_update_mode.as_ref())
+        .collect::<Vec<_>>();
+    if memory_layers > 0 {
         ensure!(
-            !periodic.is_empty(),
-            "sleep-capable MAL models require periodic_sleep on every wake phase"
+            periodic.len() == workflow.phases.len() || wake_only.len() == workflow.phases.len(),
+            "memory MAL models require one update policy on every wake phase: periodic_sleep or memory_update_mode wake_only"
         );
-        ensure!(
-            periodic.len() == workflow.phases.len(),
-            "every phase training a sleep-capable MAL model must carry periodic_sleep so memory parameters never enter the ordinary wake optimizer"
-        );
-        ensure!(
-            periodic.iter().all(|config| *config == periodic[0]),
-            "all phases in one memory training run must use an identical periodic_sleep configuration"
-        );
-        ensure!(
-            periodic[0].schedule.clock == hermes_train::sleep::UpdateClock::OptimizerSteps,
-            "the stock train command supports periodic sleep only at optimizer_steps boundaries; model_tokens can cross multiple memory boundaries inside one indivisible optimizer update"
-        );
-        validate_sleep_schedule_for_model(config, &periodic[0].schedule, &workflow.phases[0].name)?;
+        if periodic.len() == workflow.phases.len() {
+            ensure!(
+                wake_only.is_empty(),
+                "memory phases cannot combine periodic_sleep with memory_update_mode"
+            );
+            ensure!(
+                periodic.iter().all(|config| *config == periodic[0]),
+                "all phases in one memory training run must use an identical periodic_sleep configuration"
+            );
+            ensure!(
+                periodic[0].schedule.clock == hermes_train::sleep::UpdateClock::OptimizerSteps,
+                "the stock train command supports periodic sleep only at optimizer_steps boundaries; model_tokens can cross multiple memory boundaries inside one indivisible optimizer update"
+            );
+            validate_sleep_schedule_for_model(
+                config,
+                &periodic[0].schedule,
+                &workflow.phases[0].name,
+            )?;
+        } else {
+            ensure!(
+                periodic.is_empty(),
+                "wake_only memory phases cannot install periodic_sleep"
+            );
+            ensure!(
+                wake_only.iter().all(|mode| *mode == wake_only[0]),
+                "all phases in one memory training run must use an identical memory_update_mode configuration"
+            );
+            ensure!(
+                wake_only[0].schedule().clock == hermes_train::sleep::UpdateClock::OptimizerSteps,
+                "the stock train command supports wake_only tier updates only at optimizer_steps boundaries"
+            );
+            validate_sleep_schedule_for_model(
+                config,
+                wake_only[0].schedule(),
+                &workflow.phases[0].name,
+            )?;
+            validate_wake_only_metric_schedule(wake_only[0].schedule())?;
+        }
     } else {
         ensure!(
-            periodic.is_empty(),
-            "periodic_sleep requires a MAL model with an explicit memory hierarchy"
+            periodic.is_empty() && wake_only.is_empty(),
+            "periodic_sleep and memory_update_mode require a MAL model with an explicit memory hierarchy"
         );
     }
     for phase in &workflow.phases {
+        for (field, value) in [
+            ("sequence_length", phase.sequence_length),
+            ("batch_size", phase.batch_size),
+            ("gradient_accumulation", phase.gradient_accumulation),
+        ] {
+            ensure!(
+                u32::try_from(value).is_ok(),
+                "workflow phase `{}` {field} exceeds the checkpoint-metric range",
+                phase.name
+            );
+        }
         ensure!(
             phase.sequence_length <= config.max_seq_len,
             "workflow phase `{}` sequence_length {} exceeds model max_seq_len {}",
@@ -564,10 +695,15 @@ fn validate_model_wake_plan(config: &ModelDef, workflow: &ResolvedWakePlan) -> R
             phase.sequence_length,
             config.max_seq_len
         );
-        if matches!(
-            phase.objective,
-            ObjectiveConfig::ContrastiveRetrieval { .. }
-        ) {
+        if let Some(plan) = &phase.quantization {
+            ensure!(
+                !config.embeddings.tie_weights
+                    || plan.recipe.quantize_embeddings == plan.recipe.quantize_lm_head,
+                "workflow phase `{}` assigns different embedding and lm_head quantization policies to tied model weights",
+                phase.name
+            );
+        }
+        if matches!(phase.objective, TaskConfig::RetrievalRepresentation { .. }) {
             let layer = phase
                 .objective
                 .retrieval_layer()
@@ -599,14 +735,17 @@ struct PhasePlan {
 
 fn planned_sample_count(
     data: &Path,
-    objective: &ObjectiveConfig,
+    objective: &TaskConfig,
     tokenizer: &Tokenizer,
     sequence_length: usize,
     token_cache: &Path,
+    data_binding: &PhaseDataBinding,
 ) -> Result<usize> {
-    if matches!(objective, ObjectiveConfig::CausalLm)
+    data_binding.ensure_still_published()?;
+    if matches!(objective, TaskConfig::CausalLm {})
         && let Some(samples) = indexed_causal_sample_count(token_cache, sequence_length)?
     {
+        data_binding.ensure_still_published()?;
         println!(
             "token_cache={} indexed_samples={samples}",
             token_cache.display()
@@ -619,6 +758,7 @@ fn planned_sample_count(
         tokenizer,
         sequence_length,
         Some(token_cache),
+        data_binding,
     )
 }
 
@@ -626,10 +766,12 @@ fn plan_training(
     workflow: &ResolvedWakePlan,
     tokenizer: &Tokenizer,
     token_cache_paths: &[PathBuf],
+    data_bindings: &[PhaseDataBinding],
 ) -> Result<(Vec<PhasePlan>, usize)> {
     ensure!(
-        token_cache_paths.len() == workflow.phases.len(),
-        "every workflow phase must have one resolved token-cache path"
+        token_cache_paths.len() == workflow.phases.len()
+            && data_bindings.len() == workflow.phases.len(),
+        "every workflow phase must have one token-cache path and authenticated data binding"
     );
     let mut total_steps = 0usize;
     let mut plan = Vec::with_capacity(workflow.phases.len());
@@ -643,6 +785,7 @@ fn plan_training(
                     tokenizer,
                     phase.sequence_length,
                     &token_cache_paths[phase_index],
+                    &data_bindings[phase_index],
                 )?;
                 let steps_per_epoch =
                     (samples / phase.batch_size).div_euclid(phase.gradient_accumulation);
@@ -684,19 +827,103 @@ fn plan_training(
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
-    let file =
-        fs::File::open(path).with_context(|| format!("failed to hash {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
+    hash_regular_file(path)
+        .map(|(_, sha256)| sha256)
+        .with_context(|| format!("failed to hash {}", path.display()))
+}
+
+/// Read and authenticate the exact regular-file bytes that a model loader will
+/// consume. Hashing and then reopening a pathname is insufficient because a
+/// replacement between those operations could load a different checkpoint.
+fn read_pinned_checkpoint_bytes(path: &Path, expected_sha256: &str) -> Result<Vec<u8>> {
+    read_pinned_checkpoint_bytes_after_open(path, expected_sha256, || Ok(()))
+}
+
+fn read_pinned_checkpoint_bytes_after_open(
+    path: &Path,
+    expected_sha256: &str,
+    after_open: impl FnOnce() -> Result<()>,
+) -> Result<Vec<u8>> {
+    let inspected = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting pinned checkpoint {}", path.display()))?;
+    ensure!(
+        inspected.is_file() && !inspected.file_type().is_symlink(),
+        "pinned checkpoint {} must be a regular non-symlink file",
+        path.display()
+    );
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening pinned checkpoint {}", path.display()))?;
+    let opened = file.metadata()?;
+    ensure!(opened.is_file(), "opened pinned checkpoint is not a file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            inspected.dev() == opened.dev() && inspected.ino() == opened.ino(),
+            "pinned checkpoint changed while it was opened"
+        );
+    }
+    after_open()?;
+    let expected_bytes = usize::try_from(opened.len())
+        .context("pinned checkpoint is too large for this process address space")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_bytes)
+        .context("cannot reserve memory for pinned checkpoint bytes")?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    while bytes.len() < expected_bytes {
+        let remaining = expected_bytes - bytes.len();
+        let chunk_bytes = remaining.min(buffer.len());
+        let read = file
+            .read(&mut buffer[..chunk_bytes])
+            .with_context(|| format!("reading pinned checkpoint {}", path.display()))?;
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        bytes.extend_from_slice(&buffer[..read]);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    let mut extra = [0_u8; 1];
+    let has_extra = file
+        .read(&mut extra)
+        .with_context(|| format!("checking pinned checkpoint length {}", path.display()))?
+        != 0;
+    let after = file.metadata()?;
+    ensure!(
+        !has_extra
+            && bytes.len() == expected_bytes
+            && after.len() == bytes.len() as u64
+            && after.len() == opened.len()
+            && after.modified().ok() == opened.modified().ok(),
+        "pinned checkpoint changed while it was read"
+    );
+    let published = fs::symlink_metadata(path)
+        .with_context(|| format!("reinspecting pinned checkpoint {}", path.display()))?;
+    ensure!(
+        published.is_file() && !published.file_type().is_symlink(),
+        "pinned checkpoint publication changed while it was read"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            published.dev() == opened.dev() && published.ino() == opened.ino(),
+            "pinned checkpoint publication changed while it was read"
+        );
+    }
+    let observed = format!("sha256:{:x}", Sha256::digest(&bytes));
+    ensure!(
+        observed == expected_sha256,
+        "pinned checkpoint hash mismatch: expected {expected_sha256}, observed {observed}"
+    );
+    Ok(bytes)
 }
 
 fn stable_cache_id(value: &str) -> String {
@@ -770,21 +997,6 @@ fn validate_wake_rng_state(state: &TrainingState, seed: u64) -> Result<()> {
         "checkpoint model RNG seed differs from this invocation"
     );
     Ok(())
-}
-
-fn metric_phase_kind(kind: PhaseKind) -> MetricPhaseKind {
-    match kind {
-        PhaseKind::Pretrain => MetricPhaseKind::Pretrain,
-        PhaseKind::ContinuedPretrain => MetricPhaseKind::ContinuedPretrain,
-        PhaseKind::Sft => MetricPhaseKind::Sft,
-        PhaseKind::Preference => MetricPhaseKind::Preference,
-        PhaseKind::Rl => MetricPhaseKind::Rl,
-        PhaseKind::Distillation => MetricPhaseKind::Distillation,
-        PhaseKind::Sleep => MetricPhaseKind::Sleep,
-        PhaseKind::Quantization => MetricPhaseKind::Quantization,
-        PhaseKind::Evaluation => MetricPhaseKind::Evaluation,
-        PhaseKind::Promotion => MetricPhaseKind::Promotion,
-    }
 }
 
 fn start_device_sampler(args: &TrainArgs) -> Option<NvidiaSmiSampler> {
@@ -917,18 +1129,22 @@ fn run_signature(
     Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
 }
 
-fn phase_data_identity(path: &Path, tokenizer: &Tokenizer, tokenizer_hash: &str) -> Result<String> {
-    let manifest_path = if path.is_dir() {
-        Some(path.join("manifest.json"))
-    } else if path.file_name().is_some_and(|name| name == "manifest.json") {
-        Some(path.to_owned())
-    } else {
-        None
+fn bind_phase_data(
+    path: &Path,
+    tokenizer: &Tokenizer,
+    tokenizer_hash: &str,
+    cache: &mut HashMap<PathBuf, PhaseDataBinding>,
+) -> Result<PhaseDataBinding> {
+    let binding = match cache.get(path) {
+        Some(binding) => binding.clone(),
+        None => {
+            let binding = PhaseDataBinding::open(path)?;
+            cache.insert(path.to_owned(), binding.clone());
+            binding
+        }
     };
-    if let Some(manifest_path) = manifest_path {
-        let manifest: CorpusManifest = read_json(&manifest_path)?;
-        let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-        manifest.verify(root)?;
+    if let Some(corpus) = binding.authenticated_corpus() {
+        let manifest = corpus.manifest();
         ensure!(
             manifest.build.tokenizer.vocabulary_size == tokenizer.vocab_size(),
             "corpus tokenizer vocabulary {} differs from training tokenizer vocabulary {}",
@@ -941,9 +1157,8 @@ fn phase_data_identity(path: &Path, tokenizer: &Tokenizer, tokenizer_hash: &str)
             manifest.build.tokenizer.revision,
             tokenizer_hash
         );
-        return Ok(format!("sha256:{}", manifest.manifest_sha256));
     }
-    file_sha256(path)
+    Ok(binding)
 }
 
 fn add_batch_stats(total: &mut BatchStats, batch: BatchStats) -> Result<()> {
@@ -970,14 +1185,26 @@ fn add_batch_stats(total: &mut BatchStats, batch: BatchStats) -> Result<()> {
     Ok(())
 }
 
+struct ObjectiveForward {
+    loss: Tensor<1>,
+    router_loss: Option<Tensor<1>>,
+    stats: BatchStats,
+    retrieval_correct: Option<Tensor<1>>,
+    /// Student outputs used by QAT distillation. Language objectives store
+    /// selected vocabulary logits; retrieval stores the unscaled similarity
+    /// matrix. Absent outside a teacher-distillation phase.
+    distillation_logits: Option<Tensor<2>>,
+}
+
 fn objective_loss(
     model: &Transformer,
     batch: TrainingBatch,
-    objective: &ObjectiveConfig,
-) -> Result<(Tensor<1>, Option<Tensor<1>>, BatchStats, Option<Tensor<1>>)> {
+    objective: &TaskConfig,
+    capture_distillation_logits: bool,
+) -> Result<ObjectiveForward> {
     let stats = batch.stats();
     let mut retrieval_correct = None;
-    let (loss, router_loss) = match batch {
+    let (loss, router_loss, distillation_logits) = match batch {
         TrainingBatch::Language(batch) => {
             let data::LanguageBatch {
                 input_ids,
@@ -986,29 +1213,52 @@ fn objective_loss(
                 ..
             } = *batch;
             match objective {
-                ObjectiveConfig::CausalLm => {
+                TaskConfig::CausalLm {} => {
                     ensure!(
                         loss_positions.is_none(),
                         "causal_lm batch unexpectedly contains a target mask"
                     );
-                    model.forward_loss_with_router(input_ids, targets)
+                    if capture_distillation_logits {
+                        let (loss, router_loss, logits) =
+                            model.forward_loss_and_logits_with_router(input_ids, targets);
+                        (loss, router_loss, Some(logits))
+                    } else {
+                        let (loss, router_loss) =
+                            model.forward_loss_with_router(input_ids, targets);
+                        (loss, router_loss, None)
+                    }
                 }
-                ObjectiveConfig::Summarization { .. }
-                | ObjectiveConfig::RetrievalPlanning { .. }
-                | ObjectiveConfig::InstructionTuning { .. }
-                | ObjectiveConfig::QaReasoning { .. } => {
+                TaskConfig::Summarization { .. }
+                | TaskConfig::RetrievalPlanning { .. }
+                | TaskConfig::InstructionTuning { .. }
+                | TaskConfig::QaReasoning { .. } => {
                     let positions = loss_positions
                         .ok_or_else(|| anyhow::anyhow!("structured batch has no target mask"))?;
-                    model.forward_masked_loss_with_router(input_ids, targets, positions)
+                    if capture_distillation_logits {
+                        let (loss, router_loss, logits) = model
+                            .forward_masked_loss_and_logits_with_router(
+                                input_ids, targets, positions,
+                            );
+                        (loss, router_loss, Some(logits))
+                    } else {
+                        let (loss, router_loss) =
+                            model.forward_masked_loss_with_router(input_ids, targets, positions);
+                        (loss, router_loss, None)
+                    }
                 }
-                ObjectiveConfig::ContrastiveRetrieval { .. } => {
+                TaskConfig::RetrievalRepresentation { .. } => {
                     bail!("contrastive_retrieval phase produced a language batch")
+                }
+                TaskConfig::RetrievalRanking { .. }
+                | TaskConfig::PairwisePreference {}
+                | TaskConfig::VerifiableRl { .. } => {
+                    unreachable!("wake projection rejects unsupported task contracts")
                 }
             }
         }
         TrainingBatch::Retrieval(batch) => {
             ensure!(
-                matches!(objective, ObjectiveConfig::ContrastiveRetrieval { .. }),
+                matches!(objective, TaskConfig::RetrievalRepresentation { .. }),
                 "non-retrieval phase produced a retrieval batch"
             );
             let data::RetrievalBatch {
@@ -1027,9 +1277,9 @@ fn objective_loss(
                 model.forward_embeddings_with_router(query_ids, query_end_positions, layer);
             let (documents, document_router_loss) =
                 model.forward_embeddings_with_router(document_ids, document_end_positions, layer);
-            let logits = queries
-                .matmul(documents.transpose())
-                .div_scalar(temperature);
+            let similarities = queries.matmul(documents.transpose());
+            let distillation_logits = capture_distillation_logits.then(|| similarities.clone());
+            let logits = similarities.div_scalar(temperature);
             retrieval_correct = Some(
                 logits
                     .clone()
@@ -1044,88 +1294,89 @@ fn objective_loss(
                 .init(&labels.device())
                 .forward(logits, labels);
             let router_loss = sum_optional_tensors(query_router_loss, document_router_loss);
-            (loss, router_loss)
+            (loss, router_loss, distillation_logits)
         }
     };
-    Ok((loss, router_loss, stats, retrieval_correct))
+    Ok(ObjectiveForward {
+        loss,
+        router_loss,
+        stats,
+        retrieval_correct,
+        distillation_logits,
+    })
 }
 
-fn quantization_forward_kl(
-    student: &Transformer,
+fn quantization_teacher_logits(
     teacher: &Transformer,
     batch: &TrainingBatch,
-    objective: &ObjectiveConfig,
-    temperature: f64,
-) -> Result<Tensor<1>> {
-    let (teacher_logits, student_logits) = match batch {
+    objective: &TaskConfig,
+) -> Result<Tensor<2>> {
+    let teacher_logits = match batch {
         TrainingBatch::Language(batch) => {
             let [rows, sequence] = batch.input_ids.dims();
-            let vocabulary = student.config().vocab_size;
+            let vocabulary = teacher.config().vocab_size;
             ensure!(
-                teacher.config().vocab_size == vocabulary,
-                "quantization teacher/student vocabularies differ"
+                vocabulary > 1,
+                "quantization teacher vocabulary must contain at least two tokens"
             );
             match objective {
-                ObjectiveConfig::CausalLm => {
+                TaskConfig::CausalLm {} => {
                     ensure!(
                         batch.loss_positions.is_none(),
                         "causal_lm distillation batch unexpectedly contains a target mask"
                     );
-                    (
-                        teacher
-                            .forward(batch.input_ids.clone(), 0)
-                            .reshape([rows * sequence, vocabulary]),
-                        student
-                            .forward(batch.input_ids.clone(), 0)
-                            .reshape([rows * sequence, vocabulary]),
-                    )
+                    teacher
+                        .forward(batch.input_ids.clone().inner(), 0)
+                        .reshape([rows * sequence, vocabulary])
                 }
-                ObjectiveConfig::Summarization { .. }
-                | ObjectiveConfig::RetrievalPlanning { .. }
-                | ObjectiveConfig::InstructionTuning { .. }
-                | ObjectiveConfig::QaReasoning { .. } => {
+                TaskConfig::Summarization { .. }
+                | TaskConfig::RetrievalPlanning { .. }
+                | TaskConfig::InstructionTuning { .. }
+                | TaskConfig::QaReasoning { .. } => {
                     let positions = batch.loss_positions.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("structured distillation batch has no target mask")
                     })?;
-                    (
-                        teacher.forward_selected_logits(batch.input_ids.clone(), positions.clone()),
-                        student.forward_selected_logits(batch.input_ids.clone(), positions.clone()),
+                    teacher.forward_selected_logits(
+                        batch.input_ids.clone().inner(),
+                        positions.clone().inner(),
                     )
                 }
-                ObjectiveConfig::ContrastiveRetrieval { .. } => {
+                TaskConfig::RetrievalRepresentation { .. } => {
                     bail!("retrieval objective produced a language distillation batch")
+                }
+                TaskConfig::RetrievalRanking { .. }
+                | TaskConfig::PairwisePreference {}
+                | TaskConfig::VerifiableRl { .. } => {
+                    unreachable!("wake projection rejects unsupported task contracts")
                 }
             }
         }
         TrainingBatch::Retrieval(batch) => {
+            ensure!(
+                matches!(objective, TaskConfig::RetrievalRepresentation { .. }),
+                "non-retrieval phase produced a retrieval distillation batch"
+            );
             let layer = objective.retrieval_layer();
             let teacher_queries = teacher.forward_embeddings(
-                batch.query_ids.clone(),
-                batch.query_end_positions.clone(),
+                batch.query_ids.clone().inner(),
+                batch.query_end_positions.clone().inner(),
                 layer,
             );
             let teacher_documents = teacher.forward_embeddings(
-                batch.document_ids.clone(),
-                batch.document_end_positions.clone(),
+                batch.document_ids.clone().inner(),
+                batch.document_end_positions.clone().inner(),
                 layer,
             );
-            let student_queries = student.forward_embeddings(
-                batch.query_ids.clone(),
-                batch.query_end_positions.clone(),
-                layer,
-            );
-            let student_documents = student.forward_embeddings(
-                batch.document_ids.clone(),
-                batch.document_end_positions.clone(),
-                layer,
-            );
-            (
-                teacher_queries.matmul(teacher_documents.transpose()),
-                student_queries.matmul(student_documents.transpose()),
-            )
+            teacher_queries.matmul(teacher_documents.transpose())
         }
     };
-    forward_kl_distillation_tensor(teacher_logits, student_logits, temperature, true)
+    debug_assert!(
+        !teacher_logits.device().is_autodiff(),
+        "frozen quantization teacher unexpectedly built an autodiff graph"
+    );
+    // The KL loss is part of the student's autodiff graph. Lift the immutable
+    // teacher values back onto that backend without replaying teacher ops.
+    Ok(Tensor::from_inner(teacher_logits))
 }
 
 fn metric_quantization_format(format: UltraQuantFormat) -> MetricQuantizationFormat {
@@ -1180,35 +1431,30 @@ fn load_quantization_teacher(
     else {
         return Ok(None);
     };
-    let metadata = fs::symlink_metadata(teacher_checkpoint).with_context(|| {
-        format!(
-            "failed to inspect frozen quantization teacher {}",
-            teacher_checkpoint.display()
-        )
-    })?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "quantization teacher must be a regular non-symlink file"
-    );
-    ensure!(
-        file_sha256(teacher_checkpoint)? == *teacher_sha256,
-        "quantization teacher checkpoint hash mismatch"
-    );
+    let teacher_bytes = read_pinned_checkpoint_bytes(teacher_checkpoint, teacher_sha256)
+        .with_context(|| {
+            format!(
+                "cannot authenticate frozen quantization teacher {}",
+                teacher_checkpoint.display()
+            )
+        })?;
     let mut teacher_config = config.clone();
     disable_quantization_teacher_dropout(&mut teacher_config);
     let mut teacher = Transformer::new(&teacher_config, device)?;
-    load_safetensors(&mut teacher, teacher_checkpoint)?;
+    hermes_llm::load_safetensors_bytes(
+        &mut teacher,
+        teacher_bytes,
+        &format!("quantization teacher {}", teacher_checkpoint.display()),
+    )?;
     Ok(Some(LoadedQuantizationTeacher {
-        model: teacher,
+        // Distillation never optimizes the teacher. Keep it on Burn's inner
+        // backend so its forward pass does not allocate an autodiff tape; the
+        // resulting logits are lifted into the student graph as constants.
+        model: teacher.valid(),
         sha256: teacher_sha256.clone(),
         temperature: *temperature,
         loss_weight: *loss_weight,
     }))
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 fn validate_workflow_command(args: ValidateWorkflowArgs) -> Result<()> {
@@ -1356,28 +1602,31 @@ fn upgrade_memory_checkpoint_command(args: UpgradeMemoryCheckpointArgs) -> Resul
     Ok(())
 }
 
-fn validate_cli_native_sleep_adapters(
+fn validate_cli_native_sleep_selection(
     workflow: &ResolvedWorkflow,
-    registry: &NativeSleepContextRegistry,
+    sleep_runtime_configured: bool,
 ) -> Result<()> {
     let standalone = workflow
         .phases
         .iter()
         .find(|phase| phase.kind == PhaseKind::Sleep);
-    if let Some(phase) = standalone {
-        ensure!(
-            registry.has_phase_factory(),
-            "workflow sleep phase `{}` requires an in-process NativeSleepPhaseContextFactory; the stock run-workflow CLI has no model/evaluator factory configured. Embed hermes-train, register the pinned adapters with NativeWorkflowAdapters, and run NativeWorkflowHost",
-            phase.name
-        );
-    }
-    let periodic = workflow
+    ensure!(
+        standalone.is_some() == sleep_runtime_configured,
+        if let Some(phase) = standalone {
+            format!(
+                "workflow sleep phase `{}` requires --sleep-runtime and --sleep-runtime-sha256",
+                phase.name
+            )
+        } else {
+            "--sleep-runtime is only valid for a workflow with a standalone sleep phase".to_owned()
+        }
+    );
+    if let Some(phase) = workflow
         .phases
         .iter()
-        .find(|phase| phase.periodic_sleep.is_some());
-    if let Some(phase) = periodic {
-        ensure!(
-            registry.has_periodic_driver(),
+        .find(|phase| phase.periodic_sleep.is_some())
+    {
+        bail!(
             "workflow phase `{}` enables periodic in-model sleep but the stock run-workflow CLI has no native wake-boundary executor configured. Embed hermes-train, register a NativePeriodicWakeExecutor, and run NativeWorkflowHost",
             phase.name
         );
@@ -1385,37 +1634,88 @@ fn validate_cli_native_sleep_adapters(
     Ok(())
 }
 
+/// Bind every implementation selected by the stock WorkflowV2 CLI into the
+/// atomic resume identity. The external worker still receives its own exact
+/// digest on the wire; this composite is only the durable dispatch identity.
+fn run_workflow_dispatch_identity(
+    external_execution_sha256: &str,
+    sleep_runtime_sha256: Option<&str>,
+) -> Result<String> {
+    let external = ImmutableArtifact::new(
+        "dispatch://external-phase-worker",
+        external_execution_sha256,
+    )?;
+    let sleep = sleep_runtime_sha256
+        .map(|sha256| ImmutableArtifact::new("dispatch://native-sleep-runtime", sha256))
+        .transpose()?;
+    let mut hasher = Sha256::new();
+    for part in [
+        b"hermes-run-workflow-dispatch".as_slice(),
+        &RUN_WORKFLOW_DISPATCH_IDENTITY_VERSION.to_le_bytes(),
+        &PHASE_WORKER_PROTOCOL_VERSION.to_le_bytes(),
+        external.sha256().as_bytes(),
+        sleep
+            .as_ref()
+            .map_or(b"none".as_slice(), |artifact| artifact.sha256().as_bytes()),
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
 fn run_workflow_command(args: RunWorkflowArgs) -> Result<()> {
     let workflow = load_workflow_v2(&args.workflow)?;
-    let mut native_context = NativeSleepContextRegistry::new();
-    if let Some((path, sha256)) = args.sleep_runtime.zip(args.sleep_runtime_sha256) {
-        native_context
-            .register_phase_factory(BuiltinSleepPhaseContextFactory::load(path, &sha256)?)?;
-    }
-    // Fail before creating or advancing the runtime checkpoint. Native sleep
-    // cannot be delegated to the generic external worker because its typed
-    // model/evaluator objects and optimizer transaction live in process.
-    validate_cli_native_sleep_adapters(&workflow, &native_context)?;
+    ensure!(
+        args.sleep_runtime.is_some() == args.sleep_runtime_sha256.is_some(),
+        "--sleep-runtime and --sleep-runtime-sha256 must be provided together"
+    );
+    validate_cli_native_sleep_selection(&workflow, args.sleep_runtime.is_some())?;
     let executor = ExternalPhaseExecutor::new(
         &args.executor,
         args.executor_arguments,
         &args.executor_sha256,
+    )?
+    .with_timeout(Duration::from_secs(args.executor_timeout_seconds))?;
+    let dispatch_sha256 = run_workflow_dispatch_identity(
+        &executor.execution_identity(),
+        args.sleep_runtime_sha256.as_deref(),
     )?;
-    let mut checkpoint = AtomicRuntimeCheckpoint::new(&args.state, &args.executor_sha256)?;
-    match (&args.metrics, &args.run_id) {
-        (Some(metrics), Some(run_id)) => {
-            checkpoint.configure_metrics(metrics, run_id, args.resume)?;
-        }
-        (None, None) => {}
-        _ => bail!("--metrics and --run-id must be provided together"),
-    }
-    let mut state = if args.resume {
+    let mut checkpoint = AtomicRuntimeCheckpoint::new(&args.state, dispatch_sha256)?;
+
+    // Authenticate the complete dispatch identity before loading a runtime
+    // factory, whose validated configuration creates output stores. This
+    // read-only preflight also precedes metric-prefix truncation in `load`.
+    if args.resume {
         ensure!(
             args.initial_checkpoint_uri.is_none(),
             "--resume cannot replace the initial immutable checkpoint"
         );
+        checkpoint.verify_execution_identity()?;
+    }
+
+    let mut native_context = NativeSleepContextRegistry::new();
+    if let (Some(path), Some(sha256)) = (&args.sleep_runtime, &args.sleep_runtime_sha256) {
+        native_context
+            .register_phase_factory(BuiltinSleepPhaseContextFactory::load(path, sha256)?)?;
+    }
+    let mut state = if args.resume {
+        match (&args.metrics, &args.run_id) {
+            (Some(metrics), Some(run_id)) => {
+                checkpoint.configure_metrics(metrics, run_id, true)?;
+            }
+            (None, None) => {}
+            _ => bail!("--metrics and --run-id must be provided together"),
+        }
         checkpoint.load(&workflow)?
     } else {
+        match (&args.metrics, &args.run_id) {
+            (Some(metrics), Some(run_id)) => {
+                checkpoint.configure_metrics(metrics, run_id, false)?;
+            }
+            (None, None) => {}
+            _ => bail!("--metrics and --run-id must be provided together"),
+        }
         let initial_checkpoint = args
             .initial_checkpoint_uri
             .zip(args.initial_checkpoint_sha256)
@@ -1489,6 +1789,96 @@ mod tests {
     use hermes_llm::get_builtin_model;
 
     use super::*;
+
+    #[test]
+    fn coincident_wake_only_updates_emit_ordered_committed_metrics() {
+        let schedule: hermes_train::sleep::SleepSchedule =
+            serde_json::from_value(serde_json::json!({
+                "clock": "optimizer_steps",
+                "terminal_consolidation": "distill_into_base_v1",
+                "tiers": [
+                    {"id": "fast", "update_period": 1, "reserve_slots": 1},
+                    {"id": "slow", "update_period": 2, "reserve_slots": 2}
+                ]
+            }))
+            .unwrap();
+        let updates = vec![
+            WakeOnlyTierUpdate {
+                tier: 0,
+                tier_id: "fast".into(),
+                trigger_clock: 2,
+                accumulated_optimizer_steps: 1,
+                prospective_update_sha256: format!("sha256:{}", "a".repeat(64)),
+            },
+            WakeOnlyTierUpdate {
+                tier: 1,
+                tier_id: "slow".into(),
+                trigger_clock: 2,
+                accumulated_optimizer_steps: 2,
+                prospective_update_sha256: format!("sha256:{}", "b".repeat(64)),
+            },
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let mut metrics = MetricWriter::create(&path, "wake-only-metrics").unwrap();
+        let context = MetricContext {
+            global_step: 2,
+            phase: MetricPhase {
+                index: 0,
+                name: "wake-only".into(),
+                kind: MetricPhaseKind::Pretrain,
+            },
+            checkpoint_hash: None,
+        };
+        append_wake_only_tier_metrics(&mut metrics, &context, &schedule, &updates).unwrap();
+        metrics.sync_all().unwrap();
+        drop(metrics);
+
+        let records = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<hermes_train::metrics::MetricRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        let projected = records
+            .iter()
+            .map(|record| match &record.event {
+                MetricEvent::TierUpdate(update) => (
+                    update.tier,
+                    update.update_period,
+                    update.accumulated_micro_steps,
+                    update.outcome,
+                    update.receiver_tier,
+                    update.reserve_slot,
+                    update.optimizer_state_reset,
+                ),
+                other => panic!("unexpected metric {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![
+                (
+                    MetricMemoryTier::Fast,
+                    1,
+                    1,
+                    TierUpdateOutcome::Committed,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    MetricMemoryTier::Slow,
+                    2,
+                    2,
+                    TierUpdateOutcome::Committed,
+                    None,
+                    None,
+                    false,
+                ),
+            ]
+        );
+    }
 
     #[cfg(unix)]
     struct GenerationSwapGuard {
@@ -1600,6 +1990,54 @@ mod tests {
                 assert!(memory.tiers.iter().all(|tier| tier.ffn.dropout == 0.0));
             }
         }
+    }
+
+    #[test]
+    fn tied_model_rejects_split_qat_embedding_and_output_policies_before_training() {
+        let mut model = small_hybrid();
+        model.embeddings.tie_weights = true;
+        let workflow = ResolvedWakePlan {
+            version: 2,
+            phases: vec![wake::ResolvedWakePhase {
+                name: "invalid-tied-qat".into(),
+                phase_kind: PhaseKind::Quantization,
+                data: "unused.jsonl".into(),
+                objective: TaskConfig::CausalLm {},
+                sequence_length: 8,
+                batch_size: 1,
+                gradient_accumulation: 1,
+                epochs: 1,
+                shuffle_buffer: 1,
+                steps: Some(1),
+                loss_weight: 1.0,
+                learning_rate_scale: 1.0,
+                quantization: Some(WorkflowQuantizationPlan {
+                    recipe: QuantizationRecipe {
+                        format: UltraQuantFormat::BinaryG128,
+                        group_size: BONSAI_GROUP_SIZE,
+                        fake_quant_start_step: 0,
+                        ternary_warmup_steps: 0,
+                        distillation_weight: 0.0,
+                        quantize_embeddings: true,
+                        quantize_lm_head: false,
+                    },
+                    start_step: 0,
+                    end_step: None,
+                    warmup_format: None,
+                    warmup_steps: 0,
+                    training: WorkflowQuantizationTraining::Qat {
+                        straight_through: true,
+                    },
+                }),
+                periodic_sleep: None,
+                memory_update_mode: None,
+            }],
+        };
+
+        let error = validate_model_wake_plan(&model, &workflow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tied model weights"), "{error}");
     }
 
     fn small_hybrid() -> ModelDef {
@@ -1719,6 +2157,74 @@ mod tests {
     }
 
     #[test]
+    fn workflow_resume_identity_binds_the_exact_native_sleep_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow: hermes_train::workflow::WorkflowV2 =
+            serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "phases": [{
+                    "name": "pretrain",
+                    "type": "pretrain",
+                    "task": {"type": "causal_lm"},
+                    "data": "data.jsonl",
+                    "sequence_length": 8,
+                    "batch_size": 1,
+                    "gradient_accumulation": 1,
+                    "steps": 1
+                }]
+            }))
+            .unwrap();
+        let workflow = workflow
+            .resolve(&directory.path().join("workflow.json"))
+            .unwrap();
+        let external = format!("sha256:{}", "a".repeat(64));
+        let first_sleep = format!("sha256:{}", "b".repeat(64));
+        let replacement_sleep = format!("sha256:{}", "c".repeat(64));
+        let first_dispatch = run_workflow_dispatch_identity(&external, Some(&first_sleep)).unwrap();
+        let replacement_dispatch =
+            run_workflow_dispatch_identity(&external, Some(&replacement_sleep)).unwrap();
+        assert_ne!(first_dispatch, replacement_dispatch);
+        assert_ne!(
+            first_dispatch,
+            run_workflow_dispatch_identity(&external, None).unwrap()
+        );
+
+        let state_path = directory.path().join("runtime.json");
+        let metrics_path = directory.path().join("metrics.jsonl");
+        let state = WorkflowRunState::new(&workflow, None).unwrap();
+        let mut writer = AtomicRuntimeCheckpoint::new(&state_path, first_dispatch).unwrap();
+        writer
+            .configure_metrics(&metrics_path, "dispatch-binding", false)
+            .unwrap();
+        writer.initialize(&state).unwrap();
+        drop(writer);
+        fs::write(&metrics_path, b"uncommitted metric tail\n").unwrap();
+        let before = fs::read(&state_path).unwrap();
+        let before_metrics = fs::read(&metrics_path).unwrap();
+
+        let mut replacement =
+            AtomicRuntimeCheckpoint::new(&state_path, replacement_dispatch).unwrap();
+        replacement
+            .configure_metrics(&metrics_path, "dispatch-binding", true)
+            .unwrap();
+        let error = replacement
+            .verify_execution_identity()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different execution dispatch"), "{error}");
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            before,
+            "a mismatched native runtime identity mutated workflow state"
+        );
+        assert_eq!(
+            fs::read(&metrics_path).unwrap(),
+            before_metrics,
+            "a mismatched native runtime identity truncated the metric journal"
+        );
+    }
+
+    #[test]
     fn checked_in_workflow_examples_remain_strictly_valid() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for name in [
@@ -1816,15 +2322,10 @@ mod tests {
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.sleep.example.json"),
         )
         .unwrap();
-        let registry = NativeSleepContextRegistry::new();
-        let error = validate_cli_native_sleep_adapters(&workflow, &registry)
+        let error = validate_cli_native_sleep_selection(&workflow, false)
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("NativeSleepPhaseContextFactory")
-                || error.contains("NativePeriodicWakeExecutor"),
-            "{error}"
-        );
+        assert!(error.contains("NativePeriodicWakeExecutor"), "{error}");
         assert!(error.contains("stock run-workflow CLI"), "{error}");
     }
 
@@ -1872,6 +2373,107 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
         let workflow = load_wake_plan(&path).unwrap();
         (directory, workflow)
+    }
+
+    fn write_wake_only_memory_workflow() -> (tempfile::TempDir, ResolvedWakePlan) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.sleep.example.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        json["phases"].as_array_mut().unwrap().truncate(1);
+        let schedule = json["phases"][0]["periodic_sleep"]["schedule"].take();
+        json["phases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("periodic_sleep");
+        json["phases"][0]["memory_update_mode"] = serde_json::json!({
+            "type": "wake_only",
+            "schedule": schedule
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workflow.json");
+        fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let workflow = load_wake_plan(&path).unwrap();
+        (directory, workflow)
+    }
+
+    #[test]
+    fn wake_only_configuration_and_optimizer_scopes_are_checkpoint_bound() {
+        let (_directory, workflow) = write_wake_only_memory_workflow();
+        let config = sleep_memory_test_model();
+        validate_model_wake_plan(&config, &workflow).unwrap();
+        let device = hermes_llm::Device::ndarray().autodiff();
+        let model = Transformer::new(&config, &device).unwrap();
+        let mode = workflow.phases[0].memory_update_mode.clone().unwrap();
+        let bank =
+            TierOptimizerBank::new(&model, mode.schedule(), mode.tier_optimizer().clone()).unwrap();
+        let state = TrainingState {
+            version: TRAINING_STATE_VERSION,
+            global_step: 0,
+            phase: 0,
+            phase_id: workflow.phases[0].name.clone(),
+            phase_kind: workflow.phases[0].phase_kind.name().into(),
+            epoch: 0,
+            records_in_phase: 0,
+            steps_in_phase: 0,
+            tokens_seen: 0,
+            metric_records: 0,
+            workflow_signature: format!("sha256:{}", "a".repeat(64)),
+            data_manifest_hash: Some(format!("sha256:{}", "b".repeat(64))),
+            parameter_ids: parameter_ids(&model),
+            optimizer_states: vec![OptimizerStateRef {
+                scope: "wake".into(),
+                adamw: "adamw-state.bpk".into(),
+                muon: "muon-state.bpk".into(),
+                gradient_accumulator: None,
+                update_clock: 0,
+            }],
+            memory_update: TrainingMemoryUpdateState::WakeOnly {
+                config: mode,
+                optimizer_scopes: bank.scopes().unwrap(),
+            },
+            sleep: None,
+            artifacts: Vec::new(),
+            evaluator_hashes: Vec::new(),
+            rng_streams: vec![
+                RngStreamState {
+                    name: DATA_RNG_STREAM.into(),
+                    seed: 0,
+                    counter: 0,
+                },
+                RngStreamState {
+                    name: MODEL_RNG_STREAM.into(),
+                    seed: 0,
+                    counter: 0,
+                },
+            ],
+            wake_context_buffer: Vec::new(),
+            quantization: None,
+        };
+        state.validate().unwrap();
+        trainer::preflight_resumed_memory_mode(&workflow, &state).unwrap();
+
+        let mut replacement = workflow.clone();
+        let MemoryUpdateMode::WakeOnly { tier_optimizer, .. } =
+            replacement.phases[0].memory_update_mode.as_mut().unwrap();
+        tier_optimizer.learning_rate *= 2.0;
+        let error = trainer::preflight_resumed_memory_mode(&replacement, &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("differs from the exact workflow"), "{error}");
+    }
+
+    #[test]
+    fn wake_geometry_must_fit_checkpoint_metrics() {
+        if usize::BITS <= 32 {
+            return;
+        }
+        let (_directory, mut workflow) = write_wake_only_memory_workflow();
+        workflow.phases[0].batch_size = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let error = validate_model_wake_plan(&sleep_memory_test_model(), &workflow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("batch_size"), "{error}");
+        assert!(error.contains("checkpoint-metric range"), "{error}");
     }
 
     #[test]
@@ -2173,14 +2775,15 @@ mod tests {
     }
 
     #[test]
-    fn quantization_distillation_masks_structured_prompts_and_freezes_teacher() {
+    fn quantization_distillation_reuses_student_forward_and_keeps_teacher_off_tape() {
         let config = small_hybrid();
         let device = hermes_llm::default_device().autodiff();
         device.seed(11);
-        let teacher = Transformer::new(&config, &device).unwrap();
+        let teacher = Transformer::new(&config, &device).unwrap().valid();
         device.seed(29);
         let student = Transformer::new(&config, &device).unwrap();
         let input_ids = Tensor::<2, Int>::from_data([[1, 2, 3, 4]], &device);
+        let targets = Tensor::<2, Int>::from_data([[2, 3, 4, 5]], &device);
         let positions = Tensor::<1, Int>::from_data([2], &device);
         let batch = make_batch(
             &[TrainingSample::Supervised {
@@ -2192,25 +2795,122 @@ mod tests {
             &device,
         )
         .unwrap();
-        let objective = ObjectiveConfig::Summarization {
+        let objective = TaskConfig::Summarization {
             instruction: "summarize".into(),
         };
-        let loss = quantization_forward_kl(&student, &teacher, &batch, &objective, 1.0).unwrap();
-        let expected = forward_kl_distillation_tensor(
-            teacher.forward_selected_logits(input_ids.clone(), positions.clone()),
-            student.forward_selected_logits(input_ids, positions),
-            1.0,
-            true,
-        )
-        .unwrap();
+        let frozen_probe =
+            teacher.forward_selected_logits(input_ids.clone().inner(), positions.clone().inner());
+        assert!(!frozen_probe.device().is_autodiff());
+        assert!(!frozen_probe.is_require_grad());
+        let teacher_logits = quantization_teacher_logits(&teacher, &batch, &objective).unwrap();
+        assert!(teacher_logits.device().is_autodiff());
+        assert!(!teacher_logits.is_require_grad());
+
+        let ObjectiveForward {
+            loss: task_loss,
+            router_loss,
+            distillation_logits,
+            ..
+        } = objective_loss(&student, batch, &objective, true).unwrap();
+        assert!(router_loss.is_none());
+        let student_logits = distillation_logits.unwrap();
+        let expected_student_logits =
+            student.forward_selected_logits(input_ids.clone(), positions.clone());
+        let actual_logits = student_logits
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        let expected_logits = expected_student_logits
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(actual_logits, expected_logits);
+
+        let expected_task_loss =
+            scalar_value(student.forward_masked_loss(input_ids, targets, positions)).unwrap();
+        let actual_task_loss = scalar_value(task_loss.clone()).unwrap();
+        assert!((actual_task_loss - expected_task_loss).abs() < 1e-6);
+
+        let loss =
+            forward_kl_distillation_tensor(teacher_logits.clone(), student_logits, 1.0, true)
+                .unwrap();
+        let expected =
+            forward_kl_distillation_tensor(teacher_logits, expected_student_logits, 1.0, true)
+                .unwrap();
         let actual_value = scalar_value(loss.clone()).unwrap();
         let expected_value = scalar_value(expected).unwrap();
         assert!((actual_value - expected_value).abs() < 1e-6);
 
-        let mut gradients = loss.backward();
-        let teacher_gradients = GradientsParams::from_module(&mut gradients, &teacher);
+        let mut gradients = (task_loss + loss).backward();
         let student_gradients = GradientsParams::from_module(&mut gradients, &student);
-        assert!(teacher_gradients.is_empty());
+        assert!(!student_gradients.is_empty());
+    }
+
+    #[test]
+    fn retrieval_qat_reuses_student_embeddings_for_task_and_distillation() {
+        let config = small_hybrid();
+        let device = hermes_llm::default_device().autodiff();
+        device.seed(47);
+        let teacher = Transformer::new(&config, &device).unwrap().valid();
+        device.seed(53);
+        let student = Transformer::new(&config, &device).unwrap();
+        let encoded = |tokens| data::EncodedText {
+            tokens,
+            end_position: 1,
+        };
+        let batch = make_batch(
+            &[TrainingSample::Retrieval {
+                query: encoded(vec![1, 2, 0, 0]),
+                documents: vec![encoded(vec![3, 4, 0, 0]), encoded(vec![5, 6, 0, 0])],
+                truncated_tokens: 0,
+            }],
+            4,
+            &device,
+        )
+        .unwrap();
+        let objective = TaskConfig::RetrievalRepresentation {
+            temperature: 0.5,
+            layer: None,
+            query_prefix: "query".into(),
+            document_prefix: "document".into(),
+        };
+        let teacher_logits = quantization_teacher_logits(&teacher, &batch, &objective).unwrap();
+        assert!(teacher_logits.device().is_autodiff());
+        assert!(!teacher_logits.is_require_grad());
+        let ObjectiveForward {
+            loss: task_loss,
+            router_loss,
+            distillation_logits,
+            ..
+        } = objective_loss(&student, batch, &objective, true).unwrap();
+        assert!(router_loss.is_none());
+        let student_logits = distillation_logits.unwrap();
+
+        let query_ids = Tensor::<2, Int>::from_data([[1, 2, 0, 0]], &device);
+        let query_positions = Tensor::<1, Int>::from_data([1], &device);
+        let document_ids = Tensor::<2, Int>::from_data([[3, 4, 0, 0], [5, 6, 0, 0]], &device);
+        let document_positions = Tensor::<1, Int>::from_data([1, 5], &device);
+        let expected_logits = student
+            .forward_embeddings(query_ids, query_positions, None)
+            .matmul(
+                student
+                    .forward_embeddings(document_ids, document_positions, None)
+                    .transpose(),
+            );
+        let maximum: f32 = (student_logits.clone() - expected_logits)
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(maximum < 1e-6, "retrieval QAT logits differ by {maximum}");
+
+        let distillation_loss =
+            forward_kl_distillation_tensor(teacher_logits, student_logits, 1.0, true).unwrap();
+        let mut gradients = (task_loss + distillation_loss).backward();
+        let student_gradients = GradientsParams::from_module(&mut gradients, &student);
         assert!(!student_gradients.is_empty());
     }
 
@@ -2332,6 +3032,7 @@ mod tests {
                 gradient_accumulator: None,
                 update_clock: 20,
             }],
+            memory_update: TrainingMemoryUpdateState::Ordinary,
             sleep: None,
             artifacts: Vec::new(),
             evaluator_hashes: Vec::new(),
@@ -2411,6 +3112,29 @@ mod tests {
         );
         assert!((evidence.training_gpu_hours - 2.0 / 3600.0).abs() < 1e-15);
 
+        let mut mismatched_qat_state = state.clone();
+        mismatched_qat_state.quantization = Some(QuantizationTrainingState {
+            format: "binary_g128".into(),
+            fake_quant_active: false,
+            calibration_step: state.global_step as u64,
+            manifest: Some("candidate.json".into()),
+            candidate_weights_sha256: Some(format!("sha256:{}", "0".repeat(64))),
+            teacher_hash: None,
+        });
+        let error = save_training_checkpoint_with_evidence(
+            &model,
+            &adamw_optimizer,
+            &muon_optimizer,
+            &mismatched_qat_state,
+            &mut metrics,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("candidate weights differ"),
+            "{error:#}"
+        );
+
         let mut resumed = Transformer::new(&config, &device).unwrap();
         let mut resumed_ids = resumed.muon_parameter_ids();
         let mut resumed_muon = BatchedMuon::new(resumed_ids.clone());
@@ -2419,7 +3143,7 @@ mod tests {
             .with_epsilon(1e-8)
             .with_weight_decay(0.0)
             .init();
-        let (mut resumed_adamw, resumed_state) = load_training_state(
+        let (mut resumed_adamw, resumed_state, resumed_weights_sha256) = load_training_state(
             &mut resumed,
             resumed_adamw,
             &mut resumed_muon,
@@ -2427,6 +3151,10 @@ mod tests {
             &device,
         )
         .unwrap();
+        assert_eq!(
+            resumed_weights_sha256,
+            format!("sha256:{}", evidence.weights_sha256)
+        );
         assert_eq!(resumed_state.global_step, state.global_step);
         assert_eq!(resumed_state.phase, state.phase);
         assert_eq!(resumed_state.epoch, state.epoch);
@@ -2569,7 +3297,7 @@ mod tests {
                 .with_weight_decay(0.0)
                 .init();
             let mut swap = GenerationSwapGuard::new(generation_a.clone(), generation_b);
-            let (aba_adamw, aba_state) = checkpoint::load_training_state_with_hook(
+            let (aba_adamw, aba_state, _) = checkpoint::load_training_state_with_hook(
                 &mut aba_model,
                 aba_adamw,
                 &mut aba_muon,

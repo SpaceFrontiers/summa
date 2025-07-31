@@ -8,41 +8,40 @@
 #[cfg(not(unix))]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fmt::Write as FmtWrite;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(unix)]
-use std::ffi::{CStr, CString, OsStr, OsString};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use anyhow::{Context, Result, ensure};
 use burn::module::{AutodiffModule, Module, ModuleMapper, Param, ParamId};
 use burn::tensor::{Bool, Bytes, Device, Int, Tensor};
 use burn_optim::ModuleOptimizer;
 use hermes_llm::{Transformer, load_safetensors_bytes, save_safetensors};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::muon::BatchedMuon;
-use hermes_train::builtin_sleep_adapters::WakeContextRecord;
+#[cfg(unix)]
+use hermes_train::artifact_io::{PinnedDirectory, StableIdentity};
+use hermes_train::artifact_io::{
+    ensure_real_directory, hash_open_file, hash_regular_file_hex, read_regular_bounded, sha256_hex,
+    sync_directory, sync_regular_file, validate_sha256_hex, validate_sha256_identity,
+    write_new_synced as write_synced_new,
+};
+use hermes_train::builtin_sleep_adapters::{
+    MAX_WAKE_CONTEXT_ID_BYTES, MAX_WAKE_CONTEXT_RECORDS, MAX_WAKE_CONTEXT_TOKENS,
+    MAX_WAKE_CONTEXT_TOTAL_TOKENS, WakeContextRecord,
+};
 use hermes_train::metrics::MetricWriter;
 use hermes_train::native_sleep::NativeSleepCheckpoint;
 use hermes_train::optimizer_artifact::{
     canonical_module_optimizer_bytes, save_canonical_module_optimizer,
 };
-use hermes_train::quantization::QuantizationTransactionState;
+use hermes_train::sleep::{MemoryOptimizerScopes, UpdateClock};
 use hermes_train::training_accounting::{
     TRAINING_ACCOUNTING_FILE, TRAINING_ACCOUNTING_VERSION, TrainingAccounting, TrainingEvidence,
 };
+use hermes_train::workflow::MemoryUpdateMode;
 
 pub(crate) type AdamWOptimizer = ModuleOptimizer;
 
@@ -58,6 +57,11 @@ const TRAINING_STATE_FILE: &str = "training-state.json";
 const WEIGHTS_FILE: &str = "weights.safetensors";
 const ADAMW_FILE: &str = "adamw-state.bpk";
 const MUON_FILE: &str = "muon-state.bpk";
+const MAX_CHECKPOINT_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CHECKPOINT_MEMBER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_CHECKPOINT_GENERATION_FILES: usize = 1_024;
+const MAX_CHECKPOINT_GENERATION_DIRECTORIES: usize = 256;
+const MAX_CHECKPOINT_GENERATION_DEPTH: usize = 16;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -97,10 +101,52 @@ struct GenerationSnapshot {
     access: Option<GenerationAccess>,
 }
 
+#[derive(Default)]
+struct GenerationTraversalBudget {
+    files: usize,
+    directories: usize,
+}
+
+impl GenerationTraversalBudget {
+    fn enter_directory(&mut self, depth: usize) -> Result<()> {
+        ensure!(
+            depth <= MAX_CHECKPOINT_GENERATION_DEPTH,
+            "checkpoint generation exceeds its maximum directory depth"
+        );
+        if depth > 0 {
+            self.directories = self
+                .directories
+                .checked_add(1)
+                .context("checkpoint directory count overflow")?;
+            ensure!(
+                self.directories <= MAX_CHECKPOINT_GENERATION_DIRECTORIES,
+                "checkpoint generation contains too many directories"
+            );
+        }
+        Ok(())
+    }
+
+    fn record_file(&mut self, bytes: u64) -> Result<()> {
+        self.files = self
+            .files
+            .checked_add(1)
+            .context("checkpoint file count overflow")?;
+        ensure!(
+            self.files <= MAX_CHECKPOINT_GENERATION_FILES,
+            "checkpoint generation contains too many files"
+        );
+        ensure!(
+            bytes <= MAX_CHECKPOINT_MEMBER_BYTES,
+            "checkpoint generation contains an oversized file"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct GenerationAccess {
-    directory: SecureDirectory,
+    directory: PinnedDirectory,
 }
 
 #[cfg(not(unix))]
@@ -201,10 +247,34 @@ pub(crate) struct QuantizationTrainingState {
     pub(crate) fake_quant_active: bool,
     pub(crate) calibration_step: u64,
     pub(crate) manifest: Option<String>,
+    /// Canonical weights identity sealed by `manifest`. It is absent until a
+    /// final candidate exists and is checked against this checkpoint's own
+    /// authenticated weights file during both save and resume.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub(crate) candidate_weights_sha256: Option<String>,
     pub(crate) teacher_hash: Option<String>,
-    /// Exact interruption point for an in-flight fake-quant/distillation
-    /// optimizer update. The backend validates its plan fingerprint on resume.
-    pub(crate) transaction: Option<QuantizationTransactionState>,
+}
+
+/// Checkpoint-bound memory execution strategy. The wake-only variant carries
+/// the exact typed configuration and content-addressed tier optimizer scopes,
+/// including every pending gradient accumulator and independent clock.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TrainingMemoryUpdateState {
+    Ordinary,
+    PeriodicSleep,
+    WakeOnly {
+        config: MemoryUpdateMode,
+        optimizer_scopes: MemoryOptimizerScopes,
+    },
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Complete version-2 trainer state.  The schema intentionally has no serde
@@ -227,6 +297,7 @@ pub(crate) struct TrainingState {
     pub(crate) data_manifest_hash: Option<String>,
     pub(crate) parameter_ids: Vec<u64>,
     pub(crate) optimizer_states: Vec<OptimizerStateRef>,
+    pub(crate) memory_update: TrainingMemoryUpdateState,
     pub(crate) sleep: Option<NativeSleepCheckpoint>,
     pub(crate) artifacts: Vec<ArtifactRef>,
     pub(crate) evaluator_hashes: Vec<String>,
@@ -257,13 +328,72 @@ impl TrainingState {
             !self.workflow_signature.trim().is_empty(),
             "checkpoint workflow signature is empty"
         );
-        validate_content_hash(&self.workflow_signature, "checkpoint workflow signature")?;
+        validate_sha256_identity(&self.workflow_signature, "checkpoint workflow signature")?;
         if let Some(hash) = &self.data_manifest_hash {
-            validate_content_hash(hash, "checkpoint data manifest hash")?;
+            validate_sha256_identity(hash, "checkpoint data manifest hash")?;
         }
         ensure!(
             self.global_step == 0 || self.tokens_seen > 0 || self.phase_kind == "evaluation",
             "non-evaluation checkpoint has optimizer progress but no token count"
+        );
+        ensure!(
+            self.global_step == 0 || self.metric_records > 0,
+            "checkpoint has optimizer progress but no committed metrics"
+        );
+        ensure!(
+            self.wake_context_buffer.len() <= MAX_WAKE_CONTEXT_RECORDS,
+            "checkpoint wake-context buffer exceeds the {MAX_WAKE_CONTEXT_RECORDS}-record limit"
+        );
+        let checkpoint_step = u64::try_from(self.global_step)
+            .context("checkpoint global step exceeds the wake-context clock")?;
+        let mut context_ids = BTreeSet::new();
+        let mut previous_context_step = None;
+        let wake_context_tokens =
+            self.wake_context_buffer
+                .iter()
+                .try_fold(0_usize, |total, record| -> Result<usize> {
+                    ensure!(
+                        !record.id.trim().is_empty()
+                            && record.id.len() <= MAX_WAKE_CONTEXT_ID_BYTES,
+                        "checkpoint wake-context id must contain 1..={MAX_WAKE_CONTEXT_ID_BYTES} bytes"
+                    );
+                    ensure!(
+                        context_ids.insert(record.id.as_str()),
+                        "checkpoint wake-context buffer repeats identity `{}`",
+                        record.id
+                    );
+                    ensure!(
+                        previous_context_step
+                            .is_none_or(|previous| previous <= record.optimizer_step)
+                            && record.optimizer_step <= checkpoint_step,
+                        "checkpoint wake-context buffer has an invalid optimizer-step order"
+                    );
+                    previous_context_step = Some(record.optimizer_step);
+                    ensure!(
+                        !record.token_ids.is_empty(),
+                        "checkpoint wake context `{}` has no tokens",
+                        record.id
+                    );
+                    ensure!(
+                        record.token_ids.len() <= MAX_WAKE_CONTEXT_TOKENS,
+                        "checkpoint wake context `{}` exceeds the {MAX_WAKE_CONTEXT_TOKENS}-token limit",
+                        record.id
+                    );
+                    ensure!(
+                        record
+                            .token_ids
+                            .iter()
+                            .all(|token| u32::try_from(*token).is_ok()),
+                        "checkpoint wake context `{}` contains a token outside the u32 vocabulary range",
+                        record.id
+                    );
+                    total
+                        .checked_add(record.token_ids.len())
+                        .context("checkpoint wake-context token count overflows usize")
+                })?;
+        ensure!(
+            wake_context_tokens <= MAX_WAKE_CONTEXT_TOTAL_TOKENS,
+            "checkpoint wake-context buffer exceeds the {MAX_WAKE_CONTEXT_TOTAL_TOKENS}-token limit"
         );
         let optimizer_scopes = self
             .optimizer_states
@@ -312,6 +442,102 @@ impl TrainingState {
                 );
             }
         }
+        match &self.memory_update {
+            TrainingMemoryUpdateState::Ordinary => ensure!(
+                self.sleep.is_none() && self.wake_context_buffer.is_empty(),
+                "ordinary checkpoint contains memory-training state"
+            ),
+            TrainingMemoryUpdateState::PeriodicSleep => ensure!(
+                self.sleep.is_some(),
+                "periodic_sleep checkpoint has no native sleep cursor"
+            ),
+            TrainingMemoryUpdateState::WakeOnly {
+                config,
+                optimizer_scopes,
+            } => {
+                config.validate("checkpoint wake_only")?;
+                ensure!(
+                    config.schedule().clock == UpdateClock::OptimizerSteps,
+                    "wake_only checkpoint uses a clock unsupported by the stock trainer"
+                );
+                ensure!(
+                    self.sleep.is_none() && self.wake_context_buffer.is_empty(),
+                    "wake_only checkpoint contains periodic-sleep state"
+                );
+                ensure!(
+                    optimizer_scopes.tiers.len() == config.schedule().tiers.len()
+                        && !optimizer_scopes.wake_parameter_ids.is_empty(),
+                    "wake_only checkpoint optimizer topology differs from its schedule"
+                );
+                let mut owned = optimizer_scopes
+                    .wake_parameter_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                ensure!(
+                    owned.len() == optimizer_scopes.wake_parameter_ids.len(),
+                    "wake_only checkpoint repeats a wake parameter ID"
+                );
+                let global_clock = u64::try_from(self.global_step)
+                    .context("wake_only checkpoint global step exceeds u64")?;
+                for (index, (scope, tier)) in optimizer_scopes
+                    .tiers
+                    .iter()
+                    .zip(&config.schedule().tiers)
+                    .enumerate()
+                {
+                    let completed_boundaries = global_clock / tier.update_period;
+                    let expected_update_clock = completed_boundaries
+                        .checked_mul(tier.update_period)
+                        .context("wake_only tier update clock overflows u64")?;
+                    let expected_pending_steps = global_clock
+                        .checked_sub(expected_update_clock)
+                        .context("wake_only pending-step clock underflows")?;
+                    let expected_generation = global_clock
+                        .checked_add(completed_boundaries)
+                        .context("wake_only tier generation overflows u64")?;
+                    ensure!(
+                        scope.tier == index
+                            && scope.tier_id == tier.id
+                            && scope.update_clock == expected_update_clock
+                            && scope.accumulated_micro_steps == expected_pending_steps
+                            && scope.generation == expected_generation
+                            && scope.transfer_clock == 0
+                            && scope.transfer_generation == 0,
+                        "wake_only checkpoint tier `{}` has invalid identity or clocks",
+                        tier.id
+                    );
+                    ensure!(
+                        scope.parameter_ids.iter().all(|id| owned.insert(*id)),
+                        "wake_only checkpoint repeats a tier parameter ID"
+                    );
+                    ensure!(
+                        scope.artifact.is_some()
+                            || (scope.update_clock == 0
+                                && scope.accumulated_micro_steps == 0
+                                && scope.generation == 0),
+                        "wake_only checkpoint tier `{}` has mutable state without an immutable optimizer artifact",
+                        tier.id
+                    );
+                    if let Some(artifact) = &scope.artifact {
+                        artifact
+                            .validate_pending_steps(scope.accumulated_micro_steps)
+                            .with_context(|| {
+                                format!(
+                                    "wake_only checkpoint tier `{}` has invalid optimizer state",
+                                    tier.id
+                                )
+                            })?;
+                    }
+                }
+                let checkpoint_parameters =
+                    self.parameter_ids.iter().copied().collect::<BTreeSet<_>>();
+                ensure!(
+                    owned == checkpoint_parameters,
+                    "wake_only optimizer scopes do not exactly partition checkpoint parameters"
+                );
+            }
+        }
         let optimizer_paths = self
             .optimizer_states
             .iter()
@@ -342,34 +568,12 @@ impl TrainingState {
         for stream in &self.rng_streams {
             ensure!(!stream.name.trim().is_empty(), "RNG stream name is empty");
         }
-        ensure!(
-            self.wake_context_buffer
-                .windows(2)
-                .all(|pair| pair[0].optimizer_step <= pair[1].optimizer_step),
-            "checkpoint wake-context buffer moves backwards"
-        );
-        let context_ids = self
-            .wake_context_buffer
-            .iter()
-            .map(|record| record.id.as_str())
-            .collect::<BTreeSet<_>>();
-        ensure!(
-            context_ids.len() == self.wake_context_buffer.len(),
-            "checkpoint wake-context buffer repeats an identity"
-        );
-        for record in &self.wake_context_buffer {
-            ensure!(
-                !record.id.trim().is_empty()
-                    && !record.token_ids.is_empty()
-                    && record.token_ids.iter().all(|token| *token >= 0),
-                "checkpoint contains an invalid wake context"
-            );
-        }
         let unique_parameter_ids = self.parameter_ids.iter().collect::<BTreeSet<_>>();
         ensure!(
             unique_parameter_ids.len() == self.parameter_ids.len(),
             "checkpoint repeats a parameter ID"
         );
+        let mut artifact_references = BTreeSet::new();
         for artifact in &self.artifacts {
             ensure!(
                 !artifact.kind.trim().is_empty()
@@ -377,10 +581,19 @@ impl TrainingState {
                     && !artifact.hash.trim().is_empty(),
                 "checkpoint has an incomplete artifact reference"
             );
-            validate_content_hash(&artifact.hash, "checkpoint artifact hash")?;
+            validate_sha256_identity(&artifact.hash, "checkpoint artifact hash")?;
+            ensure!(
+                artifact_references.insert((artifact.kind.as_str(), artifact.manifest.as_str())),
+                "checkpoint repeats an artifact kind and manifest"
+            );
         }
+        let mut evaluator_hashes = BTreeSet::new();
         for hash in &self.evaluator_hashes {
-            validate_content_hash(hash, "checkpoint evaluator hash")?;
+            validate_sha256_identity(hash, "checkpoint evaluator hash")?;
+            ensure!(
+                evaluator_hashes.insert(hash.as_str()),
+                "checkpoint repeats an evaluator hash"
+            );
         }
         if let Some(quantization) = &self.quantization {
             ensure!(
@@ -388,28 +601,14 @@ impl TrainingState {
                 "checkpoint quantization format is empty"
             );
             if let Some(hash) = &quantization.teacher_hash {
-                validate_content_hash(hash, "checkpoint quantization teacher hash")?;
+                validate_sha256_identity(hash, "checkpoint quantization teacher hash")?;
             }
-            if let Some(transaction) = &quantization.transaction {
-                for (hash, label) in [
-                    (
-                        &transaction.transaction_id,
-                        "checkpoint quantization transaction id",
-                    ),
-                    (
-                        &transaction.plan_fingerprint,
-                        "checkpoint quantization plan fingerprint",
-                    ),
-                    (
-                        &transaction.pre_update_master_hash,
-                        "checkpoint quantization pre-update hash",
-                    ),
-                ] {
-                    validate_content_hash(hash, label)?;
-                }
-                if let Some(hash) = &transaction.post_update_master_hash {
-                    validate_content_hash(hash, "checkpoint quantization post-update hash")?;
-                }
+            ensure!(
+                quantization.manifest.is_some() == quantization.candidate_weights_sha256.is_some(),
+                "checkpoint quantization candidate manifest and weights identity must appear together"
+            );
+            if let Some(hash) = &quantization.candidate_weights_sha256 {
+                validate_sha256_identity(hash, "checkpoint quantization candidate weights hash")?;
             }
         }
         if let Some(sleep) = &self.sleep {
@@ -558,8 +757,9 @@ fn seal_training_checkpoint(
     let muon_state = staging.join(MUON_FILE);
 
     save_safetensors(&model.clone().valid(), &weights)?;
-    sync_regular_file(&weights)?;
+    sync_regular_file(&weights, "checkpoint weights")?;
     let (weights_bytes, weights_sha256) = hash_file(&weights)?;
+    validate_quantization_weights_binding(state, &weights_sha256)?;
     let accounting = TrainingAccounting {
         version: TRAINING_ACCOUNTING_VERSION,
         training_gpu_hours: accounting_input.training_gpu_hours,
@@ -574,9 +774,9 @@ fn seal_training_checkpoint(
         &serde_json::to_vec(&accounting)?,
     )?;
     save_canonical_module_optimizer(adamw, &adamw_state).context("failed to save AdamW state")?;
-    sync_regular_file(&adamw_state)?;
+    sync_regular_file(&adamw_state, "checkpoint AdamW state")?;
     muon.save(&muon_state)?;
-    sync_regular_file(&muon_state)?;
+    sync_regular_file(&muon_state, "checkpoint Muon state")?;
     write_synced_new(
         &staging.join(TRAINING_STATE_FILE),
         &serde_json::to_vec_pretty(state)?,
@@ -615,7 +815,7 @@ fn publish_training_evidence(
         "training evidence checkpoint generation is outside its output root"
     );
     let bytes = serde_json::to_vec(evidence)?;
-    let sha256 = sha256_bytes(&bytes);
+    let sha256 = sha256_hex(&bytes);
     let directory = output.join(TRAINING_EVIDENCE_DIRECTORY);
     fs::create_dir_all(&directory).with_context(|| {
         format!(
@@ -636,7 +836,7 @@ fn publish_training_evidence(
             );
             let existing = read_file_stable(&path, "published training evidence")?;
             ensure!(
-                sha256_bytes(&existing) == sha256 && existing == bytes,
+                sha256_hex(&existing) == sha256 && existing == bytes,
                 "content-addressed training-evidence collision or tampering at {}",
                 path.display()
             );
@@ -660,7 +860,7 @@ fn publish_training_evidence(
                         let existing =
                             read_file_stable(&path, "concurrently published training evidence")?;
                         ensure!(
-                            sha256_bytes(&existing) == sha256 && existing == bytes,
+                            sha256_hex(&existing) == sha256 && existing == bytes,
                             "content-addressed training-evidence collision at {}",
                             path.display()
                         );
@@ -740,18 +940,7 @@ fn create_staging_directory(output: &Path) -> Result<PathBuf> {
 }
 
 fn validate_generation_root(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "checkpoint generation root {} does not exist",
-            path.display()
-        )
-    })?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "checkpoint generation root {} is not a real directory",
-        path.display()
-    );
-    Ok(())
+    ensure_real_directory(path, "checkpoint generation root")
 }
 
 fn unique_suffix() -> String {
@@ -762,257 +951,12 @@ fn unique_suffix() -> String {
     format!("{}-{timestamp}-{sequence}", std::process::id())
 }
 
-fn write_synced_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn sync_regular_file(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect checkpoint file {}", path.display()))?;
-    ensure!(
-        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-        "checkpoint path {} is not a regular file",
-        path.display()
-    );
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {} for sync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to sync directory {}", path.display()))
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StableFileIdentity {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    length: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-#[cfg(unix)]
-impl StableFileIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            mode: metadata.mode(),
-            length: metadata.len(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        }
-    }
-}
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd"
-    )
-))]
-fn errno_slot() -> Option<*mut libc::c_int> {
-    Some(unsafe { libc::__error() })
-}
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "hurd",
-        target_os = "redox"
-    )
-))]
-fn errno_slot() -> Option<*mut libc::c_int> {
-    Some(unsafe { libc::__errno_location() })
-}
-
-#[cfg(all(
-    unix,
-    any(target_os = "android", target_os = "netbsd", target_os = "openbsd")
-))]
-fn errno_slot() -> Option<*mut libc::c_int> {
-    Some(unsafe { libc::__errno() })
-}
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "hurd",
-        target_os = "redox",
-        target_os = "android",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))
-))]
-fn errno_slot() -> Option<*mut libc::c_int> {
-    None
-}
-
-fn hash_open_file(
-    file: &mut File,
-    capture_bytes: bool,
-    label: &str,
-) -> Result<(u64, String, Option<Vec<u8>>)> {
-    let before = file
-        .metadata()
-        .with_context(|| format!("failed to inspect opened {label}"))?;
-    ensure!(before.is_file(), "{label} is not a regular file");
-    #[cfg(unix)]
-    let before_identity = StableFileIdentity::from_metadata(&before);
-    #[cfg(not(unix))]
-    let before_modified = before.modified().ok();
-
-    let mut hasher = Sha256::new();
-    let mut captured = if capture_bytes {
-        let capacity = usize::try_from(before.len())
-            .context("checkpoint file length does not fit address space")?;
-        let mut captured = Vec::new();
-        captured
-            .try_reserve_exact(capacity)
-            .context("failed to reserve authenticated checkpoint buffer")?;
-        Some(captured)
-    } else {
-        None
-    };
-    let mut buffer = [0_u8; 1024 * 1024];
-    let mut bytes = 0_u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read {label}"))?;
-        if read == 0 {
-            break;
-        }
-        let next_bytes = bytes
-            .checked_add(read as u64)
-            .context("checkpoint file length overflow")?;
-        ensure!(
-            next_bytes <= before.len(),
-            "{label} grew while it was hashed"
-        );
-        hasher.update(&buffer[..read]);
-        if let Some(captured) = &mut captured {
-            captured.extend_from_slice(&buffer[..read]);
-        }
-        bytes = next_bytes;
-    }
-    let after = file
-        .metadata()
-        .with_context(|| format!("failed to reinspect opened {label}"))?;
-    #[cfg(unix)]
-    ensure!(
-        StableFileIdentity::from_metadata(&after) == before_identity,
-        "{label} changed while it was hashed"
-    );
-    #[cfg(not(unix))]
-    ensure!(
-        after.is_file() && after.len() == before.len() && after.modified().ok() == before_modified,
-        "{label} changed while it was hashed"
-    );
-    ensure!(bytes == after.len(), "{label} changed while it was hashed");
-    let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    Ok((bytes, encoded, captured))
-}
-
-fn read_hashed_path(
-    path: &Path,
-    capture_bytes: bool,
-    label: &str,
-) -> Result<(u64, String, Option<Vec<u8>>)> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect checkpoint path {}", path.display()))?;
-    ensure!(
-        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-        "{label} is not a regular file"
-    );
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to open {label}"))?;
-    #[cfg(unix)]
-    ensure!(
-        StableFileIdentity::from_metadata(&file.metadata()?)
-            == StableFileIdentity::from_metadata(&metadata),
-        "{label} changed while it was opened"
-    );
-    let (bytes, sha256, captured) = hash_open_file(&mut file, capture_bytes, label)?;
-    let current = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to reinspect checkpoint path {}", path.display()))?;
-    #[cfg(unix)]
-    ensure!(
-        StableFileIdentity::from_metadata(&current) == StableFileIdentity::from_metadata(&metadata),
-        "{label} changed while it was hashed"
-    );
-    #[cfg(not(unix))]
-    ensure!(
-        current.file_type().is_file()
-            && !current.file_type().is_symlink()
-            && current.len() == metadata.len()
-            && current.modified().ok() == metadata.modified().ok(),
-        "{label} changed while it was hashed"
-    );
-    Ok((bytes, sha256, captured))
-}
-
 fn hash_file(path: &Path) -> Result<(u64, String)> {
-    let (bytes, sha256, _) =
-        read_hashed_path(path, false, &format!("checkpoint file {}", path.display()))?;
-    Ok((bytes, sha256))
+    hash_regular_file_hex(path)
 }
 
 fn read_file_stable(path: &Path, label: &str) -> Result<Vec<u8>> {
-    read_hashed_path(path, true, label)?
-        .2
-        .context("stable checkpoint read did not capture bytes")
+    read_regular_bounded(path, MAX_CHECKPOINT_METADATA_BYTES, label)
 }
 
 impl GenerationSnapshot {
@@ -1067,140 +1011,6 @@ impl GenerationSnapshot {
     }
 }
 
-#[cfg(unix)]
-#[derive(Debug)]
-struct SecureDirectory {
-    file: File,
-}
-
-#[cfg(unix)]
-impl SecureDirectory {
-    fn open_root(path: &Path) -> Result<Self> {
-        let path_metadata = fs::symlink_metadata(path).with_context(|| {
-            format!("failed to inspect checkpoint directory {}", path.display())
-        })?;
-        ensure!(
-            path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
-            "checkpoint generation {} is not a real directory",
-            path.display()
-        );
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .with_context(|| format!("failed to open checkpoint directory {}", path.display()))?;
-        ensure!(
-            StableFileIdentity::from_metadata(&file.metadata()?)
-                == StableFileIdentity::from_metadata(&path_metadata),
-            "checkpoint directory {} changed while it was opened",
-            path.display()
-        );
-        Ok(Self { file })
-    }
-
-    fn open_child(&self, name: &OsStr) -> Result<File> {
-        let name = CString::new(name.as_bytes()).context("checkpoint name contains a NUL byte")?;
-        // O_NONBLOCK prevents an attacker-controlled FIFO from hanging the
-        // verifier before its file type can be rejected.
-        let descriptor = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                0,
-            )
-        };
-        if descriptor < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to open checkpoint entry");
-        }
-        // SAFETY: openat returned a new owned descriptor on success.
-        Ok(unsafe { File::from_raw_fd(descriptor) })
-    }
-
-    fn open_relative_file(&self, relative: &str) -> Result<File> {
-        validate_checkpoint_relative_path(relative)?;
-        let mut directory = Self {
-            file: self
-                .file
-                .try_clone()
-                .context("failed to duplicate authenticated checkpoint directory")?,
-        };
-        let mut components = Path::new(relative).components().peekable();
-        while let Some(component) = components.next() {
-            let Component::Normal(name) = component else {
-                anyhow::bail!("checkpoint path `{relative}` is not a safe relative path");
-            };
-            let child = directory
-                .open_child(name)
-                .with_context(|| format!("failed to open authenticated artifact `{relative}`"))?;
-            let metadata = child.metadata().with_context(|| {
-                format!("failed to inspect authenticated artifact `{relative}`")
-            })?;
-            if components.peek().is_none() {
-                ensure!(
-                    metadata.is_file(),
-                    "authenticated checkpoint artifact `{relative}` is not a regular file"
-                );
-                return Ok(child);
-            }
-            ensure!(
-                metadata.is_dir(),
-                "checkpoint artifact parent for `{relative}` is not a directory"
-            );
-            directory = Self { file: child };
-        }
-        anyhow::bail!("checkpoint path `{relative}` has no file name")
-    }
-
-    fn entries(&self) -> Result<Vec<OsString>> {
-        let duplicate = unsafe { libc::dup(self.file.as_raw_fd()) };
-        if duplicate < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to duplicate checkpoint directory descriptor");
-        }
-        let stream = unsafe { libc::fdopendir(duplicate) };
-        if stream.is_null() {
-            let error = std::io::Error::last_os_error();
-            unsafe { libc::close(duplicate) };
-            return Err(error).context("failed to enumerate checkpoint directory");
-        }
-
-        struct DirectoryStream(*mut libc::DIR);
-        impl Drop for DirectoryStream {
-            fn drop(&mut self) {
-                unsafe { libc::closedir(self.0) };
-            }
-        }
-        let stream = DirectoryStream(stream);
-        let mut names = Vec::new();
-        loop {
-            let errno = errno_slot();
-            if let Some(slot) = errno {
-                // SAFETY: errno_slot returns this thread's errno storage.
-                unsafe { *slot = 0 };
-            }
-            // SAFETY: `stream` owns a private DIR used only by this loop. The
-            // returned entry is copied before the next call to readdir.
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let code = errno.map_or(0, |slot| unsafe { *slot });
-                if code != 0 {
-                    return Err(std::io::Error::from_raw_os_error(code))
-                        .context("failed while enumerating checkpoint directory");
-                }
-                break;
-            }
-            let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if bytes == b"." || bytes == b".." {
-                continue;
-            }
-            names.push(OsString::from_vec(bytes.to_vec()));
-        }
-        names.sort();
-        Ok(names)
-    }
-}
-
 impl GenerationAccess {
     fn read_authenticated(&mut self, relative: &str, expected: &GenerationFile) -> Result<Vec<u8>> {
         ensure!(
@@ -1208,7 +1018,9 @@ impl GenerationAccess {
             "checkpoint artifact identity does not match `{relative}`"
         );
         #[cfg(unix)]
-        let file = self.directory.open_relative_file(relative)?;
+        let file = self
+            .directory
+            .open_relative_file(Path::new(relative), "checkpoint generation")?;
         #[cfg(not(unix))]
         let file = self
             .files
@@ -1219,11 +1031,9 @@ impl GenerationAccess {
 }
 
 fn read_authenticated_file(mut file: File, expected: &GenerationFile) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to rewind checkpoint artifact `{}`", expected.path))?;
     let (bytes, sha256, captured) = hash_open_file(
         &mut file,
-        true,
+        Some(MAX_CHECKPOINT_MEMBER_BYTES),
         &format!("authenticated checkpoint artifact `{}`", expected.path),
     )?;
     ensure!(
@@ -1237,25 +1047,35 @@ fn read_authenticated_file(mut file: File, expected: &GenerationFile) -> Result<
 #[cfg(unix)]
 fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<GenerationSnapshot> {
     fn visit(
-        directory: &SecureDirectory,
+        directory: &PinnedDirectory,
         relative_root: &Path,
         snapshot: &mut GenerationSnapshot,
+        budget: &mut GenerationTraversalBudget,
+        depth: usize,
     ) -> Result<()> {
-        let before = StableFileIdentity::from_metadata(&directory.file.metadata()?);
-        for name in directory.entries()? {
+        budget.enter_directory(depth)?;
+        let before = directory.identity()?;
+        for name in directory.entries("checkpoint generation")? {
             let relative_path = relative_root.join(&name);
             let relative = relative_path
                 .to_str()
                 .context("checkpoint file name is not valid UTF-8")?
                 .replace(std::path::MAIN_SEPARATOR, "/");
             validate_checkpoint_relative_path(&relative)?;
-            let mut child = directory.open_child(&name).with_context(|| {
-                format!("failed to open checkpoint generation entry `{relative}`")
-            })?;
+            let mut child = directory
+                .open_child(&name, "checkpoint generation")
+                .with_context(|| {
+                    format!("failed to open checkpoint generation entry `{relative}`")
+                })?;
             let metadata = child.metadata()?;
             if metadata.is_dir() {
                 let files_before = snapshot.files.len();
-                visit(&SecureDirectory { file: child }, &relative_path, snapshot)?;
+                let child =
+                    PinnedDirectory::from_open_directory(child, "checkpoint generation child")?;
+                let child_depth = depth
+                    .checked_add(1)
+                    .context("checkpoint directory depth overflow")?;
+                visit(&child, &relative_path, snapshot, budget, child_depth)?;
                 ensure!(
                     snapshot.files.len() > files_before,
                     "checkpoint generation contains empty directory `{relative}`"
@@ -1266,28 +1086,29 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
                 metadata.is_file(),
                 "checkpoint generation contains non-file `{relative}`"
             );
+            budget.record_file(metadata.len())?;
             let capture = matches!(
                 relative.as_str(),
                 GENERATION_MANIFEST | TRAINING_STATE_FILE | TRAINING_ACCOUNTING_FILE
             );
             let (bytes, sha256, captured) = hash_open_file(
                 &mut child,
-                capture,
+                capture.then_some(MAX_CHECKPOINT_METADATA_BYTES),
                 &format!("checkpoint file `{relative}`"),
             )?;
             snapshot.record_file(relative, bytes, sha256, captured)?;
         }
         ensure!(
-            StableFileIdentity::from_metadata(&directory.file.metadata()?) == before,
+            directory.identity()? == before,
             "checkpoint directory changed while it was verified"
         );
         Ok(())
     }
 
-    let directory = SecureDirectory::open_root(root)?;
-    let root_identity = StableFileIdentity::from_metadata(&directory.file.metadata()?);
+    let (directory, root_identity) = PinnedDirectory::open(root, "checkpoint generation")?;
     let mut snapshot = GenerationSnapshot::new();
-    visit(&directory, Path::new(""), &mut snapshot)?;
+    let mut budget = GenerationTraversalBudget::default();
+    visit(&directory, Path::new(""), &mut snapshot, &mut budget, 0)?;
     let current = fs::symlink_metadata(root).with_context(|| {
         format!(
             "failed to reinspect checkpoint generation {}",
@@ -1297,7 +1118,7 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
     ensure!(
         current.is_dir()
             && !current.file_type().is_symlink()
-            && StableFileIdentity::from_metadata(&current) == root_identity,
+            && StableIdentity::from_metadata(&current) == root_identity,
         "checkpoint generation changed while it was verified"
     );
     if retain_access {
@@ -1313,9 +1134,20 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
         directory: &Path,
         snapshot: &mut GenerationSnapshot,
         retained: &mut Option<BTreeMap<String, File>>,
+        budget: &mut GenerationTraversalBudget,
+        depth: usize,
     ) -> Result<()> {
+        budget.enter_directory(depth)?;
         let before = fs::metadata(directory)?;
-        let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            entries.push(entry?);
+            ensure!(
+                entries.len()
+                    <= MAX_CHECKPOINT_GENERATION_FILES + MAX_CHECKPOINT_GENERATION_DIRECTORIES,
+                "checkpoint directory contains too many entries"
+            );
+        }
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
@@ -1327,7 +1159,10 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
             );
             if metadata.is_dir() {
                 let files_before = snapshot.files.len();
-                visit(root, &path, snapshot, retained)?;
+                let child_depth = depth
+                    .checked_add(1)
+                    .context("checkpoint directory depth overflow")?;
+                visit(root, &path, snapshot, retained, budget, child_depth)?;
                 ensure!(
                     snapshot.files.len() > files_before,
                     "checkpoint generation contains empty directory {}",
@@ -1340,6 +1175,7 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
                 "checkpoint generation contains non-file {}",
                 path.display()
             );
+            budget.record_file(metadata.len())?;
             let relative = path
                 .strip_prefix(root)?
                 .to_str()
@@ -1351,8 +1187,11 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
                 GENERATION_MANIFEST | TRAINING_STATE_FILE | TRAINING_ACCOUNTING_FILE
             );
             let mut file = File::open(&path)?;
-            let (bytes, sha256, captured) =
-                hash_open_file(&mut file, capture, &format!("checkpoint file `{relative}`"))?;
+            let (bytes, sha256, captured) = hash_open_file(
+                &mut file,
+                capture.then_some(MAX_CHECKPOINT_METADATA_BYTES),
+                &format!("checkpoint file `{relative}`"),
+            )?;
             if let Some(retained) = retained {
                 ensure!(
                     retained.insert(relative.clone(), file).is_none(),
@@ -1377,7 +1216,8 @@ fn collect_generation_snapshot(root: &Path, retain_access: bool) -> Result<Gener
     );
     let mut snapshot = GenerationSnapshot::new();
     let mut retained = retain_access.then(BTreeMap::new);
-    visit(root, root, &mut snapshot, &mut retained)?;
+    let mut budget = GenerationTraversalBudget::default();
+    visit(root, root, &mut snapshot, &mut retained, &mut budget, 0)?;
     snapshot.access = retained.map(|files| GenerationAccess { files });
     snapshot.finish()
 }
@@ -1447,29 +1287,29 @@ fn validate_training_accounting(bytes: &[u8], files: &[GenerationFile]) -> Resul
     Ok(())
 }
 
-fn validate_sha256(value: &str, label: &str) -> Result<()> {
-    ensure!(
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{label} is not a lowercase SHA-256 digest"
-    );
+fn validate_quantization_weights_binding(
+    state: &TrainingState,
+    checkpoint_weights_sha256: &str,
+) -> Result<()> {
+    validate_sha256_hex(checkpoint_weights_sha256, "checkpoint model-weights digest")?;
+    if let Some(expected) = state
+        .quantization
+        .as_ref()
+        .and_then(|quantization| quantization.candidate_weights_sha256.as_deref())
+    {
+        ensure!(
+            expected == format!("sha256:{checkpoint_weights_sha256}"),
+            "quantization candidate weights differ from checkpoint model weights"
+        );
+    }
     Ok(())
-}
-
-fn validate_content_hash(value: &str, label: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{label} must use sha256:<64 lowercase hex>"))?;
-    validate_sha256(digest, label)
 }
 
 fn validate_generation_name(name: &str) -> Result<&str> {
     let digest = name
         .strip_prefix("sha256-")
         .context("checkpoint generation is not content-addressed")?;
-    validate_sha256(digest, "checkpoint generation digest")?;
+    validate_sha256_hex(digest, "checkpoint generation digest")?;
     Ok(digest)
 }
 
@@ -1507,7 +1347,7 @@ fn seal_generation(output: &Path, staging: &Path) -> Result<SealedGeneration> {
         files,
     };
     let manifest_bytes = serde_json::to_vec(&manifest)?;
-    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let manifest_sha256 = sha256_hex(&manifest_bytes);
     let name = format!("sha256-{manifest_sha256}");
     write_synced_new(&staging.join(GENERATION_MANIFEST), &manifest_bytes)?;
     sync_directory(staging)?;
@@ -1617,7 +1457,7 @@ fn verify_generation_inner(
     retain_access: bool,
 ) -> Result<(GenerationManifest, TrainingState, Option<GenerationAccess>)> {
     let generation_digest = validate_generation_name(generation_name)?;
-    validate_sha256(expected_manifest_sha256, "checkpoint manifest digest")?;
+    validate_sha256_hex(expected_manifest_sha256, "checkpoint manifest digest")?;
     ensure!(
         generation_digest == expected_manifest_sha256,
         "checkpoint generation name and manifest digest differ"
@@ -1632,7 +1472,7 @@ fn verify_generation_inner(
         .with_context(|| format!("failed to verify checkpoint generation `{generation_name}`"))?;
     let manifest_bytes = manifest.context("checkpoint generation has no manifest")?;
     ensure!(
-        sha256_bytes(&manifest_bytes) == expected_manifest_sha256,
+        sha256_hex(&manifest_bytes) == expected_manifest_sha256,
         "checkpoint generation manifest digest mismatch"
     );
     let manifest: GenerationManifest = serde_json::from_slice(&manifest_bytes)?;
@@ -1662,6 +1502,12 @@ fn verify_generation_inner(
             .as_deref()
             .context("checkpoint generation is missing training-state.json")?,
     )?;
+    let checkpoint_weights = manifest
+        .files
+        .iter()
+        .find(|file| file.path == WEIGHTS_FILE)
+        .context("checkpoint generation has no model weights")?;
+    validate_quantization_weights_binding(&state, &checkpoint_weights.sha256)?;
     ensure!(
         state.version == manifest.training_state_version
             && state.global_step == manifest.global_step
@@ -1729,7 +1575,7 @@ fn verify_checkpoint_root_inner(
         pointer.version
     );
     validate_generation_name(&pointer.generation)?;
-    validate_sha256(&pointer.manifest_sha256, "checkpoint manifest digest")?;
+    validate_sha256_hex(&pointer.manifest_sha256, "checkpoint manifest digest")?;
     let generations = output.join(GENERATIONS_DIRECTORY);
     validate_generation_root(&generations)?;
     let generation = generations.join(&pointer.generation);
@@ -1769,13 +1615,17 @@ fn read_manifest_artifact(
     access.read_authenticated(relative, expected)
 }
 
+/// Load one authenticated generation and return its optimizer, typed state,
+/// and canonical `sha256:<hex>` model-weights identity. The identity is read
+/// from the generation manifest whose exact weights bytes were verified and
+/// loaded; callers can bind external artifacts without reserializing `model`.
 pub(crate) fn load_training_state(
     model: &mut Transformer,
     adamw: AdamWOptimizer,
     muon: &mut BatchedMuon,
     output: &Path,
     device: &Device,
-) -> Result<(AdamWOptimizer, TrainingState)> {
+) -> Result<(AdamWOptimizer, TrainingState, String)> {
     load_training_state_inner(model, adamw, muon, output, device, |_, _| Ok(()))
 }
 
@@ -1792,7 +1642,7 @@ fn load_training_state_inner(
     output: &Path,
     device: &Device,
     mut stage_hook: impl FnMut(ResumeLoadStage, &Path) -> Result<()>,
-) -> Result<(AdamWOptimizer, TrainingState)> {
+) -> Result<(AdamWOptimizer, TrainingState, String)> {
     let (verified_before, generation, manifest, state, access) =
         verify_checkpoint_root_inner(output, true)?;
     let mut access = access.context("checkpoint verifier did not retain generation access")?;
@@ -1801,6 +1651,12 @@ fn load_training_state_inner(
     let mut loaded_model = model.clone();
     let mut loaded_muon = muon.clone();
     restore_parameter_ids(&mut loaded_model, &state.parameter_ids)?;
+    let weights_identity = manifest
+        .files
+        .iter()
+        .find(|file| file.path == WEIGHTS_FILE)
+        .context("checkpoint manifest has no authenticated model weights")?;
+    let weights_sha256 = format!("sha256:{}", weights_identity.sha256);
     let weights = read_manifest_artifact(&mut access, &manifest, WEIGHTS_FILE)?;
     load_safetensors_bytes(
         &mut loaded_model,
@@ -1832,7 +1688,7 @@ fn load_training_state_inner(
         .context("failed to validate loaded AdamW state")?;
     ensure!(
         canonical_adamw.len() as u64 == expected_adamw.bytes
-            && sha256_bytes(&canonical_adamw) == expected_adamw.sha256,
+            && sha256_hex(&canonical_adamw) == expected_adamw.sha256,
         "loaded AdamW state is not a lossless reconstruction of its authenticated artifact"
     );
     stage_hook(ResumeLoadStage::AfterStagedLoad, &generation)?;
@@ -1845,7 +1701,7 @@ fn load_training_state_inner(
 
     *model = loaded_model;
     *muon = loaded_muon;
-    Ok((loaded_adamw, state))
+    Ok((loaded_adamw, state, weights_sha256))
 }
 
 #[cfg(test)]
@@ -1856,7 +1712,7 @@ pub(crate) fn load_training_state_with_hook(
     output: &Path,
     device: &Device,
     stage_hook: impl FnMut(ResumeLoadStage, &Path) -> Result<()>,
-) -> Result<(AdamWOptimizer, TrainingState)> {
+) -> Result<(AdamWOptimizer, TrainingState, String)> {
     load_training_state_inner(model, adamw, muon, output, device, stage_hook)
 }
 
@@ -1909,6 +1765,7 @@ mod tests {
                 gradient_accumulator: None,
                 update_clock: global_step as u64,
             }],
+            memory_update: TrainingMemoryUpdateState::Ordinary,
             sleep: None,
             artifacts: vec![],
             evaluator_hashes: vec![format!("sha256:{}", "2".repeat(64))],
@@ -1920,6 +1777,128 @@ mod tests {
             wake_context_buffer: Vec::new(),
             quantization: None,
         }
+    }
+
+    fn wake_only_state() -> TrainingState {
+        let mut state = state_at(3);
+        state.parameter_ids = vec![1, 2, 3];
+        let config: MemoryUpdateMode = serde_json::from_value(serde_json::json!({
+            "type": "wake_only",
+            "schedule": {
+                "clock": "optimizer_steps",
+                "terminal_consolidation": "distill_into_base_v1",
+                "tiers": [
+                    {"id": "fast", "update_period": 1, "reserve_slots": 1},
+                    {"id": "slow", "update_period": 2, "reserve_slots": 2}
+                ]
+            }
+        }))
+        .unwrap();
+        let optimizer_scopes: MemoryOptimizerScopes = serde_json::from_value(serde_json::json!({
+            "wake_parameter_ids": [1],
+            "tiers": [
+                {
+                    "tier": 0,
+                    "tier_id": "fast",
+                    "parameter_ids": [2],
+                    "update_clock": 3,
+                    "transfer_clock": 0,
+                    "accumulated_micro_steps": 0,
+                    "generation": 6,
+                    "transfer_generation": 0,
+                    "artifact": {
+                        "state_uri": "fast/manifest.json",
+                        "manifest_hash": format!("sha256:{}", "a".repeat(64)),
+                        "optimizer_parameter_ids": [2],
+                        "accumulator_parameter_ids": []
+                    }
+                },
+                {
+                    "tier": 1,
+                    "tier_id": "slow",
+                    "parameter_ids": [3],
+                    "update_clock": 2,
+                    "transfer_clock": 0,
+                    "accumulated_micro_steps": 1,
+                    "generation": 4,
+                    "transfer_generation": 0,
+                    "artifact": {
+                        "state_uri": "slow/manifest.json",
+                        "manifest_hash": format!("sha256:{}", "b".repeat(64)),
+                        "optimizer_parameter_ids": [3],
+                        "accumulator_parameter_ids": [3]
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        state.memory_update = TrainingMemoryUpdateState::WakeOnly {
+            config,
+            optimizer_scopes,
+        };
+        state
+    }
+
+    #[test]
+    fn wake_only_checkpoint_requires_exact_pending_accumulator_receipts() {
+        let valid = wake_only_state();
+        valid.validate().unwrap();
+
+        let mut missing_artifact = valid.clone();
+        let TrainingMemoryUpdateState::WakeOnly {
+            optimizer_scopes, ..
+        } = &mut missing_artifact.memory_update
+        else {
+            unreachable!()
+        };
+        optimizer_scopes.tiers[1].artifact = None;
+        assert!(missing_artifact.validate().is_err());
+
+        let mut missing_gradients = valid.clone();
+        let TrainingMemoryUpdateState::WakeOnly {
+            optimizer_scopes, ..
+        } = &mut missing_gradients.memory_update
+        else {
+            unreachable!()
+        };
+        optimizer_scopes.tiers[1]
+            .artifact
+            .as_mut()
+            .unwrap()
+            .accumulator_parameter_ids
+            .clear();
+        assert!(missing_gradients.validate().is_err());
+
+        let mut unexpected_gradients = valid;
+        let TrainingMemoryUpdateState::WakeOnly {
+            optimizer_scopes, ..
+        } = &mut unexpected_gradients.memory_update
+        else {
+            unreachable!()
+        };
+        optimizer_scopes.tiers[1].accumulated_micro_steps = 0;
+        assert!(unexpected_gradients.validate().is_err());
+
+        let mut stale_boundary = wake_only_state();
+        let TrainingMemoryUpdateState::WakeOnly {
+            optimizer_scopes, ..
+        } = &mut stale_boundary.memory_update
+        else {
+            unreachable!()
+        };
+        optimizer_scopes.tiers[0].update_clock = 2;
+        optimizer_scopes.tiers[0].accumulated_micro_steps = 1;
+        assert!(stale_boundary.validate().is_err());
+
+        let mut stale_generation = wake_only_state();
+        let TrainingMemoryUpdateState::WakeOnly {
+            optimizer_scopes, ..
+        } = &mut stale_generation.memory_update
+        else {
+            unreachable!()
+        };
+        optimizer_scopes.tiers[1].generation -= 1;
+        assert!(stale_generation.validate().is_err());
     }
 
     fn stage_test_generation(output: &Path, state: &TrainingState, tag: &str) -> PathBuf {
@@ -1982,6 +1961,49 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_bounds_wake_context_records_and_tokens_before_resume() {
+        let record = |index: usize, tokens: usize| WakeContextRecord {
+            id: format!("wake-{index}"),
+            optimizer_step: 0,
+            token_ids: vec![1; tokens],
+        };
+
+        let mut too_many_records = state_at(0);
+        too_many_records.wake_context_buffer = (0..=MAX_WAKE_CONTEXT_RECORDS)
+            .map(|index| record(index, 1))
+            .collect();
+        let error = too_many_records.validate().unwrap_err().to_string();
+        assert!(error.contains("record limit"), "{error}");
+
+        let mut oversized_record = state_at(0);
+        oversized_record.wake_context_buffer = vec![record(0, MAX_WAKE_CONTEXT_TOKENS + 1)];
+        let error = oversized_record.validate().unwrap_err().to_string();
+        assert!(error.contains("token limit"), "{error}");
+
+        let mut oversized_id = state_at(0);
+        let mut bad_id = record(0, 1);
+        bad_id.id = "x".repeat(MAX_WAKE_CONTEXT_ID_BYTES + 1);
+        oversized_id.wake_context_buffer = vec![bad_id];
+        let error = oversized_id.validate().unwrap_err().to_string();
+        assert!(error.contains("wake-context id"), "{error}");
+
+        let mut invalid_token = state_at(0);
+        let mut bad_token = record(0, 1);
+        bad_token.token_ids[0] = i64::from(u32::MAX) + 1;
+        invalid_token.wake_context_buffer = vec![bad_token];
+        let error = invalid_token.validate().unwrap_err().to_string();
+        assert!(error.contains("u32 vocabulary range"), "{error}");
+
+        let mut excessive_total = state_at(0);
+        let records = MAX_WAKE_CONTEXT_TOTAL_TOKENS / MAX_WAKE_CONTEXT_TOKENS + 1;
+        excessive_total.wake_context_buffer = (0..records)
+            .map(|index| record(index, MAX_WAKE_CONTEXT_TOKENS))
+            .collect();
+        let error = excessive_total.validate().unwrap_err().to_string();
+        assert!(error.contains("wake-context buffer exceeds"), "{error}");
+    }
+
+    #[test]
     fn optimizer_paths_must_be_safe_and_independent() {
         let mut traversal = state_at(7);
         traversal.optimizer_states[0].adamw = "../adamw-state.bpk".into();
@@ -2021,6 +2043,62 @@ mod tests {
         let mut state = state_at(7);
         state.parameter_ids.push(state.parameter_ids[0]);
         assert!(state.validate().is_err());
+
+        let mut state = state_at(7);
+        state
+            .evaluator_hashes
+            .push(state.evaluator_hashes[0].clone());
+        assert!(state.validate().is_err());
+
+        let mut state = state_at(7);
+        state.artifacts = vec![ArtifactRef {
+            kind: "fixture".into(),
+            manifest: "fixture.json".into(),
+            hash: format!("sha256:{}", "3".repeat(64)),
+        }];
+        state.artifacts.push(state.artifacts[0].clone());
+        assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn quantization_candidate_manifest_and_source_identity_are_atomic() {
+        let candidate = QuantizationTrainingState {
+            format: "binary_g128".into(),
+            fake_quant_active: false,
+            calibration_step: 7,
+            manifest: Some("candidate.json".into()),
+            candidate_weights_sha256: Some(format!("sha256:{}", "a".repeat(64))),
+            teacher_hash: None,
+        };
+        let mut valid = state_at(7);
+        valid.quantization = Some(candidate.clone());
+        valid.validate().unwrap();
+        let mut legacy_json = serde_json::to_value(&valid).unwrap();
+        legacy_json["quantization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_weights_sha256");
+        assert!(serde_json::from_value::<TrainingState>(legacy_json).is_err());
+
+        let mut missing_source = valid.clone();
+        missing_source
+            .quantization
+            .as_mut()
+            .unwrap()
+            .candidate_weights_sha256 = None;
+        assert!(missing_source.validate().is_err());
+
+        let mut missing_manifest = valid.clone();
+        missing_manifest.quantization.as_mut().unwrap().manifest = None;
+        assert!(missing_manifest.validate().is_err());
+
+        let mut malformed_source = valid;
+        malformed_source
+            .quantization
+            .as_mut()
+            .unwrap()
+            .candidate_weights_sha256 = Some("sha256:not-a-digest".into());
+        assert!(malformed_source.validate().is_err());
     }
 
     #[test]
@@ -2146,6 +2224,26 @@ mod tests {
         .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("empty directory"), "{error}");
+    }
+
+    #[test]
+    fn generation_sealer_rejects_excessive_directory_depth() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state_at(7);
+        let nested = (0..=MAX_CHECKPOINT_GENERATION_DEPTH)
+            .map(|index| format!("d{index}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let gradient = format!("{nested}/gradients.bpk");
+        state.optimizer_states[0].gradient_accumulator = Some(gradient.clone());
+        let staging = stage_test_generation(directory.path(), &state, "deep-generation");
+        fs::create_dir_all(staging.join(&nested)).unwrap();
+        write_synced_new(&staging.join(gradient), b"gradients").unwrap();
+
+        let error = seal_generation(directory.path(), &staging)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum directory depth"), "{error}");
     }
 
     #[cfg(unix)]

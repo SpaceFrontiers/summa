@@ -8,25 +8,40 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::{ParamId, list_param_ids};
 use hermes_llm::{MemorySlotStatus, Transformer};
 use serde::{Deserialize, Serialize};
 
+use crate::artifact_io::validate_sha256_identity;
 use crate::metrics::{DreamSelectionMetrics, DreamTrialMetrics, MetricEvent};
 
-fn validate_content_hash(value: &str, subject: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{subject} must use sha256:<64 lowercase hex>"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{subject} must use sha256:<64 lowercase hex>"
-    );
-    Ok(())
+pub const MAX_MEMORY_TIERS: usize = 16;
+pub const MAX_RESERVE_SLOTS_PER_TIER: usize = 4_096;
+pub const MAX_TOTAL_RESERVE_SLOTS: usize = 16_384;
+pub const MAX_SLEEP_RNG_STREAMS: usize = 1_024;
+const MAX_MEMORY_TIER_ID_BYTES: usize = 128;
+const MAX_CHECKPOINT_LOCATION_BYTES: usize = 16 * 1_024;
+const MAX_SLEEP_EVALUATOR_HASHES: usize = 32;
+const MAX_DREAM_CANDIDATE_ID_BYTES: usize = 1_024;
+const MAX_DREAM_GRADIENT_DIMENSIONS: usize = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    static FULL_SCOPE_VALIDATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_scope_validation_count() {
+    FULL_SCOPE_VALIDATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_scope_validation_count() -> u64 {
+    FULL_SCOPE_VALIDATIONS.with(Cell::get)
 }
 
 /// Unit used by a memory tier's update period.
@@ -69,14 +84,15 @@ pub struct SleepSchedule {
 impl SleepSchedule {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.tiers.len() >= 2,
-            "sleep requires at least two memory tiers"
+            (2..=MAX_MEMORY_TIERS).contains(&self.tiers.len()),
+            "sleep requires 2..={MAX_MEMORY_TIERS} memory tiers"
         );
         let mut ids = BTreeSet::new();
+        let mut total_reserve_slots = 0usize;
         for (index, tier) in self.tiers.iter().enumerate() {
             ensure!(
-                !tier.id.trim().is_empty(),
-                "memory tier {index} has an empty id"
+                !tier.id.trim().is_empty() && tier.id.len() <= MAX_MEMORY_TIER_ID_BYTES,
+                "memory tier {index} id must contain 1..={MAX_MEMORY_TIER_ID_BYTES} bytes"
             );
             ensure!(
                 ids.insert(tier.id.as_str()),
@@ -89,9 +105,16 @@ impl SleepSchedule {
                 tier.id
             );
             ensure!(
-                tier.reserve_slots > 0,
-                "memory tier `{}` reserve_slots must be positive",
+                (1..=MAX_RESERVE_SLOTS_PER_TIER).contains(&tier.reserve_slots),
+                "memory tier `{}` reserve_slots must be in 1..={MAX_RESERVE_SLOTS_PER_TIER}",
                 tier.id
+            );
+            total_reserve_slots = total_reserve_slots
+                .checked_add(tier.reserve_slots)
+                .context("sleep reserve-slot count overflow")?;
+            ensure!(
+                total_reserve_slots <= MAX_TOTAL_RESERVE_SLOTS,
+                "sleep schedule exceeds the {MAX_TOTAL_RESERVE_SLOTS}-slot total reserve limit"
             );
             if let Some(faster) = index.checked_sub(1).map(|i| &self.tiers[i]) {
                 ensure!(
@@ -275,6 +298,216 @@ pub struct SleepState {
 }
 
 const COMPLETED_TRANSACTION_TAIL: usize = 64;
+const ARTIFACT_MANIFEST_TAIL: usize = COMPLETED_TRANSACTION_TAIL + 1;
+
+fn referenced_artifact_manifests(
+    completed: &[ConsolidationTxn],
+    pending: Option<&ConsolidationTxn>,
+) -> Result<Vec<String>> {
+    let mut manifests = BTreeSet::new();
+    for manifest in completed
+        .iter()
+        .chain(pending)
+        .filter_map(|txn| txn.generated_manifest.as_ref())
+    {
+        validate_sha256_identity(manifest, "sleep artifact manifest")?;
+        manifests.insert(manifest.clone());
+    }
+    ensure!(
+        manifests.len() <= ARTIFACT_MANIFEST_TAIL,
+        "sleep artifact-manifest tail exceeds its bounded transaction history"
+    );
+    Ok(manifests.into_iter().collect())
+}
+
+fn validate_completed_transaction(
+    txn: &ConsolidationTxn,
+    tiers: &[MemoryTierState],
+    rng_counters: &[u64],
+) -> Result<()> {
+    ensure!(
+        txn.committed,
+        "completed sleep transaction is not committed"
+    );
+    ensure!(
+        txn.sender < tiers.len() && txn.receiver < tiers.len(),
+        "completed sleep transaction tier is out of range"
+    );
+    ensure!(
+        txn.trigger_clock > 0 && txn.trigger_clock <= tiers[txn.sender].last_update_clock,
+        "completed sleep transaction trigger is ahead of its sender update clock"
+    );
+    ensure!(
+        txn.terminal == (txn.sender + 1 == tiers.len())
+            && ((txn.terminal && txn.receiver == txn.sender)
+                || (!txn.terminal && txn.sender + 1 == txn.receiver)),
+        "completed sleep transaction has invalid tier topology"
+    );
+    ensure!(
+        txn.terminal || txn.receiver_slot < tiers[txn.receiver].slots.len(),
+        "completed sleep transaction receiver slot is out of range"
+    );
+    ensure!(
+        txn.sender_slots_to_reset
+            .iter()
+            .all(|slot| *slot < tiers[txn.sender].slots.len())
+            && txn
+                .sender_slots_to_reset
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+        "completed sleep transaction has an invalid sender reset plan"
+    );
+    ensure!(
+        !txn.teacher_checkpoint.trim().is_empty()
+            && txn.teacher_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES
+            && !txn.student_checkpoint.trim().is_empty()
+            && txn.student_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES,
+        "completed sleep transaction has invalid checkpoint locations"
+    );
+    for (hash, label) in [
+        (&txn.teacher_hash, "completed teacher hash"),
+        (&txn.student_hash, "completed student hash"),
+        (
+            &txn.prospective_update_hash,
+            "completed prospective-update hash",
+        ),
+    ] {
+        validate_sha256_identity(hash, label)?;
+    }
+    let candidate_checkpoint = txn
+        .candidate_checkpoint
+        .as_deref()
+        .context("completed sleep transaction has no candidate checkpoint")?;
+    ensure!(
+        !candidate_checkpoint.trim().is_empty()
+            && candidate_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES,
+        "completed sleep transaction has an invalid candidate checkpoint"
+    );
+    validate_sha256_identity(
+        txn.candidate_hash
+            .as_deref()
+            .context("completed sleep transaction has no candidate hash")?,
+        "completed candidate hash",
+    )?;
+
+    let mut reservations = [
+        txn.knowledge_rng
+            .context("completed sleep transaction has no Knowledge Seeding RNG receipt")?,
+        txn.imitation_rng
+            .context("completed sleep transaction has no imitation RNG receipt")?,
+    ]
+    .into_iter()
+    .chain(txn.dream_generation_rng)
+    .chain(txn.dream_selection_rng)
+    .chain(txn.dream_trial_rngs.iter().map(|trial| trial.reservation))
+    .collect::<Vec<_>>();
+    for reservation in &reservations {
+        reservation.validate(rng_counters)?;
+    }
+    reservations.sort_unstable_by_key(|reservation| (reservation.stream, reservation.start));
+    ensure!(
+        reservations.windows(2).all(|pair| {
+            pair[0].stream != pair[1].stream || pair[0].start + pair[0].count <= pair[1].start
+        }),
+        "completed sleep transaction has overlapping RNG receipts"
+    );
+
+    ensure!(
+        txn.tensor_transaction_generation.is_some()
+            == txn.tensor_transaction_manifest_hash.is_some(),
+        "completed sleep tensor transaction identity is incomplete"
+    );
+    if let (Some(generation), Some(hash)) = (
+        &txn.tensor_transaction_generation,
+        &txn.tensor_transaction_manifest_hash,
+    ) {
+        let digest = generation
+            .strip_prefix("sha256-")
+            .context("completed tensor generation has an unsafe name")?;
+        validate_sha256_identity(&format!("sha256:{digest}"), "completed tensor generation")?;
+        validate_sha256_identity(hash, "completed tensor manifest hash")?;
+        ensure!(
+            hash.strip_prefix("sha256:") == Some(digest),
+            "completed tensor generation differs from its manifest"
+        );
+    }
+
+    let selected = txn
+        .dream_selected
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let trial_ids = txn
+        .dream_trials
+        .iter()
+        .map(|trial| trial.candidate_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let trial_rng_ids = txn
+        .dream_trial_rngs
+        .iter()
+        .map(|trial| trial.candidate_id.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        selected.len() == txn.dream_selected.len()
+            && selected
+                .iter()
+                .all(|id| { !id.trim().is_empty() && id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES })
+            && trial_ids.len() == txn.dream_trials.len()
+            && trial_rng_ids.len() == txn.dream_trial_rngs.len(),
+        "completed sleep transaction has invalid dream candidate IDs"
+    );
+    for trial in &txn.dream_trials {
+        ensure!(
+            trial.candidate_id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES
+                && trial.independent_task_improvement.is_finite(),
+            "completed dream trial has invalid evidence"
+        );
+        validate_sha256_identity(&trial.adapter_hash, "completed dream adapter hash")?;
+        validate_sha256_identity(&trial.evaluator_hash, "completed dream evaluator hash")?;
+    }
+    match &txn.generated_manifest {
+        Some(manifest) => {
+            validate_sha256_identity(manifest, "completed dream manifest")?;
+            validate_sha256_identity(
+                txn.dream_shared_checkpoint_hash
+                    .as_deref()
+                    .context("completed dream has no shared-checkpoint hash")?,
+                "completed dream shared-checkpoint hash",
+            )?;
+            let candidate_count = usize::try_from(
+                txn.dream_generation_rng
+                    .context("completed dream has no generation RNG receipt")?
+                    .count,
+            )
+            .context("completed dream candidate count exceeds usize")?;
+            ensure!(
+                txn.dream_selection_rng.is_some()
+                    && !selected.is_empty()
+                    && selected.len() <= candidate_count
+                    && trial_ids == selected
+                    && trial_rng_ids == selected,
+                "completed dream selection/trial evidence is incomplete"
+            );
+            validate_sha256_identity(
+                txn.dream_policy_receipt
+                    .as_deref()
+                    .context("completed dream has no ReSTEM policy receipt")?,
+                "completed ReSTEM policy receipt",
+            )?;
+        }
+        None => ensure!(
+            txn.dream_generation_rng.is_none()
+                && txn.dream_selection_rng.is_none()
+                && txn.dream_trial_rngs.is_empty()
+                && txn.dream_shared_checkpoint_hash.is_none()
+                && txn.dream_selected.is_empty()
+                && txn.dream_trials.is_empty()
+                && txn.dream_policy_receipt.is_none(),
+            "completed transaction contains partial Dreaming evidence"
+        ),
+    }
+    Ok(())
+}
 
 /// Content-addressed optimizer/accumulator snapshot for one memory tier.
 /// The tensors live in the normal candidate checkpoint store; this receipt is
@@ -299,7 +532,7 @@ impl TierOptimizerArtifact {
             !self.state_uri.trim().is_empty(),
             "tier optimizer artifact has an empty URI"
         );
-        validate_content_hash(&self.manifest_hash, "tier optimizer-state manifest hash")
+        validate_sha256_identity(&self.manifest_hash, "tier optimizer-state manifest hash")
             .context("invalid tier optimizer-state bundle")?;
         for (ids, label) in [
             (&self.optimizer_parameter_ids, "optimizer"),
@@ -311,6 +544,19 @@ impl TierOptimizerArtifact {
                 "tier {label} state repeats a parameter ID"
             );
         }
+        Ok(())
+    }
+
+    /// Bind the durable gradient receipt to its independently persisted
+    /// accumulation clock. Empty gradient bytes with a positive counter would
+    /// silently shorten the next tier update; gradients with a zero counter
+    /// would be divided by an invalid wake window.
+    pub fn validate_pending_steps(&self, accumulated_micro_steps: u64) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            self.accumulator_parameter_ids.is_empty() == (accumulated_micro_steps == 0),
+            "tier optimizer accumulator receipt disagrees with its pending-step counter"
+        );
         Ok(())
     }
 }
@@ -405,6 +651,8 @@ impl MemoryOptimizerScopes {
     }
 
     pub fn validate(&self, model: &Transformer, schedule: &SleepSchedule) -> Result<()> {
+        #[cfg(test)]
+        FULL_SCOPE_VALIDATIONS.with(|count| count.set(count.get().saturating_add(1)));
         schedule.validate()?;
         ensure!(
             self.tiers.len() == schedule.tiers.len(),
@@ -449,6 +697,35 @@ impl MemoryOptimizerScopes {
                 scope.tier_id
             );
             ensure!(
+                scope.update_clock.is_multiple_of(configured.update_period),
+                "optimizer tier `{}` sender-update clock is off schedule",
+                scope.tier_id
+            );
+            if tier == 0 {
+                ensure!(
+                    scope.transfer_clock == 0 && scope.transfer_generation == 0,
+                    "fastest optimizer tier cannot contain a receiver-transfer receipt"
+                );
+            } else {
+                ensure!(
+                    scope
+                        .transfer_clock
+                        .is_multiple_of(schedule.tiers[tier - 1].update_period),
+                    "optimizer tier `{}` receiver-transfer clock is off schedule",
+                    scope.tier_id
+                );
+            }
+            ensure!(
+                scope.transfer_generation <= scope.generation,
+                "optimizer tier `{}` transfer generation exceeds its artifact generation",
+                scope.tier_id
+            );
+            ensure!(
+                scope.artifact.is_some() == (scope.generation > 0),
+                "optimizer tier `{}` artifact presence disagrees with its generation",
+                scope.tier_id
+            );
+            ensure!(
                 wake.is_disjoint(&observed),
                 "wake optimizer contains parameters from memory tier `{}`",
                 scope.tier_id
@@ -478,9 +755,21 @@ impl MemoryOptimizerScopes {
         schedule: &SleepSchedule,
         state: &SleepState,
     ) -> Result<()> {
-        self.validate(model, schedule)?;
-        validate_model_memory_state(schedule, state, &model.memory_slot_statuses())?;
         let statuses = model.memory_slot_statuses();
+        validate_model_memory_state(schedule, state, &statuses)?;
+        self.validate_active_state_after_model_validation(model, schedule, &statuses)
+    }
+
+    /// Validate optimizer ownership after the caller has already reconciled
+    /// the same model and `SleepState`. This avoids repeating the full bounded
+    /// transaction-history and slot-topology walk on every wake clock tick.
+    pub(crate) fn validate_active_state_after_model_validation(
+        &self,
+        model: &Transformer,
+        schedule: &SleepSchedule,
+        statuses: &[MemorySlotStatus],
+    ) -> Result<()> {
+        self.validate(model, schedule)?;
         for scope in &self.tiers {
             let Some(artifact) = &scope.artifact else {
                 continue;
@@ -506,12 +795,14 @@ impl MemoryOptimizerScopes {
                     scope.tier_id
                 );
             }
-            ensure!(
-                artifact.accumulator_parameter_ids.is_empty()
-                    == (scope.accumulated_micro_steps == 0),
-                "tier `{}` accumulator receipt disagrees with its micro-step counter",
-                scope.tier_id
-            );
+            artifact
+                .validate_pending_steps(scope.accumulated_micro_steps)
+                .with_context(|| {
+                    format!(
+                        "tier `{}` accumulator receipt disagrees with its micro-step counter",
+                        scope.tier_id
+                    )
+                })?;
         }
         Ok(())
     }
@@ -586,8 +877,8 @@ impl MemoryOptimizerScopes {
             .get(tier)
             .with_context(|| format!("optimizer tier {tier} is absent from schedule"))?;
         ensure!(
-            clock > 0,
-            "optimizer tier `{}` update clock is zero",
+            clock > 0 && clock.is_multiple_of(configured.update_period),
+            "optimizer tier `{}` update clock is zero or off schedule",
             configured.id
         );
         let scope = self
@@ -595,8 +886,8 @@ impl MemoryOptimizerScopes {
             .get_mut(tier)
             .with_context(|| format!("optimizer tier {tier} does not exist"))?;
         ensure!(
-            clock >= scope.update_clock,
-            "optimizer tier `{}` clock moved backwards",
+            clock > scope.update_clock,
+            "optimizer tier `{}` sender update was replayed or moved backwards",
             scope.tier_id
         );
         ensure!(
@@ -628,8 +919,8 @@ impl MemoryOptimizerScopes {
             .get_mut(tier)
             .with_context(|| format!("optimizer tier {tier} does not exist"))?;
         ensure!(
-            clock >= scope.transfer_clock,
-            "optimizer tier `{}` transfer clock moved backwards",
+            clock > scope.transfer_clock,
+            "optimizer tier `{}` receiver transfer was replayed or moved backwards",
             scope.tier_id
         );
         if scope.accumulated_micro_steps == 0 {
@@ -665,6 +956,10 @@ impl MemoryOptimizerScopes {
 impl SleepState {
     pub fn new(schedule: &SleepSchedule, rng_streams: usize) -> Result<Self> {
         schedule.validate()?;
+        ensure!(
+            (1..=MAX_SLEEP_RNG_STREAMS).contains(&rng_streams),
+            "sleep requires 1..={MAX_SLEEP_RNG_STREAMS} RNG streams"
+        );
         Ok(Self {
             cycle: 0,
             clock: 0,
@@ -701,14 +996,19 @@ impl SleepState {
     /// when the workflow is resolved.
     pub fn validate_resume(&self) -> Result<()> {
         ensure!(
-            self.tiers.len() >= 2,
-            "sleep checkpoint has fewer than two tiers"
+            (2..=MAX_MEMORY_TIERS).contains(&self.tiers.len()),
+            "sleep checkpoint must contain 2..={MAX_MEMORY_TIERS} tiers"
+        );
+        ensure!(
+            (1..=MAX_SLEEP_RNG_STREAMS).contains(&self.rng_counters.len()),
+            "sleep checkpoint must contain 1..={MAX_SLEEP_RNG_STREAMS} RNG streams"
         );
         let mut tier_ids = BTreeSet::new();
+        let mut total_reserve_slots = 0usize;
         for tier in &self.tiers {
             ensure!(
-                !tier.id.trim().is_empty(),
-                "sleep checkpoint has an empty tier id"
+                !tier.id.trim().is_empty() && tier.id.len() <= MAX_MEMORY_TIER_ID_BYTES,
+                "sleep checkpoint tier id must contain 1..={MAX_MEMORY_TIER_ID_BYTES} bytes"
             );
             ensure!(
                 tier_ids.insert(tier.id.as_str()),
@@ -716,9 +1016,16 @@ impl SleepState {
                 tier.id
             );
             ensure!(
-                !tier.slots.is_empty(),
-                "sleep tier `{}` has no reserve slots",
+                (1..=MAX_RESERVE_SLOTS_PER_TIER).contains(&tier.slots.len()),
+                "sleep tier `{}` must contain 1..={MAX_RESERVE_SLOTS_PER_TIER} reserve slots",
                 tier.id
+            );
+            total_reserve_slots = total_reserve_slots
+                .checked_add(tier.slots.len())
+                .context("sleep checkpoint reserve-slot count overflow")?;
+            ensure!(
+                total_reserve_slots <= MAX_TOTAL_RESERVE_SLOTS,
+                "sleep checkpoint exceeds the {MAX_TOTAL_RESERVE_SLOTS}-slot total reserve limit"
             );
             ensure!(
                 tier.last_update_clock <= tier.last_boundary_clock
@@ -760,13 +1067,14 @@ impl SleepState {
                     .all(|pair| pair[0] < pair[1]),
             "sleep checkpoint has an invalid due-boundary queue"
         );
+        ensure!(
+            self.evaluator_hashes.len() <= MAX_SLEEP_EVALUATOR_HASHES,
+            "sleep checkpoint exceeds the {MAX_SLEEP_EVALUATOR_HASHES}-evaluator limit"
+        );
         for hash in &self.evaluator_hashes {
-            validate_content_hash(hash, "sleep evaluator hash")?;
+            validate_sha256_identity(hash, "sleep evaluator hash")?;
         }
-        for manifest in &self.artifact_manifests {
-            validate_content_hash(manifest, "sleep artifact manifest")?;
-        }
-        validate_content_hash(&self.completed_chain_hash, "sleep completed-history hash")?;
+        validate_sha256_identity(&self.completed_chain_hash, "sleep completed-history hash")?;
         let expected_completed_tail =
             usize::try_from(self.completed_count.min(COMPLETED_TRANSACTION_TAIL as u64))
                 .context("sleep completed-transaction tail length exceeds usize")?;
@@ -787,6 +1095,17 @@ impl SleepState {
                         && txn.candidate_hash.is_some()),
             "sleep completed-transaction audit tail is invalid"
         );
+        for txn in &self.completed_transactions {
+            validate_completed_transaction(txn, &self.tiers, &self.rng_counters)?;
+        }
+        ensure!(
+            self.artifact_manifests
+                == referenced_artifact_manifests(
+                    &self.completed_transactions,
+                    self.pending.as_ref(),
+                )?,
+            "sleep artifact-manifest index differs from its bounded transaction history"
+        );
         match (self.phase, self.pending.as_ref()) {
             (SleepPhase::Wake, None) => {}
             (SleepPhase::Wake, Some(_)) => bail!("wake checkpoint has a pending sleep transaction"),
@@ -795,6 +1114,10 @@ impl SleepState {
                 ensure!(
                     txn.sender < self.tiers.len(),
                     "sleep transaction sender tier is out of range"
+                );
+                ensure!(
+                    txn.terminal == (txn.sender + 1 == self.tiers.len()),
+                    "sleep transaction terminal marker disagrees with its sender tier"
                 );
                 ensure!(
                     (txn.terminal && txn.receiver == txn.sender)
@@ -817,6 +1140,22 @@ impl SleepState {
                     self.due_clocks.first().copied() == Some(txn.trigger_clock) || txn.committed,
                     "sleep transaction trigger clock differs from due-boundary queue"
                 );
+                ensure!(
+                    txn.trigger_clock > 0 && txn.trigger_clock <= self.clock,
+                    "sleep transaction trigger clock is zero or ahead of the sleep clock"
+                );
+                if txn.committed {
+                    ensure!(
+                        self.tiers[txn.sender].last_update_clock == txn.trigger_clock
+                            && self.tiers[txn.sender].last_boundary_clock == txn.trigger_clock,
+                        "committed sleep transaction disagrees with its sender clocks"
+                    );
+                } else {
+                    ensure!(
+                        self.tiers[txn.sender].last_boundary_clock < txn.trigger_clock,
+                        "uncommitted sleep transaction does not own a future sender boundary"
+                    );
+                }
                 let expected_id = if txn.committed {
                     self.cycle
                 } else {
@@ -850,6 +1189,23 @@ impl SleepState {
                         .all(|pair| pair[0] < pair[1]),
                     "sleep sender reset slots are duplicated or unordered"
                 );
+                if !txn.committed {
+                    let active_sender_slots = self.tiers[txn.sender]
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, state)| state.active.then_some(slot))
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        txn.sender_slots_to_reset == active_sender_slots,
+                        "sleep sender reset plan does not contain the exact active-slot set"
+                    );
+                } else {
+                    ensure!(
+                        self.tiers[txn.sender].slots.iter().all(|slot| !slot.active),
+                        "committed sleep sender retains an active reserve slot"
+                    );
+                }
                 ensure!(
                     txn.sender_slots_to_reset.iter().all(|slot| {
                         self.tiers[txn.sender].slots[*slot].active != txn.committed
@@ -864,12 +1220,14 @@ impl SleepState {
                 }
                 ensure!(
                     !txn.teacher_checkpoint.trim().is_empty()
-                        && !txn.student_checkpoint.trim().is_empty(),
+                        && txn.teacher_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES
+                        && !txn.student_checkpoint.trim().is_empty()
+                        && txn.student_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES,
                     "sleep transaction has incomplete checkpoint locations"
                 );
-                validate_content_hash(&txn.teacher_hash, "sleep teacher hash")?;
-                validate_content_hash(&txn.student_hash, "sleep student hash")?;
-                validate_content_hash(
+                validate_sha256_identity(&txn.teacher_hash, "sleep teacher hash")?;
+                validate_sha256_identity(&txn.student_hash, "sleep student hash")?;
+                validate_sha256_identity(
                     &txn.prospective_update_hash,
                     "sleep prospective-update hash",
                 )?;
@@ -889,6 +1247,7 @@ impl SleepState {
                 for trial_rng in &txn.dream_trial_rngs {
                     ensure!(
                         !trial_rng.candidate_id.trim().is_empty()
+                            && trial_rng.candidate_id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES
                             && trial_rng_ids.insert(trial_rng.candidate_id.as_str()),
                         "sleep dream-trial RNG reservations have duplicate or empty IDs"
                     );
@@ -943,10 +1302,11 @@ impl SleepState {
                     (&txn.candidate_checkpoint, &txn.candidate_hash)
                 {
                     ensure!(
-                        !checkpoint.trim().is_empty(),
+                        !checkpoint.trim().is_empty()
+                            && checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES,
                         "sleep transaction candidate checkpoint is empty"
                     );
-                    validate_content_hash(hash, "sleep candidate hash")?;
+                    validate_sha256_identity(hash, "sleep candidate hash")?;
                 }
                 ensure!(
                     !txn.committed || txn.candidate_checkpoint.is_some(),
@@ -964,30 +1324,34 @@ impl SleepState {
                     let digest = generation
                         .strip_prefix("sha256-")
                         .context("sleep tensor generation has an unsafe name")?;
-                    validate_content_hash(&format!("sha256:{digest}"), "sleep tensor generation")?;
-                    validate_content_hash(hash, "sleep tensor manifest hash")?;
+                    validate_sha256_identity(
+                        &format!("sha256:{digest}"),
+                        "sleep tensor generation",
+                    )?;
+                    validate_sha256_identity(hash, "sleep tensor manifest hash")?;
                     ensure!(
                         hash.strip_prefix("sha256:") == Some(digest),
                         "sleep tensor generation does not match its manifest hash"
                     );
                 }
                 if let Some(manifest) = &txn.generated_manifest {
-                    validate_content_hash(manifest, "dream artifact manifest")?;
+                    validate_sha256_identity(manifest, "dream artifact manifest")?;
                 }
                 if let Some(hash) = &txn.dream_shared_checkpoint_hash {
-                    validate_content_hash(hash, "dream shared-checkpoint hash")?;
+                    validate_sha256_identity(hash, "dream shared-checkpoint hash")?;
                 }
                 for trial in &txn.dream_trials {
                     ensure!(
                         !trial.candidate_id.trim().is_empty()
+                            && trial.candidate_id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES
                             && trial.independent_task_improvement.is_finite(),
                         "dream trial has an invalid candidate identity or score"
                     );
-                    validate_content_hash(&trial.adapter_hash, "dream adapter hash")?;
-                    validate_content_hash(&trial.evaluator_hash, "dream evaluator hash")?;
+                    validate_sha256_identity(&trial.adapter_hash, "dream adapter hash")?;
+                    validate_sha256_identity(&trial.evaluator_hash, "dream evaluator hash")?;
                 }
                 if let Some(receipt) = &txn.dream_policy_receipt {
-                    validate_content_hash(receipt, "dream policy receipt")?;
+                    validate_sha256_identity(receipt, "dream policy receipt")?;
                 }
                 let selected = txn
                     .dream_selected
@@ -996,7 +1360,9 @@ impl SleepState {
                     .collect::<BTreeSet<_>>();
                 ensure!(
                     selected.len() == txn.dream_selected.len()
-                        && selected.iter().all(|id| !id.trim().is_empty()),
+                        && selected.iter().all(|id| {
+                            !id.trim().is_empty() && id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES
+                        }),
                     "dream selection contains an empty or duplicate candidate id"
                 );
                 let trial_ids = txn
@@ -1009,6 +1375,31 @@ impl SleepState {
                         && trial_ids.iter().all(|id| selected.contains(id)),
                     "dream trials are duplicated or absent from the selected candidates"
                 );
+                ensure!(
+                    trial_rng_ids.iter().all(|id| selected.contains(id)),
+                    "dream-trial RNG reservation is absent from the selected candidates"
+                );
+                match txn.dream_generation_rng {
+                    Some(reservation) => {
+                        let candidate_count = usize::try_from(reservation.count)
+                            .context("dream candidate count exceeds usize")?;
+                        ensure!(
+                            txn.dream_selected.len() <= candidate_count
+                                && txn.dream_trials.len() <= candidate_count
+                                && txn.dream_trial_rngs.len() <= candidate_count,
+                            "dream checkpoint evidence exceeds its generated-candidate count"
+                        );
+                    }
+                    None => ensure!(
+                        txn.generated_manifest.is_none()
+                            && txn.dream_selection_rng.is_none()
+                            && txn.dream_trial_rngs.is_empty()
+                            && txn.dream_selected.is_empty()
+                            && txn.dream_trials.is_empty()
+                            && txn.dream_policy_receipt.is_none(),
+                        "dream checkpoint contains evidence without a generation reservation"
+                    ),
+                }
                 let requires_commit = matches!(
                     self.phase,
                     SleepPhase::DreamGeneration
@@ -1092,6 +1483,68 @@ impl SleepState {
                     txn.generated_manifest.is_none() || txn.dream_shared_checkpoint_hash.is_some(),
                     "dream artifacts have no immutable shared-checkpoint identity"
                 );
+                let no_dream_evidence = txn.dream_generation_rng.is_none()
+                    && txn.dream_selection_rng.is_none()
+                    && txn.dream_trial_rngs.is_empty()
+                    && txn.generated_manifest.is_none()
+                    && txn.dream_shared_checkpoint_hash.is_none()
+                    && txn.dream_selected.is_empty()
+                    && txn.dream_trials.is_empty()
+                    && txn.dream_policy_receipt.is_none();
+                match self.phase {
+                    SleepPhase::ProspectiveUpdate => ensure!(
+                        txn.knowledge_rng.is_none()
+                            && txn.imitation_rng.is_none()
+                            && no_dream_evidence,
+                        "prospective-update checkpoint contains later-subphase evidence"
+                    ),
+                    SleepPhase::KnowledgeSeeding => ensure!(
+                        txn.imitation_rng.is_none() && no_dream_evidence,
+                        "Knowledge Seeding checkpoint contains later-subphase evidence"
+                    ),
+                    SleepPhase::Imitation
+                    | SleepPhase::RetentionValidation
+                    | SleepPhase::Commit => ensure!(
+                        no_dream_evidence,
+                        "pre-Dreaming checkpoint contains Dreaming evidence"
+                    ),
+                    SleepPhase::DreamGeneration => ensure!(
+                        txn.generated_manifest.is_none()
+                            && txn.dream_selection_rng.is_none()
+                            && txn.dream_trial_rngs.is_empty()
+                            && txn.dream_selected.is_empty()
+                            && txn.dream_trials.is_empty()
+                            && txn.dream_policy_receipt.is_none(),
+                        "Dream Generation checkpoint contains later-subphase evidence"
+                    ),
+                    SleepPhase::DreamRanking => ensure!(
+                        txn.dream_trial_rngs.is_empty()
+                            && txn.dream_selected.is_empty()
+                            && txn.dream_trials.is_empty()
+                            && txn.dream_policy_receipt.is_none(),
+                        "Dream Ranking checkpoint contains later-subphase evidence"
+                    ),
+                    SleepPhase::DreamTrials => ensure!(
+                        txn.dream_policy_receipt.is_none(),
+                        "Dream Trials checkpoint contains a premature ReSTEM receipt"
+                    ),
+                    SleepPhase::DreamPolicyUpdate => ensure!(
+                        txn.dream_policy_receipt.is_none()
+                            || (trial_ids == selected && trial_rng_ids == selected),
+                        "ReSTEM receipt precedes complete isolated-trial evidence"
+                    ),
+                    SleepPhase::Candidate => ensure!(
+                        no_dream_evidence
+                            || (txn.generated_manifest.is_some()
+                                && txn.dream_generation_rng.is_some()
+                                && txn.dream_selection_rng.is_some()
+                                && trial_ids == selected
+                                && trial_rng_ids == selected
+                                && txn.dream_policy_receipt.is_some()),
+                        "sleep candidate contains incomplete Dreaming evidence"
+                    ),
+                    SleepPhase::Wake => unreachable!("wake checkpoints cannot have a transaction"),
+                }
             }
         }
         Ok(())
@@ -1244,12 +1697,15 @@ impl SleepState {
             self.clock
         );
         ensure!(
-            !teacher_checkpoint.trim().is_empty() && !student_checkpoint.trim().is_empty(),
+            !teacher_checkpoint.trim().is_empty()
+                && teacher_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES
+                && !student_checkpoint.trim().is_empty()
+                && student_checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES,
             "consolidation checkpoint locations must not be empty"
         );
-        validate_content_hash(&teacher_hash, "teacher hash")?;
-        validate_content_hash(&student_hash, "student hash")?;
-        validate_content_hash(&prospective_update_hash, "prospective-update hash")?;
+        validate_sha256_identity(&teacher_hash, "teacher hash")?;
+        validate_sha256_identity(&student_hash, "student hash")?;
+        validate_sha256_identity(&prospective_update_hash, "prospective-update hash")?;
         let terminal = sender + 1 == self.tiers.len();
         let receiver = if terminal { sender } else { sender + 1 };
         let receiver_slot = if terminal {
@@ -1365,6 +1821,10 @@ impl SleepState {
     }
 
     pub fn reserve_knowledge_rng(&mut self, stream: usize, count: u64) -> Result<RngReservation> {
+        ensure!(
+            self.pending.is_some() && self.phase == SleepPhase::KnowledgeSeeding,
+            "knowledge RNG reservation requires the Knowledge Seeding phase"
+        );
         if let Some(reservation) = self.pending.as_ref().and_then(|txn| txn.knowledge_rng) {
             ensure!(
                 reservation.stream == stream && reservation.count == count,
@@ -1381,6 +1841,10 @@ impl SleepState {
     }
 
     pub fn reserve_imitation_rng(&mut self, stream: usize, count: u64) -> Result<RngReservation> {
+        ensure!(
+            self.pending.is_some() && self.phase == SleepPhase::Imitation,
+            "imitation RNG reservation requires the imitation phase"
+        );
         if let Some(reservation) = self.pending.as_ref().and_then(|txn| txn.imitation_rng) {
             ensure!(
                 reservation.stream == stream && reservation.count == count,
@@ -1401,6 +1865,10 @@ impl SleepState {
         stream: usize,
         count: u64,
     ) -> Result<RngReservation> {
+        ensure!(
+            self.pending.is_some() && self.phase == SleepPhase::DreamGeneration,
+            "dream-generation RNG reservation requires the Dream Generation phase"
+        );
         if let Some(reservation) = self
             .pending
             .as_ref()
@@ -1421,6 +1889,10 @@ impl SleepState {
     }
 
     pub fn reserve_dream_selection_rng(&mut self, stream: usize) -> Result<RngReservation> {
+        ensure!(
+            self.pending.is_some() && self.phase == SleepPhase::DreamRanking,
+            "dream-selection RNG reservation requires the Dream Ranking phase"
+        );
         if let Some(reservation) = self
             .pending
             .as_ref()
@@ -1446,8 +1918,18 @@ impl SleepState {
         candidate_id: &str,
     ) -> Result<RngReservation> {
         ensure!(
-            !candidate_id.trim().is_empty(),
-            "dream candidate ID is empty"
+            !candidate_id.trim().is_empty() && candidate_id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES,
+            "dream candidate ID is empty or too long"
+        );
+        ensure!(
+            self.pending.is_some() && self.phase == SleepPhase::DreamTrials,
+            "dream-trial RNG reservation requires the Dream Trials phase"
+        );
+        ensure!(
+            self.pending
+                .as_ref()
+                .is_some_and(|txn| txn.dream_selected.iter().any(|id| id == candidate_id)),
+            "dream-trial RNG reservation is not for a selected candidate"
         );
         if let Some(reservation) = self.pending.as_ref().and_then(|txn| {
             txn.dream_trial_rngs
@@ -1489,12 +1971,22 @@ impl SleepState {
             return Ok(());
         }
         ensure!(
+            txn.sender < self.tiers.len() && txn.receiver < self.tiers.len(),
+            "consolidation transaction tier is out of range"
+        );
+        ensure!(
+            txn.terminal == (txn.sender.checked_add(1) == Some(self.tiers.len()))
+                && ((txn.terminal && txn.receiver == txn.sender)
+                    || (!txn.terminal && txn.sender.checked_add(1) == Some(txn.receiver))),
+            "consolidation transaction has an invalid sender/receiver topology"
+        );
+        ensure!(
             txn.candidate_checkpoint
                 .as_ref()
                 .is_some_and(|uri| !uri.trim().is_empty()),
             "consolidation has no published candidate checkpoint"
         );
-        validate_content_hash(
+        validate_sha256_identity(
             txn.candidate_hash
                 .as_deref()
                 .context("consolidation has no published candidate hash")?,
@@ -1508,6 +2000,16 @@ impl SleepState {
             .tiers
             .get(txn.sender)
             .context("committed sender tier is out of range")?;
+        let active_sender_slots = sender_tier
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, state)| state.active.then_some(slot))
+            .collect::<Vec<_>>();
+        ensure!(
+            txn.sender_slots_to_reset == active_sender_slots,
+            "consolidation sender reset plan does not contain the exact active-slot set"
+        );
         if !txn.terminal {
             let receiver_slot = self
                 .tiers
@@ -1567,10 +2069,10 @@ impl SleepState {
             "candidate identity can be recorded only in commit phase"
         );
         ensure!(
-            !checkpoint.trim().is_empty(),
+            !checkpoint.trim().is_empty() && checkpoint.len() <= MAX_CHECKPOINT_LOCATION_BYTES,
             "candidate checkpoint is empty"
         );
-        validate_content_hash(&hash, "published candidate hash")?;
+        validate_sha256_identity(&hash, "published candidate hash")?;
         let txn = self
             .pending
             .as_mut()
@@ -1590,13 +2092,27 @@ impl SleepState {
     }
 
     pub fn record_generated_manifest(&mut self, manifest: String) -> Result<()> {
-        validate_content_hash(&manifest, "generated manifest")?;
+        validate_sha256_identity(&manifest, "generated manifest")?;
+        ensure!(
+            self.phase == SleepPhase::DreamGeneration,
+            "generated manifest can be recorded only during dream generation"
+        );
         let txn = self
             .pending
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no consolidation transaction"))?;
-        txn.generated_manifest = Some(manifest.clone());
-        self.artifact_manifests.push(manifest);
+        if let Some(existing) = &txn.generated_manifest {
+            ensure!(
+                existing == &manifest,
+                "generated manifest identity changed during retry"
+            );
+        }
+        let mut next_pending = txn.clone();
+        next_pending.generated_manifest = Some(manifest);
+        let next_manifests =
+            referenced_artifact_manifests(&self.completed_transactions, Some(&next_pending))?;
+        self.pending = Some(next_pending);
+        self.artifact_manifests = next_manifests;
         Ok(())
     }
 
@@ -1610,8 +2126,12 @@ impl SleepState {
         let digest = generation
             .strip_prefix("sha256-")
             .context("tensor transaction generation has an unsafe name")?;
-        validate_content_hash(&format!("sha256:{digest}"), "tensor transaction generation")?;
-        validate_content_hash(&manifest_hash, "tensor transaction manifest hash")?;
+        validate_sha256_identity(&format!("sha256:{digest}"), "tensor transaction generation")?;
+        validate_sha256_identity(&manifest_hash, "tensor transaction manifest hash")?;
+        ensure!(
+            manifest_hash.strip_prefix("sha256:") == Some(digest),
+            "tensor transaction generation does not match its manifest hash"
+        );
         let txn = self
             .pending
             .as_mut()
@@ -1630,26 +2150,46 @@ impl SleepState {
             self.pending.as_ref().is_some_and(|txn| txn.committed),
             "sleep candidate is not atomically committed"
         );
+        // Derive every fallible result before mutating the checkpoint. A
+        // counter overflow or serialization error must leave the committed
+        // Candidate retryable instead of dropping its pending transaction or
+        // advancing only part of the audit chain.
         let txn = self
             .pending
-            .take()
-            .expect("committed transaction checked above");
+            .as_ref()
+            .expect("committed transaction checked above")
+            .clone();
         let encoded = serde_json::to_vec(&txn)?;
+        let completed_count = self
+            .completed_count
+            .checked_add(1)
+            .context("sleep completed-transaction count overflow")?;
+        self.validate_resume()
+            .context("validating completed sleep candidate")?;
+        let encoded_len = u64::try_from(encoded.len())
+            .context("sleep completed-transaction encoding exceeds u64")?;
         let mut hash = sha2::Sha256::new();
         use sha2::Digest as _;
         hash.update(b"hermes-sleep-audit-chain-v1\0");
         hash.update(self.completed_chain_hash.as_bytes());
-        hash.update((encoded.len() as u64).to_le_bytes());
+        hash.update(encoded_len.to_le_bytes());
         hash.update(encoded);
-        self.completed_chain_hash = format!("sha256:{:x}", hash.finalize());
-        self.completed_count = self
-            .completed_count
-            .checked_add(1)
-            .context("sleep completed-transaction count overflow")?;
-        self.completed_transactions.push(txn.clone());
-        if self.completed_transactions.len() > COMPLETED_TRANSACTION_TAIL {
-            self.completed_transactions.remove(0);
+        let completed_chain_hash = format!("sha256:{:x}", hash.finalize());
+        let mut completed_transactions = self.completed_transactions.clone();
+        completed_transactions
+            .try_reserve(1)
+            .context("reserving sleep completed-transaction audit tail")?;
+        completed_transactions.push(txn.clone());
+        if completed_transactions.len() > COMPLETED_TRANSACTION_TAIL {
+            completed_transactions.remove(0);
         }
+        let artifact_manifests = referenced_artifact_manifests(&completed_transactions, None)?;
+
+        self.pending = None;
+        self.completed_chain_hash = completed_chain_hash;
+        self.completed_count = completed_count;
+        self.completed_transactions = completed_transactions;
+        self.artifact_manifests = artifact_manifests;
         self.phase = SleepPhase::Wake;
         Ok(txn)
     }
@@ -1826,6 +2366,12 @@ pub fn validate_model_memory_state(
 
 /// Backend contract for one atomic compute-consolidate-update transaction.
 pub trait ConsolidationBackend {
+    /// Number of independently sampled teacher/student rollouts consumed by
+    /// Knowledge Seeding. Persisting the exact range makes a retry reproduce
+    /// every sample instead of merely reseeding the first rollout.
+    fn knowledge_rng_count(&self) -> Result<u64>;
+    /// Number of group-relative continuations consumed by imitation/GRPO.
+    fn imitation_rng_count(&self) -> Result<u64>;
     fn compute_prospective_update(&mut self, txn: &ConsolidationTxn) -> Result<()>;
     fn stage_student(&mut self, txn: &ConsolidationTxn) -> Result<()>;
     fn knowledge_seed(&mut self, txn: &ConsolidationTxn) -> Result<()>;
@@ -1880,15 +2426,56 @@ pub struct KnowledgeSeedingConfig {
 }
 
 impl KnowledgeSeedingConfig {
+    /// Operational ceilings keep a malformed workflow from turning one sleep
+    /// boundary into an unbounded rollout or logits allocation. They are well
+    /// above the paper-reproduction recipe and may only be raised alongside
+    /// memory-profile evidence.
+    pub const MAX_CHUNK_TOKENS: usize = 16_384;
+    pub const MAX_ROLLOUTS: usize = 1_024;
+    pub const MAX_TOKEN_WORK: usize = Self::MAX_CHUNK_TOKENS * Self::MAX_ROLLOUTS;
+
+    pub fn rollout_count(&self) -> Result<usize> {
+        self.teacher_rollouts
+            .checked_add(self.detached_student_rollouts)
+            .context("knowledge-seeding rollout count overflow")
+    }
+
+    pub fn rollout_count_u64(&self) -> Result<u64> {
+        self.rollout_count()?
+            .try_into()
+            .context("knowledge-seeding rollout count exceeds u64")
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.chunk_tokens > 0,
             "knowledge-seeding chunk_tokens must be positive"
         );
         ensure!(
+            self.chunk_tokens <= Self::MAX_CHUNK_TOKENS,
+            "knowledge-seeding chunk_tokens exceeds the {}-token operational limit",
+            Self::MAX_CHUNK_TOKENS
+        );
+        ensure!(
             self.teacher_rollouts > 0 && self.detached_student_rollouts > 0,
             "knowledge seeding requires teacher and detached-student rollouts"
         );
+        let rollout_count = self.rollout_count()?;
+        ensure!(
+            rollout_count <= Self::MAX_ROLLOUTS,
+            "knowledge-seeding rollout count exceeds the {}-rollout operational limit",
+            Self::MAX_ROLLOUTS
+        );
+        let token_work = self
+            .chunk_tokens
+            .checked_mul(rollout_count)
+            .context("knowledge-seeding token work overflow")?;
+        ensure!(
+            token_work <= Self::MAX_TOKEN_WORK,
+            "knowledge-seeding token work exceeds the {}-token operational limit",
+            Self::MAX_TOKEN_WORK
+        );
+        u64::try_from(rollout_count).context("knowledge-seeding rollout count exceeds u64")?;
         ensure!(
             self.temperature.is_finite() && self.temperature > 0.0,
             "knowledge-seeding temperature must be positive"
@@ -1911,8 +2498,20 @@ pub struct ImitationConfig {
 }
 
 impl ImitationConfig {
+    /// The edit reward uses a threshold-banded dynamic program and GRPO holds
+    /// one group of rollouts together, so both axes need explicit ceilings.
+    pub const MAX_EDIT_DISTANCE: usize = 4_096;
+    pub const MAX_GRPO_GROUP_SIZE: usize = 256;
+    pub const MAX_DISTANCE_WORK: usize = Self::MAX_EDIT_DISTANCE * Self::MAX_GRPO_GROUP_SIZE;
+
+    pub fn group_size_u64(&self) -> Result<u64> {
+        self.grpo_group_size
+            .try_into()
+            .context("imitation GRPO group size exceeds u64")
+    }
+
     pub fn validate(&self) -> Result<()> {
-        validate_content_hash(&self.semantic_judge_hash, "imitation semantic-judge hash")?;
+        validate_sha256_identity(&self.semantic_judge_hash, "imitation semantic-judge hash")?;
         ensure!(
             self.semantic_weight.is_finite() && (0.0..=1.0).contains(&self.semantic_weight),
             "imitation semantic_weight must be in [0, 1]"
@@ -1921,6 +2520,26 @@ impl ImitationConfig {
             self.grpo_group_size >= 2,
             "imitation GRPO group must contain at least two samples"
         );
+        ensure!(
+            self.maximum_edit_distance <= Self::MAX_EDIT_DISTANCE,
+            "imitation maximum edit distance exceeds the {}-token operational limit",
+            Self::MAX_EDIT_DISTANCE
+        );
+        ensure!(
+            self.grpo_group_size <= Self::MAX_GRPO_GROUP_SIZE,
+            "imitation GRPO group size exceeds the {}-sample operational limit",
+            Self::MAX_GRPO_GROUP_SIZE
+        );
+        let distance_work = self
+            .maximum_edit_distance
+            .checked_mul(self.grpo_group_size)
+            .context("imitation edit-distance work overflow")?;
+        ensure!(
+            distance_work <= Self::MAX_DISTANCE_WORK,
+            "imitation edit-distance work exceeds the {}-cell operational limit",
+            Self::MAX_DISTANCE_WORK
+        );
+        u64::try_from(self.grpo_group_size).context("imitation GRPO group size exceeds u64")?;
         Ok(())
     }
 }
@@ -1941,6 +2560,15 @@ pub struct DreamingConfig {
 }
 
 impl DreamingConfig {
+    /// Dream candidates and isolated adapters are materialized by the built-in
+    /// backend. These ceilings make their maximum cardinality and rank an
+    /// explicit part of the trainer contract instead of inheriting `usize`.
+    pub const MAX_CANDIDATES: usize = 1_024;
+    pub const MAX_LORA_RANK: usize = 1_024;
+    pub const MAX_LORA_ALPHA: usize = 65_536;
+    pub const MAX_RESTEM_ITERATIONS: usize = 128;
+    pub const MAX_POLICY_WORK: usize = Self::MAX_CANDIDATES * Self::MAX_RESTEM_ITERATIONS;
+
     pub fn paper_reproduction() -> Self {
         Self {
             candidate_count: 64,
@@ -1961,29 +2589,72 @@ impl DreamingConfig {
             "dream candidate count must be positive"
         );
         ensure!(
-            self.retain_top + self.retain_random <= self.candidate_count,
+            self.candidate_count <= Self::MAX_CANDIDATES,
+            "dream candidate count exceeds the {}-candidate operational limit",
+            Self::MAX_CANDIDATES
+        );
+        let retained = self.retained_count()?;
+        ensure!(
+            retained <= self.candidate_count,
             "dream selection quotas exceed candidate count"
         );
         ensure!(
-            self.retain_top + self.retain_random > 0,
+            retained > 0,
             "dream selection must retain at least one candidate"
         );
+        for (value, label) in [
+            (self.candidate_count, "dream candidate count"),
+            (self.retain_top, "dream alignment quota"),
+            (self.retain_random, "dream diversity quota"),
+            (self.lora_rank, "dream LoRA rank"),
+        ] {
+            u32::try_from(value).with_context(|| format!("{label} exceeds metric schema"))?;
+        }
         ensure!(
             self.lora_rank > 0 && self.lora_alpha > 0,
             "dream LoRA geometry must be positive"
+        );
+        ensure!(
+            self.lora_rank <= Self::MAX_LORA_RANK,
+            "dream LoRA rank exceeds the {}-rank operational limit",
+            Self::MAX_LORA_RANK
+        );
+        ensure!(
+            self.lora_alpha <= Self::MAX_LORA_ALPHA,
+            "dream LoRA alpha exceeds the {} operational limit",
+            Self::MAX_LORA_ALPHA
         );
         ensure!(
             self.restem_iterations > 0,
             "ReSTEM iterations must be positive"
         );
         ensure!(
+            self.restem_iterations <= Self::MAX_RESTEM_ITERATIONS,
+            "ReSTEM iterations exceed the {}-iteration operational limit",
+            Self::MAX_RESTEM_ITERATIONS
+        );
+        let policy_work = retained
+            .checked_mul(self.restem_iterations)
+            .context("dream policy work overflow")?;
+        ensure!(
+            policy_work <= Self::MAX_POLICY_WORK,
+            "dream policy work exceeds the {}-trial operational limit",
+            Self::MAX_POLICY_WORK
+        );
+        ensure!(
             self.selector_version == "gradient-cosine-v1",
             "unsupported dream selector `{}`; this build implements only `gradient-cosine-v1`",
             self.selector_version
         );
-        validate_content_hash(&self.reference_set_hash, "dream reference-set hash")?;
-        validate_content_hash(&self.trial_evaluator_hash, "dream trial-evaluator hash")?;
+        validate_sha256_identity(&self.reference_set_hash, "dream reference-set hash")?;
+        validate_sha256_identity(&self.trial_evaluator_hash, "dream trial-evaluator hash")?;
         Ok(())
+    }
+
+    pub(crate) fn retained_count(&self) -> Result<usize> {
+        self.retain_top
+            .checked_add(self.retain_random)
+            .context("dream selection quota overflow")
     }
 }
 
@@ -2009,6 +2680,15 @@ pub struct DreamTrial {
 /// corpus handle: its only source is model-owned wake contexts. Trials must be
 /// isolated and the shared hash is checked around every trial.
 pub trait DreamingBackend {
+    /// Verify that the backend's shared model was loaded from this exact
+    /// committed checkpoint. The checkpoint artifact identity and the model
+    /// parameter fingerprint are deliberately separate: a serialized
+    /// checkpoint hash is not necessarily a hash of only its tensors.
+    fn verify_committed_candidate(&mut self, txn: &ConsolidationTxn) -> Result<()>;
+    /// Return the sealed full-parameter identity of the shared candidate.
+    /// Backends with interior mutability must recompute it; structurally
+    /// immutable backends may return an identity cached when they sealed the
+    /// candidate, avoiding a device-to-host model copy around every trial.
     fn shared_checkpoint_hash(&mut self) -> Result<String>;
     fn generate_from_wake_contexts(
         &mut self,
@@ -2063,10 +2743,18 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
     progress: &mut P,
 ) -> Result<Vec<DreamTrial>> {
     config.validate()?;
+    state
+        .validate_resume()
+        .context("validating Dreaming resume state")?;
     ensure!(
         state.pending.as_ref().is_some_and(|txn| txn.committed),
         "dreaming requires committed transaction metadata"
     );
+    ensure_committed_candidate_binding(
+        state.pending.as_ref().expect("transaction checked above"),
+        backend,
+        "binding Dreaming to the committed candidate",
+    )?;
     loop {
         let txn = state
             .pending
@@ -2074,8 +2762,11 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
             .ok_or_else(|| anyhow::anyhow!("dreaming has no transaction"))?;
         match state.phase {
             SleepPhase::Commit => {
-                let shared_hash = backend.shared_checkpoint_hash()?;
-                validate_content_hash(&shared_hash, "dream shared checkpoint hash")?;
+                let shared_hash = read_shared_checkpoint_hash(
+                    &txn,
+                    backend,
+                    "fingerprinting the committed candidate for Dreaming",
+                )?;
                 state
                     .pending
                     .as_mut()
@@ -2085,11 +2776,23 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                 progress.persist(state)?;
             }
             SleepPhase::DreamGeneration => {
-                state.reserve_dream_generation_rng(0, config.candidate_count as u64)?;
+                state.reserve_dream_generation_rng(
+                    0,
+                    config
+                        .candidate_count
+                        .try_into()
+                        .context("dream candidate count exceeds RNG schema")?,
+                )?;
                 progress.persist(state)?;
                 let txn = state.pending.clone().expect("transaction checked above");
-                let (manifest, candidates) =
-                    backend.generate_from_wake_contexts(&txn, config.candidate_count, true)?;
+                let (manifest, candidates) = run_shared_checkpoint_operation(
+                    &txn,
+                    backend,
+                    "dream generation",
+                    |backend| {
+                        backend.generate_from_wake_contexts(&txn, config.candidate_count, true)
+                    },
+                )?;
                 validate_generated_dreams(&candidates, config.candidate_count)?;
                 state.record_generated_manifest(manifest)?;
                 state.transition(SleepPhase::DreamRanking)?;
@@ -2103,9 +2806,25 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                     .generated_manifest
                     .as_deref()
                     .expect("validated dream manifest");
-                let candidates = backend.load_generated_dreams(&txn, manifest)?;
+                let candidates = run_shared_checkpoint_operation(
+                    &txn,
+                    backend,
+                    "loading generated dreams",
+                    |backend| backend.load_generated_dreams(&txn, manifest),
+                )?;
                 validate_generated_dreams(&candidates, config.candidate_count)?;
-                let reference = backend.reference_gradient(&txn, &config.reference_set_hash)?;
+                let reference = run_shared_checkpoint_operation(
+                    &txn,
+                    backend,
+                    "dream reference-gradient evaluation",
+                    |backend| backend.reference_gradient(&txn, &config.reference_set_hash),
+                )?;
+                ensure!(
+                    !reference.is_empty()
+                        && reference.len() <= MAX_DREAM_GRADIENT_DIMENSIONS
+                        && reference.iter().all(|value| value.is_finite()),
+                    "dream reference gradient is empty, non-finite, or exceeds the operational dimension limit"
+                );
                 let scores = candidates
                     .iter()
                     .map(|candidate| {
@@ -2124,12 +2843,7 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                 for score in &mut scores {
                     score.diversity_key ^= salt;
                 }
-                state
-                    .pending
-                    .as_mut()
-                    .expect("transaction checked above")
-                    .dream_selected =
-                    select_dreams(&scores, config.retain_top, config.retain_random)?;
+                let selected = select_dreams(&scores, config.retain_top, config.retain_random)?;
                 let cosine_mean = scores
                     .iter()
                     .map(|score| f64::from(score.importance))
@@ -2143,14 +2857,31 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                     transaction_id: format!("sleep-{}", txn.id),
                     selector_version: config.selector_version.clone(),
                     reference_set_hash: config.reference_set_hash.clone(),
-                    candidates_generated: config.candidate_count as u32,
-                    selected_by_alignment: config.retain_top as u32,
-                    selected_random: config.retain_random as u32,
-                    random_quota: config.retain_random as u32,
+                    candidates_generated: config
+                        .candidate_count
+                        .try_into()
+                        .context("dream candidate count exceeds metric schema")?,
+                    selected_by_alignment: config
+                        .retain_top
+                        .try_into()
+                        .context("dream alignment quota exceeds metric schema")?,
+                    selected_random: config
+                        .retain_random
+                        .try_into()
+                        .context("dream diversity quota exceeds metric schema")?,
+                    random_quota: config
+                        .retain_random
+                        .try_into()
+                        .context("dream diversity quota exceeds metric schema")?,
                     gradient_cosine_mean: cosine_mean,
                     gradient_cosine_max: cosine_max,
                     selected_manifest_hash: manifest.to_owned(),
                 }))?;
+                state
+                    .pending
+                    .as_mut()
+                    .expect("transaction checked above")
+                    .dream_selected = selected;
                 state.transition(SleepPhase::DreamTrials)?;
                 progress.persist(state)?;
             }
@@ -2159,7 +2890,12 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                     .generated_manifest
                     .as_deref()
                     .expect("validated dream manifest");
-                let candidates = backend.load_generated_dreams(&txn, manifest)?;
+                let candidates = run_shared_checkpoint_operation(
+                    &txn,
+                    backend,
+                    "loading dreams for isolated trials",
+                    |backend| backend.load_generated_dreams(&txn, manifest),
+                )?;
                 validate_generated_dreams(&candidates, config.candidate_count)?;
                 let completed = txn
                     .dream_trials
@@ -2177,29 +2913,38 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                     state.reserve_dream_trial_rng(0, id)?;
                     progress.persist(state)?;
                     let current_txn = state.pending.clone().expect("transaction checked above");
-                    let trial = backend.isolated_lora_trial(
+                    let trial = run_shared_checkpoint_operation(
                         &current_txn,
-                        candidate,
-                        config.lora_rank,
-                        config.lora_alpha,
+                        backend,
+                        &format!("isolated dream trial `{id}`"),
+                        |backend| {
+                            backend.isolated_lora_trial(
+                                &current_txn,
+                                candidate,
+                                config.lora_rank,
+                                config.lora_alpha,
+                            )
+                        },
                     )?;
                     ensure!(
                         trial.candidate_id == *id && trial.independent_task_improvement.is_finite(),
                         "dream trial `{id}` returned incomplete or invalid evidence"
                     );
-                    validate_content_hash(&trial.adapter_hash, "dream trial adapter hash")?;
-                    validate_content_hash(&trial.evaluator_hash, "dream trial evaluator hash")?;
+                    validate_sha256_identity(&trial.adapter_hash, "dream trial adapter hash")?;
+                    validate_sha256_identity(&trial.evaluator_hash, "dream trial evaluator hash")?;
                     ensure!(
                         trial.evaluator_hash == config.trial_evaluator_hash,
                         "dream trial `{id}` used an evaluator other than the frozen configured artifact"
                     );
-                    ensure_shared_checkpoint_unchanged(&current_txn, backend, id)?;
                     progress.metric(MetricEvent::DreamTrial(DreamTrialMetrics {
                         transaction_id: format!("sleep-{}", txn.id),
                         candidate_hash: candidate.artifact_hash.clone(),
                         adapter_hash: trial.adapter_hash.clone(),
                         evaluator_hash: trial.evaluator_hash.clone(),
-                        lora_rank: config.lora_rank as u32,
+                        lora_rank: config
+                            .lora_rank
+                            .try_into()
+                            .context("dream LoRA rank exceeds metric schema")?,
                         lora_alpha: config.lora_alpha as f64,
                         independent_task_delta: f64::from(trial.independent_task_improvement),
                         reward: f64::from(trial.independent_task_improvement),
@@ -2227,9 +2972,13 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                     .cloned()
                     .collect::<Vec<_>>();
                 if txn.dream_policy_receipt.is_none() {
-                    let receipt =
-                        backend.restem_update(&txn, &accepted, config.restem_iterations)?;
-                    validate_content_hash(&receipt, "ReSTEM policy receipt")?;
+                    let receipt = run_shared_checkpoint_operation(
+                        &txn,
+                        backend,
+                        "ReSTEM policy update",
+                        |backend| backend.restem_update(&txn, &accepted, config.restem_iterations),
+                    )?;
+                    validate_sha256_identity(&receipt, "ReSTEM policy receipt")?;
                     state
                         .pending
                         .as_mut()
@@ -2237,12 +2986,15 @@ pub fn run_dreaming_with_progress<B: DreamingBackend, P: SleepProgressSink>(
                         .dream_policy_receipt = Some(receipt);
                     progress.persist(state)?;
                 }
-                let current_txn = state.pending.clone().expect("transaction checked above");
-                ensure_shared_checkpoint_unchanged(&current_txn, backend, "ReSTEM policy update")?;
                 state.transition(SleepPhase::Candidate)?;
                 progress.persist(state)?;
             }
             SleepPhase::Candidate => {
+                ensure_shared_checkpoint_unchanged(
+                    &txn,
+                    backend,
+                    "finalizing the dream candidate",
+                )?;
                 return Ok(txn
                     .dream_trials
                     .into_iter()
@@ -2261,12 +3013,30 @@ fn validate_generated_dreams(candidates: &[GeneratedDream], expected: usize) -> 
         candidates.len()
     );
     let mut ids = BTreeSet::new();
+    let mut dimensions = None;
+    let mut gradient_elements = 0usize;
     for candidate in candidates {
         ensure!(
-            !candidate.id.trim().is_empty() && !candidate.gradient.is_empty(),
+            !candidate.id.trim().is_empty()
+                && candidate.id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES
+                && !candidate.gradient.is_empty()
+                && candidate.gradient.len() <= MAX_DREAM_GRADIENT_DIMENSIONS
+                && candidate.gradient.iter().all(|value| value.is_finite()),
             "generated dream has incomplete identity or gradient"
         );
-        validate_content_hash(&candidate.artifact_hash, "generated dream artifact hash")?;
+        ensure!(
+            dimensions.is_none_or(|expected| expected == candidate.gradient.len()),
+            "generated dreams use inconsistent gradient dimensions"
+        );
+        dimensions = Some(candidate.gradient.len());
+        gradient_elements = gradient_elements
+            .checked_add(candidate.gradient.len())
+            .context("generated-dream gradient element count overflow")?;
+        ensure!(
+            gradient_elements <= DreamingConfig::MAX_CANDIDATES * MAX_DREAM_GRADIENT_DIMENSIONS,
+            "generated-dream gradient work exceeds its operational limit"
+        );
+        validate_sha256_identity(&candidate.artifact_hash, "generated dream artifact hash")?;
         ensure!(
             ids.insert(candidate.id.as_str()),
             "duplicate dream candidate `{}`",
@@ -2285,21 +3055,121 @@ fn ensure_shared_checkpoint_unchanged<B: DreamingBackend>(
         .dream_shared_checkpoint_hash
         .as_deref()
         .context("dream transaction has no shared checkpoint hash")?;
-    let observed = backend.shared_checkpoint_hash()?;
-    validate_content_hash(&observed, "observed shared-checkpoint hash")?;
-    if observed != expected {
-        backend.restore_shared_candidate(txn).with_context(|| {
-            format!("{operation} mutated the shared checkpoint and restoration failed")
-        })?;
-        let restored = backend.shared_checkpoint_hash()?;
-        validate_content_hash(&restored, "restored shared-checkpoint hash")?;
-        ensure!(
-            restored == expected,
-            "{operation} mutated the shared checkpoint and restoration did not recover it"
-        );
-        bail!("{operation} mutated the shared checkpoint; immutable candidate was restored");
+    ensure_shared_checkpoint_hash(txn, backend, expected, operation)
+}
+
+fn ensure_committed_candidate_binding<B: DreamingBackend>(
+    txn: &ConsolidationTxn,
+    backend: &mut B,
+    operation: &str,
+) -> Result<()> {
+    let first_error = match backend.verify_committed_candidate(txn) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    backend.restore_shared_candidate(txn).with_context(|| {
+        format!("{operation} failed and restoration of the committed candidate also failed")
+    })?;
+    backend.verify_committed_candidate(txn).with_context(|| {
+        format!(
+            "{operation} failed ({first_error:#}); restoration did not recover the committed candidate"
+        )
+    })?;
+    bail!(
+        "{operation} did not start from the committed candidate; immutable candidate was restored"
+    )
+}
+
+fn read_shared_checkpoint_hash<B: DreamingBackend>(
+    txn: &ConsolidationTxn,
+    backend: &mut B,
+    operation: &str,
+) -> Result<String> {
+    let observation = backend.shared_checkpoint_hash().and_then(|observed| {
+        validate_sha256_identity(&observed, "shared-checkpoint hash")?;
+        Ok(observed)
+    });
+    match observation {
+        Ok(hash) => Ok(hash),
+        Err(error) => {
+            backend.restore_shared_candidate(txn).with_context(|| {
+                format!("{operation} failed and restoration of the committed candidate also failed")
+            })?;
+            backend
+                .verify_committed_candidate(txn)
+                .with_context(|| format!("verifying the restored candidate after {operation}"))?;
+            bail!("{operation} failed ({error:#}); immutable candidate was restored")
+        }
     }
-    Ok(())
+}
+
+fn ensure_shared_checkpoint_hash<B: DreamingBackend>(
+    txn: &ConsolidationTxn,
+    backend: &mut B,
+    expected: &str,
+    operation: &str,
+) -> Result<()> {
+    validate_sha256_identity(expected, "expected shared-checkpoint hash")?;
+    let observation = backend.shared_checkpoint_hash().and_then(|observed| {
+        validate_sha256_identity(&observed, "observed shared-checkpoint hash")?;
+        Ok(observed)
+    });
+    if observation
+        .as_ref()
+        .is_ok_and(|observed| observed == expected)
+    {
+        return Ok(());
+    }
+
+    // If an operation returned an error, malformed evidence, or even made the
+    // fingerprint temporarily unreadable, treat the shared candidate as
+    // suspect. Restoration is mandatory before the caller can retry.
+    backend.restore_shared_candidate(txn).with_context(|| {
+        format!(
+            "{operation} did not preserve a verifiable shared checkpoint and restoration failed"
+        )
+    })?;
+    let restored = backend
+        .shared_checkpoint_hash()
+        .with_context(|| format!("reading the shared checkpoint after restoring {operation}"))?;
+    validate_sha256_identity(&restored, "restored shared-checkpoint hash")?;
+    ensure!(
+        restored == expected,
+        "{operation} did not preserve the shared checkpoint and restoration recovered a different candidate"
+    );
+    match observation {
+        Ok(observed) => bail!(
+            "{operation} mutated the shared checkpoint from {expected} to {observed}; immutable candidate was restored"
+        ),
+        Err(error) => bail!(
+            "{operation} left the shared checkpoint unverifiable ({error:#}); immutable candidate was restored"
+        ),
+    }
+}
+
+/// Run one potentially fallible Dreaming backend operation behind the shared
+/// candidate boundary. The postcondition is checked regardless of whether the
+/// operation succeeds; a backend error can never bypass restoration.
+fn run_shared_checkpoint_operation<B, T>(
+    txn: &ConsolidationTxn,
+    backend: &mut B,
+    operation: &str,
+    action: impl FnOnce(&mut B) -> Result<T>,
+) -> Result<T>
+where
+    B: DreamingBackend,
+{
+    ensure_shared_checkpoint_unchanged(txn, backend, &format!("before {operation}"))?;
+    let result = action(backend);
+    let integrity = ensure_shared_checkpoint_unchanged(txn, backend, operation);
+    match (result, integrity) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error).with_context(|| format!("{operation} failed")),
+        (Ok(_), Err(integrity_error)) => Err(integrity_error),
+        (Err(error), Err(integrity_error)) => bail!(
+            "{operation} failed: {error:#}; shared-candidate recovery also reported: {integrity_error:#}"
+        ),
+    }
 }
 
 /// Execute the non-dreaming half of sleep with rollback on every failure.
@@ -2315,6 +3185,9 @@ pub fn run_consolidation_with_progress<B: ConsolidationBackend, P: SleepProgress
     backend: &mut B,
     progress: &mut P,
 ) -> Result<bool> {
+    state
+        .validate_resume()
+        .context("validating consolidation resume state")?;
     progress.persist(state)?;
     let txn = state
         .pending
@@ -2329,7 +3202,7 @@ pub fn run_consolidation_with_progress<B: ConsolidationBackend, P: SleepProgress
                 progress.persist(state)?;
             }
             SleepPhase::KnowledgeSeeding => {
-                state.reserve_knowledge_rng(0, 1)?;
+                state.reserve_knowledge_rng(0, backend.knowledge_rng_count()?)?;
                 progress.persist(state)?;
                 let current_txn = state.pending.clone().expect("transaction checked above");
                 backend.knowledge_seed(&current_txn)?;
@@ -2337,7 +3210,7 @@ pub fn run_consolidation_with_progress<B: ConsolidationBackend, P: SleepProgress
                 progress.persist(state)?;
             }
             SleepPhase::Imitation => {
-                state.reserve_imitation_rng(0, 1)?;
+                state.reserve_imitation_rng(0, backend.imitation_rng_count()?)?;
                 progress.persist(state)?;
                 let current_txn = state.pending.clone().expect("transaction checked above");
                 backend.learn_to_imitate(&current_txn)?;
@@ -2377,8 +3250,10 @@ pub fn run_consolidation_with_progress<B: ConsolidationBackend, P: SleepProgress
         Ok(true) => Ok(true),
         Ok(false) => {
             backend.restore_teacher(&txn)?;
-            state.rollback()?;
-            progress.persist(state)?;
+            let mut restored = state.clone();
+            restored.rollback()?;
+            progress.persist(&restored)?;
+            *state = restored;
             Ok(false)
         }
         Err(error) => {
@@ -2391,15 +3266,17 @@ pub fn run_consolidation_with_progress<B: ConsolidationBackend, P: SleepProgress
                     "consolidation committed in memory but durable state publication failed; retry persistence without rolling back",
                 ));
             }
-            let restore = backend.restore_teacher(&txn);
-            state.rollback()?;
-            let persist = progress.persist(state);
-            if let Err(restore_error) = restore {
+            if let Err(restore_error) = backend.restore_teacher(&txn) {
                 bail!(
                     "consolidation failed: {error:#}; teacher restore also failed: {restore_error:#}"
                 );
             }
-            persist.context("failed to persist restored consolidation rollback")?;
+            let mut restored = state.clone();
+            restored.rollback()?;
+            progress
+                .persist(&restored)
+                .context("failed to persist restored consolidation rollback")?;
+            *state = restored;
             Err(error)
         }
     }
@@ -2492,8 +3369,11 @@ pub fn select_dreams(
     top: usize,
     random: usize,
 ) -> Result<Vec<String>> {
+    let retained = top
+        .checked_add(random)
+        .context("dream selection quota overflow")?;
     ensure!(
-        top + random <= candidates.len(),
+        retained <= candidates.len(),
         "dream selection exceeds candidate count"
     );
     ensure!(
@@ -2507,7 +3387,10 @@ pub fn select_dreams(
         .map(|candidate| candidate.id.as_str())
         .collect::<BTreeSet<_>>();
     ensure!(
-        unique_ids.len() == candidates.len() && unique_ids.iter().all(|id| !id.trim().is_empty()),
+        unique_ids.len() == candidates.len()
+            && unique_ids
+                .iter()
+                .all(|id| { !id.trim().is_empty() && id.len() <= MAX_DREAM_CANDIDATE_ID_BYTES }),
         "dream candidates must have unique, non-empty IDs"
     );
     let mut ranked = candidates.to_vec();
@@ -2616,6 +3499,72 @@ mod tests {
     }
 
     #[test]
+    fn sleep_topology_and_rng_state_are_operationally_bounded() {
+        let bounded_tiers = |count: usize, reserve_slots: usize| SleepSchedule {
+            clock: UpdateClock::OptimizerSteps,
+            terminal_consolidation: TerminalConsolidation::DistillIntoBaseV1,
+            tiers: (0..count)
+                .map(|index| MemoryTierSchedule {
+                    id: format!("tier-{index}"),
+                    update_period: 1_u64 << index,
+                    reserve_slots,
+                })
+                .collect(),
+        };
+
+        assert!(bounded_tiers(MAX_MEMORY_TIERS + 1, 2).validate().is_err());
+        assert!(
+            bounded_tiers(2, MAX_RESERVE_SLOTS_PER_TIER + 1)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            bounded_tiers(5, MAX_RESERVE_SLOTS_PER_TIER)
+                .validate()
+                .is_err()
+        );
+
+        let schedule = schedule();
+        assert!(SleepState::new(&schedule, 0).is_err());
+        assert!(SleepState::new(&schedule, MAX_SLEEP_RNG_STREAMS + 1).is_err());
+        let mut state = SleepState::new(&schedule, 1).unwrap();
+        state.rng_counters.resize(MAX_SLEEP_RNG_STREAMS + 1, 0);
+        assert!(state.validate_resume().is_err());
+    }
+
+    #[test]
+    fn rng_reservations_without_a_transaction_are_failure_atomic() {
+        let mut state = SleepState::new(&schedule(), 1).unwrap();
+        let initial = state.clone();
+
+        assert!(state.reserve_knowledge_rng(0, 1).is_err());
+        assert_eq!(state, initial);
+        assert!(state.reserve_imitation_rng(0, 1).is_err());
+        assert_eq!(state, initial);
+        assert!(state.reserve_dream_generation_rng(0, 1).is_err());
+        assert_eq!(state, initial);
+        assert!(state.reserve_dream_selection_rng(0).is_err());
+        assert_eq!(state, initial);
+        assert!(state.reserve_dream_trial_rng(0, "candidate").is_err());
+        assert_eq!(state, initial);
+    }
+
+    #[test]
+    fn rng_reservations_in_the_wrong_subphase_are_failure_atomic() {
+        let mut state = begun_state();
+        let prospective = state.clone();
+        assert!(state.reserve_knowledge_rng(0, 1).is_err());
+        assert_eq!(state, prospective);
+
+        state.transition(SleepPhase::KnowledgeSeeding).unwrap();
+        let knowledge = state.clone();
+        assert!(state.reserve_imitation_rng(0, 1).is_err());
+        assert_eq!(state, knowledge);
+        assert!(state.reserve_dream_generation_rng(0, 1).is_err());
+        assert_eq!(state, knowledge);
+    }
+
+    #[test]
     fn resume_rejects_multiple_unconsumed_boundaries_for_one_sender() {
         let mut state = SleepState::new(&schedule(), 1).unwrap();
         state.clock = 4;
@@ -2655,6 +3604,20 @@ mod tests {
     }
 
     #[test]
+    fn tensor_generation_is_bound_to_its_manifest_without_partial_mutation() {
+        let mut state = begun_state();
+        let before = state.clone();
+
+        let error = state
+            .record_tensor_transaction(format!("sha256-{}", "1".repeat(64)), test_hash('2'))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn resume_rejects_transaction_clock_mask_and_dream_drift() {
         let mut wrong_clock = begun_state();
         wrong_clock.pending.as_mut().unwrap().trigger_clock += 1;
@@ -2663,6 +3626,18 @@ mod tests {
         let mut wrong_receiver_mask = begun_state();
         wrong_receiver_mask.tiers[1].slots[0].active = true;
         assert!(wrong_receiver_mask.validate_resume().is_err());
+
+        let mut wrong_committed_clock = committed_state();
+        wrong_committed_clock
+            .pending
+            .as_mut()
+            .unwrap()
+            .trigger_clock = 1;
+        let error = wrong_committed_clock
+            .validate_resume()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sender clocks"), "{error}");
 
         let mut duplicate_selection = committed_state();
         duplicate_selection
@@ -2685,6 +3660,83 @@ mod tests {
             .transition(SleepPhase::DreamTrials)
             .unwrap();
         assert!(duplicate_selection.validate_resume().is_err());
+    }
+
+    #[test]
+    fn resume_rejects_forged_terminal_topology_and_incomplete_reset_plan() {
+        let mut forged_terminal = begun_state();
+        let pending = forged_terminal.pending.as_mut().unwrap();
+        pending.terminal = true;
+        pending.receiver = pending.sender;
+        let error = forged_terminal.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("terminal marker"), "{error}");
+
+        let schedule = schedule();
+        let mut omitted_slot = SleepState::new(&schedule, 1).unwrap();
+        omitted_slot.tiers[0].slots[1].active = true;
+        omitted_slot.advance_clock(&schedule, 2).unwrap();
+        omitted_slot
+            .begin(
+                0,
+                "teacher/reset-plan".into(),
+                test_hash('a'),
+                "student/reset-plan".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        assert_eq!(
+            omitted_slot.pending.as_ref().unwrap().sender_slots_to_reset,
+            vec![1]
+        );
+        omitted_slot
+            .pending
+            .as_mut()
+            .unwrap()
+            .sender_slots_to_reset
+            .clear();
+        let error = omitted_slot.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("exact active-slot set"), "{error}");
+
+        let mut committed_omission = SleepState::new(&schedule, 1).unwrap();
+        committed_omission.tiers[0].slots[1].active = true;
+        committed_omission.advance_clock(&schedule, 2).unwrap();
+        committed_omission
+            .begin(
+                0,
+                "teacher/committed-reset-plan".into(),
+                test_hash('a'),
+                "student/committed-reset-plan".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        committed_omission
+            .transition(SleepPhase::KnowledgeSeeding)
+            .unwrap();
+        committed_omission
+            .transition(SleepPhase::Imitation)
+            .unwrap();
+        committed_omission
+            .transition(SleepPhase::RetentionValidation)
+            .unwrap();
+        committed_omission.transition(SleepPhase::Commit).unwrap();
+        committed_omission
+            .record_committed_candidate("candidate/committed-reset-plan".into(), test_hash('d'))
+            .unwrap();
+        committed_omission.commit_consolidation().unwrap();
+        committed_omission.tiers[0].slots[1].active = true;
+        committed_omission
+            .pending
+            .as_mut()
+            .unwrap()
+            .sender_slots_to_reset
+            .clear();
+        let error = committed_omission
+            .validate_resume()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("retains an active reserve slot"), "{error}");
     }
 
     #[test]
@@ -2715,7 +3767,9 @@ mod tests {
                     )
                     .unwrap();
                 state.transition(SleepPhase::KnowledgeSeeding).unwrap();
+                state.reserve_knowledge_rng(0, 1).unwrap();
                 state.transition(SleepPhase::Imitation).unwrap();
+                state.reserve_imitation_rng(0, 1).unwrap();
                 state.transition(SleepPhase::RetentionValidation).unwrap();
                 state.transition(SleepPhase::Commit).unwrap();
                 state
@@ -2898,9 +3952,20 @@ mod tests {
         calls: Vec<&'static str>,
         retention: bool,
         fail_seed: bool,
+        fail_restore: bool,
+        knowledge_samples: u64,
+        imitation_samples: u64,
     }
 
     impl ConsolidationBackend for MockBackend {
+        fn knowledge_rng_count(&self) -> Result<u64> {
+            Ok(self.knowledge_samples.max(1))
+        }
+
+        fn imitation_rng_count(&self) -> Result<u64> {
+            Ok(self.imitation_samples.max(1))
+        }
+
         fn compute_prospective_update(&mut self, _: &ConsolidationTxn) -> Result<()> {
             self.calls.push("compute");
             Ok(())
@@ -2931,6 +3996,7 @@ mod tests {
         }
         fn restore_teacher(&mut self, _: &ConsolidationTxn) -> Result<()> {
             self.calls.push("restore");
+            ensure!(!self.fail_restore, "restore failure");
             Ok(())
         }
     }
@@ -2972,6 +4038,23 @@ mod tests {
             before
         );
         assert!(state.due_senders.is_empty());
+    }
+
+    #[test]
+    fn generic_consolidation_reserves_every_backend_sample() {
+        let mut state = begun_state();
+        let mut backend = MockBackend {
+            retention: true,
+            knowledge_samples: 5,
+            imitation_samples: 7,
+            ..Default::default()
+        };
+
+        assert!(run_consolidation(&mut state, &mut backend).unwrap());
+        let txn = state.pending.unwrap();
+        assert_eq!(txn.knowledge_rng.unwrap().count, 5);
+        assert_eq!(txn.imitation_rng.unwrap().count, 7);
+        assert_eq!(state.rng_counters, vec![12]);
     }
 
     #[test]
@@ -3078,6 +4161,43 @@ mod tests {
     }
 
     #[test]
+    fn commit_rejects_an_incomplete_sender_reset_plan_without_mutation() {
+        let schedule = schedule();
+        let mut state = SleepState::new(&schedule, 1).unwrap();
+        state.tiers[0].slots[0].active = true;
+        state.advance_clock(&schedule, 2).unwrap();
+        state
+            .begin(
+                0,
+                "teacher/incomplete-reset".into(),
+                test_hash('a'),
+                "student/incomplete-reset".into(),
+                test_hash('b'),
+                test_hash('c'),
+            )
+            .unwrap();
+        state
+            .pending
+            .as_mut()
+            .unwrap()
+            .sender_slots_to_reset
+            .clear();
+        state.transition(SleepPhase::KnowledgeSeeding).unwrap();
+        state.transition(SleepPhase::Imitation).unwrap();
+        state.transition(SleepPhase::RetentionValidation).unwrap();
+        state.transition(SleepPhase::Commit).unwrap();
+        state
+            .record_committed_candidate("candidate/incomplete-reset".into(), test_hash('d'))
+            .unwrap();
+        let before = state.clone();
+
+        let error = state.commit_consolidation().unwrap_err().to_string();
+
+        assert!(error.contains("exact active-slot set"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn resume_rejects_completed_receipts_that_can_alias_attempt_ids() {
         let mut finished = committed_state();
         finished.transition(SleepPhase::Candidate).unwrap();
@@ -3110,6 +4230,110 @@ mod tests {
     }
 
     #[test]
+    fn resume_revalidates_the_bounded_completed_transaction_evidence() {
+        let mut finished = committed_state();
+        finished.transition(SleepPhase::Candidate).unwrap();
+        finished.finish_candidate().unwrap();
+
+        let mut forged_hash = finished.clone();
+        forged_hash.completed_transactions[0].candidate_hash = Some("sha256:not-a-hash".into());
+        let error = forged_hash.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("completed candidate hash"), "{error}");
+
+        let mut partial_dream = finished;
+        let start = partial_dream.rng_counters[0];
+        partial_dream.rng_counters[0] += 1;
+        partial_dream.completed_transactions[0].dream_generation_rng = Some(RngReservation {
+            stream: 0,
+            start,
+            count: 1,
+        });
+        let error = partial_dream.validate_resume().unwrap_err().to_string();
+        assert!(error.contains("partial Dreaming evidence"), "{error}");
+    }
+
+    #[test]
+    fn finish_candidate_overflow_is_failure_atomic() {
+        let mut state = committed_state();
+        state.transition(SleepPhase::Candidate).unwrap();
+        state.completed_count = u64::MAX;
+        let before = state.clone();
+
+        let error = state.finish_candidate().unwrap_err().to_string();
+
+        assert!(error.contains("count overflow"), "{error}");
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn completed_candidate_prunes_the_manifest_index_with_the_audit_tail() {
+        let mut state = committed_state();
+        state.transition(SleepPhase::Candidate).unwrap();
+        let rng_start = state.rng_counters[0];
+        state.rng_counters[0] += 3;
+        let pending = state.pending.as_mut().unwrap();
+        pending.dream_generation_rng = Some(RngReservation {
+            stream: 0,
+            start: rng_start,
+            count: 1,
+        });
+        pending.dream_selection_rng = Some(RngReservation {
+            stream: 0,
+            start: rng_start + 1,
+            count: 1,
+        });
+        pending.dream_trial_rngs = vec![DreamTrialRng {
+            candidate_id: "dream".into(),
+            reservation: RngReservation {
+                stream: 0,
+                start: rng_start + 2,
+                count: 1,
+            },
+        }];
+        pending.dream_shared_checkpoint_hash = Some(test_hash('8'));
+        pending.dream_selected = vec!["dream".into()];
+        pending.dream_trials = vec![DreamTrial {
+            candidate_id: "dream".into(),
+            adapter_hash: test_hash('9'),
+            evaluator_hash: test_hash('6'),
+            independent_task_improvement: 0.1,
+        }];
+        pending.dream_policy_receipt = Some(test_hash('5'));
+        let template = state.pending.as_ref().unwrap().clone();
+        state.completed_transactions = (1..=COMPLETED_TRANSACTION_TAIL)
+            .map(|id| {
+                let mut txn = template.clone();
+                txn.id = id as u64;
+                txn.generated_manifest = Some(format!("sha256:{:064x}", id));
+                txn
+            })
+            .collect();
+        state.completed_count = COMPLETED_TRANSACTION_TAIL as u64;
+        state.cycle = ARTIFACT_MANIFEST_TAIL as u64;
+        let pending = state.pending.as_mut().unwrap();
+        pending.id = state.cycle;
+        pending.generated_manifest = Some(format!("sha256:{:064x}", ARTIFACT_MANIFEST_TAIL));
+        state.artifact_manifests =
+            referenced_artifact_manifests(&state.completed_transactions, state.pending.as_ref())
+                .unwrap();
+        assert_eq!(state.artifact_manifests.len(), ARTIFACT_MANIFEST_TAIL);
+
+        state.finish_candidate().unwrap();
+
+        assert_eq!(
+            state.completed_transactions.len(),
+            COMPLETED_TRANSACTION_TAIL
+        );
+        assert_eq!(state.artifact_manifests.len(), COMPLETED_TRANSACTION_TAIL);
+        assert!(
+            !state
+                .artifact_manifests
+                .contains(&format!("sha256:{:064x}", 1))
+        );
+        state.validate_resume().unwrap();
+    }
+
+    #[test]
     fn failed_consolidation_restores_teacher() {
         let mut state = begun_state();
         let mut backend = MockBackend {
@@ -3120,6 +4344,84 @@ mod tests {
         assert!(run_consolidation(&mut state, &mut backend).is_err());
         assert_eq!(backend.calls, vec!["compute", "stage", "seed", "restore"]);
         assert_eq!(state.phase, SleepPhase::Wake);
+    }
+
+    #[test]
+    fn failed_teacher_restore_never_publishes_rollback_metadata() {
+        #[derive(Default)]
+        struct RecordingProgress(Vec<SleepState>);
+
+        impl SleepProgressSink for RecordingProgress {
+            fn persist(&mut self, state: &SleepState) -> Result<()> {
+                self.0.push(state.clone());
+                Ok(())
+            }
+        }
+
+        let mut state = begun_state();
+        let mut backend = MockBackend {
+            fail_seed: true,
+            fail_restore: true,
+            ..Default::default()
+        };
+        let mut progress = RecordingProgress::default();
+        let error = run_consolidation_with_progress(&mut state, &mut backend, &mut progress)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("teacher restore also failed"), "{error}");
+        assert_eq!(state.phase, SleepPhase::KnowledgeSeeding);
+        assert!(state.pending.is_some());
+        assert!(
+            progress
+                .0
+                .iter()
+                .all(|snapshot| snapshot.phase != SleepPhase::Wake && snapshot.pending.is_some()),
+            "a rollback cursor was published despite failed teacher restoration"
+        );
+    }
+
+    #[test]
+    fn failed_rollback_persistence_leaves_the_caller_pending() {
+        #[derive(Default)]
+        struct RejectRollbackProgress(Vec<SleepState>);
+
+        impl SleepProgressSink for RejectRollbackProgress {
+            fn persist(&mut self, state: &SleepState) -> Result<()> {
+                if state.phase == SleepPhase::Wake {
+                    bail!("injected rollback persistence failure");
+                }
+                self.0.push(state.clone());
+                Ok(())
+            }
+        }
+
+        for mut backend in [
+            MockBackend::default(),
+            MockBackend {
+                fail_seed: true,
+                ..Default::default()
+            },
+        ] {
+            let mut state = begun_state();
+            let mut progress = RejectRollbackProgress::default();
+            let error = format!(
+                "{:#}",
+                run_consolidation_with_progress(&mut state, &mut backend, &mut progress)
+                    .unwrap_err()
+            );
+
+            assert!(error.contains("rollback persistence failure"), "{error}");
+            assert_ne!(state.phase, SleepPhase::Wake);
+            assert!(state.pending.is_some());
+            assert!(
+                progress
+                    .0
+                    .iter()
+                    .all(|snapshot| snapshot.phase != SleepPhase::Wake),
+                "a failed rollback publication escaped into durable progress"
+            );
+        }
     }
 
     #[test]
@@ -3197,7 +4499,9 @@ mod tests {
                 )
                 .unwrap();
             state.transition(SleepPhase::KnowledgeSeeding).unwrap();
+            state.reserve_knowledge_rng(0, 1).unwrap();
             state.transition(SleepPhase::Imitation).unwrap();
+            state.reserve_imitation_rng(0, 1).unwrap();
             state.transition(SleepPhase::RetentionValidation).unwrap();
             state.transition(SleepPhase::Commit).unwrap();
             state
@@ -3354,6 +4658,130 @@ mod tests {
             },
         ];
         assert!(select_dreams(&duplicated, 1, 1).is_err());
+        assert!(select_dreams(&[], usize::MAX, 1).is_err());
+
+        let mut overflow = dreaming_config();
+        overflow.retain_top = usize::MAX;
+        overflow.retain_random = 1;
+        assert!(overflow.validate().is_err());
+
+        let mut rollout_overflow = KnowledgeSeedingConfig {
+            chunk_tokens: 1,
+            teacher_rollouts: usize::MAX,
+            detached_student_rollouts: 1,
+            temperature: 1.0,
+            forward_kl_weight: 1.0,
+        };
+        assert!(rollout_overflow.validate().is_err());
+        rollout_overflow.detached_student_rollouts = 0;
+        assert!(rollout_overflow.validate().is_err());
+    }
+
+    #[test]
+    fn generated_dream_validation_rejects_unbounded_or_nonfinite_gradients() {
+        let candidate = |gradient| GeneratedDream {
+            id: "candidate".into(),
+            artifact_hash: test_hash('d'),
+            gradient,
+            diversity_key: 0,
+        };
+
+        assert!(validate_generated_dreams(&[candidate(vec![f32::NAN])], 1).is_err());
+        assert!(
+            validate_generated_dreams(
+                &[candidate(vec![0.0; MAX_DREAM_GRADIENT_DIMENSIONS + 1])],
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sleep_configuration_accepts_boundaries_and_rejects_unbounded_work() {
+        let knowledge_boundary = KnowledgeSeedingConfig {
+            chunk_tokens: KnowledgeSeedingConfig::MAX_CHUNK_TOKENS,
+            teacher_rollouts: KnowledgeSeedingConfig::MAX_ROLLOUTS - 1,
+            detached_student_rollouts: 1,
+            temperature: 1.0,
+            forward_kl_weight: 1.0,
+        };
+        knowledge_boundary.validate().unwrap();
+
+        let mut invalid_knowledge = knowledge_boundary.clone();
+        invalid_knowledge.chunk_tokens = KnowledgeSeedingConfig::MAX_CHUNK_TOKENS + 1;
+        let error = invalid_knowledge.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("chunk_tokens"), "{error:#}");
+        invalid_knowledge = knowledge_boundary.clone();
+        invalid_knowledge.teacher_rollouts = KnowledgeSeedingConfig::MAX_ROLLOUTS;
+        let error = invalid_knowledge.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("rollout count"), "{error:#}");
+
+        let imitation_boundary = ImitationConfig {
+            semantic_judge_hash: test_hash('a'),
+            semantic_weight: 0.5,
+            maximum_edit_distance: ImitationConfig::MAX_EDIT_DISTANCE,
+            grpo_group_size: ImitationConfig::MAX_GRPO_GROUP_SIZE,
+        };
+        imitation_boundary.validate().unwrap();
+
+        let mut invalid_imitation = imitation_boundary.clone();
+        invalid_imitation.maximum_edit_distance = ImitationConfig::MAX_EDIT_DISTANCE + 1;
+        let error = invalid_imitation.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("edit distance"), "{error:#}");
+        invalid_imitation = imitation_boundary.clone();
+        invalid_imitation.grpo_group_size = ImitationConfig::MAX_GRPO_GROUP_SIZE + 1;
+        let error = invalid_imitation.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("group size"), "{error:#}");
+
+        let dreaming_boundary = DreamingConfig {
+            candidate_count: DreamingConfig::MAX_CANDIDATES,
+            retain_top: DreamingConfig::MAX_CANDIDATES,
+            retain_random: 0,
+            lora_rank: DreamingConfig::MAX_LORA_RANK,
+            lora_alpha: DreamingConfig::MAX_LORA_ALPHA,
+            restem_iterations: DreamingConfig::MAX_RESTEM_ITERATIONS,
+            selector_version: "gradient-cosine-v1".into(),
+            reference_set_hash: test_hash('b'),
+            trial_evaluator_hash: test_hash('c'),
+        };
+        dreaming_boundary.validate().unwrap();
+
+        for (mut invalid, expected) in [
+            (
+                DreamingConfig {
+                    candidate_count: DreamingConfig::MAX_CANDIDATES + 1,
+                    ..dreaming_boundary.clone()
+                },
+                "candidate count",
+            ),
+            (
+                DreamingConfig {
+                    lora_rank: DreamingConfig::MAX_LORA_RANK + 1,
+                    ..dreaming_boundary.clone()
+                },
+                "LoRA rank",
+            ),
+            (
+                DreamingConfig {
+                    lora_alpha: DreamingConfig::MAX_LORA_ALPHA + 1,
+                    ..dreaming_boundary.clone()
+                },
+                "LoRA alpha",
+            ),
+            (
+                DreamingConfig {
+                    restem_iterations: DreamingConfig::MAX_RESTEM_ITERATIONS + 1,
+                    ..dreaming_boundary.clone()
+                },
+                "ReSTEM iterations",
+            ),
+        ] {
+            // Keep quotas structurally valid when testing the candidate cap so
+            // the operational ceiling is the first rejected condition.
+            invalid.retain_top = invalid.retain_top.min(invalid.candidate_count);
+            let error = invalid.validate().unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]
@@ -3363,19 +4791,33 @@ mod tests {
         assert!(values[2] > values[1] && values[1] > values[0]);
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DreamFailure {
+        Generation,
+        Load,
+        Reference,
+        Trial,
+        Policy,
+    }
+
     #[derive(Default)]
     struct MockDreamBackend {
+        committed_hash: String,
         shared_hash: String,
         generation_calls: usize,
         load_calls: usize,
         trial_calls: Vec<String>,
         restem_calls: usize,
+        restores: usize,
         all_rejected: bool,
+        fail_once: Option<DreamFailure>,
+        invalid_trial: bool,
     }
 
     impl MockDreamBackend {
         fn new() -> Self {
             Self {
+                committed_hash: test_hash('d'),
                 shared_hash: test_hash('d'),
                 ..Self::default()
             }
@@ -3386,6 +4828,22 @@ mod tests {
                 all_rejected: true,
                 ..Self::new()
             }
+        }
+
+        fn failing(operation: DreamFailure) -> Self {
+            Self {
+                fail_once: Some(operation),
+                ..Self::new()
+            }
+        }
+
+        fn fail_if_requested(&mut self, operation: DreamFailure) -> Result<()> {
+            if self.fail_once == Some(operation) {
+                self.fail_once = None;
+                self.shared_hash = test_hash('e');
+                bail!("injected {operation:?} failure after shared-candidate mutation");
+            }
+            Ok(())
         }
 
         fn dreams() -> Vec<GeneratedDream> {
@@ -3422,6 +4880,18 @@ mod tests {
     }
 
     impl DreamingBackend for MockDreamBackend {
+        fn verify_committed_candidate(&mut self, txn: &ConsolidationTxn) -> Result<()> {
+            ensure!(
+                txn.candidate_hash.as_ref() == Some(&self.committed_hash),
+                "dream backend is bound to another committed checkpoint"
+            );
+            ensure!(
+                self.shared_hash == test_hash('d'),
+                "dream backend shared parameters differ from its immutable candidate"
+            );
+            Ok(())
+        }
+
         fn shared_checkpoint_hash(&mut self) -> Result<String> {
             Ok(self.shared_hash.clone())
         }
@@ -3434,6 +4904,7 @@ mod tests {
         ) -> Result<(String, Vec<GeneratedDream>)> {
             ensure!(random_extra_expert, "dream exploration was not enabled");
             ensure!(candidate_count == 3, "unexpected candidate count");
+            self.fail_if_requested(DreamFailure::Generation)?;
             self.generation_calls += 1;
             Ok((test_hash('7'), Self::dreams()))
         }
@@ -3444,6 +4915,7 @@ mod tests {
             manifest: &str,
         ) -> Result<Vec<GeneratedDream>> {
             ensure!(manifest == test_hash('7'), "wrong dream manifest");
+            self.fail_if_requested(DreamFailure::Load)?;
             self.load_calls += 1;
             Ok(Self::dreams())
         }
@@ -3454,6 +4926,7 @@ mod tests {
             reference_set_hash: &str,
         ) -> Result<Vec<f32>> {
             ensure!(reference_set_hash == test_hash('8'), "wrong reference set");
+            self.fail_if_requested(DreamFailure::Reference)?;
             Ok(vec![1.0, 0.0])
         }
 
@@ -3465,10 +4938,14 @@ mod tests {
             alpha: usize,
         ) -> Result<DreamTrial> {
             ensure!(rank == 64 && alpha == 128, "wrong LoRA recipe");
+            self.fail_if_requested(DreamFailure::Trial)?;
             self.trial_calls.push(candidate.id.clone());
             let mut trial = Self::trial(&candidate.id);
             if self.all_rejected {
                 trial.independent_task_improvement = -0.1;
+            }
+            if self.invalid_trial {
+                trial.candidate_id = "wrong-candidate".into();
             }
             Ok(trial)
         }
@@ -3480,6 +4957,7 @@ mod tests {
             iterations: usize,
         ) -> Result<String> {
             ensure!(iterations == 1, "wrong ReSTEM iterations");
+            self.fail_if_requested(DreamFailure::Policy)?;
             if self.all_rejected {
                 ensure!(accepted.is_empty(), "all-rejected run accepted a dream");
             } else {
@@ -3494,6 +4972,7 @@ mod tests {
 
         fn restore_shared_candidate(&mut self, _: &ConsolidationTxn) -> Result<()> {
             self.shared_hash = test_hash('d');
+            self.restores += 1;
             Ok(())
         }
     }
@@ -3580,6 +5059,51 @@ mod tests {
     }
 
     #[test]
+    fn dreaming_repairs_but_never_adopts_a_wrong_shared_candidate() {
+        let mut wrongly_bound_state = committed_state();
+        let wrongly_bound_before = wrongly_bound_state.clone();
+        let mut wrongly_bound = MockDreamBackend::new();
+        wrongly_bound.committed_hash = test_hash('e');
+        let error = run_dreaming(
+            &mut wrongly_bound_state,
+            &dreaming_config(),
+            &mut wrongly_bound,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("did not recover the committed candidate"),
+            "{error}"
+        );
+        assert_eq!(wrongly_bound_state, wrongly_bound_before);
+
+        let mut state = committed_state();
+        let before = state.clone();
+        let mut backend = MockDreamBackend::new();
+        backend.shared_hash = test_hash('e');
+
+        let error = run_dreaming(&mut state, &dreaming_config(), &mut backend)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("committed candidate"), "{error}");
+        assert_eq!(state, before);
+        assert_eq!(backend.shared_hash, test_hash('d'));
+        assert_eq!(backend.restores, 1);
+
+        run_dreaming(&mut state, &dreaming_config(), &mut backend).unwrap();
+        assert_eq!(state.phase, SleepPhase::Candidate);
+
+        backend.shared_hash = test_hash('e');
+        let before = state.clone();
+        let error = run_dreaming(&mut state, &dreaming_config(), &mut backend)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("committed candidate"), "{error}");
+        assert_eq!(state, before);
+        assert_eq!(backend.shared_hash, test_hash('d'));
+    }
+
+    #[test]
     fn dreaming_finishes_when_every_isolated_trial_is_rejected() {
         let mut state = committed_state();
         let mut backend = MockDreamBackend::all_rejected();
@@ -3595,6 +5119,51 @@ mod tests {
                 .dream_policy_receipt
                 .is_some()
         );
+    }
+
+    #[test]
+    fn dreaming_backend_errors_always_restore_the_shared_candidate_before_retry() {
+        for operation in [
+            DreamFailure::Generation,
+            DreamFailure::Load,
+            DreamFailure::Reference,
+            DreamFailure::Trial,
+            DreamFailure::Policy,
+        ] {
+            let mut state = committed_state();
+            let mut backend = MockDreamBackend::failing(operation);
+            let error = run_dreaming(&mut state, &dreaming_config(), &mut backend)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shared"), "{operation:?}: {error}");
+            assert_eq!(backend.shared_hash, test_hash('d'), "{operation:?}");
+            assert_eq!(backend.restores, 1, "{operation:?}");
+            assert!(state.pending.is_some(), "{operation:?}");
+
+            let accepted = run_dreaming(&mut state, &dreaming_config(), &mut backend).unwrap();
+            assert_eq!(accepted.len(), 1, "{operation:?}");
+            assert_eq!(state.phase, SleepPhase::Candidate, "{operation:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_dream_evidence_fails_without_changing_the_shared_candidate() {
+        let mut state = committed_state();
+        let mut backend = MockDreamBackend {
+            invalid_trial: true,
+            ..MockDreamBackend::new()
+        };
+        let error = run_dreaming(&mut state, &dreaming_config(), &mut backend)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete or invalid evidence"), "{error}");
+        assert_eq!(backend.shared_hash, test_hash('d'));
+        assert_eq!(backend.restores, 0);
+        assert_eq!(state.phase, SleepPhase::DreamTrials);
+
+        backend.invalid_trial = false;
+        let accepted = run_dreaming(&mut state, &dreaming_config(), &mut backend).unwrap();
+        assert_eq!(accepted.len(), 1);
     }
 
     #[test]
@@ -3632,5 +5201,43 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn failed_selection_metric_leaves_a_resumable_ranking_cursor() {
+        struct RejectSelectionMetric;
+
+        impl SleepProgressSink for RejectSelectionMetric {
+            fn persist(&mut self, _: &SleepState) -> Result<()> {
+                Ok(())
+            }
+
+            fn metric(&mut self, event: MetricEvent) -> Result<()> {
+                if matches!(event, MetricEvent::DreamSelection(_)) {
+                    bail!("injected dream-selection metric failure");
+                }
+                Ok(())
+            }
+        }
+
+        let mut state = committed_state();
+        let mut backend = MockDreamBackend::new();
+        let error = run_dreaming_with_progress(
+            &mut state,
+            &dreaming_config(),
+            &mut backend,
+            &mut RejectSelectionMetric,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("metric failure"), "{error}");
+        assert_eq!(state.phase, SleepPhase::DreamRanking);
+        assert!(state.pending.as_ref().unwrap().dream_selected.is_empty());
+        state.validate_resume().unwrap();
+
+        let accepted = run_dreaming(&mut state, &dreaming_config(), &mut backend).unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(state.phase, SleepPhase::Candidate);
     }
 }

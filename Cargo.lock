@@ -3303,6 +3303,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
  "tracing-subscriber",
  "ureq",
  "zstd 0.13.3",

@@ -5,33 +5,25 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use hermes_llm::Tokenizer;
+use hermes_train::task::{
+    SegmentedText, SupervisedPromptSegments, TaskAdapter, TaskConfig, TaskExample,
+};
 
-use super::{EncodedText, TrainingSample, is_jsonl, open_data, required_string};
-use crate::wake::ObjectiveConfig;
+use super::{EncodedText, TrainingSample, is_jsonl, read_training_jsonl_record};
 
-fn optional_string<'a>(
+fn supervised_prompt_segments<'a>(
     value: &'a serde_json::Value,
-    field: &str,
+    task: &TaskConfig,
     path: &Path,
     line_number: usize,
-) -> Result<Option<&'a str>> {
-    match value.get(field) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => {
-            let text = value.as_str().with_context(|| {
-                format!(
-                    "optional `{field}` at {}:{line_number} must be a string",
-                    path.display()
-                )
-            })?;
-            ensure!(
-                !text.trim().is_empty(),
-                "optional `{field}` at {}:{line_number} must not be empty",
-                path.display()
-            );
-            Ok(Some(text))
-        }
-    }
+) -> Result<SupervisedPromptSegments<'a>> {
+    task.construct_supervised_prompt(value).with_context(|| {
+        format!(
+            "invalid `{}` record at {}:{line_number}",
+            task.name(),
+            path.display()
+        )
+    })
 }
 
 fn encode_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
@@ -103,26 +95,50 @@ fn make_supervised_sample(
 
 fn encode_retrieval_text(
     tokenizer: &Tokenizer,
-    prefix: &str,
-    text: &str,
+    text: &SegmentedText,
     seq_len: usize,
 ) -> Result<(EncodedText, usize)> {
-    let prefix = encode_tokens(tokenizer, prefix)?;
-    let content = encode_tokens(tokenizer, text)?;
-    ensure!(!content.is_empty(), "retrieval text tokenized to empty");
-    let fixed_tokens = prefix
-        .len()
-        .checked_add(1)
-        .context("retrieval prefix token count overflows usize")?;
+    text.validate()?;
+    let encoded = text
+        .segments
+        .iter()
+        .map(|segment| encode_tokens(tokenizer, segment))
+        .collect::<Result<Vec<_>>>()?;
+    let fixed_tokens = encoded
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != text.truncatable_segment)
+        .try_fold(1usize, |total, (_, segment)| {
+            total
+                .checked_add(segment.len())
+                .context("retrieval fixed-token count overflows usize")
+        })?;
     ensure!(
-        fixed_tokens < seq_len,
-        "retrieval prefix and EOS leave no content room at sequence_length {seq_len}"
+        fixed_tokens <= seq_len,
+        "retrieval fixed segments and EOS require {fixed_tokens} tokens but sequence_length is {seq_len}"
     );
-    let kept_content = content.len().min(seq_len - fixed_tokens);
-    let truncated_tokens = content.len() - kept_content;
+    let (kept_truncatable, truncated_tokens) = match text.truncatable_segment {
+        Some(index) => {
+            let available = seq_len - fixed_tokens;
+            let kept = encoded[index].len().min(available);
+            if text.truncatable_segment_required {
+                ensure!(
+                    kept > 0,
+                    "retrieval fixed segments and EOS leave no token for required segment {index} at sequence_length {seq_len}"
+                );
+            }
+            (kept, encoded[index].len() - kept)
+        }
+        None => (0, 0),
+    };
     let mut tokens = Vec::with_capacity(seq_len);
-    tokens.extend(prefix);
-    tokens.extend_from_slice(&content[..kept_content]);
+    for (index, segment) in encoded.into_iter().enumerate() {
+        if Some(index) == text.truncatable_segment {
+            tokens.extend_from_slice(&segment[..kept_truncatable]);
+        } else {
+            tokens.extend(segment);
+        }
+    }
     tokens.push(i64::from(tokenizer.eos_token_id()));
     let end_position = tokens.len() - 1;
     tokens.resize(seq_len, i64::from(tokenizer.eos_token_id()));
@@ -135,193 +151,88 @@ fn encode_retrieval_text(
     ))
 }
 
-fn retrieval_negatives<'a>(
-    value: &'a serde_json::Value,
-    path: &Path,
-    line_number: usize,
-) -> Result<Vec<&'a str>> {
-    let Some(value) = value.get("negatives") else {
-        return Ok(Vec::new());
-    };
-    let values = value.as_array().with_context(|| {
-        format!(
-            "optional `negatives` at {}:{line_number} must be an array of strings",
-            path.display()
-        )
-    })?;
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let text = value.as_str().with_context(|| {
-                format!(
-                    "`negatives[{index}]` at {}:{line_number} must be a string",
-                    path.display()
-                )
-            })?;
-            ensure!(
-                !text.trim().is_empty(),
-                "`negatives[{index}]` at {}:{line_number} must not be empty",
-                path.display()
-            );
-            Ok(text)
-        })
-        .collect()
-}
-
 fn structured_sample(
     value: &serde_json::Value,
-    objective: &ObjectiveConfig,
+    objective: &TaskConfig,
     tokenizer: &Tokenizer,
     seq_len: usize,
     path: &Path,
     line_number: usize,
 ) -> Result<TrainingSample> {
     match objective {
-        ObjectiveConfig::CausalLm => unreachable!("causal data has a separate streaming path"),
-        ObjectiveConfig::Summarization { instruction } => {
-            let document = required_string(value, "document", path, line_number)?;
-            let summary = required_string(value, "summary", path, line_number)?;
+        TaskConfig::CausalLm {} => unreachable!("causal data has a separate streaming path"),
+        TaskConfig::Summarization { .. }
+        | TaskConfig::RetrievalPlanning { .. }
+        | TaskConfig::InstructionTuning { .. }
+        | TaskConfig::QaReasoning { .. } => {
+            let segments = supervised_prompt_segments(value, objective, path, line_number)?;
             make_supervised_sample(
                 tokenizer,
-                &format!("{instruction}\n\nDocument:\n"),
-                document,
-                "\n\nSummary:\n",
-                summary,
+                &segments.prefix,
+                &segments.source,
+                &segments.suffix,
+                &segments.target,
                 seq_len,
-                true,
+                segments.source_required,
             )
             .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
         }
-        ObjectiveConfig::RetrievalPlanning { instruction } => {
-            let request = required_string(value, "request", path, line_number)?;
-            let plan = required_string(value, "plan", path, line_number)?;
-            let context = optional_string(value, "context", path, line_number)?;
-            let (prefix, source) = match context {
-                Some(context) => (
-                    format!("{instruction}\n\nRequest:\n{request}\n\nContext:\n"),
-                    context,
-                ),
-                None => (format!("{instruction}\n\nRequest:\n{request}\n"), ""),
+        TaskConfig::RetrievalRepresentation { .. } => {
+            let TaskExample::RetrievalRepresentation {
+                query,
+                documents: task_documents,
+                positive_index,
+            } = objective.construct_example(value).with_context(|| {
+                format!(
+                    "invalid `{}` record at {}:{line_number}",
+                    objective.name(),
+                    path.display()
+                )
+            })?
+            else {
+                unreachable!("retrieval-representation adapter returned another example type")
             };
-            make_supervised_sample(
-                tokenizer,
-                &prefix,
-                source,
-                "\nPlan:\n",
-                plan,
-                seq_len,
-                context.is_some(),
-            )
-            .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
-        }
-        ObjectiveConfig::InstructionTuning { instruction } => {
-            let prompt = required_string(value, "instruction", path, line_number)?;
-            let response = required_string(value, "response", path, line_number)?;
-            let system = optional_string(value, "system", path, line_number)?;
-            let input = optional_string(value, "input", path, line_number)?;
-            let mut prefix = String::new();
-            if let Some(system) = system {
-                prefix.push_str("System:\n");
-                prefix.push_str(system);
-                prefix.push_str("\n\n");
-            }
-            prefix.push_str(instruction);
-            prefix.push_str("\n\nInstruction:\n");
-            prefix.push_str(prompt);
-            let (suffix, source_required) = match input {
-                Some(_) => ("\n\nResponse:\n", true),
-                None => ("\nResponse:\n", false),
-            };
-            make_supervised_sample(
-                tokenizer,
-                &prefix,
-                input.unwrap_or(""),
-                suffix,
-                response,
-                seq_len,
-                source_required,
-            )
-            .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
-        }
-        ObjectiveConfig::QaReasoning {
-            instruction,
-            require_reasoning,
-        } => {
-            let question = required_string(value, "question", path, line_number)?;
-            let answer = required_string(value, "answer", path, line_number)?;
-            let reasoning = optional_string(value, "reasoning", path, line_number)?;
             ensure!(
-                !*require_reasoning || reasoning.is_some(),
-                "qa_reasoning at {}:{line_number} requires `reasoning`",
-                path.display()
+                positive_index < task_documents.len(),
+                "retrieval task adapter returned an out-of-range positive index"
             );
-            let target = match reasoning {
-                Some(reasoning) => format!("Reasoning:\n{reasoning}\n\nAnswer:\n{answer}"),
-                None => answer.to_owned(),
-            };
-            make_supervised_sample(
-                tokenizer,
-                &format!("{instruction}\n\nQuestion:\n"),
-                question,
-                "\n\nResponse:\n",
-                &target,
-                seq_len,
-                true,
-            )
-            .with_context(|| format!("cannot encode {}:{line_number}", path.display()))
-        }
-        ObjectiveConfig::ContrastiveRetrieval {
-            query_prefix,
-            document_prefix,
-            ..
-        } => {
-            let query = required_string(value, "query", path, line_number)?;
-            let positive = required_string(value, "positive", path, line_number)?;
-            let negatives = retrieval_negatives(value, path, line_number)?;
-            let (query, mut truncated_tokens) =
-                encode_retrieval_text(tokenizer, query_prefix, query, seq_len).with_context(
-                    || format!("cannot encode query at {}:{line_number}", path.display()),
-                )?;
-            let (positive, truncated) =
-                encode_retrieval_text(tokenizer, document_prefix, positive, seq_len).with_context(
-                    || format!("cannot encode positive at {}:{line_number}", path.display()),
-                )?;
-            truncated_tokens = truncated_tokens
-                .checked_add(truncated)
-                .context("retrieval truncated-token count overflows usize")?;
-            let document_count = negatives
-                .len()
-                .checked_add(1)
-                .context("retrieval document count overflows usize")?;
-            let mut documents = Vec::with_capacity(document_count);
-            documents.push(positive);
-            for (index, negative) in negatives.into_iter().enumerate() {
-                let (negative, truncated) =
-                    encode_retrieval_text(tokenizer, document_prefix, negative, seq_len)
-                        .with_context(|| {
-                            format!(
-                                "cannot encode negative {index} at {}:{line_number}",
-                                path.display()
-                            )
-                        })?;
+            let (query, mut truncated_tokens) = encode_retrieval_text(tokenizer, &query, seq_len)
+                .with_context(|| {
+                format!("cannot encode query at {}:{line_number}", path.display())
+            })?;
+            let mut documents = Vec::with_capacity(task_documents.len());
+            for (index, document) in task_documents.iter().enumerate() {
+                let (document, truncated) = encode_retrieval_text(tokenizer, document, seq_len)
+                    .with_context(|| {
+                        format!(
+                            "cannot encode retrieval document {index} at {}:{line_number}",
+                            path.display()
+                        )
+                    })?;
                 truncated_tokens = truncated_tokens
                     .checked_add(truncated)
                     .context("retrieval truncated-token count overflows usize")?;
-                documents.push(negative);
+                documents.push(document);
             }
+            documents.swap(0, positive_index);
             Ok(TrainingSample::Retrieval {
                 query,
                 documents,
                 truncated_tokens,
             })
         }
+        TaskConfig::RetrievalRanking { .. }
+        | TaskConfig::PairwisePreference {}
+        | TaskConfig::VerifiableRl { .. } => {
+            unreachable!("wake projection rejects tasks unsupported by structured training")
+        }
     }
 }
 
 pub(super) fn visit_structured_samples(
     path: &Path,
-    objective: &ObjectiveConfig,
+    reader: &mut dyn BufRead,
+    objective: &TaskConfig,
     tokenizer: &Tokenizer,
     seq_len: usize,
     mut visit: impl FnMut(TrainingSample) -> Result<bool>,
@@ -332,22 +243,22 @@ pub(super) fn visit_structured_samples(
         objective.name(),
         path.display()
     );
-    let mut reader = open_data(path)?;
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut line_number = 0usize;
     let mut count = 0usize;
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        line_number = line_number
+        let next_line_number = line_number
             .checked_add(1)
             .context("JSONL line count overflows usize")?;
+        let Some(line) = read_training_jsonl_record(reader, &mut line, path, next_line_number)?
+        else {
+            break;
+        };
+        line_number = next_line_number;
         if line.trim().is_empty() {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(&line)
+        let value: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("invalid JSONL at {}:{line_number}", path.display()))?;
         let sample = structured_sample(&value, objective, tokenizer, seq_len, path, line_number)?;
         count = count
@@ -358,4 +269,176 @@ pub(super) fn visit_structured_samples(
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use hermes_train::task::TaskExample;
+    use serde_json::json;
+
+    use super::*;
+
+    fn assert_supervised_contract(
+        task: TaskConfig,
+        record: serde_json::Value,
+        expected: SupervisedPromptSegments<'_>,
+    ) {
+        let segments =
+            supervised_prompt_segments(&record, &task, Path::new("contract.jsonl"), 7).unwrap();
+        assert_eq!(segments, expected);
+        let expected_prompt = expected.prompt();
+        let expected_segments = vec![
+            expected.prefix.into_owned(),
+            expected.source.into_owned(),
+            expected.suffix.into_owned(),
+        ];
+        let expected_target = expected.target.into_owned();
+        let TaskExample::SupervisedGeneration { prompt, target } =
+            task.construct_example(&record).unwrap()
+        else {
+            panic!(
+                "wake task `{}` returned the wrong example type",
+                task.name()
+            );
+        };
+        assert_eq!(prompt.segments, expected_segments);
+        assert_eq!(prompt.render(), expected_prompt);
+        assert_eq!(prompt.truncatable_segment, Some(1));
+        assert_eq!(
+            prompt.truncatable_segment_required,
+            expected.source_required
+        );
+        assert_eq!(target, expected_target);
+    }
+
+    #[test]
+    fn wake_uses_task_adapter_supervised_prompt_goldens() {
+        assert_supervised_contract(
+            TaskConfig::Summarization {
+                instruction: "Summarize faithfully.".into(),
+            },
+            json!({"document": "Long source.", "summary": "Short target."}),
+            SupervisedPromptSegments {
+                prefix: "Summarize faithfully.\n\nDocument:\n".into(),
+                source: "Long source.".into(),
+                suffix: "\n\nSummary:\n".into(),
+                target: "Short target.".into(),
+                source_required: true,
+            },
+        );
+
+        for (context, expected_source, expected_suffix, source_required) in [
+            (
+                Some("Official documentation."),
+                "Official documentation.",
+                "\nPlan:\n",
+                true,
+            ),
+            (None, "", "Plan:\n", false),
+        ] {
+            let mut record = json!({"request": "Find the API.", "plan": "Search, then read."});
+            if let Some(context) = context {
+                record["context"] = json!(context);
+            }
+            assert_supervised_contract(
+                TaskConfig::RetrievalPlanning {
+                    instruction: "Plan retrieval.".into(),
+                },
+                record,
+                SupervisedPromptSegments {
+                    prefix: if source_required {
+                        "Plan retrieval.\n\nRequest:\nFind the API.\n\nContext:\n".into()
+                    } else {
+                        "Plan retrieval.\n\nRequest:\nFind the API.\n".into()
+                    },
+                    source: expected_source.into(),
+                    suffix: expected_suffix.into(),
+                    target: "Search, then read.".into(),
+                    source_required,
+                },
+            );
+        }
+
+        for (system, input, expected_prefix, expected_source, source_required) in [
+            (
+                Some("Be concise."),
+                Some("Bonjour"),
+                "System:\nBe concise.\n\nFollow the request.\n\nInstruction:\nTranslate.\n\nInput:\n",
+                "Bonjour",
+                true,
+            ),
+            (
+                Some("Be concise."),
+                None,
+                "System:\nBe concise.\n\nFollow the request.\n\nInstruction:\nTranslate.",
+                "",
+                false,
+            ),
+            (
+                None,
+                Some("Bonjour"),
+                "Follow the request.\n\nInstruction:\nTranslate.\n\nInput:\n",
+                "Bonjour",
+                true,
+            ),
+            (
+                None,
+                None,
+                "Follow the request.\n\nInstruction:\nTranslate.",
+                "",
+                false,
+            ),
+        ] {
+            let mut record = json!({"instruction": "Translate.", "response": "Hello"});
+            if let Some(system) = system {
+                record["system"] = json!(system);
+            }
+            if let Some(input) = input {
+                record["input"] = json!(input);
+            }
+            assert_supervised_contract(
+                TaskConfig::InstructionTuning {
+                    instruction: "Follow the request.".into(),
+                },
+                record,
+                SupervisedPromptSegments {
+                    prefix: expected_prefix.into(),
+                    source: expected_source.into(),
+                    suffix: "\n\nResponse:\n".into(),
+                    target: "Hello".into(),
+                    source_required,
+                },
+            );
+        }
+
+        for (reasoning, require_reasoning, expected_target) in [
+            (
+                Some("Add the operands."),
+                true,
+                "Reasoning:\nAdd the operands.\n\nAnswer:\n4",
+            ),
+            (None, false, "4"),
+        ] {
+            let mut record = json!({"question": "2 + 2?", "answer": "4"});
+            if let Some(reasoning) = reasoning {
+                record["reasoning"] = json!(reasoning);
+            }
+            assert_supervised_contract(
+                TaskConfig::QaReasoning {
+                    instruction: "Reason carefully.".into(),
+                    require_reasoning,
+                },
+                record,
+                SupervisedPromptSegments {
+                    prefix: "Reason carefully.\n\nQuestion:\n".into(),
+                    source: "2 + 2?".into(),
+                    suffix: "\n\nResponse:\n".into(),
+                    target: expected_target.into(),
+                    source_required: true,
+                },
+            );
+        }
+    }
 }

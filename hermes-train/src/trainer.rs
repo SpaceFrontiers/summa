@@ -1,12 +1,31 @@
 //! Objective-aware streaming optimization loop.
 
 use super::*;
+use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 const TRAINER_LOCK_FILE: &str = ".trainer.lock";
+const MAX_PREFETCHED_SAMPLES: usize = 4_096;
+
+fn training_prefetch_capacity(batch_size: usize) -> Result<usize> {
+    ensure!(batch_size > 0, "training batch size must be positive");
+    Ok(batch_size.saturating_mul(2).min(MAX_PREFETCHED_SAMPLES))
+}
+
+fn push_bounded_wake_context(
+    contexts: &mut VecDeque<Vec<i64>>,
+    context: Vec<i64>,
+    maximum_records: usize,
+) {
+    debug_assert!(maximum_records > 0);
+    if contexts.len() == maximum_records {
+        contexts.pop_front();
+    }
+    contexts.push_back(context);
+}
 
 /// Process-lifetime ownership of one mutable training output root.
 ///
@@ -183,20 +202,26 @@ impl hermes_train::native_sleep::NativeSleepProgressSink for TrainerSleepProgres
         checkpoint: &hermes_train::native_sleep::NativeSleepCheckpoint,
     ) -> Result<()> {
         let mut checkpoint_model = self.model_template.clone();
-        load_safetensors(
+        let checkpoint_path = Path::new(&checkpoint.live_checkpoint.uri);
+        let checkpoint_bytes =
+            read_pinned_checkpoint_bytes(checkpoint_path, &checkpoint.live_checkpoint.sha256)?;
+        hermes_llm::load_safetensors_bytes(
             &mut checkpoint_model,
-            Path::new(&checkpoint.live_checkpoint.uri),
+            checkpoint_bytes,
+            &format!("sleep checkpoint {}", checkpoint_path.display()),
         )?;
-        self.state.sleep = Some(checkpoint.clone());
-        self.state.metric_records = self.metrics.state().records;
+        let mut staged_state = self.state.clone();
+        staged_state.sleep = Some(checkpoint.clone());
+        staged_state.metric_records = self.metrics.state().records;
         let _ = save_training_checkpoint_with_evidence(
             &checkpoint_model,
             self.adamw,
             self.muon,
-            self.state,
+            &staged_state,
             self.metrics,
             self.output,
         )?;
+        *self.state = staged_state;
         Ok(())
     }
 
@@ -220,12 +245,87 @@ struct PeriodicTrainingRuntime {
     config_sha256: String,
 }
 
+/// Schedule-matched no-sleep ablation runtime. Tier optimizers and pending
+/// accumulators are identical in shape and cadence to periodic sleep, while
+/// due base updates commit directly and reserve state is never mutated.
+struct WakeOnlyMemoryRuntime {
+    config: MemoryUpdateMode,
+    bank: TierOptimizerBank,
+    publisher: DurableTierOptimizerPublisher,
+}
+
+impl WakeOnlyMemoryRuntime {
+    fn load(
+        workflow: &ResolvedWakePlan,
+        model: &Transformer,
+        output: &Path,
+        device: &hermes_llm::Device,
+    ) -> Result<Option<Self>> {
+        let Some(config) = workflow
+            .phases
+            .first()
+            .and_then(|phase| phase.memory_update_mode.clone())
+        else {
+            return Ok(None);
+        };
+        let bank =
+            TierOptimizerBank::new(model, config.schedule(), config.tier_optimizer().clone())?;
+        let output = fs::canonicalize(output)
+            .with_context(|| format!("canonicalizing training output {}", output.display()))?;
+        let publisher = DurableTierOptimizerPublisher::new(
+            bank.clone(),
+            output.join("wake-only-tier-optimizers"),
+            TensorTransactionStore::new(output.join("wake-only-tensor-transactions")),
+            model.config().clone(),
+            device.clone(),
+        )?;
+        Ok(Some(Self {
+            config,
+            bank,
+            publisher,
+        }))
+    }
+
+    fn restore(&self, state: &TrainingState, model: &Transformer) -> Result<()> {
+        let TrainingMemoryUpdateState::WakeOnly {
+            config,
+            optimizer_scopes,
+        } = &state.memory_update
+        else {
+            bail!("wake_only runtime cannot restore a checkpoint from another memory mode")
+        };
+        ensure!(
+            config == &self.config,
+            "wake_only checkpoint configuration differs from the workflow"
+        );
+        self.publisher.restore_scopes(optimizer_scopes, model)
+    }
+
+    fn checkpoint(&self, state: &mut TrainingState) -> Result<()> {
+        state.memory_update = TrainingMemoryUpdateState::WakeOnly {
+            config: self.config.clone(),
+            optimizer_scopes: self.publisher.publish_checkpoint_scopes()?,
+        };
+        Ok(())
+    }
+}
+
 /// Fake-quantized parameter leaves shared by the microbatches that contribute
 /// to one master-weight update. A window must never cross an optimizer step.
 struct StagedQuantizationWindow {
     format: UltraQuantFormat,
     model: Transformer,
     tensor_count: u64,
+}
+
+fn quantization_state_format(format: Option<UltraQuantFormat>) -> String {
+    match format {
+        None => "full_precision",
+        Some(UltraQuantFormat::BinaryG128) => "binary_g128",
+        Some(UltraQuantFormat::TernaryG128) => "ternary_g128",
+        Some(UltraQuantFormat::TernaryEntropyG128) => "ternary_entropy_g128",
+    }
+    .to_owned()
 }
 
 enum PrefetchedSample {
@@ -439,6 +539,32 @@ fn preflight_resumed_sleep_runtime(
     validate_sleep_runtime_artifact(&state.artifacts, &canonical, sha256)
 }
 
+pub(super) fn preflight_resumed_memory_mode(
+    workflow: &ResolvedWakePlan,
+    state: &TrainingState,
+) -> Result<()> {
+    let periodic = workflow
+        .phases
+        .first()
+        .and_then(|phase| phase.periodic_sleep.as_ref());
+    let wake_only = workflow
+        .phases
+        .first()
+        .and_then(|phase| phase.memory_update_mode.as_ref());
+    match (&state.memory_update, periodic, wake_only) {
+        (TrainingMemoryUpdateState::Ordinary, None, None)
+        | (TrainingMemoryUpdateState::PeriodicSleep, Some(_), None) => Ok(()),
+        (TrainingMemoryUpdateState::WakeOnly { config, .. }, None, Some(expected)) => {
+            ensure!(
+                config == expected,
+                "wake_only checkpoint configuration differs from the exact workflow"
+            );
+            Ok(())
+        }
+        _ => bail!("checkpoint memory update mode differs from the exact workflow"),
+    }
+}
+
 fn validate_periodic_runtime_binding(
     factory: &BuiltinSleepPhaseContextFactory,
     sleep: &hermes_train::workflow::InModelSleepConfig,
@@ -490,9 +616,12 @@ fn advance_and_drain_periodic_sleep(
         hermes_train::sleep::UpdateClock::OptimizerSteps => state.global_step as u64,
         hermes_train::sleep::UpdateClock::ModelTokens => state.tokens_seen as u64,
     };
+    // Keep the last durable cursor installed until a newly persisted cursor
+    // replaces it. Driver construction and boundary binding are fallible; a
+    // failed attempt must not erase resumable state from the live trainer.
     let mut cursor = state
         .sleep
-        .take()
+        .clone()
         .context("periodic training has no native sleep cursor")?;
     let continuing = cursor.sleep.pending.is_some() || cursor.sleep.next_due_sender().is_some();
     if !continuing {
@@ -601,12 +730,17 @@ fn publish_quantization_phase_candidate(
         state.global_step,
         stable_cache_id(&phase.name)
     );
-    let publication = publish_qat_candidate(
-        model,
-        &output.join("quantized-candidates"),
-        &key,
-        &plan.recipe,
-    )?;
+    let candidate_store = output.join("quantized-candidates");
+    let publication = match expected_source_checkpoint_sha256 {
+        Some(source_sha256) => publish_qat_candidate_from_authenticated_source(
+            model,
+            &candidate_store,
+            &key,
+            &plan.recipe,
+            source_sha256,
+        )?,
+        None => publish_qat_candidate(model, &candidate_store, &key, &plan.recipe)?,
+    };
     if let Some(expected) = expected_source_checkpoint_sha256 {
         ensure!(
             publication.weights_sha256 == expected,
@@ -623,10 +757,11 @@ fn publish_quantization_phase_candidate(
         .quantization
         .as_mut()
         .context("quantization phase has no checkpoint quantization state")?;
-    quantization.format = format!("{:?}", plan.recipe.format).to_ascii_lowercase();
+    quantization.format = quantization_state_format(Some(plan.recipe.format));
     quantization.fake_quant_active = false;
     quantization.calibration_step = state.global_step as u64;
     quantization.manifest = Some(manifest.clone());
+    quantization.candidate_weights_sha256 = Some(publication.weights_sha256.clone());
     if !state.artifacts.iter().any(|artifact| {
         artifact.kind == "hquant_candidate"
             && artifact.hash == publication.candidate_manifest_sha256
@@ -707,7 +842,7 @@ fn bind_post_sleep_quantization_source(
         .context("memory-model QAT phase has no periodic_sleep")?;
     let mut cursor = state
         .sleep
-        .take()
+        .clone()
         .context("memory-model QAT phase has no native sleep cursor")?;
     ensure!(
         cursor.sleep.pending.is_none() && cursor.sleep.next_due_sender().is_none(),
@@ -729,6 +864,7 @@ fn publish_completed_quantization_candidate_if_pending(
     metrics: &mut MetricWriter,
     output: &Path,
     periodic_runtime: Option<&PeriodicTrainingRuntime>,
+    authenticated_model_sha256: Option<&str>,
 ) -> Result<bool> {
     let Some(plan) = &phase.quantization else {
         return Ok(false);
@@ -742,7 +878,16 @@ fn publish_completed_quantization_candidate_if_pending(
     {
         return Ok(false);
     }
-    let source = bind_post_sleep_quantization_source(periodic_runtime, phase, state, model)?;
+    let sleep_source = bind_post_sleep_quantization_source(periodic_runtime, phase, state, model)?;
+    if let (Some(sleep_source), Some(checkpoint_source)) =
+        (sleep_source.as_deref(), authenticated_model_sha256)
+    {
+        ensure!(
+            sleep_source == checkpoint_source,
+            "post-sleep QAT source differs from the authenticated trainer checkpoint"
+        );
+    }
+    let source = sleep_source.as_deref().or(authenticated_model_sha256);
     publish_quantization_phase_candidate(
         model,
         plan,
@@ -751,7 +896,7 @@ fn publish_completed_quantization_candidate_if_pending(
         state,
         metrics,
         output,
-        source.as_deref(),
+        source,
     )?;
     Ok(true)
 }
@@ -760,30 +905,8 @@ fn verify_resumed_quantization_candidate(
     state: &TrainingState,
     phase: &super::wake::ResolvedWakePhase,
     planned_steps: usize,
-    model: &Transformer,
+    resumed_weights_sha256: &str,
 ) -> Result<()> {
-    for artifact in state
-        .artifacts
-        .iter()
-        .filter(|artifact| artifact.kind == "hquant_candidate")
-    {
-        let manifest = Path::new(&artifact.manifest);
-        ensure!(
-            manifest
-                .file_name()
-                .is_some_and(|name| name == "candidate.json"),
-            "HQUANT artifact does not name candidate.json"
-        );
-        let candidate_root = manifest
-            .parent()
-            .context("HQUANT artifact manifest has no candidate root")?;
-        let publication = open_qat_candidate(candidate_root)?;
-        ensure!(
-            publication.candidate_manifest_path == manifest
-                && publication.candidate_manifest_sha256 == artifact.hash,
-            "HQUANT artifact receipt differs from its validated candidate"
-        );
-    }
     let Some(plan) = &phase.quantization else {
         ensure!(
             state.quantization.is_none(),
@@ -795,6 +918,45 @@ fn verify_resumed_quantization_candidate(
         .quantization
         .as_ref()
         .context("quantization resume has no typed state")?;
+    let state_step = u64::try_from(state.global_step)
+        .context("quantization checkpoint global step exceeds u64")?;
+    let forward_step = if state.steps_in_phase == 0 {
+        state_step
+    } else {
+        state_step
+            .checked_sub(1)
+            .context("quantization checkpoint has phase steps but no global step")?
+    };
+    let candidate_published = quantization.manifest.is_some();
+    ensure!(
+        candidate_published == quantization.candidate_weights_sha256.is_some(),
+        "quantization candidate manifest and source identity must appear together"
+    );
+    let expected_format = if candidate_published {
+        Some(plan.recipe.format)
+    } else {
+        plan.format_at(forward_step)
+    };
+    ensure!(
+        quantization.format == quantization_state_format(expected_format)
+            && quantization.fake_quant_active
+                == (!candidate_published && expected_format.is_some()),
+        "quantization resume format differs from the configured optimizer-step schedule"
+    );
+    ensure!(
+        quantization.calibration_step == state_step,
+        "quantization resume calibration clock differs from the trainer global step"
+    );
+    let expected_teacher = match &plan.training {
+        WorkflowQuantizationTraining::Qat { .. } => None,
+        WorkflowQuantizationTraining::Distillation { teacher_sha256, .. } => {
+            Some(teacher_sha256.as_str())
+        }
+    };
+    ensure!(
+        quantization.teacher_hash.as_deref() == expected_teacher,
+        "quantization resume teacher identity differs from the workflow"
+    );
     if state.steps_in_phase < planned_steps {
         ensure!(
             quantization.manifest.is_none(),
@@ -829,25 +991,33 @@ fn verify_resumed_quantization_candidate(
     let candidate = manifest
         .parent()
         .context("quantization candidate manifest has no parent")?;
-    let root = candidate
-        .parent()
-        .context("quantization candidate has no store root")?;
-    let key = candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("quantization candidate key is not UTF-8")?;
-    let publication = publish_qat_candidate(model, root, key, &plan.recipe)?;
+    let mut artifacts = state.artifacts.iter().filter(|artifact| {
+        artifact.kind == "hquant_candidate" && artifact.manifest == manifest.to_string_lossy()
+    });
+    let artifact = artifacts
+        .next()
+        .context("completed quantization phase has no candidate artifact receipt")?;
+    ensure!(
+        artifacts.next().is_none(),
+        "completed quantization phase repeats its candidate artifact receipt"
+    );
+    let publication = open_qat_candidate_addressed(candidate, &artifact.hash)?;
     ensure!(
         publication.candidate_manifest_path == manifest,
-        "quantization candidate retry resolved to another path"
+        "quantization candidate resolved to another path"
     );
-    let artifact = state
-        .artifacts
-        .iter()
-        .find(|artifact| {
-            artifact.kind == "hquant_candidate" && artifact.manifest == manifest.to_string_lossy()
-        })
-        .context("completed quantization phase has no candidate artifact receipt")?;
+    ensure!(
+        publication.recipe == plan.recipe,
+        "quantization candidate recipe differs from the workflow"
+    );
+    ensure!(
+        publication.weights_sha256 == resumed_weights_sha256,
+        "quantization candidate weights differ from the authenticated resume checkpoint"
+    );
+    ensure!(
+        quantization.candidate_weights_sha256.as_deref() == Some(resumed_weights_sha256),
+        "quantization candidate source identity differs from the authenticated resume checkpoint"
+    );
     ensure!(
         artifact.manifest == manifest.to_string_lossy()
             && artifact.hash == publication.candidate_manifest_sha256,
@@ -879,10 +1049,25 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         device.seed(args.seed);
         Some((output_lock, device))
     };
-    let data_manifests = workflow
+    let mut data_binding_cache = HashMap::new();
+    let data_bindings = workflow
         .phases
         .iter()
-        .map(|phase| phase_data_identity(&phase.data, &tokenizer, &tokenizer_hash))
+        .map(|phase| {
+            bind_phase_data(
+                &phase.data,
+                &tokenizer,
+                &tokenizer_hash,
+                &mut data_binding_cache,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let data_manifests = data_bindings
+        .iter()
+        .map(|binding| {
+            binding.ensure_still_published()?;
+            Ok(binding.signature_identity().to_owned())
+        })
         .collect::<Result<Vec<_>>>()?;
     let initial_checkpoint_sha256 = args.checkpoint.as_deref().map(file_sha256).transpose()?;
     let signature = run_signature(
@@ -892,6 +1077,9 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         &data_manifests,
         initial_checkpoint_sha256.clone(),
     )?;
+    for binding in &data_bindings {
+        binding.ensure_still_published()?;
+    }
     if args.print_run_signature {
         println!("{signature}");
         return Ok(());
@@ -907,7 +1095,8 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             token_cache_path(&token_cache_root, data, &phase.data, &tokenizer_hash)
         })
         .collect::<Result<Vec<_>>>()?;
-    let (phase_plan, total_steps) = plan_training(&workflow, &tokenizer, &token_cache_paths)?;
+    let (phase_plan, total_steps) =
+        plan_training(&workflow, &tokenizer, &token_cache_paths, &data_bindings)?;
     ensure!(
         total_steps > 0,
         "training has zero complete optimizer steps"
@@ -916,11 +1105,16 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
     let metrics_path = args.output.join("metrics.jsonl");
     let mut initial_model = Transformer::new(&config, &device)?;
     if let Some(path) = &args.checkpoint {
-        load_safetensors(&mut initial_model, path)?;
-        ensure!(
-            Some(file_sha256(path)?) == initial_checkpoint_sha256,
-            "initial checkpoint changed after its run signature was computed"
-        );
+        let expected = initial_checkpoint_sha256
+            .as_deref()
+            .expect("checkpoint hash was computed for a configured checkpoint");
+        let bytes = read_pinned_checkpoint_bytes(path, expected)
+            .context("initial checkpoint changed after its run signature was computed")?;
+        hermes_llm::load_safetensors_bytes(
+            &mut initial_model,
+            bytes,
+            &format!("initial checkpoint {}", path.display()),
+        )?;
     }
     let mut muon_parameter_ids = initial_model.muon_parameter_ids();
     ensure!(
@@ -934,8 +1128,8 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         .with_epsilon(1e-8)
         .with_weight_decay(args.weight_decay)
         .init();
-    let resume_state = if args.resume {
-        let (optimizer, state) = load_training_state(
+    let (resume_state, resume_weights_sha256) = if args.resume {
+        let (optimizer, state, weights_sha256) = load_training_state(
             &mut initial_model,
             adamw_optimizer,
             &mut muon_optimizer,
@@ -988,11 +1182,12 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             "checkpoint has no cumulative token count and cannot safely resume"
         );
         validate_wake_rng_state(&state, args.seed)?;
-        Some(state)
+        (Some(state), Some(weights_sha256))
     } else {
-        None
+        (None, None)
     };
     if let Some(state) = &resume_state {
+        preflight_resumed_memory_mode(&workflow, state)?;
         // Authenticate the exact runtime identity before constructing its
         // factory. Factory construction validates/creates configured stores,
         // so a mismatched resume must fail before that first side effect.
@@ -1001,14 +1196,25 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             state,
             &workflow.phases[state.phase],
             phase_plan[state.phase].steps,
-            &initial_model,
+            resume_weights_sha256
+                .as_deref()
+                .expect("resume checkpoint has an authenticated weights identity"),
         )?;
     }
     let periodic_runtime =
         PeriodicTrainingRuntime::load(&args, &workflow, &signature, &initial_model, &device)?;
-    if let Some(runtime) = &periodic_runtime {
-        let wake_ids = runtime
-            .bank
+    let wake_only_runtime =
+        WakeOnlyMemoryRuntime::load(&workflow, &initial_model, &args.output, &device)?;
+    ensure!(
+        periodic_runtime.is_none() || wake_only_runtime.is_none(),
+        "one training run cannot combine periodic_sleep and wake_only runtimes"
+    );
+    let tier_bank = periodic_runtime
+        .as_ref()
+        .map(|runtime| &runtime.bank)
+        .or_else(|| wake_only_runtime.as_ref().map(|runtime| &runtime.bank));
+    if let Some(bank) = tier_bank {
+        let wake_ids = bank
             .scopes()?
             .wake_parameter_ids
             .into_iter()
@@ -1023,7 +1229,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             "ordinary wake scope has no hidden matrix parameters for Muon"
         );
         muon_optimizer.set_parameter_ids(muon_parameter_ids.clone());
-        if let Some(state) = &resume_state {
+        if let (Some(runtime), Some(state)) = (&periodic_runtime, &resume_state) {
             let checkpoint = state
                 .sleep
                 .as_ref()
@@ -1036,12 +1242,16 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 runtime.restore_bank(checkpoint, &initial_model, sleep)?;
             }
         }
+        if let (Some(runtime), Some(state)) = (&wake_only_runtime, &resume_state) {
+            runtime.restore(state, &initial_model)?;
+        }
     } else {
         ensure!(
-            resume_state
-                .as_ref()
-                .is_none_or(|state| state.sleep.is_none()),
-            "ordinary-model checkpoint unexpectedly contains native sleep state"
+            resume_state.as_ref().is_none_or(|state| {
+                state.sleep.is_none()
+                    && matches!(state.memory_update, TrainingMemoryUpdateState::Ordinary)
+            }),
+            "ordinary-model checkpoint unexpectedly contains memory-training state"
         );
     }
     if let Some(state) = &resume_state {
@@ -1074,10 +1284,9 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
 
     let mut muon_accumulator = GradientsAccumulator::new();
     let mut adamw_accumulator = GradientsAccumulator::new();
-    let mut tier_accumulators = periodic_runtime
-        .as_ref()
-        .map(|runtime| {
-            runtime.bank.scopes().map(|scopes| {
+    let mut tier_accumulators = tier_bank
+        .map(|bank| {
+            bank.scopes().map(|scopes| {
                 (0..scopes.tiers.len())
                     .map(|_| GradientsAccumulator::new())
                     .collect::<Vec<_>>()
@@ -1096,7 +1305,13 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
     let mut router_loss_sum: Option<Tensor<1>> = None;
     let mut distillation_loss_sum: Option<Tensor<1>> = None;
     let mut retrieval_correct_sum: Option<Tensor<1>> = None;
-    let mut step_wake_contexts = Vec::<Vec<i64>>::new();
+    let wake_context_limits = periodic_runtime.as_ref().map(|runtime| {
+        (
+            runtime.factory.config().max_wake_context_records,
+            runtime.factory.config().rollouts.max_context_tokens,
+        )
+    });
+    let mut step_wake_contexts = VecDeque::<Vec<i64>>::new();
     let mut step_stats = BatchStats::default();
     let mut optimizer_step_started = Instant::now();
     let mut step_input_wait_seconds = 0.0f64;
@@ -1123,6 +1338,16 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             gradient_accumulator: None,
             update_clock: 0,
         }],
+        memory_update: if periodic_runtime.is_some() {
+            TrainingMemoryUpdateState::PeriodicSleep
+        } else if let Some(runtime) = &wake_only_runtime {
+            TrainingMemoryUpdateState::WakeOnly {
+                config: runtime.config.clone(),
+                optimizer_scopes: runtime.bank.scopes()?,
+            }
+        } else {
+            TrainingMemoryUpdateState::Ordinary
+        },
         sleep: None,
         artifacts: Vec::new(),
         evaluator_hashes: Vec::new(),
@@ -1209,7 +1434,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 phase: MetricPhase {
                     index: phase_index as u32,
                     name: phase.name.clone(),
-                    kind: metric_phase_kind(phase.phase_kind),
+                    kind: phase.phase_kind.into(),
                 },
                 checkpoint_hash: None,
             };
@@ -1235,8 +1460,12 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             &mut metrics,
             &args.output,
             periodic_runtime.as_ref(),
+            resume_weights_sha256.as_deref(),
         )? {
             training_state.metric_records = metrics.state().records;
+            if let Some(runtime) = &wake_only_runtime {
+                runtime.checkpoint(&mut training_state)?;
+            }
             let publication = save_training_checkpoint_with_evidence(
                 model.as_ref().unwrap(),
                 &adamw_optimizer,
@@ -1314,6 +1543,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             }
             let artifacts = training_state.artifacts.clone();
             let evaluator_hashes = training_state.evaluator_hashes.clone();
+            let memory_update = training_state.memory_update.clone();
             training_state = TrainingState {
                 version: TRAINING_STATE_VERSION,
                 global_step: step,
@@ -1335,6 +1565,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     gradient_accumulator: None,
                     update_clock: step as u64,
                 }],
+                memory_update,
                 sleep: native_sleep,
                 artifacts,
                 evaluator_hashes,
@@ -1351,17 +1582,14 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                 quantization: phase.quantization.as_ref().map(|plan| {
                     let format = plan.format_at(step as u64);
                     QuantizationTrainingState {
-                        format: format.map_or_else(
-                            || "full_precision".to_owned(),
-                            |format| format!("{format:?}").to_ascii_lowercase(),
-                        ),
+                        format: quantization_state_format(format),
                         fake_quant_active: format.is_some(),
                         calibration_step: step as u64,
                         manifest: None,
+                        candidate_weights_sha256: None,
                         teacher_hash: quantization_teacher
                             .as_ref()
                             .map(|teacher| teacher.sha256.clone()),
-                        transaction: None,
                     }
                 }),
             };
@@ -1378,12 +1606,9 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             let tokenizer_ref = &tokenizer;
             let objective = phase.objective.clone();
             let token_cache_path = token_cache_paths[phase_index].clone();
+            let data_binding = &data_bindings[phase_index];
             std::thread::scope(|threads| -> Result<()> {
-                let prefetch_capacity = phase
-                    .batch_size
-                    .checked_mul(phase.gradient_accumulation)
-                    .and_then(|capacity| capacity.checked_mul(2))
-                    .context("training prefetch capacity overflows usize")?;
+                let prefetch_capacity = training_prefetch_capacity(phase.batch_size)?;
                 let (sender, receiver) = std::sync::mpsc::sync_channel(prefetch_capacity);
                 let reader = threads.spawn(move || -> Result<()> {
                     let mut visited = 0usize;
@@ -1403,6 +1628,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             shuffle_buffer: phase.shuffle_buffer,
                             seed: shuffle_seed,
                             token_cache: Some(&token_cache_path),
+                            data_binding,
                         },
                         |sample| {
                             visited = visited
@@ -1466,12 +1692,16 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     }
 
                     let transfer_started = Instant::now();
-                    if phase.periodic_sleep.is_some() {
-                        step_wake_contexts.extend(batch.iter().map(|sample| {
+                    if let Some((max_records, max_context_tokens)) = wake_context_limits {
+                        for sample in &batch {
                             let tokens = sample.wake_context_tokens();
-                            let keep = tokens.len().min(config.max_seq_len);
-                            tokens[tokens.len() - keep..].to_vec()
-                        }));
+                            let keep = tokens.len().min(config.max_seq_len).min(max_context_tokens);
+                            push_bounded_wake_context(
+                                &mut step_wake_contexts,
+                                tokens[tokens.len() - keep..].to_vec(),
+                                max_records,
+                            );
+                        }
                     }
                     let training_batch = make_batch(&batch, phase.sequence_length, &device)?;
                     step_host_to_device_seconds += transfer_started.elapsed().as_secs_f64();
@@ -1483,6 +1713,11 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         .checked_add(1)
                         .context("model RNG counter overflows u64")?;
                     let current = model.as_ref().unwrap();
+                    // QAT reconstruction is accelerator work too. Start the
+                    // busy interval before building the once-per-window
+                    // fake-quantized leaves so utilization metrics do not
+                    // misclassify that cost as host/input idle time.
+                    let accelerator_started = Instant::now();
                     let quantization_format = phase
                         .quantization
                         .as_ref()
@@ -1516,21 +1751,46 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     let forward_model = quantized_window
                         .as_ref()
                         .map_or(current, |window| &window.model);
-                    let accelerator_started = Instant::now();
-                    let distillation_loss = quantization_teacher
+                    let teacher_logits = quantization_teacher
                         .as_ref()
                         .map(|teacher| {
-                            quantization_forward_kl(
-                                forward_model,
+                            quantization_teacher_logits(
                                 &teacher.model,
                                 &training_batch,
                                 &phase.objective,
-                                teacher.temperature,
                             )
                         })
                         .transpose()?;
-                    let (task_loss, router_loss, batch_stats, retrieval_correct) =
-                        objective_loss(forward_model, training_batch, &phase.objective)?;
+                    let ObjectiveForward {
+                        loss: task_loss,
+                        router_loss,
+                        stats: batch_stats,
+                        retrieval_correct,
+                        distillation_logits,
+                    } = objective_loss(
+                        forward_model,
+                        training_batch,
+                        &phase.objective,
+                        quantization_teacher.is_some(),
+                    )?;
+                    let distillation_loss = match (
+                        teacher_logits,
+                        distillation_logits,
+                        quantization_teacher.as_ref(),
+                    ) {
+                        (Some(teacher_logits), Some(student_logits), Some(teacher)) => {
+                            Some(forward_kl_distillation_tensor(
+                                teacher_logits,
+                                student_logits,
+                                teacher.temperature,
+                                true,
+                            )?)
+                        }
+                        (None, None, None) => None,
+                        _ => unreachable!(
+                            "teacher and student distillation outputs must be produced together"
+                        ),
+                    };
                     let detached_loss = task_loss.clone().detach();
                     accumulate_tensor(&mut loss_sum, detached_loss);
                     if let Some(router_loss) = &router_loss {
@@ -1558,7 +1818,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         (Some(_), None) => unreachable!("distillation loss requires teacher"),
                     };
                     let gradient_accumulation_scale = phase.gradient_accumulation as f64;
-                    let backward_loss = if periodic_runtime.is_some() {
+                    let backward_loss = if tier_bank.is_some() {
                         // Tier optimizers average their independently retained
                         // raw microbatch gradients at the sender boundary.
                         optimized_loss.mul_scalar(phase.loss_weight)
@@ -1573,10 +1833,9 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         forward_model,
                         &muon_parameter_ids,
                     );
-                    let mut adamw_grads = match &periodic_runtime {
-                        Some(runtime) => {
-                            let partitioned =
-                                runtime.bank.partition_gradients(current, &mut grads)?;
+                    let mut adamw_grads = match tier_bank {
+                        Some(bank) => {
+                            let partitioned = bank.partition_gradients(current, &mut grads)?;
                             ensure!(
                                 partitioned.tiers.len() == tier_accumulators.len(),
                                 "memory-tier gradient partition changed during wake training"
@@ -1590,7 +1849,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         }
                         None => GradientsParams::from_module(&mut grads, forward_model),
                     };
-                    if periodic_runtime.is_some() {
+                    if tier_bank.is_some() {
                         let scale = 1.0 / phase.gradient_accumulation as f32;
                         scale_gradients(current, &mut muon_grads, scale);
                         scale_gradients(current, &mut adamw_grads, scale);
@@ -1648,7 +1907,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             .iter_mut()
                             .map(GradientsAccumulator::grads)
                             .collect::<Vec<_>>();
-                        if periodic_runtime.is_some() {
+                        if tier_bank.is_some() {
                             let scale = 1.0 / phase.gradient_accumulation as f32;
                             for gradients in &mut tier_grads {
                                 scale_gradients(current, gradients, scale);
@@ -1678,8 +1937,8 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                                 step + 1
                             );
                         }
-                        if let Some(runtime) = &periodic_runtime {
-                            runtime.bank.commit_tier_gradients(current, tier_grads, 1)?;
+                        if let Some(bank) = tier_bank {
+                            bank.commit_tier_gradients(current, tier_grads, 1)?;
                         } else {
                             ensure!(
                                 tier_grads.is_empty(),
@@ -1689,6 +1948,26 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         let current = model.take().unwrap();
                         let current = muon_optimizer.step(muon_lr, current, muon_grads)?;
                         model = Some(adamw_optimizer.step(lr.into(), current, adamw_grads));
+                        let next_step = step
+                            .checked_add(1)
+                            .context("global optimizer-step count overflows usize")?;
+                        let wake_only_updates = if let Some(runtime) = &wake_only_runtime {
+                            let current = model.take().expect("training model is present");
+                            let (updated, report) = runtime
+                                .bank
+                                .apply_wake_only_due_updates(&current, next_step as u64)?;
+                            debug_assert!(
+                                report
+                                    .updates
+                                    .windows(2)
+                                    .all(|pair| pair[0].tier < pair[1].tier),
+                                "wake_only updates must run fastest-to-slowest"
+                            );
+                            model = Some(updated);
+                            report.updates
+                        } else {
+                            Vec::new()
+                        };
                         let step_quantized_tensors = quantized_window
                             .as_ref()
                             .map_or(0, |window| window.tensor_count);
@@ -1696,7 +1975,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         // staged QAT leaf across optimizer-step boundaries.
                         quantized_window = None;
                         step_accelerator_seconds += accelerator_started.elapsed().as_secs_f64();
-                        step += 1;
+                        step = next_step;
                         steps_in_phase = steps_in_phase
                             .checked_add(1)
                             .context("phase optimizer-step count overflows usize")?;
@@ -1707,6 +1986,15 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         training_state.steps_in_phase = steps_in_phase;
                         training_state.tokens_seen = tokens_seen;
                         training_state.optimizer_states[0].update_clock = step as u64;
+                        let max_wake_context_records =
+                            wake_context_limits.map_or(0, |(records, _)| records);
+                        let retained_existing =
+                            max_wake_context_records.saturating_sub(step_wake_contexts.len());
+                        if training_state.wake_context_buffer.len() > retained_existing {
+                            let discard =
+                                training_state.wake_context_buffer.len() - retained_existing;
+                            training_state.wake_context_buffer.drain(..discard);
+                        }
                         for (ordinal, token_ids) in step_wake_contexts.drain(..).enumerate() {
                             training_state.wake_context_buffer.push(
                                 hermes_train::builtin_sleep_adapters::WakeContextRecord {
@@ -1716,24 +2004,15 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                                 },
                             );
                         }
-                        let max_wake_context_records =
-                            periodic_runtime.as_ref().map_or(0, |runtime| {
-                                runtime.factory.config().max_wake_context_records
-                            });
-                        if training_state.wake_context_buffer.len() > max_wake_context_records {
-                            let discard =
-                                training_state.wake_context_buffer.len() - max_wake_context_records;
-                            training_state.wake_context_buffer.drain(..discard);
-                        }
+                        debug_assert!(
+                            training_state.wake_context_buffer.len() <= max_wake_context_records
+                        );
                         if let Some(quantization) = &mut training_state.quantization {
                             let format = phase
                                 .quantization
                                 .as_ref()
                                 .and_then(|plan| plan.format_at((step - 1) as u64));
-                            quantization.format = format.map_or_else(
-                                || "full_precision".to_owned(),
-                                |format| format!("{format:?}").to_ascii_lowercase(),
-                            );
+                            quantization.format = quantization_state_format(format);
                             quantization.fake_quant_active = format.is_some();
                             quantization.calibration_step = step as u64;
                         }
@@ -1753,7 +2032,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             phase: MetricPhase {
                                 index: phase_index as u32,
                                 name: phase.name.clone(),
-                                kind: metric_phase_kind(phase.phase_kind),
+                                kind: phase.phase_kind.into(),
                             },
                             checkpoint_hash: None,
                         };
@@ -1782,6 +2061,19 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                                 retrieval_candidates: step_stats.retrieval_candidates as u64,
                             }),
                         )?;
+                        if let Some(runtime) = &wake_only_runtime {
+                            append_wake_only_tier_metrics(
+                                &mut metrics,
+                                &context,
+                                runtime.config.schedule(),
+                                &wake_only_updates,
+                            )?;
+                        } else {
+                            ensure!(
+                                wake_only_updates.is_empty(),
+                                "ordinary training produced wake_only update evidence"
+                            );
+                        }
                         if let Some(plan) = &phase.quantization {
                             let active_format = plan.format_at((step - 1) as u64);
                             metrics.append(
@@ -1864,6 +2156,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                                 &mut metrics,
                                 &args.output,
                                 periodic_runtime.as_ref(),
+                                None,
                             )?;
                         }
                         if args.checkpoint_every > 0 && step % args.checkpoint_every == 0 {
@@ -1872,7 +2165,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             {
                                 let mut cursor = training_state
                                     .sleep
-                                    .take()
+                                    .clone()
                                     .context("periodic checkpoint has no sleep cursor")?;
                                 let _ = runtime.checkpoint_wake(
                                     &mut cursor,
@@ -1880,6 +2173,9 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                                     sleep,
                                 )?;
                                 training_state.sleep = Some(cursor);
+                            }
+                            if let Some(runtime) = &wake_only_runtime {
+                                runtime.checkpoint(&mut training_state)?;
                             }
                             let publication = save_training_checkpoint_with_evidence(
                                 model.as_ref().unwrap(),
@@ -1960,7 +2256,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         if let (Some(runtime), Some(sleep)) = (&periodic_runtime, phase.periodic_sleep.as_ref()) {
             let mut cursor = training_state
                 .sleep
-                .take()
+                .clone()
                 .context("periodic phase boundary has no sleep cursor")?;
             let _ = runtime.checkpoint_wake(&mut cursor, model.as_ref().unwrap(), sleep)?;
             training_state.sleep = Some(cursor);
@@ -1970,12 +2266,15 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             phase: MetricPhase {
                 index: phase_index as u32,
                 name: phase.name.clone(),
-                kind: metric_phase_kind(phase.phase_kind),
+                kind: phase.phase_kind.into(),
             },
             checkpoint_hash: None,
         };
         drain_device_sampler(&mut device_sampler, &mut metrics, &context)?;
         training_state.metric_records = metrics.state().records;
+        if let Some(runtime) = &wake_only_runtime {
+            runtime.checkpoint(&mut training_state)?;
+        }
         let publication = save_training_checkpoint_with_evidence(
             model.as_ref().unwrap(),
             &adamw_optimizer,
@@ -2002,7 +2301,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             .expect("validated memory workflow has periodic sleep");
         let mut cursor = training_state
             .sleep
-            .take()
+            .clone()
             .context("periodic final checkpoint has no sleep cursor")?;
         let _ = runtime.checkpoint_wake(&mut cursor, model.as_ref().unwrap(), sleep)?;
         training_state.sleep = Some(cursor);
@@ -2014,12 +2313,15 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         phase: MetricPhase {
             index: final_phase_index as u32,
             name: final_phase.name.clone(),
-            kind: metric_phase_kind(final_phase.phase_kind),
+            kind: final_phase.phase_kind.into(),
         },
         checkpoint_hash: None,
     };
     shutdown_device_sampler(&mut device_sampler, &mut metrics, &final_context)?;
     training_state.metric_records = metrics.state().records;
+    if let Some(runtime) = &wake_only_runtime {
+        runtime.checkpoint(&mut training_state)?;
+    }
     let publication = save_training_checkpoint_with_evidence(
         model.as_ref().unwrap(),
         &adamw_optimizer,
@@ -2045,6 +2347,362 @@ fn print_checkpoint_publication(label: &str, publication: &CheckpointPublication
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::tensor::Int;
+
+    #[test]
+    fn training_prefetch_is_two_batches_but_never_scales_with_accumulation() {
+        assert_eq!(training_prefetch_capacity(1).unwrap(), 2);
+        assert_eq!(training_prefetch_capacity(64).unwrap(), 128);
+        assert_eq!(training_prefetch_capacity(usize::MAX).unwrap(), 4_096);
+        assert!(training_prefetch_capacity(0).is_err());
+    }
+
+    #[test]
+    fn wake_context_collection_is_bounded_while_a_step_is_accumulating() {
+        let mut contexts = VecDeque::new();
+        for token in 0..10 {
+            push_bounded_wake_context(&mut contexts, vec![token], 3);
+        }
+        assert_eq!(
+            contexts.into_iter().collect::<Vec<_>>(),
+            vec![vec![7], vec![8], vec![9]]
+        );
+    }
+
+    #[test]
+    fn quantization_checkpoint_formats_use_workflow_names() {
+        assert_eq!(quantization_state_format(None), "full_precision");
+        assert_eq!(
+            quantization_state_format(Some(UltraQuantFormat::BinaryG128)),
+            "binary_g128"
+        );
+        assert_eq!(
+            quantization_state_format(Some(UltraQuantFormat::TernaryG128)),
+            "ternary_g128"
+        );
+        assert_eq!(
+            quantization_state_format(Some(UltraQuantFormat::TernaryEntropyG128)),
+            "ternary_entropy_g128"
+        );
+    }
+
+    #[test]
+    fn pinned_checkpoint_reader_authenticates_exact_regular_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.safetensors");
+        let bytes = b"authenticated checkpoint fixture";
+        fs::write(&path, bytes).unwrap();
+        let expected = format!("sha256:{:x}", Sha256::digest(bytes));
+        assert_eq!(
+            read_pinned_checkpoint_bytes(&path, &expected).unwrap(),
+            bytes
+        );
+        let error = read_pinned_checkpoint_bytes(&path, &format!("sha256:{}", "0".repeat(64)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hash mismatch"), "{error}");
+
+        let mut mutated = bytes.to_vec();
+        mutated[0] ^= 1;
+        let error = read_pinned_checkpoint_bytes_after_open(&path, &expected, || {
+            fs::write(&path, &mutated).context("mutating opened checkpoint fixture")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("changed while it was read") || error.contains("hash mismatch"),
+            "{error}"
+        );
+        fs::write(&path, bytes).unwrap();
+
+        let mut grown = bytes.to_vec();
+        grown.push(b'!');
+        let error = read_pinned_checkpoint_bytes_after_open(&path, &expected, || {
+            fs::write(&path, &grown).context("growing opened checkpoint fixture")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed while it was read"), "{error}");
+        fs::write(&path, bytes).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = directory.path().join("linked.safetensors");
+            symlink(&path, &link).unwrap();
+            let error = read_pinned_checkpoint_bytes(&link, &expected)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("non-symlink"), "{error}");
+
+            let replacement = directory.path().join("replacement.safetensors");
+            let parked = directory.path().join("parked.safetensors");
+            fs::write(&replacement, bytes).unwrap();
+            let error = read_pinned_checkpoint_bytes_after_open(&path, &expected, || {
+                fs::rename(&path, &parked)?;
+                fs::rename(&replacement, &path)?;
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("publication changed"), "{error}");
+        }
+    }
+
+    fn qat_replay_model() -> ModelDef {
+        hermes_llm::parse_mal(
+            r#"
+            ffn base {
+                hidden_dim: 16
+                activation: swiglu
+                dropout: 0.0
+                bias: false
+            }
+            model qat-replay {
+                vocab_size: 32 max_seq_len: 8 hidden_size: 8 num_layers: 2
+                block: {
+                    attention: {
+                        num_heads: 2 num_kv_heads: 1 head_dim: 4
+                        position_encoding: none dropout: 0.0
+                    }
+                    ffn: base
+                    dropout: 0.0
+                }
+                embeddings { tie_weights: false dropout: 0.0 }
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    fn apply_qat_window(
+        mut model: Transformer,
+        muon: &mut BatchedMuon,
+        adamw: &mut AdamWOptimizer,
+        device: &Device,
+        rng_counters: &[u64],
+    ) -> Transformer {
+        assert!(!rng_counters.is_empty());
+        let muon_ids = model.muon_parameter_ids();
+        let (staged, _) =
+            fake_quantized_transformer(&model, UltraQuantFormat::BinaryG128, true, true).unwrap();
+        let mut muon_accumulator = GradientsAccumulator::new();
+        let mut adamw_accumulator = GradientsAccumulator::new();
+        for &counter in rng_counters {
+            let first = 1 + i64::try_from(counter % 8).unwrap();
+            let input =
+                Tensor::<2, Int>::from_data([[first, first + 1, first + 2, first + 3]], device);
+            let target =
+                Tensor::<2, Int>::from_data([[first + 1, first + 2, first + 3, first + 4]], device);
+            let mut gradients = staged
+                .forward_loss(input, target)
+                .div_scalar(rng_counters.len() as f64)
+                .backward();
+            let muon_gradients = GradientsParams::from_params(&mut gradients, &staged, &muon_ids);
+            let adamw_gradients = GradientsParams::from_module(&mut gradients, &staged);
+            muon_accumulator.accumulate(&model, muon_gradients);
+            adamw_accumulator.accumulate(&model, adamw_gradients);
+        }
+        let mut muon_gradients = muon_accumulator.grads();
+        let mut adamw_gradients = adamw_accumulator.grads();
+        gradient_norm_and_clip(
+            &model,
+            &mut muon_gradients,
+            &mut adamw_gradients,
+            &mut [],
+            1.0,
+        )
+        .unwrap();
+        model = muon.step(2e-2, model, muon_gradients).unwrap();
+        adamw.step(1e-3.into(), model, adamw_gradients)
+    }
+
+    fn restore_qat_boundary(
+        config: &ModelDef,
+        device: &Device,
+        output: &Path,
+    ) -> (Transformer, BatchedMuon, AdamWOptimizer, TrainingState) {
+        let mut model = Transformer::new(config, device).unwrap();
+        let mut muon = BatchedMuon::new(model.muon_parameter_ids());
+        let adamw = AdamWConfig::new()
+            .with_beta_2(0.95)
+            .with_epsilon(1e-8)
+            .with_weight_decay(0.0)
+            .init();
+        let (adamw, state, _) =
+            load_training_state(&mut model, adamw, &mut muon, output, device).unwrap();
+        (model, muon, adamw, state)
+    }
+
+    #[test]
+    fn interrupted_qat_window_replays_exactly_from_atomic_trainer_checkpoint() {
+        let config = qat_replay_model();
+        let device = Device::ndarray().autodiff();
+        let mut model = Transformer::new(&config, &device).unwrap();
+        let mut muon = BatchedMuon::new(model.muon_parameter_ids());
+        let mut adamw = AdamWConfig::new()
+            .with_beta_2(0.95)
+            .with_epsilon(1e-8)
+            .with_weight_decay(0.0)
+            .init();
+        model = apply_qat_window(model, &mut muon, &mut adamw, &device, &[0, 1]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut metrics =
+            MetricWriter::create(directory.path().join("metrics.jsonl"), "qat-replay").unwrap();
+        metrics
+            .append_at(
+                MetricContext {
+                    global_step: 1,
+                    phase: MetricPhase {
+                        index: 0,
+                        name: "qat".into(),
+                        kind: MetricPhaseKind::Quantization,
+                    },
+                    checkpoint_hash: None,
+                },
+                MetricEvent::Throughput(ThroughputMetrics {
+                    optimizer_steps: 1,
+                    compute_tokens: 8,
+                    supervised_tokens: 8,
+                    examples: 2,
+                    elapsed_seconds: 1.0,
+                    tokens_per_second: 8.0,
+                    examples_per_second: 2.0,
+                    input_wait_seconds: 0.0,
+                    host_to_device_seconds: 0.0,
+                    gpu_busy_seconds: 1.0,
+                }),
+                1,
+            )
+            .unwrap();
+        let state = TrainingState {
+            version: TRAINING_STATE_VERSION,
+            global_step: 1,
+            phase: 0,
+            phase_id: "qat".into(),
+            phase_kind: "quantization".into(),
+            epoch: 0,
+            records_in_phase: 2,
+            steps_in_phase: 1,
+            tokens_seen: 8,
+            metric_records: 1,
+            workflow_signature: format!("sha256:{}", "a".repeat(64)),
+            data_manifest_hash: Some(format!("sha256:{}", "b".repeat(64))),
+            parameter_ids: parameter_ids(&model),
+            optimizer_states: vec![OptimizerStateRef {
+                scope: "wake".into(),
+                adamw: "adamw-state.bpk".into(),
+                muon: "muon-state.bpk".into(),
+                gradient_accumulator: None,
+                update_clock: 1,
+            }],
+            memory_update: TrainingMemoryUpdateState::Ordinary,
+            sleep: None,
+            artifacts: Vec::new(),
+            evaluator_hashes: Vec::new(),
+            rng_streams: vec![
+                RngStreamState {
+                    name: DATA_RNG_STREAM.into(),
+                    seed: 19,
+                    counter: 2,
+                },
+                RngStreamState {
+                    name: MODEL_RNG_STREAM.into(),
+                    seed: 97,
+                    counter: 2,
+                },
+            ],
+            wake_context_buffer: Vec::new(),
+            quantization: Some(QuantizationTrainingState {
+                format: "binary_g128".into(),
+                fake_quant_active: true,
+                calibration_step: 1,
+                manifest: None,
+                candidate_weights_sha256: None,
+                teacher_hash: None,
+            }),
+        };
+        save_training_checkpoint_with_evidence(
+            &model,
+            &adamw,
+            &muon,
+            &state,
+            &mut metrics,
+            directory.path(),
+        )
+        .unwrap();
+        let durable_pointer = fs::read(directory.path().join("current.json")).unwrap();
+
+        let (reference_model, mut reference_muon, mut reference_adamw, reference_state) =
+            restore_qat_boundary(&config, &device, directory.path());
+        let reference = apply_qat_window(
+            reference_model,
+            &mut reference_muon,
+            &mut reference_adamw,
+            &device,
+            &[2, 3],
+        );
+
+        // This update is intentionally never published. Dropping the process-
+        // local model and optimizers represents an interruption anywhere in the
+        // accumulation/update window before the next immutable checkpoint.
+        let (interrupted_model, mut interrupted_muon, mut interrupted_adamw, interrupted_state) =
+            restore_qat_boundary(&config, &device, directory.path());
+        let interrupted = apply_qat_window(
+            interrupted_model,
+            &mut interrupted_muon,
+            &mut interrupted_adamw,
+            &device,
+            &[2],
+        );
+        drop((interrupted, interrupted_muon, interrupted_adamw));
+        assert_eq!(
+            fs::read(directory.path().join("current.json")).unwrap(),
+            durable_pointer,
+            "an in-memory QAT window must not advance the durable generation"
+        );
+        assert_eq!(interrupted_state.rng_streams, reference_state.rng_streams);
+
+        let (replayed_model, mut replayed_muon, mut replayed_adamw, replayed_state) =
+            restore_qat_boundary(&config, &device, directory.path());
+        assert_eq!(replayed_state.rng_streams, reference_state.rng_streams);
+        let replayed = apply_qat_window(
+            replayed_model,
+            &mut replayed_muon,
+            &mut replayed_adamw,
+            &device,
+            &[2, 3],
+        );
+
+        let artifacts = tempfile::tempdir().unwrap();
+        let reference_weights = artifacts.path().join("reference.safetensors");
+        let replayed_weights = artifacts.path().join("replayed.safetensors");
+        let reference_muon_path = artifacts.path().join("reference-muon.bpk");
+        let replayed_muon_path = artifacts.path().join("replayed-muon.bpk");
+        save_safetensors(&reference.valid(), &reference_weights).unwrap();
+        save_safetensors(&replayed.valid(), &replayed_weights).unwrap();
+        reference_muon.save(&reference_muon_path).unwrap();
+        replayed_muon.save(&replayed_muon_path).unwrap();
+        assert_eq!(
+            fs::read(reference_weights).unwrap(),
+            fs::read(replayed_weights).unwrap(),
+            "replayed QAT master weights differ"
+        );
+        assert_eq!(
+            fs::read(reference_muon_path).unwrap(),
+            fs::read(replayed_muon_path).unwrap(),
+            "replayed QAT Muon state differs"
+        );
+        assert_eq!(
+            &*hermes_train::optimizer_artifact::canonical_module_optimizer_bytes(&reference_adamw,)
+                .unwrap(),
+            &*hermes_train::optimizer_artifact::canonical_module_optimizer_bytes(&replayed_adamw)
+                .unwrap(),
+            "replayed QAT AdamW state differs"
+        );
+    }
 
     #[test]
     fn resume_cursor_filter_preserves_exact_shuffled_suffix() {
@@ -2267,6 +2925,7 @@ mod tests {
                 gradient_accumulator: None,
                 update_clock: 1,
             }],
+            memory_update: TrainingMemoryUpdateState::PeriodicSleep,
             sleep: Some(cursor),
             artifacts: Vec::new(),
             evaluator_hashes: Vec::new(),
@@ -2285,11 +2944,11 @@ mod tests {
             wake_context_buffer: Vec::new(),
             quantization: Some(QuantizationTrainingState {
                 format: "binary_g128".into(),
-                fake_quant_active: false,
+                fake_quant_active: true,
                 calibration_step: 1,
                 manifest: None,
+                candidate_weights_sha256: None,
                 teacher_hash: None,
-                transaction: None,
             }),
         };
         let metrics_path = directory.path().join("metrics.jsonl");
@@ -2351,9 +3010,54 @@ mod tests {
         assert_ne!(publication.weights_sha256, pre_sleep.sha256);
         let sealed = fs::read(&manifest).unwrap();
 
-        // Resume authentication reopens the same stable key with the same
-        // post-sleep model; it neither republishes nor changes any bytes.
-        verify_resumed_quantization_candidate(&state, phase, 1, &post_sleep_model).unwrap();
+        // Historical candidates are not execution inputs for this resume. A
+        // missing old archive must not trigger multi-gigabyte validation or
+        // prevent the current, independently authenticated candidate from
+        // resuming.
+        state.artifacts.push(ArtifactRef {
+            kind: "hquant_candidate".into(),
+            manifest: directory
+                .path()
+                .join("quantized-candidates/historical/candidate.json")
+                .to_string_lossy()
+                .into_owned(),
+            hash: format!("sha256:{}", "4".repeat(64)),
+        });
+
+        // Resume authentication reopens the same stable key using the sealed
+        // checkpoint weights identity; it neither serializes the mutable model
+        // nor republishes or changes any candidate bytes.
+        verify_resumed_quantization_candidate(&state, phase, 1, &post_sleep.sha256).unwrap();
+        let corruptions: [fn(&mut QuantizationTrainingState); 5] = [
+            |quantization: &mut QuantizationTrainingState| {
+                quantization.format = "full_precision".into();
+            },
+            |quantization: &mut QuantizationTrainingState| {
+                quantization.fake_quant_active = true;
+            },
+            |quantization: &mut QuantizationTrainingState| {
+                quantization.calibration_step = 0;
+            },
+            |quantization: &mut QuantizationTrainingState| {
+                quantization.teacher_hash = Some(format!("sha256:{}", "3".repeat(64)));
+            },
+            |quantization: &mut QuantizationTrainingState| {
+                quantization.candidate_weights_sha256 = Some(format!("sha256:{}", "5".repeat(64)));
+            },
+        ];
+        for mutate in corruptions {
+            let mut corrupted = state.clone();
+            mutate(corrupted.quantization.as_mut().unwrap());
+            assert!(
+                verify_resumed_quantization_candidate(&corrupted, phase, 1, &post_sleep.sha256,)
+                    .is_err(),
+                "resume accepted quantization state that differs from its workflow clock"
+            );
+        }
+        assert!(
+            verify_resumed_quantization_candidate(&state, phase, 1, &pre_sleep.sha256).is_err(),
+            "resume accepted a candidate from different authenticated checkpoint weights"
+        );
         assert_eq!(fs::read(&manifest).unwrap(), sealed);
         assert_eq!(
             open_qat_candidate(manifest.parent().unwrap())

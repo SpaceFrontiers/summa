@@ -7,11 +7,11 @@
 //! handles, which keeps retries deterministic and prevents sleep from reading
 //! new training data.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+use std::fs;
 
 use anyhow::{Context, Result, ensure};
 use burn::tensor::{Int, Tensor, TensorData};
@@ -21,10 +21,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::artifact_io::{
+    atomic_write_new, read_regular_bounded, sha256_identity, validate_sha256_identity,
+};
 use crate::sleep::{ConsolidationTxn, RngReservation};
 use crate::tensor_sleep::{
-    ConsolidationRollouts, ImitationGroup, RetentionEvaluator, RetentionScores, RolloutOwner,
-    SemanticJudge, TokenRolloutBatch,
+    ConsolidationRollouts, ImitationGroup, MAX_TENSOR_IMITATION_GROUPS, RetentionEvaluator,
+    RetentionScores, RolloutOwner, SemanticJudge, TokenRolloutBatch,
 };
 
 pub const WAKE_CONTEXT_JOURNAL_VERSION: u32 = 1;
@@ -38,35 +41,35 @@ const TEACHER_GENERATION_DOMAIN: u64 = 0x7465_6163_6865_722d;
 const STUDENT_GENERATION_DOMAIN: u64 = 0x7374_7564_656e_742d;
 const RETENTION_EVALUATION_DOMAIN: u64 = 0x7265_7465_6e74_696f;
 
-static TEMPORARY_ORDINAL: AtomicU64 = AtomicU64::new(0);
-
-fn validate_sha256(value: &str, label: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{label} must start with `sha256:`"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{label} must contain 64 lowercase hexadecimal digits"
-    );
-    Ok(())
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
+const MAX_SLEEP_INPUT_JSON_BYTES: u64 = 64 * 1024 * 1024;
+/// A sleep journal is deliberately a small model-owned context ring, not a
+/// second replay corpus. These limits bound both authenticated JSON parsing
+/// and the generation work induced by one valid runtime configuration.
+pub const MAX_WAKE_CONTEXT_RECORDS: usize = 4_096;
+pub const MAX_WAKE_CONTEXT_TOKENS: usize = 65_536;
+pub const MAX_WAKE_CONTEXT_TOTAL_TOKENS: usize = 4 * 1024 * 1024;
+pub const MAX_WAKE_CONTEXT_ID_BYTES: usize = 1_024;
+const MAX_ROLLOUT_CONTINUATION_TOKENS: usize = 16_384;
+const MAX_ROLLOUT_TOP_K: usize = 262_144;
+const MAX_RETENTION_SEQUENCES: usize = 4_096;
+const MAX_RETENTION_SEQUENCE_TOKENS: usize = 65_536;
+const MAX_RETENTION_TOTAL_TOKENS: usize = 4 * 1024 * 1024;
+const MAX_RETENTION_SEQUENCE_ID_BYTES: usize = 1_024;
+const MAX_SEMANTIC_EQUIVALENCE_CLASSES: usize = 65_536;
+const MAX_SEMANTIC_ALIAS_TOKENS: usize = 262_144;
 
 fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} {} must be a regular non-symlink file",
-        path.display()
-    );
-    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
+    // Model checkpoints also use `PinnedLocalArtifact` and are intentionally
+    // consumed from one authenticated handle by the model loader. Their size
+    // is topology-dependent, so only schema-bearing JSON uses the fixed bound
+    // below.
+    read_regular_bounded(path, u64::MAX, label)
+        .with_context(|| format!("failed to read {label} {}", path.display()))
+}
+
+fn read_regular_json(path: &Path, label: &str) -> Result<Vec<u8>> {
+    read_regular_bounded(path, MAX_SLEEP_INPUT_JSON_BYTES, label)
+        .with_context(|| format!("failed to read {label} {}", path.display()))
 }
 
 fn read_pinned_json<T: DeserializeOwned>(
@@ -74,9 +77,9 @@ fn read_pinned_json<T: DeserializeOwned>(
     expected_sha256: &str,
     label: &str,
 ) -> Result<T> {
-    validate_sha256(expected_sha256, &format!("{label} hash"))?;
-    let bytes = read_regular_file(path, label)?;
-    let observed = sha256_bytes(&bytes);
+    validate_sha256_identity(expected_sha256, &format!("{label} hash"))?;
+    let bytes = read_regular_json(path, label)?;
+    let observed = sha256_identity(&bytes);
     ensure!(
         observed == expected_sha256,
         "{label} {} changed: expected {expected_sha256}, observed {observed}",
@@ -102,7 +105,7 @@ impl PinnedLocalArtifact {
             !self.path.as_os_str().is_empty(),
             "pinned artifact path is empty"
         );
-        validate_sha256(&self.sha256, "pinned artifact hash")?;
+        validate_sha256_identity(&self.sha256, "pinned artifact hash")?;
         if self.path.is_relative() {
             self.path = base.join(&self.path);
         }
@@ -110,9 +113,9 @@ impl PinnedLocalArtifact {
     }
 
     pub fn verify_bytes(&self) -> Result<Vec<u8>> {
-        validate_sha256(&self.sha256, "pinned artifact hash")?;
+        validate_sha256_identity(&self.sha256, "pinned artifact hash")?;
         let bytes = read_regular_file(&self.path, "pinned artifact")?;
-        let observed = sha256_bytes(&bytes);
+        let observed = sha256_identity(&bytes);
         ensure!(
             observed == self.sha256,
             "pinned artifact {} changed: expected {}, observed {observed}",
@@ -123,78 +126,24 @@ impl PinnedLocalArtifact {
     }
 
     pub fn verify_json<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_slice(&self.verify_bytes()?)
+        validate_sha256_identity(&self.sha256, "pinned artifact hash")?;
+        let bytes = read_regular_json(&self.path, "pinned JSON artifact")?;
+        let observed = sha256_identity(&bytes);
+        ensure!(
+            observed == self.sha256,
+            "pinned artifact {} changed: expected {}, observed {observed}",
+            self.path.display(),
+            self.sha256
+        );
+        serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid pinned JSON artifact {}", self.path.display()))
     }
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {} for sync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to sync directory {}", path.display()))
 }
 
 /// Publish bytes without replacing an existing artifact. An existing target is
 /// accepted only when it is a regular file containing the exact same bytes.
 fn publish_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent_metadata = fs::symlink_metadata(parent)
-        .with_context(|| format!("failed to inspect output directory {}", parent.display()))?;
-    ensure!(
-        parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink(),
-        "output parent {} must be a real directory",
-        parent.display()
-    );
-    if path.exists() {
-        ensure!(
-            read_regular_file(path, "immutable artifact")? == bytes,
-            "immutable artifact {} already exists with different contents",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("immutable artifact filename is not UTF-8")?;
-    let ordinal = TEMPORARY_ORDINAL.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
-        ".{file_name}.tmp.{}.{}",
-        std::process::id(),
-        ordinal
-    ));
-    let result = (|| {
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .with_context(|| format!("failed to create {}", temporary.display()))?;
-        output.write_all(bytes)?;
-        output.sync_all()?;
-        drop(output);
-        match fs::hard_link(&temporary, path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                ensure!(
-                    read_regular_file(path, "immutable artifact")? == bytes,
-                    "immutable artifact {} won a publication race with different contents",
-                    path.display()
-                );
-            }
-            Err(error) => return Err(error).context("publishing immutable artifact"),
-        }
-        fs::remove_file(&temporary)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    atomic_write_new(path, bytes)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,15 +157,25 @@ pub struct WakeContextRecord {
 
 impl WakeContextRecord {
     fn validate(&self) -> Result<()> {
-        ensure!(!self.id.trim().is_empty(), "wake context id is empty");
+        ensure!(
+            !self.id.trim().is_empty() && self.id.len() <= MAX_WAKE_CONTEXT_ID_BYTES,
+            "wake context id must contain 1..={MAX_WAKE_CONTEXT_ID_BYTES} bytes"
+        );
         ensure!(
             !self.token_ids.is_empty(),
             "wake context `{}` has no tokens",
             self.id
         );
         ensure!(
-            self.token_ids.iter().all(|token| *token >= 0),
-            "wake context `{}` contains a negative token id",
+            self.token_ids.len() <= MAX_WAKE_CONTEXT_TOKENS,
+            "wake context `{}` exceeds the {MAX_WAKE_CONTEXT_TOKENS}-token limit",
+            self.id
+        );
+        ensure!(
+            self.token_ids
+                .iter()
+                .all(|token| u32::try_from(*token).is_ok()),
+            "wake context `{}` contains a token outside the u32 vocabulary range",
             self.id
         );
         Ok(())
@@ -241,7 +200,7 @@ impl WakeContextJournal {
             source_checkpoint_sha256: source_checkpoint_sha256.into(),
             records: Vec::new(),
         };
-        validate_sha256(
+        validate_sha256_identity(
             &journal.source_checkpoint_sha256,
             "wake-context source checkpoint hash",
         )?;
@@ -250,6 +209,10 @@ impl WakeContextJournal {
 
     pub fn push(&mut self, record: WakeContextRecord) -> Result<()> {
         record.validate()?;
+        ensure!(
+            self.records.len() < MAX_WAKE_CONTEXT_RECORDS,
+            "wake context journal exceeds the {MAX_WAKE_CONTEXT_RECORDS}-record limit"
+        );
         ensure!(
             !self.records.iter().any(|existing| existing.id == record.id),
             "wake context journal repeats id `{}`",
@@ -271,11 +234,24 @@ impl WakeContextJournal {
             "unsupported wake-context journal version {}",
             self.version
         );
-        validate_sha256(
+        validate_sha256_identity(
             &self.source_checkpoint_sha256,
             "wake-context source checkpoint hash",
         )?;
         ensure!(!self.records.is_empty(), "wake context journal is empty");
+        ensure!(
+            self.records.len() <= MAX_WAKE_CONTEXT_RECORDS,
+            "wake context journal exceeds the {MAX_WAKE_CONTEXT_RECORDS}-record limit"
+        );
+        let total_tokens = self.records.iter().try_fold(0usize, |total, record| {
+            total
+                .checked_add(record.token_ids.len())
+                .context("wake context journal token count overflow")
+        })?;
+        ensure!(
+            total_tokens <= MAX_WAKE_CONTEXT_TOTAL_TOKENS,
+            "wake context journal exceeds the {MAX_WAKE_CONTEXT_TOTAL_TOKENS}-token limit"
+        );
         let mut ids = BTreeSet::new();
         let mut previous_step = 0;
         for (index, record) in self.records.iter().enumerate() {
@@ -299,7 +275,7 @@ impl WakeContextJournal {
         self.validate()?;
         let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
-        let sha256 = sha256_bytes(&bytes);
+        let sha256 = sha256_identity(&bytes);
         publish_immutable(path, &bytes)?;
         PinnedWakeContextJournal::load(path, &sha256)
     }
@@ -381,17 +357,28 @@ impl JournalRolloutConfig {
             "journal rollout context and continuation lengths must be positive"
         );
         ensure!(
+            self.max_context_tokens <= MAX_WAKE_CONTEXT_TOKENS,
+            "journal rollout context exceeds the {MAX_WAKE_CONTEXT_TOKENS}-token limit"
+        );
+        ensure!(
+            self.continuation_tokens <= MAX_ROLLOUT_CONTINUATION_TOKENS,
+            "journal rollout continuation exceeds the {MAX_ROLLOUT_CONTINUATION_TOKENS}-token limit"
+        );
+        ensure!(
             self.temperature.is_finite() && self.temperature > 0.0,
             "journal rollout temperature must be finite and positive"
         );
-        ensure!(self.top_k > 0, "journal rollout top_k must be positive");
+        ensure!(
+            (1..=MAX_ROLLOUT_TOP_K).contains(&self.top_k),
+            "journal rollout top_k must be in 1..={MAX_ROLLOUT_TOP_K}"
+        );
         ensure!(
             self.repetition_penalty.is_finite() && self.repetition_penalty >= 1.0,
             "journal rollout repetition penalty must be finite and at least one"
         );
         ensure!(
-            self.imitation_groups > 0,
-            "journal rollout imitation_groups must be positive"
+            (1..=MAX_TENSOR_IMITATION_GROUPS).contains(&self.imitation_groups),
+            "journal rollout imitation_groups must be in 1..={MAX_TENSOR_IMITATION_GROUPS}"
         );
         Ok(())
     }
@@ -435,8 +422,8 @@ impl JournalRollouts {
         config: JournalRolloutConfig,
     ) -> Result<Self> {
         config.validate()?;
-        validate_sha256(phase_input_sha256, "sleep phase input checkpoint")?;
-        validate_sha256(teacher_sha256, "sleep transaction teacher")?;
+        validate_sha256_identity(phase_input_sha256, "sleep phase input checkpoint")?;
+        validate_sha256_identity(teacher_sha256, "sleep transaction teacher")?;
         ensure!(
             journal.source_checkpoint_sha256() == phase_input_sha256,
             "wake-context journal belongs to {}, phase input is {}",
@@ -661,11 +648,23 @@ impl TokenSemanticJudgeArtifact {
                 && self.unigram_weight + self.bigram_weight > 0.0,
             "semantic-judge n-gram weights must be finite, non-negative, and not both zero"
         );
+        ensure!(
+            self.equivalence_classes.len() <= MAX_SEMANTIC_EQUIVALENCE_CLASSES,
+            "semantic judge exceeds the {MAX_SEMANTIC_EQUIVALENCE_CLASSES}-class limit"
+        );
         let mut seen = BTreeSet::new();
+        let mut aliases = 0_usize;
         for class in &self.equivalence_classes {
             ensure!(
                 class.len() >= 2 && class.iter().all(|token| *token >= 0),
                 "semantic equivalence classes require at least two non-negative token ids"
+            );
+            aliases = aliases
+                .checked_add(class.len())
+                .context("semantic alias count overflow")?;
+            ensure!(
+                aliases <= MAX_SEMANTIC_ALIAS_TOKENS,
+                "semantic judge exceeds the {MAX_SEMANTIC_ALIAS_TOKENS}-alias limit"
             );
             for token in class {
                 ensure!(
@@ -684,7 +683,7 @@ impl TokenSemanticJudgeArtifact {
 pub struct PinnedTokenSemanticJudge {
     artifact_sha256: String,
     artifact: TokenSemanticJudgeArtifact,
-    aliases: BTreeMap<i64, i64>,
+    aliases: HashMap<i64, i64>,
 }
 
 impl PinnedTokenSemanticJudge {
@@ -707,11 +706,8 @@ impl PinnedTokenSemanticJudge {
         })
     }
 
-    fn canonical(&self, tokens: &[i64]) -> Vec<i64> {
-        tokens
-            .iter()
-            .map(|token| self.aliases.get(token).copied().unwrap_or(*token))
-            .collect()
+    fn canonical(&self, token: i64) -> i64 {
+        self.aliases.get(&token).copied().unwrap_or(token)
     }
 }
 
@@ -729,18 +725,24 @@ impl SemanticJudge for PinnedTokenSemanticJudge {
             teacher.iter().chain(candidate).all(|token| *token >= 0),
             "semantic judge received a negative token id"
         );
-        let teacher = self.canonical(teacher);
-        let candidate = self.canonical(candidate);
         let unigram = multiset_f1(
-            teacher.iter().copied().map(|token| (token, i64::MIN)),
-            candidate.iter().copied().map(|token| (token, i64::MIN)),
+            teacher
+                .iter()
+                .map(|token| (self.canonical(*token), i64::MIN)),
+            candidate
+                .iter()
+                .map(|token| (self.canonical(*token), i64::MIN)),
         );
         let bigram = if teacher.len() < 2 || candidate.len() < 2 {
             unigram
         } else {
             multiset_f1(
-                teacher.windows(2).map(|pair| (pair[0], pair[1])),
-                candidate.windows(2).map(|pair| (pair[0], pair[1])),
+                teacher
+                    .windows(2)
+                    .map(|pair| (self.canonical(pair[0]), self.canonical(pair[1]))),
+                candidate
+                    .windows(2)
+                    .map(|pair| (self.canonical(pair[0]), self.canonical(pair[1]))),
             )
         };
         let weight = self.artifact.unigram_weight + self.artifact.bigram_weight;
@@ -755,23 +757,25 @@ fn multiset_f1(
     left: impl Iterator<Item = (i64, i64)>,
     right: impl Iterator<Item = (i64, i64)>,
 ) -> f32 {
-    let mut left_counts = BTreeMap::<(i64, i64), usize>::new();
-    let mut right_counts = BTreeMap::<(i64, i64), usize>::new();
+    let mut left_counts = HashMap::<(i64, i64), usize>::new();
     for item in left {
         *left_counts.entry(item).or_default() += 1;
     }
-    for item in right {
-        *right_counts.entry(item).or_default() += 1;
-    }
     let left_total = left_counts.values().sum::<usize>();
-    let right_total = right_counts.values().sum::<usize>();
+    let mut right_total = 0_usize;
+    let mut overlap = 0_usize;
+    for item in right {
+        right_total += 1;
+        if let Some(remaining) = left_counts.get_mut(&item)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            overlap += 1;
+        }
+    }
     if left_total == 0 || right_total == 0 {
         return 0.0;
     }
-    let overlap = left_counts
-        .iter()
-        .map(|(item, count)| (*count).min(right_counts.get(item).copied().unwrap_or(0)))
-        .sum::<usize>();
     2.0 * overlap as f32 / (left_total + right_total) as f32
 }
 
@@ -810,8 +814,17 @@ impl RetentionSequence {
     fn validate(&self) -> Result<()> {
         ensure!(!self.id.trim().is_empty(), "retention sequence id is empty");
         ensure!(
+            self.id.len() <= MAX_RETENTION_SEQUENCE_ID_BYTES,
+            "retention sequence id exceeds the {MAX_RETENTION_SEQUENCE_ID_BYTES}-byte limit"
+        );
+        ensure!(
             self.token_ids.len() >= 2 && self.token_ids.iter().all(|token| *token >= 0),
             "retention sequence `{}` needs at least two non-negative token ids",
+            self.id
+        );
+        ensure!(
+            self.token_ids.len() <= MAX_RETENTION_SEQUENCE_TOKENS,
+            "retention sequence `{}` exceeds the {MAX_RETENTION_SEQUENCE_TOKENS}-token limit",
             self.id
         );
         Ok(())
@@ -837,9 +850,26 @@ impl RetentionSuiteArtifact {
             !self.stable_anchors.is_empty() && !self.incorporation.is_empty(),
             "retention suite requires stable-anchor and incorporation sequences"
         );
+        let sequence_count = self
+            .stable_anchors
+            .len()
+            .checked_add(self.incorporation.len())
+            .context("retention-suite sequence count overflow")?;
+        ensure!(
+            sequence_count <= MAX_RETENTION_SEQUENCES,
+            "retention suite exceeds the {MAX_RETENTION_SEQUENCES}-sequence limit"
+        );
         let mut ids = BTreeSet::new();
+        let mut total_tokens = 0_usize;
         for sequence in self.stable_anchors.iter().chain(&self.incorporation) {
             sequence.validate()?;
+            total_tokens = total_tokens
+                .checked_add(sequence.token_ids.len())
+                .context("retention-suite token count overflow")?;
+            ensure!(
+                total_tokens <= MAX_RETENTION_TOTAL_TOKENS,
+                "retention suite exceeds the {MAX_RETENTION_TOTAL_TOKENS}-token limit"
+            );
             ensure!(
                 ids.insert(sequence.id.as_str()),
                 "retention suite repeats sequence id `{}`",
@@ -896,7 +926,8 @@ impl PinnedLikelihoodRetentionEvaluator {
                 sequence
                     .token_ids
                     .iter()
-                    .all(|token| (*token as usize) < model.config().vocab_size),
+                    .all(|token| usize::try_from(*token)
+                        .is_ok_and(|token| token < model.config().vocab_size)),
                 "retention sequence `{}` contains an out-of-vocabulary token",
                 sequence.id
             );
@@ -977,7 +1008,7 @@ mod tests {
     fn write_json(path: &Path, value: &impl Serialize) -> String {
         let bytes = serde_json::to_vec_pretty(value).unwrap();
         fs::write(path, &bytes).unwrap();
-        sha256_bytes(&bytes)
+        sha256_identity(&bytes)
     }
 
     fn transaction(teacher_hash: String) -> ConsolidationTxn {
@@ -1017,6 +1048,90 @@ mod tests {
             dream_trials: Vec::new(),
             dream_policy_receipt: None,
             committed: false,
+        }
+    }
+
+    #[test]
+    fn pinned_sleep_json_rejects_oversized_input_before_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.json");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_SLEEP_INPUT_JSON_BYTES + 1).unwrap();
+        drop(file);
+
+        let artifact = PinnedLocalArtifact {
+            path,
+            sha256: hash('a'),
+        };
+        let error = artifact.verify_json::<serde_json::Value>().unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
+    fn wake_journal_and_rollout_work_are_semantically_bounded() {
+        let mut journal = WakeContextJournal::new(hash('1')).unwrap();
+        assert!(
+            journal
+                .push(WakeContextRecord {
+                    id: "oversized".into(),
+                    optimizer_step: 1,
+                    token_ids: vec![1; MAX_WAKE_CONTEXT_TOKENS + 1],
+                })
+                .is_err()
+        );
+        for record in [
+            WakeContextRecord {
+                id: "x".repeat(MAX_WAKE_CONTEXT_ID_BYTES + 1),
+                optimizer_step: 1,
+                token_ids: vec![1],
+            },
+            WakeContextRecord {
+                id: "invalid-token".into(),
+                optimizer_step: 1,
+                token_ids: vec![i64::from(u32::MAX) + 1],
+            },
+        ] {
+            assert!(journal.push(record).is_err());
+        }
+
+        journal.records = (0..=MAX_WAKE_CONTEXT_RECORDS)
+            .map(|index| WakeContextRecord {
+                id: format!("wake:{index}"),
+                optimizer_step: index as u64,
+                token_ids: vec![1],
+            })
+            .collect();
+        assert!(journal.validate().is_err());
+
+        let valid = JournalRolloutConfig {
+            max_context_tokens: 4,
+            continuation_tokens: 2,
+            temperature: 0.8,
+            top_k: 4,
+            repetition_penalty: 1.0,
+            eos_token: None,
+            imitation_groups: 2,
+        };
+        valid.validate().unwrap();
+        let mutations: [fn(&mut JournalRolloutConfig); 4] = [
+            |config: &mut JournalRolloutConfig| {
+                config.max_context_tokens = MAX_WAKE_CONTEXT_TOKENS + 1;
+            },
+            |config: &mut JournalRolloutConfig| {
+                config.continuation_tokens = MAX_ROLLOUT_CONTINUATION_TOKENS + 1;
+            },
+            |config: &mut JournalRolloutConfig| {
+                config.top_k = MAX_ROLLOUT_TOP_K + 1;
+            },
+            |config: &mut JournalRolloutConfig| {
+                config.imitation_groups = MAX_TENSOR_IMITATION_GROUPS + 1;
+            },
+        ];
+        for mutate in mutations {
+            let mut invalid = valid.clone();
+            mutate(&mut invalid);
+            assert!(invalid.validate().is_err());
         }
     }
 
@@ -1171,5 +1286,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn retention_suite_cardinality_and_record_sizes_are_bounded() {
+        let valid = || RetentionSequence {
+            id: "anchor".into(),
+            token_ids: vec![1, 2],
+        };
+
+        let mut oversized_id = valid();
+        oversized_id.id = "x".repeat(MAX_RETENTION_SEQUENCE_ID_BYTES + 1);
+        assert!(oversized_id.validate().is_err());
+
+        let mut oversized_tokens = valid();
+        oversized_tokens.token_ids = vec![1; MAX_RETENTION_SEQUENCE_TOKENS + 1];
+        assert!(oversized_tokens.validate().is_err());
+
+        let suite = RetentionSuiteArtifact {
+            version: RETENTION_SUITE_VERSION,
+            stable_anchors: (0..MAX_RETENTION_SEQUENCES)
+                .map(|index| RetentionSequence {
+                    id: format!("anchor-{index}"),
+                    token_ids: vec![1, 2],
+                })
+                .collect(),
+            incorporation: vec![RetentionSequence {
+                id: "incorporation".into(),
+                token_ids: vec![2, 1],
+            }],
+        };
+        let error = suite.validate().unwrap_err().to_string();
+        assert!(error.contains("sequence limit"), "{error}");
     }
 }

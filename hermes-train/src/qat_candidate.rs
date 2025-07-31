@@ -7,8 +7,7 @@
 //! returns the existing artifact only when the model bytes and recipe match.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,7 +15,12 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::module::AutodiffModule;
 use hermes_llm::{Transformer, save_safetensors};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+use crate::artifact_io::{
+    ensure_directory, ensure_real_directory, hash_regular_file, read_regular_bounded,
+    sha256_identity as sha256_label, sync_directory, sync_regular_file, validate_sha256_identity,
+    write_new_synced,
+};
 
 use crate::quantization::{
     QuantizationManifest, QuantizationRecipe, QuantizedArchive, export_safetensors_archive,
@@ -27,6 +31,7 @@ const CANDIDATE_MANIFEST: &str = "candidate.json";
 const WEIGHTS_FILE: &str = "weights.safetensors";
 const ARCHIVE_DIRECTORY: &str = "hquant";
 const ARCHIVE_MANIFEST: &str = "manifest.json";
+const MAX_QAT_JSON_BYTES: u64 = 16 * 1024 * 1024;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Exact aggregate measurements derived from the validated archive manifest.
@@ -73,6 +78,7 @@ pub struct QatCandidateManifest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QatCandidatePublication {
     pub candidate_key: String,
+    pub recipe: QuantizationRecipe,
     pub candidate_root: PathBuf,
     pub candidate_manifest_path: PathBuf,
     pub candidate_manifest_sha256: String,
@@ -97,7 +103,35 @@ pub fn publish_qat_candidate(
     key: &str,
     recipe: &QuantizationRecipe,
 ) -> Result<QatCandidatePublication> {
-    publish_qat_candidate_with_hook(model, root, key, recipe, |_, _| Ok(()))
+    publish_qat_candidate_with_hook(model, root, key, recipe, None, |_, _| Ok(()))
+}
+
+/// Publish or reopen a candidate bound to an independently authenticated
+/// canonical model snapshot.
+///
+/// When `root/key` is already sealed, `source_weights_sha256` avoids
+/// serializing `model` again. Because a crash may leave an orphan candidate
+/// whose manifest has not yet been sealed into trainer state, adoption still
+/// reproduces that archive once from its canonical weights. Callers must
+/// obtain the digest from immutable provenance such as a verified trainer
+/// checkpoint or a content-addressed sleep checkpoint; mutable in-memory state
+/// is not a valid source of this identity.
+pub fn publish_qat_candidate_from_authenticated_source(
+    model: &Transformer,
+    root: &Path,
+    key: &str,
+    recipe: &QuantizationRecipe,
+    source_weights_sha256: &str,
+) -> Result<QatCandidatePublication> {
+    validate_sha256_identity(source_weights_sha256, "QAT source weights identity")?;
+    publish_qat_candidate_with_hook(
+        model,
+        root,
+        key,
+        recipe,
+        Some(source_weights_sha256),
+        |_, _| Ok(()),
+    )
 }
 
 /// Reopen an already published candidate and authenticate its receipt,
@@ -108,7 +142,39 @@ pub fn open_qat_candidate(candidate_root: &Path) -> Result<QatCandidatePublicati
         .and_then(|name| name.to_str())
         .context("QAT candidate key is not UTF-8")?;
     validate_candidate_key(key)?;
-    validate_candidate(candidate_root, key)
+    // Without an independently sealed receipt, internally consistent hashes
+    // are not provenance: a forged archive can rehash its own wrong codes and
+    // claim the canonical source digest. Reproduce the deterministic encoding
+    // here; checkpoint resume uses the addressed fast path below.
+    validate_candidate_reproduced(candidate_root, key)
+}
+
+/// Reopen a candidate whose exact receipt bytes are sealed by an immutable
+/// trainer checkpoint manifest.
+///
+/// The small receipt is authenticated before any model weights or archive
+/// members are read, avoiding expensive validation of a candidate that cannot
+/// match the caller's durable identity.
+pub fn open_qat_candidate_addressed(
+    candidate_root: &Path,
+    expected_candidate_manifest_sha256: &str,
+) -> Result<QatCandidatePublication> {
+    validate_sha256_identity(
+        expected_candidate_manifest_sha256,
+        "QAT candidate manifest identity",
+    )?;
+    let key = candidate_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("QAT candidate key is not UTF-8")?;
+    validate_candidate_key(key)?;
+    validate_candidate_inner_with_hook(
+        candidate_root,
+        key,
+        false,
+        Some(expected_candidate_manifest_sha256),
+        || Ok(()),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +189,7 @@ fn publish_qat_candidate_with_hook<F>(
     root: &Path,
     key: &str,
     recipe: &QuantizationRecipe,
+    source_weights_sha256: Option<&str>,
     mut hook: F,
 ) -> Result<QatCandidatePublication>
 where
@@ -140,20 +207,46 @@ where
         );
     }
 
+    // A sealed source digest is sufficient to bind an existing candidate to
+    // the trainer checkpoint. Authenticate the candidate first; only a new
+    // publication needs to materialize canonical SafeTensors bytes from the
+    // accelerator-backed model.
+    if let Some(expected) = source_weights_sha256
+        && candidate_root.exists()
+    {
+        let publication = validate_candidate_reproduced(&candidate_root, key)?;
+        ensure!(
+            publication.weights_sha256 == expected,
+            "QAT candidate key '{key}' is bound to different model weights"
+        );
+        let existing: QatCandidateManifest = read_json_regular(
+            &publication.candidate_manifest_path,
+            "QAT candidate manifest",
+        )?;
+        ensure!(
+            existing.recipe == *recipe,
+            "QAT candidate key '{key}' is already bound to a different quantization recipe"
+        );
+        return Ok(publication);
+    }
+
     let staging_path = allocate_staging_directory(root, key)?;
     let mut staging = StagingDirectory::new(staging_path);
     let staged_weights = staging.path().join(WEIGHTS_FILE);
     save_safetensors(&model.clone().valid(), &staged_weights)
         .context("failed to snapshot trained QAT weights")?;
-    OpenOptions::new()
-        .read(true)
-        .open(&staged_weights)?
-        .sync_all()?;
-    let (weights_bytes, weights_sha256) = hash_regular_file(&staged_weights, "QAT weights")?;
+    sync_regular_file(&staged_weights, "QAT weights")?;
+    let (weights_bytes, weights_sha256) = hash_regular_file(&staged_weights)?;
+    if let Some(expected) = source_weights_sha256 {
+        ensure!(
+            weights_sha256 == expected,
+            "canonical QAT weights {weights_sha256} differ from authenticated source {expected}"
+        );
+    }
     hook(PublicationPoint::WeightsSynced, &mut staging)?;
 
     if candidate_root.exists() {
-        let publication = validate_candidate(&candidate_root, key)?;
+        let publication = validate_candidate_reproduced(&candidate_root, key)?;
         ensure!(
             publication.weights_sha256 == weights_sha256,
             "QAT candidate key '{key}' is already bound to different model weights"
@@ -174,8 +267,11 @@ where
         .context("failed to export trained QAT weights as HQUANT")?;
     let archive = QuantizedArchive::open(&staged_archive)
         .context("failed to reopen staged HQUANT archive")?;
+    // `export_safetensors_archive` performs the one expensive deterministic
+    // derivation check for a newly created archive. Reopening it here only
+    // needs to authenticate the exact members and their sealed source digest.
     archive
-        .verify_source_checkpoint(&staged_weights)
+        .verify_source_identity(&weights_sha256)
         .context("staged HQUANT archive is not bound to its canonical weights")?;
     ensure!(
         archive.manifest().recipe == *recipe,
@@ -183,8 +279,7 @@ where
     );
     let archive_content_sha256 = archive.content_hash()?;
     let archive_manifest_path = staged_archive.join(ARCHIVE_MANIFEST);
-    let (_, archive_manifest_sha256) =
-        hash_regular_file(&archive_manifest_path, "HQUANT manifest")?;
+    let (_, archive_manifest_sha256) = hash_regular_file(&archive_manifest_path)?;
     let metrics = aggregate_metrics(archive.manifest())?;
     hook(PublicationPoint::ArchiveVerified, &mut staging)?;
 
@@ -201,15 +296,21 @@ where
         recipe: recipe.clone(),
         metrics,
     };
+    let candidate_manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    let staged_candidate_manifest_sha256 = sha256_label(&candidate_manifest_bytes);
     write_new_synced(
         &staging.path().join(CANDIDATE_MANIFEST),
-        &serde_json::to_vec_pretty(&manifest)?,
+        &candidate_manifest_bytes,
     )?;
     sync_directory(staging.path())?;
     hook(PublicationPoint::ManifestSynced, &mut staging)?;
 
     // Validate through the same public-facing path logic before publication.
-    validate_candidate(staging.path(), key)?;
+    let staged_publication = validate_candidate(staging.path(), key)?;
+    ensure!(
+        staged_publication.candidate_manifest_sha256 == staged_candidate_manifest_sha256,
+        "staged QAT candidate manifest changed during validation"
+    );
     match fs::rename(staging.path(), &candidate_root) {
         Ok(()) => staging.disarm(),
         Err(_error) if candidate_root.exists() => {
@@ -220,13 +321,9 @@ where
                 publication.weights_sha256 == weights_sha256,
                 "concurrent QAT publication bound key '{key}' to different model weights"
             );
-            let existing: QatCandidateManifest = read_json_regular(
-                &publication.candidate_manifest_path,
-                "QAT candidate manifest",
-            )?;
             ensure!(
-                existing.recipe == *recipe,
-                "concurrent QAT publication bound key '{key}' to a different recipe"
+                publication.candidate_manifest_sha256 == staged_candidate_manifest_sha256,
+                "concurrent QAT publication bound key '{key}' to different candidate bytes"
             );
             return Ok(publication);
         }
@@ -238,8 +335,9 @@ where
 
     let publication = validate_candidate(&candidate_root, key)?;
     ensure!(
-        publication.weights_sha256 == weights_sha256,
-        "published QAT candidate weights changed during final validation"
+        publication.weights_sha256 == weights_sha256
+            && publication.candidate_manifest_sha256 == staged_candidate_manifest_sha256,
+        "published QAT candidate changed during final validation"
     );
     Ok(publication)
 }
@@ -331,11 +429,47 @@ fn aggregate_metrics(manifest: &QuantizationManifest) -> Result<QatArchiveMetric
 }
 
 fn validate_candidate(root: &Path, expected_key: &str) -> Result<QatCandidatePublication> {
+    validate_candidate_inner(root, expected_key, false)
+}
+
+fn validate_candidate_reproduced(
+    root: &Path,
+    expected_key: &str,
+) -> Result<QatCandidatePublication> {
+    validate_candidate_inner(root, expected_key, true)
+        .context("existing QAT candidate does not reproduce its canonical weights")
+}
+
+fn validate_candidate_inner(
+    root: &Path,
+    expected_key: &str,
+    reproduce_source: bool,
+) -> Result<QatCandidatePublication> {
+    validate_candidate_inner_with_hook(root, expected_key, reproduce_source, None, || Ok(()))
+}
+
+fn validate_candidate_inner_with_hook(
+    root: &Path,
+    expected_key: &str,
+    reproduce_source: bool,
+    expected_candidate_manifest_sha256: Option<&str>,
+    after_manifest: impl FnOnce() -> Result<()>,
+) -> Result<QatCandidatePublication> {
     ensure_real_directory(root, "QAT candidate")?;
     validate_candidate_inventory(root)?;
     let candidate_manifest_path = root.join(CANDIDATE_MANIFEST);
-    let manifest_bytes = read_regular(&candidate_manifest_path, "QAT candidate manifest")?;
+    let manifest_bytes = read_regular_bounded(
+        &candidate_manifest_path,
+        MAX_QAT_JSON_BYTES,
+        "QAT candidate manifest",
+    )?;
     let candidate_manifest_sha256 = sha256_label(&manifest_bytes);
+    if let Some(expected) = expected_candidate_manifest_sha256 {
+        ensure!(
+            candidate_manifest_sha256 == expected,
+            "QAT candidate receipt identity mismatch"
+        );
+    }
     let manifest: QatCandidateManifest =
         serde_json::from_slice(&manifest_bytes).context("invalid QAT candidate manifest")?;
     ensure!(
@@ -355,25 +489,29 @@ fn validate_candidate(root: &Path, expected_key: &str) -> Result<QatCandidatePub
         "QAT candidate uses a non-canonical artifact layout"
     );
     manifest.recipe.validate()?;
+    after_manifest()?;
 
     let weights_path = root.join(WEIGHTS_FILE);
-    let (weights_bytes, weights_sha256) = hash_regular_file(&weights_path, "QAT weights")?;
+    let (weights_bytes, weights_sha256) = hash_regular_file(&weights_path)?;
     ensure!(
         weights_bytes == manifest.weights_bytes && weights_sha256 == manifest.weights_sha256,
         "QAT candidate weights do not match their manifest"
     );
 
     let archive_path = root.join(ARCHIVE_DIRECTORY);
-    let archive = QuantizedArchive::open(&archive_path)
-        .context("QAT candidate contains an invalid HQUANT archive")?;
-    archive.verify_source_checkpoint(&weights_path)?;
+    let archive =
+        QuantizedArchive::open_addressed(&archive_path, &manifest.archive_manifest_sha256)
+            .context("QAT candidate contains an invalid HQUANT archive")?;
+    archive.verify_source_identity(&weights_sha256)?;
+    if reproduce_source {
+        archive.verify_source_checkpoint(&weights_path)?;
+    }
     ensure!(
         archive.manifest().recipe == manifest.recipe,
         "QAT candidate archive recipe does not match its manifest"
     );
     let archive_manifest_path = archive_path.join(ARCHIVE_MANIFEST);
-    let (_, archive_manifest_sha256) =
-        hash_regular_file(&archive_manifest_path, "HQUANT manifest")?;
+    let archive_manifest_sha256 = archive.manifest_sha256().to_owned();
     let archive_content_sha256 = archive.content_hash()?;
     ensure!(
         archive_manifest_sha256 == manifest.archive_manifest_sha256
@@ -388,6 +526,7 @@ fn validate_candidate(root: &Path, expected_key: &str) -> Result<QatCandidatePub
 
     Ok(QatCandidatePublication {
         candidate_key: manifest.candidate_key,
+        recipe: manifest.recipe,
         candidate_root: root.to_path_buf(),
         candidate_manifest_path,
         candidate_manifest_sha256,
@@ -414,7 +553,10 @@ fn validate_candidate_inventory(root: &Path) -> Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| anyhow::anyhow!("QAT candidate contains a non-UTF-8 entry"))?;
-        actual.insert(name);
+        ensure!(
+            expected.contains(&name) && actual.insert(name),
+            "QAT candidate contains missing or unverified top-level entries"
+        );
     }
     ensure!(
         actual == expected,
@@ -449,36 +591,6 @@ fn validate_candidate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_directory(path: &Path, label: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "{label} must be a real directory: {}",
-                path.display()
-            );
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .with_context(|| format!("failed to create {label} {}", path.display()))?;
-            ensure_real_directory(path, label)
-        }
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-fn ensure_real_directory(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "{label} must be a real directory: {}",
-        path.display()
-    );
-    Ok(())
-}
-
 fn allocate_staging_directory(root: &Path, key: &str) -> Result<PathBuf> {
     for _ in 0..1024 {
         let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -504,64 +616,8 @@ fn checked_sum(mut values: impl Iterator<Item = u64>, label: &str) -> Result<u64
 }
 
 fn read_json_regular<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
-    serde_json::from_slice(&read_regular(path, label)?)
+    serde_json::from_slice(&read_regular_bounded(path, MAX_QAT_JSON_BYTES, label)?)
         .with_context(|| format!("invalid {label} {}", path.display()))
-}
-
-fn read_regular(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} must be a regular file: {}",
-        path.display()
-    );
-    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
-}
-
-fn hash_regular_file(path: &Path, label: &str) -> Result<(u64, String)> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} must be a regular file: {}",
-        path.display()
-    );
-    let mut input = File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut bytes = 0u64;
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-        bytes = bytes
-            .checked_add(u64::try_from(read).context("file chunk length exceeds u64")?)
-            .context("artifact byte count overflows u64")?;
-    }
-    Ok((bytes, format!("sha256:{:x}", digest.finalize())))
-}
-
-fn sha256_label(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to create immutable file {}", path.display()))?;
-    output.write_all(bytes)?;
-    output.sync_all()?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
 }
 
 struct StagingDirectory {
@@ -637,6 +693,19 @@ mod tests {
         }
     }
 
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn publishes_validated_candidate_with_exact_metrics_and_replays_idempotently() {
         let directory = tempfile::tempdir().unwrap();
@@ -645,6 +714,16 @@ mod tests {
         let first = publish_qat_candidate(&model, directory.path(), "step-42", &recipe).unwrap();
         let second = publish_qat_candidate(&model, directory.path(), "step-42", &recipe).unwrap();
         assert_eq!(first, second);
+        assert_eq!(
+            open_qat_candidate_addressed(&first.candidate_root, &first.candidate_manifest_sha256,)
+                .unwrap(),
+            first
+        );
+        let wrong_receipt = format!("sha256:{}", "0".repeat(64));
+        let error = open_qat_candidate_addressed(&first.candidate_root, &wrong_receipt)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("receipt identity mismatch"), "{error}");
         assert!(first.metrics.quantized_tensors > 0);
         assert!(first.metrics.quantized_elements > 0);
         assert!(first.metrics.packed_bytes > 0);
@@ -652,15 +731,11 @@ mod tests {
         assert!(first.metrics.weighted_mean_squared_error >= 0.0);
         assert!(first.metrics.maximum_absolute_error >= 0.0);
         assert_eq!(
-            hash_regular_file(&first.candidate_manifest_path, "candidate")
-                .unwrap()
-                .1,
+            hash_regular_file(&first.candidate_manifest_path).unwrap().1,
             first.candidate_manifest_sha256
         );
         assert_eq!(
-            hash_regular_file(&first.archive_manifest_path, "archive manifest")
-                .unwrap()
-                .1,
+            hash_regular_file(&first.archive_manifest_path).unwrap().1,
             first.archive_manifest_sha256
         );
         let archive = QuantizedArchive::open(&first.archive_path).unwrap();
@@ -678,6 +753,96 @@ mod tests {
         assert_eq!(
             first.metrics.archive_weight_elements,
             first.metrics.quantized_elements + first.metrics.floating_elements
+        );
+    }
+
+    #[test]
+    fn authenticated_source_retry_reopens_without_serializing_mutable_model_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_model = model(32);
+        let recipe = recipe(UltraQuantFormat::BinaryG128);
+        let first =
+            publish_qat_candidate(&source_model, directory.path(), "sealed", &recipe).unwrap();
+
+        // The in-memory model is intentionally unrelated. The trusted input to
+        // this retry is the digest from an immutable checkpoint generation.
+        // A hook failure would prove that publication tried to serialize the
+        // mutable model instead of taking the authenticated existing-key path.
+        let unrelated_model = model(33);
+        let reopened = publish_qat_candidate_with_hook(
+            &unrelated_model,
+            directory.path(),
+            "sealed",
+            &recipe,
+            Some(&first.weights_sha256),
+            |point, _| bail!("unexpected serialization boundary {point:?}"),
+        )
+        .unwrap();
+        assert_eq!(reopened, first);
+
+        let wrong_source = format!("sha256:{}", "0".repeat(64));
+        let error = publish_qat_candidate_from_authenticated_source(
+            &unrelated_model,
+            directory.path(),
+            "sealed",
+            &recipe,
+            &wrong_source,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("different model weights"), "{error}");
+    }
+
+    #[test]
+    fn orphan_adoption_rejects_an_internally_rehashed_wrong_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = recipe(UltraQuantFormat::BinaryG128);
+        let source_model = model(32);
+        let source =
+            publish_qat_candidate(&source_model, directory.path(), "source", &recipe).unwrap();
+        let wrong_model = model(33);
+        let forged =
+            publish_qat_candidate(&wrong_model, directory.path(), "forged", &recipe).unwrap();
+
+        // Forge a candidate whose outer and inner hashes are all
+        // self-consistent and claim the authenticated source identity, while
+        // retaining quantized tensors derived from a different model.
+        fs::copy(&source.weights_path, &forged.weights_path).unwrap();
+        let mut archive_manifest: QuantizationManifest =
+            read_json_regular(&forged.archive_manifest_path, "HQUANT manifest").unwrap();
+        archive_manifest.base_checkpoint_hash = source.weights_sha256.clone();
+        let archive_manifest_bytes = serde_json::to_vec_pretty(&archive_manifest).unwrap();
+        fs::write(&forged.archive_manifest_path, &archive_manifest_bytes).unwrap();
+        let forged_archive = QuantizedArchive::open(&forged.archive_path).unwrap();
+
+        let mut candidate_manifest: QatCandidateManifest =
+            read_json_regular(&forged.candidate_manifest_path, "QAT candidate manifest").unwrap();
+        candidate_manifest.weights_bytes = fs::metadata(&source.weights_path).unwrap().len();
+        candidate_manifest.weights_sha256 = source.weights_sha256.clone();
+        candidate_manifest.archive_manifest_sha256 = sha256_label(&archive_manifest_bytes);
+        candidate_manifest.archive_content_sha256 = forged_archive.content_hash().unwrap();
+        fs::write(
+            &forged.candidate_manifest_path,
+            serde_json::to_vec_pretty(&candidate_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = open_qat_candidate(&forged.candidate_root).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not reproduce its canonical weights"),
+            "{error:#}"
+        );
+        let error = publish_qat_candidate_from_authenticated_source(
+            &wrong_model,
+            directory.path(),
+            "forged",
+            &recipe,
+            &source.weights_sha256,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not reproduce its canonical weights"),
+            "{error:#}"
         );
     }
 
@@ -727,6 +892,7 @@ mod tests {
                 directory.path(),
                 &key,
                 &recipe,
+                None,
                 |point, staging| {
                     if point == fault {
                         // Leaving the staging directory emulates abrupt process
@@ -757,6 +923,44 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_adoption_requires_the_exact_locally_derived_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = model(32);
+        let recipe = recipe(UltraQuantFormat::BinaryG128);
+        let key = "concurrent-receipt";
+        let competing = directory.path().join(key);
+        let error = publish_qat_candidate_with_hook(
+            &model,
+            directory.path(),
+            key,
+            &recipe,
+            None,
+            |point, staging| {
+                if point == PublicationPoint::ManifestSynced {
+                    copy_tree(staging.path(), &competing);
+                    let manifest: QatCandidateManifest = read_json_regular(
+                        &competing.join(CANDIDATE_MANIFEST),
+                        "competing candidate manifest",
+                    )?;
+                    // The candidate is semantically equivalent and internally
+                    // valid, but it is not the exact receipt derived by this
+                    // publication attempt.
+                    fs::write(
+                        competing.join(CANDIDATE_MANIFEST),
+                        serde_json::to_vec(&manifest)?,
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different candidate bytes"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn tampering_is_rejected_without_replacing_the_candidate() {
         let directory = tempfile::tempdir().unwrap();
         let model = model(32);
@@ -772,8 +976,47 @@ mod tests {
         fs::write(&member, corrupt).unwrap();
 
         let error = publish_qat_candidate(&model, directory.path(), "tamper", &recipe).unwrap_err();
-        assert!(error.to_string().contains("invalid HQUANT archive"));
+        assert!(
+            format!("{error:#}").contains("invalid HQUANT archive"),
+            "{error:#}"
+        );
+        let fast_error = publish_qat_candidate_from_authenticated_source(
+            &model,
+            directory.path(),
+            "tamper",
+            &recipe,
+            &publication.weights_sha256,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{fast_error:#}").contains("invalid HQUANT archive"),
+            "{fast_error:#}"
+        );
         assert!(publication.candidate_root.exists());
+    }
+
+    #[test]
+    fn candidate_root_swap_after_manifest_capture_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_store = directory.path().join("first-store");
+        let second_store = directory.path().join("second-store");
+        let recipe = recipe(UltraQuantFormat::BinaryG128);
+        let first = publish_qat_candidate(&model(32), &first_store, "stable", &recipe).unwrap();
+        let second = publish_qat_candidate(&model(33), &second_store, "stable", &recipe).unwrap();
+        let published = first.candidate_root.clone();
+        let replacement = second.candidate_root.clone();
+        let parked = directory.path().join("parked-candidate");
+
+        let error = validate_candidate_inner_with_hook(&published, "stable", false, None, || {
+            fs::rename(&published, &parked)?;
+            fs::rename(&replacement, &published)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("weights do not match"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -788,6 +1031,9 @@ mod tests {
             publish_qat_candidate(&model, directory.path(), "closed", &recipe).unwrap();
         fs::write(publication.candidate_root.join("extra"), b"unverified").unwrap();
         let error = publish_qat_candidate(&model, directory.path(), "closed", &recipe).unwrap_err();
-        assert!(error.to_string().contains("unverified top-level"));
+        assert!(
+            format!("{error:#}").contains("unverified top-level"),
+            "{error:#}"
+        );
     }
 }

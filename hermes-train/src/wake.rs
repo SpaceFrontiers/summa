@@ -6,98 +6,23 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use hermes_train::quantization::WorkflowQuantizationPlan;
 use hermes_train::task::{TaskAdapter, TaskConfig};
 use hermes_train::workflow::{
-    InModelSleepConfig, PhaseKind, ResolvedWorkflow as WorkflowV2,
+    InModelSleepConfig, MemoryUpdateMode, PhaseKind, ResolvedWorkflow as WorkflowV2,
     load_workflow as load_workflow_v2,
 };
 use serde::Serialize;
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ObjectiveConfig {
-    CausalLm,
-    Summarization {
-        instruction: String,
-    },
-    RetrievalPlanning {
-        instruction: String,
-    },
-    InstructionTuning {
-        instruction: String,
-    },
-    QaReasoning {
-        instruction: String,
-        require_reasoning: bool,
-    },
-    ContrastiveRetrieval {
-        temperature: f64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        layer: Option<usize>,
-        query_prefix: String,
-        document_prefix: String,
-    },
-}
-
-impl ObjectiveConfig {
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::CausalLm => "causal_lm",
-            Self::Summarization { .. } => "summarization",
-            Self::RetrievalPlanning { .. } => "retrieval_planning",
-            Self::InstructionTuning { .. } => "instruction_tuning",
-            Self::QaReasoning { .. } => "qa_reasoning",
-            Self::ContrastiveRetrieval { .. } => "retrieval_representation",
-        }
-    }
-
-    pub(crate) fn retrieval_layer(&self) -> Option<usize> {
-        match self {
-            Self::ContrastiveRetrieval { layer, .. } => *layer,
-            _ => None,
-        }
-    }
-
-    pub(crate) fn temperature(&self) -> Option<f64> {
-        match self {
-            Self::ContrastiveRetrieval { temperature, .. } => Some(*temperature),
-            _ => None,
-        }
-    }
-}
-
-fn project_task(phase_name: &str, task: &TaskConfig) -> Result<ObjectiveConfig> {
+fn project_task(phase_name: &str, task: &TaskConfig) -> Result<TaskConfig> {
     match task {
-        TaskConfig::CausalLm {} => Ok(ObjectiveConfig::CausalLm),
-        TaskConfig::Summarization { instruction } => Ok(ObjectiveConfig::Summarization {
-            instruction: instruction.clone(),
-        }),
-        TaskConfig::RetrievalPlanning { instruction } => Ok(ObjectiveConfig::RetrievalPlanning {
-            instruction: instruction.clone(),
-        }),
-        TaskConfig::InstructionTuning { instruction } => Ok(ObjectiveConfig::InstructionTuning {
-            instruction: instruction.clone(),
-        }),
-        TaskConfig::QaReasoning {
-            instruction,
-            require_reasoning,
-        } => Ok(ObjectiveConfig::QaReasoning {
-            instruction: instruction.clone(),
-            require_reasoning: *require_reasoning,
-        }),
-        TaskConfig::RetrievalRepresentation {
-            temperature,
-            layer,
-            query_prefix,
-            document_prefix,
-        } => Ok(ObjectiveConfig::ContrastiveRetrieval {
-            temperature: *temperature,
-            layer: *layer,
-            query_prefix: query_prefix.clone(),
-            document_prefix: document_prefix.clone(),
-        }),
+        TaskConfig::CausalLm {}
+        | TaskConfig::Summarization { .. }
+        | TaskConfig::RetrievalPlanning { .. }
+        | TaskConfig::InstructionTuning { .. }
+        | TaskConfig::QaReasoning { .. }
+        | TaskConfig::RetrievalRepresentation { .. } => Ok(task.clone()),
         task => bail!(
             "workflow phase `{phase_name}` task `{}` is not executable by the wake trainer; dispatch it through its WorkflowV2 task executor",
             task.name()
@@ -110,7 +35,9 @@ pub(crate) struct ResolvedWakePhase {
     pub(crate) name: String,
     pub(crate) phase_kind: PhaseKind,
     pub(crate) data: PathBuf,
-    pub(crate) objective: ObjectiveConfig,
+    /// Exact WorkflowV2 task contract consumed by data construction and loss
+    /// dispatch. Keeping this type intact avoids a second wake-only schema.
+    pub(crate) objective: TaskConfig,
     pub(crate) sequence_length: usize,
     pub(crate) batch_size: usize,
     pub(crate) gradient_accumulation: usize,
@@ -123,6 +50,8 @@ pub(crate) struct ResolvedWakePhase {
     pub(crate) quantization: Option<WorkflowQuantizationPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) periodic_sleep: Option<InModelSleepConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_update_mode: Option<MemoryUpdateMode>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -147,6 +76,11 @@ fn project_wake_workflow(workflow: WorkflowV2) -> Result<ResolvedWakePlan> {
                 phase.kind.name()
             );
         }
+        ensure!(
+            phase.parameters.is_empty(),
+            "workflow phase `{}` contains raw parameters that the wake trainer does not consume; use typed WorkflowV2 fields or a registered phase executor",
+            phase.name
+        );
         let task = phase
             .task
             .as_ref()
@@ -184,6 +118,7 @@ fn project_wake_workflow(workflow: WorkflowV2) -> Result<ResolvedWakePlan> {
             learning_rate_scale,
             quantization,
             periodic_sleep: phase.periodic_sleep,
+            memory_update_mode: phase.memory_update_mode,
         });
     }
     Ok(ResolvedWakePlan {
@@ -321,5 +256,33 @@ mod tests {
         .unwrap();
         let error = format!("{:#}", load_wake_plan(&path).unwrap_err());
         assert!(error.contains("sequnce_length"), "{error}");
+    }
+
+    #[test]
+    fn wake_projection_rejects_raw_parameters_instead_of_dropping_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "phases": [{
+                    "name": "custom-causal",
+                    "type": "pretrain",
+                    "data": "tokens.jsonl",
+                    "task": {"type": "causal_lm"},
+                    "sequence_length": 128,
+                    "batch_size": 4,
+                    "gradient_accumulation": 1,
+                    "steps": 1,
+                    "parameters": {"unconsumed_learning_rule": "v1"}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = load_wake_plan(&path).unwrap_err().to_string();
+        assert!(error.contains("raw parameters"), "{error}");
+        assert!(error.contains("does not consume"), "{error}");
     }
 }

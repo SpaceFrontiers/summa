@@ -1,3 +1,8 @@
+/// Internal, security-sensitive artifact I/O shared by the library and the
+/// `hermes-train` binary. This is public only because Cargo builds those as
+/// separate crates; it is not a stable user-facing API.
+#[doc(hidden)]
+pub mod artifact_io;
 pub mod training_accounting;
 
 pub mod builtin_dreaming;
@@ -9,8 +14,11 @@ pub mod metrics;
 pub mod native_host;
 pub mod native_sleep;
 pub mod optimizer_artifact;
+mod pinned_executable;
 pub mod posttrain;
 
+#[cfg(unix)]
+mod protocol_process;
 pub mod qat_candidate;
 pub mod quantization;
 

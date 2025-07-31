@@ -9,6 +9,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -19,20 +20,19 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, ensure};
 use hermes_llm::Tokenizer;
-use hermes_train::corpus::CorpusManifest;
+use hermes_train::corpus::AuthenticatedCorpus;
+use hermes_train::task::TaskConfig;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
-use crate::wake::ObjectiveConfig;
-
 mod batch;
 mod structured;
 
-use batch::EncodedText;
 pub(crate) use batch::{
-    BatchStats, LanguageBatch, RetrievalBatch, TrainingBatch, TrainingSample, make_batch,
+    BatchStats, EncodedText, LanguageBatch, RetrievalBatch, TrainingBatch, TrainingSample,
+    make_batch,
 };
 use structured::visit_structured_samples;
 
@@ -44,6 +44,441 @@ const TOKEN_CACHE_MAGIC: &[u8; 8] = b"HERTOK01";
 const TOKEN_CACHE_INDEX_MAGIC: &[u8; 8] = b"HERTIX01";
 const TOKEN_CACHE_INDEX_BYTES: usize = 144;
 const MAX_CACHED_DOCUMENT_TOKENS: usize = 100_000_000;
+/// One malformed input record must not make training allocate an entire
+/// (possibly decompressed) multi-gigabyte source. For JSONL this bound excludes
+/// the terminal LF, matching corpus serialization limits. It remains far above
+/// supported model context sizes.
+const MAX_TRAINING_RECORD_BYTES: usize = 64 * 1024 * 1024;
+/// `TOKENIZE_BATCH` bounds dispatch overhead, while this independently bounds
+/// the raw text retained before batch tokenization.
+const MAX_TOKENIZE_BATCH_BYTES: usize = MAX_TRAINING_RECORD_BYTES;
+#[cfg(not(test))]
+const AUTHENTICATED_READ_BUFFER_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+const AUTHENTICATED_READ_BUFFER_BYTES: usize = 4 * 1024;
+
+/// The exact immutable data generation assigned to one workflow phase.
+///
+/// Both variants retain authenticated handles for the lifetime of training.
+/// Consequently, run-signature construction, planning, token-cache creation,
+/// and every epoch all refer to the same generation instead of hashing a path
+/// and reopening whatever that path happens to name later.
+#[derive(Clone)]
+pub(crate) struct PhaseDataBinding {
+    configured_path: PathBuf,
+    source: BoundPhaseData,
+}
+
+#[derive(Clone)]
+enum BoundPhaseData {
+    Corpus {
+        signature_identity: String,
+        corpus: Arc<AuthenticatedCorpus>,
+    },
+    Direct(Arc<AuthenticatedPhaseFile>),
+}
+
+impl PhaseDataBinding {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        if let Some(corpus) = AuthenticatedCorpus::open_data_path(path)? {
+            let signature_identity = format!("sha256:{}", corpus.manifest().manifest_sha256);
+            return Ok(Self {
+                configured_path: path.to_owned(),
+                source: BoundPhaseData::Corpus {
+                    signature_identity,
+                    corpus: Arc::new(corpus),
+                },
+            });
+        }
+        Ok(Self {
+            configured_path: path.to_owned(),
+            source: BoundPhaseData::Direct(Arc::new(AuthenticatedPhaseFile::open(path)?)),
+        })
+    }
+
+    pub(crate) fn signature_identity(&self) -> &str {
+        match &self.source {
+            BoundPhaseData::Corpus {
+                signature_identity, ..
+            } => signature_identity,
+            BoundPhaseData::Direct(file) => &file.signature_identity,
+        }
+    }
+
+    pub(crate) fn authenticated_corpus(&self) -> Option<&AuthenticatedCorpus> {
+        match &self.source {
+            BoundPhaseData::Corpus { corpus, .. } => Some(corpus),
+            BoundPhaseData::Direct(_) => None,
+        }
+    }
+
+    fn configured_path(&self) -> &Path {
+        &self.configured_path
+    }
+
+    fn ensure_matches_path(&self, path: &Path) -> Result<()> {
+        ensure!(
+            path == self.configured_path(),
+            "phase data binding for {} cannot be used to read {}",
+            self.configured_path().display(),
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Reject replacement, symlinking, or in-place mutation of the published
+    /// input, including on token-cache paths that do not need source bytes.
+    pub(crate) fn ensure_still_published(&self) -> Result<()> {
+        match &self.source {
+            BoundPhaseData::Corpus { corpus, .. } => corpus.ensure_still_published(),
+            BoundPhaseData::Direct(file) => file.ensure_still_published(),
+        }
+    }
+
+    /// Stream every source through authenticated handles. The final identity
+    /// check deliberately runs even when the visitor errors or exits early.
+    fn with_readers(
+        &self,
+        path: &Path,
+        mut visit: impl FnMut(&Path, &mut dyn BufRead) -> Result<bool>,
+    ) -> Result<bool> {
+        self.ensure_matches_path(path)?;
+        self.ensure_still_published()?;
+        let result = match &self.source {
+            BoundPhaseData::Corpus { corpus, .. } => (|| -> Result<bool> {
+                let mut keep_going = true;
+                for index in 0..corpus.shard_count() {
+                    keep_going = corpus.with_verified_shard(index, |source_path, file| {
+                        with_decoded_reader(source_path, file, |reader| visit(source_path, reader))
+                    })?;
+                    if !keep_going {
+                        break;
+                    }
+                }
+                Ok(keep_going)
+            })(),
+            BoundPhaseData::Direct(file) => {
+                file.with_reader(|source_path, reader| visit(source_path, reader))
+            }
+        };
+        // Integrity errors take precedence over visitor errors: callers must
+        // never mistake an errored or shortened pass over mutated data for a
+        // harmless application-level failure.
+        self.ensure_still_published()?;
+        result
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StablePhaseFileIdentity {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl StablePhaseFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+struct AuthenticatedPhaseFile {
+    path: PathBuf,
+    identity: StablePhaseFileIdentity,
+    signature_identity: String,
+    file: Mutex<File>,
+}
+
+impl AuthenticatedPhaseFile {
+    #[cfg(not(unix))]
+    fn open(path: &Path) -> Result<Self> {
+        anyhow::bail!(
+            "exact direct phase-data binding for {} requires stable Unix file identities; use an immutable prepared-corpus manifest on this platform",
+            path.display()
+        )
+    }
+
+    #[cfg(unix)]
+    fn open(path: &Path) -> Result<Self> {
+        let mut file = open_published_phase_file(path)?;
+        let identity = StablePhaseFileIdentity::from_metadata(&file.metadata()?);
+        let signature_identity = hash_stable_phase_file(&mut file, &identity, path)?;
+        ensure_published_phase_file(path, &identity)?;
+        Ok(Self {
+            path: path.to_owned(),
+            identity,
+            signature_identity,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn with_reader(
+        &self,
+        read: impl FnOnce(&Path, &mut dyn BufRead) -> Result<bool>,
+    ) -> Result<bool> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("phase-data handle lock was poisoned"))?;
+        file.rewind()
+            .with_context(|| format!("failed to rewind phase data {}", self.path.display()))?;
+        let verified = VerifiedPhaseReader {
+            file: &mut file,
+            expected: &self.identity,
+            path: &self.path,
+        };
+        with_decoded_reader(&self.path, verified, |reader| read(&self.path, reader))
+    }
+
+    fn ensure_still_published(&self) -> Result<()> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("phase-data handle lock was poisoned"))?;
+        let observed =
+            StablePhaseFileIdentity::from_metadata(&file.metadata().with_context(|| {
+                format!("failed to inspect open phase data {}", self.path.display())
+            })?);
+        ensure!(
+            observed == self.identity,
+            "phase data {} changed in place after authentication",
+            self.path.display()
+        );
+        ensure_published_phase_file(&self.path, &self.identity)
+    }
+}
+
+/// Detect in-place mutation before any bytes from that read reach parsing,
+/// tokenization, prefetch, or a durable trainer checkpoint. A large outer
+/// buffer keeps this to roughly one `fstat` per MiB for uncompressed inputs.
+struct VerifiedPhaseReader<'a> {
+    file: &'a mut File,
+    expected: &'a StablePhaseFileIdentity,
+    path: &'a Path,
+}
+
+impl Read for VerifiedPhaseReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(buffer)?;
+        let observed = StablePhaseFileIdentity::from_metadata(&self.file.metadata()?);
+        if observed != *self.expected {
+            return Err(std::io::Error::other(format!(
+                "phase data {} changed in place while it was streamed",
+                self.path.display()
+            )));
+        }
+        Ok(read)
+    }
+}
+
+#[cfg(unix)]
+fn open_published_phase_file(path: &Path) -> Result<File> {
+    let inspected = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect phase data {}", path.display()))?;
+    ensure!(
+        inspected.file_type().is_file() && !inspected.file_type().is_symlink(),
+        "phase data {} must be a regular non-symlink file",
+        path.display()
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("failed to securely open phase data {}", path.display()))?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.file_type().is_file(),
+        "opened phase data {} is not a regular file",
+        path.display()
+    );
+    ensure!(
+        StablePhaseFileIdentity::from_metadata(&opened)
+            == StablePhaseFileIdentity::from_metadata(&inspected),
+        "phase data {} changed while it was opened",
+        path.display()
+    );
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn ensure_published_phase_file(path: &Path, expected: &StablePhaseFileIdentity) -> Result<()> {
+    let published = open_published_phase_file(path)?;
+    ensure!(
+        StablePhaseFileIdentity::from_metadata(&published.metadata()?) == *expected,
+        "published phase data {} changed after authentication",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_published_phase_file(path: &Path, _expected: &StablePhaseFileIdentity) -> Result<()> {
+    anyhow::bail!(
+        "exact direct phase-data binding for {} requires stable Unix file identities",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn hash_stable_phase_file(
+    file: &mut File,
+    expected: &StablePhaseFileIdentity,
+    path: &Path,
+) -> Result<String> {
+    file.rewind()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes_read = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash phase data {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(u64::try_from(read)?)
+            .context("phase-data byte count overflows u64")?;
+        hasher.update(&buffer[..read]);
+    }
+    let observed = StablePhaseFileIdentity::from_metadata(&file.metadata()?);
+    ensure!(
+        observed == *expected && bytes_read == expected.length,
+        "phase data {} changed while its run-signature identity was computed",
+        path.display()
+    );
+    file.rewind()?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn with_decoded_reader<T, R: Read>(
+    path: &Path,
+    reader: R,
+    read: impl FnOnce(&mut dyn BufRead) -> Result<T>,
+) -> Result<T> {
+    if path.extension().is_some_and(|extension| extension == "zst") {
+        let compressed = BufReader::with_capacity(AUTHENTICATED_READ_BUFFER_BYTES, reader);
+        let decoder = zstd::stream::read::Decoder::with_buffer(compressed)
+            .with_context(|| format!("failed to open zstd stream {}", path.display()))?;
+        let mut reader = BufReader::new(decoder);
+        read(&mut reader)
+    } else {
+        let mut reader = BufReader::with_capacity(AUTHENTICATED_READ_BUFFER_BYTES, reader);
+        read(&mut reader)
+    }
+}
+
+fn read_training_jsonl_record_bounded<'a>(
+    reader: &mut (impl BufRead + ?Sized),
+    output: &'a mut Vec<u8>,
+    maximum_bytes: usize,
+    path: &Path,
+    line_number: usize,
+) -> Result<Option<&'a str>> {
+    ensure!(
+        maximum_bytes > 0,
+        "training JSONL record byte limit must be positive"
+    );
+    output.clear();
+    let capture_bytes = maximum_bytes
+        .checked_add(1)
+        .context("training JSONL record byte limit overflows usize")?;
+    let read = reader
+        .take(u64::try_from(capture_bytes).context("training JSONL record byte limit exceeds u64")?)
+        .read_until(b'\n', output)
+        .with_context(|| {
+            format!(
+                "failed to read training JSONL record at {}:{line_number}",
+                path.display()
+            )
+        })?;
+    if read == 0 {
+        return Ok(None);
+    }
+    let record_bytes = output
+        .len()
+        .checked_sub(usize::from(output.last() == Some(&b'\n')))
+        .context("training JSONL record byte count underflows usize")?;
+    ensure!(
+        record_bytes <= maximum_bytes,
+        "training JSONL record at {}:{line_number} exceeds the maximum of {maximum_bytes} bytes before its newline",
+        path.display()
+    );
+    let record = std::str::from_utf8(output).with_context(|| {
+        format!(
+            "training JSONL record at {}:{line_number} is not UTF-8",
+            path.display()
+        )
+    })?;
+    Ok(Some(record))
+}
+
+pub(super) fn read_training_jsonl_record<'a>(
+    reader: &mut (impl BufRead + ?Sized),
+    output: &'a mut Vec<u8>,
+    path: &Path,
+    line_number: usize,
+) -> Result<Option<&'a str>> {
+    read_training_jsonl_record_bounded(reader, output, MAX_TRAINING_RECORD_BYTES, path, line_number)
+}
+
+fn read_training_text_document_bounded(
+    reader: &mut (impl BufRead + ?Sized),
+    maximum_bytes: usize,
+    path: &Path,
+) -> Result<String> {
+    ensure!(
+        maximum_bytes > 0,
+        "training text document byte limit must be positive"
+    );
+    let capture_bytes = maximum_bytes
+        .checked_add(1)
+        .context("training text document byte limit overflows usize")?;
+    let mut document = Vec::new();
+    reader
+        .take(
+            u64::try_from(capture_bytes)
+                .context("training text document byte limit exceeds u64")?,
+        )
+        .read_to_end(&mut document)
+        .with_context(|| format!("failed to read training text document {}", path.display()))?;
+    ensure!(
+        document.len() <= maximum_bytes,
+        "training text document {} exceeds the maximum of {maximum_bytes} bytes",
+        path.display()
+    );
+    String::from_utf8(document).with_context(|| {
+        format!(
+            "training text document {} is not valid UTF-8",
+            path.display()
+        )
+    })
+}
 
 struct TokenCacheWriter {
     writer: BufWriter<File>,
@@ -110,6 +545,20 @@ impl TokenCacheWriter {
         }
         write_token_cache_index_atomic(&self.location, &index.encode())?;
         self.index_invalidated = false;
+        Ok(())
+    }
+
+    /// Discard all derived records after an authoritative-input integrity
+    /// failure. Keeping even an unindexed prefix is unsafe: a later retry would
+    /// replay it and skip the corresponding source documents.
+    fn reset_to_empty(&mut self) -> Result<()> {
+        self.writer.flush().context("flushing failed token cache")?;
+        reset_open_token_cache(&self.location, self.writer.get_mut())?;
+        self.digest = Sha256::new();
+        self.digest.update(TOKEN_CACHE_MAGIC);
+        self.documents = 0;
+        self.stream_tokens = 0;
+        self.index_invalidated = true;
         Ok(())
     }
 }
@@ -412,6 +861,17 @@ impl TokenCacheLocation {
         }
     }
 
+    fn open_existing_cache_for_reset(&self) -> Result<Option<File>> {
+        #[cfg(unix)]
+        {
+            self.open_child(&self.cache_name, libc::O_RDWR)
+        }
+        #[cfg(not(unix))]
+        {
+            self.open_child_portable(&self.cache_name, false, true)
+        }
+    }
+
     fn open_index(&self) -> Result<Option<File>> {
         #[cfg(unix)]
         {
@@ -596,6 +1056,51 @@ fn invalidate_token_cache_index(location: &TokenCacheLocation) -> Result<()> {
     Ok(())
 }
 
+fn reset_token_cache_path(path: &Path) -> Result<()> {
+    let Some(location) = TokenCacheLocation::open(path, false)? else {
+        return Ok(());
+    };
+    let Some(mut cache) = location.open_existing_cache_for_reset()? else {
+        invalidate_token_cache_index(&location)?;
+        return Ok(());
+    };
+    reset_open_token_cache(&location, &mut cache)
+}
+
+fn reset_open_token_cache(location: &TokenCacheLocation, cache: &mut File) -> Result<()> {
+    invalidate_token_cache_index(location)?;
+    cache.set_len(0).context("truncating failed token cache")?;
+    cache
+        .seek(SeekFrom::Start(0))
+        .context("rewinding failed token cache")?;
+    cache
+        .write_all(TOKEN_CACHE_MAGIC)
+        .context("rewriting failed token-cache header")?;
+    cache.sync_all().context("syncing reset token cache")
+}
+
+fn ensure_token_cache_unchanged(
+    reader: &mut BufReader<File>,
+    expected: &TokenCacheFileIdentity,
+    location: &TokenCacheLocation,
+    path: &Path,
+) -> Result<()> {
+    let observed = TokenCacheFileIdentity::from_metadata(&reader.get_ref().metadata()?);
+    if observed != *expected {
+        reset_open_token_cache(location, reader.get_mut()).with_context(|| {
+            format!(
+                "failed to reset {} after detecting an in-place mutation",
+                path.display()
+            )
+        })?;
+        anyhow::bail!(
+            "token cache {} changed while it was replayed; the derived cache was reset",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Return the causal sample count from a durably completed token cache without
 /// replaying its records. Missing, torn, stale, or corrupt metadata returns
 /// `None`, so callers can safely fall back to [`count_samples`].
@@ -628,10 +1133,12 @@ pub(crate) fn indexed_causal_sample_count(
 fn replay_token_cache(
     path: &Path,
     eos_token: u32,
+    vocab_size: usize,
     packer: &mut SamplePacker,
     count: &mut usize,
     visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<(usize, bool, Option<TokenCacheWriter>, bool)> {
+    ensure!(vocab_size > 0, "tokenizer vocabulary must not be empty");
     let location = TokenCacheLocation::open(path, true)?
         .context("token-cache directory disappeared while it was opened")?;
     let mut cache = location
@@ -674,16 +1181,36 @@ fn replay_token_cache(
         cache.write_all(TOKEN_CACHE_MAGIC)?;
         cache.sync_all()?;
     }
+    let replay_identity = TokenCacheFileIdentity::from_metadata(&cache.metadata()?);
     cache.rewind()?;
 
     let mut reader = BufReader::new(cache);
     let mut magic = [0_u8; 8];
     reader.read_exact(&mut magic)?;
-    ensure!(
-        &magic == TOKEN_CACHE_MAGIC,
-        "token cache {} has an unsupported format",
-        path.display()
-    );
+    if &magic != TOKEN_CACHE_MAGIC {
+        // Token caches are derived data. An unrecognized header cannot be
+        // replayed safely, but it also must not permanently wedge training:
+        // reset it and rebuild from the authenticated authoritative corpus in
+        // this invocation.
+        let mut cache = reader.into_inner();
+        reset_open_token_cache(&location, &mut cache)?;
+        cache.seek(SeekFrom::End(0))?;
+        let mut digest = Sha256::new();
+        digest.update(TOKEN_CACHE_MAGIC);
+        return Ok((
+            0,
+            true,
+            Some(TokenCacheWriter {
+                writer: BufWriter::new(cache),
+                location,
+                digest,
+                documents: 0,
+                stream_tokens: 0,
+                index_invalidated: true,
+            }),
+            false,
+        ));
+    }
     let mut valid_bytes = TOKEN_CACHE_MAGIC.len() as u64;
     let mut documents = 0usize;
     let mut stream_tokens = 0_u64;
@@ -722,6 +1249,19 @@ fn replay_token_cache(
             }
             return Err(error.into());
         }
+        let invalid_token = bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte token chunk")))
+            .find(|token| usize::try_from(*token).map_or(true, |token| token >= vocab_size));
+        if let Some(token) = invalid_token {
+            let mut cache = reader.into_inner();
+            reset_open_token_cache(&location, &mut cache)?;
+            anyhow::bail!(
+                "token cache {} contains token id {token} outside tokenizer vocabulary size {vocab_size}; the derived cache was reset and will be rebuilt on retry",
+                path.display()
+            );
+        }
+        ensure_token_cache_unchanged(&mut reader, &replay_identity, &location, path)?;
         valid_bytes = valid_bytes
             .checked_add(4 + byte_len as u64)
             .context("token cache offset overflows u64")?;
@@ -737,10 +1277,17 @@ fn replay_token_cache(
             .chunks_exact(4)
             .map(|bytes| i64::from(u32::from_le_bytes(bytes.try_into().unwrap())))
             .chain(std::iter::once(i64::from(eos_token)));
-        if !packer.push(tokens, count, visit)? {
+        let keep_going = packer.push(tokens, count, visit);
+        // A visitor can stop or fail before the whole-cache digest check. The
+        // opened cache incarnation must therefore still be checked at that
+        // boundary so a concurrent in-place mutation cannot affect a model
+        // update and then hide behind the early return.
+        ensure_token_cache_unchanged(&mut reader, &replay_identity, &location, path)?;
+        if !keep_going? {
             return Ok((documents, false, None, false));
         }
     }
+    ensure_token_cache_unchanged(&mut reader, &replay_identity, &location, path)?;
     let mut cache = reader.into_inner();
     let verified_complete = if let Some(expected) = expected_index.take() {
         ensure!(
@@ -810,18 +1357,6 @@ fn replay_token_cache(
         }),
         false,
     ))
-}
-
-fn open_data(path: &Path) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open training data {}", path.display()))?;
-    if path.extension().is_some_and(|ext| ext == "zst") {
-        let decoder = zstd::stream::read::Decoder::new(file)
-            .with_context(|| format!("failed to open zstd stream {}", path.display()))?;
-        Ok(Box::new(BufReader::new(decoder)))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
 }
 
 struct ShuffleBuffer {
@@ -903,71 +1438,91 @@ impl SamplePacker {
     }
 }
 
-fn push_documents(
-    documents: &mut Vec<String>,
-    tokenizer: &Tokenizer,
-    packer: &mut SamplePacker,
-    count: &mut usize,
-    visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
-    cache: &mut Option<TokenCacheWriter>,
-) -> Result<bool> {
-    if documents.is_empty() {
-        return Ok(true);
-    }
-    let encodings = tokenizer.encode_batch(std::mem::take(documents), false)?;
-    for tokens in encodings {
-        if let Some(cache) = cache {
-            cache.append(&tokens)?;
+struct DocumentTokenizationBatch {
+    documents: Vec<String>,
+    bytes: usize,
+}
+
+impl DocumentTokenizationBatch {
+    fn new() -> Self {
+        Self {
+            documents: Vec::with_capacity(TOKENIZE_BATCH),
+            bytes: 0,
         }
-        let tokens = tokens
-            .into_iter()
-            .map(i64::from)
-            .chain(std::iter::once(i64::from(tokenizer.eos_token_id())));
-        if !packer.push(tokens, count, visit)? {
+    }
+
+    fn flush(
+        &mut self,
+        tokenizer: &Tokenizer,
+        packer: &mut SamplePacker,
+        count: &mut usize,
+        visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
+        cache: &mut Option<TokenCacheWriter>,
+    ) -> Result<bool> {
+        if self.documents.is_empty() {
+            debug_assert_eq!(self.bytes, 0);
+            return Ok(true);
+        }
+        let documents = std::mem::take(&mut self.documents);
+        self.bytes = 0;
+        let encodings = tokenizer.encode_batch(documents, false)?;
+        for tokens in encodings {
+            if let Some(cache) = cache {
+                cache.append(&tokens)?;
+            }
+            let tokens = tokens
+                .into_iter()
+                .map(i64::from)
+                .chain(std::iter::once(i64::from(tokenizer.eos_token_id())));
+            if !packer.push(tokens, count, visit)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn queue(
+        &mut self,
+        document: String,
+        tokenizer: &Tokenizer,
+        packer: &mut SamplePacker,
+        count: &mut usize,
+        visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
+        cache: &mut Option<TokenCacheWriter>,
+    ) -> Result<bool> {
+        ensure!(
+            document.len() <= MAX_TOKENIZE_BATCH_BYTES,
+            "training document is {} bytes, exceeding the tokenization batch limit of {MAX_TOKENIZE_BATCH_BYTES}",
+            document.len()
+        );
+        let prospective_bytes = self
+            .bytes
+            .checked_add(document.len())
+            .context("tokenization batch byte count overflows usize")?;
+        if !self.documents.is_empty()
+            && prospective_bytes > MAX_TOKENIZE_BATCH_BYTES
+            && !self.flush(tokenizer, packer, count, visit, cache)?
+        {
             return Ok(false);
         }
+        self.bytes = self
+            .bytes
+            .checked_add(document.len())
+            .context("tokenization batch byte count overflows usize")?;
+        self.documents.push(document);
+        if (self.documents.len() == TOKENIZE_BATCH || self.bytes >= MAX_TOKENIZE_BATCH_BYTES)
+            && !self.flush(tokenizer, packer, count, visit, cache)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
-    Ok(true)
 }
 
 fn is_jsonl(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
-}
-
-fn causal_data_paths(path: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let manifest_path = if path.is_dir() {
-        Some(path.join("manifest.json"))
-    } else if path.file_name().is_some_and(|name| name == "manifest.json") {
-        Some(path.to_owned())
-    } else {
-        None
-    };
-    let Some(manifest_path) = manifest_path else {
-        return Ok(vec![path.to_owned()]);
-    };
-    let manifest: CorpusManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
-        .with_context(|| format!("invalid corpus manifest {}", manifest_path.display()))?;
-    ensure!(
-        !manifest.build.shards.is_empty(),
-        "corpus manifest has no shards"
-    );
-    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    manifest
-        .build
-        .shards
-        .iter()
-        .map(|shard| {
-            let shard_path = root.join(&shard.path);
-            ensure!(
-                shard_path.is_file(),
-                "corpus shard {} is missing",
-                shard_path.display()
-            );
-            Ok(shard_path)
-        })
-        .collect()
 }
 
 fn token_array(
@@ -1010,22 +1565,104 @@ fn token_array(
         .map(Some)
 }
 
+struct CausalVisitOutcome {
+    count: usize,
+    cache: Option<TokenCacheWriter>,
+    publish_cache: bool,
+}
+
+impl CausalVisitOutcome {
+    fn reset_cache(&mut self, token_cache: Option<&Path>) -> Result<()> {
+        match &mut self.cache {
+            Some(cache) => cache.reset_to_empty(),
+            None => match token_cache {
+                Some(path) => reset_token_cache_path(path),
+                None => Ok(()),
+            },
+        }
+    }
+}
+
 fn visit_causal_samples(
     path: &Path,
     tokenizer: &Tokenizer,
     seq_len: usize,
     token_cache: Option<&Path>,
+    data_binding: &PhaseDataBinding,
     mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
+    // Both checks are intentional. The first rejects a replacement already
+    // present when an epoch begins. The second covers token-cache fast paths,
+    // early visitor exits, and mutation during streaming. Reads in between use
+    // only the descriptors captured during run-signature authentication.
+    data_binding.ensure_matches_path(path)?;
+    if let Err(identity_error) = data_binding.ensure_still_published() {
+        if let Some(path) = token_cache {
+            reset_token_cache_path(path)?;
+        }
+        return Err(identity_error);
+    }
+    let mut result = visit_causal_samples_inner(
+        path,
+        tokenizer,
+        seq_len,
+        token_cache,
+        data_binding,
+        &mut visit,
+    );
+    // This check runs before inspecting `result`, so mutation is reported even
+    // if tokenization or the caller's visitor failed or stopped early.
+    if let Err(identity_error) = data_binding.ensure_still_published() {
+        match &mut result {
+            Ok(outcome) => outcome.reset_cache(token_cache)?,
+            Err(_) => {
+                // The inner path resets whenever it owns a writer. This covers
+                // failures during cache replay, before such a writer exists.
+                if let Some(path) = token_cache {
+                    reset_token_cache_path(path)?;
+                }
+            }
+        }
+        return Err(identity_error);
+    }
+    let mut outcome = result?;
+    if outcome.publish_cache
+        && let Some(cache) = &mut outcome.cache
+    {
+        cache.publish_index()?;
+        // Close the small commit window as well. If publication changes while
+        // the sidecar is being committed, revoke the completion proof before
+        // returning the integrity error.
+        if let Err(identity_error) = data_binding.ensure_still_published() {
+            cache.reset_to_empty().with_context(|| {
+                format!(
+                    "failed to reset token cache after phase-data integrity failure: {identity_error:#}"
+                )
+            })?;
+            return Err(identity_error);
+        }
+    }
+    Ok(outcome.count)
+}
+
+fn visit_causal_samples_inner(
+    path: &Path,
+    tokenizer: &Tokenizer,
+    seq_len: usize,
+    token_cache: Option<&Path>,
+    data_binding: &PhaseDataBinding,
+    visit: &mut impl FnMut(TrainingSample) -> Result<bool>,
+) -> Result<CausalVisitOutcome> {
     let mut count = 0;
     let mut packer = SamplePacker::new(seq_len);
     let (cached_documents, keep_going, mut cache, cache_complete) = match token_cache {
         Some(path) => replay_token_cache(
             path,
             tokenizer.eos_token_id(),
+            tokenizer.vocab_size(),
             &mut packer,
             &mut count,
-            &mut visit,
+            visit,
         )?,
         None => (0, true, None, false),
     };
@@ -1038,116 +1675,150 @@ fn visit_causal_samples(
         );
     }
     if !keep_going {
-        return Ok(count);
+        return Ok(CausalVisitOutcome {
+            count,
+            cache: None,
+            publish_cache: false,
+        });
     }
     if cache_complete {
-        return Ok(count);
+        return Ok(CausalVisitOutcome {
+            count,
+            cache: None,
+            publish_cache: false,
+        });
     }
     let mut document_number = 0usize;
-    let mut documents = Vec::with_capacity(TOKENIZE_BATCH);
-    for source_path in causal_data_paths(path)? {
-        let mut reader = open_data(&source_path)?;
-        if is_jsonl(&source_path) {
-            let mut line = String::new();
-            let mut line_number = 0usize;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line)? == 0 {
-                    break;
-                }
-                line_number = line_number
-                    .checked_add(1)
-                    .context("JSONL line count overflows usize")?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                document_number = document_number
-                    .checked_add(1)
-                    .context("JSONL document count overflows usize")?;
-                if document_number <= cached_documents {
-                    continue;
-                }
-                let value: serde_json::Value = serde_json::from_str(&line).with_context(|| {
-                    format!("invalid JSONL at {}:{line_number}", source_path.display())
-                })?;
-                if let Some(tokens) = token_array(&value, &source_path, line_number)? {
-                    ensure!(
-                        tokens
-                            .iter()
-                            .all(|token| (*token as usize) < tokenizer.vocab_size()),
-                        "tokenized corpus row at {}:{line_number} contains a token outside vocabulary size {}",
-                        source_path.display(),
-                        tokenizer.vocab_size()
-                    );
-                    if !push_documents(
-                        &mut documents,
-                        tokenizer,
-                        &mut packer,
-                        &mut count,
-                        &mut visit,
-                        &mut cache,
-                    )? {
-                        return Ok(count);
+    let mut documents = DocumentTokenizationBatch::new();
+    let scan_result = (|| -> Result<bool> {
+        let fully_read = data_binding.with_readers(path, |source_path, reader| {
+            if is_jsonl(source_path) {
+                let mut line = Vec::new();
+                let mut line_number = 0usize;
+                loop {
+                    let next_line_number = line_number
+                        .checked_add(1)
+                        .context("JSONL line count overflows usize")?;
+                    let Some(line) = read_training_jsonl_record(
+                        reader,
+                        &mut line,
+                        source_path,
+                        next_line_number,
+                    )?
+                    else {
+                        break;
+                    };
+                    line_number = next_line_number;
+                    if line.trim().is_empty() {
+                        continue;
                     }
-                    if let Some(cache) = &mut cache {
-                        cache.append(&tokens)?;
+                    document_number = document_number
+                        .checked_add(1)
+                        .context("JSONL document count overflows usize")?;
+                    if document_number <= cached_documents {
+                        continue;
                     }
-                    if !packer.push(
-                        tokens
-                            .into_iter()
-                            .map(i64::from)
-                            .chain(std::iter::once(i64::from(tokenizer.eos_token_id()))),
-                        &mut count,
-                        &mut visit,
-                    )? {
-                        return Ok(count);
-                    }
-                } else {
-                    let document = required_string(&value, "text", &source_path, line_number)?;
-                    documents.push(document.to_owned());
-                    if documents.len() == TOKENIZE_BATCH
-                        && !push_documents(
-                            &mut documents,
+                    let value: serde_json::Value =
+                        serde_json::from_str(line).with_context(|| {
+                            format!("invalid JSONL at {}:{line_number}", source_path.display())
+                        })?;
+                    if let Some(tokens) = token_array(&value, source_path, line_number)? {
+                        ensure!(
+                            tokens
+                                .iter()
+                                .all(|token| (*token as usize) < tokenizer.vocab_size()),
+                            "tokenized corpus row at {}:{line_number} contains a token outside vocabulary size {}",
+                            source_path.display(),
+                            tokenizer.vocab_size()
+                        );
+                        if !documents.flush(
                             tokenizer,
                             &mut packer,
                             &mut count,
-                            &mut visit,
+                            visit,
                             &mut cache,
-                        )?
-                    {
-                        return Ok(count);
+                        )? {
+                            return Ok(false);
+                        }
+                        if let Some(cache) = &mut cache {
+                            cache.append(&tokens)?;
+                        }
+                        if !packer.push(
+                            tokens
+                                .into_iter()
+                                .map(i64::from)
+                                .chain(std::iter::once(i64::from(tokenizer.eos_token_id()))),
+                            &mut count,
+                            visit,
+                        )? {
+                            return Ok(false);
+                        }
+                    } else {
+                        let document = required_string(&value, "text", source_path, line_number)?;
+                        if !documents.queue(
+                            document.to_owned(),
+                            tokenizer,
+                            &mut packer,
+                            &mut count,
+                            visit,
+                            &mut cache,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
+                }
+            } else {
+                document_number = document_number
+                    .checked_add(1)
+                    .context("document count overflows usize")?;
+                if document_number > cached_documents {
+                    let document = read_training_text_document_bounded(
+                        reader,
+                        MAX_TRAINING_RECORD_BYTES,
+                        source_path,
+                    )?;
+                    if !documents.queue(
+                        document,
+                        tokenizer,
+                        &mut packer,
+                        &mut count,
+                        visit,
+                        &mut cache,
+                    )? {
+                        return Ok(false);
                     }
                 }
             }
-        } else {
-            document_number = document_number
-                .checked_add(1)
-                .context("document count overflows usize")?;
-            if document_number > cached_documents {
-                let mut document = String::new();
-                reader.read_to_string(&mut document)?;
-                documents.push(document);
-            }
+            Ok(true)
+        })?;
+        if !fully_read {
+            return Ok(false);
         }
-    }
-    if !push_documents(
-        &mut documents,
-        tokenizer,
-        &mut packer,
-        &mut count,
-        &mut visit,
-        &mut cache,
-    )? {
-        return Ok(count);
-    }
-    ensure!(
-        document_number >= cached_documents,
-        "authoritative corpus has {document_number} documents but token cache has {cached_documents}; remove the stale cache"
-    );
-    if let Some(cache) = &mut cache {
-        cache.publish_index()?;
-    }
-    Ok(count)
+        if !documents.flush(tokenizer, &mut packer, &mut count, visit, &mut cache)? {
+            return Ok(false);
+        }
+        ensure!(
+            document_number >= cached_documents,
+            "authoritative corpus has {document_number} documents but token cache has {cached_documents}; remove the stale cache"
+        );
+        Ok(true)
+    })();
+    let publish_cache = match scan_result {
+        Ok(fully_read) => fully_read,
+        Err(error) => {
+            if let Some(cache) = &mut cache {
+                cache.reset_to_empty()?;
+            } else if let Some(path) = token_cache {
+                reset_token_cache_path(path)?;
+            }
+            return Err(error);
+        }
+    };
+    Ok(CausalVisitOutcome {
+        count,
+        cache,
+        publish_cache,
+    })
 }
 
 fn required_string<'a>(
@@ -1176,18 +1847,37 @@ fn required_string<'a>(
 /// Visit fixed-shape objective samples in source order.
 fn visit_samples_in_order(
     path: &Path,
-    objective: &ObjectiveConfig,
+    objective: &TaskConfig,
     tokenizer: &Tokenizer,
     seq_len: usize,
     token_cache: Option<&Path>,
-    visit: impl FnMut(TrainingSample) -> Result<bool>,
+    data_binding: &PhaseDataBinding,
+    mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
     ensure!(seq_len > 0, "sequence_length must be positive");
     match objective {
-        ObjectiveConfig::CausalLm => {
-            visit_causal_samples(path, tokenizer, seq_len, token_cache, visit)
+        TaskConfig::CausalLm {} => {
+            visit_causal_samples(path, tokenizer, seq_len, token_cache, data_binding, visit)
         }
-        _ => visit_structured_samples(path, objective, tokenizer, seq_len, visit),
+        _ => {
+            ensure!(
+                data_binding.authenticated_corpus().is_none(),
+                "prepared corpus manifests are only valid for causal-LM phases"
+            );
+            let mut count = None;
+            data_binding.with_readers(path, |source_path, reader| {
+                count = Some(visit_structured_samples(
+                    source_path,
+                    reader,
+                    objective,
+                    tokenizer,
+                    seq_len,
+                    &mut visit,
+                )?);
+                Ok(true)
+            })?;
+            count.context("direct structured phase data produced no reader")
+        }
     }
 }
 
@@ -1196,11 +1886,12 @@ pub(crate) struct SampleStreamConfig<'a> {
     pub(crate) shuffle_buffer: usize,
     pub(crate) seed: u64,
     pub(crate) token_cache: Option<&'a Path>,
+    pub(crate) data_binding: &'a PhaseDataBinding,
 }
 
 pub(crate) fn visit_samples(
     path: &Path,
-    objective: &ObjectiveConfig,
+    objective: &TaskConfig,
     tokenizer: &Tokenizer,
     config: SampleStreamConfig<'_>,
     mut visit: impl FnMut(TrainingSample) -> Result<bool>,
@@ -1212,6 +1903,7 @@ pub(crate) fn visit_samples(
             tokenizer,
             config.seq_len,
             config.token_cache,
+            config.data_binding,
             visit,
         );
     }
@@ -1224,6 +1916,7 @@ pub(crate) fn visit_samples(
         tokenizer,
         config.seq_len,
         config.token_cache,
+        config.data_binding,
         |sample| {
             if let Some(sample) = shuffler.push(sample) {
                 keep_going = visit(sample)?;
@@ -1244,24 +1937,323 @@ pub(crate) fn visit_samples(
 
 pub(crate) fn count_samples(
     path: &Path,
-    objective: &ObjectiveConfig,
+    objective: &TaskConfig,
     tokenizer: &Tokenizer,
     seq_len: usize,
     token_cache: Option<&Path>,
+    data_binding: &PhaseDataBinding,
 ) -> Result<usize> {
-    visit_samples_in_order(path, objective, tokenizer, seq_len, token_cache, |_| {
-        Ok(true)
-    })
+    visit_samples_in_order(
+        path,
+        objective,
+        tokenizer,
+        seq_len,
+        token_cache,
+        data_binding,
+        |_| Ok(true),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
 
     use burn::tensor::Device;
+    use hermes_train::corpus::{
+        CORPUS_SCHEMA_VERSION, ClassificationConfig, CorpusBuildConfig, CorpusPipeline,
+        CorpusTokenizer, DeduplicationConfig, DiscoveryConfig, DiscoveryHit, DiscoveryPage,
+        DiscoveryQuery, InMemoryDeduplicator, InlineRecordMaterializer, NormalizationConfig,
+        RepetitionConfig, SearchBackend, ShardingConfig, SourceSnapshot, TokenTarget,
+        TokenizerSnapshot,
+    };
+    use hermes_train::task::{TaskAdapter, TaskExample};
+    use serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn bounded_training_jsonl_reader_accepts_exact_limit_and_stops_at_delimiter() {
+        let mut input = BufReader::new(Cursor::new(b"12345678\n{}\n"));
+        let mut record = Vec::new();
+        assert_eq!(
+            read_training_jsonl_record_bounded(
+                &mut input,
+                &mut record,
+                8,
+                Path::new("training.jsonl"),
+                1,
+            )
+            .unwrap(),
+            Some("12345678\n")
+        );
+        assert_eq!(
+            read_training_jsonl_record_bounded(
+                &mut input,
+                &mut record,
+                8,
+                Path::new("training.jsonl"),
+                2,
+            )
+            .unwrap(),
+            Some("{}\n")
+        );
+    }
+
+    #[test]
+    fn bounded_training_jsonl_reader_captures_only_one_byte_past_limit() {
+        let mut input = BufReader::new(Cursor::new(b"123456789trailing"));
+        let mut record = Vec::new();
+        let error = read_training_jsonl_record_bounded(
+            &mut input,
+            &mut record,
+            8,
+            Path::new("oversized.jsonl"),
+            7,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("oversized.jsonl:7"), "{error}");
+        assert!(error.contains("maximum of 8 bytes"), "{error}");
+        assert_eq!(record.len(), 9);
+    }
+
+    #[test]
+    fn bounded_training_jsonl_reader_rejects_malformed_utf8() {
+        let mut input = BufReader::new(Cursor::new(b"{\"text\":\"\xff\"}\n"));
+        let mut record = Vec::new();
+        let error = read_training_jsonl_record_bounded(
+            &mut input,
+            &mut record,
+            32,
+            Path::new("invalid.jsonl"),
+            3,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("invalid.jsonl:3"), "{error}");
+        assert!(error.contains("not UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn bounded_training_text_reader_preserves_one_multiline_document_at_the_limit() {
+        let mut input = BufReader::new(Cursor::new(b"one\ntwo\n"));
+        assert_eq!(
+            read_training_text_document_bounded(&mut input, 8, Path::new("document.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn bounded_training_text_reader_stops_one_byte_past_the_limit() {
+        let mut input = BufReader::new(Cursor::new(b"123456789trailing"));
+        let error = read_training_text_document_bounded(&mut input, 8, Path::new("oversized.txt"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("oversized.txt"), "{error}");
+        assert!(error.contains("maximum of 8 bytes"), "{error}");
+    }
+
+    #[test]
+    fn bounded_training_text_reader_rejects_malformed_utf8() {
+        let mut input = BufReader::new(Cursor::new(b"text-\xff"));
+        let error = read_training_text_document_bounded(&mut input, 8, Path::new("invalid.txt"))
+            .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("invalid.txt"), "{error}");
+        assert!(error.contains("not valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn malformed_jsonl_utf8_resets_a_partial_token_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("data.jsonl");
+        let cache_path = dir.path().join("tokens.bin");
+        let tokenizer = write_test_tokenizer(dir.path());
+        fs::write(&data_path, b"{\"tokens\":[1,2]}\n{\"text\":\"\xff\"}\n").unwrap();
+        let binding = PhaseDataBinding::open(&data_path).unwrap();
+
+        let error = visit_causal_samples(
+            &data_path,
+            &tokenizer,
+            2,
+            Some(&cache_path),
+            &binding,
+            |_| Ok(true),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("data.jsonl:2"), "{error}");
+        assert!(error.contains("not UTF-8"), "{error}");
+        assert_eq!(fs::read(&cache_path).unwrap(), TOKEN_CACHE_MAGIC);
+        assert!(!token_cache_index_path(&cache_path).exists());
+    }
+
+    #[test]
+    fn structured_training_uses_the_bounded_utf8_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = write_test_tokenizer(dir.path());
+        let task = TaskConfig::Summarization {
+            instruction: "Summarize.".into(),
+        };
+        let mut reader = BufReader::new(Cursor::new(b"{\"document\":\"\xff\"}\n"));
+
+        let error = visit_structured_samples(
+            Path::new("structured.jsonl"),
+            &mut reader,
+            &task,
+            &tokenizer,
+            64,
+            |_| Ok(true),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("structured.jsonl:1"), "{error}");
+        assert!(error.contains("not UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn bounded_raw_text_path_remains_one_multiline_causal_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = write_test_tokenizer(dir.path());
+        let text = "one two three\nfour five six\n";
+        let text_path = dir.path().join("document.txt");
+        let jsonl_path = dir.path().join("document.jsonl");
+        fs::write(&text_path, text).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::json!({"text": text})),
+        )
+        .unwrap();
+
+        let collect = |path: &Path| {
+            let binding = PhaseDataBinding::open(path).unwrap();
+            let mut samples = Vec::new();
+            visit_causal_samples(path, &tokenizer, 4, None, &binding, |sample| {
+                let TrainingSample::Causal { tokens } = sample else {
+                    panic!("expected causal sample")
+                };
+                samples.push(tokens);
+                Ok(true)
+            })
+            .unwrap();
+            samples
+        };
+
+        let raw_samples = collect(&text_path);
+        assert!(!raw_samples.is_empty());
+        assert_eq!(raw_samples, collect(&jsonl_path));
+    }
+
+    struct OneRecordSearch;
+
+    impl SearchBackend for OneRecordSearch {
+        fn name(&self) -> &str {
+            "one_record"
+        }
+
+        fn configuration(&self) -> Result<Value> {
+            Ok(serde_json::json!({"type": "one_record"}))
+        }
+
+        fn snapshot(&self) -> Result<SourceSnapshot> {
+            Ok(SourceSnapshot {
+                provider: "test".into(),
+                revision: "one".into(),
+            })
+        }
+
+        fn page_size(&self) -> usize {
+            1
+        }
+
+        fn discover(
+            &self,
+            _query: &DiscoveryQuery,
+            offset: usize,
+            _limit: usize,
+        ) -> Result<DiscoveryPage> {
+            Ok(DiscoveryPage {
+                hits: if offset == 0 {
+                    vec![DiscoveryHit {
+                        record_key: "record".into(),
+                        score: 1.0,
+                        uris: Vec::new(),
+                        metadata: BTreeMap::new(),
+                        inline_text: Some("source text".into()),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                total_hits: Some(1),
+                snapshot: self.snapshot()?,
+            })
+        }
+    }
+
+    struct TwoTokenCorpusTokenizer;
+
+    impl CorpusTokenizer for TwoTokenCorpusTokenizer {
+        fn snapshot(&self) -> TokenizerSnapshot {
+            TokenizerSnapshot {
+                implementation: "test".into(),
+                revision: "one".into(),
+                vocabulary_size: 16,
+            }
+        }
+
+        fn encode(&self, _text: &str) -> Result<Vec<u32>> {
+            Ok(vec![1, 2])
+        }
+    }
+
+    fn write_authenticated_test_corpus(root: &Path) -> PathBuf {
+        let config = CorpusBuildConfig {
+            version: CORPUS_SCHEMA_VERSION,
+            build_id: "bound-corpus".into(),
+            discovery: DiscoveryConfig {
+                queries: vec![DiscoveryQuery {
+                    name: "all".into(),
+                    text: "all".into(),
+                    limit: 1,
+                    parameters: BTreeMap::new(),
+                }],
+                materialization_batch_size: 1,
+            },
+            normalization: NormalizationConfig::default(),
+            deduplication: DeduplicationConfig::default(),
+            classification: ClassificationConfig::default(),
+            transformations: Vec::new(),
+            repetition: RepetitionConfig::default(),
+            token_target: TokenTarget {
+                minimum: 2,
+                desired: 2,
+                maximum: 2,
+            },
+            sharding: ShardingConfig {
+                max_tokens_per_shard: 2,
+            },
+        };
+        let mut deduplicator = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+        CorpusPipeline::new(
+            config,
+            &OneRecordSearch,
+            &InlineRecordMaterializer,
+            &TwoTokenCorpusTokenizer,
+            &mut deduplicator,
+        )
+        .unwrap()
+        .run(root)
+        .unwrap()
+        .0
+    }
 
     #[test]
     fn zstd_data_reader_streams_decompressed_text() {
@@ -1271,10 +2263,157 @@ mod tests {
         let compressed = zstd::stream::encode_all(Cursor::new(source), 1).unwrap();
         fs::write(&path, compressed).unwrap();
 
-        let mut reader = open_data(&path).unwrap();
         let mut decoded = String::new();
-        reader.read_to_string(&mut decoded).unwrap();
+        let binding = PhaseDataBinding::open(&path).unwrap();
+        binding
+            .with_readers(&path, |_path, reader| {
+                reader.read_to_string(&mut decoded)?;
+                Ok(true)
+            })
+            .unwrap();
         assert_eq!(decoded.as_bytes(), source);
+    }
+
+    #[test]
+    fn training_record_limit_applies_after_zstd_decompression() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.jsonl.zst");
+        fs::write(
+            &path,
+            zstd::stream::encode_all(Cursor::new(b"123456789decompressed"), 1).unwrap(),
+        )
+        .unwrap();
+        let binding = PhaseDataBinding::open(&path).unwrap();
+
+        let error = binding
+            .with_readers(&path, |source_path, reader| {
+                let mut record = Vec::new();
+                read_training_jsonl_record_bounded(reader, &mut record, 8, source_path, 1)?;
+                Ok(true)
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("maximum of 8 bytes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_binding_reads_the_opened_generation_and_rejects_path_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.jsonl");
+        let parked = dir.path().join("opened.jsonl");
+        let generation_a = b"{\"text\":\"generation-a\"}\n";
+        fs::write(&path, generation_a).unwrap();
+        let binding = PhaseDataBinding::open(&path).unwrap();
+
+        let mut observed = Vec::new();
+        let error = binding
+            .with_readers(&path, |_source, reader| {
+                reader.read_to_end(&mut observed)?;
+                fs::rename(&path, &parked)?;
+                fs::write(&path, b"{\"text\":\"generation-b\"}\n")?;
+                Ok(true)
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(observed, generation_a);
+        assert!(error.contains("phase data"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_zstd_binding_pins_compressed_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.jsonl.zst");
+        let parked = dir.path().join("opened.jsonl.zst");
+        let generation_a = b"{\"text\":\"compressed-a\"}\n";
+        fs::write(
+            &path,
+            zstd::stream::encode_all(Cursor::new(generation_a), 1).unwrap(),
+        )
+        .unwrap();
+        let binding = PhaseDataBinding::open(&path).unwrap();
+
+        let mut observed = Vec::new();
+        assert!(
+            binding
+                .with_readers(&path, |_source, reader| {
+                    reader.read_to_end(&mut observed)?;
+                    fs::rename(&path, &parked)?;
+                    fs::write(
+                        &path,
+                        zstd::stream::encode_all(Cursor::new(b"{\"text\":\"compressed-b\"}\n"), 1)?,
+                    )?;
+                    Ok(true)
+                })
+                .is_err()
+        );
+        assert_eq!(observed, generation_a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_binding_rejects_symlink_at_bind_and_after_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let alias = dir.path().join("alias.jsonl");
+        fs::write(&target, b"{\"text\":\"target\"}\n").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(PhaseDataBinding::open(&alias).is_err());
+
+        let path = dir.path().join("data.jsonl");
+        let parked = dir.path().join("parked.jsonl");
+        fs::write(&path, b"{\"text\":\"opened\"}\n").unwrap();
+        let binding = PhaseDataBinding::open(&path).unwrap();
+        fs::rename(&path, &parked).unwrap();
+        std::os::unix::fs::symlink(&parked, &path).unwrap();
+        assert!(binding.ensure_still_published().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_binding_checks_identity_after_error_and_early_exit() {
+        for visitor_errors in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data.jsonl");
+            fs::write(&path, b"{\"text\":\"opened\"}\n").unwrap();
+            let binding = PhaseDataBinding::open(&path).unwrap();
+
+            let result = binding.with_readers(&path, |_source, _reader| {
+                fs::write(&path, b"{\"text\":\"changed-in-place\"}\n")?;
+                if visitor_errors {
+                    anyhow::bail!("visitor failed")
+                }
+                Ok(false)
+            });
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("changed in place"), "{error}");
+            assert!(!error.contains("visitor failed"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corpus_binding_checks_manifest_identity_after_visitor_error() {
+        let root = tempfile::tempdir().unwrap();
+        let corpus_path = write_authenticated_test_corpus(root.path());
+        let manifest_path = corpus_path.join("manifest.json");
+        let replacement = corpus_path.join("replacement-manifest.json");
+        let binding = PhaseDataBinding::open(&corpus_path).unwrap();
+
+        let error = binding
+            .with_readers(&corpus_path, |_source, _reader| {
+                fs::write(&replacement, fs::read(&manifest_path)?)?;
+                fs::rename(&replacement, &manifest_path)?;
+                anyhow::bail!("visitor failed")
+            })
+            .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("corpus manifest"), "{error}");
+        assert!(!error.contains("visitor failed"), "{error}");
     }
 
     #[test]
@@ -1348,7 +2487,7 @@ mod tests {
         let mut samples = Vec::new();
         let mut count = 0;
         let (documents, keep_going, mut writer, _) =
-            replay_token_cache(&path, 0, &mut packer, &mut count, &mut |sample| {
+            replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |sample| {
                 samples.push(sample);
                 Ok(true)
             })
@@ -1368,17 +2507,58 @@ mod tests {
         let mut replay = SamplePacker::new(3);
         let mut replay_count = 0;
         let (documents, _, _, _) =
-            replay_token_cache(&path, 0, &mut replay, &mut replay_count, &mut |_| Ok(true))
-                .unwrap();
+            replay_token_cache(&path, 0, 257, &mut replay, &mut replay_count, &mut |_| {
+                Ok(true)
+            })
+            .unwrap();
         assert_eq!(documents, 3);
         assert_eq!(replay_count, 2);
+    }
+
+    #[test]
+    fn invalid_cache_header_is_rebuilt_and_pretokenized_rows_are_cached_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("data.jsonl");
+        let cache_path = dir.path().join("tokens.bin");
+        let tokenizer = write_test_tokenizer(dir.path());
+        fs::write(&data_path, b"{\"tokens\":[1,2]}\n{\"tokens\":[3,4]}\n").unwrap();
+        fs::write(&cache_path, b"BADTOK01untrusted-derived-bytes").unwrap();
+        let binding = PhaseDataBinding::open(&data_path).unwrap();
+
+        let collect = || {
+            let mut samples = Vec::new();
+            let count = visit_causal_samples(
+                &data_path,
+                &tokenizer,
+                2,
+                Some(&cache_path),
+                &binding,
+                |sample| {
+                    let TrainingSample::Causal { tokens } = sample else {
+                        panic!("expected causal sample")
+                    };
+                    samples.push(tokens);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            (count, samples)
+        };
+
+        let first = collect();
+        assert_eq!(first.0, 2);
+        assert_eq!(
+            indexed_causal_sample_count(&cache_path, 2).unwrap(),
+            Some(2)
+        );
+        assert_eq!(collect(), first, "cache replay changed the training stream");
     }
 
     fn write_test_token_cache(path: &Path, documents: &[&[u32]], complete: bool) {
         let mut packer = SamplePacker::new(4);
         let mut count = 0;
         let (_, keep_going, mut writer, _) =
-            replay_token_cache(path, 0, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
+            replay_token_cache(path, 0, 257, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
         assert!(keep_going);
         let writer = writer.as_mut().unwrap();
         for document in documents {
@@ -1389,6 +2569,161 @@ mod tests {
         } else {
             writer.flush().unwrap();
         }
+    }
+
+    fn write_test_tokenizer(directory: &Path) -> Tokenizer {
+        let allowed: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
+        let mut byte_to_unicode = ['\0'; 256];
+        for &byte in &allowed {
+            byte_to_unicode[byte as usize] = byte as char;
+        }
+        let mut offset = 0_u32;
+        for byte in 0..=255_u8 {
+            if byte_to_unicode[byte as usize] == '\0' {
+                byte_to_unicode[byte as usize] = char::from_u32(256 + offset).unwrap();
+                offset += 1;
+            }
+        }
+        let mut vocabulary = serde_json::Map::new();
+        for (id, piece) in byte_to_unicode.into_iter().enumerate() {
+            vocabulary.insert(piece.to_string(), serde_json::json!(id));
+        }
+        vocabulary.insert("<eos>".to_owned(), serde_json::json!(256));
+        let tokenizer = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": vocabulary,
+                "merges": [],
+            },
+            "added_tokens": [{
+                "id": 256,
+                "content": "<eos>",
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true,
+            }],
+            "pre_tokenizer": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "use_regex": true,
+            },
+            "decoder": { "type": "ByteLevel" },
+        });
+        let path = directory.join("tokenizer.json");
+        fs::write(&path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        Tokenizer::from_file(path).unwrap()
+    }
+
+    fn update_causal_digest(
+        digest: &mut Sha256,
+        samples: &mut usize,
+        sample: TrainingSample,
+    ) -> Result<bool> {
+        let TrainingSample::Causal { tokens } = sample else {
+            anyhow::bail!("expected a causal sample")
+        };
+        *samples += 1;
+        digest.update((tokens.len() as u64).to_le_bytes());
+        for token in tokens {
+            digest.update(token.to_le_bytes());
+        }
+        Ok(true)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_failure_resets_partial_cache_before_restored_generation_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("data.jsonl");
+        let cache_path = dir.path().join("tokens.bin");
+        let tokenizer = write_test_tokenizer(dir.path());
+        let line = "{\"tokens\":[1,2,3,4,5,6,7,8]}\n";
+        let original = line.repeat(1_000).into_bytes();
+        assert!(original.len() > AUTHENTICATED_READ_BUFFER_BYTES * 2);
+        fs::write(&data_path, &original).unwrap();
+        let binding = PhaseDataBinding::open(&data_path).unwrap();
+
+        let mut mutated = false;
+        let result = visit_causal_samples(
+            &data_path,
+            &tokenizer,
+            128,
+            Some(&cache_path),
+            &binding,
+            |_| {
+                if !mutated {
+                    let mut file = OpenOptions::new().write(true).open(&data_path)?;
+                    file.seek(SeekFrom::Start(
+                        (AUTHENTICATED_READ_BUFFER_BYTES * 2) as u64,
+                    ))?;
+                    file.write_all(b"!")?;
+                    file.sync_all()?;
+                    mutated = true;
+                }
+                Ok(true)
+            },
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("changed in place"), "{error}");
+        assert_eq!(fs::read(&cache_path).unwrap(), TOKEN_CACHE_MAGIC);
+        assert!(!token_cache_index_path(&cache_path).exists());
+
+        fs::write(&data_path, &original).unwrap();
+        let restored = PhaseDataBinding::open(&data_path).unwrap();
+        let mut retry_digest = Sha256::new();
+        let mut retry_samples = 0;
+        let retry_count = visit_causal_samples(
+            &data_path,
+            &tokenizer,
+            128,
+            Some(&cache_path),
+            &restored,
+            |sample| update_causal_digest(&mut retry_digest, &mut retry_samples, sample),
+        )
+        .unwrap();
+        assert!(token_cache_index_path(&cache_path).is_file());
+
+        let mut reference_digest = Sha256::new();
+        let mut reference_samples = 0;
+        let reference_count =
+            visit_causal_samples(&data_path, &tokenizer, 128, None, &restored, |sample| {
+                update_causal_digest(&mut reference_digest, &mut reference_samples, sample)
+            })
+            .unwrap();
+        assert_eq!(retry_count, reference_count);
+        assert_eq!(retry_samples, reference_samples);
+        assert_eq!(retry_digest.finalize(), reference_digest.finalize());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_cache_fast_path_still_rejects_direct_data_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("data.jsonl");
+        let parked = dir.path().join("opened.jsonl");
+        let cache_path = dir.path().join("tokens.bin");
+        let tokenizer = write_test_tokenizer(dir.path());
+        fs::write(&data_path, b"{\"tokens\":[1,2]}\n").unwrap();
+        let binding = PhaseDataBinding::open(&data_path).unwrap();
+        write_test_token_cache(&cache_path, &[&[1, 2]], true);
+
+        fs::rename(&data_path, &parked).unwrap();
+        fs::write(&data_path, b"{\"tokens\":[3,4]}\n").unwrap();
+        assert!(
+            visit_causal_samples(
+                &data_path,
+                &tokenizer,
+                1,
+                Some(&cache_path),
+                &binding,
+                |_| Ok(true),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&cache_path).unwrap(), TOKEN_CACHE_MAGIC);
+        assert!(!token_cache_index_path(&cache_path).exists());
     }
 
     #[test]
@@ -1411,7 +2746,8 @@ mod tests {
         let mut packer = SamplePacker::new(4);
         let mut replayed = 0;
         let (_, _, _, complete) =
-            replay_token_cache(&path, 0, &mut packer, &mut replayed, &mut |_| Ok(true)).unwrap();
+            replay_token_cache(&path, 0, 257, &mut packer, &mut replayed, &mut |_| Ok(true))
+                .unwrap();
         assert!(complete, "verified caches must not require a source rescan");
         assert_eq!(replayed, 1);
     }
@@ -1432,7 +2768,7 @@ mod tests {
         let mut packer = SamplePacker::new(3);
         let mut count = 0;
         let (documents, keep_going, _, complete) =
-            replay_token_cache(&path, 0, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
+            replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
         assert_eq!(documents, 2);
         assert_eq!(count, 1);
         assert!(keep_going);
@@ -1472,7 +2808,7 @@ mod tests {
         let mut count = 0;
         let mut samples = Vec::new();
         let (documents, keep_going, mut writer, complete) =
-            replay_token_cache(&path, 0, &mut packer, &mut count, &mut |sample| {
+            replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |sample| {
                 samples.push(sample);
                 Ok(true)
             })
@@ -1507,10 +2843,61 @@ mod tests {
         let mut packer = SamplePacker::new(2);
         let mut count = 0;
         let (_, _, mut writer, _) =
-            replay_token_cache(&changed, 0, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
+            replay_token_cache(&changed, 0, 257, &mut packer, &mut count, &mut |_| Ok(true))
+                .unwrap();
         writer.as_mut().unwrap().append(&[]).unwrap();
         assert!(!token_cache_index_path(&changed).exists());
         assert_eq!(indexed_causal_sample_count(&changed, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn out_of_vocabulary_cached_tokens_are_never_emitted_and_reset_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.bin");
+        write_test_token_cache(&path, &[&[300, 1, 2]], true);
+        assert_eq!(indexed_causal_sample_count(&path, 2).unwrap(), Some(1));
+
+        let mut packer = SamplePacker::new(2);
+        let mut count = 0;
+        let mut visited = 0;
+        let error = replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |_| {
+            visited += 1;
+            Ok(true)
+        })
+        .err()
+        .expect("out-of-vocabulary cache must fail")
+        .to_string();
+
+        assert!(error.contains("outside tokenizer vocabulary"), "{error}");
+        assert_eq!(visited, 0, "an invalid cached token reached the visitor");
+        assert_eq!(count, 0);
+        assert_eq!(fs::read(&path).unwrap(), TOKEN_CACHE_MAGIC);
+        assert!(!token_cache_index_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_cache_identity_is_checked_when_the_visitor_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.bin");
+        write_test_token_cache(&path, &[&[1, 2, 3], &[4, 5, 6]], true);
+
+        let mut packer = SamplePacker::new(2);
+        let mut count = 0;
+        let error = replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |_| {
+            let mut cache = OpenOptions::new().write(true).open(&path)?;
+            cache.seek(SeekFrom::Start(TOKEN_CACHE_MAGIC.len() as u64 + 4))?;
+            cache.write_all(&9_u32.to_le_bytes())?;
+            cache.sync_all()?;
+            Ok(false)
+        })
+        .err()
+        .expect("mutated cache must fail")
+        .to_string();
+
+        assert!(error.contains("changed while it was replayed"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), TOKEN_CACHE_MAGIC);
+        assert!(!token_cache_index_path(&path).exists());
     }
 
     #[test]
@@ -1528,7 +2915,7 @@ mod tests {
         let mut packer = SamplePacker::new(3);
         let mut count = 0;
         let (documents, _, _, complete) =
-            replay_token_cache(&path, 0, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
+            replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |_| Ok(true)).unwrap();
         assert_eq!(documents, 0);
         assert_eq!(count, 0);
         assert!(!complete);
@@ -1565,7 +2952,7 @@ mod tests {
 
         let mut packer = SamplePacker::new(3);
         let mut count = 0;
-        let error = replay_token_cache(&path, 0, &mut packer, &mut count, &mut |_| Ok(true))
+        let error = replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut |_| Ok(true))
             .err()
             .unwrap()
             .to_string();
@@ -1586,7 +2973,10 @@ mod tests {
         let mut packer = SamplePacker::new(3);
         let mut count = 0;
         assert!(
-            replay_token_cache(&cache_path, 0, &mut packer, &mut count, &mut |_| Ok(true)).is_err()
+            replay_token_cache(&cache_path, 0, 257, &mut packer, &mut count, &mut |_| Ok(
+                true
+            ),)
+            .is_err()
         );
         assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
 
@@ -1606,6 +2996,7 @@ mod tests {
             replay_token_cache(
                 &linked_root.join("other.tokens"),
                 0,
+                257,
                 &mut linked_packer,
                 &mut linked_count,
                 &mut |_| Ok(true),
@@ -1648,7 +3039,7 @@ mod tests {
         let mut visit = |_| Ok(true);
 
         let (documents, keep_going, writer, _) =
-            replay_token_cache(&path, 0, &mut packer, &mut count, &mut visit).unwrap();
+            replay_token_cache(&path, 0, 257, &mut packer, &mut count, &mut visit).unwrap();
 
         assert_eq!(documents, 0);
         assert!(keep_going);
@@ -1669,6 +3060,94 @@ mod tests {
             token_array(&serde_json::json!({"text": "raw"}), path, 7).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn retrieval_wake_encoding_consumes_the_task_adapter_segments() {
+        fn expected_text(
+            tokenizer: &Tokenizer,
+            text: &hermes_train::task::SegmentedText,
+            seq_len: usize,
+        ) -> EncodedText {
+            let mut tokens = text
+                .segments
+                .iter()
+                .flat_map(|segment| tokenizer.encode(segment, false).unwrap())
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            tokens.push(i64::from(tokenizer.eos_token_id()));
+            let end_position = tokens.len() - 1;
+            tokens.resize(seq_len, i64::from(tokenizer.eos_token_id()));
+            EncodedText {
+                tokens,
+                end_position,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = write_test_tokenizer(dir.path());
+        let path = dir.path().join("retrieval.jsonl");
+        let record = serde_json::json!({
+            "query": "needle",
+            "positive": "positive",
+            "negatives": ["negative"]
+        });
+        fs::write(&path, format!("{record}\n")).unwrap();
+        let objective = TaskConfig::RetrievalRepresentation {
+            temperature: 0.05,
+            layer: None,
+            query_prefix: "query-prefix:".into(),
+            document_prefix: "document-prefix:".into(),
+        };
+        let binding = PhaseDataBinding::open(&path).unwrap();
+        let mut observed = Vec::new();
+        assert_eq!(
+            visit_samples_in_order(
+                &path,
+                &objective,
+                &tokenizer,
+                64,
+                None,
+                &binding,
+                |sample| {
+                    observed.push(sample);
+                    Ok(true)
+                },
+            )
+            .unwrap(),
+            1
+        );
+
+        let TaskExample::RetrievalRepresentation {
+            query,
+            documents,
+            positive_index,
+        } = objective.construct_example(&record).unwrap()
+        else {
+            panic!("expected retrieval task example")
+        };
+        let TrainingSample::Retrieval {
+            query: actual_query,
+            documents: actual_documents,
+            truncated_tokens,
+        } = observed.pop().unwrap()
+        else {
+            panic!("expected retrieval training sample")
+        };
+        assert_eq!(positive_index, 0);
+        let expected_query = expected_text(&tokenizer, &query, 64);
+        assert_eq!(actual_query.tokens, expected_query.tokens);
+        assert_eq!(actual_query.end_position, expected_query.end_position);
+        let expected_documents = documents
+            .iter()
+            .map(|document| expected_text(&tokenizer, document, 64))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_documents.len(), expected_documents.len());
+        for (actual, expected) in actual_documents.iter().zip(expected_documents) {
+            assert_eq!(actual.tokens, expected.tokens);
+            assert_eq!(actual.end_position, expected.end_position);
+        }
+        assert_eq!(truncated_tokens, 0);
     }
 
     #[test]

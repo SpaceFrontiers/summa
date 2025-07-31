@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::artifact_io::validate_sha256_hex;
 pub const TRAINING_ACCOUNTING_VERSION: u32 = 1;
 
 pub const TRAINING_ACCOUNTING_FILE: &str = "training-accounting.json";
@@ -41,7 +42,7 @@ impl TrainingAccounting {
             "training accounting routes more parameters than it stores"
         );
         ensure!(self.weights_bytes > 0, "training accounting has no weights");
-        validate_sha256(&self.weights_sha256)
+        validate_sha256_hex(&self.weights_sha256, "training-accounting model weights")
             .context("invalid model-weights hash in training accounting")?;
         Ok(())
     }
@@ -77,9 +78,12 @@ impl TrainingEvidence {
             "unsupported training-evidence version {}",
             self.version
         );
-        validate_sha256(&self.checkpoint_manifest_sha256)
-            .context("invalid checkpoint hash in training evidence")?;
-        validate_sha256(&self.accounting_sha256)
+        validate_sha256_hex(
+            &self.checkpoint_manifest_sha256,
+            "training-evidence checkpoint manifest",
+        )
+        .context("invalid checkpoint hash in training evidence")?;
+        validate_sha256_hex(&self.accounting_sha256, "training-evidence accounting")
             .context("invalid accounting hash in training evidence")?;
         ensure!(
             self.training_gpu_hours.is_finite() && self.training_gpu_hours > 0.0,
@@ -97,16 +101,8 @@ impl TrainingEvidence {
             self.stored_bytes > 0,
             "training evidence has no stored bytes"
         );
-        validate_sha256(&self.weights_sha256)
+        validate_sha256_hex(&self.weights_sha256, "training-evidence model weights")
             .context("invalid model-weights hash in training evidence")?;
         Ok(())
     }
-}
-
-fn validate_sha256(value: &str) -> Result<()> {
-    ensure!(
-        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "SHA-256 must contain exactly 64 hexadecimal characters"
-    );
-    Ok(())
 }

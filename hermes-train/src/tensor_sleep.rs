@@ -9,21 +9,32 @@
 //! implemented here rather than delegated to callbacks.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Write;
 
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::tensor::activation::{log_softmax, softmax};
-use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
+use burn::tensor::{Bool, Bytes, Device, Int, Tensor, TensorData};
 use burn_optim::{AdamWConfig, GradientsParams, ModuleOptimizer};
-use hermes_llm::{MemoryRouting, ModelDef, Transformer, load_safetensors, save_safetensors};
+use hermes_llm::{MemoryRouting, ModelDef, Transformer, load_safetensors_bytes, save_safetensors};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::optimizer_artifact::save_canonical_module_optimizer;
+use crate::artifact_io::{
+    AuthenticatedDirectorySnapshot, ensure_directory, ensure_real_directory, ensure_regular_file,
+    hash_regular_file as hash_file, read_regular_bounded, sha256_identity, sync_directory,
+    sync_regular_file, validate_sha256_identity, write_new_synced,
+};
+use crate::optimizer_artifact::{
+    canonical_module_optimizer_bytes, save_canonical_module_optimizer,
+};
 use crate::sleep::{
     CommittedCandidate, ConsolidationBackend, ConsolidationTxn, DreamTrial, DreamingBackend,
     GeneratedDream, ImitationConfig, KnowledgeSeedingConfig, RngReservation, SleepProgressSink,
@@ -32,6 +43,19 @@ use crate::sleep::{
 
 const KNOWLEDGE_DEVICE_RNG_DOMAIN: u64 = 0x6b6e_6f77_6c65_6467;
 const IMITATION_DEVICE_RNG_DOMAIN: u64 = 0x696d_6974_6174_696f;
+
+// These limits apply at the algorithm-neutral tensor boundary as well as in
+// the first-party rollout adapters. An injected adapter is still untrusted
+// operational input: without aggregate ceilings it could turn one sleep
+// transaction into billions of model tokens or edit-distance cells.
+const MAX_TENSOR_ROLLOUT_BATCH_ROWS: usize = 4_096;
+const MAX_TENSOR_FORWARD_TOKENS: usize = 65_536;
+const MAX_TENSOR_SUBPHASE_TOKENS: usize = 16 * 1024 * 1024;
+const MAX_TENSOR_ROLLOUT_BATCHES: usize = 4_096;
+pub(crate) const MAX_TENSOR_IMITATION_GROUPS: usize = 256;
+const MAX_TENSOR_EDIT_DISTANCE_CELLS: usize = 64 * 1024 * 1024;
+const MAX_TENSOR_GRPO_PADDED_TOKENS: usize = 1024 * 1024;
+const FINGERPRINT_CHUNK_VALUES: usize = 4_096;
 
 fn tensor_subphase_seed(txn: &ConsolidationTxn, reservation: RngReservation, domain: u64) -> u64 {
     let mut value = domain
@@ -56,7 +80,7 @@ pub struct ImmutableTransformerCheckpoint {
 impl ImmutableTransformerCheckpoint {
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.uri.trim().is_empty(), "checkpoint URI is empty");
-        validate_sha256(&self.sha256)
+        validate_sha256_identity(&self.sha256, "checkpoint identity")
     }
 }
 
@@ -125,17 +149,14 @@ pub trait ProspectiveTransformerUpdate {
     ) -> Result<()>;
 }
 
-#[derive(Default)]
-struct ParameterFingerprintVisitor {
+struct ParameterFingerprintVisitor<'a> {
+    included: &'a BTreeSet<u64>,
     values: BTreeMap<u64, [u8; 32]>,
     failure: Option<String>,
 }
 
-impl ParameterFingerprintVisitor {
-    fn record(&mut self, id: ParamId, kind: u8, shape: &[usize], bytes: &[u8]) {
-        if self.failure.is_some() {
-            return;
-        }
+impl ParameterFingerprintVisitor<'_> {
+    fn hasher(&self, kind: u8, shape: &[usize]) -> Sha256 {
         let mut hash = Sha256::new();
         hash.update(b"hermes-parameter-fingerprint-v1\0");
         hash.update([kind]);
@@ -143,7 +164,13 @@ impl ParameterFingerprintVisitor {
         for dimension in shape {
             hash.update((*dimension as u64).to_le_bytes());
         }
-        hash.update(bytes);
+        hash
+    }
+
+    fn record(&mut self, id: ParamId, hash: Sha256) {
+        if self.failure.is_some() {
+            return;
+        }
         let digest: [u8; 32] = hash.finalize().into();
         if self.values.insert(id.val(), digest).is_some() {
             self.failure = Some(format!("model repeats parameter ID {}", id.val()));
@@ -151,63 +178,92 @@ impl ParameterFingerprintVisitor {
     }
 }
 
-impl ModuleVisitor for ParameterFingerprintVisitor {
+impl ModuleVisitor for ParameterFingerprintVisitor<'_> {
     fn visit_float<const D: usize>(&mut self, parameter: &Param<Tensor<D>>) {
+        if !self.included.contains(&parameter.id.val()) {
+            return;
+        }
         match parameter.val().into_data().convert::<f32>().to_vec::<f32>() {
             Ok(values) => {
-                let bytes = values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<_>>();
-                self.record(parameter.id, b'f', &parameter.shape().dims::<D>(), &bytes);
+                let mut hash = self.hasher(b'f', &parameter.shape().dims::<D>());
+                let mut bytes =
+                    Vec::with_capacity(FINGERPRINT_CHUNK_VALUES * std::mem::size_of::<f32>());
+                for chunk in values.chunks(FINGERPRINT_CHUNK_VALUES) {
+                    bytes.clear();
+                    bytes.extend(chunk.iter().flat_map(|value| value.to_le_bytes()));
+                    hash.update(&bytes);
+                }
+                self.record(parameter.id, hash);
             }
             Err(error) => self.failure = Some(error.to_string()),
         }
     }
 
     fn visit_int<const D: usize>(&mut self, parameter: &Param<Tensor<D, Int>>) {
+        if !self.included.contains(&parameter.id.val()) {
+            return;
+        }
         match parameter.val().into_data().to_vec::<i64>() {
             Ok(values) => {
-                let bytes = values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<_>>();
-                self.record(parameter.id, b'i', &parameter.shape().dims::<D>(), &bytes);
+                let mut hash = self.hasher(b'i', &parameter.shape().dims::<D>());
+                let mut bytes =
+                    Vec::with_capacity(FINGERPRINT_CHUNK_VALUES * std::mem::size_of::<i64>());
+                for chunk in values.chunks(FINGERPRINT_CHUNK_VALUES) {
+                    bytes.clear();
+                    bytes.extend(chunk.iter().flat_map(|value| value.to_le_bytes()));
+                    hash.update(&bytes);
+                }
+                self.record(parameter.id, hash);
             }
             Err(error) => self.failure = Some(error.to_string()),
         }
     }
 
     fn visit_bool<const D: usize>(&mut self, parameter: &Param<Tensor<D, Bool>>) {
+        if !self.included.contains(&parameter.id.val()) {
+            return;
+        }
         match parameter.val().into_data().to_vec::<bool>() {
             Ok(values) => {
-                let values = values.into_iter().map(u8::from).collect::<Vec<_>>();
-                self.record(parameter.id, b'b', &parameter.shape().dims::<D>(), &values);
+                let mut hash = self.hasher(b'b', &parameter.shape().dims::<D>());
+                let mut bytes = Vec::with_capacity(FINGERPRINT_CHUNK_VALUES);
+                for chunk in values.chunks(FINGERPRINT_CHUNK_VALUES) {
+                    bytes.clear();
+                    bytes.extend(chunk.iter().copied().map(u8::from));
+                    hash.update(&bytes);
+                }
+                self.record(parameter.id, hash);
             }
             Err(error) => self.failure = Some(error.to_string()),
         }
     }
 }
 
-fn parameter_fingerprints(model: &Transformer) -> Result<BTreeMap<u64, [u8; 32]>> {
-    let mut visitor = ParameterFingerprintVisitor::default();
+fn parameter_fingerprints(
+    model: &Transformer,
+    included: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, [u8; 32]>> {
+    let mut visitor = ParameterFingerprintVisitor {
+        included,
+        values: BTreeMap::new(),
+        failure: None,
+    };
     model.visit(&mut visitor);
     if let Some(error) = visitor.failure {
         bail!("fingerprinting prospective update parameters: {error}");
     }
-    ensure!(!visitor.values.is_empty(), "model exposes no parameters");
+    ensure!(
+        visitor.values.keys().copied().eq(included.iter().copied()),
+        "prospective update fingerprint scope contains a parameter absent from the model"
+    );
     Ok(visitor.values)
 }
 
-/// Canonical scope and identity check for a prospective sender update. Only
-/// the sender tier's base plus currently active reserve slots may change.
-/// Dormant slots, slower/faster tiers, embeddings, mixers, and heads are
-/// immutable at this boundary.
-pub fn prospective_update_hash(
+fn prospective_update_scope(
     teacher: &Transformer,
     student: &Transformer,
     sender: usize,
-) -> Result<String> {
+) -> Result<(BTreeSet<u64>, BTreeSet<u64>)> {
     ensure!(
         serde_json::to_vec(teacher.config())? == serde_json::to_vec(student.config())?,
         "prospective student changed model topology"
@@ -230,6 +286,23 @@ pub fn prospective_update_hash(
                 }),
         "prospective student changed memory masks, generations, or topology"
     );
+    let teacher_parameter_ids = burn::module::list_param_ids(teacher);
+    let teacher_parameters = teacher_parameter_ids
+        .iter()
+        .map(|id| id.val())
+        .collect::<BTreeSet<_>>();
+    let student_parameter_ids = burn::module::list_param_ids(student);
+    let student_parameters = student_parameter_ids
+        .iter()
+        .map(|id| id.val())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        !teacher_parameters.is_empty()
+            && teacher_parameters.len() == teacher_parameter_ids.len()
+            && student_parameters.len() == student_parameter_ids.len()
+            && teacher_parameters == student_parameters,
+        "prospective student parameter IDs differ from teacher"
+    );
     let mut eligible = teacher
         .memory_tier_base_parameter_ids_all_layers(sender)?
         .into_iter()
@@ -245,38 +318,86 @@ pub fn prospective_update_hash(
         !eligible.is_empty(),
         "sender update has no eligible parameters"
     );
-
-    let teacher = parameter_fingerprints(teacher)?;
-    let student = parameter_fingerprints(student)?;
     ensure!(
-        teacher.keys().eq(student.keys()),
-        "prospective student parameter IDs differ from teacher"
+        eligible.is_subset(&teacher_parameters),
+        "sender update scope contains a parameter absent from the model"
     );
-    let changed = teacher
-        .iter()
-        .filter_map(|(id, before)| {
-            let after = student.get(id).expect("parameter key sets checked");
-            (before != after).then_some((*id, *before, *after))
-        })
-        .collect::<Vec<_>>();
-    ensure!(!changed.is_empty(), "prospective sender update is empty");
-    let escaped = changed
-        .iter()
-        .filter_map(|(id, _, _)| (!eligible.contains(id)).then_some(*id))
-        .collect::<Vec<_>>();
+    Ok((eligible, teacher_parameters))
+}
+
+fn prospective_update_hash_inner(
+    teacher: &Transformer,
+    student: &Transformer,
+    sender: usize,
+    validate_outside_scope: bool,
+) -> Result<String> {
+    let (eligible, all_parameters) = prospective_update_scope(teacher, student, sender)?;
+    if validate_outside_scope {
+        let outside = all_parameters
+            .difference(&eligible)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let teacher_outside = parameter_fingerprints(teacher, &outside)?;
+        let student_outside = parameter_fingerprints(student, &outside)?;
+        let escaped = teacher_outside
+            .iter()
+            .filter_map(|(id, before)| (student_outside.get(id) != Some(before)).then_some(*id))
+            .collect::<Vec<_>>();
+        ensure!(
+            escaped.is_empty(),
+            "prospective update escaped sender tier {sender}: parameter IDs {escaped:?}"
+        );
+    }
+
+    // The hot-path identity contains only tensors which the independently
+    // scoped sender optimizer is allowed to mutate. In particular, this avoids
+    // copying embeddings, mixers, heads, and every other memory tier back to
+    // the host merely to derive one due-tier receipt.
+    let teacher_eligible = parameter_fingerprints(teacher, &eligible)?;
+    let student_eligible = parameter_fingerprints(student, &eligible)?;
     ensure!(
-        escaped.is_empty(),
-        "prospective update escaped sender tier {sender}: parameter IDs {escaped:?}"
+        teacher_eligible
+            .iter()
+            .any(|(id, before)| student_eligible.get(id) != Some(before)),
+        "prospective sender update is empty"
     );
     let mut hash = Sha256::new();
-    hash.update(b"hermes-prospective-update-v1\0");
+    hash.update(b"hermes-prospective-update-v2\0");
     hash.update((sender as u64).to_le_bytes());
-    for (id, before, after) in changed {
+    hash.update((eligible.len() as u64).to_le_bytes());
+    for (id, before) in teacher_eligible {
+        let after = student_eligible
+            .get(&id)
+            .expect("eligible parameter sets checked");
         hash.update(id.to_le_bytes());
         hash.update(before);
         hash.update(after);
     }
     Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+/// Bind the exact sender tier's base plus currently active reserve slots.
+/// The wake hot path constructs its student with an independently scoped
+/// optimizer, so hashing unrelated model tensors here would add a full-model
+/// device-to-host synchronization to every due update.
+pub fn prospective_update_hash(
+    teacher: &Transformer,
+    student: &Transformer,
+    sender: usize,
+) -> Result<String> {
+    prospective_update_hash_inner(teacher, student, sender, false)
+}
+
+/// Validate full-model parity outside the sender scope and return the same
+/// sender-only identity. This expensive check belongs at a consolidation
+/// transaction boundary, where updates may come from an injected adapter, not
+/// on ordinary wake-only optimizer updates.
+fn prospective_update_hash_at_boundary(
+    teacher: &Transformer,
+    student: &Transformer,
+    sender: usize,
+) -> Result<String> {
+    prospective_update_hash_inner(teacher, student, sender, true)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,6 +418,14 @@ impl TokenRolloutBatch {
             "rollout shape [{batch}, {sequence}] disagrees with {} tokens",
             token_ids.len()
         );
+        ensure!(
+            batch <= MAX_TENSOR_ROLLOUT_BATCH_ROWS,
+            "rollout batch exceeds the {MAX_TENSOR_ROLLOUT_BATCH_ROWS}-row operational limit"
+        );
+        ensure!(
+            token_ids.len() <= MAX_TENSOR_FORWARD_TOKENS,
+            "rollout batch exceeds the {MAX_TENSOR_FORWARD_TOKENS}-token operational limit"
+        );
         Ok(Self {
             batch,
             sequence,
@@ -306,13 +435,27 @@ impl TokenRolloutBatch {
 
     fn validate_for(&self, model: &Transformer) -> Result<()> {
         ensure!(
+            self.batch > 0
+                && self.sequence > 0
+                && self.batch.checked_mul(self.sequence) == Some(self.token_ids.len()),
+            "rollout dimensions no longer match its token storage"
+        );
+        ensure!(
+            self.batch <= MAX_TENSOR_ROLLOUT_BATCH_ROWS,
+            "rollout batch exceeds the {MAX_TENSOR_ROLLOUT_BATCH_ROWS}-row operational limit"
+        );
+        ensure!(
+            self.token_ids.len() <= MAX_TENSOR_FORWARD_TOKENS,
+            "rollout batch exceeds the {MAX_TENSOR_FORWARD_TOKENS}-token operational limit"
+        );
+        ensure!(
             self.sequence <= model.config().max_seq_len,
             "rollout exceeds model sequence limit"
         );
         ensure!(
             self.token_ids
                 .iter()
-                .all(|id| *id >= 0 && (*id as usize) < model.config().vocab_size),
+                .all(|id| usize::try_from(*id).is_ok_and(|id| id < model.config().vocab_size)),
             "rollout contains an out-of-vocabulary token"
         );
         Ok(())
@@ -324,6 +467,31 @@ impl TokenRolloutBatch {
             device,
         )
     }
+}
+
+fn validate_rollout_batches(
+    batches: &[TokenRolloutBatch],
+    model: &Transformer,
+    label: &str,
+) -> Result<u64> {
+    ensure!(
+        batches.len() <= MAX_TENSOR_ROLLOUT_BATCHES,
+        "{label} returned more than {MAX_TENSOR_ROLLOUT_BATCHES} rollout batches"
+    );
+    let mut total_tokens = 0_usize;
+    for batch in batches {
+        batch.validate_for(model)?;
+        total_tokens = total_tokens
+            .checked_add(batch.token_ids.len())
+            .with_context(|| format!("{label} token count overflow"))?;
+        ensure!(
+            total_tokens <= MAX_TENSOR_SUBPHASE_TOKENS,
+            "{label} exceeds the {MAX_TENSOR_SUBPHASE_TOKENS}-token subphase limit"
+        );
+    }
+    total_tokens
+        .try_into()
+        .with_context(|| format!("{label} token count exceeds u64"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,9 +594,15 @@ impl TensorConsolidationConfig {
     pub fn validate(&self) -> Result<()> {
         self.knowledge.validate()?;
         self.imitation.validate()?;
-        validate_sha256(&self.imitation.semantic_judge_hash)?;
-        validate_sha256(&self.retention.evaluator_hash)?;
-        validate_sha256(&self.retention.suite_hash)?;
+        validate_sha256_identity(
+            &self.imitation.semantic_judge_hash,
+            "semantic judge identity",
+        )?;
+        validate_sha256_identity(
+            &self.retention.evaluator_hash,
+            "retention evaluator identity",
+        )?;
+        validate_sha256_identity(&self.retention.suite_hash, "retention suite identity")?;
         ensure!(
             self.retention.max_anchor_forward_kl.is_finite()
                 && self.retention.max_anchor_forward_kl >= 0.0,
@@ -531,7 +705,25 @@ const TENSOR_TXN_STUDENT: &str = "student.safetensors";
 const TENSOR_TXN_OPTIMIZER: &str = "receiver-optimizer.bpk";
 const TENSOR_TXN_UPDATE_PRE: &str = "sender-update-pre.bin";
 const TENSOR_TXN_UPDATE_STAGED: &str = "sender-update-staged.bin";
+const MAX_TENSOR_TXN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TENSOR_TXN_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TENSOR_TXN_MEMBER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const TENSOR_TXN_SCHEMA: [&str; 7] = [
+    TENSOR_TXN_MANIFEST,
+    TENSOR_TXN_METADATA,
+    TENSOR_TXN_OPTIMIZER,
+    TENSOR_TXN_STUDENT,
+    TENSOR_TXN_TEACHER,
+    TENSOR_TXN_UPDATE_PRE,
+    TENSOR_TXN_UPDATE_STAGED,
+];
 static TENSOR_TXN_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TensorLoadStage {
+    AfterCapture,
+    AfterStagedLoad,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -619,7 +811,7 @@ impl TensorTransactionStore {
                 && !recovered.staged_update_state.as_bytes().is_empty(),
             "tensor snapshot is missing prospective-update state"
         );
-        validate_sha256(&recovered.student.update_sha256)?;
+        validate_sha256_identity(&recovered.student.update_sha256, "student update identity")?;
         ensure!(
             recovered.teacher.uri == txn.teacher_checkpoint
                 && recovered.teacher.sha256 == txn.teacher_hash,
@@ -670,15 +862,15 @@ impl TensorTransactionStore {
         let update_pre_path = staging.join(TENSOR_TXN_UPDATE_PRE);
         let update_staged_path = staging.join(TENSOR_TXN_UPDATE_STAGED);
         save_safetensors(&recovered.teacher.model.clone().valid(), &teacher_path)?;
-        sync_regular_file(&teacher_path)?;
+        sync_regular_file(&teacher_path, "tensor transaction teacher")?;
         save_safetensors(
             &recovered.student.checkpoint.model.clone().valid(),
             &student_path,
         )?;
-        sync_regular_file(&student_path)?;
+        sync_regular_file(&student_path, "tensor transaction student")?;
         save_canonical_module_optimizer(&recovered.receiver_optimizer, &optimizer_path)
             .context("saving receiver optimizer state")?;
-        sync_regular_file(&optimizer_path)?;
+        sync_regular_file(&optimizer_path, "tensor transaction optimizer")?;
         write_new_synced(&update_pre_path, recovered.pre_update_state.as_bytes())?;
         write_new_synced(
             &update_staged_path,
@@ -722,7 +914,7 @@ impl TensorTransactionStore {
             files,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        let manifest_sha256 = sha256_bytes(&manifest_bytes);
+        let manifest_sha256 = sha256_identity(&manifest_bytes);
         write_new_synced(&staging.join(TENSOR_TXN_MANIFEST), &manifest_bytes)?;
         sync_directory(&staging)?;
 
@@ -764,14 +956,17 @@ impl TensorTransactionStore {
         device: &Device,
         optimizer: ModuleOptimizer,
     ) -> Result<RecoveredTensorTransaction> {
-        ensure_existing_directory(&self.root, "tensor transaction root")?;
-        ensure_existing_directory(
+        ensure_real_directory(&self.root, "tensor transaction root")?;
+        ensure_real_directory(
             &self.root.join("generations"),
             "tensor transaction generations",
         )?;
         let pointer_path = self.root.join(TENSOR_TXN_POINTER);
-        ensure_regular_file(&pointer_path, "tensor transaction pointer")?;
-        let pointer: TensorTransactionPointer = serde_json::from_slice(&fs::read(&pointer_path)?)?;
+        let pointer: TensorTransactionPointer = serde_json::from_slice(&read_regular_bounded(
+            &pointer_path,
+            MAX_TENSOR_TXN_MANIFEST_BYTES,
+            "tensor transaction pointer",
+        )?)?;
         self.load_pointer(txn, config, device, optimizer, &pointer)
     }
 
@@ -808,8 +1003,20 @@ impl TensorTransactionStore {
         optimizer: ModuleOptimizer,
         pointer: &TensorTransactionPointer,
     ) -> Result<RecoveredTensorTransaction> {
-        ensure_existing_directory(&self.root, "tensor transaction root")?;
-        ensure_existing_directory(
+        self.load_pointer_inner(txn, config, device, optimizer, pointer, |_, _| Ok(()))
+    }
+
+    fn load_pointer_inner(
+        &self,
+        txn: &ConsolidationTxn,
+        config: &ModelDef,
+        device: &Device,
+        optimizer: ModuleOptimizer,
+        pointer: &TensorTransactionPointer,
+        mut stage_hook: impl FnMut(TensorLoadStage, &Path) -> Result<()>,
+    ) -> Result<RecoveredTensorTransaction> {
+        ensure_real_directory(&self.root, "tensor transaction root")?;
+        ensure_real_directory(
             &self.root.join("generations"),
             "tensor transaction generations",
         )?;
@@ -821,10 +1028,12 @@ impl TensorTransactionStore {
             pointer.txn_id == txn.id,
             "tensor transaction pointer belongs to another txn"
         );
-        validate_sha256(&pointer.manifest_sha256)?;
+        validate_sha256_identity(&pointer.manifest_sha256, "tensor manifest identity")?;
         validate_generation_identity(&pointer.generation, &pointer.manifest_sha256)?;
-        let generation = self.root.join("generations").join(&pointer.generation);
-        let metadata = verify_generation(&generation, txn.id, &pointer.manifest_sha256)?;
+        let generation_path = self.root.join("generations").join(&pointer.generation);
+        let (metadata, mut generation) =
+            capture_verified_generation(&generation_path, txn.id, &pointer.manifest_sha256)?;
+        stage_hook(TensorLoadStage::AfterCapture, &generation_path)?;
         ensure!(
             metadata.teacher_uri == txn.teacher_checkpoint
                 && metadata.teacher_sha256 == txn.teacher_hash,
@@ -839,17 +1048,38 @@ impl TensorTransactionStore {
 
         let mut teacher = Transformer::new(config, device)?;
         restore_parameter_ids(&mut teacher, &metadata.teacher_parameter_ids)?;
-        load_safetensors(&mut teacher, generation.join(TENSOR_TXN_TEACHER))?;
+        load_safetensors_bytes(
+            &mut teacher,
+            generation.take(TENSOR_TXN_TEACHER, MAX_TENSOR_TXN_MEMBER_BYTES)?,
+            "authenticated tensor-sleep teacher",
+        )?;
         let mut student = Transformer::new(config, device)?;
         restore_parameter_ids(&mut student, &metadata.student_parameter_ids)?;
-        load_safetensors(&mut student, generation.join(TENSOR_TXN_STUDENT))?;
+        load_safetensors_bytes(
+            &mut student,
+            generation.take(TENSOR_TXN_STUDENT, MAX_TENSOR_TXN_MEMBER_BYTES)?,
+            "authenticated tensor-sleep student",
+        )?;
+        let optimizer_bytes = generation.take(TENSOR_TXN_OPTIMIZER, MAX_TENSOR_TXN_MEMBER_BYTES)?;
+        let optimizer_bytes_len = optimizer_bytes.len();
+        let optimizer_sha256 = sha256_identity(&optimizer_bytes);
         let optimizer = optimizer
-            .load(generation.join(TENSOR_TXN_OPTIMIZER))
-            .context("loading receiver optimizer state")?;
-        let pre_update_state =
-            ProspectiveUpdateSnapshot::new(fs::read(generation.join(TENSOR_TXN_UPDATE_PRE))?)?;
-        let staged_update_state =
-            ProspectiveUpdateSnapshot::new(fs::read(generation.join(TENSOR_TXN_UPDATE_STAGED))?)?;
+            .from_bytes(Bytes::from_bytes_vec(optimizer_bytes))
+            .context("loading authenticated receiver optimizer state")?;
+        let canonical_optimizer = canonical_module_optimizer_bytes(&optimizer)?.to_vec();
+        ensure!(
+            canonical_optimizer.len() == optimizer_bytes_len
+                && sha256_identity(&canonical_optimizer) == optimizer_sha256,
+            "receiver optimizer bytes are non-canonical or failed exact restore"
+        );
+        let pre_update_state = ProspectiveUpdateSnapshot::new(
+            generation.take(TENSOR_TXN_UPDATE_PRE, MAX_TENSOR_TXN_MEMBER_BYTES)?,
+        )?;
+        let staged_update_state = ProspectiveUpdateSnapshot::new(
+            generation.take(TENSOR_TXN_UPDATE_STAGED, MAX_TENSOR_TXN_MEMBER_BYTES)?,
+        )?;
+        stage_hook(TensorLoadStage::AfterStagedLoad, &generation_path)?;
+        generation.ensure_still_published()?;
         Ok(RecoveredTensorTransaction {
             txn_id: txn.id,
             teacher: ImmutableTransformerCheckpoint {
@@ -873,81 +1103,6 @@ impl TensorTransactionStore {
             diagnostics: metadata.diagnostics,
         })
     }
-}
-
-fn ensure_directory(path: &Path, label: &str) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("creating {label} {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "{label} is not a real directory"
-    );
-    Ok(())
-}
-
-fn ensure_existing_directory(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("{label} {} is missing", path.display()))?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "{label} is not a real directory"
-    );
-    Ok(())
-}
-
-fn ensure_regular_file(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("{label} {} is missing", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} is not a regular non-symlink file"
-    );
-    Ok(())
-}
-
-fn sync_regular_file(path: &Path) -> Result<()> {
-    ensure_regular_file(path, "tensor transaction file")?;
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("creating immutable file {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<(u64, String)> {
-    ensure_regular_file(path, "tensor transaction artifact")?;
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes
-            .checked_add(read as u64)
-            .context("tensor transaction artifact length overflow")?;
-        hash.update(&buffer[..read]);
-    }
-    Ok((bytes, format!("sha256:{:x}", hash.finalize())))
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn transaction_file(root: &Path, name: &str) -> Result<TensorTransactionFile> {
@@ -975,12 +1130,12 @@ fn validate_generation_name(name: &str) -> Result<()> {
     let digest = name
         .strip_prefix("sha256-")
         .context("tensor generation must use sha256-<64 lowercase hex>")?;
-    validate_sha256(&format!("sha256:{digest}"))
+    validate_sha256_identity(&format!("sha256:{digest}"), "tensor generation identity")
 }
 
 fn validate_generation_identity(name: &str, manifest_sha256: &str) -> Result<()> {
     validate_generation_name(name)?;
-    validate_sha256(manifest_sha256)?;
+    validate_sha256_identity(manifest_sha256, "tensor manifest identity")?;
     let generation_digest = name
         .strip_prefix("sha256-")
         .expect("validated tensor generation has a prefix");
@@ -994,58 +1149,26 @@ fn validate_generation_identity(name: &str, manifest_sha256: &str) -> Result<()>
     Ok(())
 }
 
-fn verify_generation(
+fn capture_verified_generation(
     generation: &Path,
     txn_id: u64,
     expected_manifest_hash: &str,
-) -> Result<TensorTransactionMetadata> {
-    let metadata = fs::symlink_metadata(generation)
-        .with_context(|| format!("tensor generation {} is missing", generation.display()))?;
+) -> Result<(TensorTransactionMetadata, AuthenticatedDirectorySnapshot)> {
+    let mut captured = AuthenticatedDirectorySnapshot::capture(
+        generation,
+        &TENSOR_TXN_SCHEMA,
+        "tensor transaction generation",
+    )?;
+    let manifest_bytes =
+        captured.read_bounded(TENSOR_TXN_MANIFEST, MAX_TENSOR_TXN_MANIFEST_BYTES)?;
     ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "tensor generation is not a real directory"
-    );
-    let manifest_path = generation.join(TENSOR_TXN_MANIFEST);
-    ensure_regular_file(&manifest_path, "tensor transaction manifest")?;
-    let manifest_bytes = fs::read(&manifest_path)?;
-    ensure!(
-        sha256_bytes(&manifest_bytes) == expected_manifest_hash,
+        sha256_identity(&manifest_bytes) == expected_manifest_hash,
         "tensor transaction manifest hash mismatch"
     );
     let manifest: TensorTransactionManifest = serde_json::from_slice(&manifest_bytes)?;
     ensure!(
         manifest.version == TENSOR_TXN_MANIFEST_VERSION && manifest.txn_id == txn_id,
         "tensor transaction manifest identity/version mismatch"
-    );
-    let expected_names = [
-        TENSOR_TXN_MANIFEST,
-        TENSOR_TXN_METADATA,
-        TENSOR_TXN_OPTIMIZER,
-        TENSOR_TXN_STUDENT,
-        TENSOR_TXN_TEACHER,
-        TENSOR_TXN_UPDATE_PRE,
-        TENSOR_TXN_UPDATE_STAGED,
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<BTreeSet<_>>();
-    let mut observed_names = BTreeSet::new();
-    for entry in fs::read_dir(generation)? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("tensor generation contains non-UTF-8 name"))?;
-        let entry_metadata = fs::symlink_metadata(entry.path())?;
-        ensure!(
-            entry_metadata.is_file() && !entry_metadata.file_type().is_symlink(),
-            "tensor generation contains a non-file or symlink"
-        );
-        observed_names.insert(name);
-    }
-    ensure!(
-        observed_names == expected_names,
-        "tensor generation file set differs from its fixed schema"
     );
     ensure!(
         manifest.files.len() == 6
@@ -1068,24 +1191,27 @@ fn verify_generation(
             ),
             "tensor transaction manifest contains an unsafe path"
         );
-        validate_sha256(&file.sha256)?;
-        let (bytes, hash) = hash_file(&generation.join(&file.path))?;
+        validate_sha256_identity(&file.sha256, "tensor manifest member identity")?;
         ensure!(
-            bytes == file.bytes && hash == file.sha256,
-            "tensor transaction artifact `{}` failed authentication",
+            file.bytes <= MAX_TENSOR_TXN_MEMBER_BYTES,
+            "tensor transaction artifact `{}` exceeds the per-member size limit",
             file.path
         );
+        captured.verify(&file.path, file.bytes, &file.sha256)?;
     }
-    let transaction_path = generation.join(TENSOR_TXN_METADATA);
-    let transaction: TensorTransactionMetadata =
-        serde_json::from_slice(&fs::read(&transaction_path)?)?;
+    let metadata_bytes =
+        captured.read_bounded(TENSOR_TXN_METADATA, MAX_TENSOR_TXN_METADATA_BYTES)?;
+    let transaction: TensorTransactionMetadata = serde_json::from_slice(&metadata_bytes)?;
     ensure!(
         transaction.version == TENSOR_TXN_STORE_VERSION && transaction.txn_id == txn_id,
         "tensor transaction metadata identity/version mismatch"
     );
-    validate_sha256(&transaction.teacher_sha256)?;
-    validate_sha256(&transaction.student_sha256)?;
-    validate_sha256(&transaction.prospective_update_sha256)?;
+    validate_sha256_identity(&transaction.teacher_sha256, "teacher identity")?;
+    validate_sha256_identity(&transaction.student_sha256, "student identity")?;
+    validate_sha256_identity(
+        &transaction.prospective_update_sha256,
+        "prospective update identity",
+    )?;
     ensure!(
         !transaction.teacher_uri.trim().is_empty() && !transaction.student_uri.trim().is_empty(),
         "stored tensor transaction has an empty checkpoint URI"
@@ -1101,7 +1227,18 @@ fn verify_generation(
         transaction.retention_result,
         &transaction.diagnostics,
     )?;
-    Ok(transaction)
+    Ok((transaction, captured))
+}
+
+fn verify_generation(
+    generation: &Path,
+    txn_id: u64,
+    expected_manifest_hash: &str,
+) -> Result<TensorTransactionMetadata> {
+    let (metadata, captured) =
+        capture_verified_generation(generation, txn_id, expected_manifest_hash)?;
+    captured.ensure_still_published()?;
+    Ok(metadata)
 }
 
 fn publish_pointer(root: &Path, pointer: &TensorTransactionPointer) -> Result<()> {
@@ -1263,12 +1400,20 @@ impl ModuleMapper for RestoreParameterIds<'_> {
 /// optimizer snapshots therefore pin this companion identity vector.
 pub fn restore_parameter_ids(model: &mut Transformer, ids: &[u64]) -> Result<()> {
     ensure!(
+        ids.iter().copied().collect::<BTreeSet<_>>().len() == ids.len(),
+        "tensor transaction repeats a stored parameter ID"
+    );
+    ensure!(
         ids.len() == burn::module::list_param_ids(model).len(),
         "tensor transaction parameter-ID topology differs from model"
     );
     let mut mapper = RestoreParameterIds { ids: ids.iter() };
     *model = model.clone().map(&mut mapper);
     ensure!(mapper.ids.next().is_none(), "too many stored parameter IDs");
+    ensure!(
+        parameter_ids(model) == ids,
+        "tensor transaction failed to restore its exact parameter-ID ordering"
+    );
     Ok(())
 }
 
@@ -1434,7 +1579,7 @@ where
             &recovered.diagnostics,
         )?;
         let statuses = recovered.student.checkpoint.model.memory_slot_statuses();
-        self.receiver_ids = if txn.terminal {
+        let receiver_ids = if txn.terminal {
             recovered
                 .student
                 .checkpoint
@@ -1454,7 +1599,7 @@ where
                 .flat_map(|s| s.parameter_ids.clone())
                 .collect()
         };
-        self.reclaimed_sender_ids = statuses
+        let reclaimed_sender_ids: Vec<ParamId> = statuses
             .iter()
             .filter(|status| {
                 status.tier == txn.sender
@@ -1464,7 +1609,7 @@ where
             .flat_map(|status| status.parameter_ids.clone())
             .collect();
         ensure!(
-            txn.sender_slots_to_reset.is_empty() || !self.reclaimed_sender_ids.is_empty(),
+            txn.sender_slots_to_reset.is_empty() || !reclaimed_sender_ids.is_empty(),
             "recovered student has not reclaimed its planned sender slots"
         );
         // Restore the wake-side optimizer/accumulator only after all tensor
@@ -1478,6 +1623,8 @@ where
         self.pre_update_state = Some(recovered.pre_update_state);
         self.staged_update_state = Some(recovered.staged_update_state);
         self.receiver_optimizer = recovered.receiver_optimizer;
+        self.receiver_ids = receiver_ids;
+        self.reclaimed_sender_ids = reclaimed_sender_ids;
         self.stages = recovered.completed;
         self.retention = recovered.retention_result;
         self.diagnostics = recovered.diagnostics;
@@ -1618,14 +1765,16 @@ where
             &group.candidates,
             max_tokens,
             &self.device,
-        )?;
+        )?
+        .detach();
         let reference_log_probs = padded_group_log_probabilities(
             &teacher,
             &group.prefix,
             &group.candidates,
             max_tokens,
             &self.device,
-        )?;
+        )?
+        .detach();
         let active_mask = Tensor::<2>::from_data(
             TensorData::new(
                 group
@@ -1714,6 +1863,14 @@ where
     E: RetentionEvaluator,
     P: AtomicCandidatePublisher,
 {
+    fn knowledge_rng_count(&self) -> Result<u64> {
+        self.config.knowledge.rollout_count_u64()
+    }
+
+    fn imitation_rng_count(&self) -> Result<u64> {
+        self.config.imitation.group_size_u64()
+    }
+
     fn compute_prospective_update(&mut self, txn: &ConsolidationTxn) -> Result<()> {
         if self.stages.contains(&TensorStage::Prospective) {
             return Ok(());
@@ -1738,10 +1895,13 @@ where
         let staged = (|| {
             let student = self.updates.stage(txn, &teacher.model)?;
             student.checkpoint.validate()?;
-            validate_sha256(&student.update_sha256)?;
-            let derived_update =
-                prospective_update_hash(&teacher.model, &student.checkpoint.model, txn.sender)
-                    .context("validating prospective sender update scope")?;
+            validate_sha256_identity(&student.update_sha256, "student update identity")?;
+            let derived_update = prospective_update_hash_at_boundary(
+                &teacher.model,
+                &student.checkpoint.model,
+                txn.sender,
+            )
+            .context("validating prospective sender update scope")?;
             ensure!(
                 student.checkpoint.uri == txn.student_checkpoint
                     && student.checkpoint.sha256 == txn.student_hash,
@@ -1844,6 +2004,7 @@ where
             KNOWLEDGE_DEVICE_RNG_DOMAIN,
         ));
         let result = (|| {
+            let mut rollout_tokens = 0_u64;
             for (owner, count) in [
                 (
                     RolloutOwner::Teacher,
@@ -1865,6 +2026,17 @@ where
                     batches.len() == count,
                     "rollout source returned {} {owner:?} batches, expected {count}",
                     batches.len()
+                );
+                rollout_tokens = rollout_tokens
+                    .checked_add(validate_rollout_batches(
+                        &batches,
+                        &model,
+                        "knowledge rollout source",
+                    )?)
+                    .context("knowledge rollout token count overflow")?;
+                ensure!(
+                    rollout_tokens <= MAX_TENSOR_SUBPHASE_TOKENS as u64,
+                    "knowledge rollouts exceed the {MAX_TENSOR_SUBPHASE_TOKENS}-token subphase limit"
                 );
                 for batch in &batches {
                     self.optimize_kl(txn, batch)?;
@@ -1907,6 +2079,12 @@ where
             self.config.imitation.grpo_group_size,
         )?;
         ensure!(!groups.is_empty(), "imitation source returned no groups");
+        validate_imitation_groups(
+            &groups,
+            &student_snapshot,
+            self.config.imitation.grpo_group_size,
+            self.config.imitation.maximum_edit_distance,
+        )?;
         let old_student = self.student.clone();
         let old_optimizer = self.receiver_optimizer.clone();
         let old_diagnostics = self.diagnostics;
@@ -1939,6 +2117,7 @@ where
             !anchors.is_empty(),
             "retention evaluator returned no anchors"
         );
+        validate_rollout_batches(&anchors, &teacher, "retention anchor evaluator")?;
         let mut anchor_kl = 0.0;
         for batch in &anchors {
             anchor_kl += forward_kl_value(
@@ -2115,12 +2294,7 @@ where
                 persist_tensor_boundary(state, backend, store, progress)?;
             }
             crate::sleep::SleepPhase::KnowledgeSeeding => {
-                state.reserve_knowledge_rng(
-                    0,
-                    (backend.config.knowledge.teacher_rollouts
-                        + backend.config.knowledge.detached_student_rollouts)
-                        as u64,
-                )?;
+                state.reserve_knowledge_rng(0, backend.config.knowledge.rollout_count_u64()?)?;
                 progress.persist(state)?;
                 let current_txn = state.pending.clone().expect("transaction checked above");
                 backend.knowledge_seed(&current_txn)?;
@@ -2128,7 +2302,7 @@ where
                 persist_tensor_boundary(state, backend, store, progress)?;
             }
             crate::sleep::SleepPhase::Imitation => {
-                state.reserve_imitation_rng(0, backend.config.imitation.grpo_group_size as u64)?;
+                state.reserve_imitation_rng(0, backend.config.imitation.group_size_u64()?)?;
                 progress.persist(state)?;
                 let current_txn = state.pending.clone().expect("transaction checked above");
                 backend.learn_to_imitate(&current_txn)?;
@@ -2168,8 +2342,10 @@ where
         Ok(true) => Ok(true),
         Ok(false) => {
             backend.restore_teacher(&txn)?;
-            state.rollback()?;
-            progress.persist(state)?;
+            let mut restored = state.clone();
+            restored.rollback()?;
+            progress.persist(&restored)?;
+            *state = restored;
             Ok(false)
         }
         Err(error) => {
@@ -2182,15 +2358,17 @@ where
                     "tensor consolidation committed but state publication failed; retry persistence",
                 ));
             }
-            let restore = backend.restore_teacher(&txn);
-            state.rollback()?;
-            let persist = progress.persist(state);
-            if let Err(restore_error) = restore {
+            if let Err(restore_error) = backend.restore_teacher(&txn) {
                 bail!(
                     "tensor consolidation failed: {error:#}; teacher restore failed: {restore_error:#}"
                 );
             }
-            persist.context("persisting tensor consolidation rollback")?;
+            let mut restored = state.clone();
+            restored.rollback()?;
+            progress
+                .persist(&restored)
+                .context("persisting tensor consolidation rollback")?;
+            *state = restored;
             Err(error)
         }
     }
@@ -2267,8 +2445,8 @@ fn forward_kl_tensor(
     let teacher_projector = teacher.prepare_selected_logits(input.clone(), positions.clone());
     let student_projector = student.prepare_selected_logits(input, positions);
     let mut total: Option<Tensor<1>> = None;
-    let mut teacher_entropy = 0.0_f32;
-    let mut student_entropy = 0.0_f32;
+    let mut teacher_entropy: Option<Tensor<1>> = None;
+    let mut student_entropy: Option<Tensor<1>> = None;
     for start in (0..count).step_by(chunk_tokens) {
         let end = (start + chunk_tokens).min(count);
         let chunk_weight = (end - start) as f32 / count as f32;
@@ -2282,33 +2460,49 @@ fn forward_kl_tensor(
             .sum_dim(1)
             .mean()
             .neg()
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .context("reading teacher entropy metric")?[0];
+            .mul_scalar(chunk_weight);
         let student_entropy_chunk = (student_probability * student_log.clone().detach())
             .sum_dim(1)
             .mean()
             .neg()
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .context("reading student entropy metric")?[0];
-        teacher_entropy += teacher_entropy_chunk * chunk_weight;
-        student_entropy += student_entropy_chunk * chunk_weight;
+            .mul_scalar(chunk_weight);
+        teacher_entropy = Some(match teacher_entropy {
+            Some(sum) => sum + teacher_entropy_chunk,
+            None => teacher_entropy_chunk,
+        });
+        student_entropy = Some(match student_entropy {
+            Some(sum) => sum + student_entropy_chunk,
+            None => student_entropy_chunk,
+        });
         let loss = (teacher_probability * (teacher_log - student_log))
             .sum_dim(1)
             .mean()
             .mul_scalar(temperature * temperature * chunk_weight);
-        total = Some(total.map_or(loss.clone(), |sum| sum + loss));
+        total = Some(match total {
+            Some(sum) => sum + loss,
+            None => loss,
+        });
     }
     let total = total.context("empty KL rollout")?;
-    let value = total
-        .clone()
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .context("reading KL scalar")?[0];
+    // Keep chunk metrics on the accelerator and synchronize exactly once.
+    // Reading two entropy scalars inside every chunk otherwise serializes the
+    // projection loop and creates visible GPU idle gaps during consolidation.
+    let metrics = Tensor::cat(
+        vec![
+            total.clone().detach(),
+            teacher_entropy.context("empty teacher entropy")?,
+            student_entropy.context("empty student entropy")?,
+        ],
+        0,
+    )
+    .into_data()
+    .convert::<f32>()
+    .to_vec::<f32>()
+    .context("reading KL and entropy metrics")?;
+    ensure!(metrics.len() == 3, "KL metric tensor has invalid shape");
+    let value = metrics[0];
+    let teacher_entropy = metrics[1];
+    let student_entropy = metrics[2];
     ensure!(
         value.is_finite() && value >= -1e-5,
         "invalid forward KL {value}"
@@ -2331,51 +2525,115 @@ fn forward_kl_tensor(
     ))
 }
 
-fn continuation_token_log_probabilities(
+fn equal_length_continuation_log_probabilities(
     model: &Transformer,
     prefix: &[i64],
-    continuation: &[i64],
+    candidates: &[Vec<i64>],
+    candidate_indices: &[usize],
     device: &Device,
-) -> Result<Tensor<1>> {
+) -> Result<Tensor<2>> {
     ensure!(
-        !prefix.is_empty() && !continuation.is_empty(),
-        "imitation prefix/continuation is empty"
+        !prefix.is_empty() && !candidate_indices.is_empty(),
+        "imitation prefix/candidate bucket is empty"
     );
-    let mut full = prefix.to_vec();
-    full.extend_from_slice(continuation);
+    let continuation_len = candidates[candidate_indices[0]].len();
+    ensure!(continuation_len > 0, "imitation continuation is empty");
     ensure!(
-        full.len() - 1 <= model.config().max_seq_len,
+        candidate_indices
+            .iter()
+            .all(|index| candidates[*index].len() == continuation_len),
+        "imitation length bucket contains mixed continuation lengths"
+    );
+    let input_len = prefix
+        .len()
+        .checked_add(continuation_len)
+        .and_then(|length| length.checked_sub(1))
+        .context("imitation sequence length overflow")?;
+    ensure!(
+        input_len <= model.config().max_seq_len,
         "imitation sequence exceeds model limit"
     );
     ensure!(
-        full.iter()
-            .all(|id| *id >= 0 && (*id as usize) < model.config().vocab_size),
+        prefix
+            .iter()
+            .chain(
+                candidate_indices
+                    .iter()
+                    .flat_map(|index| candidates[*index].iter()),
+            )
+            .all(|id| usize::try_from(*id).is_ok_and(|id| id < model.config().vocab_size)),
         "imitation token is outside vocabulary"
     );
-    let input_len = full.len() - 1;
-    let start = prefix.len() - 1;
+
+    let input_capacity = candidate_indices
+        .len()
+        .checked_mul(input_len)
+        .context("imitation input size overflow")?;
+    let output_capacity = candidate_indices
+        .len()
+        .checked_mul(continuation_len)
+        .context("imitation target size overflow")?;
+    let mut input_ids = Vec::with_capacity(input_capacity);
+    let mut positions = Vec::with_capacity(output_capacity);
+    let mut targets = Vec::with_capacity(output_capacity);
+    for (row, candidate_index) in candidate_indices.iter().copied().enumerate() {
+        let candidate = &candidates[candidate_index];
+        input_ids.extend_from_slice(prefix);
+        input_ids.extend_from_slice(&candidate[..continuation_len - 1]);
+        let row_start = row
+            .checked_mul(input_len)
+            .and_then(|offset| offset.checked_add(prefix.len() - 1))
+            .context("imitation position overflow")?;
+        for position in row_start..row_start + continuation_len {
+            positions.push(
+                i64::try_from(position).context("imitation position exceeds tensor index range")?,
+            );
+        }
+        targets.extend_from_slice(candidate);
+    }
+    ensure!(
+        input_ids.len() == input_capacity
+            && positions.len() == output_capacity
+            && targets.len() == output_capacity,
+        "imitation batch construction produced an invalid shape"
+    );
     let input = Tensor::<2, Int>::from_data(
-        TensorData::new(full[..input_len].to_vec(), [1, input_len]),
+        TensorData::new(input_ids, [candidate_indices.len(), input_len]),
         device,
     );
-    let positions = Tensor::<1, Int>::from_data(
-        TensorData::new(
-            (start..start + continuation.len())
-                .map(|value| value as i64)
-                .collect(),
-            [continuation.len()],
-        ),
-        device,
-    );
-    let targets = Tensor::<1, Int>::from_data(
-        TensorData::new(continuation.to_vec(), [continuation.len()]),
-        device,
-    );
+    let positions =
+        Tensor::<1, Int>::from_data(TensorData::new(positions, [output_capacity]), device);
+    let targets = Tensor::<1, Int>::from_data(TensorData::new(targets, [output_capacity]), device);
     Ok(
         log_softmax(model.forward_selected_logits(input, positions), 1)
             .gather(1, targets.unsqueeze_dim(1))
-            .reshape([continuation.len()]),
+            .reshape([candidate_indices.len(), continuation_len]),
     )
+}
+
+fn candidate_length_buckets(
+    candidates: &[Vec<i64>],
+    max_tokens: usize,
+) -> Result<BTreeMap<usize, Vec<usize>>> {
+    let mut buckets = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        ensure!(!candidate.is_empty(), "GRPO candidate is empty");
+        ensure!(
+            candidate.len() <= max_tokens,
+            "GRPO candidate exceeds padded token width"
+        );
+        buckets.entry(candidate.len()).or_default().push(index);
+    }
+    Ok(buckets)
+}
+
+fn grpo_rows_per_forward(prefix_len: usize, continuation_len: usize) -> Result<usize> {
+    let input_len = prefix_len
+        .checked_add(continuation_len)
+        .and_then(|length| length.checked_sub(1))
+        .context("imitation sequence length overflow")?;
+    ensure!(input_len > 0, "imitation model input is empty");
+    Ok((MAX_TENSOR_FORWARD_TOKENS / input_len).max(1))
 }
 
 fn padded_group_log_probabilities(
@@ -2387,28 +2645,42 @@ fn padded_group_log_probabilities(
 ) -> Result<Tensor<2>> {
     ensure!(!candidates.is_empty(), "GRPO candidate group is empty");
     ensure!(max_tokens > 0, "GRPO candidates have no tokens");
-    let rows = candidates
-        .iter()
-        .map(|candidate| {
-            ensure!(
-                candidate.len() <= max_tokens,
-                "GRPO candidate exceeds padded token width"
-            );
-            let log_probabilities =
-                continuation_token_log_probabilities(model, prefix, candidate, device)?;
-            let padded = if candidate.len() < max_tokens {
-                Tensor::cat(
-                    vec![
-                        log_probabilities,
-                        Tensor::<1>::zeros([max_tokens - candidate.len()], device),
-                    ],
-                    0,
-                )
-            } else {
-                log_probabilities
-            };
-            Ok(padded.unsqueeze_dim::<2>(0))
-        })
+    let buckets = candidate_length_buckets(candidates, max_tokens)?;
+    let mut rows = (0..candidates.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Tensor<2>>>>();
+    for (continuation_len, candidate_indices) in buckets {
+        let rows_per_forward = grpo_rows_per_forward(prefix.len(), continuation_len)?;
+        for candidate_chunk in candidate_indices.chunks(rows_per_forward) {
+            let bucket = equal_length_continuation_log_probabilities(
+                model,
+                prefix,
+                candidates,
+                candidate_chunk,
+                device,
+            )?;
+            for (bucket_row, candidate_index) in candidate_chunk.iter().copied().enumerate() {
+                let row = bucket
+                    .clone()
+                    .slice([bucket_row..bucket_row + 1, 0..continuation_len]);
+                let padded = if continuation_len < max_tokens {
+                    Tensor::cat(
+                        vec![
+                            row,
+                            Tensor::<2>::zeros([1, max_tokens - continuation_len], device),
+                        ],
+                        1,
+                    )
+                } else {
+                    row
+                };
+                rows[candidate_index] = Some(padded);
+            }
+        }
+    }
+    let rows = rows
+        .into_iter()
+        .map(|row| row.context("GRPO candidate row was not constructed"))
         .collect::<Result<Vec<_>>>()?;
     Ok(Tensor::cat(rows, 0))
 }
@@ -2423,39 +2695,187 @@ fn validate_group(group: &ImitationGroup, model: &Transformer, size: usize) -> R
         "GRPO group has {} candidates, expected {size}",
         group.candidates.len()
     );
+    let valid_token = |token: &i64| {
+        *token >= 0 && usize::try_from(*token).is_ok_and(|id| id < model.config().vocab_size)
+    };
     ensure!(
-        group
+        group.prefix.iter().all(valid_token)
+            && group.teacher_continuation.iter().all(valid_token)
+            && group.candidates.iter().flatten().all(valid_token),
+        "imitation group contains an out-of-vocabulary token"
+    );
+    let teacher_sequence = group
+        .prefix
+        .len()
+        .checked_add(group.teacher_continuation.len())
+        .and_then(|length| length.checked_sub(1))
+        .context("imitation teacher sequence length overflow")?;
+    ensure!(
+        teacher_sequence <= model.config().max_seq_len,
+        "imitation teacher sequence exceeds model limit"
+    );
+    for candidate in &group.candidates {
+        ensure!(!candidate.is_empty(), "imitation candidate is empty");
+        let sequence = group
+            .prefix
+            .len()
+            .checked_add(candidate.len())
+            .and_then(|length| length.checked_sub(1))
+            .context("imitation candidate sequence length overflow")?;
+        ensure!(
+            sequence <= model.config().max_seq_len,
+            "imitation candidate sequence exceeds model limit"
+        );
+    }
+    Ok(())
+}
+
+fn validate_imitation_groups(
+    groups: &[ImitationGroup],
+    model: &Transformer,
+    group_size: usize,
+    maximum_edit_distance: usize,
+) -> Result<()> {
+    ensure!(
+        groups.len() <= MAX_TENSOR_IMITATION_GROUPS,
+        "imitation source returned more than {MAX_TENSOR_IMITATION_GROUPS} groups"
+    );
+    let mut model_token_evaluations = 0_usize;
+    let mut edit_distance_cells = 0_usize;
+    for group in groups {
+        validate_group(group, model, group_size)?;
+        let max_candidate_tokens = group
             .candidates
             .iter()
-            .all(|candidate| !candidate.is_empty()
-                && group.prefix.len() + candidate.len() - 1 <= model.config().max_seq_len),
-        "invalid imitation candidate"
-    );
+            .map(Vec::len)
+            .max()
+            .context("imitation group has no candidates")?;
+        let padded_tokens = max_candidate_tokens
+            .checked_mul(group.candidates.len())
+            .context("imitation padded tensor size overflow")?;
+        ensure!(
+            padded_tokens <= MAX_TENSOR_GRPO_PADDED_TOKENS,
+            "imitation group exceeds the {MAX_TENSOR_GRPO_PADDED_TOKENS}-element padded tensor limit"
+        );
+        let mut group_tokens = 0_usize;
+        for candidate in &group.candidates {
+            let sequence = group
+                .prefix
+                .len()
+                .checked_add(candidate.len())
+                .and_then(|length| length.checked_sub(1))
+                .context("imitation candidate sequence length overflow")?;
+            group_tokens = group_tokens
+                .checked_add(sequence)
+                .context("imitation group model-token work overflow")?;
+            ensure!(
+                group_tokens <= MAX_TENSOR_FORWARD_TOKENS,
+                "imitation group exceeds the {MAX_TENSOR_FORWARD_TOKENS}-token activation limit"
+            );
+            // Current policy, frozen behavior policy, and teacher reference
+            // each evaluate the same causal rows.
+            model_token_evaluations = model_token_evaluations
+                .checked_add(
+                    sequence
+                        .checked_mul(3)
+                        .context("imitation model-token work overflow")?,
+                )
+                .context("imitation model-token work overflow")?;
+            ensure!(
+                model_token_evaluations <= MAX_TENSOR_SUBPHASE_TOKENS,
+                "imitation exceeds the {MAX_TENSOR_SUBPHASE_TOKENS}-token model-work limit"
+            );
+
+            if group.teacher_continuation.len().abs_diff(candidate.len()) <= maximum_edit_distance {
+                let longest = group.teacher_continuation.len().max(candidate.len());
+                let band = maximum_edit_distance.min(longest);
+                let row_width = band
+                    .checked_mul(2)
+                    .and_then(|width| width.checked_add(1))
+                    .context("imitation edit-distance work overflow")?;
+                edit_distance_cells = edit_distance_cells
+                    .checked_add(
+                        longest
+                            .checked_mul(row_width)
+                            .context("imitation edit-distance work overflow")?,
+                    )
+                    .context("imitation edit-distance work overflow")?;
+                ensure!(
+                    edit_distance_cells <= MAX_TENSOR_EDIT_DISTANCE_CELLS,
+                    "imitation exceeds the {MAX_TENSOR_EDIT_DISTANCE_CELLS}-cell edit-distance limit"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
 pub fn thresholded_edit_reward(reference: &[i64], candidate: &[i64], maximum: usize) -> f32 {
-    let distance = levenshtein(reference, candidate);
-    if distance > maximum {
+    let Some(distance) = thresholded_levenshtein(reference, candidate, maximum) else {
         return 0.0;
-    }
+    };
     1.0 - distance as f32 / reference.len().max(candidate.len()).max(1) as f32
 }
 
-fn levenshtein(left: &[i64], right: &[i64]) -> usize {
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right.len() + 1];
+/// Return the exact edit distance when it is at most `maximum`.
+///
+/// Imitation only assigns a reward inside that threshold, so visiting the
+/// rest of the dynamic-programming matrix wastes quadratic CPU time between
+/// accelerator updates. The diagonal band is exact for every accepted result
+/// and reduces the usual `O(left * right)` work to
+/// `O(max(left, right) * maximum)` for the normal small-threshold recipe.
+fn thresholded_levenshtein(left: &[i64], right: &[i64], maximum: usize) -> Option<usize> {
+    if left.len().abs_diff(right.len()) > maximum {
+        return None;
+    }
+    if left.is_empty() {
+        return (right.len() <= maximum).then_some(right.len());
+    }
+    if right.is_empty() {
+        return (left.len() <= maximum).then_some(left.len());
+    }
+
+    // Distance is symmetric. Keeping the shorter sequence on the horizontal
+    // axis bounds scratch memory without changing the diagonal-band proof.
+    let (left, right) = if right.len() <= left.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let band = maximum.min(left.len().max(right.len()));
+    let beyond = band + 1;
+    let mut previous = vec![beyond; right.len() + 1];
+    for (column, value) in previous.iter_mut().enumerate().take(band + 1) {
+        *value = column;
+    }
+    let mut current = vec![beyond; right.len() + 1];
     for (left_index, left_token) in left.iter().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_token) in right.iter().enumerate() {
-            current[right_index + 1] = (previous[right_index]
-                + usize::from(left_token != right_token))
-            .min(previous[right_index + 1] + 1)
-            .min(current[right_index] + 1);
+        let row = left_index + 1;
+        let first_column = row.saturating_sub(band).max(1);
+        let last_column = row.saturating_add(band).min(right.len());
+        if first_column > last_column {
+            return None;
+        }
+        // Only the diagonal band is read on the next row. Reset its two
+        // sentinels rather than filling the whole sequence-width buffer; a
+        // full fill here silently turns the advertised banded algorithm back
+        // into O(left * right) CPU work.
+        current[0] = if row <= band { row } else { beyond };
+        if first_column > 1 {
+            current[first_column - 1] = beyond;
+        }
+        for column in first_column..=last_column {
+            current[column] = (previous[column - 1]
+                + usize::from(left_token != &right[column - 1]))
+            .min(previous[column].saturating_add(1))
+            .min(current[column - 1].saturating_add(1));
+        }
+        if last_column < right.len() {
+            current[last_column + 1] = beyond;
         }
         std::mem::swap(&mut previous, &mut current);
     }
-    previous[right.len()]
+    (previous[right.len()] <= maximum).then_some(previous[right.len()])
 }
 
 pub fn normalized_group_advantages(rewards: &[f32]) -> Vec<f32> {
@@ -2470,20 +2890,6 @@ pub fn normalized_group_advantages(rewards: &[f32]) -> Vec<f32> {
         / rewards.len() as f32;
     let scale = (variance + 1e-6).sqrt();
     rewards.iter().map(|value| (value - mean) / scale).collect()
-}
-
-fn validate_sha256(value: &str) -> Result<()> {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        bail!("identity must start with sha256:");
-    };
-    ensure!(
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "identity must be sha256 plus 64 lowercase hex digits"
-    );
-    Ok(())
 }
 
 /// A deterministic parameter/state digest used to verify that a publisher
@@ -2510,8 +2916,12 @@ pub(crate) fn model_parameter_hash(model: &Transformer) -> Result<String> {
             self.shape(b'f', parameter.shape().dims::<D>());
             match parameter.val().into_data().convert::<f32>().to_vec::<f32>() {
                 Ok(values) => {
-                    for value in values {
-                        self.hash.update(value.to_bits().to_le_bytes());
+                    let mut bytes =
+                        Vec::with_capacity(FINGERPRINT_CHUNK_VALUES * std::mem::size_of::<f32>());
+                    for chunk in values.chunks(FINGERPRINT_CHUNK_VALUES) {
+                        bytes.clear();
+                        bytes.extend(chunk.iter().flat_map(|value| value.to_bits().to_le_bytes()));
+                        self.hash.update(&bytes);
                     }
                 }
                 Err(error) => self.failure = Some(error.to_string()),
@@ -2522,8 +2932,12 @@ pub(crate) fn model_parameter_hash(model: &Transformer) -> Result<String> {
             self.shape(b'i', parameter.shape().dims::<D>());
             match parameter.val().into_data().to_vec::<i64>() {
                 Ok(values) => {
-                    for value in values {
-                        self.hash.update(value.to_le_bytes());
+                    let mut bytes =
+                        Vec::with_capacity(FINGERPRINT_CHUNK_VALUES * std::mem::size_of::<i64>());
+                    for chunk in values.chunks(FINGERPRINT_CHUNK_VALUES) {
+                        bytes.clear();
+                        bytes.extend(chunk.iter().flat_map(|value| value.to_le_bytes()));
+                        self.hash.update(&bytes);
                     }
                 }
                 Err(error) => self.failure = Some(error.to_string()),
@@ -2534,8 +2948,11 @@ pub(crate) fn model_parameter_hash(model: &Transformer) -> Result<String> {
             self.shape(b'b', parameter.shape().dims::<D>());
             match parameter.val().into_data().to_vec::<bool>() {
                 Ok(values) => {
-                    for value in values {
-                        self.hash.update([u8::from(value)]);
+                    let mut bytes = Vec::with_capacity(FINGERPRINT_CHUNK_VALUES);
+                    for chunk in values.chunks(FINGERPRINT_CHUNK_VALUES) {
+                        bytes.clear();
+                        bytes.extend(chunk.iter().copied().map(u8::from));
+                        self.hash.update(&bytes);
                     }
                 }
                 Err(error) => self.failure = Some(error.to_string()),
@@ -2605,6 +3022,8 @@ pub trait TransformerDreamOps {
 pub struct TensorDreamBackend<O> {
     shared: Transformer,
     immutable_shared: Transformer,
+    immutable_shared_hash: String,
+    bound_candidate_checkpoint: Option<(String, String)>,
     device: Device,
     operations: O,
 }
@@ -2617,12 +3036,35 @@ impl<O: TransformerDreamOps> TensorDreamBackend<O> {
         operations: O,
     ) -> Result<Self> {
         probe.validate_for(&shared)?;
+        let immutable_shared_hash = model_parameter_hash(&shared)?;
         Ok(Self {
             immutable_shared: shared.clone(),
             shared,
+            immutable_shared_hash,
+            bound_candidate_checkpoint: None,
             device,
             operations,
         })
+    }
+    /// Bind the in-memory immutable model to the artifact identity recorded by
+    /// the committed consolidation. This is separate from the parameter hash:
+    /// checkpoint formats may authenticate metadata in addition to tensors.
+    pub fn bind_candidate_checkpoint(&mut self, uri: &str, sha256: &str) -> Result<()> {
+        ensure!(
+            !uri.trim().is_empty(),
+            "dream candidate checkpoint URI is empty"
+        );
+        validate_sha256_identity(sha256, "published checkpoint identity")?;
+        let identity = (uri.to_owned(), sha256.to_owned());
+        if let Some(bound) = &self.bound_candidate_checkpoint {
+            ensure!(
+                bound == &identity,
+                "dream backend cannot be rebound to another candidate checkpoint"
+            );
+        } else {
+            self.bound_candidate_checkpoint = Some(identity);
+        }
+        Ok(())
     }
     pub fn shared_model(&self) -> &Transformer {
         &self.shared
@@ -2631,15 +3073,32 @@ impl<O: TransformerDreamOps> TensorDreamBackend<O> {
         &self.operations
     }
     fn fingerprint(&self) -> Result<String> {
-        // A probe-logit digest can miss changes to dormant reserve slots or
-        // parameters that do not affect that particular input. Dream trials
-        // must preserve the entire immutable candidate, including checkpoint
-        // state that is intentionally excluded from active routing.
-        model_parameter_hash(&self.shared)
+        // The shared model is never exposed mutably. Generation, reference
+        // evaluation, and policy updates receive `&Transformer`; LoRA trials
+        // receive an independently forked model. Cache the full parameter
+        // identity once instead of copying and hashing hundreds of millions
+        // of parameters around every trial.
+        Ok(self.immutable_shared_hash.clone())
     }
 }
 
 impl<O: TransformerDreamOps> DreamingBackend for TensorDreamBackend<O> {
+    fn verify_committed_candidate(&mut self, txn: &ConsolidationTxn) -> Result<()> {
+        let checkpoint = txn
+            .candidate_checkpoint
+            .as_ref()
+            .context("committed transaction has no candidate checkpoint")?;
+        let sha256 = txn
+            .candidate_hash
+            .as_ref()
+            .context("committed transaction has no candidate hash")?;
+        ensure!(
+            self.bound_candidate_checkpoint.as_ref() == Some(&(checkpoint.clone(), sha256.clone())),
+            "dream backend is not bound to the committed candidate checkpoint"
+        );
+        Ok(())
+    }
+
     fn shared_checkpoint_hash(&mut self) -> Result<String> {
         self.fingerprint()
     }
@@ -2660,9 +3119,9 @@ impl<O: TransformerDreamOps> DreamingBackend for TensorDreamBackend<O> {
             count,
             MemoryRouting::Dream { seed: txn.id },
         )?;
-        validate_sha256(&manifest)?;
+        validate_sha256_identity(&manifest, "dream manifest identity")?;
         for dream in &dreams {
-            validate_sha256(&dream.artifact_hash)?;
+            validate_sha256_identity(&dream.artifact_hash, "dream artifact identity")?;
         }
         Ok((manifest, dreams))
     }
@@ -2672,10 +3131,10 @@ impl<O: TransformerDreamOps> DreamingBackend for TensorDreamBackend<O> {
         txn: &ConsolidationTxn,
         manifest: &str,
     ) -> Result<Vec<GeneratedDream>> {
-        validate_sha256(manifest)?;
+        validate_sha256_identity(manifest, "dream manifest identity")?;
         let dreams = self.operations.load(txn, manifest)?;
         for dream in &dreams {
-            validate_sha256(&dream.artifact_hash)?;
+            validate_sha256_identity(&dream.artifact_hash, "dream artifact identity")?;
         }
         Ok(dreams)
     }
@@ -2685,7 +3144,7 @@ impl<O: TransformerDreamOps> DreamingBackend for TensorDreamBackend<O> {
         txn: &ConsolidationTxn,
         reference_hash: &str,
     ) -> Result<Vec<f32>> {
-        validate_sha256(reference_hash)?;
+        validate_sha256_identity(reference_hash, "dream reference identity")?;
         self.operations
             .reference_gradient(txn, &self.shared, reference_hash)
     }
@@ -2698,12 +3157,12 @@ impl<O: TransformerDreamOps> DreamingBackend for TensorDreamBackend<O> {
         alpha: usize,
     ) -> Result<DreamTrial> {
         let isolated = self.shared.clone().fork(&self.device);
-        validate_sha256(&candidate.artifact_hash)?;
+        validate_sha256_identity(&candidate.artifact_hash, "dream candidate identity")?;
         let trial = self
             .operations
             .isolated_lora_trial(txn, isolated, candidate, rank, alpha)?;
-        validate_sha256(&trial.adapter_hash)?;
-        validate_sha256(&trial.evaluator_hash)?;
+        validate_sha256_identity(&trial.adapter_hash, "dream adapter identity")?;
+        validate_sha256_identity(&trial.evaluator_hash, "dream evaluator identity")?;
         Ok(trial)
     }
 
@@ -2862,6 +3321,7 @@ mod tests {
     struct Update {
         device: Device,
         cleared: usize,
+        fail_restore: bool,
     }
     impl ProspectiveTransformerUpdate for Update {
         fn snapshot_state(&mut self, _: &ConsolidationTxn) -> Result<ProspectiveUpdateSnapshot> {
@@ -2873,6 +3333,7 @@ mod tests {
             _: &ConsolidationTxn,
             snapshot: &ProspectiveUpdateSnapshot,
         ) -> Result<()> {
+            ensure!(!self.fail_restore, "injected update-state restore failure");
             let bytes: [u8; std::mem::size_of::<usize>()] = snapshot
                 .as_bytes()
                 .try_into()
@@ -2933,6 +3394,30 @@ mod tests {
                 teacher_continuation: vec![3, 4],
                 candidates,
             }])
+        }
+    }
+
+    struct FailingKnowledgeRollouts;
+
+    impl ConsolidationRollouts for FailingKnowledgeRollouts {
+        fn knowledge_rollouts(
+            &mut self,
+            _: &ConsolidationTxn,
+            _: RolloutOwner,
+            _: &Transformer,
+            _: usize,
+        ) -> Result<Vec<TokenRolloutBatch>> {
+            bail!("injected knowledge-rollout failure")
+        }
+
+        fn imitation_groups(
+            &mut self,
+            _: &ConsolidationTxn,
+            _: &Transformer,
+            _: &Transformer,
+            _: usize,
+        ) -> Result<Vec<ImitationGroup>> {
+            bail!("imitation must not run after the injected knowledge failure")
         }
     }
 
@@ -3062,6 +3547,7 @@ mod tests {
             Update {
                 device: device.clone(),
                 cleared: 0,
+                fail_restore: false,
             },
             Rollouts(batch.clone()),
             Judge,
@@ -3155,6 +3641,106 @@ mod tests {
     }
 
     #[test]
+    fn durable_rollback_persist_failure_leaves_the_caller_pending() {
+        #[derive(Default)]
+        struct RejectRollbackSink(Vec<SleepState>);
+
+        impl SleepProgressSink for RejectRollbackSink {
+            fn persist(&mut self, state: &SleepState) -> Result<()> {
+                if state.phase == crate::sleep::SleepPhase::Wake {
+                    bail!("injected durable rollback persistence failure");
+                }
+                self.0.push(state.clone());
+                Ok(())
+            }
+        }
+
+        let device = Device::ndarray().autodiff();
+        device.seed(12);
+        let mut model = Transformer::new(&tiny_config(), &device).unwrap();
+        let (mut state, _) = begin(&mut model, &device);
+        let mut backend = backend(model, &device, true);
+        let directory = tempfile::tempdir().unwrap();
+        let store = TensorTransactionStore::new(directory.path());
+        let mut sink = RejectRollbackSink::default();
+
+        let error =
+            execute_tensor_consolidation_durable(&mut state, &mut backend, &store, &mut sink)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("rollback persistence failure"), "{error}");
+        assert_eq!(state.phase, crate::sleep::SleepPhase::RetentionValidation);
+        assert!(state.pending.is_some());
+        assert!(
+            sink.0
+                .iter()
+                .all(|snapshot| snapshot.phase != crate::sleep::SleepPhase::Wake),
+            "a failed tensor rollback publication escaped into durable progress"
+        );
+    }
+
+    #[test]
+    fn durable_restore_failure_never_publishes_rollback_metadata() {
+        #[derive(Default)]
+        struct RecordingSink(Vec<SleepState>);
+
+        impl SleepProgressSink for RecordingSink {
+            fn persist(&mut self, state: &SleepState) -> Result<()> {
+                self.0.push(state.clone());
+                Ok(())
+            }
+        }
+
+        let device = Device::ndarray().autodiff();
+        device.seed(14);
+        let mut model = Transformer::new(&tiny_config(), &device).unwrap();
+        let (mut state, _) = begin(&mut model, &device);
+        let batch = TokenRolloutBatch::new(1, 4, vec![1, 2, 3, 4]).unwrap();
+        let mut backend = TensorConsolidationBackend::new(
+            ImmutableTransformerCheckpoint {
+                uri: "teacher.bpk".into(),
+                sha256: hash('a'),
+                model,
+            },
+            device.clone(),
+            config(),
+            Update {
+                device,
+                cleared: 0,
+                fail_restore: true,
+            },
+            FailingKnowledgeRollouts,
+            Judge,
+            Evaluator {
+                batch,
+                reject: false,
+                calls: 0,
+            },
+            Publisher::default(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = TensorTransactionStore::new(directory.path());
+        let mut sink = RecordingSink::default();
+
+        let error =
+            execute_tensor_consolidation_durable(&mut state, &mut backend, &store, &mut sink)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("teacher restore failed"), "{error}");
+        assert_eq!(state.phase, crate::sleep::SleepPhase::KnowledgeSeeding);
+        assert!(state.pending.is_some());
+        assert!(
+            sink.0
+                .iter()
+                .all(|snapshot| snapshot.phase != crate::sleep::SleepPhase::Wake),
+            "a tensor rollback cursor was published despite failed restoration"
+        );
+    }
+
+    #[test]
     fn exact_receiver_optimizer_snapshot_resumes_from_imitation_boundary() {
         let device = Device::ndarray().autodiff();
         device.seed(13);
@@ -3181,7 +3767,7 @@ mod tests {
         let pointer = store
             .publish(&txn, &first.snapshot_inflight(&txn).unwrap())
             .unwrap();
-        validate_sha256(&pointer.manifest_sha256).unwrap();
+        validate_sha256_identity(&pointer.manifest_sha256, "tensor manifest identity").unwrap();
         state
             .record_tensor_transaction(pointer.generation.clone(), pointer.manifest_sha256.clone())
             .unwrap();
@@ -3209,6 +3795,45 @@ mod tests {
         assert!(execute_tensor_consolidation(&mut state, &mut resumed, &mut sink).unwrap());
         assert_eq!(resumed.diagnostics().knowledge_updates, 2);
         assert_eq!(resumed.diagnostics().imitation_updates, 1);
+    }
+
+    #[test]
+    fn failed_inflight_restore_does_not_partially_install_tensor_topology() {
+        let device = Device::ndarray().autodiff();
+        device.seed(41);
+        let mut model = Transformer::new(&tiny_config(), &device).unwrap();
+        let (_, txn) = begin(&mut model, &device);
+        let mut staged = backend(model.clone(), &device, false);
+        staged.compute_prospective_update(&txn).unwrap();
+        staged.stage_student(&txn).unwrap();
+        let recovered = staged.snapshot_inflight(&txn).unwrap();
+
+        let mut resumed = backend(model, &device, false);
+        resumed.updates.fail_restore = true;
+        let live_before = model_parameter_hash(&resumed.live.model).unwrap();
+        let error = resumed
+            .restore_inflight(&txn, recovered)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("prospective sender optimizer state"),
+            "{error}"
+        );
+        assert!(resumed.teacher.is_none());
+        assert!(resumed.student.is_none());
+        assert!(resumed.pre_update_state.is_none());
+        assert!(resumed.staged_update_state.is_none());
+        assert!(resumed.receiver_ids.is_empty());
+        assert!(resumed.reclaimed_sender_ids.is_empty());
+        assert!(resumed.stages.is_empty());
+        assert_eq!(resumed.retention, None);
+        assert_eq!(resumed.diagnostics, TensorSleepDiagnostics::default());
+        assert_eq!(resumed.updates.cleared, 0);
+        assert_eq!(
+            model_parameter_hash(&resumed.live.model).unwrap(),
+            live_before
+        );
     }
 
     #[test]
@@ -3264,6 +3889,135 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tensor_generation_load_is_aba_safe_and_rejects_persistent_replacement() {
+        let device = Device::ndarray().autodiff();
+        device.seed(31);
+        let mut model = Transformer::new(&tiny_config(), &device).unwrap();
+        let (_, txn) = begin(&mut model, &device);
+        let expected_teacher = model_parameter_hash(&model).unwrap();
+        let mut backend = backend(model, &device, false);
+        backend.compute_prospective_update(&txn).unwrap();
+        backend.stage_student(&txn).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = TensorTransactionStore::new(directory.path());
+        let pointer = store
+            .publish(&txn, &backend.snapshot_inflight(&txn).unwrap())
+            .unwrap();
+        let generation = directory
+            .path()
+            .join("generations")
+            .join(&pointer.generation);
+        let held = directory.path().join("held-tensor-generation");
+
+        let recovered = store
+            .load_pointer_inner(
+                &txn,
+                &tiny_config(),
+                &device,
+                AdamWConfig::new().with_weight_decay(0.0).init(),
+                &pointer,
+                |stage, path| {
+                    match stage {
+                        TensorLoadStage::AfterCapture => {
+                            fs::rename(path, &held)?;
+                            fs::create_dir(path)?;
+                        }
+                        TensorLoadStage::AfterStagedLoad => {
+                            fs::remove_dir(path)?;
+                            fs::rename(&held, path)?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            model_parameter_hash(&recovered.teacher.model).unwrap(),
+            expected_teacher,
+            "an A->B->A pathname swap changed the loaded teacher"
+        );
+
+        let held = directory.path().join("held-persistent-tensor-generation");
+        let persistent = store.load_pointer_inner(
+            &txn,
+            &tiny_config(),
+            &device,
+            AdamWConfig::new().with_weight_decay(0.0).init(),
+            &pointer,
+            |stage, path| {
+                if stage == TensorLoadStage::AfterCapture {
+                    fs::rename(path, &held)?;
+                    fs::create_dir(path)?;
+                }
+                Ok(())
+            },
+        );
+        let error = match persistent {
+            Ok(_) => panic!("persistent tensor generation replacement was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("changed during authenticated load"),
+            "{error}"
+        );
+        fs::remove_dir(&generation).unwrap();
+        fs::rename(held, &generation).unwrap();
+
+        let student = generation.join(TENSOR_TXN_STUDENT);
+        let held_student = directory.path().join("held-student.safetensors");
+        let replacement = store.load_pointer_inner(
+            &txn,
+            &tiny_config(),
+            &device,
+            AdamWConfig::new().with_weight_decay(0.0).init(),
+            &pointer,
+            |stage, _| {
+                if stage == TensorLoadStage::AfterCapture {
+                    fs::rename(&student, &held_student)?;
+                    fs::write(&student, b"persistent replacement")?;
+                }
+                Ok(())
+            },
+        );
+        let error = match replacement {
+            Ok(_) => panic!("persistent tensor child replacement was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("file `student.safetensors` changed"),
+            "{error}"
+        );
+        fs::remove_file(&student).unwrap();
+        fs::rename(held_student, &student).unwrap();
+
+        let mutation = store.load_pointer_inner(
+            &txn,
+            &tiny_config(),
+            &device,
+            AdamWConfig::new().with_weight_decay(0.0).init(),
+            &pointer,
+            |stage, _| {
+                if stage == TensorLoadStage::AfterCapture {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&student)?
+                        .write_all(b"persistent mutation")?;
+                }
+                Ok(())
+            },
+        );
+        let error = match mutation {
+            Ok(_) => panic!("persistent in-place tensor mutation was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("file `student.safetensors` changed"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3358,7 +4112,11 @@ mod tests {
             live,
             device.clone(),
             config(),
-            Update { device, cleared: 0 },
+            Update {
+                device,
+                cleared: 0,
+                fail_restore: false,
+            },
             Rollouts(batch.clone()),
             Judge,
             Evaluator {
@@ -3398,6 +4156,48 @@ mod tests {
     }
 
     #[test]
+    fn threshold_banded_edit_distance_matches_full_dynamic_programming() {
+        fn full_distance(left: &[i64], right: &[i64]) -> usize {
+            let mut previous = (0..=right.len()).collect::<Vec<_>>();
+            let mut current = vec![0; right.len() + 1];
+            for (left_index, left_token) in left.iter().enumerate() {
+                current[0] = left_index + 1;
+                for (right_index, right_token) in right.iter().enumerate() {
+                    current[right_index + 1] = (previous[right_index]
+                        + usize::from(left_token != right_token))
+                    .min(previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1);
+                }
+                std::mem::swap(&mut previous, &mut current);
+            }
+            previous[right.len()]
+        }
+
+        for left_len in 0..=5 {
+            for right_len in 0..=5 {
+                for left_bits in 0..(1usize << left_len) {
+                    let left = (0..left_len)
+                        .map(|bit| i64::from(((left_bits >> bit) & 1) != 0))
+                        .collect::<Vec<_>>();
+                    for right_bits in 0..(1usize << right_len) {
+                        let right = (0..right_len)
+                            .map(|bit| i64::from(((right_bits >> bit) & 1) != 0))
+                            .collect::<Vec<_>>();
+                        let exact = full_distance(&left, &right);
+                        for maximum in 0..=6 {
+                            assert_eq!(
+                                thresholded_levenshtein(&left, &right, maximum),
+                                (exact <= maximum).then_some(exact),
+                                "left={left:?} right={right:?} maximum={maximum}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn chunked_forward_kl_matches_an_unchunked_batch() {
         let device = Device::ndarray().autodiff();
         device.seed(37);
@@ -3415,6 +4215,79 @@ mod tests {
     }
 
     #[test]
+    fn grpo_log_probabilities_batch_equal_length_candidates_without_reordering() {
+        let device = Device::ndarray().autodiff();
+        device.seed(43);
+        let model = Transformer::new(&tiny_config(), &device).unwrap();
+        let prefix = vec![1, 2];
+        let candidates = vec![vec![3, 4], vec![5], vec![6, 7]];
+        let buckets = candidate_length_buckets(&candidates, 2).unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets.get(&2), Some(&vec![0, 2]));
+
+        let grouped = padded_group_log_probabilities(&model, &prefix, &candidates, 2, &device)
+            .unwrap()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        let mut singleton = Vec::new();
+        for candidate in &candidates {
+            singleton.extend(
+                padded_group_log_probabilities(
+                    &model,
+                    &prefix,
+                    std::slice::from_ref(candidate),
+                    2,
+                    &device,
+                )
+                .unwrap()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap(),
+            );
+        }
+        assert_eq!(grouped.len(), singleton.len());
+        for (batched, separate) in grouped.iter().zip(&singleton) {
+            assert!(
+                (batched - separate).abs() < 1e-5,
+                "batched log probability {batched} differs from {separate}"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_sleep_rollout_work_is_bounded_before_tensor_execution() {
+        let device = Device::ndarray().autodiff();
+        let model = Transformer::new(&tiny_config(), &device).unwrap();
+        let oversized_batch = TokenRolloutBatch {
+            batch: MAX_TENSOR_ROLLOUT_BATCH_ROWS + 1,
+            sequence: 1,
+            token_ids: vec![1; MAX_TENSOR_ROLLOUT_BATCH_ROWS + 1],
+        };
+        assert!(oversized_batch.validate_for(&model).is_err());
+
+        let group = ImitationGroup {
+            prefix: vec![1, 2],
+            teacher_continuation: vec![3, 4],
+            candidates: vec![vec![3, 4], vec![5, 6]],
+        };
+        let groups = vec![group; MAX_TENSOR_IMITATION_GROUPS + 1];
+        let error = validate_imitation_groups(&groups, &model, 2, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than"), "{error}");
+
+        let batch = TokenRolloutBatch::new(1, 1, vec![1]).unwrap();
+        let batches = vec![batch; MAX_TENSOR_ROLLOUT_BATCHES + 1];
+        let error = validate_rollout_batches(&batches, &model, "hostile source")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rollout batches"), "{error}");
+    }
+
+    #[test]
     fn prospective_update_rejects_parameters_outside_sender_tier() {
         let device = Device::ndarray().autodiff();
         let mut teacher = Transformer::new(&tiny_config(), &device).unwrap();
@@ -3429,7 +4302,7 @@ mod tests {
                 .with_weight_decay(0.0)
                 .init()
                 .step(1e-2.into(), student, selected);
-        let error = prospective_update_hash(&teacher, &student, 0)
+        let error = prospective_update_hash_at_boundary(&teacher, &student, 0)
             .unwrap_err()
             .to_string();
         assert!(error.contains("escaped sender tier"), "{error}");
@@ -3541,6 +4414,13 @@ mod tests {
             },
         )
         .unwrap();
+        let committed = state.pending.as_ref().unwrap();
+        dreams
+            .bind_candidate_checkpoint(
+                committed.candidate_checkpoint.as_ref().unwrap(),
+                committed.candidate_hash.as_ref().unwrap(),
+            )
+            .unwrap();
         let before = dreams.shared_checkpoint_hash().unwrap();
         let config = DreamingConfig {
             candidate_count: 2,
@@ -3564,7 +4444,7 @@ mod tests {
     }
 
     #[test]
-    fn dream_checkpoint_identity_covers_dormant_reserve_state() {
+    fn model_parameter_identity_covers_dormant_reserve_state() {
         let device = Device::ndarray().autodiff();
         device.seed(31);
         let model = Transformer::new(&tiny_config(), &device).unwrap();
@@ -3580,7 +4460,7 @@ mod tests {
             },
         )
         .unwrap();
-        let checkpoint_before = dreams.shared_checkpoint_hash().unwrap();
+        let checkpoint_before = model_parameter_hash(dreams.shared_model()).unwrap();
 
         // Reclaiming a slot leaves it dormant, so ordinary logits return to
         // their original value while its generation/stored tensors differ.
@@ -3593,6 +4473,26 @@ mod tests {
             model_probe_hash(dreams.shared_model(), &probe, &device).unwrap(),
             probe_before
         );
-        assert_ne!(dreams.shared_checkpoint_hash().unwrap(), checkpoint_before);
+        assert_ne!(
+            model_parameter_hash(dreams.shared_model()).unwrap(),
+            checkpoint_before
+        );
+    }
+
+    #[test]
+    fn parameter_id_restore_rejects_aliasing_without_mutating_the_model() {
+        let device = Device::ndarray().autodiff();
+        let mut model = Transformer::new(&tiny_config(), &device).unwrap();
+        let original = parameter_ids(&model);
+        assert!(original.len() >= 2);
+        let mut aliased = original.clone();
+        aliased[1] = aliased[0];
+
+        let error = restore_parameter_ids(&mut model, &aliased)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("repeats a stored parameter ID"), "{error}");
+        assert_eq!(parameter_ids(&model), original);
     }
 }

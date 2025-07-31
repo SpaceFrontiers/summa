@@ -7,21 +7,29 @@
 //! and publishes content-addressed optimizer/candidate generations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Write;
 
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::{AutodiffModule, Module, ModuleVisitor, Param, ParamId, list_param_ids};
 use burn::tensor::{Device, Gradients, Tensor, TensorData};
 use burn_optim::{AdamWConfig, GradientsParams, ModuleOptimizer};
 use burn_pack::{Bytes, Reader, Tensor as PackedTensor, Writer};
-use hermes_llm::{ModelDef, Transformer, load_safetensors, save_safetensors};
+use hermes_llm::{ModelDef, Transformer, load_safetensors_bytes, save_safetensors};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::artifact_io::{
+    AuthenticatedDirectorySnapshot, atomic_write_new, ensure_directory, ensure_real_directory,
+    hash_regular_file as hash_file, read_regular_bounded, sha256_identity, sync_directory,
+    sync_regular_file, write_new_synced,
+};
 use crate::native_sleep::{
     PlannedConsolidation, TierOptimizerCommit, TierOptimizerCommitRole, TierOptimizerPublisher,
 };
@@ -42,7 +50,18 @@ const GRADIENT_FILE: &str = "gradients.bpk";
 const STATE_FILE: &str = "state.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const WEIGHTS_FILE: &str = "weights.safetensors";
+const MAX_TIER_BUNDLE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TIER_BUNDLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TIER_BUNDLE_MEMBER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_TIER_SNAPSHOT_HEADER_BYTES: usize = 64 * 1024 * 1024;
+const TIER_BUNDLE_SCHEMA: [&str; 4] = [MANIFEST_FILE, OPTIMIZER_FILE, GRADIENT_FILE, STATE_FILE];
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TierBundleLoadStage {
+    AfterCapture,
+    AfterStagedLoad,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +163,8 @@ struct BankInner {
 #[derive(Clone)]
 pub struct TierOptimizerBank {
     inner: Arc<Mutex<BankInner>>,
+    #[cfg(test)]
+    snapshot_serializations: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +172,24 @@ pub struct TierAccumulationReport {
     pub wake_gradient_tensors: usize,
     pub tier_gradient_tensors: Vec<usize>,
     pub accumulated_micro_steps: Vec<u64>,
+}
+
+/// One directly applied due tier update in the `wake_only` sleep ablation.
+/// The independently scoped optimizer can touch only this tier; the receipt
+/// binds the exact eligible before/after tensors and unchanged reserve state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeOnlyTierUpdate {
+    pub tier: usize,
+    pub tier_id: String,
+    pub trigger_clock: u64,
+    pub accumulated_optimizer_steps: u64,
+    pub prospective_update_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeOnlyTierUpdateReport {
+    pub trigger_clock: u64,
+    pub updates: Vec<WakeOnlyTierUpdate>,
 }
 
 /// One backward pass partitioned into the ordinary wake scope and one gradient
@@ -206,6 +245,8 @@ impl TierOptimizerBank {
                 staged: None,
                 cached_candidate: None,
             })),
+            #[cfg(test)]
+            snapshot_serializations: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -277,8 +318,10 @@ impl TierOptimizerBank {
         })
     }
 
-    /// Commit one or more already-averaged and already-clipped optimizer-step
-    /// gradients to the independently-clocked tier accumulators.  The operation
+    /// Commit one already-averaged and already-clipped optimizer-step gradient
+    /// set to the independently-clocked tier accumulators. Checkpoint v2 binds
+    /// one accumulator generation to every optimizer step, so callers must not
+    /// coalesce multiple optimizer steps into one state mutation. The operation
     /// validates every tier before changing any of them.
     pub fn commit_tier_gradients(
         &self,
@@ -287,8 +330,8 @@ impl TierOptimizerBank {
         optimizer_steps: u64,
     ) -> Result<TierAccumulationReport> {
         ensure!(
-            optimizer_steps > 0,
-            "optimizer-step increment must be positive"
+            optimizer_steps == 1,
+            "tier optimizer checkpoints require exactly one optimizer step per accumulation commit"
         );
         let mut inner = self.lock()?;
         validate_model_topology(&inner, model)?;
@@ -378,7 +421,7 @@ impl TierOptimizerBank {
 
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>> {
         let inner = self.lock()?;
-        snapshot_inner(&inner)
+        self.serialize_snapshot(&inner)
     }
 
     /// Restore only after fully decoding, authenticating, and reconstructing
@@ -390,16 +433,15 @@ impl TierOptimizerBank {
         Ok(())
     }
 
-    fn snapshot_with_layout(&self) -> Result<(Vec<u8>, Transformer)> {
-        let inner = self.lock()?;
-        Ok((snapshot_inner(&inner)?, inner.model_layout.clone()))
+    fn serialize_snapshot(&self, inner: &BankInner) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        self.snapshot_serializations.fetch_add(1, Ordering::Relaxed);
+        snapshot_inner(inner)
     }
 
-    fn restore_with_layout(&self, bytes: &[u8], model_layout: &Transformer) -> Result<()> {
-        let mut inner = self.lock()?;
-        let restored = restore_inner(&inner, bytes, model_layout)?;
-        *inner = restored;
-        Ok(())
+    #[cfg(test)]
+    fn snapshot_serialization_count(&self) -> u64 {
+        self.snapshot_serializations.load(Ordering::Relaxed)
     }
 
     pub fn tier_clocks(&self) -> Result<Vec<(u64, u64, u64)>> {
@@ -417,31 +459,162 @@ impl TierOptimizerBank {
             .collect())
     }
 
+    /// Apply every tier whose configured boundary is due, fastest-to-slowest,
+    /// without any consolidation, receiver transfer, reserve activation/reset,
+    /// or Dreaming. This is deliberately schedule-bound: it is the exact
+    /// `wake_only` ablation, not ordinary every-step AdamW over all tiers.
+    ///
+    /// The operation is atomic with respect to the bank. Every tier applies
+    /// the same averaged prospective base update used by sleep staging, while
+    /// the returned model is mutated only through the returned value.
+    pub fn apply_wake_only_due_updates(
+        &self,
+        model: &Transformer,
+        trigger_clock: u64,
+    ) -> Result<(Transformer, WakeOnlyTierUpdateReport)> {
+        ensure!(trigger_clock > 0, "wake_only update clock must be positive");
+        // Most wake steps are not tier boundaries. Inspect the immutable
+        // schedule before taking the rollback snapshot: snapshotting canonical
+        // optimizer/gradient bytes synchronizes every accumulator to the host.
+        // There is no state to roll back when no tier is due.
+        let mut inner = self.lock()?;
+        validate_model_topology(&inner, model)?;
+        ensure!(
+            inner.staged.is_none(),
+            "cannot apply wake_only tier updates while a sleep update is staged"
+        );
+        if !inner
+            .update_periods
+            .iter()
+            .any(|period| trigger_clock.is_multiple_of(*period))
+        {
+            inner.model_layout = model.clone();
+            inner.cached_candidate = None;
+            return Ok((
+                model.clone(),
+                WakeOnlyTierUpdateReport {
+                    trigger_clock,
+                    updates: Vec::new(),
+                },
+            ));
+        }
+        // Keep the bank lock across snapshot, mutation, and rollback. The bank
+        // is cloneable and may be shared by checkpointing/control code; a
+        // second caller must never commit between our rollback point and a
+        // failed update and then have that successful work silently undone.
+        let before_layout = inner.model_layout.clone();
+        let before = self.serialize_snapshot(&inner)?;
+        let result = (|| -> Result<(Transformer, WakeOnlyTierUpdateReport)> {
+            let due = inner
+                .update_periods
+                .iter()
+                .enumerate()
+                .filter_map(|(tier, period)| trigger_clock.is_multiple_of(*period).then_some(tier))
+                .collect::<Vec<_>>();
+            let learning_rate = inner.config.learning_rate;
+            let mut updated_model = model.clone();
+            let mut updates = Vec::with_capacity(due.len());
+            for sender in due {
+                let before_tier = updated_model.clone();
+                let tier = &mut inner.tiers[sender];
+                ensure!(
+                    trigger_clock > tier.update_clock,
+                    "wake_only tier {sender} update clock did not advance"
+                );
+                ensure!(
+                    tier.accumulated_micro_steps > 0 && !tier.accumulator.is_empty(),
+                    "wake_only tier {sender} has no accumulated wake gradients at its due boundary"
+                );
+                let active_ids = active_tier_parameter_ids(&updated_model, sender)?;
+                let active = active_ids
+                    .iter()
+                    .map(|id| id.val())
+                    .collect::<BTreeSet<_>>();
+                let accumulator_ids =
+                    gradient_parameter_ids(&updated_model, &tier.accumulator, &tier.parameter_ids)?;
+                ensure!(
+                    accumulator_ids.iter().all(|id| active.contains(id)),
+                    "wake_only tier {sender} accumulator contains a dormant parameter"
+                );
+                let accumulated_optimizer_steps = tier.accumulated_micro_steps;
+                let mut gradients = std::mem::take(&mut tier.accumulator);
+                average_gradients(
+                    &updated_model,
+                    &mut gradients,
+                    &active_ids,
+                    accumulated_optimizer_steps,
+                )?;
+                let mut optimizer = tier.optimizer.clone();
+                let candidate =
+                    optimizer.step(learning_rate.into(), updated_model.clone(), gradients);
+                let prospective_update_sha256 =
+                    prospective_update_hash(&before_tier, &candidate, sender)?;
+                tier.optimizer = optimizer;
+                tier.accumulated_micro_steps = 0;
+                tier.update_clock = trigger_clock;
+                tier.generation = tier
+                    .generation
+                    .checked_add(1)
+                    .context("wake_only tier optimizer generation overflow")?;
+                tier.artifact = None;
+                updates.push(WakeOnlyTierUpdate {
+                    tier: sender,
+                    tier_id: tier.tier_id.clone(),
+                    trigger_clock,
+                    accumulated_optimizer_steps,
+                    prospective_update_sha256,
+                });
+                updated_model = candidate;
+            }
+            inner.model_layout = updated_model.clone();
+            inner.cached_candidate = None;
+            Ok((
+                updated_model,
+                WakeOnlyTierUpdateReport {
+                    trigger_clock,
+                    updates,
+                },
+            ))
+        })();
+        match result {
+            Ok(updated) => Ok(updated),
+            Err(error) => {
+                *inner = restore_inner(&inner, &before, &before_layout)
+                    .context("restoring tier optimizer bank after failed wake_only update")?;
+                Err(error)
+            }
+        }
+    }
+
     /// Return checkpoint-v2 scopes only when every non-empty tier state has a
     /// matching immutable bundle. Call `publish_checkpoint_scopes` on the
     /// durable publisher after wake accumulation and before persisting a cursor.
     pub fn scopes(&self) -> Result<MemoryOptimizerScopes> {
         let inner = self.lock()?;
-        let mut scopes = inner.scopes.clone();
-        for (scope, tier) in scopes.tiers.iter_mut().zip(&inner.tiers) {
-            ensure!(
-                tier.artifact.is_some()
-                    || (tier.accumulated_micro_steps == 0
-                        && tier.update_clock == 0
-                        && tier.transfer_clock == 0
-                        && tier.generation == 0),
-                "tier `{}` has mutable state without an immutable optimizer bundle",
-                tier.tier_id
-            );
-            scope.update_clock = tier.update_clock;
-            scope.transfer_clock = tier.transfer_clock;
-            scope.accumulated_micro_steps = tier.accumulated_micro_steps;
-            scope.generation = tier.generation;
-            scope.transfer_generation = tier.transfer_generation;
-            scope.artifact = tier.artifact.clone();
-        }
-        Ok(scopes)
+        scopes_from_inner(&inner)
     }
+}
+
+fn scopes_from_inner(inner: &BankInner) -> Result<MemoryOptimizerScopes> {
+    let mut scopes = inner.scopes.clone();
+    for (scope, tier) in scopes.tiers.iter_mut().zip(&inner.tiers) {
+        ensure!(
+            tier.artifact.is_some()
+                || (tier.accumulated_micro_steps == 0
+                    && tier.update_clock == 0
+                    && tier.transfer_clock == 0
+                    && tier.generation == 0),
+            "tier `{}` has mutable state without an immutable optimizer bundle",
+            tier.tier_id
+        );
+        scope.update_clock = tier.update_clock;
+        scope.transfer_clock = tier.transfer_clock;
+        scope.accumulated_micro_steps = tier.accumulated_micro_steps;
+        scope.generation = tier.generation;
+        scope.transfer_generation = tier.transfer_generation;
+        scope.artifact = tier.artifact.clone();
+    }
+    Ok(scopes)
 }
 
 fn optimizer_topology_hash(
@@ -468,7 +641,7 @@ fn optimizer_topology_hash(
             })
             .collect(),
     })?;
-    Ok(sha256_bytes(&bytes))
+    Ok(sha256_identity(&bytes))
 }
 
 fn validate_model_topology(inner: &BankInner, model: &Transformer) -> Result<()> {
@@ -497,14 +670,7 @@ fn validate_model_topology(inner: &BankInner, model: &Transformer) -> Result<()>
 }
 
 fn active_tier_parameter_ids(model: &Transformer, tier: usize) -> Result<Vec<ParamId>> {
-    let mut ids = model.memory_tier_base_parameter_ids_all_layers(tier)?;
-    ids.extend(
-        model
-            .memory_slot_statuses()
-            .into_iter()
-            .filter(|status| status.tier == tier && status.active)
-            .flat_map(|status| status.parameter_ids),
-    );
+    let ids = model.memory_tier_active_parameter_ids_all_layers(tier)?;
     let unique = ids.iter().map(|id| id.val()).collect::<BTreeSet<_>>();
     ensure!(
         unique.len() == ids.len(),
@@ -514,12 +680,7 @@ fn active_tier_parameter_ids(model: &Transformer, tier: usize) -> Result<Vec<Par
 }
 
 fn dormant_parameter_ids(model: &Transformer) -> Vec<ParamId> {
-    model
-        .memory_slot_statuses()
-        .into_iter()
-        .filter(|status| !status.active)
-        .flat_map(|status| status.parameter_ids)
-        .collect()
+    model.dormant_memory_parameter_ids()
 }
 
 struct GradientAccumulatorVisitor<'a> {
@@ -647,9 +808,9 @@ fn snapshot_inner(inner: &BankInner) -> Result<Vec<u8>> {
             transfer_generation: tier.transfer_generation,
             artifact: tier.artifact.clone(),
             optimizer_bytes: optimizer.len() as u64,
-            optimizer_sha256: sha256_bytes(&optimizer),
+            optimizer_sha256: sha256_identity(&optimizer),
             gradient_bytes: gradients.len() as u64,
-            gradient_sha256: sha256_bytes(&gradients),
+            gradient_sha256: sha256_identity(&gradients),
         });
         chunks.push((optimizer, gradients));
     }
@@ -695,6 +856,10 @@ fn restore_inner(
             .expect("fixed slice"),
     ))
     .context("tier snapshot header does not fit this platform")?;
+    ensure!(
+        header_len <= MAX_TIER_SNAPSHOT_HEADER_BYTES,
+        "tier optimizer snapshot header exceeds the {MAX_TIER_SNAPSHOT_HEADER_BYTES}-byte limit"
+    );
     let header_start = SNAPSHOT_MAGIC.len() + 8;
     let header_end = header_start
         .checked_add(header_len)
@@ -735,6 +900,12 @@ fn restore_inner(
             .context("optimizer snapshot does not fit this platform")?;
         let gradient_len = usize::try_from(saved.gradient_bytes)
             .context("gradient snapshot does not fit this platform")?;
+        ensure!(
+            saved.optimizer_bytes <= MAX_TIER_BUNDLE_MEMBER_BYTES
+                && saved.gradient_bytes <= MAX_TIER_BUNDLE_MEMBER_BYTES,
+            "tier {} snapshot payload exceeds the per-member size limit",
+            saved.tier
+        );
         let optimizer_end = offset
             .checked_add(optimizer_len)
             .context("optimizer snapshot length overflow")?;
@@ -748,8 +919,8 @@ fn restore_inner(
         let optimizer_bytes = &bytes[offset..optimizer_end];
         let gradient_bytes = &bytes[optimizer_end..gradient_end];
         ensure!(
-            sha256_bytes(optimizer_bytes) == saved.optimizer_sha256
-                && sha256_bytes(gradient_bytes) == saved.gradient_sha256,
+            sha256_identity(optimizer_bytes) == saved.optimizer_sha256
+                && sha256_identity(gradient_bytes) == saved.gradient_sha256,
             "tier {} snapshot payload hash mismatch",
             saved.tier
         );
@@ -944,10 +1115,6 @@ fn restore_gradients(
     Ok((gradients, ids))
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
 struct GradientScaleVisitor<'a> {
     allowed: &'a BTreeSet<u64>,
     gradients: &'a mut GradientsParams,
@@ -1014,9 +1181,21 @@ impl ProspectiveTierUpdate {
         teacher: &ImmutableTransformerCheckpoint,
     ) -> Result<PlannedConsolidation> {
         teacher.validate()?;
-        let (before, before_layout) = self.bank.snapshot_with_layout()?;
-        let staged = self.stage_sender(txn_id, sender, trigger_clock, teacher);
-        let restored = self.bank.restore_with_layout(&before, &before_layout);
+        let teacher_model = load_local_checkpoint(&teacher.model, &teacher.uri, &teacher.sha256)?;
+        let mut inner = self.bank.lock()?;
+        let before_layout = inner.model_layout.clone();
+        let before = self.bank.serialize_snapshot(&inner)?;
+        let staged = stage_sender_locked(
+            &self.root,
+            &mut inner,
+            txn_id,
+            sender,
+            trigger_clock,
+            &teacher_model,
+        );
+        let restored = restore_inner(&inner, &before, &before_layout).map(|restored| {
+            *inner = restored;
+        });
         match (staged, restored) {
             (Ok(candidate), Ok(())) => Ok(PlannedConsolidation {
                 student_checkpoint: candidate.checkpoint.uri,
@@ -1043,101 +1222,117 @@ impl ProspectiveTierUpdate {
         teacher.validate()?;
         let teacher_model = load_local_checkpoint(&teacher.model, &teacher.uri, &teacher.sha256)?;
         let mut inner = self.bank.lock()?;
-        validate_model_topology(&inner, &teacher_model)?;
-        if let Some(staged) = &inner.staged {
-            ensure!(
-                staged.txn_id == txn_id
-                    && staged.sender == sender
-                    && staged.trigger_clock == trigger_clock,
-                "another prospective tier update is already staged"
-            );
-            let model = match &inner.cached_candidate {
-                Some(model) => model.clone(),
-                None => load_local_checkpoint(
-                    &teacher_model,
-                    &staged.student_uri,
-                    &staged.student_sha256,
-                )?,
-            };
-            return Ok(ProspectiveTransformerCandidate {
-                checkpoint: ImmutableTransformerCheckpoint {
-                    uri: staged.student_uri.clone(),
-                    sha256: staged.student_sha256.clone(),
-                    model,
-                },
-                update_sha256: staged.update_sha256.clone(),
-            });
-        }
-        let learning_rate = inner.config.learning_rate;
-        let update_period = *inner
-            .update_periods
-            .get(sender)
-            .with_context(|| format!("sender optimizer tier {sender} does not exist"))?;
-        ensure!(
-            trigger_clock.is_multiple_of(update_period),
-            "sender tier {sender} update is off its configured boundary"
-        );
-        let tier = inner
-            .tiers
-            .get_mut(sender)
-            .with_context(|| format!("sender optimizer tier {sender} does not exist"))?;
-        ensure!(
-            tier.accumulated_micro_steps > 0 && !tier.accumulator.is_empty(),
-            "sender tier {sender} has no accumulated wake gradients"
-        );
-        ensure!(
-            trigger_clock > tier.update_clock,
-            "sender tier {sender} update clock did not advance"
-        );
-        let active_ids = active_tier_parameter_ids(&teacher_model, sender)?;
-        let active_set = active_ids
-            .iter()
-            .map(|id| id.val())
-            .collect::<BTreeSet<_>>();
-        let (accumulator_bytes, accumulator_ids) =
-            canonical_gradients(&teacher_model, &tier.accumulator, &tier.parameter_ids)?;
-        let _ = accumulator_bytes;
-        ensure!(
-            accumulator_ids.iter().all(|id| active_set.contains(id)),
-            "sender tier accumulator contains a dormant parameter"
-        );
-
-        let mut gradients = std::mem::take(&mut tier.accumulator);
-        average_gradients(
-            &teacher_model,
-            &mut gradients,
-            &active_ids,
-            tier.accumulated_micro_steps,
-        )?;
-        let mut optimizer = tier.optimizer.clone();
-        let candidate_model =
-            optimizer.step(learning_rate.into(), teacher_model.clone(), gradients);
-        let update_sha256 = prospective_update_hash(&teacher_model, &candidate_model, sender)?;
-        let (student_uri, student_sha256) =
-            publish_immutable_model(&self.root, txn_id, &candidate_model)?;
-        tier.optimizer = optimizer;
-        tier.accumulated_micro_steps = 0;
-        tier.artifact = None;
-        let staged = StagedUpdateMeta {
+        stage_sender_locked(
+            &self.root,
+            &mut inner,
             txn_id,
             sender,
             trigger_clock,
-            student_uri: student_uri.clone(),
-            student_sha256: student_sha256.clone(),
-            update_sha256: update_sha256.clone(),
-            cleared_parameter_ids: Vec::new(),
-        };
-        inner.staged = Some(staged);
-        inner.cached_candidate = Some(candidate_model.clone());
-        Ok(ProspectiveTransformerCandidate {
-            checkpoint: ImmutableTransformerCheckpoint {
-                uri: student_uri,
-                sha256: student_sha256,
-                model: candidate_model,
-            },
-            update_sha256,
-        })
+            &teacher_model,
+        )
     }
+}
+
+fn stage_sender_locked(
+    root: &Path,
+    inner: &mut BankInner,
+    txn_id: u64,
+    sender: usize,
+    trigger_clock: u64,
+    teacher_model: &Transformer,
+) -> Result<ProspectiveTransformerCandidate> {
+    validate_model_topology(inner, teacher_model)?;
+    if let Some(staged) = &inner.staged {
+        ensure!(
+            staged.txn_id == txn_id
+                && staged.sender == sender
+                && staged.trigger_clock == trigger_clock,
+            "another prospective tier update is already staged"
+        );
+        let model = match &inner.cached_candidate {
+            Some(model) => model.clone(),
+            None => {
+                load_local_checkpoint(teacher_model, &staged.student_uri, &staged.student_sha256)?
+            }
+        };
+        return Ok(ProspectiveTransformerCandidate {
+            checkpoint: ImmutableTransformerCheckpoint {
+                uri: staged.student_uri.clone(),
+                sha256: staged.student_sha256.clone(),
+                model,
+            },
+            update_sha256: staged.update_sha256.clone(),
+        });
+    }
+    let learning_rate = inner.config.learning_rate;
+    let update_period = *inner
+        .update_periods
+        .get(sender)
+        .with_context(|| format!("sender optimizer tier {sender} does not exist"))?;
+    ensure!(
+        trigger_clock.is_multiple_of(update_period),
+        "sender tier {sender} update is off its configured boundary"
+    );
+    let tier = inner
+        .tiers
+        .get_mut(sender)
+        .with_context(|| format!("sender optimizer tier {sender} does not exist"))?;
+    ensure!(
+        tier.accumulated_micro_steps > 0 && !tier.accumulator.is_empty(),
+        "sender tier {sender} has no accumulated wake gradients"
+    );
+    ensure!(
+        trigger_clock > tier.update_clock,
+        "sender tier {sender} update clock did not advance"
+    );
+    let active_ids = active_tier_parameter_ids(teacher_model, sender)?;
+    let active_set = active_ids
+        .iter()
+        .map(|id| id.val())
+        .collect::<BTreeSet<_>>();
+    // This is an execution-time scope check, not a checkpoint write. Reuse
+    // the parameter-only visitor so consolidation does not serialize every
+    // gradient (and synchronize it back to the host) merely to inspect IDs.
+    let accumulator_ids =
+        gradient_parameter_ids(teacher_model, &tier.accumulator, &tier.parameter_ids)?;
+    ensure!(
+        accumulator_ids.iter().all(|id| active_set.contains(id)),
+        "sender tier accumulator contains a dormant parameter"
+    );
+
+    let mut gradients = std::mem::take(&mut tier.accumulator);
+    average_gradients(
+        teacher_model,
+        &mut gradients,
+        &active_ids,
+        tier.accumulated_micro_steps,
+    )?;
+    let mut optimizer = tier.optimizer.clone();
+    let candidate_model = optimizer.step(learning_rate.into(), teacher_model.clone(), gradients);
+    let update_sha256 = prospective_update_hash(teacher_model, &candidate_model, sender)?;
+    let (student_uri, student_sha256) = publish_immutable_model(root, txn_id, &candidate_model)?;
+    tier.optimizer = optimizer;
+    tier.accumulated_micro_steps = 0;
+    tier.artifact = None;
+    let staged = StagedUpdateMeta {
+        txn_id,
+        sender,
+        trigger_clock,
+        student_uri: student_uri.clone(),
+        student_sha256: student_sha256.clone(),
+        update_sha256: update_sha256.clone(),
+        cleared_parameter_ids: Vec::new(),
+    };
+    inner.staged = Some(staged);
+    inner.cached_candidate = Some(candidate_model.clone());
+    Ok(ProspectiveTransformerCandidate {
+        checkpoint: ImmutableTransformerCheckpoint {
+            uri: student_uri,
+            sha256: student_sha256,
+            model: candidate_model,
+        },
+        update_sha256,
+    })
 }
 
 impl ProspectiveTransformerUpdate for ProspectiveTierUpdate {
@@ -1217,13 +1412,24 @@ impl ProspectiveTransformerUpdate for ProspectiveTierUpdate {
 }
 
 fn load_local_checkpoint(template: &Transformer, uri: &str, sha256: &str) -> Result<Transformer> {
+    load_local_checkpoint_inner(template, uri, sha256, |_| Ok(()))
+}
+
+fn load_local_checkpoint_inner(
+    template: &Transformer,
+    uri: &str,
+    sha256: &str,
+    stage_hook: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Transformer> {
     let path = Path::new(uri);
+    let bytes = read_regular_bounded(path, MAX_TIER_BUNDLE_MEMBER_BYTES, "prospective checkpoint")?;
     ensure!(
-        hash_file(path)?.1 == sha256,
+        sha256_identity(&bytes) == sha256,
         "prospective checkpoint hash changed"
     );
+    stage_hook(path)?;
     let mut model = template.clone();
-    load_safetensors(&mut model, path)?;
+    load_safetensors_bytes(&mut model, bytes, "authenticated prospective checkpoint")?;
     Ok(model)
 }
 
@@ -1234,22 +1440,23 @@ fn filter_optimizer(
 ) -> Result<ModuleOptimizer> {
     let bytes = canonical_optimizer(optimizer)?;
     let reader = Reader::from_bytes(Bytes::from_bytes_vec(bytes))?;
+    let scalars = reader.scalars().clone();
+    let metadata = reader.metadata().clone();
     let mut tensors = reader.into_tensors()?;
     tensors.retain(|tensor| tensor.param_id.is_none_or(|id| !removed.contains(&id)));
-    let reader = Reader::from_bytes(canonical_module_optimizer_bytes(optimizer)?)?;
     let mut writer = Writer::new(tensors);
-    for (key, value) in reader.scalars() {
-        if key_parameter_id(key).is_none_or(|id| !removed.contains(&id)) {
-            writer = writer.with_scalar(key, *value);
+    for (key, value) in scalars {
+        if key_parameter_id(&key).is_none_or(|id| !removed.contains(&id)) {
+            writer = writer.with_scalar(&key, value);
         }
     }
-    for (key, value) in reader.metadata() {
+    for (key, value) in metadata {
         if key
             .parse::<u64>()
             .ok()
             .is_none_or(|id| !removed.contains(&id))
         {
-            writer = writer.with_metadata(key, value);
+            writer = writer.with_metadata(&key, &value);
         }
     }
     let filtered = writer.into_bytes()?;
@@ -1300,7 +1507,11 @@ impl AtomicCandidatePublisher for AtomicSafetensorsCandidatePublisher {
             .join("transactions")
             .join(format!("txn-{}.json", txn.id));
         if receipt_path.exists() {
-            let receipt: CandidateReceipt = serde_json::from_slice(&read_regular(&receipt_path)?)?;
+            let receipt: CandidateReceipt = serde_json::from_slice(&read_regular_bounded(
+                &receipt_path,
+                MAX_TIER_BUNDLE_MANIFEST_BYTES,
+                "candidate receipt",
+            )?)?;
             ensure!(
                 receipt.version == CANDIDATE_STORE_VERSION && receipt.txn_id == txn.id,
                 "candidate receipt belongs to another transaction"
@@ -1448,7 +1659,7 @@ impl DurableTierOptimizerPublisher {
         model: &Transformer,
     ) -> Result<()> {
         let mut inner = self.bank.lock()?;
-        let before = snapshot_inner(&inner)?;
+        let before = self.bank.serialize_snapshot(&inner)?;
         let before_layout = inner.model_layout.clone();
         let result = (|| -> Result<()> {
             ensure!(
@@ -1528,22 +1739,19 @@ impl DurableTierOptimizerPublisher {
     /// return the exact checkpoint-v2 scope view. No clock is advanced by a
     /// checkpoint-only publication.
     pub fn publish_checkpoint_scopes(&self) -> Result<MemoryOptimizerScopes> {
-        let (before, before_layout) = self.bank.snapshot_with_layout()?;
-        let result = (|| -> Result<()> {
-            let mut inner = self.bank.lock()?;
-            for tier in 0..inner.tiers.len() {
-                let artifact = publish_tier_bundle(&self.root, &inner, tier)?;
-                inner.tiers[tier].artifact = Some(artifact);
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.bank
-                .restore_with_layout(&before, &before_layout)
-                .context("restoring tier optimizer bank after checkpoint publication failure")?;
-            return Err(error);
+        let mut inner = self.bank.lock()?;
+        // Publication itself is read-only. Stage every immutable receipt first
+        // and update the in-memory references only after all filesystem work
+        // succeeds. This makes failure atomic without serializing and then
+        // deserializing the complete optimizer/gradient bank on every wake
+        // checkpoint.
+        let artifacts = (0..inner.tiers.len())
+            .map(|tier| publish_tier_bundle(&self.root, &inner, tier))
+            .collect::<Result<Vec<_>>>()?;
+        for (tier, artifact) in inner.tiers.iter_mut().zip(artifacts) {
+            tier.artifact = Some(artifact);
         }
-        self.bank.scopes()
+        scopes_from_inner(&inner)
     }
 
     fn receipt_path(&self, txn_id: u64) -> PathBuf {
@@ -1569,19 +1777,27 @@ impl DurableTierOptimizerPublisher {
         let mut recorded = txn.clone();
         recorded.tensor_transaction_generation = Some(pointer.generation.clone());
         recorded.tensor_transaction_manifest_hash = Some(pointer.manifest_sha256.clone());
-        let committed_model = {
+        let optimizer = {
             let inner = self.bank.lock()?;
-            load_committed_tensor_model(
-                &self.tensor_store,
-                &recorded,
-                &self.model_config,
-                &self.device,
-                inner.config.optimizer(),
-            )?
+            inner.config.optimizer()
         };
-        let (before, before_layout) = self.bank.snapshot_with_layout()?;
+        let committed_model = load_committed_tensor_model(
+            &self.tensor_store,
+            &recorded,
+            &self.model_config,
+            &self.device,
+            optimizer,
+        )?;
+
+        // Keep the ownership lock from the rollback snapshot through the
+        // complete receipt application. Releasing it between those points
+        // would let another clone commit work which a later failure here could
+        // silently erase by restoring a stale snapshot.
+        let mut inner = self.bank.lock()?;
+        ensure_transaction_tiers_exist(&inner, txn)?;
+        let before_layout = inner.model_layout.clone();
+        let before = self.bank.serialize_snapshot(&inner)?;
         let result = (|| -> Result<()> {
-            let mut inner = self.bank.lock()?;
             inner.model_layout = committed_model;
             for commit in &receipt.commits {
                 let restored_tier = restore_tier_bundle(&self.root, &mut inner, &commit.artifact)?;
@@ -1609,8 +1825,7 @@ impl DurableTierOptimizerPublisher {
             Ok(())
         })();
         if let Err(error) = result {
-            self.bank
-                .restore_with_layout(&before, &before_layout)
+            *inner = restore_inner(&inner, &before, &before_layout)
                 .context("restoring tier optimizer bank after invalid durable receipt")?;
             return Err(error);
         }
@@ -1652,6 +1867,24 @@ fn validate_optimizer_receipt_commits(
     Ok(())
 }
 
+fn ensure_transaction_tiers_exist(inner: &BankInner, txn: &ConsolidationTxn) -> Result<()> {
+    ensure!(
+        txn.sender < inner.tiers.len(),
+        "consolidation sender tier {} is outside optimizer bank with {} tiers",
+        txn.sender,
+        inner.tiers.len()
+    );
+    if !txn.terminal {
+        ensure!(
+            txn.receiver < inner.tiers.len() && txn.receiver != txn.sender,
+            "consolidation receiver tier {} is absent or aliases sender tier {}",
+            txn.receiver,
+            txn.sender
+        );
+    }
+    Ok(())
+}
+
 impl TierOptimizerPublisher for DurableTierOptimizerPublisher {
     fn publish(
         &mut self,
@@ -1665,8 +1898,11 @@ impl TierOptimizerPublisher for DurableTierOptimizerPublisher {
         );
         let receipt_path = self.receipt_path(txn.id);
         if receipt_path.exists() {
-            let receipt: OptimizerTxnReceipt =
-                serde_json::from_slice(&read_regular(&receipt_path)?)?;
+            let receipt: OptimizerTxnReceipt = serde_json::from_slice(&read_regular_bounded(
+                &receipt_path,
+                MAX_TIER_BUNDLE_MANIFEST_BYTES,
+                "optimizer transaction receipt",
+            )?)?;
             return self.apply_receipt(txn, pointer, &receipt);
         }
 
@@ -1685,9 +1921,26 @@ impl TierOptimizerPublisher for DurableTierOptimizerPublisher {
                 .receiver_optimizer
         };
 
-        let (before, before_layout) = self.bank.snapshot_with_layout()?;
+        // The bank is shared by cloned publishers and wake accumulation.
+        // Serialize all mutable work from the rollback point onward so a
+        // failed transaction can restore only its own changes.
+        let mut inner = self.bank.lock()?;
+        if receipt_path.exists() {
+            // Another clone may have published while this caller loaded the
+            // detached tensor transaction. Drop the guard before the normal
+            // idempotent receipt path acquires it again.
+            drop(inner);
+            let receipt: OptimizerTxnReceipt = serde_json::from_slice(&read_regular_bounded(
+                &receipt_path,
+                MAX_TIER_BUNDLE_MANIFEST_BYTES,
+                "optimizer transaction receipt",
+            )?)?;
+            return self.apply_receipt(txn, pointer, &receipt);
+        }
+        ensure_transaction_tiers_exist(&inner, txn)?;
+        let before_layout = inner.model_layout.clone();
+        let before = self.bank.serialize_snapshot(&inner)?;
         let result = (|| {
-            let mut inner = self.bank.lock()?;
             let staged = inner
                 .staged
                 .as_ref()
@@ -1849,12 +2102,14 @@ impl TierOptimizerPublisher for DurableTierOptimizerPublisher {
             inner.cached_candidate = None;
             Ok(commits)
         })();
-        if result.is_err() {
-            self.bank
-                .restore_with_layout(&before, &before_layout)
-                .context("restoring tier optimizer bank after failed artifact transaction")?;
+        match result {
+            Ok(commits) => Ok(commits),
+            Err(error) => {
+                *inner = restore_inner(&inner, &before, &before_layout)
+                    .context("restoring tier optimizer bank after failed artifact transaction")?;
+                Err(error)
+            }
         }
-        result
     }
 }
 
@@ -2006,7 +2261,7 @@ fn publish_tier_bundle(
         files,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    let manifest_hash = sha256_bytes(&manifest_bytes);
+    let manifest_hash = sha256_identity(&manifest_bytes);
     write_new_synced(&staging.join(MANIFEST_FILE), &manifest_bytes)?;
     sync_directory(&staging)?;
     let generation = format!(
@@ -2034,20 +2289,45 @@ fn restore_tier_bundle(
     inner: &mut BankInner,
     artifact: &TierOptimizerArtifact,
 ) -> Result<usize> {
+    restore_tier_bundle_inner(root, inner, artifact, |_, _| Ok(()))
+}
+
+fn restore_tier_bundle_inner(
+    root: &Path,
+    inner: &mut BankInner,
+    artifact: &TierOptimizerArtifact,
+    mut stage_hook: impl FnMut(TierBundleLoadStage, &Path) -> Result<()>,
+) -> Result<usize> {
     artifact.validate()?;
     let manifest_path = Path::new(&artifact.state_uri);
+    let generations = root.join("generations");
     ensure!(
-        manifest_path.starts_with(root.join("generations"))
-            && manifest_path.file_name().and_then(|name| name.to_str()) == Some(MANIFEST_FILE),
+        manifest_path.file_name().and_then(|name| name.to_str()) == Some(MANIFEST_FILE),
         "tier optimizer artifact escapes configured store"
     );
     let generation = manifest_path
         .parent()
         .context("tier artifact has no generation")?;
-    ensure_real_directory(generation, "tier optimizer generation")?;
-    let manifest = verify_tier_bundle(generation, &artifact.manifest_hash)?;
-    let state: TierBundleState =
-        serde_json::from_slice(&read_regular(&generation.join(STATE_FILE))?)?;
+    ensure!(
+        generation.parent() == Some(generations.as_path()),
+        "tier optimizer artifact escapes configured store"
+    );
+    let expected_generation = format!(
+        "sha256-{}",
+        artifact
+            .manifest_hash
+            .strip_prefix("sha256:")
+            .context("tier optimizer manifest hash is malformed")?
+    );
+    ensure!(
+        generation.file_name().and_then(|name| name.to_str()) == Some(expected_generation.as_str()),
+        "tier optimizer generation name differs from its manifest hash"
+    );
+    let (manifest, mut captured) =
+        capture_verified_tier_bundle(generation, &artifact.manifest_hash)?;
+    stage_hook(TierBundleLoadStage::AfterCapture, generation)?;
+    let state_bytes = captured.read_bounded(STATE_FILE, MAX_TIER_BUNDLE_STATE_BYTES)?;
+    let state: TierBundleState = serde_json::from_slice(&state_bytes)?;
     ensure!(
         state.version == TIER_BUNDLE_VERSION
             && state.tier == manifest.tier
@@ -2057,9 +2337,10 @@ fn restore_tier_bundle(
             && state.accumulator_parameter_ids == artifact.accumulator_parameter_ids,
         "tier optimizer bundle metadata differs from receipt"
     );
+    artifact.validate_pending_steps(state.accumulated_micro_steps)?;
     let tier = inner
         .tiers
-        .get_mut(state.tier)
+        .get(state.tier)
         .context("tier optimizer bundle references absent tier")?;
     ensure!(
         tier.tier_id == state.tier_id,
@@ -2075,15 +2356,27 @@ fn restore_tier_bundle(
                 .all(|id| active.contains(id)),
         "tier optimizer bundle contains dormant or omits active parameter scope"
     );
-    let optimizer_bytes = read_regular(&generation.join(OPTIMIZER_FILE))?;
-    let gradient_bytes = read_regular(&generation.join(GRADIENT_FILE))?;
+    let optimizer_bytes = captured.take(OPTIMIZER_FILE, MAX_TIER_BUNDLE_MEMBER_BYTES)?;
     let optimizer = optimizer_from_bytes(&inner.config, &optimizer_bytes)?;
+    drop(optimizer_bytes);
+    let gradient_bytes = captured.take(GRADIENT_FILE, MAX_TIER_BUNDLE_MEMBER_BYTES)?;
     let (accumulator, ids) =
         restore_gradients(&inner.model_layout, &gradient_bytes, &tier.parameter_ids)?;
+    drop(gradient_bytes);
     ensure!(
         ids == state.accumulator_parameter_ids,
         "tier gradient receipt changed"
     );
+    ensure!(
+        accumulator.is_empty() == (state.accumulated_micro_steps == 0),
+        "restored tier gradients disagree with the pending-step counter"
+    );
+    stage_hook(TierBundleLoadStage::AfterStagedLoad, generation)?;
+    captured.ensure_still_published()?;
+    let tier = inner
+        .tiers
+        .get_mut(state.tier)
+        .context("tier optimizer bundle references absent tier")?;
     tier.optimizer = optimizer;
     tier.accumulator = accumulator;
     tier.accumulated_micro_steps = state.accumulated_micro_steps;
@@ -2096,10 +2389,23 @@ fn restore_tier_bundle(
 }
 
 fn verify_tier_bundle(generation: &Path, expected_hash: &str) -> Result<TierBundleManifest> {
-    ensure_real_directory(generation, "tier optimizer generation")?;
-    let manifest_bytes = read_regular(&generation.join(MANIFEST_FILE))?;
+    let (manifest, captured) = capture_verified_tier_bundle(generation, expected_hash)?;
+    captured.ensure_still_published()?;
+    Ok(manifest)
+}
+
+fn capture_verified_tier_bundle(
+    generation: &Path,
+    expected_hash: &str,
+) -> Result<(TierBundleManifest, AuthenticatedDirectorySnapshot)> {
+    let mut captured = AuthenticatedDirectorySnapshot::capture(
+        generation,
+        &TIER_BUNDLE_SCHEMA,
+        "tier optimizer generation",
+    )?;
+    let manifest_bytes = captured.read_bounded(MANIFEST_FILE, MAX_TIER_BUNDLE_MANIFEST_BYTES)?;
     ensure!(
-        sha256_bytes(&manifest_bytes) == expected_hash,
+        sha256_identity(&manifest_bytes) == expected_hash,
         "tier manifest hash mismatch"
     );
     let manifest: TierBundleManifest = serde_json::from_slice(&manifest_bytes)?;
@@ -2120,14 +2426,14 @@ fn verify_tier_bundle(generation: &Path, expected_hash: &str) -> Result<TierBund
         "tier bundle does not contain the exact required file set"
     );
     for file in &manifest.files {
-        let path = generation.join(&file.path);
-        let (bytes, hash) = hash_file(&path)?;
         ensure!(
-            bytes == file.bytes && hash == file.sha256,
-            "tier bundle file changed"
+            file.bytes <= MAX_TIER_BUNDLE_MEMBER_BYTES,
+            "tier bundle file `{}` exceeds the per-member size limit",
+            file.path
         );
+        captured.verify(&file.path, file.bytes, &file.sha256)?;
     }
-    Ok(manifest)
+    Ok((manifest, captured))
 }
 
 fn bundle_file(root: &Path, name: &str) -> Result<BundleFile> {
@@ -2149,109 +2455,6 @@ impl Drop for StagingDirectory {
     }
 }
 
-fn ensure_directory(path: &Path, label: &str) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("creating {label} {}", path.display()))?;
-    ensure_real_directory(path, label)
-}
-
-fn ensure_real_directory(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "{label} {} is not a real directory",
-        path.display()
-    );
-    Ok(())
-}
-
-fn read_regular(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("reading artifact metadata {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "artifact {} is not a regular non-symlink file",
-        path.display()
-    );
-    fs::read(path).with_context(|| format!("reading artifact {}", path.display()))
-}
-
-fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("creating immutable file {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn atomic_write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("atomic artifact has no parent")?;
-    ensure_directory(parent, "atomic artifact parent")?;
-    if path.exists() {
-        ensure!(
-            read_regular(path)? == bytes,
-            "immutable artifact already exists with different bytes"
-        );
-        return Ok(());
-    }
-    let name = path
-        .file_name()
-        .context("atomic artifact has no file name")?
-        .to_string_lossy();
-    let temporary = parent.join(format!(
-        ".{name}.staging-{}-{}",
-        std::process::id(),
-        STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    write_new_synced(&temporary, bytes)?;
-    match fs::hard_link(&temporary, path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure!(
-                read_regular(path)? == bytes,
-                "concurrent immutable publication differs"
-            );
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error).context("atomically linking immutable artifact");
-        }
-    }
-    fs::remove_file(&temporary)?;
-    sync_directory(parent)
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<(u64, String)> {
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "hashed artifact {} is not a regular file",
-        path.display()
-    );
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    let mut bytes = 0_u64;
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        bytes = bytes
-            .checked_add(read as u64)
-            .context("artifact byte count overflow")?;
-    }
-    Ok((bytes, format!("sha256:{:x}", hasher.finalize())))
-}
-
 fn publish_immutable_model(
     root: &Path,
     txn_id: u64,
@@ -2269,7 +2472,7 @@ fn publish_immutable_model(
     let _guard = StagingDirectory(staging.clone());
     let weights = staging.join(WEIGHTS_FILE);
     save_safetensors(&model.clone().valid(), &weights)?;
-    OpenOptions::new().read(true).open(&weights)?.sync_all()?;
+    sync_regular_file(&weights, "model generation weights")?;
     let (_, sha256) = hash_file(&weights)?;
     sync_directory(&staging)?;
     let generation = format!(
@@ -2397,6 +2600,21 @@ mod tests {
         assert_eq!(bank.tier_clocks().unwrap(), vec![(0, 0, 0), (0, 0, 0)]);
     }
 
+    #[test]
+    fn accumulation_cannot_coalesce_checkpoint_generations() {
+        let (_, _, model) = model();
+        let bank =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        let before = bank.snapshot_bytes().unwrap();
+
+        let error = bank
+            .commit_tier_gradients(&model, Vec::new(), 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exactly one optimizer step"), "{error}");
+        assert_eq!(bank.snapshot_bytes().unwrap(), before);
+    }
+
     fn teacher_checkpoint(root: &Path, model: &Transformer) -> ImmutableTransformerCheckpoint {
         let path = root.join("teacher.safetensors");
         save_safetensors(&model.clone().valid(), &path).unwrap();
@@ -2465,7 +2683,10 @@ mod tests {
             device,
         )
         .unwrap();
+        let clocks_before_publication = restored.tier_clocks().unwrap();
         let scopes = publisher.publish_checkpoint_scopes().unwrap();
+        assert_eq!(restored.tier_clocks().unwrap(), clocks_before_publication);
+        assert_eq!(publisher.publish_checkpoint_scopes().unwrap(), scopes);
         let dormant = dormant_parameter_ids(&model)
             .into_iter()
             .map(|id| id.val())
@@ -2486,6 +2707,265 @@ mod tests {
             format!("sha256:{}", "0".repeat(64));
         assert!(publisher.restore_scopes(&corrupted, &model).is_err());
         assert_eq!(before_failed_restore, restored.snapshot_bytes().unwrap());
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_an_oversized_header_before_parsing() {
+        let (_, _, model) = model();
+        let bank =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        let before = bank.snapshot_bytes().unwrap();
+        let mut hostile = Vec::from(SNAPSHOT_MAGIC.as_slice());
+        hostile.extend_from_slice(
+            &u64::try_from(MAX_TIER_SNAPSHOT_HEADER_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+
+        let error = bank.restore_bytes(&hostile).unwrap_err().to_string();
+        assert!(error.contains("snapshot header exceeds"), "{error}");
+        assert_eq!(bank.snapshot_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn wake_only_non_boundary_does_not_serialize_optimizer_state() {
+        let (_, device, model) = model();
+        let mut delayed = schedule();
+        delayed.tiers[0].update_period = 2;
+        delayed.tiers[1].update_period = 4;
+        let bank =
+            TierOptimizerBank::new(&model, &delayed, TierOptimizerConfig::default()).unwrap();
+        accumulate(&bank, &model, &device);
+        let serializations_before = bank.snapshot_serialization_count();
+        let clocks_before = bank.tier_clocks().unwrap();
+
+        let (unchanged, report) = bank.apply_wake_only_due_updates(&model, 1).unwrap();
+
+        assert!(report.updates.is_empty());
+        assert_eq!(bank.snapshot_serialization_count(), serializations_before);
+        assert_eq!(bank.tier_clocks().unwrap(), clocks_before);
+        assert_eq!(
+            crate::tensor_sleep::model_parameter_hash(&unchanged).unwrap(),
+            crate::tensor_sleep::model_parameter_hash(&model).unwrap()
+        );
+    }
+
+    #[test]
+    fn wake_only_failure_after_an_earlier_due_tier_rolls_back_the_complete_bank() {
+        let (_, device, model) = model();
+        let bank =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        accumulate(&bank, &model, &device);
+        {
+            let mut inner = bank.lock().unwrap();
+            inner.tiers[1].generation = u64::MAX;
+        }
+        let before = bank.snapshot_bytes().unwrap();
+        let clocks_before = bank.tier_clocks().unwrap();
+
+        let error = bank.apply_wake_only_due_updates(&model, 2).unwrap_err();
+
+        assert!(
+            error.to_string().contains("generation overflow"),
+            "{error:#}"
+        );
+        assert_eq!(bank.snapshot_bytes().unwrap(), before);
+        assert_eq!(bank.tier_clocks().unwrap(), clocks_before);
+    }
+
+    #[test]
+    fn wake_only_updates_due_tiers_and_resumes_pending_accumulation_exactly() {
+        let (config, device, model) = model();
+        let schedule = schedule();
+        let optimizer = TierOptimizerConfig::default();
+        let source = TierOptimizerBank::new(&model, &schedule, optimizer.clone()).unwrap();
+        let initial_slots = model.memory_slot_statuses();
+        let initial_hash = crate::tensor_sleep::model_parameter_hash(&model).unwrap();
+
+        accumulate(&source, &model, &device);
+        let (after_one, first) = source.apply_wake_only_due_updates(&model, 1).unwrap();
+        assert_eq!(first.updates.len(), 1);
+        assert_eq!(first.updates[0].tier, 0);
+        assert_eq!(first.updates[0].accumulated_optimizer_steps, 1);
+        assert_ne!(
+            crate::tensor_sleep::model_parameter_hash(&after_one).unwrap(),
+            initial_hash,
+            "the due fast tier did not update model parameters"
+        );
+        assert_eq!(after_one.memory_slot_statuses(), initial_slots);
+        assert_eq!(source.tier_clocks().unwrap(), vec![(1, 0, 0), (0, 0, 1)]);
+
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("wake-only-optimizers");
+        let publisher = DurableTierOptimizerPublisher::new(
+            source.clone(),
+            &root,
+            TensorTransactionStore::new(directory.path().join("unused-tensors")),
+            config.clone(),
+            device.clone(),
+        )
+        .unwrap();
+        let scopes = publisher.publish_checkpoint_scopes().unwrap();
+        assert_eq!(scopes.tiers[1].accumulated_micro_steps, 1);
+        let checkpoint_snapshot = source.snapshot_bytes().unwrap();
+
+        let resumed = TierOptimizerBank::new(&after_one, &schedule, optimizer).unwrap();
+        let resumed_publisher = DurableTierOptimizerPublisher::new(
+            resumed.clone(),
+            &root,
+            TensorTransactionStore::new(directory.path().join("unused-tensors")),
+            config,
+            device.clone(),
+        )
+        .unwrap();
+        resumed_publisher
+            .restore_scopes(&scopes, &after_one)
+            .unwrap();
+        assert_eq!(
+            resumed.snapshot_bytes().unwrap(),
+            checkpoint_snapshot,
+            "wake_only optimizer moments, clocks, or pending gradients changed on resume"
+        );
+
+        accumulate(&source, &after_one, &device);
+        accumulate(&resumed, &after_one, &device);
+        let (source_after_two, source_report) =
+            source.apply_wake_only_due_updates(&after_one, 2).unwrap();
+        let (resumed_after_two, resumed_report) =
+            resumed.apply_wake_only_due_updates(&after_one, 2).unwrap();
+        assert_eq!(source_report, resumed_report);
+        assert_eq!(
+            source_report
+                .updates
+                .iter()
+                .map(|update| (update.tier, update.accumulated_optimizer_steps))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2)],
+            "coincident boundaries must update fastest-to-slowest and retain the slow pending window"
+        );
+        assert_eq!(
+            crate::tensor_sleep::model_parameter_hash(&source_after_two).unwrap(),
+            crate::tensor_sleep::model_parameter_hash(&resumed_after_two).unwrap(),
+            "resumed wake_only update produced different parameters"
+        );
+        assert_eq!(
+            source.snapshot_bytes().unwrap(),
+            resumed.snapshot_bytes().unwrap()
+        );
+        assert_eq!(source.tier_clocks().unwrap(), vec![(2, 0, 0), (2, 0, 0)]);
+        assert_eq!(source_after_two.memory_slot_statuses(), initial_slots);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tier_bundle_load_is_aba_safe_and_rejects_persistent_replacement() {
+        let (config, device, model) = model();
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("optimizers");
+        let source =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        accumulate(&source, &model, &device);
+        let publisher = DurableTierOptimizerPublisher::new(
+            source.clone(),
+            root.clone(),
+            TensorTransactionStore::new(directory.path().join("tensor")),
+            config,
+            device,
+        )
+        .unwrap();
+        let scopes = publisher.publish_checkpoint_scopes().unwrap();
+        let artifact = scopes.tiers[0].artifact.as_ref().unwrap().clone();
+        let generation = Path::new(&artifact.state_uri).parent().unwrap().to_owned();
+        let held = root.join("held-tier-generation");
+
+        let restored =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        {
+            let mut inner = restored.lock().unwrap();
+            restore_tier_bundle_inner(&root, &mut inner, &artifact, |stage, path| {
+                match stage {
+                    TierBundleLoadStage::AfterCapture => {
+                        fs::rename(path, &held)?;
+                        fs::create_dir(path)?;
+                    }
+                    TierBundleLoadStage::AfterStagedLoad => {
+                        fs::remove_dir(path)?;
+                        fs::rename(&held, path)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            restored.tier_clocks().unwrap()[0],
+            source.tier_clocks().unwrap()[0],
+            "an A->B->A pathname swap changed the restored tier state"
+        );
+
+        let persistent =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        let before = persistent.snapshot_bytes().unwrap();
+        let held = root.join("held-persistent-tier-generation");
+        let result = {
+            let mut inner = persistent.lock().unwrap();
+            restore_tier_bundle_inner(&root, &mut inner, &artifact, |stage, path| {
+                if stage == TierBundleLoadStage::AfterCapture {
+                    fs::rename(path, &held)?;
+                    fs::create_dir(path)?;
+                }
+                Ok(())
+            })
+        };
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("changed during authenticated load"),
+            "{error}"
+        );
+        assert_eq!(persistent.snapshot_bytes().unwrap(), before);
+        fs::remove_dir(&generation).unwrap();
+        fs::rename(held, &generation).unwrap();
+
+        let state_path = generation.join(STATE_FILE);
+        let held_state = root.join("held-tier-state.json");
+        let replacement =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        let before = replacement.snapshot_bytes().unwrap();
+        let result = {
+            let mut inner = replacement.lock().unwrap();
+            restore_tier_bundle_inner(&root, &mut inner, &artifact, |stage, _| {
+                if stage == TierBundleLoadStage::AfterCapture {
+                    fs::rename(&state_path, &held_state)?;
+                    fs::write(&state_path, b"persistent replacement")?;
+                }
+                Ok(())
+            })
+        };
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("file `state.json` changed"), "{error}");
+        assert_eq!(replacement.snapshot_bytes().unwrap(), before);
+        fs::remove_file(&state_path).unwrap();
+        fs::rename(held_state, state_path).unwrap();
+
+        let optimizer_path = generation.join(OPTIMIZER_FILE);
+        let mutated =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        let before = mutated.snapshot_bytes().unwrap();
+        let result = {
+            let mut inner = mutated.lock().unwrap();
+            restore_tier_bundle_inner(&root, &mut inner, &artifact, |stage, _| {
+                if stage == TierBundleLoadStage::AfterCapture {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&optimizer_path)?
+                        .write_all(b"persistent mutation")?;
+                }
+                Ok(())
+            })
+        };
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("file `optimizer.bpk` changed"), "{error}");
+        assert_eq!(mutated.snapshot_bytes().unwrap(), before);
     }
 
     #[test]
@@ -2529,6 +3009,64 @@ mod tests {
             .unwrap();
         assert_eq!(first.uri, second.uri);
         assert_eq!(first.sha256, second.sha256);
+    }
+
+    #[test]
+    fn failed_prospective_preview_restores_a_consumed_sender_accumulator() {
+        let (_, device, model) = model();
+        let directory = TempDir::new().unwrap();
+        let bank =
+            TierOptimizerBank::new(&model, &schedule(), TierOptimizerConfig::default()).unwrap();
+        accumulate(&bank, &model, &device);
+        let teacher = teacher_checkpoint(directory.path(), &model);
+        let root = directory.path().join("prospective-failure");
+        let mut update = ProspectiveTierUpdate::new(bank.clone(), &root).unwrap();
+        // Staging consumes the sender accumulator before publishing its
+        // immutable candidate. Force that publication to fail after the
+        // consume point and require byte-exact in-memory rollback.
+        fs::write(root.join("model-generations"), b"not a directory").unwrap();
+        let before = bank.snapshot_bytes().unwrap();
+
+        assert!(update.prepare_consolidation(1, 0, 1, &teacher).is_err());
+        assert_eq!(bank.snapshot_bytes().unwrap(), before);
+        assert_eq!(bank.tier_clocks().unwrap(), vec![(0, 0, 1), (0, 0, 1)]);
+    }
+
+    #[test]
+    fn prospective_checkpoint_load_uses_the_authenticated_bytes_after_path_replacement() {
+        let (config, device, model) = model();
+        let directory = TempDir::new().unwrap();
+        let checkpoint = directory.path().join("prospective.safetensors");
+        let held = directory.path().join("held-prospective.safetensors");
+        let replacement = directory.path().join("replacement.safetensors");
+        save_safetensors(&model.clone().valid(), &checkpoint).unwrap();
+        let expected_sha256 = hash_file(&checkpoint).unwrap().1;
+        let expected_parameters = crate::tensor_sleep::model_parameter_hash(&model).unwrap();
+
+        device.seed(97);
+        let other = Transformer::new(&config, &device).unwrap();
+        assert_ne!(
+            crate::tensor_sleep::model_parameter_hash(&other).unwrap(),
+            expected_parameters
+        );
+        save_safetensors(&other.valid(), &replacement).unwrap();
+
+        let loaded = load_local_checkpoint_inner(
+            &model,
+            checkpoint.to_str().unwrap(),
+            &expected_sha256,
+            |path| {
+                fs::rename(path, &held)?;
+                fs::rename(&replacement, path)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::tensor_sleep::model_parameter_hash(&loaded).unwrap(),
+            expected_parameters,
+            "prospective checkpoint loader reopened a replaced pathname"
+        );
     }
 
     fn run_tier_bundle_crash_scenario(sender_active: bool) {

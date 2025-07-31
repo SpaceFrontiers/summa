@@ -702,7 +702,7 @@
         "teacher": {
           "adapter": "hermes_checkpoint",
           "artifact": "teachers/instruction-teacher.json",
-          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         },
         "temperature": 1.5,
         "scale_by_temperature_squared": true
@@ -787,7 +787,7 @@
         "reference": {
           "adapter": "hermes_checkpoint",
           "artifact": "references/sft-reference.json",
-          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         },
         "beta": 0.1,
         "label_smoothing": 0.0,
@@ -880,7 +880,7 @@
         "reference": {
           "adapter": "hermes_checkpoint",
           "artifact": "references/dpo-reference.json",
-          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         },
         "sampling": {
           "max_new_tokens": 512,

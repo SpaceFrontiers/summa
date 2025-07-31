@@ -6,8 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::module::{Initializer, ModuleVisitor, Param, ParamId};
 use burn::prelude::*;
 use burn::tensor::{DType, Int};
+use burn_nn::loss::CrossEntropyLossConfig;
 use burn_nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
+use burn_store::ModuleSnapshot;
 
 use crate::mal::{BlockDef, ModelDef, NormConfig, PositionEncoding};
 
@@ -163,6 +165,36 @@ fn validate_config(config: &ModelDef) -> Result<()> {
                             tier.name
                         );
                     }
+                    let factor_parameters = config
+                        .hidden_size
+                        .checked_mul(reserve.rank)
+                        .and_then(|count| count.checked_mul(2))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "layer {i} memory tier '{}' reserve low-rank shape overflows usize",
+                                tier.name
+                            )
+                        })?;
+                    factor_parameters
+                        .checked_mul(reserve.capacity)
+                        .and_then(|count| {
+                            config
+                                .hidden_size
+                                .checked_mul(reserve.capacity)
+                                .and_then(|router| count.checked_add(router))
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "layer {i} memory tier '{}' reserve capacity overflows usize",
+                                tier.name
+                            )
+                        })?;
+                    i64::try_from(reserve.capacity).with_context(|| {
+                        format!(
+                            "layer {i} memory tier '{}' reserve capacity exceeds device index range",
+                            tier.name
+                        )
+                    })?;
                     if reserve.top_k != 1 {
                         bail!(
                             "layer {i} memory tier '{}' reserve top_k must be 1 so wake active compute stays constant as stored capacity activates",
@@ -424,7 +456,7 @@ impl Transformer {
         );
         let embedding_dropout = DropoutConfig::new(config.embeddings.dropout).init();
         let layers = (0..config.num_layers)
-            .map(|i| TransformerBlock::new(config, config.block_for_layer(i), device))
+            .map(|i| TransformerBlock::new(config, config.block_for_layer(i), i, device))
             .collect();
         let norm_block = config.block_for_layer(0);
         let norm_config = config.output.norm.as_ref().unwrap_or(&norm_block.norm);
@@ -584,21 +616,31 @@ impl Transformer {
         input_ids: Tensor<2, Int>,
         targets: Tensor<2, Int>,
     ) -> (Tensor<1>, Option<Tensor<1>>) {
-        let [batch, seq_len] = targets.dims();
-        let tokens = batch * seq_len;
-        let (hidden, router_loss) =
-            self.forward_hidden_through_with_aux(input_ids, 0, self.layers.len());
-        let hidden = hidden.reshape([tokens, self.config.hidden_size]);
-        let (weight, bias) = self.output_parameters();
-        let loss = linear_cross_entropy(
-            hidden,
-            weight,
-            bias,
-            targets.reshape([tokens]),
-            self.config.vocab_size,
-            tokens.div_ceil(LOSS_CHUNKS),
-        );
+        let (loss, router_loss, logits) =
+            self.forward_language_objective(input_ids, targets, None, false);
+        debug_assert!(logits.is_none());
         (loss, router_loss)
+    }
+
+    /// Next-token loss, MoE router regularization, and flattened vocabulary
+    /// logits from one shared backbone pass.
+    ///
+    /// Quantization distillation needs both the ordinary task loss and student
+    /// logits. Keeping this as one model operation prevents QAT from running
+    /// the complete Transformer twice for every microbatch while retaining the
+    /// same chunked cross-entropy implementation and gradients.
+    pub fn forward_loss_and_logits_with_router(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Tensor<2, Int>,
+    ) -> (Tensor<1>, Option<Tensor<1>>, Tensor<2>) {
+        let (loss, router_loss, logits) =
+            self.forward_language_objective(input_ids, targets, None, true);
+        (
+            loss,
+            router_loss,
+            logits.expect("requested language logits are present"),
+        )
     }
 
     /// Causal cross-entropy over selected flattened token positions.
@@ -623,27 +665,74 @@ impl Transformer {
         targets: Tensor<2, Int>,
         positions: Tensor<1, Int>,
     ) -> (Tensor<1>, Option<Tensor<1>>) {
+        let (loss, router_loss, logits) =
+            self.forward_language_objective(input_ids, targets, Some(positions), false);
+        debug_assert!(logits.is_none());
+        (loss, router_loss)
+    }
+
+    /// Selected-position language loss, MoE router regularization, and the
+    /// corresponding vocabulary logits from one shared backbone pass.
+    pub fn forward_masked_loss_and_logits_with_router(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Tensor<2, Int>,
+        positions: Tensor<1, Int>,
+    ) -> (Tensor<1>, Option<Tensor<1>>, Tensor<2>) {
+        let (loss, router_loss, logits) =
+            self.forward_language_objective(input_ids, targets, Some(positions), true);
+        (
+            loss,
+            router_loss,
+            logits.expect("requested masked-language logits are present"),
+        )
+    }
+
+    fn forward_language_objective(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Tensor<2, Int>,
+        positions: Option<Tensor<1, Int>>,
+        materialize_logits: bool,
+    ) -> (Tensor<1>, Option<Tensor<1>>, Option<Tensor<2>>) {
         let [batch, seq_len] = targets.dims();
         assert_eq!(input_ids.dims(), [batch, seq_len]);
-        let [selected_tokens] = positions.dims();
-        assert!(selected_tokens > 0, "masked loss requires target tokens");
         let tokens = batch * seq_len;
         let (hidden, router_loss) =
             self.forward_hidden_through_with_aux(input_ids, 0, self.layers.len());
-        let hidden = hidden
-            .reshape([tokens, self.config.hidden_size])
-            .select(0, positions.clone());
-        let targets = targets.reshape([tokens]).select(0, positions);
-        let (weight, bias) = self.output_parameters();
-        let loss = linear_cross_entropy(
-            hidden,
-            weight,
-            bias,
-            targets,
-            self.config.vocab_size,
-            selected_tokens.div_ceil(LOSS_CHUNKS),
-        );
-        (loss, router_loss)
+        let hidden = hidden.reshape([tokens, self.config.hidden_size]);
+        let targets = targets.reshape([tokens]);
+        let (hidden, targets, supervised_tokens) = match positions {
+            Some(positions) => {
+                let [selected_tokens] = positions.dims();
+                assert!(selected_tokens > 0, "masked loss requires target tokens");
+                (
+                    hidden.select(0, positions.clone()),
+                    targets.select(0, positions),
+                    selected_tokens,
+                )
+            }
+            None => (hidden, targets, tokens),
+        };
+        let logits =
+            materialize_logits.then(|| self.project_flat_hidden(hidden.clone(), supervised_tokens));
+        let loss = match &logits {
+            Some(logits) => CrossEntropyLossConfig::new()
+                .init(&logits.device())
+                .forward(logits.clone(), targets),
+            None => {
+                let (weight, bias) = self.output_parameters();
+                linear_cross_entropy(
+                    hidden,
+                    weight,
+                    bias,
+                    targets,
+                    self.config.vocab_size,
+                    supervised_tokens.div_ceil(LOSS_CHUNKS),
+                )
+            }
+        };
+        (loss, router_loss, logits)
     }
 
     /// Vocabulary logits only for selected row-major token positions.
@@ -923,6 +1012,43 @@ impl Transformer {
         Ok(visitor.ids)
     }
 
+    /// Canonical SafeTensors paths selected by the ultra-low-bit QAT policy.
+    ///
+    /// This resolves paths through the same Burn snapshot traversal and enum-
+    /// variant policy used by [`crate::save_safetensors`]. It is primarily an
+    /// integration invariant for proving that the training-time ParamId policy
+    /// and archive-time tensor policy select the same matrices exactly.
+    pub fn ultra_quant_parameter_names(
+        &self,
+        quantize_embeddings: bool,
+        quantize_lm_head: bool,
+    ) -> Result<Vec<String>> {
+        let selected = self.ultra_quant_parameter_ids(quantize_embeddings, quantize_lm_head)?;
+        let mut matched = Vec::with_capacity(selected.len());
+        let mut names = self
+            .collect(None, None, true)
+            .into_iter()
+            .filter_map(|snapshot| {
+                let id = snapshot.tensor_id?;
+                selected.contains(&id).then(|| {
+                    matched.push(id);
+                    snapshot.full_path()
+                })
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        ensure!(
+            selected.iter().all(|id| matched.contains(id)),
+            "QAT parameter selection contains an ID absent from canonical SafeTensors traversal"
+        );
+        ensure!(
+            matched.len() == selected.len() && names.len() == selected.len(),
+            "QAT parameter selection is not one-to-one with canonical SafeTensors paths"
+        );
+        Ok(names)
+    }
+
     /// Visit one transformer block without exposing its module fields. This is
     /// used by opt-in trainer diagnostics such as per-layer gradient norms.
     pub fn visit_layer<V: ModuleVisitor>(&self, index: usize, visitor: &mut V) -> Result<()> {
@@ -1031,9 +1157,31 @@ impl Transformer {
         state: &mut InferenceState,
         routing: MemoryRouting,
     ) -> Tensor<2> {
-        self.project_last_logits(
-            self.forward_hidden_with_state_and_routing(input_ids, state, routing),
+        self.forward_next_features_and_logits_with_state_and_memory_routing(
+            input_ids, state, routing,
         )
+        .1
+    }
+
+    /// Run cached generation and return the final hidden feature together with
+    /// its vocabulary logits.
+    ///
+    /// Dreaming applies an isolated LM-head policy to this feature. Returning
+    /// both values from the same cached backbone pass avoids recomputing the
+    /// complete prefix for every generated token.
+    pub fn forward_next_features_and_logits_with_state_and_memory_routing(
+        &self,
+        input_ids: Tensor<2, Int>,
+        state: &mut InferenceState,
+        routing: MemoryRouting,
+    ) -> (Tensor<2>, Tensor<2>) {
+        let hidden = self.forward_hidden_with_state_and_routing(input_ids, state, routing);
+        let [batch, seq_len, width] = hidden.dims();
+        let feature = hidden
+            .slice([0..batch, seq_len - 1..seq_len, 0..width])
+            .reshape([batch, width]);
+        let logits = self.project_flat_hidden(feature.clone(), batch);
+        (feature, logits)
     }
 
     fn forward_hidden_with_state(
@@ -1245,38 +1393,71 @@ impl Transformer {
 
     /// Float parameters for one logical tier across all memory-bearing layers.
     pub fn memory_tier_parameter_ids_all_layers(&self, tier: usize) -> Result<Vec<ParamId>> {
-        let layers = self
-            .memory_slot_statuses()
-            .into_iter()
-            .filter(|status| status.tier == tier)
-            .map(|status| status.layer)
-            .collect::<std::collections::BTreeSet<_>>();
-        ensure!(!layers.is_empty(), "memory tier {tier} does not exist");
         let mut ids = Vec::new();
-        for layer in layers {
-            ids.extend(self.memory_tier_parameter_ids(layer, tier)?);
+        let mut matching_layers = 0_usize;
+        for (layer, block) in self.layers.iter().enumerate() {
+            if !block.has_memory_tier(tier) {
+                continue;
+            }
+            matching_layers += 1;
+            ids.extend(
+                block
+                    .memory_tier_parameter_ids(tier)
+                    .with_context(|| format!("reading layer {layer} memory tier {tier}"))?,
+            );
         }
+        ensure!(matching_layers > 0, "memory tier {tier} does not exist");
         Ok(ids)
+    }
+
+    /// Wake-eligible parameters for one logical memory tier across all layers.
+    /// This is a synchronization-free query over parameter IDs and the
+    /// boundary-refreshed runtime activation mirror.
+    pub fn memory_tier_active_parameter_ids_all_layers(&self, tier: usize) -> Result<Vec<ParamId>> {
+        let mut ids = Vec::new();
+        let mut matching_layers = 0_usize;
+        for (layer, block) in self.layers.iter().enumerate() {
+            if !block.has_memory_tier(tier) {
+                continue;
+            }
+            matching_layers += 1;
+            ids.extend(
+                block
+                    .memory_tier_active_parameter_ids(tier)
+                    .with_context(|| format!("reading active layer {layer} memory tier {tier}"))?,
+            );
+        }
+        ensure!(matching_layers > 0, "memory tier {tier} does not exist");
+        Ok(ids)
+    }
+
+    /// Parameters of every dormant reserve slot. Unlike
+    /// [`Self::memory_slot_statuses`], this does not read serialized masks or
+    /// generations from the device and is safe on the per-step wake path.
+    pub fn dormant_memory_parameter_ids(&self) -> Vec<ParamId> {
+        self.layers
+            .iter()
+            .flat_map(TransformerBlock::dormant_memory_parameter_ids)
+            .collect()
     }
 
     /// Persistent base FFN/MoE parameters for one memory tier across every
     /// memory-bearing layer. Reserve expert tensors are deliberately excluded.
     pub fn memory_tier_base_parameter_ids_all_layers(&self, tier: usize) -> Result<Vec<ParamId>> {
-        let layers = self
-            .memory_slot_statuses()
-            .into_iter()
-            .filter(|status| status.tier == tier)
-            .map(|status| status.layer)
-            .collect::<std::collections::BTreeSet<_>>();
-        ensure!(!layers.is_empty(), "memory tier {tier} does not exist");
         let mut ids = Vec::new();
-        for layer in layers {
+        let mut matching_layers = 0_usize;
+        for (layer, block) in self.layers.iter().enumerate() {
+            if !block.has_memory_tier(tier) {
+                continue;
+            }
+            matching_layers += 1;
             ids.extend(
-                self.layers[layer]
+                block
                     .memory_tier_base_parameter_ids(tier)
                     .with_context(|| format!("reading layer {layer} memory tier {tier} base"))?,
             );
         }
+        ensure!(matching_layers > 0, "memory tier {tier} does not exist");
         ensure!(
             !ids.is_empty(),
             "memory tier {tier} base has no float parameters"
@@ -1633,6 +1814,66 @@ mod tests {
     }
 
     #[test]
+    fn task_loss_and_distillation_logits_match_independent_model_apis() {
+        let mut config = get_builtin_model("tiny").unwrap();
+        config.vocab_size = 32;
+        config.hidden_size = 8;
+        config.num_layers = 1;
+        config.max_seq_len = 8;
+        config.embeddings.dropout = 0.0;
+        config.block.dropout = 0.0;
+        config.block.attention.dropout = 0.0;
+        config.block.attention.num_heads = Some(2);
+        config.block.attention.num_kv_heads = Some(1);
+        config.block.attention.head_dim = Some(4);
+        config.block.ffn.dropout = 0.0;
+        config.block.ffn.hidden_dim = Some(16);
+        let device = Device::ndarray().autodiff();
+        device.seed(43);
+        let model = Transformer::new(&config, &device).unwrap();
+        let inputs = vec![1_i64, 2, 3, 4, 5, 6, 7, 8];
+        let targets = vec![2_i64, 3, 4, 5, 6, 7, 8, 9];
+        let batch = || {
+            (
+                Tensor::<2, Int>::from_data(TensorData::new(inputs.clone(), [2, 4]), &device),
+                Tensor::<2, Int>::from_data(TensorData::new(targets.clone(), [2, 4]), &device),
+            )
+        };
+        let value = |loss: Tensor<1>| loss.into_data().convert::<f32>().to_vec::<f32>().unwrap()[0];
+
+        let (input, target) = batch();
+        let (combined_loss, router_loss, combined_logits) =
+            model.forward_loss_and_logits_with_router(input, target);
+        assert!(router_loss.is_none());
+        let (input, target) = batch();
+        let independent_loss = model.forward_loss(input, target);
+        let (input, _) = batch();
+        let independent_logits = model.forward(input, 0).reshape([8, config.vocab_size]);
+        assert!((value(combined_loss) - value(independent_loss)).abs() < 1e-6);
+        let maximum: f32 = (combined_logits - independent_logits)
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(maximum < 1e-6, "causal QAT logits differ by {maximum}");
+
+        let positions = || Tensor::<1, Int>::from_data([1_i64, 6], &device);
+        let (input, target) = batch();
+        let (combined_loss, router_loss, combined_logits) =
+            model.forward_masked_loss_and_logits_with_router(input, target, positions());
+        assert!(router_loss.is_none());
+        let (input, target) = batch();
+        let independent_loss = model.forward_masked_loss(input, target, positions());
+        let (input, _) = batch();
+        let independent_logits = model.forward_selected_logits(input, positions());
+        assert!((value(combined_loss) - value(independent_loss)).abs() < 1e-6);
+        let maximum: f32 = (combined_logits - independent_logits)
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(maximum < 1e-6, "masked QAT logits differ by {maximum}");
+    }
+
+    #[test]
     fn selected_logits_match_materialized_positions() {
         let mut config = get_builtin_model("tiny").unwrap();
         config.vocab_size = 32;
@@ -1862,6 +2103,53 @@ mod tests {
     }
 
     #[test]
+    fn sync_free_tier_scopes_skip_layers_without_the_requested_tier() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ffn base { hidden_dim: 12 activation: swiglu }
+            memory fast_only {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 1 rank: 3 top_k: 1 }
+                }
+            }
+            memory fast_slow {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 1 rank: 3 top_k: 1 }
+                }
+                tier slow {
+                    ffn: base residual_init: zero
+                    reserve_experts { capacity: 1 rank: 3 top_k: 1 }
+                }
+            }
+            block short { attention: { num_heads: 1 } memory: fast_only }
+            block long { attention: { num_heads: 1 } memory: fast_slow }
+            model heterogeneous-sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 2
+                block: short
+                pattern: [short, long]
+            }
+            "#,
+        )
+        .unwrap();
+        let model = Transformer::new(&config, &Device::ndarray()).unwrap();
+
+        let direct = model.memory_tier_parameter_ids(1, 1).unwrap();
+        assert_eq!(
+            model.memory_tier_parameter_ids_all_layers(1).unwrap(),
+            direct
+        );
+        assert_eq!(
+            model
+                .memory_tier_active_parameter_ids_all_layers(1)
+                .unwrap(),
+            model.memory_tier_base_parameter_ids_all_layers(1).unwrap()
+        );
+        assert!(model.memory_tier_parameter_ids_all_layers(2).is_err());
+    }
+
+    #[test]
     fn memory_reserve_rejects_growing_top_k_compute() {
         let config = crate::mal::parse_mal(
             r#"
@@ -1887,6 +2175,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("reserve top_k must be 1"), "{error}");
+    }
+
+    #[test]
+    fn memory_reserve_rejects_overflowing_low_rank_capacity_before_allocation() {
+        let mut config = crate::mal::parse_mal(
+            r#"
+            ffn base { hidden_dim: 12 activation: swiglu }
+            memory cms {
+                tier fast {
+                    ffn: base
+                    reserve_experts { capacity: 1 rank: 3 top_k: 1 }
+                }
+            }
+            model sleeper {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } memory: cms }
+            }
+            "#,
+        )
+        .unwrap();
+        config.block.memory.as_mut().unwrap().tiers[0]
+            .reserve_experts
+            .rank = usize::MAX;
+
+        let error = Transformer::new(&config, &Device::ndarray())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("low-rank shape overflows"), "{error}");
     }
 
     #[test]
@@ -1951,6 +2267,26 @@ mod tests {
             difference > 0.0,
             "persistent MoE exploration should remain active with one receiver slot"
         );
+
+        let cached_input = Tensor::<2, Int>::from_data([[1_i64, 2, 3]], &device);
+        let mut feature_state = model.make_state_with_capacity(1, 3, &device);
+        let (features, cached_logits) = model
+            .forward_next_features_and_logits_with_state_and_memory_routing(
+                cached_input.clone(),
+                &mut feature_state,
+                MemoryRouting::Dream { seed: 0x5678 },
+            );
+        let mut logits_state = model.make_state_with_capacity(1, 3, &device);
+        let logits_only = model.forward_next_logits_with_state_and_memory_routing(
+            cached_input,
+            &mut logits_state,
+            MemoryRouting::Dream { seed: 0x5678 },
+        );
+        assert_eq!(features.dims(), [1, config.hidden_size]);
+        assert_eq!(feature_state.pos(), 3);
+        assert_eq!(logits_state.pos(), 3);
+        let cached_difference: f32 = (cached_logits - logits_only).abs().max().into_scalar();
+        assert!(cached_difference < 1e-6, "difference={cached_difference}");
     }
 
     #[test]

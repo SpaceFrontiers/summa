@@ -498,7 +498,9 @@ fn cli_enforces_memory_and_periodic_runtime_pairing() {
     );
     assert!(
         diagnostic(&ordinary_periodic)
-            .contains("periodic_sleep requires a MAL model with an explicit memory hierarchy"),
+            .contains(
+                "periodic_sleep and memory_update_mode require a MAL model with an explicit memory hierarchy"
+            ),
         "{}",
         diagnostic(&ordinary_periodic)
     );

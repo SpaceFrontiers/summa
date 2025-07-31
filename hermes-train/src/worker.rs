@@ -7,18 +7,34 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::thread;
+use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+#[cfg(not(unix))]
+use anyhow::bail;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::metrics::{
-    MetricContext, MetricEvent, MetricLogState, MetricPhase, MetricPhaseKind, MetricWriter,
-};
+use crate::artifact_io::{read_regular_bounded, validate_sha256_identity};
+#[cfg(test)]
+use crate::metrics::MetricPhaseKind;
+use crate::metrics::{MetricContext, MetricEvent, MetricLogState, MetricPhase, MetricWriter};
+use crate::pinned_executable::file_sha256 as hash_file_sha256;
+#[cfg(unix)]
+use crate::pinned_executable::{PinnedExecutable, StagedExecutable};
+#[cfg(unix)]
+use crate::protocol_process::{ProtocolRead, SupervisedProcess};
 use crate::runtime::{
     ImmutableModelCheckpoint, PhaseExecutionRequest, PhaseExecutionResult, PhaseExecutor,
     PhaseProduct, PhaseProgressSink, RuntimeBoundary, RuntimeCheckpoint, WorkflowRunState,
@@ -27,7 +43,13 @@ use crate::workflow::ResolvedWorkflow;
 
 pub const PHASE_WORKER_PROTOCOL_VERSION: u32 = 2;
 pub const RUNTIME_CHECKPOINT_FILE_VERSION: u32 = 2;
+const PHASE_WORKER_EXECUTION_CONTRACT_VERSION: u32 = 1;
 const MAX_WORKER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RUNTIME_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PHASE_WORKER_ARGUMENTS: usize = 128;
+const MAX_PHASE_WORKER_ARGUMENT_BYTES: usize = 4 * 1024;
+const MAX_PHASE_WORKER_TOTAL_ARGUMENT_BYTES: usize = 64 * 1024;
+const DEFAULT_PHASE_WORKER_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +89,7 @@ pub struct ExternalPhaseExecutor {
     executable: PathBuf,
     arguments: Vec<OsString>,
     expected_sha256: String,
+    timeout: Duration,
 }
 
 impl ExternalPhaseExecutor {
@@ -79,32 +102,136 @@ impl ExternalPhaseExecutor {
             executable: executable.into(),
             arguments,
             expected_sha256: expected_sha256.into(),
+            timeout: DEFAULT_PHASE_WORKER_TIMEOUT,
         };
+        validate_worker_arguments(&executor.arguments)?;
         executor.verify_identity()?;
         Ok(executor)
+    }
+
+    /// Set the hard wall-clock bound for one phase-worker invocation. Timeout
+    /// always terminates and reaps the worker's complete process group.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
+        ensure!(!timeout.is_zero(), "phase worker timeout must be positive");
+        checked_worker_deadline(timeout)?;
+        self.timeout = timeout;
+        Ok(self)
     }
 
     pub fn expected_sha256(&self) -> &str {
         &self.expected_sha256
     }
 
-    pub fn verify_identity(&self) -> Result<()> {
-        validate_sha256(&self.expected_sha256)?;
-        let metadata = fs::symlink_metadata(&self.executable).with_context(|| {
-            format!("phase worker {} is unavailable", self.executable.display())
-        })?;
-        ensure!(
-            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-            "phase worker {} must be a regular non-symlink file",
-            self.executable.display()
+    /// Stable identity of all executable semantics owned by this adapter.
+    /// Runtime checkpoints bind this value, while worker requests continue to
+    /// carry the raw executable content hash expected by protocol v2.
+    pub fn execution_identity(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_execution_part(&mut hasher, b"hermes-external-phase-executor");
+        hash_execution_part(&mut hasher, &PHASE_WORKER_PROTOCOL_VERSION.to_le_bytes());
+        hash_execution_part(
+            &mut hasher,
+            &PHASE_WORKER_EXECUTION_CONTRACT_VERSION.to_le_bytes(),
         );
-        ensure!(
-            file_sha256(&self.executable)? == self.expected_sha256,
-            "phase worker {} does not match its pinned SHA-256",
-            self.executable.display()
-        );
-        Ok(())
+        hash_execution_part(&mut hasher, b"empty-environment");
+        hash_execution_part(&mut hasher, b"working-directory:/");
+        hash_execution_part(&mut hasher, self.expected_sha256.as_bytes());
+        hash_execution_part(&mut hasher, &self.timeout.as_nanos().to_le_bytes());
+        hash_execution_part(&mut hasher, &(self.arguments.len() as u64).to_le_bytes());
+        for argument in &self.arguments {
+            #[cfg(unix)]
+            hash_execution_part(&mut hasher, argument.as_os_str().as_bytes());
+            #[cfg(not(unix))]
+            {
+                let text = argument.to_string_lossy();
+                hash_execution_part(&mut hasher, text.as_bytes());
+            }
+        }
+        format!("sha256:{:x}", hasher.finalize())
     }
+
+    pub fn verify_identity(&self) -> Result<()> {
+        validate_sha256_identity(&self.expected_sha256, "phase worker identity")?;
+        validate_worker_arguments(&self.arguments)?;
+        #[cfg(unix)]
+        {
+            PinnedExecutable::verify(&self.executable, &self.expected_sha256, "phase worker")
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::symlink_metadata(&self.executable).with_context(|| {
+                format!("phase worker {} is unavailable", self.executable.display())
+            })?;
+            ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "phase worker {} must be a regular non-symlink file",
+                self.executable.display()
+            );
+            ensure!(
+                file_sha256(&self.executable)? == self.expected_sha256,
+                "phase worker {} does not match its pinned SHA-256",
+                self.executable.display()
+            );
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn pinned_command(&self) -> Result<(Command, StagedExecutable)> {
+        let executable = PinnedExecutable::open(
+            &self.executable,
+            &self.expected_sha256,
+            "phase worker",
+            "phase-worker",
+        )?;
+        let mut command = executable.command();
+        command
+            .args(&self.arguments)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        Ok((command, executable.into_staged()))
+    }
+}
+
+fn validate_worker_arguments(arguments: &[OsString]) -> Result<()> {
+    ensure!(
+        arguments.len() <= MAX_PHASE_WORKER_ARGUMENTS,
+        "phase worker has more than {MAX_PHASE_WORKER_ARGUMENTS} arguments"
+    );
+    let mut total = 0usize;
+    for (index, argument) in arguments.iter().enumerate() {
+        #[cfg(unix)]
+        let bytes = argument.as_os_str().as_bytes();
+        #[cfg(not(unix))]
+        let encoded = argument.to_string_lossy();
+        #[cfg(not(unix))]
+        let bytes = encoded.as_bytes();
+        ensure!(
+            bytes.len() <= MAX_PHASE_WORKER_ARGUMENT_BYTES,
+            "phase worker argument {index} exceeds {MAX_PHASE_WORKER_ARGUMENT_BYTES} bytes"
+        );
+        ensure!(
+            !bytes.contains(&0),
+            "phase worker argument {index} contains a NUL byte"
+        );
+        total = total
+            .checked_add(bytes.len())
+            .context("phase worker argument bytes overflow usize")?;
+    }
+    ensure!(
+        total <= MAX_PHASE_WORKER_TOTAL_ARGUMENT_BYTES,
+        "phase worker arguments exceed {MAX_PHASE_WORKER_TOTAL_ARGUMENT_BYTES} total bytes"
+    );
+    Ok(())
+}
+
+fn hash_execution_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 impl<C> PhaseExecutor<C> for ExternalPhaseExecutor {
@@ -114,138 +241,165 @@ impl<C> PhaseExecutor<C> for ExternalPhaseExecutor {
         _: &mut C,
         progress: &mut dyn PhaseProgressSink,
     ) -> Result<PhaseExecutionResult> {
-        // Re-hash immediately before every spawn so a worker cannot change
-        // between workflow initialization and a later resumed phase.
-        self.verify_identity()?;
-        let mut child = Command::new(&self.executable)
-            .args(&self.arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
+        #[cfg(not(unix))]
+        {
+            let _ = (request, progress);
+            bail!("external phase workers require a Unix process host");
+        }
+        #[cfg(unix)]
+        {
+            // Open and hash one exact file generation immediately before every
+            // spawn. Unix executes a private materialization of those opened bytes,
+            // closing the path-replacement window between verification and exec.
+            let wire_request = PhaseWorkerRequest {
+                version: PHASE_WORKER_PROTOCOL_VERSION,
+                executor_sha256: self.expected_sha256.clone(),
+                phase_index: request.phase_index,
+                phase: request.phase.clone(),
+                input_checkpoint: request.input_checkpoint.clone(),
+                resume_state: request.resume_state.clone(),
+            };
+            let mut encoded_request = serde_json::to_vec(&wire_request)?;
+            ensure!(
+                encoded_request.len() < MAX_WORKER_MESSAGE_BYTES,
+                "phase worker request is larger than {MAX_WORKER_MESSAGE_BYTES} bytes"
+            );
+            encoded_request.push(b'\n');
+            let deadline = checked_worker_deadline(self.timeout)?;
+            let (mut command, staged_executable) = self.pinned_command()?;
+            let child = command.spawn().with_context(|| {
                 format!("failed to start phase worker {}", self.executable.display())
             })?;
-        let wire_request = PhaseWorkerRequest {
-            version: PHASE_WORKER_PROTOCOL_VERSION,
-            executor_sha256: self.expected_sha256.clone(),
-            phase_index: request.phase_index,
-            phase: request.phase.clone(),
-            input_checkpoint: request.input_checkpoint.clone(),
-            resume_state: request.resume_state.clone(),
-        };
-        {
-            let mut stdin = child
-                .stdin
-                .take()
-                .context("phase worker stdin is unavailable")?;
-            serde_json::to_writer(&mut stdin, &wire_request)?;
-            stdin.write_all(b"\n")?;
-            stdin.flush()?;
-        }
-
-        let stdout = child
-            .stdout
-            .take()
-            .context("phase worker stdout is unavailable")?;
-        let mut reader = BufReader::new(stdout);
-        let mut terminal = None;
-        while let Some(line) = read_worker_message(&mut reader)? {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
+            let mut child = SupervisedProcess::new(
+                child,
+                staged_executable,
+                "phase worker",
+                MAX_WORKER_MESSAGE_BYTES,
+            )?;
+            let mut written = 0_usize;
+            let mut terminal = None;
+            loop {
+                child.write_available(&encoded_request, &mut written)?;
+                if written == encoded_request.len() {
+                    child.close_input();
+                }
+                drain_phase_output(
+                    &mut child,
+                    request,
+                    progress,
+                    &mut terminal,
+                    deadline,
+                    self.timeout,
+                )?;
+                if let Some(status) = child.try_wait()? {
+                    // Do not wait for pipe EOF after leader exit. An unauthorized
+                    // setsid() descendant can retain stdout outside the process
+                    // group; every byte the leader committed is already readable.
+                    child.terminate_process_group();
+                    drain_phase_output(
+                        &mut child,
+                        request,
+                        progress,
+                        &mut terminal,
+                        deadline,
+                        self.timeout,
+                    )?;
+                    child.finish_output_at_leader_exit()?;
+                    ensure!(
+                        written == encoded_request.len(),
+                        "phase worker exited before consuming its complete request"
+                    );
+                    ensure!(status.success(), "phase worker exited with status {status}");
+                    return terminal.context("phase worker exited without a terminal message");
+                }
+                ensure_worker_before_deadline(deadline, self.timeout)?;
+                child.wait_for_activity(written < encoded_request.len(), deadline)?;
             }
-            ensure!(
-                terminal.is_none(),
-                "phase worker emitted data after a terminal message"
-            );
-            let message: PhaseWorkerMessage = serde_json::from_slice(&line)
-                .context("phase worker emitted invalid protocol JSON")?;
-            match message {
-                PhaseWorkerMessage::Metric {
-                    global_step,
-                    checkpoint_hash,
-                    event,
-                } => {
-                    if let Some(hash) = &checkpoint_hash {
-                        validate_sha256(hash).context(
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drain_phase_output(
+    child: &mut SupervisedProcess,
+    request: &PhaseExecutionRequest,
+    progress: &mut dyn PhaseProgressSink,
+    terminal: &mut Option<PhaseExecutionResult>,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<()> {
+    loop {
+        ensure_worker_before_deadline(deadline, timeout)?;
+        let ProtocolRead::Line(line) = child.read_line()? else {
+            return Ok(());
+        };
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        ensure!(
+            terminal.is_none(),
+            "phase worker emitted data after a terminal message"
+        );
+        let message: PhaseWorkerMessage =
+            serde_json::from_slice(&line).context("phase worker emitted invalid protocol JSON")?;
+        match message {
+            PhaseWorkerMessage::Metric {
+                global_step,
+                checkpoint_hash,
+                event,
+            } => {
+                if let Some(hash) = &checkpoint_hash {
+                    validate_sha256_identity(hash, "phase worker metric checkpoint identity")
+                        .context(
                             "phase worker metric checkpoint_hash is not a canonical SHA-256",
                         )?;
-                    }
-                    event
-                        .validate()
-                        .context("phase worker emitted an invalid typed metric")?;
-                    progress.metric(
-                        MetricContext {
-                            global_step,
-                            phase: metric_phase(&request.phase, request.phase_index)?,
-                            checkpoint_hash,
-                        },
-                        event,
-                    )?;
                 }
-                PhaseWorkerMessage::Progress { resume_state } => {
-                    progress.checkpoint(resume_state)?;
-                }
-                PhaseWorkerMessage::Yielded { resume_state } => {
-                    terminal = Some(PhaseExecutionResult::Yielded { resume_state });
-                }
-                PhaseWorkerMessage::Complete { product } => {
-                    terminal = Some(PhaseExecutionResult::Complete(product));
-                }
+                event
+                    .validate()
+                    .context("phase worker emitted an invalid typed metric")?;
+                progress.metric(
+                    MetricContext {
+                        global_step,
+                        phase: metric_phase(&request.phase, request.phase_index)?,
+                        checkpoint_hash,
+                    },
+                    event,
+                )?;
+            }
+            PhaseWorkerMessage::Progress { resume_state } => {
+                progress.checkpoint(resume_state)?;
+            }
+            PhaseWorkerMessage::Yielded { resume_state } => {
+                *terminal = Some(PhaseExecutionResult::Yielded { resume_state });
+            }
+            PhaseWorkerMessage::Complete { product } => {
+                *terminal = Some(PhaseExecutionResult::Complete(product));
             }
         }
-        let status = child.wait()?;
-        ensure!(status.success(), "phase worker exited with status {status}");
-        terminal.context("phase worker exited without a terminal message")
     }
+}
+
+fn checked_worker_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .context("phase worker timeout is too large for the monotonic clock")
+}
+
+fn ensure_worker_before_deadline(deadline: Instant, timeout: Duration) -> Result<()> {
+    ensure!(
+        Instant::now() < deadline,
+        "phase worker exceeded its {timeout:?} wall timeout"
+    );
+    Ok(())
 }
 
 fn metric_phase(phase: &crate::workflow::PhaseV2, phase_index: usize) -> Result<MetricPhase> {
     let index = u32::try_from(phase_index).context("workflow phase index exceeds u32")?;
-    let kind = match phase.kind {
-        crate::workflow::PhaseKind::Pretrain => MetricPhaseKind::Pretrain,
-        crate::workflow::PhaseKind::ContinuedPretrain => MetricPhaseKind::ContinuedPretrain,
-        crate::workflow::PhaseKind::Sft => MetricPhaseKind::Sft,
-        crate::workflow::PhaseKind::Preference => MetricPhaseKind::Preference,
-        crate::workflow::PhaseKind::Rl => MetricPhaseKind::Rl,
-        crate::workflow::PhaseKind::Distillation => MetricPhaseKind::Distillation,
-        crate::workflow::PhaseKind::Sleep => MetricPhaseKind::Sleep,
-        crate::workflow::PhaseKind::Quantization => MetricPhaseKind::Quantization,
-        crate::workflow::PhaseKind::Evaluation => MetricPhaseKind::Evaluation,
-        crate::workflow::PhaseKind::Promotion => MetricPhaseKind::Promotion,
-    };
     Ok(MetricPhase {
         index,
         name: phase.name.clone(),
-        kind,
+        kind: phase.kind.into(),
     })
-}
-
-fn read_worker_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            ensure!(
-                line.is_empty(),
-                "phase worker emitted an unterminated JSONL message"
-            );
-            return Ok(None);
-        }
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |position| position + 1);
-        ensure!(
-            line.len() + take <= MAX_WORKER_MESSAGE_BYTES,
-            "phase worker emitted a JSONL message larger than {MAX_WORKER_MESSAGE_BYTES} bytes"
-        );
-        line.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if line.ends_with(b"\n") {
-            return Ok(Some(line));
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -291,7 +445,7 @@ impl AtomicRuntimeCheckpoint {
             !checkpoint.path.as_os_str().is_empty(),
             "workflow-runtime checkpoint path is empty"
         );
-        validate_sha256(&checkpoint.executor_sha256)?;
+        validate_sha256_identity(&checkpoint.executor_sha256, "runtime executor identity")?;
         Ok(checkpoint)
     }
 
@@ -335,9 +489,14 @@ impl AtomicRuntimeCheckpoint {
         self.publish(None, state)
     }
 
-    pub fn load(&mut self, workflow: &ResolvedWorkflow) -> Result<WorkflowRunState> {
+    fn read_saved(&self) -> Result<RuntimeCheckpointFile> {
         ensure_regular_non_symlink(&self.path, "workflow-runtime checkpoint")?;
-        let bytes = fs::read(&self.path).with_context(|| {
+        let bytes = read_regular_bounded(
+            &self.path,
+            MAX_RUNTIME_CHECKPOINT_BYTES,
+            "workflow-runtime checkpoint",
+        )
+        .with_context(|| {
             format!(
                 "failed to read workflow-runtime checkpoint {}",
                 self.path.display()
@@ -349,6 +508,10 @@ impl AtomicRuntimeCheckpoint {
                 self.path.display()
             )
         })?;
+        Ok(saved)
+    }
+
+    fn validate_execution_identity(&self, saved: &RuntimeCheckpointFile) -> Result<()> {
         ensure!(
             saved.version == RUNTIME_CHECKPOINT_FILE_VERSION,
             "unsupported workflow-runtime checkpoint-file version {}",
@@ -356,8 +519,22 @@ impl AtomicRuntimeCheckpoint {
         );
         ensure!(
             saved.executor_sha256 == self.executor_sha256,
-            "workflow-runtime checkpoint was produced by a different phase worker"
+            "workflow-runtime checkpoint was produced by a different execution dispatch"
         );
+        Ok(())
+    }
+
+    /// Read-only preflight for adapter-backed resume. Callers can reject a
+    /// replacement native runtime before constructing it or truncating the
+    /// metric journal to the checkpoint's committed prefix.
+    pub fn verify_execution_identity(&self) -> Result<()> {
+        let saved = self.read_saved()?;
+        self.validate_execution_identity(&saved)
+    }
+
+    pub fn load(&mut self, workflow: &ResolvedWorkflow) -> Result<WorkflowRunState> {
+        let saved = self.read_saved()?;
+        self.validate_execution_identity(&saved)?;
         saved.state.validate(workflow)?;
         self.resume_metrics(saved.metrics.as_ref())?;
         Ok(saved.state)
@@ -540,44 +717,94 @@ fn ensure_path_absent(path: &Path, label: &str) -> Result<()> {
 }
 
 pub fn file_sha256(path: &Path) -> Result<String> {
-    let mut input = BufReader::new(
-        File::open(path).with_context(|| format!("failed to hash {}", path.display()))?,
-    );
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        use std::io::Read as _;
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
-}
-
-fn validate_sha256(value: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .context("SHA-256 identity must start with `sha256:`")?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "SHA-256 identity must contain 64 lowercase hexadecimal digits"
-    );
-    Ok(())
+    hash_file_sha256(path)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::*;
     use crate::metrics::{MetricEvent, PhaseBoundary, PhaseTimingMetrics, validate_metric_log};
     use crate::runtime::{ExecutorRegistry, RuntimeStatus, run_until_yield_or_complete};
-    use crate::workflow::{WorkflowV2, load_workflow};
+    use crate::workflow::{ResolvedWorkflow, WorkflowV2, load_workflow};
+
+    struct NoopProgress;
+
+    impl PhaseProgressSink for NoopProgress {
+        fn checkpoint(&mut self, _: Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn metric(&mut self, _: MetricContext, _: MetricEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn one_phase_workflow(directory: &Path) -> ResolvedWorkflow {
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [{
+                "name": "pretrain",
+                "type": "pretrain",
+                "task": {"type": "causal_lm"},
+                "data": "data.jsonl",
+                "sequence_length": 8,
+                "batch_size": 1,
+                "gradient_accumulation": 1,
+                "steps": 1
+            }]
+        }))
+        .unwrap();
+        workflow.resolve(&directory.join("workflow.json")).unwrap()
+    }
+
+    fn phase_request(workflow: &ResolvedWorkflow) -> PhaseExecutionRequest {
+        PhaseExecutionRequest {
+            phase_index: 0,
+            phase: workflow.phases[0].clone(),
+            input_checkpoint: None,
+            resume_state: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn python_with_setsid() -> PathBuf {
+        [
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "/opt/homebrew/bin/python3",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("setsid worker tests require an absolute Python 3 interpreter")
+    }
+
+    #[cfg(unix)]
+    fn kill_detached_pid(path: &Path) {
+        for _ in 0..100 {
+            if let Ok(value) = fs::read_to_string(path)
+                && let Ok(pid) = value.trim().parse::<i32>()
+            {
+                // SAFETY: the test helper wrote its own positive process ID.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("detached worker did not publish its pid");
+    }
 
     fn timing_event() -> MetricEvent {
         MetricEvent::PhaseTiming(PhaseTimingMetrics {
@@ -859,6 +1086,401 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn protocol_failure_terminates_the_worker_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workflow_path = directory.path().join("workflow.json");
+        fs::write(
+            &workflow_path,
+            r#"{
+                "version": 2,
+                "phases": [{
+                    "name": "pretrain",
+                    "type": "pretrain",
+                    "task": {"type": "causal_lm"},
+                    "data": "data.jsonl",
+                    "sequence_length": 8,
+                    "batch_size": 1,
+                    "gradient_accumulation": 1,
+                    "steps": 1
+                }]
+            }"#,
+        )
+        .unwrap();
+        let workflow = load_workflow(&workflow_path).unwrap();
+        let worker_path = directory.path().join("worker.sh");
+        fs::write(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "echo '{not-json'\n",
+                "sleep 1\n",
+                "echo leaked > \"$1\"\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&worker_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&worker_path, permissions).unwrap();
+        let leaked_side_effect = directory.path().join("leaked-side-effect");
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut registry = ExecutorRegistry::new();
+        registry
+            .register(
+                crate::workflow::PhaseKind::Pretrain,
+                ExternalPhaseExecutor::new(
+                    &worker_path,
+                    vec![leaked_side_effect.clone().into_os_string()],
+                    &worker_hash,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let state_path = directory.path().join("runtime.json");
+        let mut sink = AtomicRuntimeCheckpoint::new(&state_path, &worker_hash).unwrap();
+        let mut state = WorkflowRunState::new(&workflow, None).unwrap();
+        sink.initialize(&state).unwrap();
+
+        let error =
+            run_until_yield_or_complete(&workflow, &mut state, &mut registry, &mut (), &mut sink)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("invalid protocol JSON"), "{error}");
+        std::thread::sleep(Duration::from_millis(1_200));
+        assert!(
+            !leaked_side_effect.exists(),
+            "failed worker continued mutating state after its protocol error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wall_timeout_terminates_worker_and_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = one_phase_workflow(directory.path());
+        let worker_path = directory.path().join("worker.sh");
+        let leaked_side_effect = directory.path().join("leaked-side-effect");
+        write_executable(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r request\n",
+                "test -n \"$request\"\n",
+                "(sleep 1; echo leaked > \"$1\") &\n",
+                "sleep 30\n"
+            ),
+        );
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut executor = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![leaked_side_effect.clone().into_os_string()],
+            &worker_hash,
+        )
+        .unwrap()
+        .with_timeout(Duration::from_millis(150))
+        .unwrap();
+        let start = Instant::now();
+        let error = executor
+            .execute(&phase_request(&workflow), &mut (), &mut NoopProgress)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wall timeout"), "{error}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "phase timeout did not return promptly"
+        );
+        thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            !leaked_side_effect.exists(),
+            "timed-out worker descendant remained able to mutate state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wall_timeout_is_bounded_when_setsid_descendant_retains_protocol_pipes() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = one_phase_workflow(directory.path());
+        let worker_path = directory.path().join("setsid-timeout.sh");
+        let detached_pid = directory.path().join("detached.pid");
+        write_executable(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r request\n",
+                "test -n \"$request\"\n",
+                "\"$1\" -c 'import os,sys,time; os.setsid(); f=open(sys.argv[1],\"w\"); f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno()); time.sleep(30)' \"$2\" &\n",
+                "while [ ! -s \"$2\" ]; do /bin/sleep 0.01; done\n",
+                "/bin/sleep 30\n"
+            ),
+        );
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut executor = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![
+                python_with_setsid().into_os_string(),
+                detached_pid.clone().into_os_string(),
+            ],
+            &worker_hash,
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(3))
+        .unwrap();
+
+        let started = Instant::now();
+        let result = executor.execute(&phase_request(&workflow), &mut (), &mut NoopProgress);
+        let elapsed = started.elapsed();
+        kill_detached_pid(&detached_pid);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("wall timeout"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "setsid descendant delayed phase timeout for {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_error_is_bounded_when_setsid_descendant_retains_stdout() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = one_phase_workflow(directory.path());
+        let worker_path = directory.path().join("setsid-error.sh");
+        let detached_pid = directory.path().join("detached.pid");
+        write_executable(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r request\n",
+                "test -n \"$request\"\n",
+                "\"$1\" -c 'import os,sys,time; os.setsid(); f=open(sys.argv[1],\"w\"); f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno()); time.sleep(30)' \"$2\" &\n",
+                "while [ ! -s \"$2\" ]; do /bin/sleep 0.01; done\n",
+                "printf '{not-json}\\n'\n",
+                "/bin/sleep 30\n"
+            ),
+        );
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut executor = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![
+                python_with_setsid().into_os_string(),
+                detached_pid.clone().into_os_string(),
+            ],
+            &worker_hash,
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(3))
+        .unwrap();
+
+        let started = Instant::now();
+        let result = executor.execute(&phase_request(&workflow), &mut (), &mut NoopProgress);
+        let elapsed = started.elapsed();
+        kill_detached_pid(&detached_pid);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("invalid protocol JSON"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "setsid descendant delayed phase protocol error for {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_worker_does_not_wait_for_descendant_holding_stdout() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = one_phase_workflow(directory.path());
+        let worker_path = directory.path().join("worker.sh");
+        write_executable(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r request\n",
+                "test -n \"$request\"\n",
+                "sleep 30 &\n",
+                "echo '{\"type\":\"complete\",\"product\":{\"type\":\"model_candidate\",\"checkpoint\":{\"uri\":\"checkpoint://candidate\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n"
+            ),
+        );
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut executor = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash)
+            .unwrap()
+            .with_timeout(Duration::from_secs(5))
+            .unwrap();
+        let start = Instant::now();
+        let result = executor
+            .execute(&phase_request(&workflow), &mut (), &mut NoopProgress)
+            .unwrap();
+        assert!(
+            matches!(result, PhaseExecutionResult::Complete(_)),
+            "worker did not return its terminal product"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "descendant-held stdout delayed worker completion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leader_exit_is_bounded_when_setsid_descendant_retains_stdout() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = one_phase_workflow(directory.path());
+        let worker_path = directory.path().join("setsid-exit.sh");
+        let detached_pid = directory.path().join("detached.pid");
+        write_executable(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r request\n",
+                "test -n \"$request\"\n",
+                "\"$1\" -c 'import os,sys,time; os.setsid(); f=open(sys.argv[1],\"w\"); f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno()); time.sleep(30)' \"$2\" &\n",
+                "while [ ! -s \"$2\" ]; do /bin/sleep 0.01; done\n",
+                "echo '{\"type\":\"complete\",\"product\":{\"type\":\"model_candidate\",\"checkpoint\":{\"uri\":\"checkpoint://candidate\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n"
+            ),
+        );
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut executor = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![
+                python_with_setsid().into_os_string(),
+                detached_pid.clone().into_os_string(),
+            ],
+            &worker_hash,
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(2))
+        .unwrap();
+
+        let started = Instant::now();
+        let result = executor.execute(&phase_request(&workflow), &mut (), &mut NoopProgress);
+        let elapsed = started.elapsed();
+        kill_detached_pid(&detached_pid);
+        assert!(matches!(result.unwrap(), PhaseExecutionResult::Complete(_)));
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "setsid descendant delayed phase leader exit for {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_identity_binds_arguments_and_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker_path = directory.path().join("worker.sh");
+        write_executable(&worker_path, "#!/bin/sh\nexit 0\n");
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let baseline = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![OsString::from("argument")],
+            &worker_hash,
+        )
+        .unwrap();
+        let same = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![OsString::from("argument")],
+            &worker_hash,
+        )
+        .unwrap();
+        let changed_argument = ExternalPhaseExecutor::new(
+            &worker_path,
+            vec![OsString::from("different")],
+            &worker_hash,
+        )
+        .unwrap();
+        let changed_timeout = same.clone().with_timeout(Duration::from_secs(60)).unwrap();
+
+        assert_eq!(baseline.execution_identity(), same.execution_identity());
+        assert_ne!(
+            baseline.execution_identity(),
+            changed_argument.execution_identity()
+        );
+        assert_ne!(
+            baseline.execution_identity(),
+            changed_timeout.execution_identity()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_runs_with_empty_environment_and_root_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = one_phase_workflow(directory.path());
+        let worker_path = directory.path().join("worker.sh");
+        write_executable(
+            &worker_path,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r request\n",
+                "test -n \"$request\"\n",
+                "test \"$PWD\" = /\n",
+                "test -z \"${HOME+x}\"\n",
+                "echo '{\"type\":\"complete\",\"product\":{\"type\":\"model_candidate\",\"checkpoint\":{\"uri\":\"checkpoint://candidate\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n"
+            ),
+        );
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let mut executor = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash)
+            .unwrap()
+            .with_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            executor
+                .execute(&phase_request(&workflow), &mut (), &mut NoopProgress)
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_phase_worker_generation_survives_path_replacement_before_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker_path = directory.path().join("worker.sh");
+        write_executable(&worker_path, "#!/bin/sh\nprintf 'pinned\\n'\n");
+        let worker_hash = file_sha256(&worker_path).unwrap();
+        let executor = ExternalPhaseExecutor::new(&worker_path, Vec::new(), &worker_hash).unwrap();
+        let (mut command, staged) = executor.pinned_command().unwrap();
+
+        let replacement = directory.path().join("replacement.sh");
+        write_executable(&replacement, "#!/bin/sh\nprintf 'replacement\\n'\n");
+        fs::rename(&replacement, &worker_path).unwrap();
+
+        command.stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"pinned\n");
+        drop(staged);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_worker_arguments_are_canonical_and_bounded() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let worker_path = directory.path().join("worker.sh");
+        write_executable(&worker_path, "#!/bin/sh\nexit 0\n");
+        let worker_hash = file_sha256(&worker_path).unwrap();
+
+        let too_many = vec![OsString::from("x"); MAX_PHASE_WORKER_ARGUMENTS + 1];
+        let error = ExternalPhaseExecutor::new(&worker_path, too_many, &worker_hash)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than"), "{error}");
+
+        let oversized = OsString::from("x".repeat(MAX_PHASE_WORKER_ARGUMENT_BYTES + 1));
+        let error = ExternalPhaseExecutor::new(&worker_path, vec![oversized], &worker_hash)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds"), "{error}");
+
+        let nul = OsString::from_vec(b"a\0b".to_vec());
+        let error = ExternalPhaseExecutor::new(&worker_path, vec![nul], &worker_hash)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("NUL"), "{error}");
+    }
+
     #[test]
     fn checkpoint_rejects_a_different_worker_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -877,11 +1499,29 @@ mod tests {
         let second = format!("sha256:{:064x}", 2);
         let path = directory.path().join("runtime.json");
         let mut writer = AtomicRuntimeCheckpoint::new(&path, &first).unwrap();
+        let initial = ImmutableModelCheckpoint::new(
+            "checkpoint://promotion-input",
+            format!("sha256:{:064x}", 3),
+        )
+        .unwrap();
         writer
-            .initialize(&WorkflowRunState::new(&workflow, None).unwrap())
+            .initialize(&WorkflowRunState::new(&workflow, Some(initial)).unwrap())
             .unwrap();
         let mut reader = AtomicRuntimeCheckpoint::new(&path, &second).unwrap();
         assert!(reader.load(&workflow).is_err());
+    }
+
+    #[test]
+    fn runtime_checkpoint_read_is_bounded_before_json_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.json");
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_RUNTIME_CHECKPOINT_BYTES + 1)
+            .unwrap();
+        let checkpoint = AtomicRuntimeCheckpoint::new(&path, format!("sha256:{:064x}", 1)).unwrap();
+        let error = format!("{:#}", checkpoint.verify_execution_identity().unwrap_err());
+        assert!(error.contains("byte limit"), "{error}");
     }
 
     #[cfg(unix)]
@@ -902,21 +1542,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("regular non-symlink file"), "{error}");
-    }
-
-    #[test]
-    fn worker_protocol_rejects_unterminated_and_oversized_messages_without_unbounded_reads() {
-        let mut unterminated = Cursor::new(b"{}".to_vec());
-        assert!(read_worker_message(&mut unterminated).is_err());
-
-        let mut oversized = Cursor::new(vec![b'x'; MAX_WORKER_MESSAGE_BYTES + 1]);
-        assert!(read_worker_message(&mut oversized).is_err());
-
-        let mut valid = Cursor::new(b"{}\n".to_vec());
-        assert_eq!(
-            read_worker_message(&mut valid).unwrap(),
-            Some(b"{}\n".to_vec())
-        );
-        assert_eq!(read_worker_message(&mut valid).unwrap(), None);
     }
 }

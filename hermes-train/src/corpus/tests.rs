@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::*;
 
@@ -106,8 +107,36 @@ fn search_api_config() -> SearchApiConfig {
         max_retries: 0,
         retry_initial_ms: 1,
         retry_max_ms: 1,
+        max_response_bytes: 1024 * 1024,
         auth: None,
     }
+}
+
+fn discover_search_response(config: SearchApiConfig, response: Value) -> Result<DiscoveryPage> {
+    let (transport, _) = MockSearchTransport::new(vec![response]);
+    SearchApiClient::with_transport(config, transport)?.discover(
+        &DiscoveryQuery {
+            name: "probe".to_owned(),
+            text: "probe".to_owned(),
+            limit: 1,
+            parameters: BTreeMap::new(),
+        },
+        0,
+        1,
+    )
+}
+
+fn valid_search_response() -> Value {
+    json!({
+        "snapshot": {"provider": "search-test", "revision": "index-42"},
+        "results": {
+            "count": 1,
+            "items": [{
+                "primary_key": "record-1",
+                "rank": 0.75
+            }]
+        }
+    })
 }
 
 #[test]
@@ -193,6 +222,52 @@ fn search_api_rejects_a_vector_field_outside_its_declared_fusion_clause() {
 }
 
 #[test]
+fn search_api_rejects_overlapping_request_write_targets() {
+    let cases = [
+        {
+            let mut config = search_api_config();
+            config.request_mapping.disabled_reranker_pointers[0] =
+                config.fusion.marker_pointer.clone();
+            ("reranker and fusion marker", config)
+        },
+        {
+            let mut config = search_api_config();
+            config.request_mapping.offset_pointer = config.request_mapping.query_pointer.clone();
+            ("query and pagination", config)
+        },
+        {
+            let mut config = search_api_config();
+            config.request_mapping.parameter_pointers.insert(
+                "types".to_owned(),
+                config.request_mapping.limit_pointer.clone(),
+            );
+            ("parameter and pagination", config)
+        },
+        {
+            let mut config = search_api_config();
+            config.snapshot.request_revision_pointer = config.fusion.marker_pointer.clone();
+            ("snapshot and fusion marker", config)
+        },
+        {
+            let mut config = search_api_config();
+            config.request_mapping.return_documents_pointer =
+                Some(config.fusion.sparse.clause_pointer.clone());
+            ("ancestor and descendant", config)
+        },
+    ];
+
+    for (name, config) in cases {
+        let (transport, _) = MockSearchTransport::new(vec![]);
+        let error = SearchApiClient::with_transport(config, transport)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("write targets"), "{name}: {error}");
+        assert!(error.contains("overlap"), "{name}: {error}");
+    }
+}
+
+#[test]
 fn search_api_rejects_missing_or_drifted_remote_snapshot_proof() {
     for response in [
         json!({"results": {"count": 0, "items": []}}),
@@ -218,6 +293,127 @@ fn search_api_rejects_missing_or_drifted_remote_snapshot_proof() {
         let error = format!("{error:#}");
         assert!(error.contains("snapshot"), "{error}");
     }
+}
+
+#[test]
+fn search_api_rejects_missing_or_malformed_configured_numeric_response_fields() {
+    let cases = [
+        {
+            let mut response = valid_search_response();
+            response["results"]["items"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("rank");
+            ("missing score", response, "configured score")
+        },
+        {
+            let mut response = valid_search_response();
+            response["results"]["items"][0]["rank"] = json!("high");
+            ("wrong score type", response, "finite number")
+        },
+        {
+            let mut response = valid_search_response();
+            response["results"].as_object_mut().unwrap().remove("count");
+            ("missing total", response, "configured total_hits")
+        },
+        {
+            let mut response = valid_search_response();
+            response["results"]["count"] = json!("one");
+            (
+                "wrong total type",
+                response,
+                "nonnegative integer fitting u64",
+            )
+        },
+        {
+            let mut response = valid_search_response();
+            response["results"]["count"] = json!(-1);
+            (
+                "negative total",
+                response,
+                "nonnegative integer fitting u64",
+            )
+        },
+    ];
+
+    for (name, response, expected) in cases {
+        let error = format!(
+            "{:#}",
+            discover_search_response(search_api_config(), response).unwrap_err()
+        );
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+}
+
+#[test]
+fn absent_numeric_response_mappings_keep_explicit_defaults() {
+    let mut config = search_api_config();
+    config.response_mapping.score_pointer = None;
+    config.response_mapping.total_hits_pointer = None;
+    let response = json!({
+        "snapshot": {"provider": "search-test", "revision": "index-42"},
+        "results": {"items": [{"primary_key": "record-1"}]}
+    });
+
+    let page = discover_search_response(config, response).unwrap();
+    assert_eq!(page.total_hits, None);
+    assert_eq!(page.hits[0].score, 0.0);
+}
+
+#[test]
+fn search_api_enforces_configured_page_and_resource_limits() {
+    let mut response = valid_search_response();
+    response["results"]["count"] = json!(2);
+    response["results"]["items"] = json!([
+        {"primary_key": "record-1", "rank": 0.75},
+        {"primary_key": "record-2", "rank": 0.50}
+    ]);
+    let error = discover_search_response(search_api_config(), response)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("request limit of 1"), "{error}");
+
+    for (name, mutate) in [
+        (
+            "page size",
+            (|config: &mut SearchApiConfig| config.page_size = usize::MAX)
+                as fn(&mut SearchApiConfig),
+        ),
+        (
+            "response bytes",
+            (|config: &mut SearchApiConfig| config.max_response_bytes = usize::MAX)
+                as fn(&mut SearchApiConfig),
+        ),
+        (
+            "timeout",
+            (|config: &mut SearchApiConfig| config.timeout_seconds = u64::MAX)
+                as fn(&mut SearchApiConfig),
+        ),
+        (
+            "retry delay",
+            (|config: &mut SearchApiConfig| config.retry_max_ms = u64::MAX)
+                as fn(&mut SearchApiConfig),
+        ),
+    ] {
+        let mut config = search_api_config();
+        mutate(&mut config);
+        assert!(config.validate().is_err(), "accepted hostile {name}");
+    }
+}
+
+#[test]
+fn search_api_rejects_a_malformed_configured_inline_text() {
+    let mut config = search_api_config();
+    config.response_mapping.inline_text_pointer = Some("/body".to_owned());
+    let mut response = valid_search_response();
+    response["results"]["items"][0]["body"] = json!(["not", "text"]);
+
+    let error = format!(
+        "{:#}",
+        discover_search_response(config, response).unwrap_err()
+    );
+    assert!(error.contains("inline text"), "{error}");
+    assert!(error.contains("must be a string"), "{error}");
 }
 
 struct MockPostgresExecutor {
@@ -425,6 +621,37 @@ struct AdversarialSearchBackend {
     pages: Mutex<VecDeque<DiscoveryPage>>,
 }
 
+struct SnapshotOnlySearchBackend {
+    snapshot: SourceSnapshot,
+}
+
+impl SearchBackend for SnapshotOnlySearchBackend {
+    fn name(&self) -> &str {
+        "snapshot_only_search"
+    }
+
+    fn configuration(&self) -> Result<Value> {
+        Ok(json!({"type": "snapshot_only"}))
+    }
+
+    fn snapshot(&self) -> Result<SourceSnapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn page_size(&self) -> usize {
+        1
+    }
+
+    fn discover(
+        &self,
+        _query: &DiscoveryQuery,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<DiscoveryPage> {
+        unreachable!("invalid initial snapshots fail before discovery")
+    }
+}
+
 impl SearchBackend for AdversarialSearchBackend {
     fn name(&self) -> &str {
         "adversarial_search"
@@ -529,6 +756,59 @@ struct SnapshotMaterializer {
     revision: &'static str,
 }
 
+struct DuplicateKeyMaterializer;
+
+impl RecordMaterializer for DuplicateKeyMaterializer {
+    fn name(&self) -> &str {
+        "duplicate_key_store"
+    }
+
+    fn configuration(&self) -> Result<Value> {
+        Ok(json!({"type": "adversarial_duplicates"}))
+    }
+
+    fn snapshot(&self) -> Result<SourceSnapshot> {
+        Ok(SourceSnapshot {
+            provider: "duplicate_key_store".to_owned(),
+            revision: "stable".to_owned(),
+        })
+    }
+
+    fn materialize(&self, hits: &[DiscoveryHit]) -> Result<Vec<MaterializedRecord>> {
+        let mut records = MockMaterializer.materialize(hits)?;
+        records.push(
+            records
+                .first()
+                .expect("pipeline sends a non-empty batch")
+                .clone(),
+        );
+        Ok(records)
+    }
+}
+
+struct OmittingMaterializer;
+
+impl RecordMaterializer for OmittingMaterializer {
+    fn name(&self) -> &str {
+        "omitting_store"
+    }
+
+    fn configuration(&self) -> Result<Value> {
+        Ok(json!({"type": "omits_deleted_rows"}))
+    }
+
+    fn snapshot(&self) -> Result<SourceSnapshot> {
+        MockMaterializer.snapshot()
+    }
+
+    fn materialize(&self, hits: &[DiscoveryHit]) -> Result<Vec<MaterializedRecord>> {
+        // Model a row deleted between discovery and materialization.
+        let mut records = MockMaterializer.materialize(hits)?;
+        records.retain(|record| record.record_key != "b");
+        Ok(records)
+    }
+}
+
 impl RecordMaterializer for SnapshotMaterializer {
     fn name(&self) -> &str {
         "mock_store"
@@ -567,6 +847,59 @@ impl CorpusTokenizer for MockTokenizer {
             .enumerate()
             .map(|(index, _)| index as u32 + 1)
             .collect())
+    }
+}
+
+struct FixedTokenizer {
+    snapshot: TokenizerSnapshot,
+    tokens: Vec<u32>,
+}
+
+impl CorpusTokenizer for FixedTokenizer {
+    fn snapshot(&self) -> TokenizerSnapshot {
+        self.snapshot.clone()
+    }
+
+    fn encode(&self, _text: &str) -> Result<Vec<u32>> {
+        Ok(self.tokens.clone())
+    }
+}
+
+struct DriftingTokenizer {
+    encoded: Mutex<bool>,
+}
+
+impl CorpusTokenizer for DriftingTokenizer {
+    fn snapshot(&self) -> TokenizerSnapshot {
+        TokenizerSnapshot {
+            implementation: "drifting".to_owned(),
+            revision: if *self.encoded.lock().unwrap() {
+                "2".to_owned()
+            } else {
+                "1".to_owned()
+            },
+            vocabulary_size: 100,
+        }
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        *self.encoded.lock().unwrap() = true;
+        MockTokenizer.encode(text)
+    }
+}
+
+struct CountingTokenizer {
+    calls: Mutex<usize>,
+}
+
+impl CorpusTokenizer for CountingTokenizer {
+    fn snapshot(&self) -> TokenizerSnapshot {
+        MockTokenizer.snapshot()
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        *self.calls.lock().unwrap() += 1;
+        MockTokenizer.encode(text)
     }
 }
 
@@ -661,6 +994,47 @@ fn pipeline_config() -> CorpusBuildConfig {
     }
 }
 
+#[test]
+fn corpus_config_bounds_work_amplification_before_pipeline_execution() {
+    let mut config = pipeline_config();
+    config.discovery.materialization_batch_size = usize::MAX;
+    assert!(config.validate().is_err());
+
+    let mut config = pipeline_config();
+    config.discovery.queries[0].limit = usize::MAX;
+    assert!(config.validate().is_err());
+
+    let mut config = pipeline_config();
+    config.repetition.max_copies_per_record = usize::MAX;
+    assert!(config.validate().is_err());
+
+    let mut config = pipeline_config();
+    config.transformations = (0..1_025)
+        .map(|index| TransformationConfig {
+            name: format!("transform-{index}"),
+            template: "${text}".to_owned(),
+            copies: 1,
+            when: RecordPredicate::default(),
+        })
+        .collect();
+    assert!(config.validate().is_err());
+
+    let mut config = pipeline_config();
+    config.transformations[0].name = "source".to_owned();
+    assert!(config.validate().is_err());
+
+    let mut config = pipeline_config();
+    config.classification.topic_rules = vec![ClassificationRule {
+        label: "non-mathematics".to_owned(),
+        priority: 0,
+        any_terms: Vec::new(),
+        all_terms: Vec::new(),
+        none_terms: vec!["mathematics".to_owned()],
+        metadata_equals: BTreeMap::new(),
+    }];
+    config.validate().unwrap();
+}
+
 fn target_boundary_config(
     build_id: &str,
     minimum: u64,
@@ -675,6 +1049,199 @@ fn target_boundary_config(
         maximum,
     };
     config
+}
+
+fn build_test_corpus(
+    config: CorpusBuildConfig,
+    tokenizer: &dyn CorpusTokenizer,
+) -> (tempfile::TempDir, std::path::PathBuf, CorpusManifest) {
+    let root = tempfile::tempdir().unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let (path, manifest) =
+        CorpusPipeline::new(config, &backend, &MockMaterializer, tokenizer, &mut dedup)
+            .unwrap()
+            .run(root.path())
+            .unwrap();
+    (root, path, manifest)
+}
+
+fn rehash_manifest_body(manifest: &mut CorpusManifest) {
+    manifest.manifest_sha256 =
+        super::pipeline::canonical_json_sha256(&serde_json::to_value(&manifest.build).unwrap())
+            .unwrap();
+}
+
+fn rehash_manifest_configuration_and_body(manifest: &mut CorpusManifest) {
+    manifest.build.config_sha256 =
+        super::pipeline::corpus_manifest_configuration_sha256(&manifest.build).unwrap();
+    rehash_manifest_body(manifest);
+}
+
+#[test]
+fn pipeline_rejects_invalid_generic_source_snapshots_before_io() {
+    for (label, snapshot) in [
+        (
+            "provider",
+            SourceSnapshot {
+                provider: " ".to_owned(),
+                revision: "stable".to_owned(),
+            },
+        ),
+        (
+            "revision",
+            SourceSnapshot {
+                provider: "mock".to_owned(),
+                revision: String::new(),
+            },
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let backend = SnapshotOnlySearchBackend { snapshot };
+        let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+        let error = CorpusPipeline::new(
+            pipeline_config(),
+            &backend,
+            &MockMaterializer,
+            &MockTokenizer,
+            &mut dedup,
+        )
+        .unwrap()
+        .run(root.path())
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("source snapshot"), "{label}: {error}");
+        assert!(error.contains(label), "{label}: {error}");
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let materializer = SnapshotMaterializer { revision: "" };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &materializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("materializer"), "{error}");
+    assert!(error.contains("revision"), "{error}");
+}
+
+#[test]
+fn pipeline_rejects_empty_generic_discovery_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = AdversarialSearchBackend {
+        page_size: 2,
+        pages: Mutex::new([discovery_page(&[""], Some(1))].into_iter().collect()),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &MockMaterializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("invalid hit"), "{error}");
+    assert!(error.contains("record key must not be empty"), "{error}");
+}
+
+#[test]
+fn pipeline_rejects_non_finite_generic_discovery_scores() {
+    for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let root = tempfile::tempdir().unwrap();
+        let mut hit = discovery_hit("invalid-score");
+        hit.score = score;
+        let backend = AdversarialSearchBackend {
+            page_size: 1,
+            pages: Mutex::new(
+                [DiscoveryPage {
+                    hits: vec![hit],
+                    total_hits: Some(1),
+                    snapshot: SourceSnapshot {
+                        provider: "mock".to_owned(),
+                        revision: "stable".to_owned(),
+                    },
+                }]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+        let error = CorpusPipeline::new(
+            pipeline_config(),
+            &backend,
+            &MockMaterializer,
+            &MockTokenizer,
+            &mut dedup,
+        )
+        .unwrap()
+        .run(root.path())
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("invalid hit"), "{score}: {error}");
+        assert!(error.contains("score must be finite"), "{score}: {error}");
+    }
+}
+
+#[test]
+fn pipeline_counts_records_the_materializer_omitted() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let (_, manifest) = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &OmittingMaterializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap();
+    assert_eq!(manifest.build.stats.unmaterialized_records, 1);
+    assert_eq!(manifest.build.stats.materialized_records, 2);
+}
+
+#[test]
+fn pipeline_rejects_duplicate_keys_from_generic_materializers() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &DuplicateKeyMaterializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("duplicate record key"), "{error}");
 }
 
 #[test]
@@ -846,6 +1413,459 @@ fn pipeline_runs_all_stages_and_publishes_immutable_manifest() {
         .write_all(b"tampered")
         .unwrap();
     assert!(manifest.verify(&path).is_err());
+}
+
+#[test]
+fn authenticated_corpus_reuses_the_verified_shard_generation() {
+    let (_root, path, manifest) = build_test_corpus(pipeline_config(), &MockTokenizer);
+    let corpus = AuthenticatedCorpus::open_data_path(&path)
+        .unwrap()
+        .expect("a corpus directory must produce an authenticated binding");
+
+    assert_eq!(corpus.manifest().manifest_sha256, manifest.manifest_sha256);
+    assert_eq!(corpus.shard_count(), manifest.build.shards.len());
+    for index in 0..corpus.shard_count() {
+        let expected = fs::read(path.join(&manifest.build.shards[index].path)).unwrap();
+        let mut actual = Vec::new();
+        corpus
+            .with_shard(index, |_path, shard| {
+                shard.read_to_end(&mut actual)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+    corpus.ensure_still_published().unwrap();
+
+    let standalone = path.join("ordinary.jsonl");
+    fs::write(&standalone, b"{\"text\":\"ordinary\"}\n").unwrap();
+    assert!(
+        AuthenticatedCorpus::open_data_path(&standalone)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_corpus_reader_rejects_in_place_mutation_before_returning_more_bytes() {
+    let (_root, path, manifest) = build_test_corpus(pipeline_config(), &MockTokenizer);
+    let corpus = AuthenticatedCorpus::open_data_path(&path)
+        .unwrap()
+        .expect("a corpus directory must produce an authenticated binding");
+    let published = path.join(&manifest.build.shards[0].path);
+    let expected = fs::read(&published).unwrap();
+
+    let mut rest = Vec::new();
+    let error = corpus
+        .with_verified_shard(0, |_path, shard| {
+            let mut first = [0_u8; 1];
+            shard.read_exact(&mut first)?;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&published)?
+                .write_all(b"tampered")?;
+            shard.read_to_end(&mut rest)?;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changed"), "{error}");
+    assert_eq!(
+        rest,
+        expected[1..],
+        "only bytes captured and authenticated before the mutation may escape the verified reader"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_corpus_rejects_persistent_manifest_and_shard_replacements() {
+    fn replace_with_same_bytes(path: &std::path::Path) {
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, fs::read(path).unwrap()).unwrap();
+        fs::rename(&replacement, path).unwrap();
+    }
+
+    let (_manifest_root, manifest_path, _manifest) =
+        build_test_corpus(pipeline_config(), &MockTokenizer);
+    let manifest_binding = AuthenticatedCorpus::open_data_path(&manifest_path)
+        .unwrap()
+        .unwrap();
+    replace_with_same_bytes(&manifest_path.join("manifest.json"));
+    let error = manifest_binding
+        .ensure_still_published()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("corpus manifest"), "{error}");
+
+    let mut config = pipeline_config();
+    config.build_id = "persistent-shard-replacement".to_owned();
+    let (_shard_root, shard_path, manifest) = build_test_corpus(config, &MockTokenizer);
+    let shard_binding = AuthenticatedCorpus::open_data_path(&shard_path)
+        .unwrap()
+        .unwrap();
+    replace_with_same_bytes(&shard_path.join(&manifest.build.shards[0].path));
+    let error = shard_binding
+        .ensure_still_published()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("corpus shard"), "{error}");
+
+    let mut config = pipeline_config();
+    config.build_id = "replacement-during-shard-read".to_owned();
+    let (_during_root, during_path, manifest) = build_test_corpus(config, &MockTokenizer);
+    let during_binding = AuthenticatedCorpus::open_data_path(&during_path)
+        .unwrap()
+        .unwrap();
+    let published = during_path.join(&manifest.build.shards[0].path);
+    let parked = during_path.join("parked-original.jsonl");
+    let expected = fs::read(&published).unwrap();
+    let error = during_binding
+        .with_shard(0, |_path, opened| {
+            fs::rename(&published, &parked)?;
+            fs::write(&published, &expected)?;
+            let mut observed = Vec::new();
+            opened.read_to_end(&mut observed)?;
+            assert_eq!(
+                observed, expected,
+                "the opened handle must remain generation A"
+            );
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("corpus shard"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_corpus_rejects_symlinked_root_manifest_and_shard() {
+    use std::os::unix::fs::symlink;
+
+    let (root, path, manifest) = build_test_corpus(pipeline_config(), &MockTokenizer);
+    let root_alias = root.path().join("root-alias");
+    symlink(&path, &root_alias).unwrap();
+    assert!(AuthenticatedCorpus::open_data_path(&root_alias).is_err());
+
+    let manifest_path = path.join("manifest.json");
+    let real_manifest = path.join("real-manifest.json");
+    fs::rename(&manifest_path, &real_manifest).unwrap();
+    symlink("real-manifest.json", &manifest_path).unwrap();
+    assert!(AuthenticatedCorpus::open_data_path(&manifest_path).is_err());
+    fs::remove_file(&manifest_path).unwrap();
+    fs::rename(&real_manifest, &manifest_path).unwrap();
+
+    let shard_path = path.join(&manifest.build.shards[0].path);
+    let real_shard = path.join("real-shard.jsonl");
+    fs::rename(&shard_path, &real_shard).unwrap();
+    symlink("real-shard.jsonl", &shard_path).unwrap();
+    assert!(AuthenticatedCorpus::open_data_path(&path).is_err());
+}
+
+#[test]
+fn manifest_verification_recounts_actual_shard_rows_and_tokens() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let (path, manifest) = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &MockMaterializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap();
+
+    let mut forged_records = manifest.clone();
+    forged_records.build.shards[0].records += 1;
+    forged_records.build.stats.emitted_views += 1;
+    forged_records.manifest_sha256 = super::pipeline::canonical_json_sha256(
+        &serde_json::to_value(&forged_records.build).unwrap(),
+    )
+    .unwrap();
+    let error = forged_records.verify(&path).unwrap_err().to_string();
+    assert!(
+        error.contains("records but its manifest declares"),
+        "{error}"
+    );
+
+    let mut forged_tokens = manifest;
+    forged_tokens.build.shards[0].tokens += 1;
+    forged_tokens.build.stats.exposure_tokens += 1;
+    forged_tokens.manifest_sha256 = super::pipeline::canonical_json_sha256(
+        &serde_json::to_value(&forged_tokens.build).unwrap(),
+    )
+    .unwrap();
+    let error = forged_tokens.verify(&path).unwrap_err().to_string();
+    assert!(
+        error.contains("tokens but its manifest declares"),
+        "{error}"
+    );
+}
+
+#[test]
+fn manifest_verification_rejects_rehashed_cross_field_forgery() {
+    let (_root, path, manifest) = build_test_corpus(pipeline_config(), &MockTokenizer);
+
+    let mut wrong_version = manifest.clone();
+    wrong_version.build.version += 1;
+    rehash_manifest_body(&mut wrong_version);
+    let error = wrong_version.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("version differs"), "{error}");
+
+    let mut wrong_build = manifest.clone();
+    wrong_build.build.build_id.push_str("-forged");
+    rehash_manifest_body(&mut wrong_build);
+    let error = wrong_build.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("build_id differs"), "{error}");
+
+    let mut changed_component = manifest.clone();
+    changed_component.build.discovery.configuration["forged"] = json!(true);
+    rehash_manifest_body(&mut changed_component);
+    let error = changed_component.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("configuration hash"), "{error}");
+
+    let mut changed_hash = manifest.clone();
+    changed_hash.build.config_sha256 = "0".repeat(64);
+    rehash_manifest_body(&mut changed_hash);
+    let error = changed_hash.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("configuration hash"), "{error}");
+
+    let mut impossible_stats = manifest.clone();
+    impossible_stats.build.stats.unique_records = impossible_stats.build.stats.emitted_views + 1;
+    rehash_manifest_body(&mut impossible_stats);
+    let error = impossible_stats.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("unique-record count"), "{error}");
+
+    let mut impossible_topics = manifest.clone();
+    impossible_topics.build.topic_counts = BTreeMap::from([(
+        "forged".to_owned(),
+        impossible_topics.build.stats.unique_records + 1,
+    )]);
+    rehash_manifest_body(&mut impossible_topics);
+    let error = impossible_topics.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("topic counts"), "{error}");
+
+    let mut empty_component_name = manifest;
+    empty_component_name.build.materializer.name = " ".to_owned();
+    rehash_manifest_body(&mut empty_component_name);
+    let error = empty_component_name.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("component name"), "{error}");
+}
+
+#[test]
+fn manifest_verification_rejects_noncanonical_paths_and_symlinked_roots() {
+    let (root, path, manifest) = build_test_corpus(pipeline_config(), &MockTokenizer);
+
+    let mut noncanonical = manifest.clone();
+    noncanonical.build.shards[0].path = format!("./{}", noncanonical.build.shards[0].path);
+    rehash_manifest_body(&mut noncanonical);
+    let error = noncanonical.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("non-canonical"), "{error}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let alias = root.path().join("corpus-alias");
+        symlink(&path, &alias).unwrap();
+        let error = manifest.verify(&alias).unwrap_err().to_string();
+        assert!(error.contains("real directory"), "{error}");
+    }
+}
+
+#[test]
+fn manifest_verification_rejects_out_of_vocabulary_tokens_and_shard_limit_forgery() {
+    let (_root, path, manifest) = build_test_corpus(pipeline_config(), &MockTokenizer);
+
+    let mut out_of_vocabulary = manifest.clone();
+    let shard_path = path.join(&out_of_vocabulary.build.shards[0].path);
+    let mut rows = fs::read_to_string(&shard_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    rows[0]["tokens"][0] = json!(out_of_vocabulary.build.tokenizer.vocabulary_size);
+    let mut bytes = Vec::new();
+    for row in rows {
+        bytes.extend(serde_json::to_vec(&row).unwrap());
+        bytes.push(b'\n');
+    }
+    fs::write(&shard_path, &bytes).unwrap();
+    out_of_vocabulary.build.shards[0].sha256 = format!("{:x}", Sha256::digest(&bytes));
+    rehash_manifest_body(&mut out_of_vocabulary);
+    let error = out_of_vocabulary.verify(&path).unwrap_err().to_string();
+    assert!(error.contains("outside vocabulary size"), "{error}");
+
+    // Restore the authenticated shard before exercising an independent
+    // manifest/configuration forgery against the same immutable build.
+    let (_other_root, other_path, mut too_small_shards) =
+        build_test_corpus(pipeline_config(), &MockTokenizer);
+    too_small_shards.build.config.sharding.max_tokens_per_shard = 1;
+    rehash_manifest_configuration_and_body(&mut too_small_shards);
+    let error = too_small_shards
+        .verify(&other_path)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exceeds configured"), "{error}");
+}
+
+#[test]
+fn pipeline_rejects_invalid_drifting_and_out_of_vocabulary_tokenizers() {
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let invalid = FixedTokenizer {
+        snapshot: TokenizerSnapshot {
+            implementation: "invalid".to_owned(),
+            revision: "1".to_owned(),
+            vocabulary_size: 0,
+        },
+        tokens: vec![0],
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &MockMaterializer,
+        &invalid,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("vocabulary_size must be positive"));
+    assert!(backend.calls.lock().unwrap().is_empty());
+
+    let root = tempfile::tempdir().unwrap();
+    let out_of_vocabulary = FixedTokenizer {
+        snapshot: TokenizerSnapshot {
+            implementation: "invalid-output".to_owned(),
+            revision: "1".to_owned(),
+            vocabulary_size: 2,
+        },
+        tokens: vec![2],
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &MockMaterializer,
+        &out_of_vocabulary,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("outside vocabulary size"));
+
+    let root = tempfile::tempdir().unwrap();
+    let drifting = DriftingTokenizer {
+        encoded: Mutex::new(false),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &MockMaterializer,
+        &drifting,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("tokenizer snapshot changed"));
+}
+
+#[test]
+fn pipeline_rejects_a_single_view_larger_than_its_shard_limit() {
+    let mut config = pipeline_config();
+    config.build_id = "oversized-view".to_owned();
+    config.sharding.max_tokens_per_shard = 2;
+    let root = tempfile::tempdir().unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+    let error = CorpusPipeline::new(
+        config,
+        &backend,
+        &MockMaterializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(root.path())
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("one corpus view contains 3 tokens"),
+        "{error}"
+    );
+    assert!(error.contains("max_tokens_per_shard 2"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_rejects_a_symlinked_output_root() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let target = parent.path().join("real-output");
+    fs::create_dir(&target).unwrap();
+    let alias = parent.path().join("output-alias");
+    symlink(&target, &alias).unwrap();
+    let backend = MockSearchBackend {
+        calls: Mutex::new(Vec::new()),
+        fail_once_at: Mutex::new(None),
+    };
+    let mut dedup = InMemoryDeduplicator::new(DeduplicationConfig::default()).unwrap();
+
+    let error = CorpusPipeline::new(
+        pipeline_config(),
+        &backend,
+        &MockMaterializer,
+        &MockTokenizer,
+        &mut dedup,
+    )
+    .unwrap()
+    .run(&alias)
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("output root"), "{error}");
+    assert!(error.contains("real directory"), "{error}");
+    assert!(backend.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn pipeline_tokenizes_identical_repeated_views_once_per_record() {
+    let mut config = pipeline_config();
+    config.build_id = "tokenization-cache".to_owned();
+    config.repetition.base_copies = 2;
+    config.repetition.max_copies_per_record = 4;
+    config.transformations[0].copies = 2;
+    let tokenizer = CountingTokenizer {
+        calls: Mutex::new(0),
+    };
+
+    let (_root, _path, manifest) = build_test_corpus(config, &tokenizer);
+
+    assert_eq!(manifest.build.stats.unique_records, 2);
+    assert_eq!(manifest.build.stats.emitted_views, 8);
+    assert_eq!(
+        *tokenizer.calls.lock().unwrap(),
+        4,
+        "each record has only source and transformed token content"
+    );
 }
 
 #[test]

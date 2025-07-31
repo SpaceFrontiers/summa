@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::io::Read;
 use std::thread;
 use std::time::Duration;
 
@@ -8,12 +9,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
 use super::DiscoveryQuery;
+use super::config::MAX_DISCOVERY_BATCH_SIZE;
+
+const MAX_SEARCH_TIMEOUT_SECONDS: u64 = 3_600;
+const MAX_SEARCH_RETRY_DELAY_MS: u64 = 300_000;
+const MAX_SEARCH_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSnapshot {
     pub provider: String,
     pub revision: String,
+}
+
+impl SourceSnapshot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.provider.trim().is_empty(),
+            "source snapshot provider must not be empty"
+        );
+        ensure!(
+            !self.revision.trim().is_empty(),
+            "source snapshot revision must not be empty"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -25,6 +45,17 @@ pub struct DiscoveryHit {
     pub uris: Vec<String>,
     pub metadata: BTreeMap<String, Value>,
     pub inline_text: Option<String>,
+}
+
+impl DiscoveryHit {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.record_key.trim().is_empty(),
+            "discovery hit record key must not be empty"
+        );
+        ensure!(self.score.is_finite(), "discovery hit score must be finite");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +107,11 @@ pub struct SearchApiConfig {
     pub retry_initial_ms: u64,
     #[serde(default = "default_retry_max_ms")]
     pub retry_max_ms: u64,
+    /// Hard response-body limit applied before JSON parsing. Search pages are
+    /// metadata-only in the production recipe, so an unexpectedly enormous
+    /// body is an error rather than an unbounded allocation.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
     pub auth: Option<SearchApiAuthConfig>,
 }
 
@@ -95,30 +131,109 @@ fn default_retry_max_ms() -> u64 {
     30_000
 }
 
+fn default_max_response_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 impl SearchApiConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.endpoint.starts_with("http://") || self.endpoint.starts_with("https://"),
             "search_api endpoint must use HTTP or HTTPS"
         );
-        ensure!(self.page_size > 0, "search_api page_size must be positive");
         ensure!(
-            self.timeout_seconds > 0,
-            "search_api timeout_seconds must be positive"
+            (1..=MAX_DISCOVERY_BATCH_SIZE).contains(&self.page_size),
+            "search_api page_size must be within 1..={MAX_DISCOVERY_BATCH_SIZE}"
+        );
+        ensure!(
+            (1..=MAX_SEARCH_TIMEOUT_SECONDS).contains(&self.timeout_seconds),
+            "search_api timeout_seconds must be within 1..={MAX_SEARCH_TIMEOUT_SECONDS}"
+        );
+        ensure!(
+            self.max_retries <= 32,
+            "search_api max_retries must not exceed 32"
         );
         ensure!(
             self.retry_initial_ms > 0 && self.retry_initial_ms <= self.retry_max_ms,
             "search_api retry delays must be positive and ordered"
         );
+        ensure!(
+            self.retry_max_ms <= MAX_SEARCH_RETRY_DELAY_MS,
+            "search_api retry_max_ms must not exceed {MAX_SEARCH_RETRY_DELAY_MS}"
+        );
+        ensure!(
+            (1..=MAX_SEARCH_RESPONSE_BYTES).contains(&self.max_response_bytes),
+            "search_api max_response_bytes must be within 1..={MAX_SEARCH_RESPONSE_BYTES}"
+        );
         self.request_mapping.validate(&self.request_template)?;
         self.response_mapping.validate()?;
         self.fusion.validate(&self.request_template)?;
         self.snapshot.validate(&self.request_template)?;
+        self.validate_request_write_targets()?;
         if let Some(auth) = &self.auth {
             ensure!(
                 !auth.header.trim().is_empty() && !auth.environment.trim().is_empty(),
                 "search_api auth header and environment must not be empty"
             );
+        }
+        Ok(())
+    }
+
+    fn validate_request_write_targets(&self) -> Result<()> {
+        let mut targets = vec![
+            (
+                "query".to_owned(),
+                self.request_mapping.query_pointer.as_str(),
+            ),
+            (
+                "offset".to_owned(),
+                self.request_mapping.offset_pointer.as_str(),
+            ),
+            (
+                "limit".to_owned(),
+                self.request_mapping.limit_pointer.as_str(),
+            ),
+            (
+                "snapshot revision".to_owned(),
+                self.snapshot.request_revision_pointer.as_str(),
+            ),
+            (
+                "fusion marker".to_owned(),
+                self.fusion.marker_pointer.as_str(),
+            ),
+            (
+                "sparse vector field".to_owned(),
+                self.fusion.sparse.vector_field_pointer.as_str(),
+            ),
+            (
+                "dense vector field".to_owned(),
+                self.fusion.dense.vector_field_pointer.as_str(),
+            ),
+        ];
+        targets.extend(
+            self.request_mapping
+                .parameter_pointers
+                .iter()
+                .map(|(name, pointer)| (format!("query parameter `{name}`"), pointer.as_str())),
+        );
+        targets.extend(
+            self.request_mapping
+                .disabled_reranker_pointers
+                .iter()
+                .enumerate()
+                .map(|(index, pointer)| (format!("disabled reranker {index}"), pointer.as_str())),
+        );
+        if let Some(pointer) = &self.request_mapping.return_documents_pointer {
+            targets.push(("return documents".to_owned(), pointer));
+        }
+
+        for (index, (left_name, left)) in targets.iter().enumerate() {
+            for (right_name, right) in &targets[index + 1..] {
+                ensure!(
+                    !json_pointer_writes_overlap(left, right),
+                    "search_api request write targets `{left_name}` (`{left}`) and `{right_name}` (`{right}`) overlap"
+                );
+            }
         }
         Ok(())
     }
@@ -346,6 +461,17 @@ fn validate_json_pointer(pointer: &str) -> Result<()> {
     Ok(())
 }
 
+fn json_pointer_writes_overlap(left: &str, right: &str) -> bool {
+    fn contains(ancestor: &str, descendant: &str) -> bool {
+        ancestor.is_empty()
+            || ancestor == descendant
+            || descendant
+                .strip_prefix(ancestor)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+    contains(left, right) || contains(right, left)
+}
+
 fn ensure_pointer(value: &Value, pointer: &str) -> Result<()> {
     validate_json_pointer(pointer)?;
     ensure!(
@@ -368,6 +494,7 @@ pub struct UreqSearchApiTransport {
     max_retries: usize,
     retry_initial_ms: u64,
     retry_max_ms: u64,
+    max_response_bytes: usize,
 }
 
 impl UreqSearchApiTransport {
@@ -394,6 +521,7 @@ impl UreqSearchApiTransport {
             max_retries: config.max_retries,
             retry_initial_ms: config.retry_initial_ms,
             retry_max_ms: config.retry_max_ms,
+            max_response_bytes: config.max_response_bytes,
         })
     }
 }
@@ -405,15 +533,16 @@ impl SearchApiTransport for UreqSearchApiTransport {
                 .agent
                 .post(endpoint)
                 .set("Content-Type", "application/json")
-                .set("X-Request-Source", "hermes-train-corpus");
+                .set("X-Request-Source", "training-corpus");
             if let Some((header, value)) = &self.auth {
                 request = request.set(header, value);
             }
             match request.send_json(body) {
                 Ok(response) => {
-                    return response
-                        .into_json::<Value>()
-                        .context("search_api returned invalid JSON");
+                    return parse_bounded_json_response(
+                        response.into_reader(),
+                        self.max_response_bytes,
+                    );
                 }
                 Err(ureq::Error::Status(status, response)) => {
                     let retryable = matches!(status, 429 | 500 | 502 | 503 | 504);
@@ -439,6 +568,29 @@ impl SearchApiTransport for UreqSearchApiTransport {
         }
         unreachable!("bounded search_api retry loop always returns")
     }
+}
+
+fn parse_bounded_json_response(mut reader: impl Read, maximum_bytes: usize) -> Result<Value> {
+    ensure!(
+        maximum_bytes > 0,
+        "search_api max_response_bytes must be positive"
+    );
+    let maximum =
+        u64::try_from(maximum_bytes).context("search_api max_response_bytes exceeds u64")?;
+    let capture = maximum
+        .checked_add(1)
+        .context("search_api response limit overflows u64")?;
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(capture)
+        .read_to_end(&mut bytes)
+        .context("failed to read search_api response")?;
+    ensure!(
+        bytes.len() <= maximum_bytes,
+        "search_api response exceeds max_response_bytes {maximum_bytes}"
+    );
+    serde_json::from_slice(&bytes).context("search_api returned invalid JSON")
 }
 
 pub struct SearchApiClient<T = UreqSearchApiTransport> {
@@ -469,6 +621,11 @@ where
         limit: usize,
     ) -> Result<Value> {
         ensure!(limit > 0, "search_api request limit must be positive");
+        ensure!(
+            limit <= self.config.page_size,
+            "search_api request limit {limit} exceeds configured page_size {}",
+            self.config.page_size
+        );
         let mut request = self.config.request_template.clone();
         set_pointer(
             &mut request,
@@ -570,20 +727,36 @@ where
                 )
             })?;
         let mut hits = Vec::with_capacity(raw_hits.len());
-        for raw in raw_hits {
+        let mut metadata_matches = mapping
+            .metadata_pointers
+            .keys()
+            .map(|name| (name.as_str(), 0usize))
+            .collect::<BTreeMap<_, _>>();
+        for (index, raw) in raw_hits.iter().enumerate() {
             let record_key = scalar_string(raw.pointer(&mapping.record_key_pointer))
                 .context("search_api hit has no scalar record key")?;
             ensure!(
                 !record_key.is_empty(),
                 "search_api hit record key must not be empty"
             );
-            let score = mapping
-                .score_pointer
-                .as_ref()
-                .and_then(|pointer| raw.pointer(pointer))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let score = if score.is_finite() { score } else { 0.0 };
+            let score = match &mapping.score_pointer {
+                Some(pointer) => {
+                    let score = raw
+                        .pointer(pointer)
+                        .with_context(|| {
+                            format!("search_api hit {index} has no configured score at `{pointer}`")
+                        })?
+                        .as_f64()
+                        .with_context(|| {
+                            format!(
+                                "search_api hit {index} score `{pointer}` must be a finite number"
+                            )
+                        })?;
+                    validate_finite_score(score, pointer)
+                        .with_context(|| format!("invalid search_api hit {index}"))?
+                }
+                None => 0.0,
+            };
             let uris = mapping
                 .uris_pointer
                 .as_ref()
@@ -594,16 +767,22 @@ where
             let inline_text = mapping
                 .inline_text_pointer
                 .as_ref()
-                .and_then(|pointer| raw.pointer(pointer))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+                .and_then(|pointer| raw.pointer(pointer).map(|value| (pointer, value)))
+                .map(|(pointer, value)| {
+                    value.as_str().map(str::to_owned).with_context(|| {
+                        format!("search_api hit {index} inline text `{pointer}` must be a string")
+                    })
+                })
+                .transpose()?;
             let metadata = mapping
                 .metadata_pointers
                 .iter()
                 .filter_map(|(name, pointer)| {
-                    raw.pointer(pointer)
-                        .cloned()
-                        .map(|value| (name.clone(), value))
+                    let value = raw.pointer(pointer)?.clone();
+                    if let Some(matched) = metadata_matches.get_mut(name.as_str()) {
+                        *matched += 1;
+                    }
+                    Some((name.clone(), value))
                 })
                 .collect();
             hits.push(DiscoveryHit {
@@ -614,17 +793,52 @@ where
                 inline_text,
             });
         }
+        // A configured metadata pointer that matches nothing silently disables
+        // every classification rule and transformation predicate keyed on it.
+        for (name, matched) in &metadata_matches {
+            if *matched == 0 && !hits.is_empty() {
+                tracing::warn!(
+                    "search_api metadata pointer `{}` (`{}`) matched none of the {} hits on this page; \
+                     rules keyed on this metadata will not fire",
+                    name,
+                    mapping.metadata_pointers[*name],
+                    hits.len()
+                );
+            }
+        }
         let total_hits = mapping
             .total_hits_pointer
             .as_ref()
-            .and_then(|pointer| response.pointer(pointer))
-            .and_then(Value::as_u64);
+            .map(|pointer| {
+                response
+                    .pointer(pointer)
+                    .with_context(|| {
+                        format!(
+                            "search_api response has no configured total_hits at `{pointer}`"
+                        )
+                    })?
+                    .as_u64()
+                    .with_context(|| {
+                        format!(
+                            "search_api total_hits `{pointer}` must be a nonnegative integer fitting u64"
+                        )
+                    })
+            })
+            .transpose()?;
         Ok(DiscoveryPage {
             hits,
             total_hits,
             snapshot,
         })
     }
+}
+
+fn validate_finite_score(score: f64, pointer: &str) -> Result<f64> {
+    ensure!(
+        score.is_finite(),
+        "search_api score `{pointer}` must be finite"
+    );
+    Ok(score)
 }
 
 impl<T> SearchBackend for SearchApiClient<T>
@@ -658,8 +872,16 @@ where
             .transport
             .post_json(&self.config.endpoint, &request)
             .with_context(|| format!("search_api query `{}` failed", query.name))?;
-        self.parse_response(&response)
-            .with_context(|| format!("invalid search_api response for query `{}`", query.name))
+        let page = self
+            .parse_response(&response)
+            .with_context(|| format!("invalid search_api response for query `{}`", query.name))?;
+        ensure!(
+            page.hits.len() <= limit,
+            "search_api returned {} hits for query `{}` after a request limit of {limit}",
+            page.hits.len(),
+            query.name
+        );
+        Ok(page)
     }
 }
 
@@ -693,5 +915,32 @@ fn strings(value: &Value) -> Result<Vec<String>> {
             })
             .collect(),
         _ => bail!("URI mapping must resolve to a string or string array"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{parse_bounded_json_response, validate_finite_score};
+
+    #[test]
+    fn configured_score_validation_rejects_non_finite_values() {
+        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = validate_finite_score(score, "/rank").unwrap_err();
+            assert!(error.to_string().contains("must be finite"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn response_capture_is_bounded_before_json_parsing() {
+        assert_eq!(
+            parse_bounded_json_response(Cursor::new(br#"{"ok":true}"#), 11).unwrap()["ok"],
+            true
+        );
+        let error = parse_bounded_json_response(Cursor::new(br#"{"ok":true}"#), 10)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_response_bytes 10"), "{error}");
     }
 }

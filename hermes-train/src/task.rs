@@ -5,10 +5,10 @@
 //! algorithm, RL algorithm, or model implementation; those choices belong to
 //! workflow phases and their executors.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, ensure};
-use serde::de::DeserializeOwned;
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 fn default_temperature() -> f64 {
@@ -38,6 +38,18 @@ fn default_query_prefix() -> String {
 fn default_document_prefix() -> String {
     "Represent this document for retrieval:\n".to_owned()
 }
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Includes the positive document. Wake retrieval materializes every document
+/// as one fixed-length token sequence before shuffling, so this also provides
+/// a finite geometry contract to WorkflowV2.
+const MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS: usize = 32;
+/// Ranking is dispatched to a dedicated executor and can use larger lists,
+/// but a single bounded JSONL row must still not create an unbounded example.
+const MAX_RETRIEVAL_RANKING_DOCUMENTS: usize = 1_024;
 
 /// The model-facing operation required by a task.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,8 +106,79 @@ pub struct TaskContract {
     pub metrics: &'static [TaskMetric],
 }
 
+/// Text whose tokenization boundaries are part of the task contract.
+///
+/// Executors must tokenize each segment independently and concatenate the
+/// resulting token IDs. Tokenizing [`Self::render`] as one string is not
+/// equivalent for boundary-sensitive tokenizers such as BPE. At most one
+/// segment may be truncated; fixed prompt text must remain intact.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentedText {
+    /// Ordered strings whose independently encoded token IDs are concatenated.
+    pub segments: Vec<String>,
+    /// The only segment an executor may shorten to meet its sequence limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncatable_segment: Option<usize>,
+    /// Whether truncation must retain at least one token from that segment.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncatable_segment_required: bool,
+}
+
+impl SegmentedText {
+    fn prefixed(prefix: &str, text: String) -> Self {
+        Self {
+            segments: vec![prefix.to_owned(), text],
+            truncatable_segment: Some(1),
+            truncatable_segment_required: true,
+        }
+    }
+
+    /// Validate structural invariants before an externally supplied example is
+    /// dispatched to a model executor.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.segments.is_empty(),
+            "segmented text must not be empty"
+        );
+        if let Some(index) = self.truncatable_segment {
+            ensure!(
+                index < self.segments.len(),
+                "truncatable segment {index} is outside {} segments",
+                self.segments.len()
+            );
+            if self.truncatable_segment_required {
+                ensure!(
+                    !self.segments[index].is_empty(),
+                    "required truncatable segment {index} must not be empty"
+                );
+            }
+        } else {
+            ensure!(
+                !self.truncatable_segment_required,
+                "a required truncatable segment needs an index"
+            );
+        }
+        Ok(())
+    }
+
+    /// Rendered text for inspection, logging, or APIs that consume text. Model
+    /// execution must preserve the segment boundaries documented above.
+    pub fn render(&self) -> String {
+        let capacity = self
+            .segments
+            .iter()
+            .fold(0usize, |total, segment| total.saturating_add(segment.len()));
+        let mut rendered = String::with_capacity(capacity);
+        for segment in &self.segments {
+            rendered.push_str(segment);
+        }
+        rendered
+    }
+}
+
 /// Backend-neutral example produced from one validated task record. Executors
-/// tokenize these strings and apply the accompanying [`LossSpec`] instead of
+/// tokenize these inputs and apply the accompanying [`LossSpec`] instead of
 /// hard-coding storage-field names in trainer core.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -104,17 +187,17 @@ pub enum TaskExample {
         text: String,
     },
     SupervisedGeneration {
-        prompt: String,
+        prompt: SegmentedText,
         target: String,
     },
     RetrievalRepresentation {
-        query: String,
-        documents: Vec<String>,
+        query: SegmentedText,
+        documents: Vec<SegmentedText>,
         positive_index: usize,
     },
     RetrievalRanking {
-        query: String,
-        documents: Vec<String>,
+        query: SegmentedText,
+        documents: Vec<SegmentedText>,
         relevance: Vec<f64>,
     },
     PairwisePreference {
@@ -208,7 +291,65 @@ pub enum TaskConfig {
     },
 }
 
+/// Canonical rendering of a supervised-generation record.
+///
+/// The source is kept separate from the fixed prompt text so an executor can
+/// truncate long documents, questions, or optional inputs without truncating
+/// the instruction, response marker, or target. All built-in executors must
+/// consume these segments instead of rebuilding task prompts independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisedPromptSegments<'a> {
+    pub prefix: Cow<'a, str>,
+    pub source: Cow<'a, str>,
+    pub suffix: Cow<'a, str>,
+    pub target: Cow<'a, str>,
+    pub source_required: bool,
+}
+
+impl SupervisedPromptSegments<'_> {
+    pub fn prompt(&self) -> String {
+        let mut prompt = String::with_capacity(
+            self.prefix
+                .len()
+                .saturating_add(self.source.len())
+                .saturating_add(self.suffix.len()),
+        );
+        prompt.push_str(&self.prefix);
+        prompt.push_str(&self.source);
+        prompt.push_str(&self.suffix);
+        prompt
+    }
+
+    fn into_example(self) -> TaskExample {
+        let prompt = SegmentedText {
+            segments: vec![
+                self.prefix.into_owned(),
+                self.source.into_owned(),
+                self.suffix.into_owned(),
+            ],
+            truncatable_segment: Some(1),
+            truncatable_segment_required: self.source_required,
+        };
+        debug_assert!(prompt.validate().is_ok());
+        TaskExample::SupervisedGeneration {
+            prompt,
+            target: self.target.into_owned(),
+        }
+    }
+}
+
 impl TaskConfig {
+    /// Conservative upper bound on fixed-length model sequences retained for
+    /// one example by the built-in wake data path. Workflow validation uses it
+    /// for batch and shuffle-memory geometry instead of assuming one sequence
+    /// for a contrastive retrieval example.
+    pub fn maximum_model_sequences_per_example(&self) -> usize {
+        match self {
+            Self::RetrievalRepresentation { .. } => 1 + MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS,
+            _ => 1,
+        }
+    }
+
     pub fn retrieval_layer(&self) -> Option<usize> {
         match self {
             Self::RetrievalRepresentation { layer, .. } | Self::RetrievalRanking { layer, .. } => {
@@ -223,6 +364,113 @@ impl TaskConfig {
             Self::RetrievalRepresentation { temperature, .. }
             | Self::RetrievalRanking { temperature, .. } => Some(*temperature),
             _ => None,
+        }
+    }
+
+    /// Parse and render one record for a built-in supervised-generation task.
+    /// The returned segmentation is the single prompt contract shared by wake
+    /// training and post-training executors.
+    pub fn construct_supervised_prompt<'a>(
+        &self,
+        record: &'a serde_json::Value,
+    ) -> Result<SupervisedPromptSegments<'a>> {
+        self.validate()?;
+        self.construct_supervised_prompt_after_validation(record)
+    }
+
+    fn construct_supervised_prompt_after_validation<'a>(
+        &self,
+        record: &'a serde_json::Value,
+    ) -> Result<SupervisedPromptSegments<'a>> {
+        match self {
+            Self::Summarization { instruction } => {
+                let record = parse_record::<SummarizationRecord>(record)?;
+                record.validate()?;
+                Ok(SupervisedPromptSegments {
+                    prefix: format!("{instruction}\n\nDocument:\n").into(),
+                    source: record.document,
+                    suffix: "\n\nSummary:\n".into(),
+                    target: record.summary,
+                    source_required: true,
+                })
+            }
+            Self::RetrievalPlanning { instruction } => {
+                let record = parse_record::<RetrievalPlanningRecord>(record)?;
+                record.validate()?;
+                let (prefix, source, suffix, source_required) = match record.context {
+                    Some(context) => (
+                        Cow::Owned(format!(
+                            "{instruction}\n\nRequest:\n{}\n\nContext:\n",
+                            record.request
+                        )),
+                        context,
+                        Cow::Borrowed("\nPlan:\n"),
+                        true,
+                    ),
+                    None => (
+                        Cow::Owned(format!("{instruction}\n\nRequest:\n{}\n", record.request)),
+                        Cow::Borrowed(""),
+                        Cow::Borrowed("Plan:\n"),
+                        false,
+                    ),
+                };
+                Ok(SupervisedPromptSegments {
+                    prefix,
+                    source,
+                    suffix,
+                    target: record.plan,
+                    source_required,
+                })
+            }
+            Self::InstructionTuning { instruction } => {
+                let record = parse_record::<InstructionTuningRecord>(record)?;
+                record.validate()?;
+                let mut prefix = String::new();
+                if let Some(system) = record.system {
+                    prefix.push_str("System:\n");
+                    prefix.push_str(&system);
+                    prefix.push_str("\n\n");
+                }
+                prefix.push_str(instruction);
+                prefix.push_str("\n\nInstruction:\n");
+                prefix.push_str(&record.instruction);
+                let (source, source_required) = match record.input {
+                    Some(input) => {
+                        prefix.push_str("\n\nInput:\n");
+                        (input, true)
+                    }
+                    None => (Cow::Borrowed(""), false),
+                };
+                Ok(SupervisedPromptSegments {
+                    prefix: prefix.into(),
+                    source,
+                    suffix: "\n\nResponse:\n".into(),
+                    target: record.response,
+                    source_required,
+                })
+            }
+            Self::QaReasoning {
+                instruction,
+                require_reasoning,
+            } => {
+                let record = parse_record::<QaReasoningRecord>(record)?;
+                record.validate(*require_reasoning)?;
+                let target = match record.reasoning {
+                    Some(reasoning) => Cow::Owned(format!(
+                        "Reasoning:\n{reasoning}\n\nAnswer:\n{}",
+                        record.answer
+                    )),
+                    None => record.answer,
+                };
+                Ok(SupervisedPromptSegments {
+                    prefix: format!("{instruction}\n\nQuestion:\n").into(),
+                    source: record.question,
+                    suffix: "\n\nResponse:\n".into(),
+                    target,
+                    source_required: true,
+                })
+            }
+            _ => bail!("task `{}` is not a supervised-generation task", self.name()),
         }
     }
 }
@@ -298,10 +546,16 @@ impl TaskAdapter for TaskConfig {
                 loss_mask: LossMaskPolicy::TargetTokensOnly,
                 metrics: &[TaskMetric::Loss],
             },
-            Self::QaReasoning { .. } => TaskContract {
+            Self::QaReasoning {
+                require_reasoning, ..
+            } => TaskContract {
                 execution: TaskExecution::SupervisedGeneration,
                 data_format: TaskDataFormat::Jsonl,
-                required_fields: &["question", "answer"],
+                required_fields: if *require_reasoning {
+                    &["question", "answer", "reasoning"]
+                } else {
+                    &["question", "answer"]
+                },
                 input_fields: &["question"],
                 target_fields: &["reasoning", "answer"],
                 loss_mask: LossMaskPolicy::TargetTokensOnly,
@@ -386,17 +640,12 @@ impl TaskAdapter for TaskConfig {
                 record.validate()?;
                 Ok(TaskExample::Autoregressive { text: record.text })
             }
-            Self::Summarization { instruction } => {
-                let record = parse_record::<SummarizationRecord>(record)?;
-                record.validate()?;
-                Ok(TaskExample::SupervisedGeneration {
-                    prompt: format!(
-                        "{instruction}\n\nDocument:\n{}\n\nSummary:\n",
-                        record.document
-                    ),
-                    target: record.summary,
-                })
-            }
+            Self::Summarization { .. }
+            | Self::RetrievalPlanning { .. }
+            | Self::InstructionTuning { .. }
+            | Self::QaReasoning { .. } => Ok(self
+                .construct_supervised_prompt_after_validation(record)?
+                .into_example()),
             Self::RetrievalRepresentation {
                 query_prefix,
                 document_prefix,
@@ -405,15 +654,15 @@ impl TaskAdapter for TaskConfig {
                 let record = parse_record::<RetrievalRepresentationRecord>(record)?;
                 record.validate()?;
                 let mut documents = Vec::with_capacity(record.negatives.len() + 1);
-                documents.push(format!("{document_prefix}{}", record.positive));
+                documents.push(SegmentedText::prefixed(document_prefix, record.positive));
                 documents.extend(
                     record
                         .negatives
                         .into_iter()
-                        .map(|document| format!("{document_prefix}{document}")),
+                        .map(|document| SegmentedText::prefixed(document_prefix, document)),
                 );
                 Ok(TaskExample::RetrievalRepresentation {
-                    query: format!("{query_prefix}{}", record.query),
+                    query: SegmentedText::prefixed(query_prefix, record.query),
                     documents,
                     positive_index: 0,
                 })
@@ -425,75 +674,16 @@ impl TaskAdapter for TaskConfig {
             } => {
                 let record = parse_record::<RetrievalRankingRecord>(record)?;
                 record.validate()?;
+                let mut documents = Vec::with_capacity(record.documents.len());
+                let mut relevance = Vec::with_capacity(record.documents.len());
+                for document in record.documents {
+                    documents.push(SegmentedText::prefixed(document_prefix, document.document));
+                    relevance.push(document.relevance);
+                }
                 Ok(TaskExample::RetrievalRanking {
-                    query: format!("{query_prefix}{}", record.query),
-                    documents: record
-                        .documents
-                        .iter()
-                        .map(|document| format!("{document_prefix}{}", document.document))
-                        .collect(),
-                    relevance: record
-                        .documents
-                        .into_iter()
-                        .map(|document| document.relevance)
-                        .collect(),
-                })
-            }
-            Self::RetrievalPlanning { instruction } => {
-                let record = parse_record::<RetrievalPlanningRecord>(record)?;
-                record.validate()?;
-                let prompt = match record.context {
-                    Some(context) => format!(
-                        "{instruction}\n\nRequest:\n{}\n\nContext:\n{context}\nPlan:\n",
-                        record.request
-                    ),
-                    None => format!("{instruction}\n\nRequest:\n{}\nPlan:\n", record.request),
-                };
-                Ok(TaskExample::SupervisedGeneration {
-                    prompt,
-                    target: record.plan,
-                })
-            }
-            Self::InstructionTuning { instruction } => {
-                let record = parse_record::<InstructionTuningRecord>(record)?;
-                record.validate()?;
-                let mut prompt = String::new();
-                if let Some(system) = record.system {
-                    prompt.push_str("System:\n");
-                    prompt.push_str(&system);
-                    prompt.push_str("\n\n");
-                }
-                prompt.push_str(instruction);
-                prompt.push_str("\n\nInstruction:\n");
-                prompt.push_str(&record.instruction);
-                if let Some(input) = record.input {
-                    prompt.push_str("\n\nInput:\n");
-                    prompt.push_str(&input);
-                }
-                prompt.push_str("\n\nResponse:\n");
-                Ok(TaskExample::SupervisedGeneration {
-                    prompt,
-                    target: record.response,
-                })
-            }
-            Self::QaReasoning {
-                instruction,
-                require_reasoning,
-            } => {
-                let record = parse_record::<QaReasoningRecord>(record)?;
-                record.validate(*require_reasoning)?;
-                let target = match record.reasoning {
-                    Some(reasoning) => {
-                        format!("Reasoning:\n{reasoning}\n\nAnswer:\n{}", record.answer)
-                    }
-                    None => record.answer,
-                };
-                Ok(TaskExample::SupervisedGeneration {
-                    prompt: format!(
-                        "{instruction}\n\nQuestion:\n{}\n\nResponse:\n",
-                        record.question
-                    ),
-                    target,
+                    query: SegmentedText::prefixed(query_prefix, record.query),
+                    documents,
+                    relevance,
                 })
             }
             Self::PairwisePreference {} => {
@@ -554,8 +744,8 @@ impl TaskAdapter for TaskConfig {
     }
 }
 
-fn parse_record<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T> {
-    serde_json::from_value(value.clone()).context("record does not match the task schema")
+fn parse_record<'de, T: Deserialize<'de>>(value: &'de serde_json::Value) -> Result<T> {
+    T::deserialize(value).context("record does not match the task schema")
 }
 
 fn ensure_nonempty(value: &str, field: &str) -> Result<()> {
@@ -597,12 +787,14 @@ impl CausalLmRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct SummarizationRecord {
-    pub document: String,
-    pub summary: String,
+pub struct SummarizationRecord<'a> {
+    #[serde(borrow)]
+    pub document: Cow<'a, str>,
+    #[serde(borrow)]
+    pub summary: Cow<'a, str>,
 }
 
-impl SummarizationRecord {
+impl SummarizationRecord<'_> {
     fn validate(&self) -> Result<()> {
         ensure_nonempty(&self.document, "document")?;
         ensure_nonempty(&self.summary, "summary")
@@ -621,9 +813,19 @@ impl RetrievalRepresentationRecord {
     fn validate(&self) -> Result<()> {
         ensure_nonempty(&self.query, "query")?;
         ensure_nonempty(&self.positive, "positive")?;
+        let mut documents = BTreeSet::from([self.positive.as_str()]);
         for (index, negative) in self.negatives.iter().enumerate() {
             ensure_nonempty(negative, &format!("negatives[{index}]"))?;
+            ensure!(
+                documents.insert(negative),
+                "`negatives[{index}]` duplicates the positive or another negative document"
+            );
         }
+        ensure!(
+            self.negatives.len() < MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS,
+            "retrieval representation has {} documents; at most {MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS} including the positive are supported",
+            self.negatives.len().saturating_add(1)
+        );
         Ok(())
     }
 }
@@ -647,35 +849,48 @@ impl RetrievalRankingRecord {
             self.documents.len() >= 2,
             "`documents` must contain at least two candidates"
         );
-        let mut positive = false;
-        let mut non_positive = false;
+        ensure!(
+            self.documents.len() <= MAX_RETRIEVAL_RANKING_DOCUMENTS,
+            "`documents` exceeds the {MAX_RETRIEVAL_RANKING_DOCUMENTS}-candidate limit"
+        );
+        let mut first_relevance = None;
+        let mut distinct_relevance = false;
+        let mut documents = BTreeSet::new();
         for (index, document) in self.documents.iter().enumerate() {
             ensure_nonempty(&document.document, &format!("documents[{index}].document"))?;
             ensure!(
-                document.relevance.is_finite(),
-                "`documents[{index}].relevance` must be finite"
+                documents.insert(document.document.as_str()),
+                "`documents[{index}].document` duplicates another ranking candidate"
             );
-            positive |= document.relevance > 0.0;
-            non_positive |= document.relevance <= 0.0;
+            ensure!(
+                document.relevance.is_finite() && document.relevance >= 0.0,
+                "`documents[{index}].relevance` must be finite and non-negative"
+            );
+            match first_relevance {
+                Some(first) => distinct_relevance |= document.relevance != first,
+                None => first_relevance = Some(document.relevance),
+            }
         }
-        ensure!(positive, "`documents` must contain a positive candidate");
         ensure!(
-            non_positive,
-            "`documents` must contain a non-positive candidate"
+            distinct_relevance,
+            "`documents` must contain at least two distinct relevance grades"
         );
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct RetrievalPlanningRecord {
-    pub request: String,
+pub struct RetrievalPlanningRecord<'a> {
+    #[serde(borrow)]
+    pub request: Cow<'a, str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
-    pub plan: String,
+    #[serde(borrow)]
+    pub context: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    pub plan: Cow<'a, str>,
 }
 
-impl RetrievalPlanningRecord {
+impl RetrievalPlanningRecord<'_> {
     fn validate(&self) -> Result<()> {
         ensure_nonempty(&self.request, "request")?;
         ensure_optional_nonempty(self.context.as_deref(), "context")?;
@@ -684,16 +899,20 @@ impl RetrievalPlanningRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct InstructionTuningRecord {
+pub struct InstructionTuningRecord<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
-    pub instruction: String,
+    #[serde(borrow)]
+    pub system: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    pub instruction: Cow<'a, str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<String>,
-    pub response: String,
+    #[serde(borrow)]
+    pub input: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    pub response: Cow<'a, str>,
 }
 
-impl InstructionTuningRecord {
+impl InstructionTuningRecord<'_> {
     fn validate(&self) -> Result<()> {
         ensure_optional_nonempty(self.system.as_deref(), "system")?;
         ensure_nonempty(&self.instruction, "instruction")?;
@@ -703,14 +922,17 @@ impl InstructionTuningRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct QaReasoningRecord {
-    pub question: String,
-    pub answer: String,
+pub struct QaReasoningRecord<'a> {
+    #[serde(borrow)]
+    pub question: Cow<'a, str>,
+    #[serde(borrow)]
+    pub answer: Cow<'a, str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
+    #[serde(borrow)]
+    pub reasoning: Option<Cow<'a, str>>,
 }
 
-impl QaReasoningRecord {
+impl QaReasoningRecord<'_> {
     fn validate(&self, require_reasoning: bool) -> Result<()> {
         ensure_nonempty(&self.question, "question")?;
         ensure_nonempty(&self.answer, "answer")?;
@@ -799,6 +1021,46 @@ mod tests {
     }
 
     #[test]
+    fn qa_contract_exposes_configured_reasoning_requirement() {
+        let optional = config(json!({"type": "qa_reasoning"}));
+        assert_eq!(optional.contract().required_fields, ["question", "answer"]);
+
+        let required = config(json!({
+            "type": "qa_reasoning",
+            "require_reasoning": true
+        }));
+        assert_eq!(
+            required.contract().required_fields,
+            ["question", "answer", "reasoning"]
+        );
+    }
+
+    #[test]
+    fn supervised_prompt_segments_borrow_large_record_fields() {
+        let task = config(json!({"type": "summarization"}));
+        let record = json!({
+            "document": "a document large enough that copying it is undesirable",
+            "summary": "short summary"
+        });
+        let document = record["document"].as_str().unwrap();
+        let summary = record["summary"].as_str().unwrap();
+        let segments = task.construct_supervised_prompt(&record).unwrap();
+        assert!(matches!(&segments.source, Cow::Borrowed(_)));
+        assert!(matches!(&segments.target, Cow::Borrowed(_)));
+        assert_eq!(segments.source.as_ptr(), document.as_ptr());
+        assert_eq!(segments.target.as_ptr(), summary.as_ptr());
+
+        let reasoning = config(json!({
+            "type": "qa_reasoning",
+            "require_reasoning": true
+        }));
+        let record = json!({"question": "why?", "reasoning": "because", "answer": "therefore"});
+        let segments = reasoning.construct_supervised_prompt(&record).unwrap();
+        assert!(matches!(&segments.source, Cow::Borrowed(_)));
+        assert!(matches!(&segments.target, Cow::Owned(_)));
+    }
+
+    #[test]
     fn shipped_task_schemas_accept_valid_records() {
         let cases = [
             (
@@ -818,8 +1080,8 @@ mod tests {
                 json!({
                     "query": "q",
                     "documents": [
-                        {"document": "relevant", "relevance": 1.0},
-                        {"document": "irrelevant", "relevance": 0.0}
+                        {"document": "best", "relevance": 3.0},
+                        {"document": "also relevant", "relevance": 1.0}
                     ]
                 }),
             ),
@@ -855,18 +1117,53 @@ mod tests {
 
     #[test]
     fn record_validation_rejects_semantically_useless_examples() {
+        let representation = config(json!({"type": "retrieval_representation"}));
+        let error = representation
+            .validate_record(&json!({
+                "query": "q",
+                "positive": "same document",
+                "negatives": ["same document"]
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicates the positive"), "{error}");
+
         let ranking = config(json!({"type": "retrieval_ranking"}));
         let error = ranking
             .validate_record(&json!({
                 "query": "q",
                 "documents": [
                     {"document": "a", "relevance": 1.0},
-                    {"document": "b", "relevance": 2.0}
+                    {"document": "b", "relevance": 1.0}
                 ]
             }))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("non-positive candidate"), "{error}");
+        assert!(error.contains("distinct relevance grades"), "{error}");
+
+        let error = ranking
+            .validate_record(&json!({
+                "query": "q",
+                "documents": [
+                    {"document": "same document", "relevance": 1.0},
+                    {"document": "same document", "relevance": 0.0}
+                ]
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicates another ranking"), "{error}");
+
+        let error = ranking
+            .validate_record(&json!({
+                "query": "q",
+                "documents": [
+                    {"document": "a", "relevance": 1.0},
+                    {"document": "b", "relevance": -1.0}
+                ]
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-negative"), "{error}");
 
         let preference = config(json!({"type": "pairwise_preference"}));
         let error = preference
@@ -881,6 +1178,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("reasoning"), "{error}");
+    }
+
+    #[test]
+    fn retrieval_records_bound_per_example_candidate_materialization() {
+        let representation = config(json!({"type": "retrieval_representation"}));
+        let accepted_negatives = (0..MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS - 1)
+            .map(|index| format!("negative-{index}"))
+            .collect::<Vec<_>>();
+        representation
+            .validate_record(&json!({
+                "query": "q",
+                "positive": "p",
+                "negatives": accepted_negatives
+            }))
+            .unwrap();
+        let excessive_negatives = (0..MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS)
+            .map(|index| format!("negative-{index}"))
+            .collect::<Vec<_>>();
+        let error = representation
+            .validate_record(&json!({
+                "query": "q",
+                "positive": "p",
+                "negatives": excessive_negatives
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("including the positive"), "{error}");
+        assert_eq!(
+            representation.maximum_model_sequences_per_example(),
+            MAX_RETRIEVAL_REPRESENTATION_DOCUMENTS + 1
+        );
+
+        let ranking = config(json!({"type": "retrieval_ranking"}));
+        let documents = (0..=MAX_RETRIEVAL_RANKING_DOCUMENTS)
+            .map(|index| json!({"document": format!("document-{index}"), "relevance": index}))
+            .collect::<Vec<_>>();
+        let error = ranking
+            .validate_record(&json!({"query": "q", "documents": documents}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("candidate limit"), "{error}");
     }
 
     #[test]
@@ -917,7 +1255,9 @@ mod tests {
         let TaskExample::SupervisedGeneration { prompt, target } = example else {
             panic!("expected supervised-generation example")
         };
-        assert!(prompt.contains("Question:\nWhy?"));
+        assert!(prompt.render().contains("Question:\nWhy?"));
+        assert_eq!(prompt.truncatable_segment, Some(1));
+        assert!(prompt.truncatable_segment_required);
         assert_eq!(target, "Reasoning:\nBecause.\n\nAnswer:\nTherefore.");
         assert_eq!(
             reasoning.loss_spec(),
@@ -926,6 +1266,33 @@ mod tests {
             }
         );
         assert!(reasoning.reward_spec().is_none());
+
+        let retrieval = config(json!({
+            "type": "retrieval_representation",
+            "query_prefix": "query:",
+            "document_prefix": "document:"
+        }));
+        let example = retrieval
+            .construct_example(&json!({
+                "query": "needle",
+                "positive": "haystack",
+                "negatives": ["other"]
+            }))
+            .unwrap();
+        let TaskExample::RetrievalRepresentation {
+            query, documents, ..
+        } = example
+        else {
+            panic!("expected retrieval-representation example")
+        };
+        assert_eq!(query.segments, ["query:", "needle"]);
+        assert_eq!(documents[0].segments, ["document:", "haystack"]);
+        assert_eq!(documents[1].segments, ["document:", "other"]);
+        assert_eq!(query.render(), "query:needle");
+        query.validate().unwrap();
+        for document in documents {
+            document.validate().unwrap();
+        }
 
         let rl = config(json!({
             "type": "verifiable_rl",

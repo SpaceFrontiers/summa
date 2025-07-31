@@ -6,15 +6,13 @@
 //! immutable candidate identity.
 
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use hermes_llm::Transformer;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::artifact_io::{hash_regular_file, validate_sha256_identity};
 use crate::metrics::{
     ActiveCapacityMetrics, DistillationDivergenceMetrics, ImitationRewardMetrics, MemoryTier,
     MetricContext, MetricDirection, MetricEvent, MetricPhase, MetricPhaseKind,
@@ -37,20 +35,6 @@ use crate::tensor_sleep::{
 use crate::workflow::InModelSleepConfig;
 
 pub const NATIVE_SLEEP_CHECKPOINT_VERSION: u32 = 1;
-
-fn validate_hash(value: &str, label: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{label} must use sha256:<64 lowercase hex>"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{label} must use sha256:<64 lowercase hex>"
-    );
-    Ok(())
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -86,26 +70,11 @@ impl PinnedNativeArtifact {
             !self.path.trim().is_empty(),
             "pinned sleep artifact path is empty"
         );
-        validate_hash(&self.sha256, "pinned sleep artifact hash")?;
+        validate_sha256_identity(&self.sha256, "pinned sleep artifact hash")?;
         let path = Path::new(&self.path);
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("reading pinned sleep artifact {}", path.display()))?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "pinned sleep artifact {} is not a regular non-symlink file",
-            path.display()
-        );
-        let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 1024 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let observed = format!("sha256:{:x}", hasher.finalize());
+        let observed = hash_regular_file(path)
+            .with_context(|| format!("reading pinned sleep artifact {}", path.display()))?
+            .1;
         ensure!(
             observed == self.sha256,
             "pinned sleep artifact {} changed: expected {}, observed {observed}",
@@ -131,7 +100,7 @@ impl NativeCheckpointRef {
             !self.uri.trim().is_empty(),
             "native checkpoint URI is empty"
         );
-        validate_hash(&self.sha256, "native checkpoint hash")
+        validate_sha256_identity(&self.sha256, "native checkpoint hash")
     }
 }
 
@@ -225,13 +194,27 @@ impl NativeSleepCheckpoint {
     }
 
     pub fn validate(&self, model: &Transformer, config: &InModelSleepConfig) -> Result<()> {
+        self.validate_state(model, config)?;
+        self.retention_suite.verify()?;
+        if let Some(journal) = &self.wake_context_journal {
+            journal
+                .verify()
+                .context("verifying pinned wake-context journal")?;
+        }
+        Ok(())
+    }
+
+    /// Validate the in-memory cursor/model relationship without touching
+    /// external artifacts. Ordinary wake steps use this path; content-pinned
+    /// files are re-authenticated before a due boundary consumes them.
+    fn validate_state(&self, model: &Transformer, config: &InModelSleepConfig) -> Result<()> {
         let schedule = &config.schedule;
         ensure!(
             self.version == NATIVE_SLEEP_CHECKPOINT_VERSION,
             "unsupported native sleep checkpoint version {}",
             self.version
         );
-        validate_hash(&self.workflow_signature, "sleep workflow signature")?;
+        validate_sha256_identity(&self.workflow_signature, "sleep workflow signature")?;
         ensure!(
             !self.phase_name.trim().is_empty(),
             "sleep phase name is empty"
@@ -243,43 +226,23 @@ impl NativeSleepCheckpoint {
                 && config.retention_suite_sha256 == self.retention_suite.sha256,
             "native checkpoint retention suite differs from WorkflowV2"
         );
-        self.retention_suite.verify()?;
-        if let Some(journal) = &self.wake_context_journal {
-            journal
-                .verify()
-                .context("verifying pinned wake-context journal")?;
+        let mut expected_evaluators = vec![
+            self.retention_suite.sha256.clone(),
+            config.imitation.semantic_judge_hash.clone(),
+            config.retention.evaluator_hash.clone(),
+        ];
+        if let Some(dreaming) = &config.dreaming {
+            expected_evaluators.push(dreaming.reference_set_hash.clone());
+            expected_evaluators.push(dreaming.trial_evaluator_hash.clone());
         }
         ensure!(
-            self.sleep
-                .evaluator_hashes
-                .contains(&self.retention_suite.sha256),
-            "native sleep state does not record the retention-suite identity"
+            self.sleep.evaluator_hashes == expected_evaluators,
+            "native sleep evaluator identities or their configured roles have drifted"
         );
-        for expected in [
-            config.imitation.semantic_judge_hash.as_str(),
-            config.retention.evaluator_hash.as_str(),
-        ] {
-            ensure!(
-                self.sleep
-                    .evaluator_hashes
-                    .iter()
-                    .any(|hash| hash == expected),
-                "native sleep state is missing configured evaluator `{expected}`"
-            );
-        }
-        if let Some(dreaming) = &config.dreaming {
-            for expected in [&dreaming.reference_set_hash, &dreaming.trial_evaluator_hash] {
-                ensure!(
-                    self.sleep.evaluator_hashes.contains(expected),
-                    "native sleep state is missing configured dream evaluator `{expected}`"
-                );
-            }
-        }
-        self.sleep.validate_resume()?;
+        let memory_statuses = model.memory_slot_statuses();
+        validate_model_memory_state(schedule, &self.sleep, &memory_statuses)?;
         if let Some(txn) = &self.sleep.pending {
-            let expected_knowledge = (config.knowledge_seeding.teacher_rollouts
-                + config.knowledge_seeding.detached_student_rollouts)
-                as u64;
+            let expected_knowledge = config.knowledge_seeding.rollout_count_u64()?;
             if let Some(reservation) = txn.knowledge_rng {
                 ensure!(
                     reservation.stream == 0 && reservation.count == expected_knowledge,
@@ -289,7 +252,7 @@ impl NativeSleepCheckpoint {
             if let Some(reservation) = txn.imitation_rng {
                 ensure!(
                     reservation.stream == 0
-                        && reservation.count == config.imitation.grpo_group_size as u64,
+                        && reservation.count == config.imitation.group_size_u64()?,
                     "native imitation RNG reservation differs from WorkflowV2"
                 );
             }
@@ -298,7 +261,9 @@ impl NativeSleepCheckpoint {
                     if let Some(reservation) = txn.dream_generation_rng {
                         ensure!(
                             reservation.stream == 0
-                                && reservation.count == dreaming.candidate_count as u64,
+                                && reservation.count
+                                    == u64::try_from(dreaming.candidate_count)
+                                        .context("dream candidate count exceeds RNG schema")?,
                             "native dream-generation RNG reservation differs from WorkflowV2"
                         );
                     }
@@ -320,6 +285,25 @@ impl NativeSleepCheckpoint {
                             .all(|trial| trial.evaluator_hash == dreaming.trial_evaluator_hash),
                         "native dream trial used an evaluator outside WorkflowV2"
                     );
+                    let retained = dreaming.retained_count()?;
+                    ensure!(
+                        txn.dream_selected.len() <= retained
+                            && txn.dream_trials.len() <= txn.dream_selected.len()
+                            && txn.dream_trial_rngs.len() <= txn.dream_selected.len(),
+                        "native dream evidence exceeds the configured selection quota"
+                    );
+                    if matches!(
+                        self.sleep.phase,
+                        SleepPhase::DreamTrials
+                            | SleepPhase::DreamPolicyUpdate
+                            | SleepPhase::Candidate
+                    ) && txn.generated_manifest.is_some()
+                    {
+                        ensure!(
+                            txn.dream_selected.len() == retained,
+                            "native dream selection differs from the configured quota"
+                        );
+                    }
                 }
                 None => ensure!(
                     txn.dream_generation_rng.is_none()
@@ -333,16 +317,16 @@ impl NativeSleepCheckpoint {
                 ),
             }
         }
-        validate_model_memory_state(schedule, &self.sleep, &model.memory_slot_statuses())?;
         self.optimizer_scopes
-            .validate_active_state(model, schedule, &self.sleep)?;
+            .validate_active_state_after_model_validation(model, schedule, &memory_statuses)?;
         ensure!(
             self.optimizer_scopes
                 .tiers
                 .iter()
-                .all(|scope| scope.update_clock <= self.sleep.clock
+                .zip(&self.sleep.tiers)
+                .all(|(scope, tier)| scope.update_clock == tier.last_update_clock
                     && scope.transfer_clock <= self.sleep.clock),
-            "native optimizer or receiver-transfer clock is ahead of the wake/sleep clock"
+            "native optimizer update clock disagrees with its sleep tier, or a receiver-transfer clock is ahead of the wake/sleep clock"
         );
         if let Some(txn) = &self.sleep.pending
             && txn.committed
@@ -351,6 +335,51 @@ impl NativeSleepCheckpoint {
                 txn.candidate_checkpoint.as_deref() == Some(self.live_checkpoint.uri.as_str())
                     && txn.candidate_hash.as_deref() == Some(self.live_checkpoint.sha256.as_str()),
                 "native live checkpoint differs from committed sleep candidate"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate only state that can change between already authenticated sleep
+    /// boundaries. Model topology, active masks, evaluator bindings, and full
+    /// optimizer ownership are revalidated at construction/resume and before a
+    /// boundary consumes them; rebuilding their parameter-ID sets on every
+    /// ordinary wake step would put a large CPU allocation in the hot path.
+    fn validate_wake_tick(&self, config: &InModelSleepConfig) -> Result<()> {
+        ensure!(
+            self.version == NATIVE_SLEEP_CHECKPOINT_VERSION,
+            "unsupported native sleep checkpoint version {}",
+            self.version
+        );
+        ensure!(
+            self.sleep.phase == SleepPhase::Wake
+                && self.sleep.pending.is_none()
+                && self.sleep.due_senders.is_empty()
+                && self.sleep.due_clocks.is_empty(),
+            "ordinary wake clock advance found an unfinished sleep boundary"
+        );
+        ensure!(
+            self.sleep.tiers.len() == config.schedule.tiers.len()
+                && self.optimizer_scopes.tiers.len() == config.schedule.tiers.len(),
+            "native sleep tier count differs from WorkflowV2"
+        );
+        for (tier, ((saved, scope), configured)) in self
+            .sleep
+            .tiers
+            .iter()
+            .zip(&self.optimizer_scopes.tiers)
+            .zip(&config.schedule.tiers)
+            .enumerate()
+        {
+            ensure!(
+                saved.id == configured.id
+                    && saved.slots.len() == configured.reserve_slots
+                    && scope.tier == tier
+                    && scope.tier_id == configured.id
+                    && scope.update_clock == saved.last_update_clock
+                    && scope.transfer_clock <= self.sleep.clock,
+                "native wake tier `{}` differs from its schedule/optimizer clock",
+                configured.id
             );
         }
         Ok(())
@@ -387,9 +416,22 @@ impl NativeSleepCheckpoint {
         config: &InModelSleepConfig,
         clock: u64,
     ) -> Result<()> {
-        self.validate(model, config)?;
-        self.sleep.advance_clock(&config.schedule, clock)?;
-        self.validate(model, config)
+        let reaches_boundary = reaches_sleep_boundary(&self.sleep, &config.schedule, clock)?;
+        if reaches_boundary {
+            self.validate_state(model, config)?;
+            self.retention_suite.verify()?;
+            if let Some(journal) = &self.wake_context_journal {
+                journal
+                    .verify()
+                    .context("verifying pinned wake-context journal")?;
+            }
+        } else {
+            self.validate_wake_tick(config)?;
+        }
+        // SleepState computes every fallible boundary decision before it
+        // mutates clocks/queues, so no full checkpoint clone is required for
+        // failure atomicity on the wake hot path.
+        self.sleep.advance_clock(&config.schedule, clock)
     }
 
     pub fn begin_next(&mut self, plan: PlannedConsolidation) -> Result<ConsolidationTxn> {
@@ -407,6 +449,37 @@ impl NativeSleepCheckpoint {
             plan.prospective_update_sha256,
         )
     }
+
+    /// Model topology paired with the durable tier optimizer scopes. Before
+    /// commit those scopes still describe the teacher; after commit they
+    /// include the activated receiver and reclaimed sender masks in `live`.
+    pub(crate) fn optimizer_scope_checkpoint(&self) -> Result<NativeCheckpointRef> {
+        match self.sleep.pending.as_ref() {
+            Some(txn) if !txn.committed => {
+                NativeCheckpointRef::new(&txn.teacher_checkpoint, &txn.teacher_hash)
+            }
+            _ => Ok(self.live_checkpoint.clone()),
+        }
+    }
+}
+
+fn reaches_sleep_boundary(
+    state: &SleepState,
+    schedule: &SleepSchedule,
+    clock: u64,
+) -> Result<bool> {
+    for (saved, configured) in state.tiers.iter().zip(&schedule.tiers) {
+        let next = saved
+            .last_boundary_clock
+            .checked_div(configured.update_period)
+            .and_then(|multiple| multiple.checked_add(1))
+            .and_then(|multiple| multiple.checked_mul(configured.update_period))
+            .context("sleep boundary clock overflow")?;
+        if next <= clock {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -423,8 +496,8 @@ impl PlannedConsolidation {
             !self.student_checkpoint.trim().is_empty(),
             "prospective student checkpoint is empty"
         );
-        validate_hash(&self.student_sha256, "prospective student hash")?;
-        validate_hash(
+        validate_sha256_identity(&self.student_sha256, "prospective student hash")?;
+        validate_sha256_identity(
             &self.prospective_update_sha256,
             "prospective optimizer-update hash",
         )
@@ -538,7 +611,7 @@ impl NativeSleepContextRegistry {
     where
         F: NativeSleepPhaseContextFactory + 'static,
     {
-        validate_hash(factory.identity(), "native sleep factory identity")?;
+        validate_sha256_identity(factory.identity(), "native sleep factory identity")?;
         ensure!(
             self.phase_factory.is_none(),
             "a native sleep phase factory is already registered"
@@ -602,7 +675,7 @@ pub struct NativeSleepPhaseExecutor {
 impl NativeSleepPhaseExecutor {
     pub fn new(workflow_signature: impl Into<String>) -> Result<Self> {
         let workflow_signature = workflow_signature.into();
-        validate_hash(&workflow_signature, "native executor workflow signature")?;
+        validate_sha256_identity(&workflow_signature, "native executor workflow signature")?;
         Ok(Self { workflow_signature })
     }
 
@@ -612,6 +685,22 @@ impl NativeSleepPhaseExecutor {
         request: &PhaseExecutionRequest,
         config: &InModelSleepConfig,
     ) -> Result<()> {
+        ensure!(
+            cursor.version == NATIVE_SLEEP_CHECKPOINT_VERSION,
+            "unsupported native sleep checkpoint version {}",
+            cursor.version
+        );
+        cursor.input_checkpoint.validate()?;
+        cursor.live_checkpoint.validate()?;
+        cursor
+            .sleep
+            .validate_resume()
+            .context("validating native sleep phase cursor")?;
+        if let Some(journal) = &cursor.wake_context_journal {
+            journal
+                .verify()
+                .context("verifying native sleep phase wake-context journal")?;
+        }
         let input = request
             .input_checkpoint
             .as_ref()
@@ -639,31 +728,19 @@ impl NativeSleepPhaseExecutor {
             "native sleep cursor retention suite differs from WorkflowV2"
         );
         cursor.retention_suite.verify()?;
-        for hash in [
-            config.imitation.semantic_judge_hash.as_str(),
-            config.retention.evaluator_hash.as_str(),
-        ] {
-            ensure!(
-                cursor
-                    .sleep
-                    .evaluator_hashes
-                    .iter()
-                    .any(|saved| saved == hash),
-                "native sleep cursor is missing evaluator `{hash}`"
-            );
-        }
+        let mut expected_evaluators = vec![
+            config.retention_suite_sha256.clone(),
+            config.imitation.semantic_judge_hash.clone(),
+            config.retention.evaluator_hash.clone(),
+        ];
         if let Some(dreaming) = &config.dreaming {
-            for expected in [&dreaming.reference_set_hash, &dreaming.trial_evaluator_hash] {
-                ensure!(
-                    cursor
-                        .sleep
-                        .evaluator_hashes
-                        .iter()
-                        .any(|saved| saved == expected),
-                    "native sleep cursor is missing dream evaluator `{expected}`"
-                );
-            }
+            expected_evaluators.push(dreaming.reference_set_hash.clone());
+            expected_evaluators.push(dreaming.trial_evaluator_hash.clone());
         }
+        ensure!(
+            cursor.sleep.evaluator_hashes == expected_evaluators,
+            "native sleep cursor evaluator identities or configured roles have drifted"
+        );
         if let Some(trigger) = config.standalone_trigger_clock {
             ensure!(
                 cursor.sleep.clock == trigger,
@@ -760,7 +837,8 @@ impl<C: NativeSleepPhaseContext> PhaseExecutor<C> for NativeSleepPhaseExecutor {
                 ensure!(
                     cursor.sleep.phase == SleepPhase::Wake
                         && cursor.sleep.pending.is_none()
-                        && cursor.sleep.due_senders.is_empty(),
+                        && cursor.sleep.due_senders.is_empty()
+                        && cursor.sleep.due_clocks.is_empty(),
                     "native sleep phase accepted before every due sender completed"
                 );
                 Ok(PhaseExecutionResult::Complete(
@@ -1029,7 +1107,7 @@ fn emit_retention_metrics<S: NativeSleepProgressSink>(
             candidate_score: f64::from(diagnostics.student_incorporation),
             improvement: f64::from(diagnostics.incorporation_gain),
             maximum_allowed_regression: 0.0,
-            passed: diagnostics.incorporation_gain >= 0.0,
+            passed: diagnostics.incorporation_gain >= config.retention.min_incorporation_gain,
         },
     ] {
         sink.metric(checkpoint, MetricEvent::RetentionDelta(metric))?;
@@ -1224,12 +1302,15 @@ fn emit_active_capacity_metrics<S: NativeSleepProgressSink>(
                 ],
                 "stored reserve experts",
             )?;
-            // Exactly one low-rank route executes on every wake pass. Before
-            // any real slot is active the model executes its deterministic
-            // zero fallback; activation replaces that lane rather than adding
-            // a route. Candidate router scoring is intentionally not counted
-            // as routed expert parameters and remains covered by measured
-            // throughput/latency gates.
+            // Router scoring covers every preallocated row even though only
+            // top-k low-rank experts execute. Before any real slot is active
+            // the model executes its deterministic zero fallback; activation
+            // replaces that lane rather than adding a route.
+            checked_add_product(
+                &mut routed_active_parameters,
+                &[reserve.capacity, hidden],
+                "fixed reserve router lanes",
+            )?;
             checked_add_product(
                 &mut routed_active_parameters,
                 &[reserve.top_k, 2, hidden, reserve.rank],
@@ -1334,12 +1415,9 @@ where
                 persist_tensor_boundary(checkpoint, backend, store, sink)?;
             }
             SleepPhase::KnowledgeSeeding => {
-                checkpoint.sleep.reserve_knowledge_rng(
-                    0,
-                    (config.knowledge_seeding.teacher_rollouts
-                        + config.knowledge_seeding.detached_student_rollouts)
-                        as u64,
-                )?;
+                checkpoint
+                    .sleep
+                    .reserve_knowledge_rng(0, config.knowledge_seeding.rollout_count_u64()?)?;
                 sink.persist(checkpoint)?;
                 let current_txn = checkpoint
                     .sleep
@@ -1354,7 +1432,7 @@ where
             SleepPhase::Imitation => {
                 checkpoint
                     .sleep
-                    .reserve_imitation_rng(0, config.imitation.grpo_group_size as u64)?;
+                    .reserve_imitation_rng(0, config.imitation.group_size_u64()?)?;
                 sink.persist(checkpoint)?;
                 let current_txn = checkpoint
                     .sleep
@@ -1459,16 +1537,15 @@ where
             restored.live_checkpoint =
                 NativeCheckpointRef::new(txn.teacher_checkpoint.clone(), txn.teacher_hash.clone())?;
             restored.validate(&backend.live_checkpoint().model, config)?;
-            emit_tier_update_metric(
+            let metric = emit_tier_update_metric(
                 &restored,
                 schedule,
                 &txn,
                 sender_accumulated_micro_steps,
                 TierUpdateOutcome::RolledBack,
                 sink,
-            )?;
-            sink.persist(&restored)?;
-            *checkpoint = restored;
+            );
+            publish_native_rollback(checkpoint, restored, metric, sink)?;
             Ok(NativeConsolidationOutcome::Rejected(
                 checkpoint.live_checkpoint.clone(),
             ))
@@ -1479,11 +1556,16 @@ where
                     "native candidate was published; retry idempotent artifact and cursor publication without rollback",
                 ));
             }
-            let restore = backend.restore_teacher(&txn);
+            if let Err(restore_error) = backend.restore_teacher(&txn) {
+                bail!(
+                    "native consolidation failed: {error:#}; teacher restore also failed: {restore_error:#}"
+                );
+            }
             let mut restored = checkpoint.clone();
             restored.sleep.rollback()?;
             restored.live_checkpoint =
                 NativeCheckpointRef::new(txn.teacher_checkpoint.clone(), txn.teacher_hash.clone())?;
+            restored.validate(&backend.live_checkpoint().model, config)?;
             let metric = emit_tier_update_metric(
                 &restored,
                 schedule,
@@ -1492,18 +1574,29 @@ where
                 TierUpdateOutcome::RolledBack,
                 sink,
             );
-            let persist = sink.persist(&restored);
-            if let Err(restore_error) = restore {
-                bail!(
-                    "native consolidation failed: {error:#}; teacher restore also failed: {restore_error:#}"
-                );
-            }
-            metric.context("emitting native sleep rollback metric")?;
-            persist.context("persisting native sleep rollback")?;
-            *checkpoint = restored;
+            publish_native_rollback(checkpoint, restored, metric, sink)?;
             Err(error)
         }
     }
+}
+
+/// Publish restored semantic state even if telemetry emission failed. Once the
+/// tensor backend has restored its teacher, leaving the durable or in-memory
+/// cursor in an in-flight subphase would make a same-process retry disagree
+/// with the backend. A failed checkpoint publication still leaves the caller
+/// pending so it can retry from the last durable boundary.
+fn publish_native_rollback<S: NativeSleepProgressSink>(
+    checkpoint: &mut NativeSleepCheckpoint,
+    restored: NativeSleepCheckpoint,
+    metric: Result<()>,
+    sink: &mut S,
+) -> Result<()> {
+    let persist = sink.persist(&restored);
+    if persist.is_ok() {
+        *checkpoint = restored;
+    }
+    metric.context("emitting native sleep rollback metric")?;
+    persist.context("persisting native sleep rollback")
 }
 
 fn persist_tensor_boundary_without_cursor<U, R, J, E, P, T>(
@@ -1727,11 +1820,12 @@ mod tests {
     use burn::tensor::{Int, Tensor};
     use burn_optim::{AdamWConfig, GradientsParams};
     use hermes_llm::{Device, Transformer, parse_mal};
+    use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::sleep::{
         ImitationConfig, KnowledgeSeedingConfig, MemoryTierSchedule, TerminalConsolidation,
-        UpdateClock,
+        UpdateClock, full_scope_validation_count, reset_full_scope_validation_count,
     };
     use crate::tensor_sleep::RetentionGateConfig;
     use crate::tensor_sleep::{
@@ -1943,6 +2037,174 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CapacitySink(Vec<ActiveCapacityMetrics>);
+
+    impl NativeSleepProgressSink for CapacitySink {
+        fn persist(&mut self, _: &NativeSleepCheckpoint) -> Result<()> {
+            Ok(())
+        }
+
+        fn metric(&mut self, _: &NativeSleepCheckpoint, event: MetricEvent) -> Result<()> {
+            if let MetricEvent::ActiveCapacity(metric) = event {
+                self.0.push(metric);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn active_capacity_metrics_include_every_fixed_reserve_router_lane() {
+        let model = model();
+        let (_, checkpoint) = checkpoint(&model);
+        let schedule = schedule();
+        let mut sink = CapacitySink::default();
+
+        emit_active_capacity_metrics(&checkpoint, &model, &schedule, &mut sink).unwrap();
+
+        assert_eq!(sink.0.len(), schedule.tiers.len());
+        let memory_stored = sink
+            .0
+            .iter()
+            .map(|metric| metric.stored_parameters)
+            .sum::<u64>();
+        let memory_routed = sink
+            .0
+            .iter()
+            .map(|metric| metric.routed_active_parameters)
+            .sum::<u64>();
+        let model_accounting = model.wake_parameter_accounting().unwrap();
+        let non_memory = model_accounting
+            .stored_parameters
+            .checked_sub(memory_stored)
+            .unwrap();
+        assert_eq!(
+            non_memory + memory_routed,
+            model_accounting.routed_active_parameters
+        );
+    }
+
+    #[derive(Default)]
+    struct RetentionSink(Vec<RetentionDeltaMetrics>);
+
+    impl NativeSleepProgressSink for RetentionSink {
+        fn persist(&mut self, _: &NativeSleepCheckpoint) -> Result<()> {
+            Ok(())
+        }
+
+        fn metric(&mut self, _: &NativeSleepCheckpoint, event: MetricEvent) -> Result<()> {
+            if let MetricEvent::RetentionDelta(metric) = event {
+                self.0.push(metric);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn incorporation_metric_uses_the_configured_retention_threshold() {
+        let model = model();
+        let (directory, mut checkpoint) = checkpoint(&model);
+        let mut config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
+        config.retention.min_incorporation_gain = 0.2;
+        checkpoint.advance_clock(&model, &config, 100).unwrap();
+        let txn = checkpoint
+            .begin_next(PlannedConsolidation {
+                student_checkpoint: "student-metric".into(),
+                student_sha256: hash('b'),
+                prospective_update_sha256: hash('c'),
+            })
+            .unwrap();
+        let diagnostics = crate::tensor_sleep::TensorSleepDiagnostics {
+            retention_anchor_kl: 0.0,
+            teacher_stable_anchor: 0.8,
+            student_stable_anchor: 0.8,
+            teacher_incorporation: 0.4,
+            student_incorporation: 0.5,
+            incorporation_gain: 0.1,
+            ..Default::default()
+        };
+        let mut sink = RetentionSink::default();
+
+        emit_retention_metrics(&checkpoint, &txn, &config, diagnostics, &mut sink).unwrap();
+
+        let incorporation = sink
+            .0
+            .iter()
+            .find(|metric| metric.metric == "incorporation")
+            .unwrap();
+        assert!(!incorporation.passed);
+    }
+
+    #[test]
+    fn native_resume_rejects_extra_or_reordered_evaluator_roles() {
+        let model = model();
+        let (directory, checkpoint) = checkpoint(&model);
+        let config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
+
+        let mut extra = checkpoint.clone();
+        extra.sleep.evaluator_hashes.push(hash('9'));
+        assert!(extra.validate(&model, &config).is_err());
+
+        let mut reordered = checkpoint;
+        reordered.sleep.evaluator_hashes.swap(0, 1);
+        assert!(reordered.validate(&model, &config).is_err());
+    }
+
+    #[derive(Default)]
+    struct RecordingRollbackSink {
+        persisted: Option<NativeSleepCheckpoint>,
+        fail_persist: bool,
+    }
+
+    impl NativeSleepProgressSink for RecordingRollbackSink {
+        fn persist(&mut self, checkpoint: &NativeSleepCheckpoint) -> Result<()> {
+            if self.fail_persist {
+                bail!("injected rollback persistence failure");
+            }
+            self.persisted = Some(checkpoint.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rollback_cursor_stays_aligned_with_the_durable_backend_when_metrics_fail() {
+        let model = model();
+        let (_, mut checkpoint) = checkpoint(&model);
+        let original = checkpoint.clone();
+        let mut restored = checkpoint.clone();
+        restored.sleep.clock = 1;
+        let expected = restored.clone();
+        let mut sink = RecordingRollbackSink::default();
+
+        let error = publish_native_rollback(
+            &mut checkpoint,
+            restored,
+            Err(anyhow::anyhow!("injected metric failure")),
+            &mut sink,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("rollback metric"), "{error}");
+        assert_ne!(checkpoint, original);
+        assert_eq!(checkpoint, expected);
+        assert_eq!(sink.persisted, Some(expected));
+
+        let before_failed_persist = checkpoint.clone();
+        let mut sink = RecordingRollbackSink {
+            fail_persist: true,
+            ..Default::default()
+        };
+        let error = publish_native_rollback(&mut checkpoint, original, Ok(()), &mut sink)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("persisting native sleep rollback"),
+            "{error}"
+        );
+        assert_eq!(checkpoint, before_failed_persist);
+    }
+
+    #[derive(Default)]
     struct RollbackBoundaryDriver(Vec<(u64, usize)>);
 
     impl PeriodicSleepBoundaryDriver for RollbackBoundaryDriver {
@@ -2135,6 +2397,7 @@ mod tests {
     struct CrashUpdate {
         device: Device,
         state: u64,
+        fail_restore: bool,
     }
 
     impl ProspectiveTransformerUpdate for CrashUpdate {
@@ -2147,6 +2410,10 @@ mod tests {
             _: &ConsolidationTxn,
             snapshot: &ProspectiveUpdateSnapshot,
         ) -> Result<()> {
+            ensure!(
+                !self.fail_restore,
+                "injected native update-state restore failure"
+            );
             self.state = u64::from_le_bytes(
                 snapshot
                     .as_bytes()
@@ -2185,6 +2452,7 @@ mod tests {
 
     struct CrashRollouts {
         plan: CrashPlan,
+        fail_knowledge: bool,
     }
 
     impl ConsolidationRollouts for CrashRollouts {
@@ -2195,6 +2463,10 @@ mod tests {
             _: &Transformer,
             count: usize,
         ) -> Result<Vec<TokenRolloutBatch>> {
+            ensure!(
+                !self.fail_knowledge,
+                "injected native knowledge-rollout failure"
+            );
             self.plan.hit(CrashEdge::KnowledgeWork);
             Ok((0..count)
                 .map(|_| TokenRolloutBatch::new(1, 4, vec![1, 2, 3, 4]).unwrap())
@@ -2388,6 +2660,14 @@ mod tests {
     }
 
     impl DreamingBackend for CrashDreamBackend {
+        fn verify_committed_candidate(&mut self, txn: &ConsolidationTxn) -> Result<()> {
+            ensure!(
+                txn.candidate_hash.as_deref() == Some(hash('9').as_str()),
+                "crash backend is bound to another candidate"
+            );
+            Ok(())
+        }
+
         fn shared_checkpoint_hash(&mut self) -> Result<String> {
             Ok(hash('9'))
         }
@@ -2522,6 +2802,8 @@ mod tests {
         candidate: DurableCandidate,
         optimizer: DurableOptimizer,
         plan: CrashPlan,
+        fail_restore: bool,
+        fail_knowledge: bool,
     }
 
     struct CrashOutcome {
@@ -2551,6 +2833,8 @@ mod tests {
                 candidate: DurableCandidate::default(),
                 optimizer: DurableOptimizer::default(),
                 plan,
+                fail_restore: false,
+                fail_knowledge: false,
             }
         }
 
@@ -2571,9 +2855,11 @@ mod tests {
                 CrashUpdate {
                     device: self.seed.device.clone(),
                     state: 0,
+                    fail_restore: self.fail_restore,
                 },
                 CrashRollouts {
                     plan: self.plan.clone(),
+                    fail_knowledge: self.fail_knowledge,
                 },
                 CrashJudge,
                 CrashEvaluator {
@@ -2708,6 +2994,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_native_teacher_restore_never_publishes_rollback_metadata() {
+        let seed = CrashSeed::new();
+        let mut harness = CrashHarness::new(&seed, CrashPlan::default());
+        harness.fail_knowledge = true;
+        harness.fail_restore = true;
+
+        let error = harness.attempt().unwrap_err().to_string();
+        assert!(error.contains("teacher restore also failed"), "{error}");
+        let durable = harness.journal.checkpoint.borrow().clone().unwrap();
+        assert_eq!(durable.sleep.phase, SleepPhase::KnowledgeSeeding);
+        assert!(durable.sleep.pending.is_some());
+        assert!(
+            harness
+                .journal
+                .checkpoint
+                .borrow()
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.sleep.phase != SleepPhase::Wake),
+            "a native rollback cursor was published despite failed restoration"
+        );
+    }
+
+    #[test]
     fn retention_bytes_are_reverified_before_resume_or_mutation() {
         let model = model();
         let (directory, checkpoint) = checkpoint(&model);
@@ -2718,6 +3027,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("changed"), "{error}");
+    }
+
+    #[test]
+    fn wake_steps_defer_external_artifact_io_until_a_sleep_boundary() {
+        let model = model();
+        let (directory, mut checkpoint) = checkpoint(&model);
+        let config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
+        fs::write(directory.path().join("retention.json"), b"drifted").unwrap();
+
+        checkpoint.advance_clock(&model, &config, 1).unwrap();
+        let before_boundary = checkpoint.clone();
+        let error = checkpoint
+            .advance_clock(&model, &config, 100)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed"), "{error}");
+        assert_eq!(checkpoint, before_boundary);
+    }
+
+    #[test]
+    fn ordinary_wake_ticks_skip_full_parameter_scope_validation() {
+        let model = model();
+        let (directory, mut checkpoint) = checkpoint(&model);
+        let config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
+
+        reset_full_scope_validation_count();
+        checkpoint.advance_clock(&model, &config, 1).unwrap();
+        assert_eq!(full_scope_validation_count(), 0);
+
+        checkpoint.advance_clock(&model, &config, 100).unwrap();
+        assert!(
+            full_scope_validation_count() > 0,
+            "a due boundary must still revalidate the complete model scope"
+        );
+    }
+
+    #[test]
+    fn optimizer_scope_restore_uses_candidate_topology_after_commit() {
+        let mut model = model();
+        let (directory, mut checkpoint) = checkpoint(&model);
+        let config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
+        checkpoint.advance_clock(&model, &config, 100).unwrap();
+        let txn = checkpoint
+            .begin_next(PlannedConsolidation {
+                student_checkpoint: "student.safetensors".into(),
+                student_sha256: hash('b'),
+                prospective_update_sha256: hash('c'),
+            })
+            .unwrap();
+
+        assert_eq!(
+            checkpoint.optimizer_scope_checkpoint().unwrap(),
+            NativeCheckpointRef::new(&txn.teacher_checkpoint, &txn.teacher_hash).unwrap()
+        );
+
+        commit_test_transaction(&mut checkpoint, &mut model, &txn, 'd');
+        let pending = checkpoint.sleep.pending.as_ref().unwrap();
+        checkpoint.live_checkpoint = NativeCheckpointRef::new(
+            pending.candidate_checkpoint.as_ref().unwrap(),
+            pending.candidate_hash.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkpoint.optimizer_scope_checkpoint().unwrap(),
+            checkpoint.live_checkpoint
+        );
+    }
+
+    #[test]
+    fn resume_rejects_optimizer_update_clock_drift_from_sleep_state() {
+        let model = model();
+        let (directory, mut checkpoint) = checkpoint(&model);
+        let config = sleep_config(directory.path(), checkpoint.retention_suite.sha256.clone());
+        checkpoint.advance_clock(&model, &config, 100).unwrap();
+        checkpoint.optimizer_scopes.tiers[0].update_clock = 100;
+
+        let error = checkpoint
+            .validate(&model, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disagrees with its sleep tier"), "{error}");
     }
 
     #[test]
@@ -2795,6 +3187,7 @@ mod tests {
             .val();
         let mut state = artifact('b');
         state.optimizer_parameter_ids.push(dormant_id);
+        checkpoint.optimizer_scopes.tiers[1].generation = 1;
         checkpoint.optimizer_scopes.tiers[1].artifact = Some(state);
         let error = checkpoint
             .optimizer_scopes

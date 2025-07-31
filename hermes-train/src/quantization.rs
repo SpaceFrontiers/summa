@@ -9,8 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::{Module, ModuleMapper, Param, ParamId};
@@ -19,19 +22,29 @@ use burn::tensor::Device;
 use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorData};
 use half::{bf16, f16};
 use hermes_llm::Transformer;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
+use safetensors::tensor::{Metadata as SafeTensorMetadata, TensorInfo};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::artifact_io::{
+    StableIdentity, hash_open_file, sha256_identity, validate_sha256_identity,
+};
 use crate::workflow::{QuantizationConfig, QuantizationFormat, QuantizationTraining};
 
 const MAGIC: &[u8; 8] = b"HQUANT1\0";
 const CODEC_VERSION: u16 = 1;
 pub const QUANTIZATION_ARCHIVE_VERSION: u32 = 2;
-pub const QUANTIZATION_TRANSACTION_VERSION: u32 = 1;
 const ARCHIVE_VERSION: u32 = QUANTIZATION_ARCHIVE_VERSION;
-const TRANSACTION_VERSION: u32 = QUANTIZATION_TRANSACTION_VERSION;
 pub const BONSAI_GROUP_SIZE: usize = 128;
+const MAX_QUANTIZATION_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_QUANTIZATION_ARCHIVE_MEMBERS: usize = 65_536;
+const MAX_QUANTIZATION_ARCHIVE_DIRECTORIES: usize = 4_096;
+const MAX_QUANTIZATION_ARCHIVE_DEPTH: usize = 32;
+const MAX_QUANTIZATION_MEMBER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TENSOR_RANK: usize = 32;
+const MAX_TENSOR_NAME_BYTES: usize = 4_096;
+const MAX_ARCHIVE_MEMBER_PATH_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -164,7 +177,7 @@ impl WorkflowQuantizationPlan {
                     !teacher_checkpoint.as_os_str().is_empty(),
                     "quantization distillation requires teacher_checkpoint"
                 );
-                validate_sha256_label(teacher_sha256)?;
+                validate_sha256_identity(teacher_sha256, "quantization teacher identity")?;
                 ensure!(
                     temperature.is_finite() && *temperature > 0.0,
                     "quantization distillation temperature must be finite and positive"
@@ -266,7 +279,7 @@ impl WorkflowQuantizationPlan {
                     !teacher_checkpoint.as_os_str().is_empty(),
                     "quantization teacher checkpoint is empty"
                 );
-                validate_sha256_label(teacher_sha256)?;
+                validate_sha256_identity(teacher_sha256, "quantization teacher identity")?;
                 ensure!(
                     temperature.is_finite() && *temperature > 0.0,
                     "quantization teacher temperature must be finite and positive"
@@ -281,12 +294,12 @@ impl WorkflowQuantizationPlan {
                 );
             }
         }
-        self.start_step
+        let target_start = self
+            .start_step
             .checked_add(self.warmup_steps)
             .context("quantization warmup schedule overflows u64")?;
         ensure!(
-            self.end_step
-                .is_none_or(|end| { end > self.start_step.saturating_add(self.warmup_steps) }),
+            self.end_step.is_none_or(|end| end > target_start),
             "quantization interval ends before the target format becomes active"
         );
         Ok(())
@@ -329,11 +342,6 @@ impl WorkflowQuantizationPlan {
                 .map_or_else(|| "unbounded".to_owned(), |end| end.to_string())
         );
         Ok(())
-    }
-
-    pub fn fingerprint(&self) -> Result<String> {
-        self.validate()?;
-        Ok(sha256_label(&serde_json::to_vec(self)?))
     }
 }
 
@@ -393,7 +401,10 @@ impl QuantizationRecipe {
             return None;
         }
         if self.format == UltraQuantFormat::BinaryG128
-            && step < self.fake_quant_start_step + self.ternary_warmup_steps
+            && step
+                < self
+                    .fake_quant_start_step
+                    .saturating_add(self.ternary_warmup_steps)
         {
             return Some(UltraQuantFormat::TernaryG128);
         }
@@ -412,19 +423,34 @@ pub struct PackedTensor {
 }
 
 impl PackedTensor {
-    pub fn elements(&self) -> usize {
-        self.shape.iter().product()
+    pub fn elements(&self) -> Result<usize> {
+        ensure!(
+            (1..=MAX_TENSOR_RANK).contains(&self.shape.len()),
+            "packed tensor rank must be in 1..={MAX_TENSOR_RANK}"
+        );
+        checked_elements(&self.shape)
     }
 
     /// Codec payload rate (codes plus FP16 group scales), excluding the small
     /// HQUANT container header/checksum. Archive accounting uses actual files.
-    pub fn bits_per_weight(&self) -> f64 {
-        8.0 * (self.codes.len() + self.scales.len() * 2) as f64 / self.elements() as f64
+    pub fn bits_per_weight(&self) -> Result<f64> {
+        validate_packed(self)?;
+        let payload_bytes = self
+            .scales
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|scale_bytes| scale_bytes.checked_add(self.codes.len()))
+            .context("packed tensor payload size overflows usize")?;
+        Ok(8.0 * payload_bytes as f64 / self.elements()? as f64)
     }
 
     pub fn decode(&self) -> Result<Vec<f32>> {
         validate_packed(self)?;
-        let mut output = Vec::with_capacity(self.elements());
+        let elements = self.elements()?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(elements)
+            .context("reserving decoded quantized tensor")?;
         for group in 0..self.scales.len() {
             let scale = f16::from_bits(self.scales[group]).to_f32();
             match self.format {
@@ -470,7 +496,7 @@ impl PackedTensor {
                 }
             }
         }
-        output.truncate(self.elements());
+        output.truncate(elements);
         Ok(output)
     }
 
@@ -519,6 +545,10 @@ impl PackedTensor {
         let format = UltraQuantFormat::from_tag(read_u8(&mut input)?)?;
         let group_size = usize::from(read_u16(&mut input)?);
         let rank = usize::from(read_u8(&mut input)?);
+        ensure!(
+            (1..=MAX_TENSOR_RANK).contains(&rank),
+            "packed tensor rank must be in 1..={MAX_TENSOR_RANK}"
+        );
         let mut shape = Vec::with_capacity(rank);
         for _ in 0..rank {
             shape.push(
@@ -588,7 +618,8 @@ impl PackedTensor {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes =
+            read_regular_file_bounded(path, MAX_QUANTIZATION_MEMBER_BYTES, "packed tensor")?;
         Self::from_bytes(&bytes)
     }
 
@@ -598,6 +629,7 @@ impl PackedTensor {
     /// not presented as a production GEMM kernel.
     pub fn matrix_vector(&self, input: &[f32]) -> Result<Vec<f32>> {
         validate_packed(self)?;
+        let elements = self.elements()?;
         ensure!(
             self.shape.len() == 2,
             "packed linear weight must be rank two"
@@ -614,18 +646,15 @@ impl PackedTensor {
             let mut sum = 0.0f32;
             for (column, activation) in input.iter().enumerate() {
                 let index = row * columns + column;
-                sum += self.value_at(index)? * activation;
+                sum += self.value_at(index, elements)? * activation;
             }
             *output = sum;
         }
         Ok(output)
     }
 
-    fn value_at(&self, index: usize) -> Result<f32> {
-        ensure!(
-            index < self.elements(),
-            "packed tensor index is out of bounds"
-        );
+    fn value_at(&self, index: usize, elements: usize) -> Result<f32> {
+        ensure!(index < elements, "packed tensor index is out of bounds");
         let group = index / self.group_size;
         let local = index % self.group_size;
         let scale = f16::from_bits(self.scales[group]).to_f32();
@@ -902,631 +931,6 @@ pub fn fake_quantized_transformer(
     Ok((staged, mapper.mapped))
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct QuantizationStepResult {
-    pub format: Option<UltraQuantFormat>,
-    pub task_loss: f64,
-    pub distillation_forward_kl: Option<f64>,
-    pub quantized_matrices: usize,
-}
-
-/// Accelerator/model adapter for straight-through fake-quantized training.
-/// Full-precision master weights remain authoritative; temporary quantized
-/// forward tensors are always restored before an optimizer update is applied.
-pub trait QuantizationTrainingBackend {
-    type Gradients;
-
-    fn master_weights_hash(&mut self) -> Result<String>;
-    fn stage_fake_quantized_forward(
-        &mut self,
-        format: UltraQuantFormat,
-        group_size: usize,
-        embeddings: bool,
-        lm_head: bool,
-    ) -> Result<usize>;
-    fn compute_straight_through_gradients(
-        &mut self,
-        distillation_weight: f64,
-    ) -> Result<(Self::Gradients, f64, Option<f64>)>;
-    fn restore_master_weights(&mut self) -> Result<()>;
-    fn apply_master_update(&mut self, gradients: Self::Gradients) -> Result<()>;
-}
-
-/// Execute one QAT step with cleanup on every error. Before fake-quant starts,
-/// this still uses the same backend gradient/apply path without staging a
-/// quantized forward, which makes progressive schedules checkpoint-stable.
-pub fn run_quantization_step<B: QuantizationTrainingBackend>(
-    backend: &mut B,
-    recipe: &QuantizationRecipe,
-    step: u64,
-) -> Result<QuantizationStepResult> {
-    recipe.validate()?;
-    let master_hash = backend.master_weights_hash()?;
-    let format = recipe.forward_format(step);
-    let quantized_matrices = match format {
-        Some(format) => backend.stage_fake_quantized_forward(
-            format,
-            recipe.group_size,
-            recipe.quantize_embeddings,
-            recipe.quantize_lm_head,
-        )?,
-        None => 0,
-    };
-    let computed = backend.compute_straight_through_gradients(recipe.distillation_weight);
-    let restore = backend.restore_master_weights();
-    if let Err(error) = restore {
-        return match computed {
-            Ok(_) => Err(error.context("failed to restore full-precision masters after QAT")),
-            Err(compute_error) => bail!(
-                "QAT gradient computation failed: {compute_error:#}; master restore also failed: {error:#}"
-            ),
-        };
-    }
-    ensure!(
-        backend.master_weights_hash()? == master_hash,
-        "fake-quantized forward mutated full-precision master weights"
-    );
-    let (gradients, task_loss, distillation_forward_kl) = computed?;
-    ensure!(task_loss.is_finite(), "QAT task loss is non-finite");
-    if let Some(divergence) = distillation_forward_kl {
-        ensure!(
-            divergence.is_finite() && divergence >= 0.0,
-            "QAT distillation divergence is invalid"
-        );
-    }
-    backend.apply_master_update(gradients)?;
-    Ok(QuantizationStepResult {
-        format,
-        task_loss,
-        distillation_forward_kl,
-        quantized_matrices,
-    })
-}
-
-/// Durable state of one optimizer step. The state is intentionally independent
-/// of trainer checkpoint internals so it can be embedded in the strict v2
-/// checkpoint and atomically persisted by the caller.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct QuantizationTransactionState {
-    pub version: u32,
-    pub transaction_id: String,
-    pub plan_fingerprint: String,
-    pub optimizer_step: u64,
-    pub format: Option<UltraQuantFormat>,
-    pub substep: QuantizationSubstep,
-    pub pre_update_master_hash: String,
-    pub quantized_matrices: Option<usize>,
-    pub gradient_handle: Option<String>,
-    pub task_loss: Option<f64>,
-    pub distillation_forward_kl: Option<f64>,
-    pub post_update_master_hash: Option<String>,
-    pub failure: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuantizationSubstep {
-    Prepared,
-    ForwardStaged,
-    GradientsComputed,
-    MastersRestored,
-    UpdateApplied,
-    Complete,
-    Aborted,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DurableGradientResult {
-    /// Backend-owned durable handle. Calling the compute operation again with
-    /// the same transaction id must return the same logical gradients/handle.
-    pub gradient_handle: String,
-    pub task_loss: f64,
-    pub distillation_forward_kl: Option<f64>,
-}
-
-/// Backend contract for interruption-safe QAT and quantization distillation.
-/// Every method ending in `_once` must be idempotent for a transaction id.
-/// In particular, `apply_master_update_once` must never apply an optimizer
-/// update twice after a crash between the update and its checkpoint callback.
-pub trait DurableQuantizationBackend {
-    fn master_weights_hash(&mut self) -> Result<String>;
-
-    fn stage_fake_quantized_forward_once(
-        &mut self,
-        transaction_id: &str,
-        format: UltraQuantFormat,
-        group_size: usize,
-        embeddings: bool,
-        lm_head: bool,
-    ) -> Result<usize>;
-
-    fn compute_gradients_once(
-        &mut self,
-        transaction_id: &str,
-        training: &WorkflowQuantizationTraining,
-    ) -> Result<DurableGradientResult>;
-
-    fn restore_master_weights_once(&mut self, transaction_id: &str) -> Result<()>;
-
-    fn apply_master_update_once(
-        &mut self,
-        transaction_id: &str,
-        gradient_handle: &str,
-    ) -> Result<()>;
-
-    /// Restore full-precision masters and make a failed transaction terminal.
-    /// Repeating this operation must be harmless.
-    fn abort_transaction_once(&mut self, transaction_id: &str) -> Result<()>;
-
-    /// Release backend-side temporary tensors/gradient handles only after the
-    /// complete state is durably published. Repeating cleanup must be harmless.
-    fn clear_transaction_once(&mut self, transaction_id: &str) -> Result<()>;
-}
-
-/// Callback used at every substep boundary. Implementations must atomically
-/// and durably publish the supplied state before returning success.
-pub trait QuantizationCheckpointCallback {
-    fn checkpoint_quantization(&mut self, state: &QuantizationTransactionState) -> Result<()>;
-}
-
-impl<F> QuantizationCheckpointCallback for F
-where
-    F: FnMut(&QuantizationTransactionState) -> Result<()>,
-{
-    fn checkpoint_quantization(&mut self, state: &QuantizationTransactionState) -> Result<()> {
-        self(state)
-    }
-}
-
-/// Atomic JSON state store for runtimes that keep the quantization transaction
-/// beside (or as an artifact referenced by) the model checkpoint generation.
-/// Publication fsyncs the file and parent directory before returning.
-#[derive(Clone, Debug)]
-pub struct AtomicQuantizationStateStore {
-    path: PathBuf,
-}
-
-impl AtomicQuantizationStateStore {
-    pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        ensure!(
-            !path.as_os_str().is_empty(),
-            "quantization state path is empty"
-        );
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create quantization state directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        if path.exists() {
-            let metadata = fs::symlink_metadata(&path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "quantization state path must be a regular file"
-            );
-        }
-        Ok(Self { path })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn load(
-        &self,
-        plan: &WorkflowQuantizationPlan,
-    ) -> Result<Option<QuantizationTransactionState>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let metadata = fs::symlink_metadata(&self.path)?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "quantization state path must be a regular file"
-        );
-        let state: QuantizationTransactionState = serde_json::from_slice(
-            &fs::read(&self.path)
-                .with_context(|| format!("failed to read {}", self.path.display()))?,
-        )
-        .with_context(|| format!("invalid quantization state {}", self.path.display()))?;
-        state.validate_for(plan)?;
-        Ok(Some(state))
-    }
-
-    /// Resume the requested optimizer step, or prepare it after a previously
-    /// completed earlier step. In-progress future/backward mismatches fail
-    /// closed instead of applying an update under the wrong global step.
-    pub fn load_or_prepare<B: DurableQuantizationBackend>(
-        &self,
-        backend: &mut B,
-        plan: &WorkflowQuantizationPlan,
-        optimizer_step: u64,
-    ) -> Result<QuantizationTransactionState> {
-        match self.load(plan)? {
-            None => QuantizationTransactionState::prepare(backend, plan, optimizer_step),
-            Some(state) if state.optimizer_step == optimizer_step => Ok(state),
-            Some(state)
-                if state.optimizer_step < optimizer_step
-                    && state.substep == QuantizationSubstep::Complete =>
-            {
-                QuantizationTransactionState::prepare(backend, plan, optimizer_step)
-            }
-            Some(state) => bail!(
-                "quantization state is at step {} ({:?}), requested step {optimizer_step}",
-                state.optimizer_step,
-                state.substep
-            ),
-        }
-    }
-}
-
-impl QuantizationCheckpointCallback for AtomicQuantizationStateStore {
-    fn checkpoint_quantization(&mut self, state: &QuantizationTransactionState) -> Result<()> {
-        write_atomic_synced(&self.path, &serde_json::to_vec_pretty(state)?)
-    }
-}
-
-impl QuantizationTransactionState {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.substep,
-            QuantizationSubstep::Complete | QuantizationSubstep::Aborted
-        )
-    }
-
-    pub fn prepare<B: DurableQuantizationBackend>(
-        backend: &mut B,
-        plan: &WorkflowQuantizationPlan,
-        optimizer_step: u64,
-    ) -> Result<Self> {
-        plan.validate()?;
-        let plan_fingerprint = plan.fingerprint()?;
-        let pre_update_master_hash = backend.master_weights_hash()?;
-        validate_sha256_label(&pre_update_master_hash)
-            .context("quantization backend returned an invalid master hash")?;
-        let transaction_id =
-            transaction_id(&plan_fingerprint, optimizer_step, &pre_update_master_hash);
-        let state = Self {
-            version: TRANSACTION_VERSION,
-            transaction_id,
-            plan_fingerprint,
-            optimizer_step,
-            format: plan.format_at(optimizer_step),
-            substep: QuantizationSubstep::Prepared,
-            pre_update_master_hash,
-            quantized_matrices: None,
-            gradient_handle: None,
-            task_loss: None,
-            distillation_forward_kl: None,
-            post_update_master_hash: None,
-            failure: None,
-        };
-        state.validate_for(plan)?;
-        Ok(state)
-    }
-
-    pub fn validate_for(&self, plan: &WorkflowQuantizationPlan) -> Result<()> {
-        plan.validate()?;
-        ensure!(
-            self.version == TRANSACTION_VERSION,
-            "unsupported quantization transaction version {}",
-            self.version
-        );
-        ensure!(
-            self.plan_fingerprint == plan.fingerprint()?,
-            "quantization transaction plan fingerprint mismatch"
-        );
-        ensure!(
-            self.format == plan.format_at(self.optimizer_step),
-            "quantization transaction forward format does not match its plan"
-        );
-        validate_sha256_label(&self.transaction_id)
-            .context("quantization transaction id is not content-addressed")?;
-        validate_sha256_label(&self.plan_fingerprint)
-            .context("quantization plan fingerprint is not content-addressed")?;
-        validate_sha256_label(&self.pre_update_master_hash)
-            .context("quantization pre-update master hash is not content-addressed")?;
-        ensure!(
-            self.transaction_id
-                == transaction_id(
-                    &self.plan_fingerprint,
-                    self.optimizer_step,
-                    &self.pre_update_master_hash,
-                ),
-            "quantization transaction id is invalid"
-        );
-
-        let staged = matches!(
-            self.substep,
-            QuantizationSubstep::ForwardStaged
-                | QuantizationSubstep::GradientsComputed
-                | QuantizationSubstep::MastersRestored
-                | QuantizationSubstep::UpdateApplied
-                | QuantizationSubstep::Complete
-        );
-        ensure!(
-            staged == self.quantized_matrices.is_some(),
-            "quantization transaction staged-count invariant failed"
-        );
-        let gradients = matches!(
-            self.substep,
-            QuantizationSubstep::GradientsComputed
-                | QuantizationSubstep::MastersRestored
-                | QuantizationSubstep::UpdateApplied
-                | QuantizationSubstep::Complete
-        );
-        ensure!(
-            gradients == (self.gradient_handle.is_some() && self.task_loss.is_some()),
-            "quantization transaction gradient invariant failed"
-        );
-        if let Some(handle) = &self.gradient_handle {
-            ensure!(
-                !handle.trim().is_empty(),
-                "quantization gradient handle is empty"
-            );
-        }
-        if let Some(task_loss) = self.task_loss {
-            ensure!(
-                task_loss.is_finite(),
-                "quantization task loss is non-finite"
-            );
-        }
-        if let Some(divergence) = self.distillation_forward_kl {
-            ensure!(
-                gradients && divergence.is_finite() && divergence >= 0.0,
-                "quantization distillation divergence is invalid"
-            );
-        }
-        let applied = matches!(
-            self.substep,
-            QuantizationSubstep::UpdateApplied | QuantizationSubstep::Complete
-        );
-        ensure!(
-            applied == self.post_update_master_hash.is_some(),
-            "quantization transaction post-update hash invariant failed"
-        );
-        if let Some(hash) = &self.post_update_master_hash {
-            validate_sha256_label(hash)
-                .context("quantization post-update master hash is not content-addressed")?;
-        }
-        ensure!(
-            (self.substep == QuantizationSubstep::Aborted) == self.failure.is_some(),
-            "quantization transaction failure invariant failed"
-        );
-        Ok(())
-    }
-
-    pub fn result(&self) -> Result<QuantizationStepResult> {
-        ensure!(
-            self.substep == QuantizationSubstep::Complete,
-            "quantization transaction is not complete"
-        );
-        Ok(QuantizationStepResult {
-            format: self.format,
-            task_loss: self
-                .task_loss
-                .context("complete transaction has no task loss")?,
-            distillation_forward_kl: self.distillation_forward_kl,
-            quantized_matrices: self
-                .quantized_matrices
-                .context("complete transaction has no staged matrix count")?,
-        })
-    }
-}
-
-/// Resume a QAT/distillation step from any durably checkpointed substep.
-///
-/// The callback runs before the first mutation and after every successful
-/// transition. A callback failure stops execution immediately and leaves the
-/// backend transaction available for an exact retry.
-pub fn run_durable_quantization_step<B, C>(
-    backend: &mut B,
-    checkpoints: &mut C,
-    plan: &WorkflowQuantizationPlan,
-    state: &mut QuantizationTransactionState,
-) -> Result<QuantizationStepResult>
-where
-    B: DurableQuantizationBackend,
-    C: QuantizationCheckpointCallback,
-{
-    state.validate_for(plan)?;
-    checkpoints.checkpoint_quantization(state)?;
-    loop {
-        match state.substep {
-            QuantizationSubstep::Prepared => {
-                let staged = match state.format {
-                    Some(format) => backend.stage_fake_quantized_forward_once(
-                        &state.transaction_id,
-                        format,
-                        plan.recipe.group_size,
-                        plan.recipe.quantize_embeddings,
-                        plan.recipe.quantize_lm_head,
-                    ),
-                    None => Ok(0),
-                };
-                let count = match staged {
-                    Ok(count) => count,
-                    Err(error) => {
-                        return abort_quantization_transaction(
-                            backend,
-                            checkpoints,
-                            plan,
-                            state,
-                            error.context("failed to stage fake-quantized forward"),
-                        );
-                    }
-                };
-                if backend.master_weights_hash()? != state.pre_update_master_hash {
-                    return abort_quantization_transaction(
-                        backend,
-                        checkpoints,
-                        plan,
-                        state,
-                        anyhow::anyhow!("fake-quant staging mutated full-precision master weights"),
-                    );
-                }
-                state.quantized_matrices = Some(count);
-                state.substep = QuantizationSubstep::ForwardStaged;
-                state.validate_for(plan)?;
-                checkpoints.checkpoint_quantization(state)?;
-            }
-            QuantizationSubstep::ForwardStaged => {
-                let computed =
-                    match backend.compute_gradients_once(&state.transaction_id, &plan.training) {
-                        Ok(computed) => computed,
-                        Err(error) => {
-                            return abort_quantization_transaction(
-                                backend,
-                                checkpoints,
-                                plan,
-                                state,
-                                error.context("failed to compute quantization gradients"),
-                            );
-                        }
-                    };
-                let invalid = if computed.gradient_handle.trim().is_empty() {
-                    Some("quantization backend returned an empty gradient handle")
-                } else if !computed.task_loss.is_finite() {
-                    Some("quantization task loss is non-finite")
-                } else if computed
-                    .distillation_forward_kl
-                    .is_some_and(|value| !value.is_finite() || value < 0.0)
-                {
-                    Some("quantization distillation divergence is invalid")
-                } else {
-                    None
-                };
-                if let Some(invalid) = invalid {
-                    return abort_quantization_transaction(
-                        backend,
-                        checkpoints,
-                        plan,
-                        state,
-                        anyhow::anyhow!(invalid),
-                    );
-                }
-                state.gradient_handle = Some(computed.gradient_handle);
-                state.task_loss = Some(computed.task_loss);
-                state.distillation_forward_kl = computed.distillation_forward_kl;
-                state.substep = QuantizationSubstep::GradientsComputed;
-                state.validate_for(plan)?;
-                checkpoints.checkpoint_quantization(state)?;
-            }
-            QuantizationSubstep::GradientsComputed => {
-                backend
-                    .restore_master_weights_once(&state.transaction_id)
-                    .context("failed to restore full-precision masters")?;
-                ensure!(
-                    backend.master_weights_hash()? == state.pre_update_master_hash,
-                    "restored QAT masters do not match their pre-update hash"
-                );
-                state.substep = QuantizationSubstep::MastersRestored;
-                state.validate_for(plan)?;
-                checkpoints.checkpoint_quantization(state)?;
-            }
-            QuantizationSubstep::MastersRestored => {
-                backend
-                    .apply_master_update_once(
-                        &state.transaction_id,
-                        state
-                            .gradient_handle
-                            .as_deref()
-                            .context("restored transaction has no gradient handle")?,
-                    )
-                    .context("failed to atomically apply quantization master update")?;
-                let post_hash = backend.master_weights_hash()?;
-                ensure!(
-                    !post_hash.trim().is_empty(),
-                    "quantization backend returned an empty post-update hash"
-                );
-                state.post_update_master_hash = Some(post_hash);
-                state.substep = QuantizationSubstep::UpdateApplied;
-                state.validate_for(plan)?;
-                checkpoints.checkpoint_quantization(state)?;
-            }
-            QuantizationSubstep::UpdateApplied => {
-                ensure!(
-                    backend.master_weights_hash()?
-                        == *state
-                            .post_update_master_hash
-                            .as_ref()
-                            .context("applied transaction has no post-update hash")?,
-                    "quantization model changed before transaction completion"
-                );
-                state.substep = QuantizationSubstep::Complete;
-                state.validate_for(plan)?;
-                checkpoints.checkpoint_quantization(state)?;
-                backend
-                    .clear_transaction_once(&state.transaction_id)
-                    .context("failed to clear completed quantization transaction")?;
-                return state.result();
-            }
-            QuantizationSubstep::Complete => {
-                ensure!(
-                    backend.master_weights_hash()?
-                        == *state
-                            .post_update_master_hash
-                            .as_ref()
-                            .context("complete transaction has no post-update hash")?,
-                    "completed quantization transaction model hash mismatch"
-                );
-                backend.clear_transaction_once(&state.transaction_id)?;
-                return state.result();
-            }
-            QuantizationSubstep::Aborted => bail!(
-                "quantization transaction `{}` is aborted: {}",
-                state.transaction_id,
-                state.failure.as_deref().unwrap_or("unknown failure")
-            ),
-        }
-    }
-}
-
-fn abort_quantization_transaction<B, C>(
-    backend: &mut B,
-    checkpoints: &mut C,
-    plan: &WorkflowQuantizationPlan,
-    state: &mut QuantizationTransactionState,
-    cause: anyhow::Error,
-) -> Result<QuantizationStepResult>
-where
-    B: DurableQuantizationBackend,
-    C: QuantizationCheckpointCallback,
-{
-    backend
-        .abort_transaction_once(&state.transaction_id)
-        .with_context(|| format!("{cause:#}; also failed to abort quantization transaction"))?;
-    ensure!(
-        backend.master_weights_hash()? == state.pre_update_master_hash,
-        "aborted quantization transaction did not restore master weights"
-    );
-    state.quantized_matrices = None;
-    state.gradient_handle = None;
-    state.task_loss = None;
-    state.distillation_forward_kl = None;
-    state.post_update_master_hash = None;
-    state.failure = Some(format!("{cause:#}"));
-    state.substep = QuantizationSubstep::Aborted;
-    state.validate_for(plan)?;
-    checkpoints.checkpoint_quantization(state)?;
-    Err(cause)
-}
-
-fn transaction_id(plan_fingerprint: &str, step: u64, master_hash: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"hermes-quantization-transaction-v1\0");
-    hasher.update(plan_fingerprint.as_bytes());
-    hasher.update(step.to_le_bytes());
-    hasher.update(master_hash.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
-}
-
 fn optimal_ternary(group: &[f32]) -> (f32, Vec<u8>) {
     let mut ranked = group
         .iter()
@@ -1578,7 +982,7 @@ fn validate_packed(packed: &PackedTensor) -> Result<()> {
         packed.group_size == BONSAI_GROUP_SIZE,
         "packed tensor is not g128"
     );
-    let elements = checked_elements(&packed.shape)?;
+    let elements = packed.elements()?;
     ensure!(elements > 0, "packed tensor is empty");
     let groups = elements.div_ceil(packed.group_size);
     ensure!(
@@ -1762,6 +1166,7 @@ impl QuantizationManifest {
 pub struct QuantizedArchive {
     root: PathBuf,
     manifest: QuantizationManifest,
+    manifest_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1785,6 +1190,28 @@ pub trait QuantizedModelBackend {
 
 impl QuantizedArchive {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_inner(root, None)
+    }
+
+    /// Open an archive whose exact manifest bytes are sealed by an enclosing
+    /// immutable receipt. Member hashes are read only from those authenticated
+    /// bytes, so pathname replacement cannot mix one manifest with another
+    /// archive generation.
+    pub(crate) fn open_addressed(root: &Path, expected_manifest_sha256: &str) -> Result<Self> {
+        validate_sha256_identity(expected_manifest_sha256, "quantization manifest identity")
+            .context("invalid expected quantization manifest identity")?;
+        Self::open_inner(root, Some(expected_manifest_sha256))
+    }
+
+    fn open_inner(root: &Path, expected_manifest_sha256: Option<&str>) -> Result<Self> {
+        Self::open_inner_with_hook(root, expected_manifest_sha256, || Ok(()))
+    }
+
+    fn open_inner_with_hook(
+        root: &Path,
+        expected_manifest_sha256: Option<&str>,
+        after_manifest: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let metadata = fs::symlink_metadata(root)
             .with_context(|| format!("failed to inspect quantized archive {}", root.display()))?;
         ensure!(
@@ -1802,38 +1229,69 @@ impl QuantizedArchive {
             manifest_metadata.is_file() && !manifest_metadata.file_type().is_symlink(),
             "quantization manifest must be a regular file"
         );
-        let manifest: QuantizationManifest = serde_json::from_slice(
-            &fs::read(&manifest_path)
-                .with_context(|| format!("failed to read {}", manifest_path.display()))?,
-        )
-        .context("invalid quantization manifest")?;
+        let manifest_bytes = read_regular_file_bounded(
+            &manifest_path,
+            MAX_QUANTIZATION_MANIFEST_BYTES,
+            "quantization manifest",
+        )?;
+        let manifest_sha256 = sha256_identity(&manifest_bytes);
+        if let Some(expected) = expected_manifest_sha256 {
+            ensure!(
+                manifest_sha256 == expected,
+                "quantization manifest identity mismatch"
+            );
+        }
+        let manifest: QuantizationManifest =
+            serde_json::from_slice(&manifest_bytes).context("invalid quantization manifest")?;
         manifest.true_average_bits_per_weight()?;
         ensure!(
             manifest.version == ARCHIVE_VERSION,
             "unsupported quantization manifest version {}",
             manifest.version
         );
-        validate_sha256_label(&manifest.base_checkpoint_hash)
-            .context("quantization manifest has an invalid source checkpoint hash")?;
+        validate_sha256_identity(
+            &manifest.base_checkpoint_hash,
+            "quantization source checkpoint identity",
+        )
+        .context("quantization manifest has an invalid source checkpoint hash")?;
         ensure!(
             !manifest.matrices.is_empty(),
             "quantization archive contains no quantized matrices"
         );
+        ensure!(
+            manifest
+                .matrices
+                .len()
+                .checked_add(manifest.floating_tensors.len())
+                .is_some_and(|members| members <= MAX_QUANTIZATION_ARCHIVE_MEMBERS),
+            "quantization archive exceeds its {MAX_QUANTIZATION_ARCHIVE_MEMBERS}-member limit"
+        );
+        after_manifest()?;
 
         let mut names = BTreeSet::new();
         let mut files = BTreeSet::new();
         for matrix in &manifest.matrices {
             validate_member_identity(&matrix.name, &matrix.file, &mut names, &mut files)?;
             ensure!(
-                matrix.shape.len() >= 2,
-                "quantized matrix `{}` must have rank at least two",
-                matrix.name
+                (2..=MAX_TENSOR_RANK).contains(&matrix.shape.len()),
+                "quantized matrix `{}` rank must be in 2..={MAX_TENSOR_RANK}",
+                matrix.name,
             );
             ensure!(
                 matrix.elements
                     == u64::try_from(checked_elements(&matrix.shape)?)
                         .context("matrix element count exceeds u64")?,
                 "quantized matrix `{}` element count mismatch",
+                matrix.name
+            );
+            ensure!(
+                matrix.packed_bytes
+                    == packed_tensor_storage_bytes(
+                        &matrix.shape,
+                        matrix.format,
+                        manifest.recipe.group_size,
+                    )?,
+                "quantized matrix `{}` packed byte count does not match its shape and format",
                 matrix.name
             );
             ensure!(
@@ -1861,6 +1319,12 @@ impl QuantizedArchive {
         }
         for tensor in &manifest.floating_tensors {
             validate_member_identity(&tensor.name, &tensor.file, &mut names, &mut files)?;
+            ensure!(
+                tensor.shape.len() <= MAX_TENSOR_RANK,
+                "floating tensor `{}` has unsupported rank {}",
+                tensor.name,
+                tensor.shape.len()
+            );
             let elements = checked_elements(&tensor.shape)?;
             ensure!(
                 tensor.elements
@@ -1882,6 +1346,7 @@ impl QuantizedArchive {
         Ok(Self {
             root: root.to_path_buf(),
             manifest,
+            manifest_sha256,
         })
     }
 
@@ -1889,32 +1354,49 @@ impl QuantizedArchive {
         &self.manifest
     }
 
+    pub(crate) fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
     /// Content identity of the parsed manifest. Since every member SHA-256 is
     /// embedded in schema v2, this also identifies the complete archive.
     pub fn content_hash(&self) -> Result<String> {
-        Ok(sha256_label(&serde_json::to_vec(&self.manifest)?))
+        Ok(sha256_identity(&serde_json::to_vec(&self.manifest)?))
     }
 
-    /// Bind this archive to the complete source checkpoint, rather than only
-    /// trusting the source hash copied into the manifest. Every source tensor
-    /// must appear exactly once in the archive under the recipe-selected
-    /// representation. Quantized members are deterministically regenerated
-    /// and their diagnostics are recomputed; floating members must be exact
-    /// byte copies.
-    pub fn verify_source_checkpoint(&self, checkpoint: &Path) -> Result<()> {
-        let source = read_regular_file(checkpoint, "source checkpoint")?;
-        self.verify_source_safetensors(&source)
-    }
-
-    fn verify_source_safetensors(&self, source: &[u8]) -> Result<()> {
+    /// Authenticate the archive's source identity without regenerating its
+    /// quantized tensors.
+    ///
+    /// `source_sha256` must come from an independently authenticated source
+    /// checkpoint (for example, a sealed trainer generation). [`Self::open`]
+    /// has already authenticated every archive member against the hashes in
+    /// the manifest, so this comparison binds those exact bytes to that exact
+    /// source without repeating a potentially multi-gigabyte quantization.
+    pub fn verify_source_identity(&self, source_sha256: &str) -> Result<()> {
+        validate_sha256_identity(source_sha256, "quantization source checkpoint identity")
+            .context("invalid source checkpoint identity")?;
         ensure!(
-            sha256_label(source) == self.manifest.base_checkpoint_hash,
+            self.manifest.base_checkpoint_hash == source_sha256,
             "quantized archive source checkpoint hash mismatch"
         );
+        Ok(())
+    }
 
-        let tensors = SafeTensors::deserialize(source).context("invalid source safetensors")?;
+    /// Reproduce the complete archive from a source checkpoint.
+    ///
+    /// This deliberately expensive derivation check is required once while a
+    /// new archive is created. Routine authenticated reopens should use
+    /// [`Self::verify_source_identity`] instead: member hashes plus the sealed
+    /// source digest already preserve the same immutable binding.
+    pub fn verify_source_checkpoint(&self, checkpoint: &Path) -> Result<()> {
+        let mut source = StreamingSafetensors::open(checkpoint, "source checkpoint")?;
+        self.verify_source_safetensors(&mut source)
+    }
+
+    fn verify_source_safetensors(&self, source: &mut StreamingSafetensors) -> Result<()> {
+        self.verify_source_identity(source.sha256())?;
         ensure!(
-            !tensors.is_empty(),
+            !source.tensors.is_empty(),
             "source safetensors checkpoint contains no tensors"
         );
         let matrices = self
@@ -1934,36 +1416,33 @@ impl QuantizedArchive {
             .chain(floating.keys())
             .map(|name| (*name).to_owned())
             .collect::<BTreeSet<_>>();
-        let source_names = tensors
-            .names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
+        let source_names = source.tensors.keys().cloned().collect::<BTreeSet<_>>();
         ensure!(
             archive_names == source_names,
             "quantized archive tensor inventory differs from source checkpoint: expected {source_names:?}, got {archive_names:?}"
         );
 
-        for (name, tensor) in tensors.iter() {
-            let elements = checked_elements(tensor.shape())?;
+        for (name, tensor) in source.tensor_entries() {
+            let elements = checked_elements(&tensor.shape)?;
             let elements_u64 =
                 u64::try_from(elements).context("source tensor element count exceeds u64")?;
-            if should_quantize(name, tensor.shape(), tensor.dtype(), &self.manifest.recipe) {
-                let matrix = matrices.get(name).with_context(|| {
+            let tensor_bytes = source.read_tensor(&tensor)?;
+            if should_quantize(&name, &tensor.shape, tensor.dtype, &self.manifest.recipe) {
+                let matrix = matrices.get(name.as_str()).with_context(|| {
                     format!("source tensor `{name}` must be a quantized matrix under this recipe")
                 })?;
                 ensure!(
-                    matrix.shape == tensor.shape() && matrix.elements == elements_u64,
+                    matrix.shape == tensor.shape && matrix.elements == elements_u64,
                     "quantized matrix `{name}` shape or element count differs from source checkpoint"
                 );
-                let values = tensor_as_f32(tensor.dtype(), tensor.data())?;
+                let values = tensor_as_f32(tensor.dtype, &tensor_bytes)?;
                 ensure!(
                     values.len() == elements,
                     "source tensor `{name}` data length does not match its shape"
                 );
                 let expected = quantize_tensor(
                     &values,
-                    tensor.shape().to_vec(),
+                    tensor.shape.clone(),
                     self.manifest.recipe.format,
                     self.manifest.recipe.group_size,
                 )?;
@@ -1984,23 +1463,23 @@ impl QuantizedArchive {
                     "quantized matrix `{name}` maximum error was not derived from source"
                 );
             } else {
-                let archived = floating.get(name).with_context(|| {
+                let archived = floating.get(name.as_str()).with_context(|| {
                     format!("source tensor `{name}` must remain floating under this recipe")
                 })?;
-                let dtype = format!("{:?}", tensor.dtype());
+                let dtype = format!("{:?}", tensor.dtype);
                 ensure!(
                     archived.dtype == dtype
-                        && archived.shape == tensor.shape()
+                        && archived.shape == tensor.shape
                         && archived.elements == elements_u64,
                     "floating tensor `{name}` metadata differs from source checkpoint"
                 );
                 ensure!(
-                    self.load_floating_entry(archived)?.bytes == tensor.data(),
+                    self.load_floating_entry(archived)?.bytes == tensor_bytes,
                     "floating tensor `{name}` bytes differ from source checkpoint"
                 );
             }
         }
-        Ok(())
+        source.ensure_unchanged()
     }
 
     pub fn load_matrix(&self, name: &str) -> Result<PackedTensor> {
@@ -2082,8 +1561,8 @@ pub fn export_safetensors_archive(
     recipe: &QuantizationRecipe,
 ) -> Result<QuantizationManifest> {
     recipe.validate()?;
-    let source = read_regular_file(checkpoint, "source checkpoint")?;
-    let source_hash = sha256_label(&source);
+    let mut source = StreamingSafetensors::open(checkpoint, "source checkpoint")?;
+    let source_hash = source.sha256().to_owned();
     if output.exists() {
         let archive = QuantizedArchive::open(output).with_context(|| {
             format!(
@@ -2096,14 +1575,16 @@ pub fn export_safetensors_archive(
                 && archive.manifest.recipe == *recipe,
             "existing quantization output does not match this checkpoint and recipe"
         );
+        // Unlike trainer resume, this standalone API has no externally sealed
+        // candidate receipt. Reproduce an existing output before accepting it
+        // rather than treating its mutable manifest as provenance.
         archive
-            .verify_source_safetensors(&source)
+            .verify_source_safetensors(&mut source)
             .context("existing quantization output does not reproduce its source checkpoint")?;
         return Ok(archive.manifest.clone());
     }
-    let tensors = SafeTensors::deserialize(&source).context("invalid safetensors checkpoint")?;
     ensure!(
-        !tensors.is_empty(),
+        !source.tensors.is_empty(),
         "safetensors checkpoint contains no tensors"
     );
 
@@ -2119,22 +1600,22 @@ pub fn export_safetensors_archive(
     let export = (|| {
         let mut matrices = Vec::new();
         let mut floating_tensors = Vec::new();
-        let mut tensor_entries = tensors.iter().collect::<Vec<_>>();
-        tensor_entries.sort_by(|left, right| left.0.cmp(right.0));
+        let tensor_entries = source.tensor_entries();
         for (index, (name, tensor)) in tensor_entries.into_iter().enumerate() {
-            let elements = checked_elements(tensor.shape())?;
+            let elements = checked_elements(&tensor.shape)?;
             let elements_u64 =
                 u64::try_from(elements).context("tensor element count exceeds u64")?;
-            let identifier = format!("{index:06}-{}", safe_file_component(name));
-            if should_quantize(name, tensor.shape(), tensor.dtype(), recipe) {
-                let values = tensor_as_f32(tensor.dtype(), tensor.data())?;
+            let identifier = format!("{index:06}-{}", safe_file_component(&name));
+            let tensor_bytes = source.read_tensor(&tensor)?;
+            if should_quantize(&name, &tensor.shape, tensor.dtype, recipe) {
+                let values = tensor_as_f32(tensor.dtype, &tensor_bytes)?;
                 ensure!(
                     values.len() == elements,
                     "tensor `{name}` data length does not match its shape"
                 );
                 let packed = quantize_tensor(
                     &values,
-                    tensor.shape().to_vec(),
+                    tensor.shape.clone(),
                     recipe.format,
                     recipe.group_size,
                 )?;
@@ -2145,32 +1626,33 @@ pub fn export_safetensors_archive(
                 let bytes = packed.to_bytes()?;
                 write_file_synced(&temporary.join(&relative), &bytes)?;
                 matrices.push(QuantizedMatrixManifest {
-                    name: name.to_owned(),
-                    shape: tensor.shape().to_vec(),
+                    name: name.clone(),
+                    shape: tensor.shape.clone(),
                     elements: elements_u64,
                     format: recipe.format,
                     file: path_to_manifest(&relative)?,
                     packed_bytes: u64::try_from(bytes.len())
                         .context("packed tensor size exceeds u64")?,
-                    sha256: sha256_label(&bytes),
+                    sha256: sha256_identity(&bytes),
                     mean_squared_error,
                     maximum_absolute_error,
                 });
             } else {
                 let relative = PathBuf::from("floating").join(format!("{identifier}.bin"));
-                write_file_synced(&temporary.join(&relative), tensor.data())?;
+                write_file_synced(&temporary.join(&relative), &tensor_bytes)?;
                 floating_tensors.push(FloatingTensorManifest {
-                    name: name.to_owned(),
-                    dtype: format!("{:?}", tensor.dtype()),
-                    shape: tensor.shape().to_vec(),
+                    name: name.clone(),
+                    dtype: format!("{:?}", tensor.dtype),
+                    shape: tensor.shape.clone(),
                     elements: elements_u64,
                     file: path_to_manifest(&relative)?,
-                    bytes: u64::try_from(tensor.data().len())
+                    bytes: u64::try_from(tensor_bytes.len())
                         .context("floating tensor size exceeds u64")?,
-                    sha256: sha256_label(tensor.data()),
+                    sha256: sha256_identity(&tensor_bytes),
                 });
             }
         }
+        source.ensure_unchanged()?;
         ensure!(
             !matrices.is_empty(),
             "checkpoint contains no eligible floating-point matrices"
@@ -2195,11 +1677,15 @@ pub fn export_safetensors_archive(
         // structs is incorrect here because serde_json may round diagnostic
         // floating-point values to a neighboring representation.
         ensure!(
-            fs::read(output.join("manifest.json"))? == manifest_bytes,
+            read_regular_file_bounded(
+                &output.join("manifest.json"),
+                MAX_QUANTIZATION_MANIFEST_BYTES,
+                "published quantization manifest",
+            )? == manifest_bytes,
             "published quantization manifest bytes changed during validation"
         );
         QuantizedArchive::open(output)?
-            .verify_source_safetensors(&source)
+            .verify_source_checkpoint(checkpoint)
             .context("published quantization archive does not reproduce its source checkpoint")?;
         Ok(manifest)
     })();
@@ -2324,12 +1810,20 @@ fn validate_member_identity(
 ) -> Result<()> {
     ensure!(!name.trim().is_empty(), "archive tensor name is empty");
     ensure!(
+        name.len() <= MAX_TENSOR_NAME_BYTES,
+        "archive tensor name exceeds its {MAX_TENSOR_NAME_BYTES}-byte limit"
+    );
+    ensure!(
         names.insert(name.to_owned()),
         "archive repeats tensor name `{name}`"
     );
     ensure!(
         !file.trim().is_empty(),
         "archive tensor `{name}` has no file"
+    );
+    ensure!(
+        file.len() <= MAX_ARCHIVE_MEMBER_PATH_BYTES,
+        "archive member path exceeds its {MAX_ARCHIVE_MEMBER_PATH_BYTES}-byte limit"
     );
     ensure!(
         files.insert(file.to_owned()),
@@ -2375,12 +1869,29 @@ fn checked_archive_member(root: &Path, relative: &str) -> Result<PathBuf> {
 /// could carry different unverified payloads, and an unnoticed temporary file
 /// could later be mistaken for part of the immutable archive.
 fn validate_archive_inventory(root: &Path, members: &BTreeSet<String>) -> Result<()> {
-    fn visit(root: &Path, directory: &Path, files: &mut BTreeSet<String>) -> Result<()> {
-        let mut entries = fs::read_dir(directory)
-            .with_context(|| format!("failed to read archive directory {}", directory.display()))?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        depth: usize,
+        entries_seen: &mut usize,
+        files: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        ensure!(
+            depth <= MAX_QUANTIZATION_ARCHIVE_DEPTH,
+            "quantized archive exceeds its {MAX_QUANTIZATION_ARCHIVE_DEPTH}-directory depth limit"
+        );
+        let entries = fs::read_dir(directory)
+            .with_context(|| format!("failed to read archive directory {}", directory.display()))?;
         for entry in entries {
+            let entry = entry?;
+            *entries_seen = entries_seen
+                .checked_add(1)
+                .context("quantized archive entry count overflow")?;
+            ensure!(
+                *entries_seen
+                    <= MAX_QUANTIZATION_ARCHIVE_MEMBERS + MAX_QUANTIZATION_ARCHIVE_DIRECTORIES + 1,
+                "quantized archive exceeds its bounded file/directory inventory"
+            );
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
             ensure!(
@@ -2389,7 +1900,7 @@ fn validate_archive_inventory(root: &Path, members: &BTreeSet<String>) -> Result
                 path.display()
             );
             if metadata.is_dir() {
-                visit(root, &path, files)?;
+                visit(root, &path, depth + 1, entries_seen, files)?;
                 continue;
             }
             ensure!(
@@ -2413,7 +1924,8 @@ fn validate_archive_inventory(root: &Path, members: &BTreeSet<String>) -> Result
     let mut expected = members.clone();
     expected.insert("manifest.json".to_owned());
     let mut actual = BTreeSet::new();
-    visit(root, root, &mut actual)?;
+    let mut entries_seen = 0;
+    visit(root, root, 0, &mut entries_seen, &mut actual)?;
     ensure!(
         actual == expected,
         "quantized archive file inventory differs from its manifest: expected {expected:?}, got {actual:?}"
@@ -2427,30 +1939,59 @@ fn read_verified_member(
     declared_sha256: &str,
 ) -> Result<Vec<u8>> {
     ensure!(
-        declared_sha256.starts_with("sha256:") && declared_sha256.len() == 71,
-        "archive member {} has an invalid SHA-256 label",
+        declared_bytes <= MAX_QUANTIZATION_MEMBER_BYTES,
+        "archive member {} exceeds its {MAX_QUANTIZATION_MEMBER_BYTES}-byte limit",
         path.display()
     );
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect archive member {}", path.display()))?;
+    validate_sha256_identity(declared_sha256, "quantization archive member identity")
+        .with_context(|| {
+            format!(
+                "archive member {} has an invalid SHA-256 label",
+                path.display()
+            )
+        })?;
+    let bytes = read_regular_file_exact(path, declared_bytes, "archive member")?;
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "archive member {} is not a regular file",
-        path.display()
-    );
-    ensure!(
-        metadata.len() == declared_bytes,
-        "archive member {} size mismatch",
-        path.display()
-    );
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read archive member {}", path.display()))?;
-    ensure!(
-        sha256_label(&bytes) == declared_sha256,
+        sha256_identity(&bytes) == declared_sha256,
         "archive member {} SHA-256 mismatch",
         path.display()
     );
     Ok(bytes)
+}
+
+fn packed_tensor_storage_bytes(
+    shape: &[usize],
+    format: UltraQuantFormat,
+    group_size: usize,
+) -> Result<u64> {
+    ensure!(group_size == BONSAI_GROUP_SIZE, "packed tensor is not g128");
+    let elements = checked_elements(shape)?;
+    ensure!(elements > 0, "packed tensor is empty");
+    let rank = u64::try_from(shape.len()).context("packed tensor rank exceeds u64")?;
+    ensure!(rank <= u64::from(u8::MAX), "packed tensor rank exceeds u8");
+    let groups = elements.div_ceil(group_size);
+    let codes_per_group = match format {
+        UltraQuantFormat::BinaryG128 => group_size / 8,
+        UltraQuantFormat::TernaryG128 => group_size / 4,
+        UltraQuantFormat::TernaryEntropyG128 => group_size.div_ceil(5),
+    };
+    let payload = groups
+        .checked_mul(2)
+        .and_then(|scales| {
+            groups
+                .checked_mul(codes_per_group)
+                .and_then(|codes| scales.checked_add(codes))
+        })
+        .context("packed tensor payload size overflows usize")?;
+    let payload = u64::try_from(payload).context("packed tensor payload exceeds u64")?;
+    // Fixed header/checksum plus one u64 for every dimension.
+    38_u64
+        .checked_add(
+            rank.checked_mul(8)
+                .context("packed tensor shape header overflows u64")?,
+        )
+        .and_then(|bytes| bytes.checked_add(payload))
+        .context("packed tensor storage size overflows u64")
 }
 
 fn tensor_storage_bytes(dtype: &str, elements: usize) -> Result<u64> {
@@ -2471,85 +2012,244 @@ fn tensor_storage_bytes(dtype: &str, elements: usize) -> Result<u64> {
         .context("tensor storage byte count overflows u64")
 }
 
-fn sha256_label(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+struct StreamingSafetensors {
+    file: fs::File,
+    path: PathBuf,
+    label: String,
+    identity: StableIdentity,
+    sha256: String,
+    data_start: u64,
+    tensors: BTreeMap<String, TensorInfo>,
 }
 
-fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
+impl StreamingSafetensors {
+    fn open(path: &Path, label: &str) -> Result<Self> {
+        let mut file = open_regular_file(path, label)?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
+        ensure!(metadata.is_file(), "opened {label} is not a regular file");
+        let identity = StableIdentity::from_metadata(&metadata);
+        let (_, digest, _) = hash_open_file(&mut file, None, label)?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut length_bytes = [0_u8; 8];
+        file.read_exact(&mut length_bytes)
+            .with_context(|| format!("{label} has a truncated safetensors header"))?;
+        let header_bytes = u64::from_le_bytes(length_bytes);
+        ensure!(
+            header_bytes <= MAX_SAFETENSORS_HEADER_BYTES,
+            "{label} safetensors header exceeds its {MAX_SAFETENSORS_HEADER_BYTES}-byte limit"
+        );
+        let header_len = usize::try_from(header_bytes)
+            .with_context(|| format!("{label} safetensors header exceeds this address space"))?;
+        let mut header = Vec::new();
+        header
+            .try_reserve_exact(header_len)
+            .with_context(|| format!("reserving {label} safetensors header"))?;
+        header.resize(header_len, 0);
+        file.read_exact(&mut header)
+            .with_context(|| format!("{label} safetensors header is truncated"))?;
+        let parsed: SafeTensorMetadata = serde_json::from_slice(&header)
+            .with_context(|| format!("invalid {label} safetensors metadata"))?;
+        let data_start = 8_u64
+            .checked_add(header_bytes)
+            .context("safetensors data offset overflows u64")?;
+        let data_bytes =
+            u64::try_from(parsed.data_len()).context("safetensors payload length exceeds u64")?;
+        ensure!(
+            data_start.checked_add(data_bytes) == Some(metadata.len()),
+            "{label} safetensors metadata does not cover the exact file"
+        );
+        let tensors = parsed
+            .tensors()
+            .into_iter()
+            .map(|(name, info)| (name, info.clone()))
+            .collect::<BTreeMap<_, _>>();
+        ensure!(
+            !tensors.is_empty() && tensors.len() <= MAX_QUANTIZATION_ARCHIVE_MEMBERS,
+            "{label} tensor inventory must contain 1..={MAX_QUANTIZATION_ARCHIVE_MEMBERS} entries"
+        );
+        for (name, tensor) in &tensors {
+            ensure!(
+                !name.trim().is_empty() && name.len() <= MAX_TENSOR_NAME_BYTES,
+                "{label} contains an invalid or oversized tensor name"
+            );
+            ensure!(
+                tensor.shape.len() <= MAX_TENSOR_RANK,
+                "{label} tensor `{name}` has unsupported rank {}",
+                tensor.shape.len()
+            );
+        }
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            label: label.to_owned(),
+            identity,
+            sha256: format!("sha256:{digest}"),
+            data_start,
+            tensors,
+        })
+    }
+
+    fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    fn tensor_entries(&self) -> Vec<(String, TensorInfo)> {
+        self.tensors
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.clone()))
+            .collect()
+    }
+
+    fn read_tensor(&mut self, tensor: &TensorInfo) -> Result<Vec<u8>> {
+        let bytes = tensor
+            .data_offsets
+            .1
+            .checked_sub(tensor.data_offsets.0)
+            .context("safetensors tensor offsets move backwards")?;
+        let bytes_u64 = u64::try_from(bytes).context("safetensors tensor size exceeds u64")?;
+        ensure!(
+            bytes_u64 <= MAX_QUANTIZATION_MEMBER_BYTES,
+            "source tensor exceeds its {MAX_QUANTIZATION_MEMBER_BYTES}-byte materialization limit"
+        );
+        let offset = self
+            .data_start
+            .checked_add(
+                u64::try_from(tensor.data_offsets.0)
+                    .context("safetensors tensor offset exceeds u64")?,
+            )
+            .context("safetensors tensor file offset overflows u64")?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(bytes)
+            .context("reserving source tensor buffer")?;
+        data.resize(bytes, 0);
+        self.file.read_exact(&mut data).with_context(|| {
+            format!(
+                "source tensor payload is truncated in {}",
+                self.path.display()
+            )
+        })?;
+        Ok(data)
+    }
+
+    fn ensure_unchanged(&mut self) -> Result<()> {
+        ensure!(
+            StableIdentity::from_metadata(&self.file.metadata()?) == self.identity,
+            "{} {} changed while tensors were streamed",
+            self.label,
+            self.path.display()
+        );
+        let (_, digest, _) = hash_open_file(&mut self.file, None, &self.label)?;
+        ensure!(
+            format!("sha256:{digest}") == self.sha256,
+            "{} {} changed while tensors were streamed",
+            self.label,
+            self.path.display()
+        );
+        Ok(())
+    }
+}
+
+fn open_regular_file(path: &Path, label: &str) -> Result<fs::File> {
+    let inspected = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} must be a regular file: {}",
+        inspected.is_file() && !inspected.file_type().is_symlink(),
+        "{label} {} must be a regular non-symlink file",
         path.display()
     );
-    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
+    #[cfg(unix)]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("failed to open {label} {}", path.display()))?;
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
+    ensure!(
+        StableIdentity::from_metadata(&opened) == StableIdentity::from_metadata(&inspected),
+        "{label} {} changed while it was opened",
+        path.display()
+    );
+    Ok(file)
 }
 
-fn validate_sha256_label(value: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .context("SHA-256 identity must use sha256:<64 lowercase hex>")?;
+fn read_regular_file_exact(path: &Path, expected: u64, label: &str) -> Result<Vec<u8>> {
+    read_open_regular_file_exact(open_regular_file(path, label)?, path, expected, label)
+}
+
+fn read_open_regular_file_exact(
+    mut file: fs::File,
+    path: &Path,
+    expected: u64,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
     ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "SHA-256 identity must use sha256:<64 lowercase hex>"
+        metadata.is_file() && metadata.len() == expected,
+        "{label} {} is not a regular file of the declared size",
+        path.display()
     );
-    Ok(())
+    let capacity = usize::try_from(expected)
+        .with_context(|| format!("{label} {} exceeds this address space", path.display()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .with_context(|| format!("reserving {expected} bytes for {label} {}", path.display()))?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    while bytes.len() < capacity {
+        let remaining = capacity - bytes.len();
+        let chunk = remaining.min(buffer.len());
+        let read = file
+            .read(&mut buffer[..chunk])
+            .with_context(|| format!("failed to read opened {label} {}", path.display()))?;
+        ensure!(
+            read > 0,
+            "{label} {} was truncated while read",
+            path.display()
+        );
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    let mut tail = [0_u8; 1];
+    ensure!(
+        file.read(&mut tail)
+            .with_context(|| format!("failed to finish reading {label} {}", path.display()))?
+            == 0,
+        "{label} {} grew while read",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+fn read_regular_file_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>> {
+    let file = open_regular_file(path, label)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
+    ensure!(metadata.is_file(), "{label} is not a regular file");
+    ensure!(
+        metadata.len() <= maximum,
+        "{label} {} exceeds the {maximum}-byte limit",
+        path.display()
+    );
+    // Consume the already-opened descriptor so pathname replacement cannot
+    // change either the allocation bound or the returned bytes.
+    read_open_regular_file_exact(file, path, metadata.len(), label)
 }
 
 fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    Ok(())
-}
-
-fn write_atomic_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .context("atomic output path has no file name")?;
-    let mut temporary = None;
-    for attempt in 0..1024u32 {
-        let mut temporary_name = file_name.to_os_string();
-        temporary_name.push(format!(".tmp-{}-{attempt}", std::process::id()));
-        let candidate = parent.join(temporary_name);
-        match fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                if let Err(error) = (|| {
-                    file.write_all(bytes)?;
-                    file.sync_all()?;
-                    Ok::<_, std::io::Error>(())
-                })() {
-                    let _ = fs::remove_file(&candidate);
-                    return Err(error).with_context(|| {
-                        format!("failed to write atomic file {}", candidate.display())
-                    });
-                }
-                temporary = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to create atomic file {}", candidate.display())
-                });
-            }
-        }
-    }
-    let temporary = temporary.context("could not allocate an atomic temporary file")?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("failed to publish {}", path.display()));
-    }
-    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -2588,6 +2288,21 @@ mod tests {
         (0..BONSAI_GROUP_SIZE * 2)
             .map(|index| ((index as f32 * 0.37).sin() * 2.0) + (index % 7) as f32 * 0.01)
             .collect()
+    }
+
+    #[test]
+    fn archive_inventory_rejects_excessive_directory_depth_without_recursive_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("manifest.json"), b"{}").unwrap();
+        let mut nested = directory.path().to_path_buf();
+        for depth in 0..=MAX_QUANTIZATION_ARCHIVE_DEPTH {
+            nested.push(format!("level-{depth}"));
+            fs::create_dir(&nested).unwrap();
+        }
+        let error = validate_archive_inventory(directory.path(), &BTreeSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("depth limit"), "{error}");
     }
 
     #[test]
@@ -2683,7 +2398,7 @@ mod tests {
     }
 
     #[test]
-    fn transformer_qat_and_archive_select_the_same_matrix_set() {
+    fn transformer_qat_and_archive_select_the_exact_same_matrix_names() {
         use burn::module::AutodiffModule;
 
         let device = Device::default().autodiff();
@@ -2705,22 +2420,81 @@ mod tests {
             }
         }
         let model = Transformer::new(&config, &device).unwrap();
-        let selected = model.ultra_quant_parameter_ids(true, true).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let checkpoint = directory.path().join("weights.safetensors");
         hermes_llm::save_safetensors(&model.valid(), &checkpoint).unwrap();
-        let output = directory.path().join("weights.hquant");
-        let recipe = QuantizationRecipe {
-            format: UltraQuantFormat::BinaryG128,
-            group_size: BONSAI_GROUP_SIZE,
-            fake_quant_start_step: 0,
-            ternary_warmup_steps: 0,
-            distillation_weight: 0.0,
-            quantize_embeddings: true,
-            quantize_lm_head: true,
-        };
-        let manifest = export_safetensors_archive(&checkpoint, &output, &recipe).unwrap();
-        assert_eq!(manifest.matrices.len(), selected.len());
+        for (ordinal, (quantize_embeddings, quantize_lm_head)) in
+            [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let expected = model
+                .ultra_quant_parameter_names(quantize_embeddings, quantize_lm_head)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let output = directory.path().join(format!("weights-{ordinal}.hquant"));
+            let recipe = QuantizationRecipe {
+                format: UltraQuantFormat::BinaryG128,
+                group_size: BONSAI_GROUP_SIZE,
+                fake_quant_start_step: 0,
+                ternary_warmup_steps: 0,
+                distillation_weight: 0.0,
+                quantize_embeddings,
+                quantize_lm_head,
+            };
+            let manifest = export_safetensors_archive(&checkpoint, &output, &recipe).unwrap();
+            let actual = manifest
+                .matrices
+                .into_iter()
+                .map(|matrix| matrix.name)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                actual, expected,
+                "QAT ParamIds and archive names differ for embeddings={quantize_embeddings}, lm_head={quantize_lm_head}"
+            );
+        }
+
+        config.embeddings.tie_weights = true;
+        let tied = Transformer::new(&config, &device).unwrap();
+        let tied_checkpoint = directory.path().join("tied-weights.safetensors");
+        hermes_llm::save_safetensors(&tied.valid(), &tied_checkpoint).unwrap();
+        for (ordinal, quantize_tied_weight) in [false, true].into_iter().enumerate() {
+            let expected = tied
+                .ultra_quant_parameter_names(quantize_tied_weight, quantize_tied_weight)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let output = directory
+                .path()
+                .join(format!("tied-weights-{ordinal}.hquant"));
+            let recipe = QuantizationRecipe {
+                format: UltraQuantFormat::BinaryG128,
+                group_size: BONSAI_GROUP_SIZE,
+                fake_quant_start_step: 0,
+                ternary_warmup_steps: 0,
+                distillation_weight: 0.0,
+                quantize_embeddings: quantize_tied_weight,
+                quantize_lm_head: quantize_tied_weight,
+            };
+            let manifest = export_safetensors_archive(&tied_checkpoint, &output, &recipe).unwrap();
+            let actual = manifest
+                .matrices
+                .into_iter()
+                .map(|matrix| matrix.name)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                actual, expected,
+                "tied QAT/archive names differ for quantize_tied_weight={quantize_tied_weight}"
+            );
+        }
+        for (quantize_embeddings, quantize_lm_head) in [(false, true), (true, false)] {
+            let error = tied
+                .ultra_quant_parameter_names(quantize_embeddings, quantize_lm_head)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("tied embedding/output weights"), "{error}");
+        }
     }
 
     #[test]
@@ -2734,10 +2508,41 @@ mod tests {
         .unwrap();
         assert_eq!(packed.codes.len(), 32);
         assert_eq!(packed.scales.len(), 2);
-        assert!((packed.bits_per_weight() - 1.125).abs() < 1e-9);
+        assert!((packed.bits_per_weight().unwrap() - 1.125).abs() < 1e-9);
         let decoded = packed.decode().unwrap();
         assert_eq!(decoded.len(), weights().len());
         assert!(decoded.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn malformed_public_packed_tensor_geometry_returns_errors_without_panicking() {
+        let malformed = PackedTensor {
+            format: UltraQuantFormat::BinaryG128,
+            shape: vec![usize::MAX, 2],
+            group_size: BONSAI_GROUP_SIZE,
+            scales: Vec::new(),
+            codes: Vec::new(),
+        };
+
+        for error in [
+            malformed.elements().unwrap_err(),
+            malformed.bits_per_weight().unwrap_err(),
+            malformed.decode().unwrap_err(),
+            malformed.to_bytes().unwrap_err(),
+            malformed.matrix_vector(&[0.0, 0.0]).unwrap_err(),
+        ] {
+            assert!(
+                format!("{error:#}").contains("element count overflows"),
+                "{error:#}"
+            );
+        }
+
+        let invalid_rank = PackedTensor {
+            shape: Vec::new(),
+            ..malformed
+        };
+        let error = invalid_rank.bits_per_weight().unwrap_err();
+        assert!(format!("{error:#}").contains("rank must be"), "{error:#}");
     }
 
     #[test]
@@ -2758,8 +2563,8 @@ mod tests {
         .unwrap();
         assert_eq!(dense.decode().unwrap(), entropy.decode().unwrap());
         assert!(entropy.codes.len() < dense.codes.len());
-        assert_eq!(dense.bits_per_weight(), 2.125);
-        assert_eq!(entropy.bits_per_weight(), 1.75);
+        assert_eq!(dense.bits_per_weight().unwrap(), 2.125);
+        assert_eq!(entropy.bits_per_weight().unwrap(), 1.75);
     }
 
     #[test]
@@ -2871,6 +2676,18 @@ mod tests {
         let path = directory.path().join("matrix.hquant");
         packed.save_atomic(&path).unwrap();
         assert_eq!(PackedTensor::load(&path).unwrap(), packed);
+    }
+
+    #[test]
+    fn packed_tensor_load_rejects_oversized_file_before_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.hquant");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_QUANTIZATION_MEMBER_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = PackedTensor::load(&path).unwrap_err().to_string();
+        assert!(error.contains("byte limit"), "{error}");
     }
 
     #[test]
@@ -3154,6 +2971,22 @@ mod tests {
     }
 
     #[test]
+    fn archive_rejects_impossible_packed_size_before_loading_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, output, _) =
+            export_source_verification_fixture(directory.path(), "oversized-member");
+        let mut manifest = read_archive_manifest(&output);
+        manifest.matrices[0].packed_bytes += 1;
+        write_archive_manifest(&output, &manifest);
+
+        let error = QuantizedArchive::open(&output).unwrap_err().to_string();
+        assert!(
+            error.contains("packed byte count does not match"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn existing_archive_retry_rejects_reencoded_matrix() {
         let directory = tempfile::tempdir().unwrap();
         let (checkpoint, output, recipe) =
@@ -3166,7 +2999,7 @@ mod tests {
         let bytes = packed.to_bytes().unwrap();
         fs::write(&path, &bytes).unwrap();
         matrix.packed_bytes = bytes.len() as u64;
-        matrix.sha256 = sha256_label(&bytes);
+        matrix.sha256 = sha256_identity(&bytes);
         write_archive_manifest(&output, &manifest);
 
         assert!(QuantizedArchive::open(&output).is_ok());
@@ -3212,17 +3045,74 @@ mod tests {
         let matrix = &mut manifest.matrices[0];
         let path = output.join(&matrix.file);
         let mut packed = PackedTensor::from_bytes(&fs::read(&path).unwrap()).unwrap();
-        packed.shape = vec![packed.elements(), 1];
+        packed.shape = vec![packed.elements().unwrap(), 1];
         let bytes = packed.to_bytes().unwrap();
         fs::write(&path, &bytes).unwrap();
         matrix.shape = packed.shape;
         matrix.packed_bytes = bytes.len() as u64;
-        matrix.sha256 = sha256_label(&bytes);
+        matrix.sha256 = sha256_identity(&bytes);
         write_archive_manifest(&output, &manifest);
         assert!(QuantizedArchive::open(&output).is_ok());
         let error = export_safetensors_archive(&checkpoint, &output, &recipe).unwrap_err();
         assert!(
             format!("{error:#}").contains("shape or element count differs"),
+            "{error:#}"
+        );
+    }
+
+    fn alter_first_packed_member(output: &Path) {
+        let mut manifest = read_archive_manifest(output);
+        let matrix = &mut manifest.matrices[0];
+        let path = output.join(&matrix.file);
+        let mut packed = PackedTensor::from_bytes(&fs::read(&path).unwrap()).unwrap();
+        packed.codes[0] ^= 1;
+        let bytes = packed.to_bytes().unwrap();
+        fs::write(&path, &bytes).unwrap();
+        matrix.packed_bytes = bytes.len() as u64;
+        matrix.sha256 = sha256_identity(&bytes);
+        write_archive_manifest(output, &manifest);
+    }
+
+    #[test]
+    fn addressed_open_rejects_archive_swap_after_manifest_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, published, _) = export_source_verification_fixture(directory.path(), "published");
+        let (_, replacement, _) =
+            export_source_verification_fixture(directory.path(), "replacement");
+        alter_first_packed_member(&replacement);
+        let expected = sha256_identity(&fs::read(published.join("manifest.json")).unwrap());
+        let parked = directory.path().join("parked.hquant");
+
+        let error = QuantizedArchive::open_inner_with_hook(&published, Some(&expected), || {
+            fs::rename(&published, &parked)?;
+            fs::rename(&replacement, &published)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("SHA-256 mismatch"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn addressed_archive_load_rejects_member_root_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, published, _) =
+            export_source_verification_fixture(directory.path(), "published-load");
+        let (_, replacement, _) =
+            export_source_verification_fixture(directory.path(), "replacement-load");
+        alter_first_packed_member(&replacement);
+        let expected = sha256_identity(&fs::read(published.join("manifest.json")).unwrap());
+        let archive = QuantizedArchive::open_addressed(&published, &expected).unwrap();
+        let matrix_name = archive.manifest().matrices[0].name.clone();
+        let parked = directory.path().join("parked-load.hquant");
+        fs::rename(&published, parked).unwrap();
+        fs::rename(&replacement, &published).unwrap();
+
+        let error = archive.load_matrix(&matrix_name).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("SHA-256 mismatch"),
             "{error:#}"
         );
     }
@@ -3415,278 +3305,5 @@ mod tests {
             self.floating.clear();
             Ok(())
         }
-    }
-
-    #[derive(Default)]
-    struct MockDurableQat {
-        master: u64,
-        staged: BTreeSet<String>,
-        applied: BTreeSet<String>,
-        aborted: BTreeSet<String>,
-        cleared: BTreeSet<String>,
-        apply_invocations: usize,
-        fail_compute: bool,
-    }
-
-    impl DurableQuantizationBackend for MockDurableQat {
-        fn master_weights_hash(&mut self) -> Result<String> {
-            Ok(sha256_label(&self.master.to_le_bytes()))
-        }
-
-        fn stage_fake_quantized_forward_once(
-            &mut self,
-            transaction_id: &str,
-            _: UltraQuantFormat,
-            group_size: usize,
-            _: bool,
-            _: bool,
-        ) -> Result<usize> {
-            ensure!(group_size == BONSAI_GROUP_SIZE, "unexpected group size");
-            ensure!(
-                !self.aborted.contains(transaction_id),
-                "transaction is aborted"
-            );
-            self.staged.insert(transaction_id.to_owned());
-            Ok(7)
-        }
-
-        fn compute_gradients_once(
-            &mut self,
-            transaction_id: &str,
-            training: &WorkflowQuantizationTraining,
-        ) -> Result<DurableGradientResult> {
-            ensure!(
-                self.staged.contains(transaction_id),
-                "forward was not staged"
-            );
-            ensure!(
-                matches!(training, WorkflowQuantizationTraining::Qat { .. }),
-                "unexpected training mode"
-            );
-            if self.fail_compute {
-                bail!("injected compute failure");
-            }
-            Ok(DurableGradientResult {
-                gradient_handle: format!("gradient:{transaction_id}"),
-                task_loss: 2.5,
-                distillation_forward_kl: Some(0.25),
-            })
-        }
-
-        fn restore_master_weights_once(&mut self, transaction_id: &str) -> Result<()> {
-            self.staged.remove(transaction_id);
-            Ok(())
-        }
-
-        fn apply_master_update_once(
-            &mut self,
-            transaction_id: &str,
-            gradient_handle: &str,
-        ) -> Result<()> {
-            ensure!(
-                gradient_handle == format!("gradient:{transaction_id}"),
-                "gradient handle mismatch"
-            );
-            self.apply_invocations += 1;
-            if self.applied.insert(transaction_id.to_owned()) {
-                self.master += 1;
-            }
-            Ok(())
-        }
-
-        fn abort_transaction_once(&mut self, transaction_id: &str) -> Result<()> {
-            self.staged.remove(transaction_id);
-            self.aborted.insert(transaction_id.to_owned());
-            Ok(())
-        }
-
-        fn clear_transaction_once(&mut self, transaction_id: &str) -> Result<()> {
-            self.staged.remove(transaction_id);
-            self.cleared.insert(transaction_id.to_owned());
-            Ok(())
-        }
-    }
-
-    struct RecordingCheckpoint {
-        fail_on: Option<usize>,
-        calls: usize,
-        durable: Option<QuantizationTransactionState>,
-    }
-
-    impl QuantizationCheckpointCallback for RecordingCheckpoint {
-        fn checkpoint_quantization(&mut self, state: &QuantizationTransactionState) -> Result<()> {
-            self.calls += 1;
-            if self.fail_on == Some(self.calls) {
-                bail!("injected checkpoint failure");
-            }
-            self.durable = Some(state.clone());
-            Ok(())
-        }
-    }
-
-    fn durable_plan() -> WorkflowQuantizationPlan {
-        let config: QuantizationConfig = serde_json::from_value(serde_json::json!({
-            "format": "binary_g128",
-            "start_step": 0,
-            "training": {"type": "qat"}
-        }))
-        .unwrap();
-        WorkflowQuantizationPlan::from_workflow(&config).unwrap()
-    }
-
-    #[test]
-    fn qat_resumes_idempotently_from_every_durable_substep() {
-        let plan = durable_plan();
-        // Calls 2..=6 fail immediately after each state transition. Restoring
-        // the last successful callback emulates a process crash exactly.
-        for fail_on in 2..=6 {
-            let mut backend = MockDurableQat::default();
-            let mut state = QuantizationTransactionState::prepare(&mut backend, &plan, 4).unwrap();
-            let mut checkpoints = RecordingCheckpoint {
-                fail_on: Some(fail_on),
-                calls: 0,
-                durable: None,
-            };
-            assert!(
-                run_durable_quantization_step(&mut backend, &mut checkpoints, &plan, &mut state,)
-                    .is_err()
-            );
-            state = checkpoints.durable.take().unwrap();
-            let mut resumed = RecordingCheckpoint {
-                fail_on: None,
-                calls: 0,
-                durable: None,
-            };
-            let result =
-                run_durable_quantization_step(&mut backend, &mut resumed, &plan, &mut state)
-                    .unwrap();
-            assert_eq!(result.format, Some(UltraQuantFormat::BinaryG128));
-            assert_eq!(result.quantized_matrices, 7);
-            assert_eq!(backend.master, 1, "failed at callback {fail_on}");
-            assert!(backend.applied.contains(&state.transaction_id));
-            assert!(backend.cleared.contains(&state.transaction_id));
-            assert_eq!(state.substep, QuantizationSubstep::Complete);
-        }
-    }
-
-    #[test]
-    fn failed_qat_compute_restores_masters_and_persists_terminal_abort() {
-        let plan = durable_plan();
-        let mut backend = MockDurableQat {
-            fail_compute: true,
-            ..Default::default()
-        };
-        let mut state = QuantizationTransactionState::prepare(&mut backend, &plan, 1).unwrap();
-        let mut checkpoints = RecordingCheckpoint {
-            fail_on: None,
-            calls: 0,
-            durable: None,
-        };
-        assert!(
-            run_durable_quantization_step(&mut backend, &mut checkpoints, &plan, &mut state,)
-                .is_err()
-        );
-        assert_eq!(state.substep, QuantizationSubstep::Aborted);
-        assert_eq!(backend.master, 0);
-        assert!(backend.aborted.contains(&state.transaction_id));
-        assert_eq!(checkpoints.durable, Some(state));
-    }
-
-    #[test]
-    fn atomic_qat_state_store_roundtrips_and_rejects_corruption() {
-        let plan = durable_plan();
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("checkpoint/quantization-state.json");
-        let mut store = AtomicQuantizationStateStore::new(&path).unwrap();
-        assert!(store.load(&plan).unwrap().is_none());
-
-        let mut backend = MockDurableQat::default();
-        let mut state = QuantizationTransactionState::prepare(&mut backend, &plan, 8).unwrap();
-        run_durable_quantization_step(&mut backend, &mut store, &plan, &mut state).unwrap();
-        let mut loaded = store.load(&plan).unwrap().unwrap();
-        assert_eq!(loaded, state);
-        run_durable_quantization_step(&mut backend, &mut store, &plan, &mut loaded).unwrap();
-        assert_eq!(backend.master, 1);
-        let next = store.load_or_prepare(&mut backend, &plan, 9).unwrap();
-        assert_eq!(next.optimizer_step, 9);
-        assert_eq!(next.substep, QuantizationSubstep::Prepared);
-        assert!(store.load_or_prepare(&mut backend, &plan, 7).is_err());
-
-        let mut document: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        document["transaction_id"] = serde_json::json!("tampered");
-        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        assert!(store.load(&plan).is_err());
-
-        document = serde_json::to_value(&state).unwrap();
-        document["pre_update_master_hash"] = serde_json::json!("master:0");
-        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        assert!(store.load(&plan).is_err());
-    }
-
-    #[derive(Default)]
-    struct MockQat {
-        staged: bool,
-        master: u64,
-        applied: usize,
-    }
-
-    impl QuantizationTrainingBackend for MockQat {
-        type Gradients = u64;
-
-        fn master_weights_hash(&mut self) -> Result<String> {
-            Ok(self.master.to_string())
-        }
-
-        fn stage_fake_quantized_forward(
-            &mut self,
-            _: UltraQuantFormat,
-            group_size: usize,
-            _: bool,
-            _: bool,
-        ) -> Result<usize> {
-            assert_eq!(group_size, BONSAI_GROUP_SIZE);
-            self.staged = true;
-            Ok(3)
-        }
-
-        fn compute_straight_through_gradients(
-            &mut self,
-            _: f64,
-        ) -> Result<(Self::Gradients, f64, Option<f64>)> {
-            Ok((1, 2.0, Some(0.25)))
-        }
-
-        fn restore_master_weights(&mut self) -> Result<()> {
-            self.staged = false;
-            Ok(())
-        }
-
-        fn apply_master_update(&mut self, gradients: Self::Gradients) -> Result<()> {
-            assert!(!self.staged);
-            self.master += gradients;
-            self.applied += 1;
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn qat_restores_master_before_applying_straight_through_update() {
-        let mut backend = MockQat::default();
-        let recipe = QuantizationRecipe {
-            format: UltraQuantFormat::BinaryG128,
-            group_size: BONSAI_GROUP_SIZE,
-            fake_quant_start_step: 10,
-            ternary_warmup_steps: 5,
-            distillation_weight: 1.0,
-            quantize_embeddings: true,
-            quantize_lm_head: true,
-        };
-        let full_precision = run_quantization_step(&mut backend, &recipe, 9).unwrap();
-        assert_eq!(full_precision.format, None);
-        let ternary = run_quantization_step(&mut backend, &recipe, 10).unwrap();
-        assert_eq!(ternary.format, Some(UltraQuantFormat::TernaryG128));
-        assert_eq!(ternary.quantized_matrices, 3);
-        assert_eq!(backend.applied, 2);
     }
 }

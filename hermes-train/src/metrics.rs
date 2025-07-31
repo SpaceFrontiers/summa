@@ -9,7 +9,7 @@
 //! step cannot silently produce a misleading history.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,8 +17,17 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::artifact_io::sha256_hex;
+use crate::artifact_io::validate_sha256_identity;
+
 /// Increment when the on-disk record contract changes incompatibly.
 pub const METRIC_SCHEMA_VERSION: u32 = 2;
+
+/// A metric is diagnostic evidence, not an artifact transport. Bounding each
+/// JSONL record prevents a corrupt or adversarial length-less line from
+/// consuming memory without bounding the lifetime of an append-only run.
+const MAX_METRIC_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +43,23 @@ pub enum MetricPhaseKind {
     Promotion,
     Quantization,
     CorpusPreparation,
+}
+
+impl From<crate::workflow::PhaseKind> for MetricPhaseKind {
+    fn from(kind: crate::workflow::PhaseKind) -> Self {
+        match kind {
+            crate::workflow::PhaseKind::Pretrain => Self::Pretrain,
+            crate::workflow::PhaseKind::ContinuedPretrain => Self::ContinuedPretrain,
+            crate::workflow::PhaseKind::Sft => Self::Sft,
+            crate::workflow::PhaseKind::Preference => Self::Preference,
+            crate::workflow::PhaseKind::Rl => Self::Rl,
+            crate::workflow::PhaseKind::Distillation => Self::Distillation,
+            crate::workflow::PhaseKind::Sleep => Self::Sleep,
+            crate::workflow::PhaseKind::Quantization => Self::Quantization,
+            crate::workflow::PhaseKind::Evaluation => Self::Evaluation,
+            crate::workflow::PhaseKind::Promotion => Self::Promotion,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,9 +152,9 @@ pub struct ActiveCapacityMetrics {
     /// untrainable zero-output low-rank fallback; afterward an activated slot
     /// replaces it. It therefore remains one while stored slots activate.
     pub reserve_routed_top_k: u32,
-    /// Per-token routed expert parameter-equivalent. Reserve router scoring is
-    /// excluded: candidate-pool overhead is bounded by stored capacity and is
-    /// enforced by the independent wake throughput/latency gates.
+    /// Per-token routed parameter-equivalent. This includes the fixed-width
+    /// reserve router, one low-rank reserve lane, and the ordinary FFN/MoE
+    /// routes; the independent throughput/latency gates cover their kernels.
     pub routed_active_parameters: u64,
     pub stored_parameters: u64,
     pub dream_generation: bool,
@@ -592,15 +618,26 @@ impl MetricWriter {
         let run_id = run_id.into();
         validate_identifier("run_id", &run_id)?;
         let mut file = open_existing_metric_file(path, "metric log", true)?;
-        let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, "metric log")?;
-        let state = validate_log_bytes(&bytes, Some(&run_id))
-            .with_context(|| format!("validate metric log {}", path.display()))?;
-        ensure_open_metric_file_unchanged(&file, path, &stamp, "metric log")?;
+        lock_metric_writer(&file, path)?;
+        let visited = visit_open_metric_file(
+            &mut file,
+            path,
+            "metric log",
+            Some(&run_id),
+            None,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .with_context(|| format!("validate metric log {}", path.display()))?;
+        ensure!(
+            visited.reached_eof,
+            "complete metric validation stopped early"
+        );
         Ok(Self {
             path: path.to_owned(),
             run_id,
             output: BufWriter::new(file),
-            state,
+            state: visited.state,
         })
     }
 
@@ -617,8 +654,6 @@ impl MetricWriter {
         let path = path.as_ref();
         let run_id = run_id.into();
         validate_identifier("run_id", &run_id)?;
-        let committed_records = usize::try_from(committed_records)
-            .context("committed metric record count exceeds usize")?;
         let expected_last_step = (committed_records > 0).then_some(committed_global_step);
         Self::resume_validated_prefix(
             path,
@@ -642,8 +677,6 @@ impl MetricWriter {
         let path = path.as_ref();
         let run_id = run_id.into();
         validate_identifier("run_id", &run_id)?;
-        let committed_records = usize::try_from(committed_records)
-            .context("committed metric record count exceeds usize")?;
         Self::resume_validated_prefix(
             path,
             run_id,
@@ -656,34 +689,37 @@ impl MetricWriter {
     fn resume_validated_prefix(
         path: &Path,
         run_id: String,
-        committed_records: usize,
+        committed_records: u64,
         committed_last_global_step: Option<u64>,
         operation: &str,
     ) -> Result<Self> {
         let mut file = open_existing_metric_file(path, "metric log", true)
             .with_context(|| format!("open metric log {} for {operation}", path.display()))?;
-        let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, "metric log")
-            .with_context(|| format!("read metric log {} for {operation}", path.display()))?;
-        let (end, state) = validate_committed_prefix_bytes(
-            &bytes,
+        lock_metric_writer(&file, path)?;
+        let visited = visit_open_metric_file(
+            &mut file,
             path,
-            committed_records,
-            committed_last_global_step,
+            "metric log",
             Some(&run_id),
-        )?;
+            Some(committed_records),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .with_context(|| format!("read metric log {} for {operation}", path.display()))?;
+        validate_committed_stream_state(&visited, committed_records, committed_last_global_step)?;
 
         // JSON validation can be substantial for a long journal. Reinspect
         // both the descriptor and its pathname after validation so an
         // in-place writer or path replacement cannot make us truncate bytes
         // other than the exact generation that was parsed above.
-        ensure_open_metric_file_unchanged(&file, path, &stamp, "metric log")?;
-        file.set_len(end as u64)
+        ensure_open_metric_file_unchanged(&file, path, &visited.stamp, "metric log")?;
+        file.set_len(visited.consumed_bytes)
             .with_context(|| format!("truncate metric log {} for {operation}", path.display()))?;
         file.sync_all()
             .with_context(|| format!("sync metric log {} after {operation}", path.display()))?;
         let truncated = opened_metric_file_stamp(&file, "metric log")?;
         ensure!(
-            truncated.same_file(&stamp) && truncated.len == end as u64,
+            truncated.same_file(&visited.stamp) && truncated.len == visited.consumed_bytes,
             "metric log changed while its committed prefix was truncated"
         );
         ensure_metric_path_matches_stamp(path, &truncated, "metric log", true)?;
@@ -692,7 +728,7 @@ impl MetricWriter {
             path: path.to_owned(),
             run_id,
             output: BufWriter::new(file),
-            state,
+            state: visited.state,
         })
     }
 
@@ -752,6 +788,10 @@ impl MetricWriter {
 
         let mut encoded = serde_json::to_vec(&record).context("serialize metric record")?;
         encoded.push(b'\n');
+        ensure!(
+            encoded.len() <= MAX_METRIC_RECORD_BYTES,
+            "metric record exceeds the {MAX_METRIC_RECORD_BYTES}-byte JSONL limit"
+        );
         self.output
             .write_all(&encoded)
             .with_context(|| format!("append metric log {}", self.path.display()))?;
@@ -772,7 +812,9 @@ impl MetricWriter {
         self.output
             .get_ref()
             .sync_data()
-            .with_context(|| format!("sync metric data {}", self.path.display()))
+            .with_context(|| format!("sync metric data {}", self.path.display()))?;
+        let current = opened_metric_file_stamp(self.output.get_ref(), "metric log")?;
+        ensure_metric_path_matches_stamp(&self.path, &current, "metric log", true)
     }
 
     /// Flush and persist both file data and metadata.
@@ -781,7 +823,9 @@ impl MetricWriter {
         self.output
             .get_ref()
             .sync_all()
-            .with_context(|| format!("sync metric log {}", self.path.display()))
+            .with_context(|| format!("sync metric log {}", self.path.display()))?;
+        let current = opened_metric_file_stamp(self.output.get_ref(), "metric log")?;
+        ensure_metric_path_matches_stamp(&self.path, &current, "metric log", true)
     }
 
     /// Persist and measure exactly the prefix named by checkpoint state.
@@ -809,57 +853,6 @@ impl MetricWriter {
     }
 }
 
-fn committed_prefix_end(bytes: &[u8], committed_records: usize) -> Result<usize> {
-    if committed_records == 0 {
-        return Ok(0);
-    }
-    bytes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
-        .nth(committed_records - 1)
-        .context("metric log has fewer records than the runtime checkpoint")
-}
-
-fn validate_committed_prefix_bytes(
-    bytes: &[u8],
-    path: &Path,
-    committed_records: usize,
-    committed_last_global_step: Option<u64>,
-    expected_run_id: Option<&str>,
-) -> Result<(usize, MetricLogState)> {
-    validate_committed_prefix_bytes_with(
-        bytes,
-        path,
-        committed_records,
-        committed_last_global_step,
-        expected_run_id,
-        |_| Ok(()),
-    )
-}
-
-fn validate_committed_prefix_bytes_with(
-    bytes: &[u8],
-    path: &Path,
-    committed_records: usize,
-    committed_last_global_step: Option<u64>,
-    expected_run_id: Option<&str>,
-    visitor: impl FnMut(&MetricRecord) -> Result<()>,
-) -> Result<(usize, MetricLogState)> {
-    let end = committed_prefix_end(bytes, committed_records)?;
-    let state = visit_validated_records(&bytes[..end], expected_run_id, visitor)
-        .with_context(|| format!("validate committed metric prefix in {}", path.display()))?;
-    ensure!(
-        state.records == committed_records as u64,
-        "committed metric prefix record count is inconsistent"
-    );
-    ensure!(
-        state.last_global_step == committed_last_global_step,
-        "committed metric prefix global step is inconsistent"
-    );
-    Ok((end, state))
-}
-
 /// Validate a metric log without opening it for append.
 pub fn validate_metric_log(
     path: impl AsRef<Path>,
@@ -870,11 +863,21 @@ pub fn validate_metric_log(
     }
     let path = path.as_ref();
     let mut file = open_existing_metric_file(path, "metric log", false)?;
-    let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, "metric log")?;
-    let state = validate_log_bytes(&bytes, expected_run_id)
-        .with_context(|| format!("validate metric log {}", path.display()))?;
-    ensure_open_metric_file_unchanged(&file, path, &stamp, "metric log")?;
-    Ok(state)
+    let visited = visit_open_metric_file(
+        &mut file,
+        path,
+        "metric log",
+        expected_run_id,
+        None,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .with_context(|| format!("validate metric log {}", path.display()))?;
+    ensure!(
+        visited.reached_eof,
+        "complete metric validation stopped early"
+    );
+    Ok(visited.state)
 }
 
 /// Validate the exact journal prefix committed by a training checkpoint
@@ -914,18 +917,19 @@ fn validate_metric_prefix_impl(
     committed_global_step: u64,
     expected_run_id: Option<&str>,
 ) -> Result<MetricLogState> {
-    let bytes = read_regular_file_stable(path, "metric log")?;
-    let committed_records = usize::try_from(committed_records)
-        .context("committed metric record count exceeds usize")?;
     let expected_last_step = (committed_records > 0).then_some(committed_global_step);
-    let (_, state) = validate_committed_prefix_bytes(
-        &bytes,
+    let mut file = open_existing_metric_file(path, "metric log", false)?;
+    let visited = visit_open_metric_file(
+        &mut file,
         path,
-        committed_records,
-        expected_last_step,
+        "metric log",
         expected_run_id,
+        Some(committed_records),
+        |_| Ok(()),
+        |_| Ok(()),
     )?;
-    Ok(state)
+    validate_committed_stream_state(&visited, committed_records, expected_last_step)?;
+    Ok(visited.state)
 }
 
 /// Validate an immutable metric snapshot that contains exactly the records
@@ -965,22 +969,23 @@ fn validate_metric_snapshot_impl(
     committed_global_step: u64,
     expected_run_id: Option<&str>,
 ) -> Result<MetricLogState> {
-    let bytes = read_regular_file_stable(path, "metric snapshot")?;
-    let committed_records = usize::try_from(committed_records)
-        .context("committed metric record count exceeds usize")?;
     let expected_last_step = (committed_records > 0).then_some(committed_global_step);
-    let (end, state) = validate_committed_prefix_bytes(
-        &bytes,
+    let mut file = open_existing_metric_file(path, "metric snapshot", false)?;
+    let visited = visit_open_metric_file(
+        &mut file,
         path,
-        committed_records,
-        expected_last_step,
+        "metric snapshot",
         expected_run_id,
+        Some(committed_records),
+        |_| Ok(()),
+        |_| Ok(()),
     )?;
+    validate_committed_stream_state(&visited, committed_records, expected_last_step)?;
     ensure!(
-        end == bytes.len(),
+        visited.reached_eof,
         "immutable metric snapshot contains an uncommitted tail"
     );
-    Ok(state)
+    Ok(visited.state)
 }
 
 /// Measure committed single-accelerator work from a validated metric prefix.
@@ -996,17 +1001,16 @@ pub fn summarize_committed_training_time(
 ) -> Result<CommittedTrainingTime> {
     validate_identifier("expected run_id", expected_run_id)?;
     let path = path.as_ref();
-    let bytes = read_regular_file_stable(path, "metric log for training evidence")?;
-    let committed_records_usize = usize::try_from(committed_records)
-        .context("committed metric record count exceeds usize")?;
+    let mut file = open_existing_metric_file(path, "metric log for training evidence", false)?;
     let mut optimizer_steps = 0_u64;
     let mut elapsed_nanoseconds = 0_u64;
-    let (_, _) = validate_committed_prefix_bytes_with(
-        &bytes,
+    let visited = visit_open_metric_file(
+        &mut file,
         path,
-        committed_records_usize,
-        Some(committed_global_step),
+        "metric log for training evidence",
         Some(expected_run_id),
+        Some(committed_records),
+        |_| Ok(()),
         |record| {
             let elapsed = match &record.event {
                 MetricEvent::Throughput(metric) => {
@@ -1034,6 +1038,7 @@ pub fn summarize_committed_training_time(
             Ok(())
         },
     )?;
+    validate_committed_stream_state(&visited, committed_records, Some(committed_global_step))?;
     ensure!(
         optimizer_steps == committed_global_step,
         "throughput metrics account for {optimizer_steps} optimizer steps, checkpoint records {committed_global_step}"
@@ -1063,14 +1068,41 @@ pub fn metric_log_digests(
         validate_identifier("expected run_id", run_id)?;
     }
     let path = path.as_ref();
-    let bytes = read_regular_file_stable(path, "metric log for digest")?;
-    metric_log_digests_from_bytes(&bytes, expected_run_id)
-        .with_context(|| format!("validate metric log {} for digest", path.display()))
+    let mut file = open_existing_metric_file(path, "metric log for digest", false)?;
+    let mut raw = Sha256::new();
+    let mut semantic = Sha256::new();
+    let visited = visit_open_metric_file(
+        &mut file,
+        path,
+        "metric log for digest",
+        expected_run_id,
+        None,
+        |line| {
+            raw.update(line);
+            Ok(())
+        },
+        |record| {
+            if let Some(value) = semantic_record(record)? {
+                semantic.update(serde_json::to_vec(&canonicalize_json(value))?);
+                semantic.update(b"\n");
+            }
+            Ok(())
+        },
+    )
+    .with_context(|| format!("validate metric log {} for digest", path.display()))?;
+    ensure!(visited.reached_eof, "complete metric digest stopped early");
+    Ok(MetricLogDigests {
+        raw_sha256: format!("{:x}", raw.finalize()),
+        semantic_progress_sha256: format!("{:x}", semantic.finalize()),
+        records: visited.state.records,
+        last_global_step: visited.state.last_global_step,
+    })
 }
 
 /// Verify and digest bytes already read through a stable artifact handle. This
 /// lets higher-level evidence verification avoid a second path open between
 /// checking an artifact's raw digest and projecting semantic progress.
+#[cfg(test)]
 pub(crate) fn metric_log_digests_from_bytes(
     bytes: &[u8],
     expected_run_id: Option<&str>,
@@ -1087,18 +1119,145 @@ pub(crate) fn metric_log_digests_from_bytes(
         Ok(())
     })?;
     Ok(MetricLogDigests {
-        raw_sha256: hex_sha256(bytes),
+        raw_sha256: sha256_hex(bytes),
         semantic_progress_sha256: format!("{:x}", semantic.finalize()),
         records: state.records,
         last_global_step: state.last_global_step,
     })
 }
 
-fn read_regular_file_stable(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let mut file = open_existing_metric_file(path, label, false)?;
-    let (bytes, stamp) = read_open_metric_file_stable(&mut file, path, label)?;
-    ensure_open_metric_file_unchanged(&file, path, &stamp, label)?;
-    Ok(bytes)
+#[derive(Debug)]
+struct MetricStreamVisit {
+    state: MetricLogState,
+    consumed_bytes: u64,
+    reached_eof: bool,
+    stamp: MetricFileStamp,
+}
+
+fn read_bounded_metric_line(
+    reader: &mut (impl BufRead + ?Sized),
+    line: &mut Vec<u8>,
+    maximum_bytes: usize,
+) -> Result<usize> {
+    ensure!(
+        maximum_bytes > 0,
+        "metric record byte limit must be positive"
+    );
+    line.clear();
+    let capture_bytes = maximum_bytes
+        .checked_add(1)
+        .context("metric record byte limit overflows usize")?;
+    let mut bounded = reader.take(capture_bytes as u64);
+    let read = bounded
+        .read_until(b'\n', line)
+        .context("read metric JSONL record")?;
+    ensure!(
+        line.len() <= maximum_bytes,
+        "metric record exceeds the {maximum_bytes}-byte JSONL limit"
+    );
+    Ok(read)
+}
+
+fn visit_validated_reader(
+    reader: &mut (impl BufRead + ?Sized),
+    expected_run_id: Option<&str>,
+    record_limit: Option<u64>,
+    mut raw_visitor: impl FnMut(&[u8]) -> Result<()>,
+    mut visitor: impl FnMut(&MetricRecord) -> Result<()>,
+) -> Result<(MetricLogState, u64, bool)> {
+    let mut state = MetricLogState::default();
+    let mut consumed_bytes = 0_u64;
+    let mut line = Vec::new();
+    loop {
+        if record_limit == Some(state.records) {
+            let reached_eof = reader.fill_buf()?.is_empty();
+            return Ok((state, consumed_bytes, reached_eof));
+        }
+        let read = read_bounded_metric_line(reader, &mut line, MAX_METRIC_RECORD_BYTES)?;
+        if read == 0 {
+            return Ok((state, consumed_bytes, true));
+        }
+        consumed_bytes = consumed_bytes
+            .checked_add(u64::try_from(read).context("metric record length exceeds u64")?)
+            .context("metric log byte offset overflows u64")?;
+        ensure!(
+            line.last() == Some(&b'\n'),
+            "metric log ends with a partial record; refuse unsafe resume"
+        );
+        raw_visitor(&line)?;
+        let encoded = &line[..line.len() - 1];
+        let line_number = state
+            .records
+            .checked_add(1)
+            .context("metric line number overflows u64")?;
+        ensure!(
+            !encoded.is_empty(),
+            "metric log contains an empty record at line {line_number}"
+        );
+        let record: MetricRecord = serde_json::from_slice(encoded)
+            .with_context(|| format!("decode metric record at line {line_number}"))?;
+        validate_record(&record)
+            .with_context(|| format!("invalid metric record at line {line_number}"))?;
+        validate_record_position(&record, &state)
+            .with_context(|| format!("invalid metric sequence at line {line_number}"))?;
+        if let Some(expected) = expected_run_id {
+            ensure!(
+                record.run_id == expected,
+                "metric run_id `{}` does not match requested `{expected}`",
+                record.run_id
+            );
+        }
+        visitor(&record).with_context(|| format!("process metric record at line {line_number}"))?;
+        advance_state(&mut state, &record)?;
+    }
+}
+
+fn visit_open_metric_file(
+    file: &mut File,
+    path: &Path,
+    label: &str,
+    expected_run_id: Option<&str>,
+    record_limit: Option<u64>,
+    raw_visitor: impl FnMut(&[u8]) -> Result<()>,
+    visitor: impl FnMut(&MetricRecord) -> Result<()>,
+) -> Result<MetricStreamVisit> {
+    let stamp = opened_metric_file_stamp(file, label)?;
+    ensure_metric_path_matches_stamp(path, &stamp, label, true)?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind opened {label} {}", path.display()))?;
+    let (state, consumed_bytes, reached_eof) = {
+        let mut reader = BufReader::new(&mut *file);
+        visit_validated_reader(
+            &mut reader,
+            expected_run_id,
+            record_limit,
+            raw_visitor,
+            visitor,
+        )?
+    };
+    ensure_open_metric_file_unchanged(file, path, &stamp, label)?;
+    Ok(MetricStreamVisit {
+        state,
+        consumed_bytes,
+        reached_eof,
+        stamp,
+    })
+}
+
+fn validate_committed_stream_state(
+    visited: &MetricStreamVisit,
+    committed_records: u64,
+    committed_last_global_step: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        visited.state.records == committed_records,
+        "metric log has fewer records than the runtime checkpoint"
+    );
+    ensure!(
+        visited.state.last_global_step == committed_last_global_step,
+        "committed metric prefix global step is inconsistent"
+    );
+    Ok(())
 }
 
 fn create_empty_metric_file(path: &Path, label: &str) -> Result<File> {
@@ -1131,6 +1290,7 @@ fn create_empty_metric_file(path: &Path, label: &str) -> Result<File> {
         );
     }
     ensure_metric_path_matches_stamp(path, &opened, label, true)?;
+    lock_metric_writer(&file, path)?;
 
     // Truncate only after the opened descriptor is proven to be the exact
     // regular file inspected above. A path swap can therefore make creation
@@ -1145,6 +1305,30 @@ fn create_empty_metric_file(path: &Path, label: &str) -> Result<File> {
     );
     ensure_metric_path_matches_stamp(path, &empty, label, true)?;
     into_append_metric_file(file, path, label)
+}
+
+#[cfg(unix)]
+fn lock_metric_writer(file: &File, path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // The lock remains attached to the writer's open file description for its
+    // lifetime. It is advisory so read-only sidecars remain unaffected, while
+    // every MetricWriter in this crate fails before validation or truncation.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "acquire exclusive metric-writer lock for {}",
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_metric_writer(_: &File, _: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn open_existing_metric_file(path: &Path, label: &str, append: bool) -> Result<File> {
@@ -1168,6 +1352,7 @@ fn open_existing_metric_file(path: &Path, label: &str, append: bool) -> Result<F
     Ok(file)
 }
 
+#[cfg(test)]
 fn read_open_metric_file_stable(
     file: &mut File,
     path: &Path,
@@ -1379,54 +1564,19 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn validate_log_bytes(bytes: &[u8], expected_run_id: Option<&str>) -> Result<MetricLogState> {
-    visit_validated_records(bytes, expected_run_id, |_| Ok(()))
-}
-
+#[cfg(test)]
 fn visit_validated_records(
     bytes: &[u8],
     expected_run_id: Option<&str>,
-    mut visitor: impl FnMut(&MetricRecord) -> Result<()>,
+    visitor: impl FnMut(&MetricRecord) -> Result<()>,
 ) -> Result<MetricLogState> {
-    if bytes.is_empty() {
-        return Ok(MetricLogState::default());
-    }
+    let mut reader = std::io::Cursor::new(bytes);
+    let (state, consumed_bytes, reached_eof) =
+        visit_validated_reader(&mut reader, expected_run_id, None, |_| Ok(()), visitor)?;
     ensure!(
-        bytes.last() == Some(&b'\n'),
-        "metric log ends with a partial record; refuse unsafe resume"
+        reached_eof && consumed_bytes == bytes.len() as u64,
+        "metric byte validation stopped before the exact end"
     );
-
-    let mut state = MetricLogState::default();
-    for (line_index, line) in bytes[..bytes.len() - 1]
-        .split(|byte| *byte == b'\n')
-        .enumerate()
-    {
-        ensure!(
-            !line.is_empty(),
-            "metric log contains an empty record at line {}",
-            line_index + 1
-        );
-        let record: MetricRecord = serde_json::from_slice(line)
-            .with_context(|| format!("decode metric record at line {}", line_index + 1))?;
-        validate_record(&record)
-            .with_context(|| format!("invalid metric record at line {}", line_index + 1))?;
-        validate_record_position(&record, &state)
-            .with_context(|| format!("invalid metric sequence at line {}", line_index + 1))?;
-        if let Some(expected) = expected_run_id {
-            ensure!(
-                record.run_id == expected,
-                "metric run_id `{}` does not match requested `{expected}`",
-                record.run_id
-            );
-        }
-        visitor(&record)
-            .with_context(|| format!("process metric record at line {}", line_index + 1))?;
-        advance_state(&mut state, &record)?;
-    }
     Ok(state)
 }
 
@@ -1485,7 +1635,7 @@ pub fn validate_record(record: &MetricRecord) -> Result<()> {
     validate_identifier("run_id", &record.run_id)?;
     validate_identifier("phase name", &record.phase.name)?;
     if let Some(hash) = &record.checkpoint_hash {
-        validate_sha256("checkpoint hash", hash)?;
+        validate_sha256_identity(hash, "checkpoint hash")?;
     }
     record.event.validate()?;
     if let MetricEvent::DeviceUtilization(metric) = &record.event {
@@ -1532,14 +1682,20 @@ impl MetricEvent {
                     metric.reserve_slot.is_some() == metric.reserve_generation.is_some(),
                     "reserve_slot and reserve_generation must be present together"
                 );
-                if matches!(metric.outcome, TierUpdateOutcome::RolledBack) {
-                    ensure!(
-                        !metric.optimizer_state_reset,
-                        "a rolled-back tier update cannot reset optimizer state"
-                    );
-                }
+                ensure!(
+                    !metric.optimizer_state_reset
+                        || matches!(metric.outcome, TierUpdateOutcome::Committed),
+                    "only a committed tier update can reset optimizer state"
+                );
             }
             Self::ActiveCapacity(metric) => {
+                ensure!(
+                    metric
+                        .active_reserve_experts
+                        .checked_add(metric.dormant_reserve_experts)
+                        .is_some_and(|capacity| capacity > 0),
+                    "sleep reserve capacity must be positive and fit u32"
+                );
                 ensure!(metric.routed_top_k > 0, "routed_top_k must be positive");
                 ensure!(
                     metric.reserve_routed_top_k == 1,
@@ -1550,8 +1706,10 @@ impl MetricEvent {
                     "routed_top_k exceeds persistent base experts"
                 );
                 ensure!(
-                    metric.routed_active_parameters <= metric.stored_parameters,
-                    "routed active parameters exceed stored parameters"
+                    metric.routed_active_parameters > 0
+                        && metric.stored_parameters > 0
+                        && metric.routed_active_parameters <= metric.stored_parameters,
+                    "routed and stored parameters must be positive, and routed parameters must not exceed stored parameters"
                 );
                 ensure!(
                     !metric.random_extra_expert || metric.dream_generation,
@@ -1581,6 +1739,20 @@ impl MetricEvent {
                     "wake capacity envelope is inverted"
                 );
                 ensure!(
+                    metric.minimum_observed_wake_routed_active_parameters
+                        <= metric.initial_wake_routed_active_parameters
+                        && metric.initial_wake_routed_active_parameters
+                            <= metric.maximum_observed_wake_routed_active_parameters,
+                    "initial wake capacity is outside the observed envelope"
+                );
+                ensure!(
+                    metric.minimum_observed_wake_routed_active_parameters
+                        == metric.initial_wake_routed_active_parameters
+                        && metric.maximum_observed_wake_routed_active_parameters
+                            == metric.initial_wake_routed_active_parameters,
+                    "wake routed-active parameters changed across sleep cycles"
+                );
+                ensure!(
                     metric.maximum_observed_wake_routed_active_parameters
                         <= metric.stored_parameters,
                     "wake routed parameters exceed stored parameters"
@@ -1588,8 +1760,8 @@ impl MetricEvent {
             }
             Self::DistillationDivergence(metric) => {
                 validate_identifier("transaction_id", &metric.transaction_id)?;
-                validate_sha256("teacher_hash", &metric.teacher_hash)?;
-                validate_sha256("student_hash", &metric.student_hash)?;
+                validate_sha256_identity(&metric.teacher_hash, "teacher_hash")?;
+                validate_sha256_identity(&metric.student_hash, "student_hash")?;
                 ensure!(metric.chunk_count > 0, "chunk_count must be positive");
                 ensure!(
                     metric.chunk_index < metric.chunk_count,
@@ -1609,7 +1781,7 @@ impl MetricEvent {
             }
             Self::ImitationReward(metric) => {
                 validate_identifier("transaction_id", &metric.transaction_id)?;
-                validate_sha256("semantic_judge_hash", &metric.semantic_judge_hash)?;
+                validate_sha256_identity(&metric.semantic_judge_hash, "semantic_judge_hash")?;
                 ensure!(metric.samples > 0, "imitation samples must be positive");
                 unit_interval("semantic_score_mean", metric.semantic_score_mean)?;
                 unit_interval(
@@ -1624,8 +1796,16 @@ impl MetricEvent {
             Self::DreamSelection(metric) => {
                 validate_identifier("transaction_id", &metric.transaction_id)?;
                 validate_identifier("selector_version", &metric.selector_version)?;
-                validate_sha256("reference_set_hash", &metric.reference_set_hash)?;
-                validate_sha256("selected_manifest_hash", &metric.selected_manifest_hash)?;
+                validate_sha256_identity(&metric.reference_set_hash, "reference_set_hash")?;
+                validate_sha256_identity(&metric.selected_manifest_hash, "selected_manifest_hash")?;
+                ensure!(
+                    metric.candidates_generated > 0,
+                    "dream selection requires generated candidates"
+                );
+                ensure!(
+                    metric.random_quota <= metric.candidates_generated,
+                    "random dream quota exceeds generated candidates"
+                );
                 ensure!(
                     metric.selected_random <= metric.random_quota,
                     "selected random dreams exceed the configured quota"
@@ -1635,8 +1815,8 @@ impl MetricEvent {
                     .checked_add(metric.selected_random)
                     .context("selected dream count overflows u32")?;
                 ensure!(
-                    selected <= metric.candidates_generated,
-                    "selected dreams exceed generated candidates"
+                    selected > 0 && selected <= metric.candidates_generated,
+                    "selected dream count must be in 1..=candidates_generated"
                 );
                 signed_unit_interval("gradient_cosine_mean", metric.gradient_cosine_mean)?;
                 signed_unit_interval("gradient_cosine_max", metric.gradient_cosine_max)?;
@@ -1647,9 +1827,9 @@ impl MetricEvent {
             }
             Self::DreamTrial(metric) => {
                 validate_identifier("transaction_id", &metric.transaction_id)?;
-                validate_sha256("candidate_hash", &metric.candidate_hash)?;
-                validate_sha256("adapter_hash", &metric.adapter_hash)?;
-                validate_sha256("evaluator_hash", &metric.evaluator_hash)?;
+                validate_sha256_identity(&metric.candidate_hash, "candidate_hash")?;
+                validate_sha256_identity(&metric.adapter_hash, "adapter_hash")?;
+                validate_sha256_identity(&metric.evaluator_hash, "evaluator_hash")?;
                 ensure!(metric.lora_rank > 0, "LoRA rank must be positive");
                 ensure!(metric.lora_alpha > 0.0, "LoRA alpha must be positive");
                 finite("lora_alpha", metric.lora_alpha)?;
@@ -1666,7 +1846,7 @@ impl MetricEvent {
                 validate_identifier("transaction_id", &metric.transaction_id)?;
                 validate_identifier("suite", &metric.suite)?;
                 validate_identifier("metric", &metric.metric)?;
-                validate_sha256("evaluator_hash", &metric.evaluator_hash)?;
+                validate_sha256_identity(&metric.evaluator_hash, "evaluator_hash")?;
                 finite("baseline_score", metric.baseline_score)?;
                 finite("candidate_score", metric.candidate_score)?;
                 finite("improvement", metric.improvement)?;
@@ -1725,6 +1905,17 @@ impl MetricEvent {
                         metric.average_bits_per_weight.is_some() && metric.packed_bytes.is_some(),
                         "quantization export requires packed size and bits-per-weight"
                     );
+                    ensure!(
+                        metric.tensors_quantized > 0
+                            && metric.packed_bytes.is_some_and(|bytes| bytes > 0),
+                        "non-empty quantization export requires tensors and packed bytes"
+                    );
+                }
+                if metric.stage == QuantizationStage::Export {
+                    ensure!(
+                        approximately_equal(metric.progress_fraction, 1.0),
+                        "quantization export must report complete progress"
+                    );
                 }
             }
             Self::DeviceUtilization(metric) => {
@@ -1764,6 +1955,14 @@ impl MetricEvent {
                     "elapsed_seconds must be positive"
                 );
                 finite("elapsed_seconds", metric.elapsed_seconds)?;
+                ensure!(
+                    metric.compute_tokens > 0 && metric.examples > 0,
+                    "throughput window must contain tokens and examples"
+                );
+                ensure!(
+                    metric.supervised_tokens <= metric.compute_tokens,
+                    "throughput supervised tokens exceed compute tokens"
+                );
                 nonnegative("tokens_per_second", metric.tokens_per_second)?;
                 nonnegative("examples_per_second", metric.examples_per_second)?;
                 nonnegative("input_wait_seconds", metric.input_wait_seconds)?;
@@ -1828,10 +2027,14 @@ impl MetricEvent {
                 );
             }
             Self::PostTrainingUpdate(metric) => {
-                validate_sha256("transaction_id", &metric.transaction_id)?;
-                validate_sha256("checkpoint_sha256", &metric.checkpoint_sha256)?;
-                validate_sha256("optimizer_sha256", &metric.optimizer_sha256)?;
+                validate_sha256_identity(&metric.transaction_id, "transaction_id")?;
+                validate_sha256_identity(&metric.checkpoint_sha256, "checkpoint_sha256")?;
+                validate_sha256_identity(&metric.optimizer_sha256, "optimizer_sha256")?;
                 ensure!(metric.records > 0, "post-training update is empty");
+                metric
+                    .first_record
+                    .checked_add(metric.records)
+                    .context("post-training record interval overflows u64")?;
                 ensure!(metric.optimizer_step > 0, "optimizer_step must be positive");
                 ensure!(
                     metric.rng_counter_end >= metric.rng_counter_start,
@@ -1852,6 +2055,7 @@ impl MetricEvent {
                 );
                 match metric.algorithm {
                     PostTrainingAlgorithm::Dpo => {
+                        nonnegative("post_training_loss", metric.loss)?;
                         ensure!(
                             dpo.0.is_some()
                                 && dpo.1.is_some()
@@ -1861,12 +2065,17 @@ impl MetricEvent {
                         );
                         unit_interval("preference_accuracy", dpo.0.expect("checked present"))?;
                         finite("implicit_reward_margin", dpo.1.expect("checked present"))?;
+                        let expected_rngs = metric
+                            .records
+                            .checked_mul(2)
+                            .context("DPO model RNG range overflows u64")?;
                         ensure!(
-                            metric.rng_counter_start == metric.rng_counter_end,
-                            "DPO must not consume rollout RNG"
+                            metric.rng_counter_end - metric.rng_counter_start == expected_rngs,
+                            "DPO must reserve exactly two model RNG substreams per record"
                         );
                     }
                     PostTrainingAlgorithm::ForwardKl => {
+                        nonnegative("post_training_loss", metric.loss)?;
                         ensure!(
                             dpo == (None, None)
                                 && distillation.0.is_some()
@@ -1879,8 +2088,8 @@ impl MetricEvent {
                         nonnegative("teacher_entropy", distillation.1.expect("checked present"))?;
                         unit_interval("top1_agreement", distillation.2.expect("checked present"))?;
                         ensure!(
-                            metric.rng_counter_start == metric.rng_counter_end,
-                            "forward-KL must not consume rollout RNG"
+                            metric.rng_counter_end - metric.rng_counter_start == metric.records,
+                            "forward-KL must reserve exactly one model RNG substream per record"
                         );
                     }
                     PostTrainingAlgorithm::Grpo => {
@@ -1914,20 +2123,6 @@ fn validate_identifier(name: &str, value: &str) -> Result<()> {
     ensure!(
         !value.contains(['\n', '\r']),
         "{name} must not contain a newline"
-    );
-    Ok(())
-}
-
-fn validate_sha256(name: &str, value: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{name} must start with `sha256:`"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{name} must contain 64 lowercase hexadecimal digits"
     );
     Ok(())
 }
@@ -2094,6 +2289,36 @@ mod tests {
         assert_eq!(state.last_emitted_at_unix_ms, Some(102));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_second_writer_cannot_validate_or_truncate_the_live_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let mut owner = MetricWriter::create(&path, "run-a").unwrap();
+        owner.append_at(context(1), throughput(), 100).unwrap();
+        owner.sync_all().unwrap();
+        let committed = fs::read(&path).unwrap();
+
+        let resume_error = MetricWriter::resume(&path, "run-a")
+            .err()
+            .expect("second resume unexpectedly acquired the journal")
+            .to_string();
+        assert!(
+            resume_error.contains("metric-writer lock"),
+            "{resume_error}"
+        );
+        let create_error = MetricWriter::create(&path, "run-b")
+            .err()
+            .expect("second create unexpectedly acquired the journal")
+            .to_string();
+        assert!(
+            create_error.contains("metric-writer lock"),
+            "{create_error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        assert_eq!(owner.state().records, 1);
+    }
+
     #[test]
     fn resume_rejects_partial_final_record() {
         let directory = tempfile::tempdir().unwrap();
@@ -2101,6 +2326,24 @@ mod tests {
         fs::write(&path, b"{\"partial\":true}").unwrap();
         let error = MetricWriter::resume(&path, "run-a").err().unwrap();
         assert!(format!("{error:#}").contains("partial record"));
+    }
+
+    #[test]
+    fn bounded_line_reader_rejects_a_lengthless_record_without_unbounded_growth() {
+        let mut accepted = std::io::Cursor::new(b"1234\n".to_vec());
+        let mut line = Vec::new();
+        assert_eq!(
+            read_bounded_metric_line(&mut accepted, &mut line, 5).unwrap(),
+            5
+        );
+        assert_eq!(line, b"1234\n");
+
+        let mut oversized = std::io::Cursor::new(b"12345\n".to_vec());
+        let error = read_bounded_metric_line(&mut oversized, &mut line, 5)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("5-byte JSONL limit"), "{error}");
+        assert_eq!(line.len(), 6, "reader captures only limit + 1 bytes");
     }
 
     #[cfg(unix)]
@@ -2200,6 +2443,44 @@ mod tests {
             validate_metric_log(&path, Some("run-a")).unwrap().records,
             2
         );
+    }
+
+    #[test]
+    fn checkpoint_resume_does_not_materialize_an_oversized_uncommitted_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        {
+            let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+            writer.append_at(context(1), throughput(), 100).unwrap();
+            writer.sync_all().unwrap();
+        }
+        let committed_len = fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(committed_len + MAX_METRIC_RECORD_BYTES as u64 * 4)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let writer = MetricWriter::resume_from_checkpoint(&path, "run-a", 1, 1).unwrap();
+        assert_eq!(writer.state().records, 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), committed_len);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_sync_rejects_a_replaced_live_journal_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let mut writer = MetricWriter::create(&path, "run-a").unwrap();
+        writer.append_at(context(1), throughput(), 100).unwrap();
+        writer.sync_all().unwrap();
+
+        let displaced = directory.path().join("displaced.jsonl");
+        fs::rename(&path, &displaced).unwrap();
+        fs::write(&path, b"").unwrap();
+        writer.append_at(context(2), throughput(), 101).unwrap();
+        let error = writer.sync_all().unwrap_err().to_string();
+        assert!(error.contains("replaced"), "{error}");
+        assert!(fs::read(&path).unwrap().is_empty());
     }
 
     #[test]
@@ -2360,6 +2641,7 @@ mod tests {
             .append_at(context(1), one_step_throughput(2.0), 100)
             .unwrap();
         first.sync_all().unwrap();
+        let first_bytes = fs::read(&first_path).unwrap();
 
         let mut second = MetricWriter::create(&second_path, "resumed").unwrap();
         second
@@ -2387,6 +2669,11 @@ mod tests {
         second.sync_all().unwrap();
 
         let first = metric_log_digests(&first_path, Some("uninterrupted")).unwrap();
+        assert_eq!(
+            first,
+            metric_log_digests_from_bytes(&first_bytes, Some("uninterrupted")).unwrap(),
+            "streaming and already-authenticated byte projections must agree"
+        );
         let second = metric_log_digests(&second_path, Some("resumed")).unwrap();
         assert_ne!(first.raw_sha256, second.raw_sha256);
         assert_eq!(
@@ -2500,6 +2787,27 @@ mod tests {
         off_boundary.tier_clock = 101;
         assert!(MetricEvent::TierUpdate(off_boundary).validate().is_err());
 
+        let mut invalid_reset = TierUpdateMetrics {
+            transaction_id: "txn-2".to_owned(),
+            tier: MemoryTier::Fast,
+            receiver_tier: Some(MemoryTier::Medium),
+            tier_clock: 100,
+            update_period: 10,
+            accumulated_micro_steps: 10,
+            outcome: TierUpdateOutcome::Prospective,
+            update_l2_norm: None,
+            reserve_slot: Some(1),
+            reserve_generation: Some(3),
+            optimizer_state_reset: true,
+        };
+        assert!(
+            MetricEvent::TierUpdate(invalid_reset.clone())
+                .validate()
+                .is_err()
+        );
+        invalid_reset.outcome = TierUpdateOutcome::Committed;
+        MetricEvent::TierUpdate(invalid_reset).validate().unwrap();
+
         let mut capacity = ActiveCapacityMetrics {
             tier: MemoryTier::Fast,
             active_base_experts: 8,
@@ -2515,6 +2823,21 @@ mod tests {
         MetricEvent::ActiveCapacity(capacity.clone())
             .validate()
             .unwrap();
+        let mut empty_reserve = capacity.clone();
+        empty_reserve.active_reserve_experts = 0;
+        empty_reserve.dormant_reserve_experts = 0;
+        assert!(
+            MetricEvent::ActiveCapacity(empty_reserve)
+                .validate()
+                .is_err()
+        );
+        let mut empty_accounting = capacity.clone();
+        empty_accounting.routed_active_parameters = 0;
+        assert!(
+            MetricEvent::ActiveCapacity(empty_accounting)
+                .validate()
+                .is_err()
+        );
         let mut no_distinct_expert = capacity.clone();
         no_distinct_expert.active_base_experts = 2;
         no_distinct_expert.active_reserve_experts = 7;
@@ -2551,9 +2874,27 @@ mod tests {
         envelope.minimum_observed_wake_routed_active_parameters = 81;
         envelope.maximum_observed_wake_routed_active_parameters = 80;
         assert!(
-            MetricEvent::WakeCapacityEnvelope(envelope)
+            MetricEvent::WakeCapacityEnvelope(envelope.clone())
                 .validate()
                 .is_err()
+        );
+
+        envelope.minimum_observed_wake_routed_active_parameters = 79;
+        envelope.maximum_observed_wake_routed_active_parameters = 81;
+        assert!(
+            MetricEvent::WakeCapacityEnvelope(envelope.clone())
+                .validate()
+                .is_err(),
+            "active-compute drift must fail even when the initial sample is inside the range"
+        );
+
+        envelope.minimum_observed_wake_routed_active_parameters = 79;
+        envelope.maximum_observed_wake_routed_active_parameters = 79;
+        assert!(
+            MetricEvent::WakeCapacityEnvelope(envelope)
+                .validate()
+                .is_err(),
+            "an envelope that excludes its initial sample must fail"
         );
     }
 
@@ -2604,6 +2945,24 @@ mod tests {
             selected_manifest_hash: hash('5'),
         };
         MetricEvent::DreamSelection(selection).validate().unwrap();
+
+        let empty_selection = DreamSelectionMetrics {
+            transaction_id: "txn".to_owned(),
+            selector_version: "cosine-v1".to_owned(),
+            reference_set_hash: hash('4'),
+            candidates_generated: 1,
+            selected_by_alignment: 0,
+            selected_random: 0,
+            random_quota: 0,
+            gradient_cosine_mean: 0.2,
+            gradient_cosine_max: 0.9,
+            selected_manifest_hash: hash('5'),
+        };
+        assert!(
+            MetricEvent::DreamSelection(empty_selection)
+                .validate()
+                .is_err()
+        );
 
         let mut trial = DreamTrialMetrics {
             transaction_id: "txn".to_owned(),
@@ -2688,9 +3047,17 @@ mod tests {
         };
         MetricEvent::Quantization(qat).validate().unwrap();
 
-        let mut missing_error = valid_export;
+        let mut missing_error = valid_export.clone();
         missing_error.mean_squared_error = None;
         assert!(MetricEvent::Quantization(missing_error).validate().is_err());
+
+        let mut incomplete_export = valid_export;
+        incomplete_export.progress_fraction = 0.99;
+        assert!(
+            MetricEvent::Quantization(incomplete_export)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -2733,6 +3100,44 @@ mod tests {
                 .validate()
                 .is_err()
         );
+
+        let mut overflow = PostTrainingUpdateMetrics {
+            transaction_id: hash('a'),
+            algorithm: PostTrainingAlgorithm::Dpo,
+            epoch: 0,
+            first_record: u64::MAX,
+            records: 1,
+            optimizer_step: 1,
+            rng_counter_start: 0,
+            rng_counter_end: 2,
+            loss: 0.1,
+            checkpoint_sha256: hash('b'),
+            optimizer_sha256: hash('c'),
+            preference_accuracy: Some(1.0),
+            implicit_reward_margin: Some(1.0),
+            forward_kl: None,
+            teacher_entropy: None,
+            top1_agreement: None,
+            mean_reward: None,
+            reward_stddev: None,
+            mean_kl: None,
+            clipped_fraction: None,
+        };
+        assert!(
+            MetricEvent::PostTrainingUpdate(Box::new(overflow.clone()))
+                .validate()
+                .is_err()
+        );
+        overflow.first_record = u64::MAX - 1;
+        MetricEvent::PostTrainingUpdate(Box::new(overflow.clone()))
+            .validate()
+            .unwrap();
+        overflow.loss = -0.1;
+        assert!(
+            MetricEvent::PostTrainingUpdate(Box::new(overflow))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -2760,6 +3165,12 @@ mod tests {
         event.validate().unwrap();
         if let MetricEvent::Throughput(metric) = &mut event {
             metric.tokens_per_second = 9_000.0;
+        }
+        assert!(event.validate().is_err());
+
+        let mut event = throughput();
+        if let MetricEvent::Throughput(metric) = &mut event {
+            metric.supervised_tokens = metric.compute_tokens + 1;
         }
         assert!(event.validate().is_err());
     }

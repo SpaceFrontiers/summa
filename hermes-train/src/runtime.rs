@@ -11,9 +11,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-use crate::metrics::{MetricContext, MetricEvent};
+use crate::artifact_io::{sha256_identity, validate_sha256_identity};
+use crate::metrics::{MetricContext, MetricEvent, MetricPhaseKind};
 use crate::workflow::{PhaseClass, PhaseKind, PhaseV2, ResolvedWorkflow};
 
 /// Version of the serialized workflow-runtime state.
@@ -66,9 +66,9 @@ impl ImmutableModelCheckpoint {
         self.sha256 == other.sha256
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.uri.trim().is_empty(), "checkpoint URI is empty");
-        validate_sha256(&self.sha256, "checkpoint")
+        validate_sha256_identity(&self.sha256, "checkpoint digest")
     }
 }
 
@@ -99,24 +99,10 @@ impl ImmutableArtifact {
         &self.sha256
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.uri.trim().is_empty(), "artifact URI is empty");
-        validate_sha256(&self.sha256, "artifact")
+        validate_sha256_identity(&self.sha256, "artifact digest")
     }
-}
-
-fn validate_sha256(value: &str, subject: &str) -> Result<()> {
-    let digest = value.strip_prefix("sha256:").with_context(|| {
-        format!("{subject} digest must use the `sha256:<64 lowercase hex>` form")
-    })?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{subject} digest must use the `sha256:<64 lowercase hex>` form"
-    );
-    Ok(())
 }
 
 /// A completed executor result.  The variants encode the legal side effects
@@ -250,7 +236,7 @@ impl WorkflowRunState {
         }
         let state = Self {
             version: WORKFLOW_RUNTIME_STATE_VERSION,
-            workflow_signature: workflow_signature(workflow)?,
+            workflow_signature: workflow_signature_after_validation(workflow)?,
             current_checkpoint: initial_checkpoint.clone(),
             initial_checkpoint,
             next_phase: 0,
@@ -302,7 +288,7 @@ impl WorkflowRunState {
             self.version
         );
         ensure!(
-            self.workflow_signature == workflow_signature(workflow)?,
+            self.workflow_signature == workflow_signature_after_validation(workflow)?,
             "workflow-runtime checkpoint does not belong to this resolved workflow"
         );
         ensure!(
@@ -349,6 +335,12 @@ impl WorkflowRunState {
             self.current_checkpoint == expected_checkpoint,
             "workflow-runtime current checkpoint disagrees with its phase receipts"
         );
+        if self.next_phase < workflow.phases.len() {
+            validate_phase_input(
+                &workflow.phases[self.next_phase],
+                expected_checkpoint.as_ref(),
+            )?;
+        }
 
         match &self.active {
             Some(active) => {
@@ -388,8 +380,12 @@ impl WorkflowRunState {
 /// workflow, including changed phase order or parameters.
 pub fn workflow_signature(workflow: &ResolvedWorkflow) -> Result<String> {
     workflow.validate()?;
+    workflow_signature_after_validation(workflow)
+}
+
+fn workflow_signature_after_validation(workflow: &ResolvedWorkflow) -> Result<String> {
     let encoded = serde_json::to_vec(workflow)?;
-    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+    Ok(sha256_identity(&encoded))
 }
 
 fn validate_product(
@@ -478,6 +474,18 @@ fn validate_product(
             class
         ),
     }
+}
+
+fn validate_phase_input(phase: &PhaseV2, input: Option<&ImmutableModelCheckpoint>) -> Result<()> {
+    if phase.kind != PhaseKind::Pretrain {
+        ensure!(
+            input.is_some(),
+            "workflow phase `{}` ({}) requires an input model checkpoint",
+            phase.name,
+            phase.kind.name()
+        );
+    }
+    Ok(())
 }
 
 /// Owned request passed to an executor.  Cloning a phase boundary avoids
@@ -691,6 +699,33 @@ impl<S: RuntimeCheckpoint + ?Sized> PhaseProgressSink for ProgressCheckpoint<'_,
     }
 
     fn metric(&mut self, context: MetricContext, event: MetricEvent) -> Result<()> {
+        let active = self
+            .state
+            .active
+            .as_ref()
+            .context("cannot emit a metric without an active phase")?;
+        let expected_index = u32::try_from(active.phase_index)
+            .context("active workflow phase index exceeds the metric schema")?;
+        ensure!(
+            context.phase.index == expected_index && context.phase.name == active.phase_name,
+            "executor metric phase identity does not match active workflow phase `{}`",
+            active.phase_name
+        );
+        let expected_kind = MetricPhaseKind::from(active.phase_kind);
+        let periodic_sleep_subphase = context.phase.kind == MetricPhaseKind::Sleep
+            && self.workflow.phases[active.phase_index]
+                .periodic_sleep
+                .is_some();
+        ensure!(
+            context.phase.kind == expected_kind || periodic_sleep_subphase,
+            "executor metric kind does not match active workflow phase `{}` ({})",
+            active.phase_name,
+            active.phase_kind.name()
+        );
+        if let Some(checkpoint_hash) = &context.checkpoint_hash {
+            validate_sha256_identity(checkpoint_hash, "metric checkpoint digest")?;
+        }
+        event.validate()?;
         self.checkpoint.append_metric(context, event)
     }
 }
@@ -743,6 +778,11 @@ fn commit_prepared<S: RuntimeCheckpoint + ?Sized>(
 /// the already-persisted product without invoking an executor again.  This is
 /// the critical interruption window for immutable sleep/quantization
 /// candidates and release publication.
+///
+/// After any error, discard the driver and reload it from its
+/// [`RuntimeCheckpoint`]. An executor may have successfully persisted progress
+/// before a later operation failed, while metrics emitted after that boundary
+/// must be truncated by the persistence implementation during resume.
 pub fn run_next_phase<C, S: RuntimeCheckpoint + ?Sized>(
     workflow: &ResolvedWorkflow,
     state: &mut WorkflowRunState,
@@ -884,7 +924,7 @@ mod tests {
     use crate::workflow::WorkflowV2;
 
     fn digest(label: &str) -> String {
-        format!("sha256:{:x}", Sha256::digest(label.as_bytes()))
+        sha256_identity(label.as_bytes())
     }
 
     fn checkpoint(label: &str) -> ImmutableModelCheckpoint {
@@ -1047,6 +1087,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCheckpoint {
         boundaries: Vec<RuntimeBoundary>,
+        metrics: Vec<(MetricContext, MetricEvent)>,
         fail_commit_once: bool,
     }
 
@@ -1059,6 +1100,23 @@ mod tests {
             self.boundaries.push(boundary.clone());
             Ok(())
         }
+
+        fn append_metric(&mut self, context: MetricContext, event: MetricEvent) -> Result<()> {
+            self.metrics.push((context, event));
+            Ok(())
+        }
+    }
+
+    fn timing_event() -> MetricEvent {
+        MetricEvent::PhaseTiming(crate::metrics::PhaseTimingMetrics {
+            boundary: crate::metrics::PhaseBoundary::Progress,
+            elapsed_seconds: 0.0,
+            input_wait_seconds: 0.0,
+            forward_seconds: 0.0,
+            backward_seconds: 0.0,
+            optimizer_seconds: 0.0,
+            checkpoint_seconds: 0.0,
+        })
     }
 
     struct CompleteExecutor;
@@ -1169,6 +1227,150 @@ mod tests {
         assert!(error.contains("pretrain"), "{error}");
         assert_eq!(state, pristine);
         assert!(persistence.boundaries.is_empty());
+    }
+
+    #[test]
+    fn executor_metrics_are_bound_to_the_active_workflow_phase() {
+        let full = full_workflow();
+        let workflow = ResolvedWorkflow {
+            version: full.version,
+            name: Some("metric-binding".to_owned()),
+            phases: vec![full.phases[0].clone()],
+        };
+        let mut state = WorkflowRunState::new(&workflow, None).unwrap();
+        let mut registry = ExecutorRegistry::new();
+        registry
+            .register(
+                PhaseKind::Pretrain,
+                |request: &PhaseExecutionRequest,
+                 _: &mut (),
+                 progress: &mut dyn PhaseProgressSink| {
+                    progress.metric(
+                        MetricContext {
+                            global_step: 1,
+                            phase: crate::metrics::MetricPhase {
+                                index: u32::try_from(request.phase_index).unwrap(),
+                                name: request.phase.name.clone(),
+                                kind: request.phase.kind.into(),
+                            },
+                            checkpoint_hash: None,
+                        },
+                        timing_event(),
+                    )?;
+                    Ok(PhaseExecutionResult::Complete(
+                        PhaseProduct::ModelCandidate {
+                            checkpoint: checkpoint("metric-output"),
+                        },
+                    ))
+                },
+            )
+            .unwrap();
+        let mut persistence = RecordingCheckpoint::default();
+        run_next_phase(
+            &workflow,
+            &mut state,
+            &mut registry,
+            &mut (),
+            &mut persistence,
+        )
+        .unwrap();
+        assert_eq!(persistence.metrics.len(), 1);
+
+        let mut state = WorkflowRunState::new(&workflow, None).unwrap();
+        let mut registry = ExecutorRegistry::new();
+        registry
+            .register(
+                PhaseKind::Pretrain,
+                |request: &PhaseExecutionRequest,
+                 _: &mut (),
+                 progress: &mut dyn PhaseProgressSink| {
+                    progress.metric(
+                        MetricContext {
+                            global_step: 1,
+                            phase: crate::metrics::MetricPhase {
+                                index: u32::try_from(request.phase_index).unwrap(),
+                                name: request.phase.name.clone(),
+                                kind: MetricPhaseKind::Evaluation,
+                            },
+                            checkpoint_hash: None,
+                        },
+                        timing_event(),
+                    )?;
+                    unreachable!("invalid metric must stop the executor")
+                },
+            )
+            .unwrap();
+        let mut persistence = RecordingCheckpoint::default();
+        let error = run_next_phase(
+            &workflow,
+            &mut state,
+            &mut registry,
+            &mut (),
+            &mut persistence,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("metric kind"), "{error}");
+        assert!(persistence.metrics.is_empty());
+    }
+
+    #[test]
+    fn periodic_sleep_metrics_keep_the_outer_phase_identity() {
+        let full = full_workflow();
+        let mut phase = full.phases[0].clone();
+        let mut periodic_sleep = full.phases[6]
+            .sleep
+            .clone()
+            .expect("full workflow has a standalone sleep fixture");
+        periodic_sleep.standalone_trigger_clock = None;
+        phase.periodic_sleep = Some(periodic_sleep);
+        let workflow = ResolvedWorkflow {
+            version: full.version,
+            name: Some("periodic-sleep-metric-binding".to_owned()),
+            phases: vec![phase],
+        };
+        workflow.validate().unwrap();
+
+        let mut state = WorkflowRunState::new(&workflow, None).unwrap();
+        let mut registry = ExecutorRegistry::new();
+        registry
+            .register(
+                PhaseKind::Pretrain,
+                |request: &PhaseExecutionRequest,
+                 _: &mut (),
+                 progress: &mut dyn PhaseProgressSink| {
+                    progress.metric(
+                        MetricContext {
+                            global_step: 1,
+                            phase: crate::metrics::MetricPhase {
+                                index: u32::try_from(request.phase_index).unwrap(),
+                                name: request.phase.name.clone(),
+                                kind: MetricPhaseKind::Sleep,
+                            },
+                            checkpoint_hash: None,
+                        },
+                        timing_event(),
+                    )?;
+                    Ok(PhaseExecutionResult::Complete(
+                        PhaseProduct::ModelCandidate {
+                            checkpoint: checkpoint("periodic-sleep-metric-output"),
+                        },
+                    ))
+                },
+            )
+            .unwrap();
+        let mut persistence = RecordingCheckpoint::default();
+        run_next_phase(
+            &workflow,
+            &mut state,
+            &mut registry,
+            &mut (),
+            &mut persistence,
+        )
+        .unwrap();
+        assert_eq!(persistence.metrics.len(), 1);
+        assert_eq!(persistence.metrics[0].0.phase.name, workflow.phases[0].name);
+        assert_eq!(persistence.metrics[0].0.phase.kind, MetricPhaseKind::Sleep);
     }
 
     #[derive(Default)]
@@ -1286,6 +1488,34 @@ mod tests {
             Some(&checkpoint("resumed-output"))
         );
         assert!(state.is_complete(&workflow));
+    }
+
+    #[test]
+    fn only_pretrain_can_bootstrap_without_an_input_model() {
+        let complete = full_workflow();
+        let pretrain_only = ResolvedWorkflow {
+            version: complete.version,
+            name: Some("pretrain-only".to_owned()),
+            phases: vec![complete.phases[0].clone()],
+        };
+        WorkflowRunState::new(&pretrain_only, None).unwrap();
+
+        for phase in complete.phases.iter().skip(1) {
+            let workflow = ResolvedWorkflow {
+                version: complete.version,
+                name: Some(format!("{}-only", phase.kind.name())),
+                phases: vec![phase.clone()],
+            };
+            let error = WorkflowRunState::new(&workflow, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("requires an input model checkpoint"),
+                "{} unexpectedly accepted no input: {error}",
+                phase.kind.name()
+            );
+            WorkflowRunState::new(&workflow, Some(checkpoint("input"))).unwrap();
+        }
     }
 
     #[test]

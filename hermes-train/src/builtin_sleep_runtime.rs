@@ -8,21 +8,17 @@
 //! native factory and boundary-driver contracts without weakening these
 //! bindings.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
-use burn::module::list_param_ids;
-use burn_optim::{AdamWConfig, ModuleOptimizer};
-use hermes_llm::{Device, ModelDef, Transformer, default_device, load_safetensors, parse_mal};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
+use crate::artifact_io::{
+    atomic_write_new, ensure_directory, sha256_identity, validate_sha256_identity,
+};
 use crate::builtin_dreaming::{BuiltinDreamOps, BuiltinDreamingRuntimeConfig};
 use crate::builtin_sleep_adapters::{
-    JournalRolloutConfig, JournalRollouts, PinnedLikelihoodRetentionEvaluator, PinnedLocalArtifact,
-    PinnedTokenSemanticJudge, PinnedWakeContextJournal,
+    JournalRolloutConfig, JournalRollouts, MAX_WAKE_CONTEXT_RECORDS, MAX_WAKE_CONTEXT_TOTAL_TOKENS,
+    PinnedLikelihoodRetentionEvaluator, PinnedLocalArtifact, PinnedTokenSemanticJudge,
+    PinnedWakeContextJournal,
 };
 use crate::native_sleep::{
     NativeCheckpointRef, NativeConsolidationOutcome, NativeSleepCheckpoint,
@@ -31,6 +27,7 @@ use crate::native_sleep::{
     execute_native_consolidation, execute_native_dreaming,
 };
 use crate::runtime::PhaseExecutionRequest;
+use crate::sleep::MAX_SLEEP_RNG_STREAMS;
 use crate::tensor_sleep::{
     ImmutableTransformerCheckpoint, TensorConsolidationBackend, TensorDreamBackend,
     TensorTransactionStore, restore_parameter_ids,
@@ -40,6 +37,13 @@ use crate::tier_optimizer::{
     TierOptimizerBank, TierOptimizerConfig,
 };
 use crate::workflow::InModelSleepConfig;
+use anyhow::{Context, Result, bail, ensure};
+use burn::module::list_param_ids;
+use burn_optim::{AdamWConfig, ModuleOptimizer};
+use hermes_llm::{
+    Device, ModelDef, Transformer, default_device, load_safetensors_bytes, parse_mal,
+};
+use serde::{Deserialize, Serialize};
 
 pub const BUILTIN_SLEEP_RUNTIME_CONFIG_VERSION: u32 = 1;
 pub const MODEL_PARAMETER_IDS_VERSION: u32 = 1;
@@ -164,13 +168,22 @@ impl BuiltinSleepRuntimeConfig {
             "unsupported built-in sleep runtime version {}",
             self.version
         );
-        validate_sha256(&self.workflow_signature, "workflow signature")?;
+        validate_sha256_identity(&self.workflow_signature, "workflow signature")?;
         self.rollouts.validate()?;
         self.tier_optimizer.validate()?;
-        ensure!(self.rng_streams > 0, "sleep runtime has no RNG streams");
         ensure!(
-            self.max_wake_context_records > 0,
-            "sleep runtime wake-context ring is empty"
+            (1..=MAX_SLEEP_RNG_STREAMS).contains(&self.rng_streams),
+            "sleep runtime must contain 1..={MAX_SLEEP_RNG_STREAMS} RNG streams"
+        );
+        ensure!(
+            (1..=MAX_WAKE_CONTEXT_RECORDS).contains(&self.max_wake_context_records),
+            "sleep runtime wake-context ring must contain 1..={MAX_WAKE_CONTEXT_RECORDS} records"
+        );
+        ensure!(
+            self.max_wake_context_records
+                .checked_mul(self.rollouts.max_context_tokens)
+                .is_some_and(|tokens| tokens <= MAX_WAKE_CONTEXT_TOTAL_TOKENS),
+            "sleep runtime wake-context ring exceeds the {MAX_WAKE_CONTEXT_TOTAL_TOKENS}-token limit"
         );
         let mut directories = vec![
             &self.tensor_transaction_directory,
@@ -292,7 +305,7 @@ impl ModelParameterIdsArtifact {
             "unsupported model parameter-id artifact version {}",
             self.version
         );
-        validate_sha256(&self.checkpoint_sha256, "parameter-id checkpoint")?;
+        validate_sha256_identity(&self.checkpoint_sha256, "parameter-id checkpoint")?;
         ensure!(
             !self.parameter_ids.is_empty(),
             "model parameter-id artifact is empty"
@@ -408,7 +421,7 @@ impl BuiltinSleepPhaseContextFactory {
             &config.candidate_directory,
             &config.rejection_report_directory,
         ] {
-            ensure_real_directory(directory)?;
+            ensure_directory(directory, "sleep runtime directory")?;
         }
         Ok(Self {
             identity: expected_sha256.to_owned(),
@@ -534,6 +547,31 @@ impl NativeSleepProgressSink for ProgressForward<'_> {
     }
 }
 
+fn load_pinned_checkpoint_model(
+    artifact: &PinnedLocalArtifact,
+    model_def: &ModelDef,
+    device: &Device,
+) -> Result<Transformer> {
+    load_pinned_checkpoint_model_inner(artifact, model_def, device, |_| Ok(()))
+}
+
+fn load_pinned_checkpoint_model_inner(
+    artifact: &PinnedLocalArtifact,
+    model_def: &ModelDef,
+    device: &Device,
+    stage_hook: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Transformer> {
+    let bytes = artifact.verify_bytes()?;
+    stage_hook(&artifact.path)?;
+    let mut model = Transformer::new(model_def, device)?;
+    load_safetensors_bytes(
+        &mut model,
+        bytes,
+        "authenticated standalone sleep checkpoint",
+    )?;
+    Ok(model)
+}
+
 impl BuiltinStandaloneSleepContext {
     fn model_def(&self) -> Result<ModelDef> {
         let bytes = self.runtime.model_mal.verify_bytes()?;
@@ -550,9 +588,7 @@ impl BuiltinStandaloneSleepContext {
             path: PathBuf::from(&reference.uri),
             sha256: reference.sha256.clone(),
         };
-        artifact.verify_bytes()?;
-        let mut model = Transformer::new(model_def, &self.device)?;
-        load_safetensors(&mut model, &artifact.path)?;
+        let model = load_pinned_checkpoint_model(&artifact, model_def, &self.device)?;
         Ok(ImmutableTransformerCheckpoint {
             uri: reference.uri.clone(),
             sha256: reference.sha256.clone(),
@@ -781,11 +817,7 @@ impl NativeSleepPhaseContext for BuiltinStandaloneSleepContext {
 
         // Rehydrate every durable optimizer generation before either replaying
         // an in-flight transaction or preparing the next sender.
-        let scope_model_ref = if let Some(txn) = &cursor.sleep.pending {
-            NativeCheckpointRef::new(&txn.teacher_checkpoint, &txn.teacher_hash)?
-        } else {
-            cursor.live_checkpoint.clone()
-        };
+        let scope_model_ref = cursor.optimizer_scope_checkpoint()?;
         let scope_model = self.recover_model_for_ref(
             &cursor,
             &scope_model_ref,
@@ -866,6 +898,7 @@ impl NativeSleepPhaseContext for BuiltinStandaloneSleepContext {
                             probe,
                             ops,
                         )?;
+                        dreaming.bind_candidate_checkpoint(&committed.uri, &committed.sha256)?;
                         execute_native_dreaming(
                             &mut cursor,
                             &committed.model,
@@ -1383,6 +1416,7 @@ impl PeriodicSleepBoundaryDriver for BuiltinPeriodicSleepBoundaryDriver {
                     probe,
                     ops,
                 )?;
+                dreaming.bind_candidate_checkpoint(&self.live.uri, &self.live.sha256)?;
                 execute_native_dreaming(
                     checkpoint,
                     &self.live.model,
@@ -1415,6 +1449,10 @@ impl PeriodicSleepBoundaryDriver for BuiltinPeriodicSleepBoundaryDriver {
 struct NoDreamBackend;
 
 impl crate::sleep::DreamingBackend for NoDreamBackend {
+    fn verify_committed_candidate(&mut self, _: &crate::sleep::ConsolidationTxn) -> Result<()> {
+        unreachable!("Dreaming backend is absent")
+    }
+
     fn shared_checkpoint_hash(&mut self) -> Result<String> {
         unreachable!("Dreaming backend is absent")
     }
@@ -1481,27 +1519,14 @@ struct RejectionReport {
 }
 
 fn publish_json<T: Serialize>(root: &Path, stem: &str, value: &T) -> Result<(String, String)> {
-    ensure_real_directory(root)?;
+    ensure_directory(root, "sleep runtime directory")?;
     let bytes = serde_json::to_vec_pretty(value)?;
-    let sha256 = sha256_bytes(&bytes);
+    let sha256 = sha256_identity(&bytes);
     let digest = sha256
         .strip_prefix("sha256:")
         .expect("hash helper returns prefixed digest");
     let path = root.join(format!("{stem}-sha256-{digest}.json"));
-    if path.exists() {
-        ensure!(
-            read_regular(&path)? == bytes,
-            "immutable report hash collision"
-        );
-    } else {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        File::open(root)?.sync_all()?;
-    }
+    atomic_write_new(&path, &bytes).context("publishing immutable sleep report")?;
     Ok((
         path.to_str()
             .context("report path is not UTF-8")?
@@ -1510,55 +1535,9 @@ fn publish_json<T: Serialize>(root: &Path, stem: &str, value: &T) -> Result<(Str
     ))
 }
 
-fn validate_sha256(value: &str, label: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{label} must use sha256:<64 lowercase hex>"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{label} must use sha256:<64 lowercase hex>"
-    );
-    Ok(())
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn read_regular(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("reading metadata for {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{} is not a regular non-symlink file",
-        path.display()
-    );
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn ensure_real_directory(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path)?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "{} is not a real directory",
-            path.display()
-        );
-    } else {
-        fs::create_dir_all(path)
-            .with_context(|| format!("creating sleep runtime directory {}", path.display()))?;
-    }
-    Ok(())
-}
-
 fn ensure_same_directory(left: &Path, right: &Path, label: &str) -> Result<()> {
-    ensure_real_directory(left)?;
-    ensure_real_directory(right)?;
+    ensure_directory(left, "sleep runtime directory")?;
+    ensure_directory(right, "sleep runtime directory")?;
     ensure!(
         fs::canonicalize(left)? == fs::canonicalize(right)?,
         "WorkflowV2 {label} differs from built-in runtime"
@@ -1617,7 +1596,7 @@ mod tests {
         fs::write(path, bytes).unwrap();
         PinnedLocalArtifact {
             path: path.to_owned(),
-            sha256: sha256_bytes(bytes),
+            sha256: sha256_identity(bytes),
         }
     }
 
@@ -1655,7 +1634,7 @@ mod tests {
 
     fn publish_test_policy(root: &Path, transaction_id: u64) -> String {
         let mut bytes = serde_json::to_vec(&serde_json::json!({
-            "version": 2,
+            "version": crate::builtin_dreaming::RESTEM_POLICY_VERSION,
             "parent_policy_sha256": null,
             "parent_adapter_sha256": null,
             "transaction_id": transaction_id,
@@ -1675,7 +1654,7 @@ mod tests {
         }))
         .unwrap();
         bytes.push(b'\n');
-        let receipt = sha256_bytes(&bytes);
+        let receipt = sha256_identity(&bytes);
         let policies = root.join("policies");
         fs::create_dir_all(&policies).unwrap();
         fs::write(
@@ -1736,13 +1715,33 @@ mod tests {
     }
 
     #[test]
+    fn periodic_wake_context_ring_rejects_unbounded_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = periodic_runtime(directory.path());
+        config.max_wake_context_records = MAX_WAKE_CONTEXT_RECORDS + 1;
+        let error = config.validate_periodic().unwrap_err().to_string();
+        assert!(error.contains("wake-context ring"), "{error}");
+
+        config.max_wake_context_records = MAX_WAKE_CONTEXT_RECORDS;
+        config.rollouts.max_context_tokens = crate::builtin_sleep_adapters::MAX_WAKE_CONTEXT_TOKENS;
+        let error = config.validate_periodic().unwrap_err().to_string();
+        assert!(error.contains("token limit"), "{error}");
+
+        config.max_wake_context_records = 64;
+        config.rollouts.max_context_tokens = 512;
+        config.rng_streams = MAX_SLEEP_RNG_STREAMS + 1;
+        let error = config.validate_periodic().unwrap_err().to_string();
+        assert!(error.contains("RNG streams"), "{error}");
+    }
+
+    #[test]
     fn periodic_loader_does_not_require_standalone_wake_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let config = periodic_runtime(directory.path());
         let path = directory.path().join("runtime.json");
         let bytes = serde_json::to_vec_pretty(&config).unwrap();
         fs::write(&path, &bytes).unwrap();
-        let digest = sha256_bytes(&bytes);
+        let digest = sha256_identity(&bytes);
 
         let factory = BuiltinSleepPhaseContextFactory::load_periodic_on_device(
             &path,
@@ -1867,6 +1866,44 @@ mod tests {
             &Device::ndarray().autodiff(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn standalone_checkpoint_load_does_not_reopen_a_replaced_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_def = parse_mal(model_source()).unwrap();
+        let device = Device::ndarray().autodiff();
+        device.seed(41);
+        let model = Transformer::new(&model_def, &device).unwrap();
+        let expected = crate::tensor_sleep::model_parameter_hash(&model).unwrap();
+        let checkpoint = directory.path().join("standalone.safetensors");
+        hermes_llm::save_safetensors(&model.clone().valid(), &checkpoint).unwrap();
+        let artifact = PinnedLocalArtifact {
+            path: checkpoint.clone(),
+            sha256: sha256_identity(&fs::read(&checkpoint).unwrap()),
+        };
+
+        device.seed(43);
+        let replacement_model = Transformer::new(&model_def, &device).unwrap();
+        assert_ne!(
+            crate::tensor_sleep::model_parameter_hash(&replacement_model).unwrap(),
+            expected
+        );
+        let replacement = directory.path().join("replacement.safetensors");
+        let held = directory.path().join("held-standalone.safetensors");
+        hermes_llm::save_safetensors(&replacement_model.valid(), &replacement).unwrap();
+
+        let loaded = load_pinned_checkpoint_model_inner(&artifact, &model_def, &device, |path| {
+            fs::rename(path, &held)?;
+            fs::rename(&replacement, path)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            crate::tensor_sleep::model_parameter_hash(&loaded).unwrap(),
+            expected,
+            "standalone sleep checkpoint loader reopened a replaced pathname"
+        );
     }
 
     #[test]
@@ -2009,7 +2046,7 @@ mod tests {
         let checkpoint_path = root.join("teacher.safetensors");
         hermes_llm::save_safetensors(&model.clone().valid(), &checkpoint_path).unwrap();
         let checkpoint_bytes = fs::read(&checkpoint_path).unwrap();
-        let checkpoint_sha256 = sha256_bytes(&checkpoint_bytes);
+        let checkpoint_sha256 = sha256_identity(&checkpoint_bytes);
 
         let bank = TierOptimizerBank::new(
             &model,
@@ -2089,7 +2126,7 @@ mod tests {
         let runtime_path = root.join("standalone-runtime.json");
         let runtime_bytes = serde_json::to_vec_pretty(&runtime).unwrap();
         fs::write(&runtime_path, &runtime_bytes).unwrap();
-        let runtime_sha256 = sha256_bytes(&runtime_bytes);
+        let runtime_sha256 = sha256_identity(&runtime_bytes);
 
         let mut sleep = sleep_config(root, suite.sha256.clone());
         sleep.standalone_trigger_clock = Some(0);

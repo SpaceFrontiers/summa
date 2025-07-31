@@ -1,16 +1,18 @@
 //! Backend-neutral post-training objectives and executor interfaces.
 //!
 //! This module owns the mathematics and validation for preference,
-//! distillation, and verifiable-RL phases. Model execution remains injected:
-//! a backend supplies differentiable policy scores/logits and generated
-//! rollouts, while these cores return losses, metrics, and derivatives with
-//! respect to those supplied scores. No task is converted to another task
-//! shape implicitly.
+//! distillation, and verifiable-RL phases. The public scalar/tensor objectives
+//! are correctness oracles; native execution uses mandatory device-owned batch
+//! runtimes so logits, scores, and gradients never become trainer-side host
+//! vectors. No task is converted to another task shape implicitly.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use anyhow::{Context, Result, bail, ensure};
 use burn::prelude::Tensor;
@@ -18,6 +20,7 @@ use burn::tensor::activation::{log_sigmoid, log_softmax as tensor_log_softmax};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::artifact_io::{sha256_identity, sha256_identity_from_hex, validate_sha256_identity};
 use crate::metrics::{
     MetricContext, MetricEvent, MetricPhase, MetricPhaseKind, PostTrainingAlgorithm,
     PostTrainingUpdateMetrics,
@@ -28,8 +31,28 @@ use crate::runtime::{
     PhaseExecutor, PhaseProduct, PhaseProgressSink,
 };
 use crate::sleep::{SleepPhase, UpdateClock};
-use crate::task::{RewardSpec, TaskAdapter, TaskConfig, TaskDataFormat, TaskExample, VerifierSpec};
+use crate::task::{
+    RewardSpec, TaskAdapter, TaskConfig, TaskDataFormat, TaskExample, TaskExecution, VerifierSpec,
+};
 use crate::workflow::{InModelSleepConfig, PhaseKind, PhaseV2};
+
+/// A malformed input without a record delimiter must not make post-training
+/// buffer an entire multi-gigabyte dataset. The limit is deliberately much
+/// larger than any supported training context while keeping memory bounded.
+const MAX_POST_TRAINING_RECORD_BYTES: usize = 64 * 1024 * 1024;
+/// One native update must remain small enough to collect and authenticate
+/// without an allocator abort. Larger effective batches should be split into
+/// additional optimizer steps rather than represented by an enormous host
+/// vector.
+pub const MAX_POST_TRAINING_UPDATE_EXAMPLES: usize = 65_536;
+/// Hard limit for the serialized input records retained by one update. This is
+/// independent of the per-record framing bound above.
+pub const MAX_POST_TRAINING_UPDATE_INPUT_BYTES: usize = 256 * 1024 * 1024;
+/// Upper bound for host-visible GRPO token metadata across one device batch.
+/// Numeric token state remains device-owned.
+pub const MAX_POST_TRAINING_ROLLOUT_TOKENS: usize = 8_388_608;
+pub const MAX_POST_TRAINING_SEQUENCE_TOKENS: usize = 1_048_576;
+pub const MAX_POST_TRAINING_ROLLOUTS_PER_PROMPT: usize = 4_096;
 
 fn default_dpo_beta() -> f64 {
     0.1
@@ -79,7 +102,8 @@ pub struct FrozenModelSpec {
     pub adapter: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<PathBuf>,
-    /// SHA-256 of the exact artifact bytes. Required for every local artifact.
+    /// Canonical `sha256:<64 lowercase hex>` identity of the exact artifact
+    /// bytes. Required for every local artifact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,28 +114,22 @@ pub struct FrozenModelSpec {
 
 impl FrozenModelSpec {
     fn validate(&self, field: &str) -> Result<()> {
-        ensure!(
-            !self.adapter.trim().is_empty(),
-            "`{field}.adapter` must not be empty"
-        );
+        validate_frozen_identifier(&self.adapter, &format!("`{field}.adapter`"))?;
         ensure!(
             self.artifact
                 .as_ref()
                 .is_none_or(|path| !path.as_os_str().is_empty()),
             "`{field}.artifact` must not be empty when set"
         );
-        ensure!(
-            self.revision
-                .as_deref()
-                .is_none_or(|revision| !revision.trim().is_empty()),
-            "`{field}.revision` must not be empty when set"
-        );
+        if let Some(revision) = self.revision.as_deref() {
+            validate_frozen_identifier(revision, &format!("`{field}.revision`"))?;
+        }
         ensure!(
             self.artifact.is_none() || self.sha256.is_some(),
             "`{field}.artifact` requires an exact `sha256`"
         );
         if let Some(sha256) = &self.sha256 {
-            validate_sha256(sha256).with_context(|| format!("invalid `{field}.sha256`"))?;
+            validate_sha256_identity(sha256, &format!("`{field}.sha256`"))?;
         }
         ensure!(
             self.sha256.is_some() || self.revision.is_some(),
@@ -120,18 +138,22 @@ impl FrozenModelSpec {
         Ok(())
     }
 
-    /// Stable identity required from an injected provider.
+    /// Stable identity required from the frozen side of a device runtime.
     pub fn immutable_identity(&self) -> Result<String> {
         self.validate("frozen_model")?;
-        Ok(match &self.sha256 {
-            Some(sha256) => format!("sha256:{}", normalize_sha256(sha256)),
-            None => format!(
-                "revision:{}",
-                self.revision
-                    .as_deref()
-                    .context("validated frozen model has no immutable identity")?
-            ),
-        })
+        if let Some(sha256) = &self.sha256 {
+            return Ok(sha256.clone());
+        }
+        let revision = self
+            .revision
+            .as_deref()
+            .context("validated frozen model has no immutable identity")?;
+        canonical_sha256(&(
+            "hermes-frozen-revision-identity-v1",
+            &self.adapter,
+            revision,
+            &self.parameters,
+        ))
     }
 
     /// Verify local artifact bytes before an executor is allowed to load them.
@@ -140,33 +162,19 @@ impl FrozenModelSpec {
         let Some(path) = &self.artifact else {
             return Ok(());
         };
-        let metadata = std::fs::symlink_metadata(path).with_context(|| {
-            format!("failed to inspect frozen model artifact {}", path.display())
-        })?;
-        ensure!(
-            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-            "frozen model artifact {} must be a non-symlink regular file",
-            path.display()
-        );
-        let expected = normalize_sha256(
-            self.sha256
-                .as_deref()
-                .expect("validated local artifact has sha256"),
-        );
-        let mut file = File::open(path)
-            .with_context(|| format!("failed to open frozen model artifact {}", path.display()))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 1024 * 1024];
-        loop {
-            let read = file.read(&mut buffer).with_context(|| {
-                format!("failed to hash frozen model artifact {}", path.display())
-            })?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let actual = format!("{:x}", hasher.finalize());
+        let expected = self
+            .sha256
+            .as_deref()
+            .expect("validated local artifact has sha256")
+            .strip_prefix("sha256:")
+            .expect("validated local artifact digest is canonical");
+        let authenticated =
+            AuthenticatedPostTrainingInput::open_labeled(path, "frozen model artifact")?;
+        let actual = authenticated
+            .identity
+            .sha256
+            .strip_prefix("sha256:")
+            .expect("authenticated digest has a sha256 prefix");
         ensure!(
             actual == expected,
             "frozen model artifact {} sha256 mismatch: expected {expected}, got {actual}",
@@ -182,6 +190,14 @@ impl FrozenModelSpec {
             *artifact = base.join(&*artifact);
         }
     }
+}
+
+fn validate_frozen_identifier(value: &str, field: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control),
+        "{field} must be non-empty, trimmed, and contain no control characters"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -270,7 +286,10 @@ impl PostTrainingConfig {
                 reference,
                 sampling,
             } => {
-                ensure!(*group_size >= 2, "GRPO group_size must be at least two");
+                ensure!(
+                    (2..=MAX_POST_TRAINING_ROLLOUTS_PER_PROMPT).contains(group_size),
+                    "GRPO group_size must be in 2..={MAX_POST_TRAINING_ROLLOUTS_PER_PROMPT}"
+                );
                 ensure!(
                     clip_epsilon.is_finite() && *clip_epsilon > 0.0 && *clip_epsilon < 1.0,
                     "GRPO clip_epsilon must be finite and in (0, 1)"
@@ -311,6 +330,20 @@ impl PostTrainingConfig {
             } => {}
         }
     }
+
+    fn verify_local_artifacts(&self) -> Result<()> {
+        match self {
+            Self::Dpo { reference, .. } => reference.verify_local_artifact(),
+            Self::ForwardKl { teacher, .. } => teacher.verify_local_artifact(),
+            Self::Grpo {
+                reference: Some(reference),
+                ..
+            } => reference.verify_local_artifact(),
+            Self::Grpo {
+                reference: None, ..
+            } => Ok(()),
+        }
+    }
 }
 
 /// Sampling geometry is part of the persisted RL recipe rather than an
@@ -337,7 +370,10 @@ impl Default for RolloutSampling {
 
 impl RolloutSampling {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.max_new_tokens > 0, "max_new_tokens must be positive");
+        ensure!(
+            (1..=MAX_POST_TRAINING_SEQUENCE_TOKENS).contains(&self.max_new_tokens),
+            "max_new_tokens must be in 1..={MAX_POST_TRAINING_SEQUENCE_TOKENS}"
+        );
         ensure!(
             self.temperature.is_finite() && self.temperature > 0.0,
             "rollout temperature must be finite and positive"
@@ -350,7 +386,8 @@ impl RolloutSampling {
     }
 }
 
-/// Differentiable sequence scores supplied by policy/reference executors.
+/// Scalar correctness-oracle input. Native execution keeps these scores inside
+/// [`DpoDeviceBatchRuntime`] and never constructs this value in trainer core.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PairwiseLogProbabilities {
     pub policy_chosen: f64,
@@ -359,8 +396,8 @@ pub struct PairwiseLogProbabilities {
     pub reference_rejected: f64,
 }
 
-/// DPO scalar result. Derivatives target the aggregate policy sequence log
-/// probabilities and can be seeded into any autodiff backend.
+/// DPO scalar-oracle result. Derivatives target the aggregate policy sequence
+/// log probabilities; this is not a native runtime transport type.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DpoLoss {
     pub loss: f64,
@@ -404,7 +441,7 @@ pub fn dpo_loss(
     let loss = (1.0 - label_smoothing) * softplus(-implicit_reward_margin)
         + label_smoothing * softplus(implicit_reward_margin);
     let d_z = sigmoid(implicit_reward_margin) - (1.0 - label_smoothing);
-    Ok(DpoLoss {
+    let result = DpoLoss {
         loss,
         policy_margin,
         reference_margin,
@@ -412,7 +449,19 @@ pub fn dpo_loss(
         preference_correct: policy_margin > reference_margin,
         d_policy_chosen: beta * d_z,
         d_policy_rejected: -beta * d_z,
-    })
+    };
+    ensure_finite(
+        &[
+            result.loss,
+            result.policy_margin,
+            result.reference_margin,
+            result.implicit_reward_margin,
+            result.d_policy_chosen,
+            result.d_policy_rejected,
+        ],
+        "derived DPO objective values",
+    )?;
+    Ok(result)
 }
 
 /// Autodiff-preserving batched DPO loss over aggregate sequence log-probs.
@@ -468,6 +517,8 @@ pub fn reduce_sequence_log_probs(values: &[f64], reduction: SequenceReduction) -
     })
 }
 
+/// Host scalar-oracle row. Native forward-KL execution keeps full vocabulary
+/// distributions inside [`ForwardKlDeviceBatchRuntime`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct DistillationToken<'a> {
     pub teacher_logits: &'a [f64],
@@ -476,6 +527,8 @@ pub struct DistillationToken<'a> {
     pub weight: f64,
 }
 
+/// Scalar-oracle output. Its gradient vectors intentionally remain available
+/// for golden tests, but are never returned by the native device-batch API.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DistillationLoss {
     /// Temperature-scaled training objective.
@@ -536,6 +589,10 @@ pub fn forward_kl_distillation(
     } else {
         1.0 / temperature
     };
+    ensure!(
+        loss_scale.is_finite() && gradient_scale.is_finite(),
+        "distillation temperature scaling overflowed"
+    );
     let mut weighted_kl = 0.0;
     let mut weighted_entropy = 0.0;
     let mut weighted_agreement = 0.0;
@@ -544,6 +601,8 @@ pub fn forward_kl_distillation(
     for token in tokens {
         let teacher_log_probs = log_softmax(token.teacher_logits, temperature);
         let student_log_probs = log_softmax(token.student_logits, temperature);
+        ensure_finite(&teacher_log_probs, "teacher log probabilities")?;
+        ensure_finite(&student_log_probs, "student log probabilities")?;
         let teacher_probs: Vec<f64> = teacher_log_probs.iter().map(|value| value.exp()).collect();
         let student_probs: Vec<f64> = student_log_probs.iter().map(|value| value.exp()).collect();
         let kl: f64 = teacher_probs
@@ -562,23 +621,33 @@ pub fn forward_kl_distillation(
         weighted_agreement +=
             token.weight * f64::from(argmax(token.teacher_logits) == argmax(token.student_logits));
         let row_scale = token.weight / total_weight * gradient_scale;
-        student_gradients.push(
-            student_probs
-                .iter()
-                .zip(&teacher_probs)
-                .map(|(student, teacher)| row_scale * (student - teacher))
-                .collect(),
-        );
+        let gradients = student_probs
+            .iter()
+            .zip(&teacher_probs)
+            .map(|(student, teacher)| row_scale * (student - teacher))
+            .collect::<Vec<_>>();
+        ensure_finite(&gradients, "distillation student gradients")?;
+        student_gradients.push(gradients);
     }
 
     let mean_forward_kl = weighted_kl / total_weight;
-    Ok(DistillationLoss {
+    let result = DistillationLoss {
         loss: loss_scale * mean_forward_kl,
         mean_forward_kl,
         teacher_entropy: weighted_entropy / total_weight,
         top1_agreement: weighted_agreement / total_weight,
         student_gradients,
-    })
+    };
+    ensure_finite(
+        &[
+            result.loss,
+            result.mean_forward_kl,
+            result.teacher_entropy,
+            result.top1_agreement,
+        ],
+        "derived distillation objective values",
+    )?;
+    Ok(result)
 }
 
 /// Autodiff-preserving forward-KL tensor core for already selected target-token
@@ -621,7 +690,8 @@ pub fn forward_kl_distillation_tensor(
     })
 }
 
-/// One on-policy/near-policy rollout in a GRPO prompt group.
+/// Scalar correctness-oracle rollout. Native GRPO scores and token ids stay
+/// opaque inside [`GrpoDeviceBatchRuntime`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrpoRollout<'a> {
     pub reward: f64,
@@ -630,6 +700,7 @@ pub struct GrpoRollout<'a> {
     pub reference_token_log_probs: Option<&'a [f64]>,
 }
 
+/// Scalar-oracle output; native execution returns only reduced batch metrics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrpoLoss {
     pub loss: f64,
@@ -957,151 +1028,292 @@ pub fn grpo_loss_tensor(
     Ok(loss)
 }
 
-/// Request sent to an executor-owned rollout generator.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RolloutRequest<'a> {
-    pub prompt: &'a str,
-    pub count: usize,
+/// One deterministic model-execution substream. A device runtime must use the
+/// same substream for a stochastic forward and its matching backward replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelExecutionRng {
+    pub seed: u64,
+    pub counter: u64,
+}
+
+/// Exact half-open model RNG range reserved by the durable trainer cursor.
+/// Batch runtimes derive example-major substreams from this range without
+/// asking trainer core to make one model call per example.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelExecutionRngRange {
+    seed: u64,
+    start: u64,
+    end: u64,
+}
+
+impl ModelExecutionRngRange {
+    fn reserve(seed: u64, start: u64, count: u64) -> Result<Self> {
+        ensure!(count > 0, "model RNG range must not be empty");
+        Ok(Self {
+            seed,
+            start,
+            end: start
+                .checked_add(count)
+                .context("post-training model RNG counter overflows u64")?,
+        })
+    }
+
+    pub fn len(self) -> u64 {
+        self.end - self.start
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+
+    pub fn seed(self) -> u64 {
+        self.seed
+    }
+
+    pub fn start(self) -> u64 {
+        self.start
+    }
+
+    pub fn end(self) -> u64 {
+        self.end
+    }
+
+    pub fn substream(self, offset: u64) -> Result<ModelExecutionRng> {
+        ensure!(
+            offset < self.len(),
+            "model RNG substream offset is out of range"
+        );
+        Ok(ModelExecutionRng {
+            seed: self.seed,
+            counter: self
+                .start
+                .checked_add(offset)
+                .context("post-training model RNG counter overflows u64")?,
+        })
+    }
+}
+
+/// Compact backend-owned evidence for a prepared device update. Implementors
+/// hash their exact batched execution without materializing logits or
+/// gradients in trainer memory. The digest must bind the input batch, base
+/// model/optimizer generation, RNG range, objective configuration, reduced
+/// metrics, and staged backward result; replay after restore must reproduce it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DeviceExecutionReceipt {
+    pub execution_sha256: String,
+    pub model_tokens: u64,
+}
+
+impl DeviceExecutionReceipt {
+    fn validate(&self) -> Result<()> {
+        validate_sha256_identity(&self.execution_sha256, "device execution receipt")?;
+        ensure!(
+            self.model_tokens > 0,
+            "device execution reported zero model tokens"
+        );
+        Ok(())
+    }
+}
+
+/// Immutable model/optimizer generation restored before a device batch is
+/// prepared. Passing it explicitly keeps runtime receipts self-contained and
+/// prevents a backend from accidentally authenticating only the examples and
+/// objective configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct DeviceBatchBaseGeneration<'a> {
+    pub model_sha256: &'a str,
+    pub optimizer_sha256: Option<&'a str>,
+}
+
+impl DeviceBatchBaseGeneration<'_> {
+    fn validate(self) -> Result<()> {
+        validate_sha256_identity(self.model_sha256, "device-batch base model")?;
+        if let Some(optimizer_sha256) = self.optimizer_sha256 {
+            validate_sha256_identity(optimizer_sha256, "device-batch base optimizer")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DpoDeviceBatchRequest<'a> {
+    pub examples: &'a [TaskExample],
+    pub batch_sha256: &'a str,
+    pub base: DeviceBatchBaseGeneration<'a>,
+    pub max_sequence_tokens: usize,
+    pub beta: f64,
+    pub label_smoothing: f64,
+    pub sequence_reduction: SequenceReduction,
+    /// Multiply the mean batch gradient by this value. Returned metrics remain
+    /// the unweighted per-example objective sums.
+    pub loss_weight: f64,
+    /// Exactly two example-major substreams per pair: chosen, then rejected.
+    /// Each stochastic forward and its internal backward use the same value.
+    pub rng: ModelExecutionRngRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DpoDeviceBatchResult {
+    pub receipt: DeviceExecutionReceipt,
+    pub examples: u64,
+    pub loss_sum: f64,
+    pub preference_correct: u64,
+    pub implicit_reward_margin_sum: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ForwardKlDeviceBatchRequest<'a> {
+    pub examples: &'a [TaskExample],
+    pub batch_sha256: &'a str,
+    pub base: DeviceBatchBaseGeneration<'a>,
+    pub max_sequence_tokens: usize,
+    pub temperature: f64,
+    pub scale_by_temperature_squared: bool,
+    pub loss_weight: f64,
+    /// Exactly one example-major student substream. Teacher execution is
+    /// frozen; the student forward and internal backward reuse this value.
+    pub rng: ModelExecutionRngRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ForwardKlDeviceBatchResult {
+    pub receipt: DeviceExecutionReceipt,
+    pub examples: u64,
+    pub loss_sum: f64,
+    pub forward_kl_sum: f64,
+    pub teacher_entropy_sum: f64,
+    pub top1_agreement_sum: f64,
+}
+
+/// Host-visible portion of a rollout. Token ids and all behavior/current/
+/// reference scores remain owned by [`GrpoDeviceBatchRuntime`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GeneratedRolloutText {
+    pub text: String,
+    pub token_count: usize,
+}
+
+/// Opaque device generation plus the text needed by the configured verifier.
+/// `generation_sha256` must bind the complete generation request together with
+/// runtime-owned token ids and behavior-score state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GrpoGeneratedBatch {
+    pub generation_sha256: String,
+    pub groups: Vec<Vec<GeneratedRolloutText>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GrpoGenerationBatchRequest<'a> {
+    pub examples: &'a [TaskExample],
+    pub batch_sha256: &'a str,
+    pub base: DeviceBatchBaseGeneration<'a>,
+    pub group_size: usize,
     pub max_sequence_tokens: usize,
     pub sampling: &'a RolloutSampling,
-    /// Stable seed owned by the durable phase cursor.
-    pub rng_seed: u64,
-    /// First counter reserved for this request. Implementations must derive
-    /// all sampling randomness from `(rng_seed, rng_counter)` and consume one
-    /// deterministic substream per requested rollout.
-    pub rng_counter: u64,
+    /// One example-major substream per rollout in each prompt group.
+    pub rng: ModelExecutionRngRange,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneratedRollout {
-    pub text: String,
-    pub token_ids: Vec<u32>,
-    /// Log probabilities under the behavior policy that generated the sample.
-    pub behavior_token_log_probs: Vec<f64>,
+#[derive(Clone, Debug)]
+pub struct GrpoDeviceBatchRequest<'a> {
+    pub examples: &'a [TaskExample],
+    pub batch_sha256: &'a str,
+    pub base: DeviceBatchBaseGeneration<'a>,
+    pub generation: &'a GrpoGeneratedBatch,
+    pub rewards: &'a [Vec<f64>],
+    pub clip_epsilon: f64,
+    pub advantage_epsilon: f64,
+    pub kl_coefficient: f64,
+    pub loss_weight: f64,
+    /// One example-major rescoring substream per generated rollout; internal
+    /// policy forward/backward must reuse the same substream.
+    pub rng: ModelExecutionRngRange,
 }
 
-/// A model runtime capable of generating a pinned group of policy rollouts.
-pub trait RolloutGenerator {
-    fn identity(&self) -> &str;
-    fn generate(&mut self, request: RolloutRequest<'_>) -> Result<Vec<GeneratedRollout>>;
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GrpoDeviceBatchResult {
+    pub receipt: DeviceExecutionReceipt,
+    pub examples: u64,
+    pub rollouts: u64,
+    pub loss_sum: f64,
+    pub mean_reward_sum: f64,
+    pub reward_stddev_sum: f64,
+    pub mean_kl_sum: f64,
+    pub clipped_fraction_sum: f64,
 }
 
-/// Frozen policy scoring used by DPO and distillation executors. Implementors
-/// must preserve token alignment and return one log-probability per supplied
-/// continuation token.
-pub trait SequenceLogProbabilityProvider {
-    /// Must equal [`FrozenModelSpec::immutable_identity`] for frozen providers.
-    fn identity(&self) -> &str;
-    fn tokenizer_identity(&self) -> &str;
-    fn continuation_log_probs(
-        &mut self,
-        prompt: &str,
-        continuation: &str,
-        max_sequence_tokens: usize,
-    ) -> Result<Vec<f64>>;
-}
-
-/// Frozen teacher distribution used by a distillation executor. Rows must be
-/// aligned with the student target-token rows for the exact task example.
-pub trait TeacherDistributionProvider {
-    fn identity(&self) -> &str;
-    fn tokenizer_identity(&self) -> &str;
-    fn token_logits(
-        &mut self,
-        example: &TaskExample,
-        max_sequence_tokens: usize,
-    ) -> Result<Vec<Vec<f64>>>;
-}
-
-/// Trainable DPO policy. Backward receives gradients for exactly the token
-/// log-probabilities returned by `continuation_log_probs`.
-pub trait PreferencePolicy: SequenceLogProbabilityProvider {
-    /// Exact cumulative number of trainable-policy model tokens processed by
-    /// this adapter. The counter must be monotonic for the lifetime of the
-    /// borrowed adapter and include every policy forward/generation executed
-    /// by the methods below. The resumable executor samples it around one
-    /// deterministic update; it never estimates tokens from sequence length.
+/// Device-owned DPO execution. A single call must batch all examples, run the
+/// trainable and frozen policies, apply backward internally, and return only a
+/// compact result. There is deliberately no per-example or host-logit fallback.
+/// `prepare_device_batch` stages gradients but must not apply the optimizer;
+/// publication invokes `optimizer_step` exactly once through an idempotent
+/// publisher after the prepared transaction is durable.
+pub trait DpoDeviceBatchRuntime {
+    fn trainable_identity(&self) -> &str;
+    fn trainable_tokenizer_identity(&self) -> &str;
+    fn frozen_identity(&self) -> &str;
+    fn frozen_tokenizer_identity(&self) -> &str;
+    /// Monotonic host-maintained counter. Reading it must not synchronize a
+    /// device or copy a tensor to the host.
     fn model_tokens_processed(&self) -> u64;
-
-    fn backward_pairwise_log_probs(
+    fn prepare_device_batch(
         &mut self,
-        example: &TaskExample,
-        chosen_gradients: &[f64],
-        rejected_gradients: &[f64],
-    ) -> Result<()>;
+        request: DpoDeviceBatchRequest<'_>,
+    ) -> Result<DpoDeviceBatchResult>;
     fn optimizer_step(&mut self, learning_rate_scale: f64) -> Result<()>;
 }
 
-/// Trainable student distribution. Backward rows are aligned one-for-one with
-/// the rows returned by `student_token_logits`.
-pub trait DistillationPolicy {
-    fn identity(&self) -> &str;
-    fn tokenizer_identity(&self) -> &str;
-    /// Exact cumulative trainable-student model-token counter. See
-    /// [`PreferencePolicy::model_tokens_processed`].
+/// Device-owned forward-KL execution. Teacher and student distributions and
+/// student gradients never cross this boundary as host vectors. Preparation
+/// stages the complete batch backward but does not apply the optimizer.
+pub trait ForwardKlDeviceBatchRuntime {
+    fn trainable_identity(&self) -> &str;
+    fn trainable_tokenizer_identity(&self) -> &str;
+    fn frozen_identity(&self) -> &str;
+    fn frozen_tokenizer_identity(&self) -> &str;
+    /// Monotonic host-maintained counter. Reading it must not synchronize a
+    /// device or copy a tensor to the host.
     fn model_tokens_processed(&self) -> u64;
-    fn student_token_logits(
+    fn prepare_device_batch(
         &mut self,
-        example: &TaskExample,
-        max_sequence_tokens: usize,
-    ) -> Result<Vec<Vec<f64>>>;
-    fn backward_student_logits(
-        &mut self,
-        example: &TaskExample,
-        gradients: &[Vec<f64>],
-    ) -> Result<()>;
+        request: ForwardKlDeviceBatchRequest<'_>,
+    ) -> Result<ForwardKlDeviceBatchResult>;
     fn optimizer_step(&mut self, learning_rate_scale: f64) -> Result<()>;
 }
 
-/// Trainable GRPO policy. Rescoring and backward preserve the generated
-/// rollout's token alignment exactly.
-pub trait GrpoPolicy: RolloutGenerator {
-    fn tokenizer_identity(&self) -> &str;
-    /// Exact cumulative trainable-policy model-token counter, including both
-    /// generation and policy rescoring. See
-    /// [`PreferencePolicy::model_tokens_processed`].
+/// Device-owned GRPO numeric execution. Generation exposes only verifier text
+/// and token counts; behavior/current/reference scores and backward remain in
+/// the runtime. `prepare_device_batch` consumes the whole verified batch once.
+/// It stages gradients but leaves optimizer application to the publisher.
+pub trait GrpoDeviceBatchRuntime {
+    fn trainable_identity(&self) -> &str;
+    fn trainable_tokenizer_identity(&self) -> &str;
+    fn frozen_identity(&self) -> Option<&str>;
+    fn frozen_tokenizer_identity(&self) -> Option<&str>;
+    /// Monotonic host-maintained counter. Reading it must not synchronize a
+    /// device or copy a tensor to the host.
     fn model_tokens_processed(&self) -> u64;
-    fn current_token_log_probs(
+    fn generate_device_batch(
         &mut self,
-        prompt: &str,
-        rollout: &GeneratedRollout,
-        max_sequence_tokens: usize,
-    ) -> Result<Vec<f64>>;
-    fn backward_rollout_log_probs(
+        request: GrpoGenerationBatchRequest<'_>,
+    ) -> Result<GrpoGeneratedBatch>;
+    fn prepare_device_batch(
         &mut self,
-        prompt: &str,
-        rollout: &GeneratedRollout,
-        gradients: &[f64],
-    ) -> Result<()>;
+        request: GrpoDeviceBatchRequest<'_>,
+    ) -> Result<GrpoDeviceBatchResult>;
     fn optimizer_step(&mut self, learning_rate_scale: f64) -> Result<()>;
 }
 
-/// Frozen reference scorer consuming the generator's exact tokenization.
-pub trait AlignedReferencePolicy {
-    fn identity(&self) -> &str;
-    fn tokenizer_identity(&self) -> &str;
-    fn rollout_token_log_probs(
-        &mut self,
-        prompt: &str,
-        rollout: &GeneratedRollout,
-        max_sequence_tokens: usize,
-    ) -> Result<Vec<f64>>;
-}
-
-/// Exactly one adapter set must match the typed algorithm on the phase.
-pub enum PostTrainingPhaseAdapters<'a> {
+/// Exactly one device-owned runtime must match the typed phase algorithm.
+pub enum PostTrainingPhaseRuntime<'a> {
     Dpo {
-        policy: &'a mut dyn PreferencePolicy,
-        reference: &'a mut dyn SequenceLogProbabilityProvider,
+        runtime: &'a mut dyn DpoDeviceBatchRuntime,
     },
     ForwardKl {
-        policy: &'a mut dyn DistillationPolicy,
-        teacher: &'a mut dyn TeacherDistributionProvider,
+        runtime: &'a mut dyn ForwardKlDeviceBatchRuntime,
     },
     Grpo {
-        policy: &'a mut dyn GrpoPolicy,
-        reference: Option<&'a mut dyn AlignedReferencePolicy>,
+        runtime: &'a mut dyn GrpoDeviceBatchRuntime,
         verifier: &'a dyn RewardVerifier,
     },
 }
@@ -1118,35 +1330,22 @@ pub struct PostTrainingPhaseReport {
     pub metrics: BTreeMap<String, f64>,
 }
 
-fn validate_frozen_provider(
+fn validate_frozen_runtime(
     spec: &FrozenModelSpec,
-    provider_identity: &str,
-    provider_tokenizer: &str,
+    runtime_identity: &str,
+    runtime_tokenizer: &str,
     policy_tokenizer: &str,
 ) -> Result<()> {
-    spec.verify_local_artifact()?;
     let expected = spec.immutable_identity()?;
     ensure!(
-        provider_identity == expected,
-        "frozen provider identity mismatch: expected `{expected}`, got `{provider_identity}`"
+        runtime_identity == expected,
+        "frozen runtime identity mismatch: expected `{expected}`, got `{runtime_identity}`"
     );
     ensure!(
-        !provider_tokenizer.trim().is_empty() && provider_tokenizer == policy_tokenizer,
-        "frozen provider and trainable policy tokenizer identities differ"
+        !runtime_tokenizer.trim().is_empty() && runtime_tokenizer == policy_tokenizer,
+        "frozen and trainable runtime tokenizer identities differ"
     );
     Ok(())
-}
-
-fn distribute_sequence_gradient(
-    aggregate_gradient: f64,
-    token_count: usize,
-    reduction: SequenceReduction,
-) -> Vec<f64> {
-    let value = match reduction {
-        SequenceReduction::Sum => aggregate_gradient,
-        SequenceReduction::Mean => aggregate_gradient / token_count as f64,
-    };
-    vec![value; token_count]
 }
 
 fn post_training_algorithm_name(config: &PostTrainingConfig) -> &'static str {
@@ -1158,7 +1357,7 @@ fn post_training_algorithm_name(config: &PostTrainingConfig) -> &'static str {
 }
 
 /// Serialized native post-training cursor contract.
-pub const POST_TRAINING_CURSOR_VERSION: u32 = 2;
+pub const POST_TRAINING_CURSOR_VERSION: u32 = 3;
 pub const POST_TRAINING_RESUME_VERSION: u32 = 1;
 
 /// Authenticated cumulative wake clock bound to one immutable model
@@ -1211,9 +1410,9 @@ impl PostTrainingClockReceipt {
     }
 
     fn validate(&self) -> Result<()> {
-        validate_prefixed_sha256(&self.authority_identity, "post-training clock authority")?;
-        validate_prefixed_sha256(&self.checkpoint_sha256, "post-training clock checkpoint")?;
-        validate_prefixed_sha256(&self.receipt_sha256, "post-training clock receipt")?;
+        validate_sha256_identity(&self.authority_identity, "post-training clock authority")?;
+        validate_sha256_identity(&self.checkpoint_sha256, "post-training clock checkpoint")?;
+        validate_sha256_identity(&self.receipt_sha256, "post-training clock receipt")?;
         ensure!(
             self.receipt_sha256 == canonical_sha256(&self.body())?,
             "post-training clock receipt does not match its content"
@@ -1273,58 +1472,229 @@ pub struct PinnedPostTrainingInput {
 }
 
 impl PinnedPostTrainingInput {
-    fn from_path(path: &Path) -> Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("failed to inspect post-training input {}", path.display()))?;
+    fn validate(&self) -> Result<()> {
         ensure!(
-            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-            "post-training input {} must be a non-symlink regular file",
-            path.display()
+            !self.path.trim().is_empty(),
+            "post-training input path is empty"
         );
-        let path_text = path
-            .to_str()
-            .context("post-training input path is not valid UTF-8")?
-            .to_owned();
-        let mut file = File::open(path)
-            .with_context(|| format!("failed to open post-training input {}", path.display()))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 1024 * 1024];
-        loop {
-            let read = file.read(&mut buffer).with_context(|| {
-                format!("failed to hash post-training input {}", path.display())
-            })?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        Ok(Self {
-            path: path_text,
-            sha256: format!("sha256:{:x}", hasher.finalize()),
-            bytes: metadata.len(),
-        })
-    }
-
-    fn verify(&self, path: &Path) -> Result<()> {
-        validate_prefixed_sha256(&self.sha256, "post-training input")?;
-        let actual = Self::from_path(path)?;
-        ensure!(
-            &actual == self,
-            "post-training input identity changed: expected {} ({} bytes), got {} ({} bytes)",
-            self.sha256,
-            self.bytes,
-            actual.sha256,
-            actual.bytes
-        );
-        Ok(())
+        validate_sha256_identity(&self.sha256, "post-training input")
     }
 }
 
-/// All runtime adapters are pinned into the cursor. Frozen model identities
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StablePostTrainingFileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl StablePostTrainingFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+/// One authenticated file description used for both the durable input digest
+/// and every task record consumed during this execution attempt. Keeping the
+/// opened file prevents a pathname replacement from substituting bytes after
+/// the cursor has been content-addressed.
+struct AuthenticatedPostTrainingInput {
+    description: &'static str,
+    path: PathBuf,
+    identity: PinnedPostTrainingInput,
+    file: File,
+    #[cfg(unix)]
+    stable_identity: StablePostTrainingFileIdentity,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl AuthenticatedPostTrainingInput {
+    fn open(path: &Path) -> Result<Self> {
+        Self::open_labeled(path, "post-training input")
+    }
+
+    fn open_labeled(path: &Path, description: &'static str) -> Result<Self> {
+        let path_metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {description} {}", path.display()))?;
+        ensure!(
+            path_metadata.file_type().is_file() && !path_metadata.file_type().is_symlink(),
+            "{description} {} must be a non-symlink regular file",
+            path.display()
+        );
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("failed to open {description} {}", path.display()))?;
+        let opened_metadata = file.metadata().with_context(|| {
+            format!("failed to inspect opened {description} {}", path.display())
+        })?;
+        ensure!(
+            opened_metadata.is_file(),
+            "{description} {} must remain a regular file while opening",
+            path.display()
+        );
+        #[cfg(unix)]
+        let stable_identity = StablePostTrainingFileIdentity::from_metadata(&path_metadata);
+        #[cfg(unix)]
+        ensure!(
+            StablePostTrainingFileIdentity::from_metadata(&opened_metadata) == stable_identity,
+            "{description} {} changed while it was opened",
+            path.display()
+        );
+        #[cfg(not(unix))]
+        let modified = path_metadata.modified().ok();
+        #[cfg(not(unix))]
+        ensure!(
+            opened_metadata.len() == path_metadata.len()
+                && opened_metadata.modified().ok() == modified,
+            "{description} {} changed while it was opened",
+            path.display()
+        );
+
+        let expected_bytes = opened_metadata.len();
+        let mut bytes = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("failed to hash {description} {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            bytes = bytes
+                .checked_add(read as u64)
+                .context("post-training input byte count overflows u64")?;
+            ensure!(
+                bytes <= expected_bytes,
+                "{description} {} grew while it was hashed",
+                path.display()
+            );
+            hasher.update(&buffer[..read]);
+        }
+        ensure!(
+            bytes == expected_bytes,
+            "{description} {} changed while it was hashed",
+            path.display()
+        );
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("failed to rewind {description} {}", path.display()))?;
+        let path_text = path
+            .to_str()
+            .with_context(|| format!("{description} path is not valid UTF-8"))?
+            .to_owned();
+        let source = Self {
+            description,
+            path: path.to_owned(),
+            identity: PinnedPostTrainingInput {
+                path: path_text,
+                sha256: format!("sha256:{:x}", hasher.finalize()),
+                bytes,
+            },
+            file,
+            #[cfg(unix)]
+            stable_identity,
+            #[cfg(not(unix))]
+            modified,
+        };
+        source.ensure_still_published()?;
+        Ok(source)
+    }
+
+    fn ensure_still_published(&self) -> Result<()> {
+        let opened = self.file.metadata().with_context(|| {
+            format!(
+                "failed to reinspect opened {} {}",
+                self.description,
+                self.path.display()
+            )
+        })?;
+        let published = fs::symlink_metadata(&self.path).with_context(|| {
+            format!(
+                "failed to reinspect {} {}",
+                self.description,
+                self.path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        ensure!(
+            StablePostTrainingFileIdentity::from_metadata(&opened) == self.stable_identity
+                && StablePostTrainingFileIdentity::from_metadata(&published)
+                    == self.stable_identity,
+            "{} {} changed after it was authenticated",
+            self.description,
+            self.path.display()
+        );
+        #[cfg(not(unix))]
+        ensure!(
+            opened.is_file()
+                && published.file_type().is_file()
+                && !published.file_type().is_symlink()
+                && opened.len() == self.identity.bytes
+                && published.len() == self.identity.bytes
+                && opened.modified().ok() == self.modified
+                && published.modified().ok() == self.modified,
+            "{} {} changed after it was authenticated",
+            self.description,
+            self.path.display()
+        );
+        Ok(())
+    }
+
+    fn reader(&mut self) -> Result<Box<dyn BufRead>> {
+        self.ensure_still_published()?;
+        self.file.seek(SeekFrom::Start(0)).with_context(|| {
+            format!(
+                "failed to rewind post-training input {}",
+                self.path.display()
+            )
+        })?;
+        // `try_clone` retains the authenticated inode. The retained base
+        // handle is never read concurrently and rewinds the shared offset only
+        // after the previous reader has been dropped at an epoch boundary.
+        let file = self.file.try_clone().with_context(|| {
+            format!(
+                "failed to clone post-training input {}",
+                self.path.display()
+            )
+        })?;
+        if self.path.extension().is_some_and(|ext| ext == "zst") {
+            Ok(Box::new(BufReader::new(
+                zstd::stream::read::Decoder::new(file).with_context(|| {
+                    format!("failed to open zstd task data {}", self.path.display())
+                })?,
+            )))
+        } else {
+            Ok(Box::new(BufReader::new(file)))
+        }
+    }
+}
+
+/// All model runtimes are pinned into the cursor. Frozen model identities
 /// additionally remain bound to their WorkflowV2 `FrozenModelSpec`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PostTrainingAdapterIdentities {
+pub struct PostTrainingRuntimeIdentities {
     pub trainable: String,
     pub tokenizer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1443,7 +1813,17 @@ impl PostTrainingUpdateSummary {
             self.examples > 0 && self.model_tokens > 0 && self.loss_sum.is_finite(),
             "post-training update summary is empty or non-finite"
         );
-        validate_prefixed_sha256(&self.execution_sha256, "post-training execution")?;
+        if matches!(
+            &self.objective,
+            PostTrainingObjectiveSummary::Dpo { .. }
+                | PostTrainingObjectiveSummary::ForwardKl { .. }
+        ) {
+            ensure!(
+                self.loss_sum >= 0.0,
+                "DPO/forward-KL loss sum must be non-negative"
+            );
+        }
+        validate_sha256_identity(&self.execution_sha256, "post-training execution")?;
         self.objective.validate(self.examples)
     }
 }
@@ -1578,12 +1958,16 @@ impl PreparedPostTrainingUpdate {
     }
 
     fn validate(&self) -> Result<()> {
-        validate_prefixed_sha256(&self.phase_sha256, "post-training phase")?;
-        validate_prefixed_sha256(
+        validate_sha256_identity(&self.phase_sha256, "post-training phase")?;
+        validate_sha256_identity(
             &self.previous_receipt_chain_sha256,
             "post-training receipt chain",
         )?;
-        validate_prefixed_sha256(&self.batch_sha256, "post-training batch")?;
+        validate_sha256_identity(&self.batch_sha256, "post-training batch")?;
+        self.base_model.validate()?;
+        if let Some(optimizer) = &self.base_optimizer {
+            optimizer.validate()?;
+        }
         self.summary.validate()?;
         match (&self.clock_before, &self.clock_after) {
             (Some(before), Some(after)) => {
@@ -1614,10 +1998,45 @@ impl PreparedPostTrainingUpdate {
                 || (self.end.epoch == self.start.epoch && self.end.record > self.start.record),
             "post-training update does not advance its input cursor"
         );
-        ensure!(
-            self.rng_end >= self.rng_start,
-            "post-training RNG range is inverted"
-        );
+        let reserved_rngs = self
+            .rng_end
+            .checked_sub(self.rng_start)
+            .context("post-training RNG range is inverted")?;
+        match &self.summary.objective {
+            PostTrainingObjectiveSummary::Dpo { .. } => {
+                let expected = self
+                    .summary
+                    .examples
+                    .checked_mul(2)
+                    .context("DPO model RNG range overflows u64")?;
+                ensure!(
+                    reserved_rngs == expected,
+                    "DPO prepared update must reserve exactly two model RNG substreams per example"
+                );
+            }
+            PostTrainingObjectiveSummary::ForwardKl { .. } => ensure!(
+                reserved_rngs == self.summary.examples,
+                "forward-KL prepared update must reserve exactly one model RNG substream per example"
+            ),
+            PostTrainingObjectiveSummary::Grpo { .. } => {
+                let per_group = self
+                    .summary
+                    .examples
+                    .checked_mul(2)
+                    .context("GRPO model RNG range overflows u64")?;
+                ensure!(
+                    reserved_rngs % per_group == 0,
+                    "GRPO prepared update has an incomplete model RNG group"
+                );
+                let group_size = reserved_rngs / per_group;
+                let maximum = u64::try_from(MAX_POST_TRAINING_ROLLOUTS_PER_PROMPT)
+                    .expect("GRPO group-size limit fits u64");
+                ensure!(
+                    (2..=maximum).contains(&group_size),
+                    "GRPO prepared update model RNG range encodes an invalid group size"
+                );
+            }
+        }
         ensure!(
             self.transaction_id == self.computed_transaction_id()?,
             "post-training transaction id does not match its content"
@@ -1634,7 +2053,17 @@ pub struct PostTrainingCommittedState {
     pub optimizer: Option<ImmutableArtifact>,
 }
 
-/// The publisher's proof that the attached trainable adapter was restored to
+impl PostTrainingCommittedState {
+    fn validate(&self) -> Result<()> {
+        self.model.validate()?;
+        if let Some(optimizer) = &self.optimizer {
+            optimizer.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// The publisher's proof that the attached trainable runtime was restored to
 /// the exact committed model/optimizer generation before recomputation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostTrainingRestoreReceipt {
@@ -1722,6 +2151,8 @@ impl PostTrainingUpdateReceipt {
     }
 
     fn validate(&self, plan: &PreparedPostTrainingUpdate, publisher: &str) -> Result<()> {
+        self.checkpoint.validate()?;
+        self.optimizer.validate()?;
         ensure!(
             self.transaction_id == plan.transaction_id,
             "optimizer receipt belongs to another update transaction"
@@ -1738,7 +2169,7 @@ impl PostTrainingUpdateReceipt {
             !self.receipt_uri.trim().is_empty(),
             "optimizer receipt URI is empty"
         );
-        validate_prefixed_sha256(&self.receipt_sha256, "optimizer receipt")?;
+        validate_sha256_identity(&self.receipt_sha256, "optimizer receipt")?;
         ensure!(
             self.receipt_sha256 == self.computed_sha256()?,
             "optimizer receipt hash does not match its content"
@@ -1758,7 +2189,7 @@ impl PostTrainingUpdateReceipt {
     }
 }
 
-/// Adapter which atomically owns model/optimizer restoration and immutable
+/// Publisher which atomically owns model/optimizer restoration and immutable
 /// update publication. It may keep a transaction table in local or remote
 /// durable storage, but publication must be idempotent by the plan's content
 /// hash. On a retry it returns the original receipt without invoking `apply`.
@@ -1774,7 +2205,9 @@ pub trait PostTrainingUpdatePublisher {
     ) -> Result<PostTrainingRestoreReceipt>;
 
     /// Apply and durably publish one update. Implementations must key the
-    /// operation by `plan.transaction_id` and never overwrite an artifact.
+    /// operation by `plan.transaction_id` and never overwrite an artifact. A
+    /// new transaction invokes `apply` exactly once; an idempotent retry
+    /// returns its original receipt without invoking `apply`.
     fn publish_update(
         &mut self,
         plan: &PreparedPostTrainingUpdate,
@@ -1844,14 +2277,16 @@ impl PostTrainingBoundaryReceipt {
         input: &PostTrainingCommittedState,
         expected_clock: PostTrainingClockValues,
     ) -> Result<()> {
+        input.validate()?;
+        self.state.validate()?;
         ensure!(
             self.transaction_id == transaction_id
                 && self.hook_identity == hook_identity
                 && self.input_model_sha256 == input.model.sha256(),
             "periodic-sleep boundary receipt belongs to another boundary"
         );
-        validate_prefixed_sha256(&self.receipt_sha256, "periodic-sleep receipt")?;
-        validate_prefixed_sha256(
+        validate_sha256_identity(&self.receipt_sha256, "periodic-sleep receipt")?;
+        validate_sha256_identity(
             &self.native_sleep_checkpoint_sha256,
             "periodic-sleep native checkpoint",
         )?;
@@ -1911,7 +2346,7 @@ pub struct NativePostTrainingBoundaryController<R> {
 
 impl<R: NativePostTrainingSleepRuntime> NativePostTrainingBoundaryController<R> {
     pub fn new(runtime: R) -> Result<Self> {
-        validate_prefixed_sha256(runtime.identity(), "native post-training sleep runtime")?;
+        validate_sha256_identity(runtime.identity(), "native post-training sleep runtime")?;
         Ok(Self { runtime })
     }
 
@@ -1950,9 +2385,10 @@ impl<R: NativePostTrainingSleepRuntime> PostTrainingBoundaryHook
         resume: Option<NativeSleepCheckpoint>,
         progress: &mut dyn NativeSleepProgressSink,
     ) -> Result<PostTrainingBoundaryReceipt> {
-        validate_prefixed_sha256(request.transaction_id, "post-training sleep transaction")?;
-        validate_prefixed_sha256(request.workflow_signature, "post-training sleep workflow")?;
+        validate_sha256_identity(request.transaction_id, "post-training sleep transaction")?;
+        validate_sha256_identity(request.workflow_signature, "post-training sleep workflow")?;
         request.clock_before.validate()?;
+        request.input.validate()?;
         ensure!(
             request.clock_before.authority_identity == self.identity()
                 && request.clock_before.checkpoint_sha256 == request.input.model.sha256(),
@@ -1986,6 +2422,11 @@ impl<R: NativePostTrainingSleepRuntime> PostTrainingBoundaryHook
                 && checkpoint.phase_name == request.phase_name,
             "native post-training sleep cursor belongs to another workflow phase"
         );
+        ensure!(
+            checkpoint.input_checkpoint.uri == request.input.model.uri()
+                && checkpoint.input_checkpoint.sha256 == request.input.model.sha256(),
+            "native post-training sleep cursor belongs to another boundary input checkpoint"
+        );
         if !resumed {
             ensure!(
                 checkpoint.live_checkpoint.uri == request.input.model.uri()
@@ -2006,6 +2447,16 @@ impl<R: NativePostTrainingSleepRuntime> PostTrainingBoundaryHook
         let state = self
             .runtime
             .advance_and_drain(request, &mut checkpoint, progress)?;
+        checkpoint.live_checkpoint.validate()?;
+        checkpoint.sleep.validate_resume()?;
+        state.validate()?;
+        ensure!(
+            checkpoint.workflow_signature == request.workflow_signature
+                && checkpoint.phase_name == request.phase_name
+                && checkpoint.input_checkpoint.uri == request.input.model.uri()
+                && checkpoint.input_checkpoint.sha256 == request.input.model.sha256(),
+            "post-training sleep runtime changed its workflow/boundary identity"
+        );
         let target = request.clock_after.selected(request.config.schedule.clock);
         ensure!(
             checkpoint.sleep.clock == target
@@ -2132,7 +2583,7 @@ impl PostTrainingProgress {
         &self,
         phase: &PhaseV2,
         algorithm: &str,
-        identities: &PostTrainingAdapterIdentities,
+        identities: &PostTrainingRuntimeIdentities,
     ) -> Result<PostTrainingPhaseReport> {
         ensure!(
             self.examples > 0 && self.optimizer_steps > 0,
@@ -2198,7 +2649,7 @@ pub struct PostTrainingCursor {
     pub phase_sha256: String,
     pub input_checkpoint: ImmutableModelCheckpoint,
     pub input_data: PinnedPostTrainingInput,
-    pub adapters: PostTrainingAdapterIdentities,
+    pub runtime_identities: PostTrainingRuntimeIdentities,
     pub publisher_identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary_hook_identity: Option<String>,
@@ -2225,7 +2676,7 @@ impl PostTrainingCursor {
         workflow_signature: String,
         request: &PhaseExecutionRequest,
         input_data: PinnedPostTrainingInput,
-        adapters: PostTrainingAdapterIdentities,
+        runtime_identities: PostTrainingRuntimeIdentities,
         publisher_identity: String,
         boundary_hook_identity: Option<String>,
         clock: Option<PostTrainingClockReceipt>,
@@ -2249,7 +2700,7 @@ impl PostTrainingCursor {
             phase_sha256,
             input_checkpoint: input_checkpoint.clone(),
             input_data,
-            adapters,
+            runtime_identities,
             publisher_identity,
             boundary_hook_identity,
             input_clock: clock.clone(),
@@ -2282,11 +2733,14 @@ impl PostTrainingCursor {
             "unsupported post-training cursor version {}",
             self.version
         );
-        validate_prefixed_sha256(&self.workflow_signature, "workflow signature")?;
-        validate_prefixed_sha256(&self.phase_sha256, "post-training phase")?;
-        validate_prefixed_sha256(&self.publisher_identity, "post-training publisher")?;
+        validate_sha256_identity(&self.workflow_signature, "workflow signature")?;
+        validate_sha256_identity(&self.phase_sha256, "post-training phase")?;
+        self.input_checkpoint.validate()?;
+        self.input_data.validate()?;
+        self.committed.validate()?;
+        validate_sha256_identity(&self.publisher_identity, "post-training publisher")?;
         if let Some(identity) = &self.boundary_hook_identity {
-            validate_prefixed_sha256(identity, "post-training boundary hook")?;
+            validate_sha256_identity(identity, "post-training boundary hook")?;
         }
         match (&self.boundary_hook_identity, &self.input_clock, &self.clock) {
             (Some(identity), Some(input_clock), Some(clock)) => {
@@ -2324,7 +2778,7 @@ impl PostTrainingCursor {
             (None, None, None) => {}
             _ => bail!("post-training cursor has a partial periodic-sleep clock binding"),
         }
-        validate_prefixed_sha256(&self.receipt_chain_sha256, "post-training receipt chain")?;
+        validate_sha256_identity(&self.receipt_chain_sha256, "post-training receipt chain")?;
         ensure!(
             self.progress.examples >= self.progress.optimizer_steps,
             "post-training progress has more updates than examples"
@@ -2339,12 +2793,14 @@ impl PostTrainingCursor {
                 );
             }
             (Some(receipt), steps) if steps > 0 => {
-                validate_prefixed_sha256(&receipt.transaction_id, "post-training transaction")?;
-                validate_prefixed_sha256(
+                receipt.checkpoint.validate()?;
+                receipt.optimizer.validate()?;
+                validate_sha256_identity(&receipt.transaction_id, "post-training transaction")?;
+                validate_sha256_identity(
                     &receipt.previous_receipt_chain_sha256,
                     "previous post-training receipt chain",
                 )?;
-                validate_prefixed_sha256(&receipt.receipt_sha256, "optimizer receipt")?;
+                validate_sha256_identity(&receipt.receipt_sha256, "optimizer receipt")?;
                 ensure!(
                     receipt.publisher_identity == self.publisher_identity
                         && receipt.receipt_sha256 == receipt.computed_sha256()?,
@@ -2360,11 +2816,11 @@ impl PostTrainingCursor {
                     "post-training committed optimizer is missing after an update"
                 );
                 if let Some(boundary) = &self.last_boundary_receipt {
-                    validate_prefixed_sha256(
+                    validate_sha256_identity(
                         &boundary.transaction_id,
                         "periodic-sleep transaction",
                     )?;
-                    validate_prefixed_sha256(&boundary.receipt_sha256, "periodic-sleep receipt")?;
+                    validate_sha256_identity(&boundary.receipt_sha256, "periodic-sleep receipt")?;
                     ensure!(
                         self.boundary_hook_identity.as_deref()
                             == Some(boundary.hook_identity.as_str())
@@ -2437,6 +2893,7 @@ impl PostTrainingBoundaryInFlight {
         publisher_identity: &str,
         config: &InModelSleepConfig,
     ) -> Result<()> {
+        self.published_state.validate()?;
         let before = expected
             .clock_before
             .as_ref()
@@ -2470,6 +2927,11 @@ impl PostTrainingBoundaryInFlight {
         if let Some(native) = &self.native_sleep {
             native.live_checkpoint.validate()?;
             native.sleep.validate_resume()?;
+            ensure!(
+                native.input_checkpoint.uri == self.published_state.model.uri()
+                    && native.input_checkpoint.sha256 == self.published_state.model.sha256(),
+                "in-flight native sleep cursor belongs to another published update"
+            );
             ensure!(
                 native.sleep.clock >= before.selected(config.schedule.clock)
                     && native.sleep.clock <= after.selected(config.schedule.clock),
@@ -2537,10 +2999,13 @@ impl PostTrainingResumeEnvelope {
     }
 }
 
-/// One phase's concrete adapters. It is intentionally borrowed and contains
-/// no site-specific loader, storage client, or global singleton.
+/// One phase's concrete device runtime. It is intentionally borrowed and
+/// contains no site-specific loader, storage client, or global singleton. The
+/// runtime and publisher must refer to the same model state: restoring a
+/// committed publisher generation must also discard any previously staged
+/// device batch before deterministic replay.
 pub struct PostTrainingExecutionContext<'a> {
-    pub adapters: PostTrainingPhaseAdapters<'a>,
+    pub runtime: PostTrainingPhaseRuntime<'a>,
     pub publisher: &'a mut dyn PostTrainingUpdatePublisher,
     pub boundary_hook: Option<&'a mut dyn PostTrainingBoundaryHook>,
     /// Authenticated cumulative clocks from the exact input checkpoint.
@@ -2576,7 +3041,7 @@ impl NativePostTrainingPhaseExecutor {
         update_budget: usize,
     ) -> Result<Self> {
         let workflow_signature = workflow_signature.into();
-        validate_prefixed_sha256(&workflow_signature, "workflow signature")?;
+        validate_sha256_identity(&workflow_signature, "workflow signature")?;
         ensure!(
             update_budget > 0,
             "post-training update budget must be positive"
@@ -2604,7 +3069,7 @@ impl<'a> PhaseExecutor<PostTrainingExecutionContext<'a>> for NativePostTrainingP
         let outcome = drive_resumable_post_training_phase(
             &self.workflow_signature,
             request,
-            &mut context.adapters,
+            &mut context.runtime,
             context.publisher,
             &mut context.boundary_hook,
             context.starting_clock.as_ref(),
@@ -2633,7 +3098,7 @@ impl<'a> PhaseExecutor<PostTrainingExecutionContext<'a>> for NativePostTrainingP
 pub fn drive_resumable_post_training_phase(
     workflow_signature: &str,
     request: &PhaseExecutionRequest,
-    adapters: &mut PostTrainingPhaseAdapters<'_>,
+    runtime: &mut PostTrainingPhaseRuntime<'_>,
     publisher: &mut dyn PostTrainingUpdatePublisher,
     boundary_hook: &mut Option<&mut dyn PostTrainingBoundaryHook>,
     starting_clock: Option<&PostTrainingClockReceipt>,
@@ -2641,35 +3106,31 @@ pub fn drive_resumable_post_training_phase(
     update_budget: usize,
     progress: &mut dyn PhaseProgressSink,
 ) -> Result<ResumablePostTrainingOutcome> {
-    validate_prefixed_sha256(workflow_signature, "workflow signature")?;
+    validate_sha256_identity(workflow_signature, "workflow signature")?;
     ensure!(
         update_budget > 0,
         "post-training update budget must be positive"
     );
     let phase = &request.phase;
     validate_resumable_phase(phase)?;
-    let data = phase
-        .data
-        .as_deref()
-        .context("native post-training phase has no data")?;
-    let actual_input = PinnedPostTrainingInput::from_path(data)?;
-    let identities = validate_and_capture_adapter_identities(phase, adapters)?;
-    validate_prefixed_sha256(publisher.identity(), "post-training publisher")?;
+    let input_checkpoint = request
+        .input_checkpoint
+        .as_ref()
+        .context("native post-training requires an immutable input checkpoint")?;
+    input_checkpoint.validate()?;
+    let identities = validate_and_capture_runtime_identities(phase, runtime)?;
+    validate_sha256_identity(publisher.identity(), "post-training publisher")?;
     let (hook_identity, initial_clock) = match (
         &phase.periodic_sleep,
         boundary_hook.as_deref(),
         starting_clock,
     ) {
         (Some(_), Some(hook), Some(clock)) => {
-            validate_prefixed_sha256(hook.identity(), "post-training boundary hook")?;
+            validate_sha256_identity(hook.identity(), "post-training boundary hook")?;
             clock.validate()?;
-            let input = request
-                .input_checkpoint
-                .as_ref()
-                .context("native post-training requires an immutable input checkpoint")?;
             ensure!(
                 clock.authority_identity == hook.identity()
-                    && clock.checkpoint_sha256 == input.sha256(),
+                    && clock.checkpoint_sha256 == input_checkpoint.sha256(),
                 "post-training starting clock is not authenticated for its input/hook"
             );
             (Some(hook.identity().to_owned()), Some(clock.clone()))
@@ -2692,6 +3153,21 @@ pub fn drive_resumable_post_training_phase(
         ),
         (None, None, None) => (None, None),
     };
+    // Perform large immutable-file hashes once per execution attempt, after
+    // cheap runtime, publisher, and boundary-clock preflight. Rehashing a
+    // multi-gigabyte teacher/reference for every update would serialize the
+    // hot loop on storage.
+    phase
+        .post_training
+        .as_ref()
+        .expect("validated native post-training algorithm")
+        .verify_local_artifacts()?;
+    let data = phase
+        .data
+        .as_deref()
+        .context("native post-training phase has no data")?;
+    let authenticated_input = AuthenticatedPostTrainingInput::open(data)?;
+    let actual_input = authenticated_input.identity.clone();
     let phase_sha256 = canonical_sha256(phase)?;
     let (resume_cursor, mut in_flight) = resume
         .map(PostTrainingResumeEnvelope::into_parts)
@@ -2708,22 +3184,17 @@ pub fn drive_resumable_post_training_phase(
                     && cursor.phase_sha256 == phase_sha256,
                 "native post-training cursor belongs to another workflow phase"
             );
-            let input = request
-                .input_checkpoint
-                .as_ref()
-                .context("native post-training requires an immutable input checkpoint")?;
             ensure!(
-                &cursor.input_checkpoint == input,
+                &cursor.input_checkpoint == input_checkpoint,
                 "native post-training cursor belongs to another input checkpoint"
             );
             ensure!(
                 cursor.input_data == actual_input,
                 "native post-training cursor belongs to different input bytes"
             );
-            actual_input.verify(data)?;
             ensure!(
-                cursor.adapters == identities,
-                "native post-training adapter/provider identity changed across resume"
+                cursor.runtime_identities == identities,
+                "native post-training device-runtime identity changed across resume"
             );
             ensure!(
                 cursor.publisher_identity == publisher.identity(),
@@ -2749,6 +3220,16 @@ pub fn drive_resumable_post_training_phase(
             initial_clock,
         )?,
     };
+    let mut batches = PostTrainingBatchStream::new(
+        authenticated_input,
+        phase
+            .task
+            .as_ref()
+            .expect("validated post-training task")
+            .clone(),
+        cursor.position,
+        u64::try_from(phase.epochs_or_default()).context("epoch count exceeds u64")?,
+    )?;
     ensure!(
         in_flight.is_none()
             || (phase.periodic_sleep.is_some()
@@ -2760,18 +3241,27 @@ pub fn drive_resumable_post_training_phase(
     let mut updates_this_drive = 0usize;
     loop {
         cursor.validate_internal()?;
-        validate_and_capture_adapter_identities(phase, adapters).and_then(|current| {
+        validate_and_capture_runtime_identities(phase, runtime).and_then(|current| {
             ensure!(
-                current == cursor.adapters,
-                "native post-training adapter/provider identity drifted during execution"
+                current == cursor.runtime_identities,
+                "native post-training device-runtime identity drifted during execution"
             );
             Ok(())
         })?;
+        // Runtime identity callbacks are external code and can take long
+        // enough for the published input path to change.  Bracket the restore
+        // itself so an already-invalid phase never pays for, or observes side
+        // effects from, restoring a model generation it can no longer use.
+        batches.ensure_still_published()?;
         validate_restore_receipt(
             &publisher.restore_committed(&cursor.committed)?,
             publisher.identity(),
             &cursor.committed,
         )?;
+        // Restoration is deployment-controlled and may perform arbitrary I/O.
+        // Recheck the authenticated pathname before either returning a final
+        // product or consuming another batch from the retained description.
+        batches.ensure_still_published()?;
 
         if phase_is_complete(phase, &cursor)? {
             ensure!(
@@ -2786,20 +3276,14 @@ pub fn drive_resumable_post_training_phase(
                         .as_ref()
                         .expect("validated post-training config"),
                 ),
-                &cursor.adapters,
+                &cursor.runtime_identities,
             )?;
             return Ok(ResumablePostTrainingOutcome::Complete { cursor, report });
         }
 
         let update_examples = update_examples(phase)?;
         let start = cursor.position;
-        let batch = collect_post_training_batch(
-            data,
-            phase.task.as_ref().expect("validated post-training task"),
-            start,
-            update_examples,
-            u64::try_from(phase.epochs_or_default()).context("epoch count exceeds u64")?,
-        )?;
+        let batch = batches.next_batch(update_examples)?;
         ensure!(
             !batch.examples.is_empty(),
             "post-training phase `{}` reached no data before its configured end",
@@ -2810,7 +3294,9 @@ pub fn drive_resumable_post_training_phase(
         let prepared_computation = accumulate_resumable_update(
             phase,
             &batch.examples,
-            adapters,
+            &batch_sha256,
+            &cursor.committed,
+            runtime,
             cursor.rng.seed,
             rng_start,
         )?;
@@ -2852,6 +3338,10 @@ pub fn drive_resumable_post_training_phase(
                 ))?)?;
             }
         }
+        // The prepared update is durable, but no model mutation may be
+        // published from a batch whose pathname stopped naming the exact
+        // authenticated file after preparation.
+        batches.ensure_still_published()?;
 
         let (receipt, published_state) = match &in_flight {
             Some(boundary) => {
@@ -2867,7 +3357,7 @@ pub fn drive_resumable_post_training_phase(
             }
             None => {
                 let learning_rate_scale = phase.learning_rate_scale_or_default();
-                let mut apply = || optimizer_step(adapters, learning_rate_scale);
+                let mut apply = || optimizer_step(runtime, learning_rate_scale);
                 let receipt = publisher.publish_update(&expected, &mut apply)?;
                 receipt.validate(&expected, publisher.identity())?;
                 let published_state = PostTrainingCommittedState {
@@ -2877,11 +3367,16 @@ pub fn drive_resumable_post_training_phase(
                 (receipt, published_state)
             }
         };
+        // A publisher can take long enough for the source pathname to change.
+        // Reject before paying to restore the new generation or entering an
+        // optional sleep boundary; its immutable artifacts remain unreferenced.
+        batches.ensure_still_published()?;
         validate_restore_receipt(
             &publisher.restore_committed(&published_state)?,
             publisher.identity(),
             &published_state,
         )?;
+        batches.ensure_still_published()?;
 
         let (committed, boundary_receipt) =
             match (phase.periodic_sleep.as_ref(), boundary_hook.as_deref_mut()) {
@@ -2972,6 +3467,10 @@ pub fn drive_resumable_post_training_phase(
                 }
                 _ => unreachable!("boundary-hook presence validated before execution"),
             };
+        // Publication is immutable, so a late input replacement can leave an
+        // unreferenced artifact but must not advance the durable phase cursor
+        // or become its final product.
+        batches.ensure_still_published()?;
 
         let next_chain = canonical_sha256(&(
             "post_training_receipt_chain_v1",
@@ -2999,9 +3498,11 @@ pub fn drive_resumable_post_training_phase(
         let metric = update_metric(&expected, &receipt)?;
         metric.validate()?;
         progress.metric(metric_context(request, &next)?, metric)?;
+        batches.ensure_still_published()?;
         progress.checkpoint(serde_json::to_value(PostTrainingResumeEnvelope::wake(
             next.clone(),
         ))?)?;
+        batches.ensure_still_published()?;
         cursor = next;
         updates_this_drive += 1;
 
@@ -3014,7 +3515,7 @@ pub fn drive_resumable_post_training_phase(
                         .as_ref()
                         .expect("validated post-training config"),
                 ),
-                &cursor.adapters,
+                &cursor.runtime_identities,
             )?;
             return Ok(ResumablePostTrainingOutcome::Complete { cursor, report });
         }
@@ -3088,7 +3589,15 @@ impl NativeSleepProgressSink for PostTrainingSleepProgressBridge<'_> {
     }
 }
 
-fn validate_resumable_phase(phase: &PhaseV2) -> Result<()> {
+/// Validate the exact phase surface consumed by the built-in native
+/// post-training executor. Native host dispatch calls this before creating a
+/// runtime checkpoint so a syntactically valid WorkflowV2 phase cannot fail
+/// only after durable state has already been published.
+pub(crate) fn validate_resumable_phase(phase: &PhaseV2) -> Result<()> {
+    ensure!(
+        !phase.name.trim().is_empty(),
+        "native post-training phase name must not be empty"
+    );
     ensure!(
         matches!(
             phase.kind,
@@ -3105,19 +3614,68 @@ fn validate_resumable_phase(phase: &PhaseV2) -> Result<()> {
         phase.parameters.is_empty(),
         "native post-training rejects unconsumed raw parameters"
     );
-    phase
+    ensure!(
+        phase.memory_update_mode.is_none(),
+        "native post-training does not implement memory_update_mode; use periodic_sleep or a tier-aware phase executor"
+    );
+    let task = phase
         .task
         .as_ref()
-        .context("native post-training phase has no task")?
-        .validate()?;
-    phase
+        .context("native post-training phase has no task")?;
+    task.validate()?;
+    let execution = task.contract().execution;
+    match phase.kind {
+        PhaseKind::Preference => ensure!(
+            execution == TaskExecution::PairwisePreference,
+            "native DPO requires a pairwise-preference task"
+        ),
+        PhaseKind::Distillation => ensure!(
+            matches!(
+                execution,
+                TaskExecution::AutoregressiveTokenPrediction | TaskExecution::SupervisedGeneration
+            ),
+            "native forward-KL requires an autoregressive or supervised-generation task"
+        ),
+        PhaseKind::Rl => ensure!(
+            execution == TaskExecution::VerifiableReward,
+            "native GRPO requires a verifiable-reward task"
+        ),
+        _ => unreachable!("phase kind was restricted above"),
+    }
+    let data = phase
         .data
         .as_ref()
         .context("native post-training phase has no data")?;
-    phase
+    ensure!(
+        !data.as_os_str().is_empty(),
+        "native post-training phase has an empty data path"
+    );
+    let sequence_length = phase
         .sequence_length
         .context("native post-training phase has no sequence_length")?;
-    update_examples(phase)?;
+    ensure!(
+        (1..=MAX_POST_TRAINING_SEQUENCE_TOKENS).contains(&sequence_length),
+        "native post-training sequence_length must be between 1 and {MAX_POST_TRAINING_SEQUENCE_TOKENS}"
+    );
+    ensure!(
+        phase.epochs_or_default() > 0,
+        "native post-training epochs must be positive"
+    );
+    ensure!(
+        phase.steps.is_none_or(|steps| steps > 0),
+        "native post-training steps must be positive when set"
+    );
+    let loss_weight = phase.loss_weight_or_default();
+    ensure!(
+        loss_weight.is_finite() && loss_weight > 0.0,
+        "native post-training loss_weight must be finite and positive"
+    );
+    let learning_rate_scale = phase.learning_rate_scale_or_default();
+    ensure!(
+        learning_rate_scale.is_finite() && learning_rate_scale > 0.0,
+        "native post-training learning_rate_scale must be finite and positive"
+    );
+    let update_examples = update_examples(phase)?;
     let config = phase
         .post_training
         .as_ref()
@@ -3135,6 +3693,21 @@ fn validate_resumable_phase(phase: &PhaseV2) -> Result<()> {
             "GRPO max_new_tokens exceeds sequence_length"
         );
     }
+    if let PostTrainingConfig::Grpo {
+        group_size,
+        sampling,
+        ..
+    } = config
+    {
+        let update_tokens = group_size
+            .checked_mul(sampling.max_new_tokens)
+            .and_then(|tokens| tokens.checked_mul(update_examples))
+            .context("GRPO rollout-update token geometry overflows usize")?;
+        ensure!(
+            update_tokens <= MAX_POST_TRAINING_ROLLOUT_TOKENS,
+            "GRPO rollout update exceeds the {MAX_POST_TRAINING_ROLLOUT_TOKENS}-token native limit"
+        );
+    }
     Ok(())
 }
 
@@ -3149,6 +3722,10 @@ fn update_examples(phase: &PhaseV2) -> Result<usize> {
         )
         .context("native post-training update example count overflows usize")?;
     ensure!(examples > 0, "native post-training update batch is empty");
+    ensure!(
+        examples <= MAX_POST_TRAINING_UPDATE_EXAMPLES,
+        "native post-training update has {examples} examples, exceeding the limit of {MAX_POST_TRAINING_UPDATE_EXAMPLES}"
+    );
     Ok(examples)
 }
 
@@ -3165,125 +3742,330 @@ fn phase_is_complete(phase: &PhaseV2, cursor: &PostTrainingCursor) -> Result<boo
         >= u64::try_from(phase.epochs_or_default()).context("epoch count exceeds u64")?)
 }
 
+#[derive(Debug)]
 struct CollectedPostTrainingBatch {
     examples: Vec<TaskExample>,
     end: PostTrainingRecordPosition,
 }
 
-fn collect_post_training_batch(
-    path: &Path,
-    task: &TaskConfig,
-    start: PostTrainingRecordPosition,
-    target: usize,
-    epochs: u64,
-) -> Result<CollectedPostTrainingBatch> {
-    ensure!(
-        start.epoch < epochs,
-        "post-training input cursor is already at end"
-    );
-    let mut epoch = start.epoch;
-    let mut record = start.record;
-    let mut examples = Vec::with_capacity(target);
-    while epoch < epochs && examples.len() < target {
-        let mut seen = 0_u64;
-        let wanted = record;
-        let mut has_unconsumed_record = false;
-        visit_task_examples_while(path, task, |example| {
-            let index = seen;
-            seen = seen
-                .checked_add(1)
-                .context("post-training per-epoch record counter overflows u64")?;
-            if index < wanted {
-                return Ok(true);
-            }
-            if examples.len() == target {
-                has_unconsumed_record = true;
-                return Ok(false);
-            }
-            examples.push(example);
-            record = seen;
-            Ok(true)
-        })?;
-        ensure!(
-            wanted <= seen,
-            "post-training cursor record {} exceeds epoch {} length {}",
-            wanted,
-            epoch,
-            seen
-        );
-        if examples.len() == target {
-            if !has_unconsumed_record {
-                epoch = epoch
-                    .checked_add(1)
-                    .context("post-training epoch cursor overflows u64")?;
-                record = 0;
-            }
-            break;
-        }
-        epoch = epoch
-            .checked_add(1)
-            .context("post-training epoch cursor overflows u64")?;
-        record = 0;
-    }
-    if examples.len() < target {
-        epoch = epochs;
-        record = 0;
-    }
-    Ok(CollectedPostTrainingBatch {
-        examples,
-        end: PostTrainingRecordPosition { epoch, record },
-    })
+#[derive(Debug)]
+struct RawPostTrainingRecord {
+    line: String,
+    line_number: usize,
 }
 
+fn read_post_training_record_bounded(
+    reader: &mut (impl BufRead + ?Sized),
+    output: &mut Vec<u8>,
+    maximum_bytes: usize,
+) -> Result<usize> {
+    ensure!(
+        maximum_bytes > 0,
+        "post-training record byte limit must be positive"
+    );
+    output.clear();
+    let capture_bytes = maximum_bytes
+        .checked_add(1)
+        .context("post-training record byte limit overflows usize")?;
+    let read = reader
+        .take(u64::try_from(capture_bytes).context("post-training record byte limit exceeds u64")?)
+        .read_until(b'\n', output)
+        .context("failed to read post-training record")?;
+    let payload_bytes = output
+        .len()
+        .checked_sub(usize::from(output.last() == Some(&b'\n')))
+        .context("post-training record framing underflow")?;
+    ensure!(
+        payload_bytes <= maximum_bytes,
+        "post-training record exceeds the maximum of {maximum_bytes} bytes"
+    );
+    Ok(read)
+}
+
+/// Sequential batch reader over one authenticated file description. Resume
+/// performs at most one prefix scan to the durable record cursor; ordinary
+/// updates continue from the existing buffered reader instead of reopening
+/// and rescanning the file from record zero.
+struct PostTrainingBatchStream {
+    source: AuthenticatedPostTrainingInput,
+    task: TaskConfig,
+    reader: Box<dyn BufRead>,
+    jsonl: bool,
+    line: Vec<u8>,
+    line_number: usize,
+    epoch: u64,
+    record: u64,
+    records_in_epoch: u64,
+    epochs: u64,
+    lookahead: Option<RawPostTrainingRecord>,
+}
+
+impl PostTrainingBatchStream {
+    fn new(
+        mut source: AuthenticatedPostTrainingInput,
+        task: TaskConfig,
+        start: PostTrainingRecordPosition,
+        epochs: u64,
+    ) -> Result<Self> {
+        ensure!(
+            start.epoch < epochs || (start.epoch == epochs && start.record == 0),
+            "post-training input cursor exceeds the configured epoch range"
+        );
+        task.validate()?;
+        let jsonl =
+            task.contract().data_format == TaskDataFormat::Jsonl || is_jsonl_path(&source.path);
+        ensure!(
+            task.contract().data_format != TaskDataFormat::Jsonl || jsonl,
+            "task `{}` requires JSONL framing",
+            task.name()
+        );
+        let reader = source.reader()?;
+        let mut stream = Self {
+            source,
+            task,
+            reader,
+            jsonl,
+            line: Vec::new(),
+            line_number: 0,
+            epoch: start.epoch,
+            record: 0,
+            records_in_epoch: 0,
+            epochs,
+            lookahead: None,
+        };
+        while stream.record < start.record {
+            ensure!(
+                stream.read_record()?.is_some(),
+                "post-training cursor record {} exceeds epoch {} length {}",
+                start.record,
+                start.epoch,
+                stream.records_in_epoch
+            );
+            stream.record = stream
+                .record
+                .checked_add(1)
+                .context("post-training record cursor overflows u64")?;
+        }
+        stream.source.ensure_still_published()?;
+        Ok(stream)
+    }
+
+    fn read_raw_record(&mut self) -> Result<Option<RawPostTrainingRecord>> {
+        loop {
+            let read = read_post_training_record_bounded(
+                &mut self.reader,
+                &mut self.line,
+                MAX_POST_TRAINING_RECORD_BYTES,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to read task data {}:{}",
+                    self.source.path.display(),
+                    self.line_number.saturating_add(1)
+                )
+            })?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.line_number = self
+                .line_number
+                .checked_add(1)
+                .context("task-data line counter overflows usize")?;
+            let line = String::from_utf8(std::mem::take(&mut self.line)).with_context(|| {
+                format!(
+                    "task data is not UTF-8 at {}:{}",
+                    self.source.path.display(),
+                    self.line_number
+                )
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            return Ok(Some(RawPostTrainingRecord {
+                line,
+                line_number: self.line_number,
+            }));
+        }
+    }
+
+    fn construct_record(&mut self, raw: RawPostTrainingRecord) -> Result<(TaskExample, usize)> {
+        let input_bytes = raw.line.len();
+        let record = if self.jsonl {
+            serde_json::from_str(&raw.line).with_context(|| {
+                format!(
+                    "invalid JSON task record at {}:{}",
+                    self.source.path.display(),
+                    raw.line_number
+                )
+            })?
+        } else {
+            serde_json::json!({"text": raw.line.trim_end_matches(['\r', '\n'])})
+        };
+        let example = self.task.construct_example(&record).with_context(|| {
+            format!(
+                "invalid task record at {}:{}",
+                self.source.path.display(),
+                raw.line_number
+            )
+        })?;
+        self.records_in_epoch = self
+            .records_in_epoch
+            .checked_add(1)
+            .context("post-training per-epoch record counter overflows u64")?;
+        Ok((example, input_bytes))
+    }
+
+    fn read_record(&mut self) -> Result<Option<(TaskExample, usize)>> {
+        self.read_raw_record()?
+            .map(|raw| self.construct_record(raw))
+            .transpose()
+    }
+
+    fn ensure_still_published(&self) -> Result<()> {
+        self.source.ensure_still_published()
+    }
+
+    fn advance_epoch(&mut self) -> Result<()> {
+        ensure!(
+            self.records_in_epoch > 0,
+            "task data {} contains no examples",
+            self.source.path.display()
+        );
+        self.source.ensure_still_published()?;
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .context("post-training epoch cursor overflows u64")?;
+        self.record = 0;
+        self.records_in_epoch = 0;
+        self.line_number = 0;
+        if self.epoch < self.epochs {
+            // Drop the cloned handle before rewinding the retained base file;
+            // both descriptors intentionally refer to the same open file.
+            self.reader = Box::new(std::io::empty());
+            self.reader = self.source.reader()?;
+        }
+        Ok(())
+    }
+
+    fn next_batch(&mut self, target: usize) -> Result<CollectedPostTrainingBatch> {
+        ensure!(target > 0, "post-training target batch is empty");
+        ensure!(
+            target <= MAX_POST_TRAINING_UPDATE_EXAMPLES,
+            "post-training target batch exceeds {MAX_POST_TRAINING_UPDATE_EXAMPLES} examples"
+        );
+        self.source.ensure_still_published()?;
+        let mut examples = Vec::with_capacity(target);
+        let mut input_bytes = 0usize;
+        while self.epoch < self.epochs && examples.len() < target {
+            let raw = match self.lookahead.take() {
+                Some(raw) => Some(raw),
+                None => self.read_raw_record()?,
+            };
+            match raw {
+                Some(raw) => {
+                    let next_input_bytes = input_bytes
+                        .checked_add(raw.line.len())
+                        .context("post-training update input byte count overflows usize")?;
+                    ensure!(
+                        next_input_bytes <= MAX_POST_TRAINING_UPDATE_INPUT_BYTES,
+                        "post-training update input exceeds the {MAX_POST_TRAINING_UPDATE_INPUT_BYTES}-byte limit"
+                    );
+                    let (example, record_bytes) = self.construct_record(raw)?;
+                    input_bytes = input_bytes
+                        .checked_add(record_bytes)
+                        .context("post-training update input byte count overflows usize")?;
+                    debug_assert_eq!(input_bytes, next_input_bytes);
+                    examples.push(example);
+                    self.record = self
+                        .record
+                        .checked_add(1)
+                        .context("post-training record cursor overflows u64")?;
+                }
+                None => self.advance_epoch()?,
+            }
+        }
+
+        // Resolve the exact-EOF case now so a batch ending on the last record
+        // durably records the next epoch boundary instead of requiring an
+        // empty follow-up update attempt. Preserve one framed but unparsed
+        // record as lookahead when more data remains in this epoch: a phase
+        // ending at its step limit must not validate data it never consumes.
+        if examples.len() == target && self.epoch < self.epochs {
+            match self.read_raw_record()? {
+                Some(raw) => self.lookahead = Some(raw),
+                None => self.advance_epoch()?,
+            }
+        }
+        self.source.ensure_still_published()?;
+        Ok(CollectedPostTrainingBatch {
+            examples,
+            end: PostTrainingRecordPosition {
+                epoch: self.epoch,
+                record: self.record,
+            },
+        })
+    }
+}
+
+#[derive(Debug)]
 struct PreparedComputation {
     summary: PostTrainingUpdateSummary,
     rng_end: u64,
 }
 
-fn validate_and_capture_adapter_identities(
+fn validate_and_capture_runtime_identities(
     phase: &PhaseV2,
-    adapters: &mut PostTrainingPhaseAdapters<'_>,
-) -> Result<PostTrainingAdapterIdentities> {
+    runtime: &mut PostTrainingPhaseRuntime<'_>,
+) -> Result<PostTrainingRuntimeIdentities> {
     let config = phase
         .post_training
         .as_ref()
         .context("post-training phase has no typed algorithm")?;
-    match (config, adapters) {
+    match (config, runtime) {
         (
             PostTrainingConfig::Dpo {
                 reference: spec, ..
             },
-            PostTrainingPhaseAdapters::Dpo { policy, reference },
+            PostTrainingPhaseRuntime::Dpo { runtime },
         ) => {
-            validate_frozen_provider(
+            validate_frozen_runtime(
                 spec,
-                reference.identity(),
-                reference.tokenizer_identity(),
-                policy.tokenizer_identity(),
+                runtime.frozen_identity(),
+                runtime.frozen_tokenizer_identity(),
+                runtime.trainable_tokenizer_identity(),
             )?;
-            validate_adapter_identity(policy.identity(), "trainable DPO policy")?;
-            Ok(PostTrainingAdapterIdentities {
-                trainable: policy.identity().to_owned(),
-                tokenizer: policy.tokenizer_identity().to_owned(),
-                frozen: Some(reference.identity().to_owned()),
+            validate_runtime_identity(runtime.trainable_identity(), "trainable DPO policy")?;
+            validate_runtime_identity(runtime.trainable_tokenizer_identity(), "DPO tokenizer")?;
+            Ok(PostTrainingRuntimeIdentities {
+                trainable: runtime.trainable_identity().to_owned(),
+                tokenizer: runtime.trainable_tokenizer_identity().to_owned(),
+                frozen: Some(runtime.frozen_identity().to_owned()),
                 verifier: None,
             })
         }
         (
             PostTrainingConfig::ForwardKl { teacher: spec, .. },
-            PostTrainingPhaseAdapters::ForwardKl { policy, teacher },
+            PostTrainingPhaseRuntime::ForwardKl { runtime },
         ) => {
-            validate_frozen_provider(
+            validate_frozen_runtime(
                 spec,
-                teacher.identity(),
-                teacher.tokenizer_identity(),
-                policy.tokenizer_identity(),
+                runtime.frozen_identity(),
+                runtime.frozen_tokenizer_identity(),
+                runtime.trainable_tokenizer_identity(),
             )?;
-            validate_adapter_identity(policy.identity(), "trainable distillation policy")?;
-            Ok(PostTrainingAdapterIdentities {
-                trainable: policy.identity().to_owned(),
-                tokenizer: policy.tokenizer_identity().to_owned(),
-                frozen: Some(teacher.identity().to_owned()),
+            validate_runtime_identity(
+                runtime.trainable_identity(),
+                "trainable distillation policy",
+            )?;
+            validate_runtime_identity(
+                runtime.trainable_tokenizer_identity(),
+                "distillation tokenizer",
+            )?;
+            Ok(PostTrainingRuntimeIdentities {
+                trainable: runtime.trainable_identity().to_owned(),
+                tokenizer: runtime.trainable_tokenizer_identity().to_owned(),
+                frozen: Some(runtime.frozen_identity().to_owned()),
                 verifier: None,
             })
         }
@@ -3293,61 +4075,75 @@ fn validate_and_capture_adapter_identities(
                 kl_coefficient,
                 ..
             },
-            PostTrainingPhaseAdapters::Grpo {
-                policy,
-                reference,
-                verifier,
-            },
+            PostTrainingPhaseRuntime::Grpo { runtime, verifier },
         ) => {
-            match (reference_spec.as_ref(), reference.as_deref()) {
-                (Some(spec), Some(provider)) => validate_frozen_provider(
+            ensure!(
+                runtime.frozen_identity().is_some()
+                    == runtime.frozen_tokenizer_identity().is_some(),
+                "GRPO device runtime has a partial frozen-reference identity"
+            );
+            match (reference_spec.as_ref(), runtime.frozen_identity()) {
+                (Some(spec), Some(identity)) => validate_frozen_runtime(
                     spec,
-                    provider.identity(),
-                    provider.tokenizer_identity(),
-                    policy.tokenizer_identity(),
+                    identity,
+                    runtime
+                        .frozen_tokenizer_identity()
+                        .expect("checked frozen tokenizer present"),
+                    runtime.trainable_tokenizer_identity(),
                 )?,
-                (Some(_), None) => bail!("GRPO phase requires its frozen reference adapter"),
-                (None, Some(_)) => bail!("GRPO phase supplied an unconfigured reference adapter"),
+                (Some(_), None) => bail!("GRPO phase requires its frozen reference runtime"),
+                (None, Some(_)) => bail!("GRPO phase supplied an unconfigured reference runtime"),
                 (None, None) => ensure!(
                     *kl_coefficient == 0.0,
                     "GRPO without a reference requires zero KL coefficient"
                 ),
             }
-            validate_adapter_identity(policy.identity(), "trainable GRPO policy")?;
-            validate_adapter_identity(verifier.adapter_name(), "GRPO verifier")?;
-            Ok(PostTrainingAdapterIdentities {
-                trainable: policy.identity().to_owned(),
-                tokenizer: policy.tokenizer_identity().to_owned(),
-                frozen: reference
-                    .as_deref()
-                    .map(|provider| provider.identity().to_owned()),
-                verifier: Some(verifier.adapter_name().to_owned()),
+            validate_runtime_identity(runtime.trainable_identity(), "trainable GRPO policy")?;
+            validate_runtime_identity(runtime.trainable_tokenizer_identity(), "GRPO tokenizer")?;
+            validate_sha256_identity(verifier.identity(), "GRPO verifier implementation")?;
+            let TaskConfig::VerifiableRl {
+                verifier: verifier_spec,
+            } = phase.task.as_ref().expect("validated post-training task")
+            else {
+                bail!("GRPO phase requires a verifiable-RL task");
+            };
+            ensure!(
+                verifier.adapter_name() == verifier_spec.adapter,
+                "verifier adapter mismatch: task requires `{}`, executor supplied `{}`",
+                verifier_spec.adapter,
+                verifier.adapter_name()
+            );
+            Ok(PostTrainingRuntimeIdentities {
+                trainable: runtime.trainable_identity().to_owned(),
+                tokenizer: runtime.trainable_tokenizer_identity().to_owned(),
+                frozen: runtime.frozen_identity().map(str::to_owned),
+                verifier: Some(verifier.identity().to_owned()),
             })
         }
-        _ => bail!("post-training algorithm and adapter set do not match"),
+        _ => bail!("post-training algorithm and device runtime do not match"),
     }
 }
 
 fn optimizer_step(
-    adapters: &mut PostTrainingPhaseAdapters<'_>,
+    runtime: &mut PostTrainingPhaseRuntime<'_>,
     learning_rate_scale: f64,
 ) -> Result<()> {
-    match adapters {
-        PostTrainingPhaseAdapters::Dpo { policy, .. } => policy.optimizer_step(learning_rate_scale),
-        PostTrainingPhaseAdapters::ForwardKl { policy, .. } => {
-            policy.optimizer_step(learning_rate_scale)
+    match runtime {
+        PostTrainingPhaseRuntime::Dpo { runtime } => runtime.optimizer_step(learning_rate_scale),
+        PostTrainingPhaseRuntime::ForwardKl { runtime } => {
+            runtime.optimizer_step(learning_rate_scale)
         }
-        PostTrainingPhaseAdapters::Grpo { policy, .. } => {
-            policy.optimizer_step(learning_rate_scale)
+        PostTrainingPhaseRuntime::Grpo { runtime, .. } => {
+            runtime.optimizer_step(learning_rate_scale)
         }
     }
 }
 
-fn adapter_model_tokens_processed(adapters: &PostTrainingPhaseAdapters<'_>) -> u64 {
-    match adapters {
-        PostTrainingPhaseAdapters::Dpo { policy, .. } => policy.model_tokens_processed(),
-        PostTrainingPhaseAdapters::ForwardKl { policy, .. } => policy.model_tokens_processed(),
-        PostTrainingPhaseAdapters::Grpo { policy, .. } => policy.model_tokens_processed(),
+fn runtime_model_tokens_processed(runtime: &PostTrainingPhaseRuntime<'_>) -> u64 {
+    match runtime {
+        PostTrainingPhaseRuntime::Dpo { runtime } => runtime.model_tokens_processed(),
+        PostTrainingPhaseRuntime::ForwardKl { runtime } => runtime.model_tokens_processed(),
+        PostTrainingPhaseRuntime::Grpo { runtime, .. } => runtime.model_tokens_processed(),
     }
 }
 
@@ -3357,7 +4153,7 @@ fn exact_model_token_delta(start: u64, end: u64) -> Result<u64> {
         .context("trainable-policy model-token counter regressed during an update")?;
     ensure!(
         delta > 0,
-        "trainable-policy adapter reported zero model tokens for a non-empty update"
+        "trainable device runtime reported zero model tokens for a non-empty update"
     );
     Ok(delta)
 }
@@ -3365,22 +4161,40 @@ fn exact_model_token_delta(start: u64, end: u64) -> Result<u64> {
 fn accumulate_resumable_update(
     phase: &PhaseV2,
     examples: &[TaskExample],
-    adapters: &mut PostTrainingPhaseAdapters<'_>,
+    batch_sha256: &str,
+    base_state: &PostTrainingCommittedState,
+    runtime: &mut PostTrainingPhaseRuntime<'_>,
     rng_seed: u64,
     rng_start: u64,
 ) -> Result<PreparedComputation> {
-    let model_tokens_start = adapter_model_tokens_processed(adapters);
+    ensure!(
+        !examples.is_empty() && examples.len() <= MAX_POST_TRAINING_UPDATE_EXAMPLES,
+        "post-training prepared update example geometry is invalid"
+    );
+    let model_tokens_start = runtime_model_tokens_processed(runtime);
     let sequence_length = phase.sequence_length.expect("validated sequence length");
+    ensure!(
+        sequence_length <= MAX_POST_TRAINING_SEQUENCE_TOKENS,
+        "post-training sequence length exceeds the native limit"
+    );
+    validate_sha256_identity(batch_sha256, "post-training batch")?;
+    base_state.validate()?;
+    let base = DeviceBatchBaseGeneration {
+        model_sha256: base_state.model.sha256(),
+        optimizer_sha256: base_state.optimizer.as_ref().map(ImmutableArtifact::sha256),
+    };
+    base.validate()?;
     let loss_weight = phase.loss_weight_or_default();
-    let batch_scale = loss_weight / examples.len() as f64;
+    ensure!(
+        loss_weight.is_finite() && loss_weight > 0.0,
+        "post-training loss weight must be finite and positive"
+    );
+    let example_count = u64::try_from(examples.len()).context("batch size exceeds u64")?;
     let config = phase
         .post_training
         .as_ref()
         .expect("validated post-training config");
-    let mut trace = Sha256::new();
-    trace_serialized(&mut trace, &phase.name)?;
-    trace_serialized(&mut trace, examples)?;
-    match (config, adapters) {
+    match (config, runtime) {
         (
             PostTrainingConfig::Dpo {
                 beta,
@@ -3388,97 +4202,68 @@ fn accumulate_resumable_update(
                 sequence_reduction,
                 ..
             },
-            PostTrainingPhaseAdapters::Dpo { policy, reference },
+            PostTrainingPhaseRuntime::Dpo { runtime },
         ) => {
-            let mut loss_sum = 0.0;
-            let mut preference_correct = 0_u64;
-            let mut implicit_reward_margin_sum = 0.0;
             for example in examples {
-                let TaskExample::PairwisePreference {
-                    prompt,
-                    chosen,
-                    rejected,
-                } = example
-                else {
+                if !matches!(example, TaskExample::PairwisePreference { .. }) {
                     bail!("DPO executor received a non-pairwise task example");
-                };
-                let policy_chosen =
-                    policy.continuation_log_probs(prompt, chosen, sequence_length)?;
-                let policy_rejected =
-                    policy.continuation_log_probs(prompt, rejected, sequence_length)?;
-                let reference_chosen =
-                    reference.continuation_log_probs(prompt, chosen, sequence_length)?;
-                let reference_rejected =
-                    reference.continuation_log_probs(prompt, rejected, sequence_length)?;
-                let objective = dpo_loss(
-                    PairwiseLogProbabilities {
-                        policy_chosen: reduce_sequence_log_probs(
-                            &policy_chosen,
-                            *sequence_reduction,
-                        )?,
-                        policy_rejected: reduce_sequence_log_probs(
-                            &policy_rejected,
-                            *sequence_reduction,
-                        )?,
-                        reference_chosen: reduce_sequence_log_probs(
-                            &reference_chosen,
-                            *sequence_reduction,
-                        )?,
-                        reference_rejected: reduce_sequence_log_probs(
-                            &reference_rejected,
-                            *sequence_reduction,
-                        )?,
-                    },
-                    *beta,
-                    *label_smoothing,
-                )?;
-                let chosen_gradients = distribute_sequence_gradient(
-                    objective.d_policy_chosen * batch_scale,
-                    policy_chosen.len(),
-                    *sequence_reduction,
-                );
-                let rejected_gradients = distribute_sequence_gradient(
-                    objective.d_policy_rejected * batch_scale,
-                    policy_rejected.len(),
-                    *sequence_reduction,
-                );
-                trace_serialized(
-                    &mut trace,
-                    &(
-                        &policy_chosen,
-                        &policy_rejected,
-                        &reference_chosen,
-                        &reference_rejected,
-                        objective.loss,
-                        &chosen_gradients,
-                        &rejected_gradients,
-                    ),
-                )?;
-                policy.backward_pairwise_log_probs(
-                    example,
-                    &chosen_gradients,
-                    &rejected_gradients,
-                )?;
-                loss_sum += objective.loss;
-                preference_correct += u64::from(objective.preference_correct);
-                implicit_reward_margin_sum += objective.implicit_reward_margin;
+                }
             }
+            let rng = ModelExecutionRngRange::reserve(
+                rng_seed,
+                rng_start,
+                example_count
+                    .checked_mul(2)
+                    .context("DPO model RNG range overflows u64")?,
+            )?;
+            let result = runtime.prepare_device_batch(DpoDeviceBatchRequest {
+                examples,
+                batch_sha256,
+                base,
+                max_sequence_tokens: sequence_length,
+                beta: *beta,
+                label_smoothing: *label_smoothing,
+                sequence_reduction: *sequence_reduction,
+                loss_weight,
+                rng,
+            })?;
+            result.receipt.validate()?;
+            ensure!(
+                result.examples == example_count,
+                "DPO device runtime returned a partial batch summary"
+            );
             let model_tokens =
-                exact_model_token_delta(model_tokens_start, policy.model_tokens_processed())?;
+                exact_model_token_delta(model_tokens_start, runtime.model_tokens_processed())?;
+            ensure!(
+                result.receipt.model_tokens == model_tokens,
+                "DPO device receipt disagrees with the runtime model-token counter"
+            );
+            let execution_sha256 = canonical_sha256(&(
+                "dpo_device_batch_v1",
+                batch_sha256,
+                base,
+                sequence_length,
+                beta,
+                label_smoothing,
+                sequence_reduction,
+                loss_weight,
+                rng,
+                &result,
+            ))?;
             let summary = PostTrainingUpdateSummary {
-                examples: u64::try_from(examples.len()).context("batch size exceeds u64")?,
+                examples: example_count,
                 model_tokens,
-                loss_sum,
-                execution_sha256: format!("sha256:{:x}", trace.finalize()),
+                loss_sum: result.loss_sum,
+                execution_sha256,
                 objective: PostTrainingObjectiveSummary::Dpo {
-                    preference_correct,
-                    implicit_reward_margin_sum,
+                    preference_correct: result.preference_correct,
+                    implicit_reward_margin_sum: result.implicit_reward_margin_sum,
                 },
             };
             summary.validate()?;
             Ok(PreparedComputation {
                 summary,
-                rng_end: rng_start,
+                rng_end: rng.end,
             })
         }
         (
@@ -3487,63 +4272,64 @@ fn accumulate_resumable_update(
                 scale_by_temperature_squared,
                 ..
             },
-            PostTrainingPhaseAdapters::ForwardKl { policy, teacher },
+            PostTrainingPhaseRuntime::ForwardKl { runtime },
         ) => {
-            let mut loss_sum = 0.0;
-            let mut forward_kl_sum = 0.0;
-            let mut teacher_entropy_sum = 0.0;
-            let mut top1_agreement_sum = 0.0;
             for example in examples {
-                let teacher_logits = teacher.token_logits(example, sequence_length)?;
-                let student_logits = policy.student_token_logits(example, sequence_length)?;
-                ensure!(
-                    teacher_logits.len() == student_logits.len(),
-                    "teacher/student target-token row counts differ"
-                );
-                let tokens: Vec<_> = teacher_logits
-                    .iter()
-                    .zip(&student_logits)
-                    .map(|(teacher_logits, student_logits)| DistillationToken {
-                        teacher_logits,
-                        student_logits,
-                        weight: 1.0,
-                    })
-                    .collect();
-                let objective =
-                    forward_kl_distillation(&tokens, *temperature, *scale_by_temperature_squared)?;
-                let mut gradients = objective.student_gradients;
-                for row in &mut gradients {
-                    for value in row {
-                        *value *= batch_scale;
-                    }
+                if !matches!(
+                    example,
+                    TaskExample::Autoregressive { .. } | TaskExample::SupervisedGeneration { .. }
+                ) {
+                    bail!("forward-KL executor received an incompatible task example");
                 }
-                trace_serialized(
-                    &mut trace,
-                    &(&teacher_logits, &student_logits, objective.loss, &gradients),
-                )?;
-                policy.backward_student_logits(example, &gradients)?;
-                loss_sum += objective.loss;
-                forward_kl_sum += objective.mean_forward_kl;
-                teacher_entropy_sum += objective.teacher_entropy;
-                top1_agreement_sum += objective.top1_agreement;
             }
+            let rng = ModelExecutionRngRange::reserve(rng_seed, rng_start, example_count)?;
+            let result = runtime.prepare_device_batch(ForwardKlDeviceBatchRequest {
+                examples,
+                batch_sha256,
+                base,
+                max_sequence_tokens: sequence_length,
+                temperature: *temperature,
+                scale_by_temperature_squared: *scale_by_temperature_squared,
+                loss_weight,
+                rng,
+            })?;
+            result.receipt.validate()?;
+            ensure!(
+                result.examples == example_count,
+                "forward-KL device runtime returned a partial batch summary"
+            );
             let model_tokens =
-                exact_model_token_delta(model_tokens_start, policy.model_tokens_processed())?;
+                exact_model_token_delta(model_tokens_start, runtime.model_tokens_processed())?;
+            ensure!(
+                result.receipt.model_tokens == model_tokens,
+                "forward-KL device receipt disagrees with the runtime model-token counter"
+            );
+            let execution_sha256 = canonical_sha256(&(
+                "forward_kl_device_batch_v1",
+                batch_sha256,
+                base,
+                sequence_length,
+                temperature,
+                scale_by_temperature_squared,
+                loss_weight,
+                rng,
+                &result,
+            ))?;
             let summary = PostTrainingUpdateSummary {
-                examples: u64::try_from(examples.len()).context("batch size exceeds u64")?,
+                examples: example_count,
                 model_tokens,
-                loss_sum,
-                execution_sha256: format!("sha256:{:x}", trace.finalize()),
+                loss_sum: result.loss_sum,
+                execution_sha256,
                 objective: PostTrainingObjectiveSummary::ForwardKl {
-                    forward_kl_sum,
-                    teacher_entropy_sum,
-                    top1_agreement_sum,
+                    forward_kl_sum: result.forward_kl_sum,
+                    teacher_entropy_sum: result.teacher_entropy_sum,
+                    top1_agreement_sum: result.top1_agreement_sum,
                 },
             };
             summary.validate()?;
             Ok(PreparedComputation {
                 summary,
-                rng_end: rng_start,
+                rng_end: rng.end,
             })
         }
         (
@@ -3555,133 +4341,138 @@ fn accumulate_resumable_update(
                 sampling,
                 ..
             },
-            PostTrainingPhaseAdapters::Grpo {
-                policy,
-                reference,
-                verifier,
-            },
+            PostTrainingPhaseRuntime::Grpo { runtime, verifier },
         ) => {
             let task = phase.task.as_ref().expect("validated task");
-            let mut loss_sum = 0.0;
-            let mut mean_reward_sum = 0.0;
-            let mut reward_stddev_sum = 0.0;
-            let mut mean_kl_sum = 0.0;
-            let mut clipped_fraction_sum = 0.0;
-            let mut rng_counter = rng_start;
             for example in examples {
-                let TaskExample::VerifiableRollout { prompt, .. } = example else {
+                if !matches!(example, TaskExample::VerifiableRollout { .. }) {
                     bail!("GRPO executor received a non-verifiable task example");
-                };
-                let generated = policy.generate(RolloutRequest {
-                    prompt,
-                    count: *group_size,
-                    max_sequence_tokens: sequence_length,
-                    sampling,
-                    rng_seed,
-                    rng_counter,
-                })?;
-                rng_counter = rng_counter
-                    .checked_add(u64::try_from(*group_size).context("GRPO group exceeds u64")?)
-                    .context("GRPO RNG counter overflows u64")?;
+                }
+            }
+            let group_count = u64::try_from(*group_size).context("GRPO group exceeds u64")?;
+            let rollouts = example_count
+                .checked_mul(group_count)
+                .context("GRPO rollout count overflows u64")?;
+            let generation_rng = ModelExecutionRngRange::reserve(rng_seed, rng_start, rollouts)?;
+            let scoring_rng =
+                ModelExecutionRngRange::reserve(rng_seed, generation_rng.end, rollouts)?;
+            let generated = runtime.generate_device_batch(GrpoGenerationBatchRequest {
+                examples,
+                batch_sha256,
+                base,
+                group_size: *group_size,
+                max_sequence_tokens: sequence_length,
+                sampling,
+                rng: generation_rng,
+            })?;
+            validate_sha256_identity(&generated.generation_sha256, "GRPO device generation")?;
+            ensure!(
+                generated.groups.len() == examples.len(),
+                "GRPO device runtime returned {} prompt groups, expected {}",
+                generated.groups.len(),
+                examples.len()
+            );
+            let mut rewards = Vec::with_capacity(examples.len());
+            let mut rollout_tokens = 0usize;
+            let mut rollout_text_bytes = 0usize;
+            for (example_index, (example, group)) in
+                examples.iter().zip(&generated.groups).enumerate()
+            {
                 ensure!(
-                    generated.len() == *group_size,
-                    "rollout generator returned {} candidates, expected {group_size}",
-                    generated.len()
+                    group.len() == *group_size,
+                    "GRPO device runtime returned {} rollouts for prompt {example_index}, expected {group_size}",
+                    group.len()
                 );
-                let mut rewards = Vec::with_capacity(*group_size);
-                let mut current_scores = Vec::with_capacity(*group_size);
-                let mut reference_scores = Vec::with_capacity(*group_size);
-                for (index, rollout) in generated.iter().enumerate() {
+                let mut group_rewards = Vec::with_capacity(*group_size);
+                for (rollout_index, rollout) in group.iter().enumerate() {
                     ensure!(
                         !rollout.text.trim().is_empty(),
-                        "rollout {index} completion is empty"
+                        "rollout {example_index}:{rollout_index} completion is empty"
                     );
                     ensure!(
-                        !rollout.token_ids.is_empty()
-                            && rollout.token_ids.len() == rollout.behavior_token_log_probs.len(),
-                        "rollout {index} token ids and behavior log-probs are not aligned"
+                        rollout.token_count > 0
+                            && rollout.token_count <= sampling.max_new_tokens
+                            && rollout.token_count <= sequence_length,
+                        "rollout {example_index}:{rollout_index} exceeds its configured token limit"
                     );
-                    ensure_finite(
-                        &rollout.behavior_token_log_probs,
-                        "rollout behavior log probabilities",
-                    )?;
-                    rewards.push(verify_rollout(task, example, *verifier, &rollout.text)?.reward);
-                    current_scores.push(policy.current_token_log_probs(
-                        prompt,
-                        rollout,
-                        sequence_length,
-                    )?);
-                    reference_scores.push(match reference.as_deref_mut() {
-                        Some(reference) => Some(reference.rollout_token_log_probs(
-                            prompt,
-                            rollout,
-                            sequence_length,
-                        )?),
-                        None => None,
-                    });
+                    rollout_tokens = rollout_tokens
+                        .checked_add(rollout.token_count)
+                        .context("GRPO rollout token count overflows usize")?;
+                    ensure!(
+                        rollout_tokens <= MAX_POST_TRAINING_ROLLOUT_TOKENS,
+                        "GRPO rollout group exceeds the native token limit"
+                    );
+                    rollout_text_bytes = rollout_text_bytes
+                        .checked_add(rollout.text.len())
+                        .context("GRPO rollout text byte count overflows usize")?;
+                    ensure!(
+                        rollout_text_bytes <= MAX_POST_TRAINING_UPDATE_INPUT_BYTES,
+                        "GRPO rollout text exceeds the native byte limit"
+                    );
+                    group_rewards
+                        .push(verify_rollout(task, example, *verifier, &rollout.text)?.reward);
                 }
-                let scalar_rollouts: Vec<_> = generated
-                    .iter()
-                    .enumerate()
-                    .map(|(index, rollout)| GrpoRollout {
-                        reward: rewards[index],
-                        current_token_log_probs: &current_scores[index],
-                        behavior_token_log_probs: &rollout.behavior_token_log_probs,
-                        reference_token_log_probs: reference_scores[index].as_deref(),
-                    })
-                    .collect();
-                let objective = grpo_loss(
-                    &scalar_rollouts,
-                    *clip_epsilon,
-                    *advantage_epsilon,
-                    *kl_coefficient,
-                )?;
-                let scaled_gradients: Vec<Vec<f64>> = objective
-                    .current_log_prob_gradients
-                    .iter()
-                    .map(|row| row.iter().map(|value| value * batch_scale).collect())
-                    .collect();
-                trace_serialized(
-                    &mut trace,
-                    &(
-                        &generated,
-                        &rewards,
-                        &current_scores,
-                        &reference_scores,
-                        objective.loss,
-                        &scaled_gradients,
-                    ),
-                )?;
-                for (index, rollout) in generated.iter().enumerate() {
-                    policy.backward_rollout_log_probs(prompt, rollout, &scaled_gradients[index])?;
-                }
-                loss_sum += objective.loss;
-                mean_reward_sum += objective.mean_reward;
-                reward_stddev_sum += objective.reward_stddev;
-                mean_kl_sum += objective.mean_kl;
-                clipped_fraction_sum += objective.clipped_fraction;
+                rewards.push(group_rewards);
             }
+            let result = runtime.prepare_device_batch(GrpoDeviceBatchRequest {
+                examples,
+                batch_sha256,
+                base,
+                generation: &generated,
+                rewards: &rewards,
+                clip_epsilon: *clip_epsilon,
+                advantage_epsilon: *advantage_epsilon,
+                kl_coefficient: *kl_coefficient,
+                loss_weight,
+                rng: scoring_rng,
+            })?;
+            result.receipt.validate()?;
+            ensure!(
+                result.examples == example_count && result.rollouts == rollouts,
+                "GRPO device runtime returned a partial batch summary"
+            );
             let model_tokens =
-                exact_model_token_delta(model_tokens_start, policy.model_tokens_processed())?;
+                exact_model_token_delta(model_tokens_start, runtime.model_tokens_processed())?;
+            ensure!(
+                result.receipt.model_tokens == model_tokens,
+                "GRPO device receipt disagrees with the runtime model-token counter"
+            );
+            let verification_sha256 = canonical_sha256(&(&generated, &rewards))?;
+            let execution_sha256 = canonical_sha256(&(
+                "grpo_device_batch_v1",
+                batch_sha256,
+                base,
+                sequence_length,
+                group_size,
+                clip_epsilon,
+                advantage_epsilon,
+                kl_coefficient,
+                sampling,
+                loss_weight,
+                generation_rng,
+                scoring_rng,
+                verification_sha256,
+                &result,
+            ))?;
             let summary = PostTrainingUpdateSummary {
-                examples: u64::try_from(examples.len()).context("batch size exceeds u64")?,
+                examples: example_count,
                 model_tokens,
-                loss_sum,
-                execution_sha256: format!("sha256:{:x}", trace.finalize()),
+                loss_sum: result.loss_sum,
+                execution_sha256,
                 objective: PostTrainingObjectiveSummary::Grpo {
-                    mean_reward_sum,
-                    reward_stddev_sum,
-                    mean_kl_sum,
-                    clipped_fraction_sum,
+                    mean_reward_sum: result.mean_reward_sum,
+                    reward_stddev_sum: result.reward_stddev_sum,
+                    mean_kl_sum: result.mean_kl_sum,
+                    clipped_fraction_sum: result.clipped_fraction_sum,
                 },
             };
             summary.validate()?;
             Ok(PreparedComputation {
                 summary,
-                rng_end: rng_counter,
+                rng_end: scoring_rng.end,
             })
         }
-        _ => bail!("post-training algorithm and adapter set do not match"),
+        _ => bail!("post-training algorithm and device runtime do not match"),
     }
 }
 
@@ -3690,6 +4481,7 @@ fn validate_restore_receipt(
     publisher_identity: &str,
     state: &PostTrainingCommittedState,
 ) -> Result<()> {
+    state.validate()?;
     ensure!(
         receipt.publisher_identity == publisher_identity
             && receipt.model_sha256 == state.model.sha256()
@@ -3768,12 +4560,13 @@ fn metric_context(
     request: &PhaseExecutionRequest,
     cursor: &PostTrainingCursor,
 ) -> Result<MetricContext> {
-    let kind = match request.phase.kind {
-        PhaseKind::Preference => MetricPhaseKind::Preference,
-        PhaseKind::Distillation => MetricPhaseKind::Distillation,
-        PhaseKind::Rl => MetricPhaseKind::Rl,
-        _ => bail!("unsupported post-training metric phase"),
-    };
+    ensure!(
+        matches!(
+            request.phase.kind,
+            PhaseKind::Preference | PhaseKind::Distillation | PhaseKind::Rl
+        ),
+        "unsupported post-training metric phase"
+    );
     Ok(MetricContext {
         global_step: cursor
             .clock
@@ -3784,13 +4577,13 @@ fn metric_context(
         phase: MetricPhase {
             index: u32::try_from(request.phase_index).context("phase index exceeds u32")?,
             name: request.phase.name.clone(),
-            kind,
+            kind: request.phase.kind.into(),
         },
         checkpoint_hash: Some(cursor.committed.model.sha256().to_owned()),
     })
 }
 
-fn validate_adapter_identity(identity: &str, name: &str) -> Result<()> {
+fn validate_runtime_identity(identity: &str, name: &str) -> Result<()> {
     ensure!(
         !identity.trim().is_empty() && !identity.contains(['\n', '\r']),
         "{name} identity must be non-empty and single-line"
@@ -3798,34 +4591,51 @@ fn validate_adapter_identity(identity: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_prefixed_sha256(value: &str, name: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{name} must use sha256:<64 lowercase hex>"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{name} must use sha256:<64 lowercase hex>"
-    );
-    Ok(())
+struct JsonDigestWriter {
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl JsonDigestWriter {
+    fn new() -> Self {
+        Self {
+            digest: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.bytes, format!("{:x}", self.digest.finalize()))
+    }
+}
+
+impl Write for JsonDigestWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(u64::try_from(buffer.len()).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("serialized JSON length overflows u64"))?;
+        self.digest.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_digest<T: Serialize + ?Sized>(
+    value: &T,
+    context: &'static str,
+) -> Result<(u64, String)> {
+    let mut writer = JsonDigestWriter::new();
+    serde_json::to_writer(&mut writer, value).context(context)?;
+    Ok(writer.finish())
 }
 
 fn canonical_sha256(value: &impl Serialize) -> Result<String> {
-    let bytes = serde_json::to_vec(value).context("failed to serialize content-addressed value")?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
-}
-
-fn trace_serialized<T: Serialize + ?Sized>(hasher: &mut Sha256, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value).context("failed to serialize execution trace")?;
-    hasher.update(
-        u64::try_from(bytes.len())
-            .context("execution trace component exceeds u64")?
-            .to_le_bytes(),
-    );
-    hasher.update(bytes);
-    Ok(())
+    let (_, digest) = serialized_json_digest(value, "failed to serialize content-addressed value")?;
+    sha256_identity_from_hex(&digest, "serialized JSON digest")
 }
 
 fn deterministic_rng_seed(workflow: &str, phase: &str, checkpoint: &str) -> u64 {
@@ -3840,10 +4650,7 @@ fn deterministic_rng_seed(workflow: &str, phase: &str, checkpoint: &str) -> u64 
 }
 
 fn empty_receipt_chain() -> String {
-    format!(
-        "sha256:{:x}",
-        Sha256::digest(b"post_training_receipt_chain_v1")
-    )
+    sha256_identity(b"post_training_receipt_chain_v1")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3864,6 +4671,10 @@ pub struct Verification {
 /// Named, executor-injected reward implementation. The adapter name must
 /// exactly match the task's verifier spec before it can score a rollout.
 pub trait RewardVerifier {
+    /// Content identity of the verifier implementation. Task parameters are
+    /// already part of the phase hash; this identity prevents another binary
+    /// with the same adapter name from changing rewards after resume.
+    fn identity(&self) -> &str;
     fn adapter_name(&self) -> &str;
     fn verify(&self, spec: &VerifierSpec, request: VerificationRequest<'_>)
     -> Result<Verification>;
@@ -3897,7 +4708,7 @@ pub fn verify_rollout(
             task.name()
         );
     };
-    verifier.verify(
+    let verification = verifier.verify(
         &spec,
         VerificationRequest {
             prompt,
@@ -3905,7 +4716,19 @@ pub fn verify_rollout(
             verifier_payload,
             reference_answer: reference_answer.as_deref(),
         },
-    )
+    )?;
+    ensure!(
+        verification.reward.is_finite(),
+        "verifier returned a non-finite reward"
+    );
+    ensure!(
+        verification
+            .components
+            .iter()
+            .all(|(name, value)| !name.trim().is_empty() && value.is_finite()),
+        "verifier returned an empty component name or non-finite component value"
+    );
+    Ok(verification)
 }
 
 /// Built-in deterministic verifier for exact-answer curricula. Arbitrary test
@@ -3930,6 +4753,10 @@ impl Default for ExactAnswerParameters {
 }
 
 impl RewardVerifier for ExactAnswerVerifier {
+    fn identity(&self) -> &str {
+        "sha256:ff08a60a76f25d2e611dd1e1755fcfe137e92913fa1ee1b8e1d59552ecce928b"
+    }
+
     fn adapter_name(&self) -> &str {
         "exact_answer"
     }
@@ -3989,12 +4816,25 @@ pub fn visit_task_examples(
 pub fn visit_task_examples_while(
     path: &Path,
     task: &TaskConfig,
+    visit: impl FnMut(TaskExample) -> Result<bool>,
+) -> Result<usize> {
+    visit_task_examples_while_with_record_limit(path, task, MAX_POST_TRAINING_RECORD_BYTES, visit)
+}
+
+fn visit_task_examples_while_with_record_limit(
+    path: &Path,
+    task: &TaskConfig,
+    maximum_record_bytes: usize,
     mut visit: impl FnMut(TaskExample) -> Result<bool>,
 ) -> Result<usize> {
     task.validate()?;
+    ensure!(
+        maximum_record_bytes > 0,
+        "task record byte limit must be positive"
+    );
     let file =
         File::open(path).with_context(|| format!("failed to open task data {}", path.display()))?;
-    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|ext| ext == "zst") {
+    let mut reader: Box<dyn BufRead> = if path.extension().is_some_and(|ext| ext == "zst") {
         Box::new(BufReader::new(
             zstd::stream::read::Decoder::new(file)
                 .with_context(|| format!("failed to open zstd task data {}", path.display()))?,
@@ -4010,10 +4850,23 @@ pub fn visit_task_examples_while(
     );
 
     let mut count = 0usize;
-    for (line_index, line) in reader.lines().enumerate() {
-        let line_number = line_index + 1;
-        let line = line.with_context(|| {
-            format!("failed to read task data {}:{line_number}", path.display())
+    let mut line_number = 0usize;
+    let mut line_bytes = Vec::new();
+    loop {
+        let next_line = line_number
+            .checked_add(1)
+            .context("task-data line counter overflows usize")?;
+        let read =
+            read_post_training_record_bounded(&mut *reader, &mut line_bytes, maximum_record_bytes)
+                .with_context(|| {
+                    format!("failed to read task data {}:{next_line}", path.display())
+                })?;
+        if read == 0 {
+            break;
+        }
+        line_number = next_line;
+        let line = String::from_utf8(std::mem::take(&mut line_bytes)).with_context(|| {
+            format!("task data is not UTF-8 at {}:{line_number}", path.display())
         })?;
         if line.trim().is_empty() {
             continue;
@@ -4052,22 +4905,6 @@ fn is_jsonl_path(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
-}
-
-fn normalize_sha256(value: &str) -> String {
-    value
-        .strip_prefix("sha256:")
-        .unwrap_or(value)
-        .to_ascii_lowercase()
-}
-
-fn validate_sha256(value: &str) -> Result<()> {
-    let value = normalize_sha256(value);
-    ensure!(
-        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "sha256 must contain exactly 64 hexadecimal digits"
-    );
-    Ok(())
 }
 
 fn ensure_finite(values: &[f64], name: &str) -> Result<()> {
@@ -4139,6 +4976,42 @@ mod tests {
         assert!(
             (actual - expected).abs() < 1e-12,
             "expected {expected:.16}, got {actual:.16}"
+        );
+    }
+
+    #[test]
+    fn post_training_record_reader_enforces_a_hard_allocation_bound() {
+        let mut accepted = std::io::Cursor::new(b"12345\nrest".to_vec());
+        let mut output = Vec::new();
+        assert_eq!(
+            read_post_training_record_bounded(&mut accepted, &mut output, 5).unwrap(),
+            6
+        );
+        assert_eq!(output, b"12345\n");
+
+        let mut oversized = std::io::Cursor::new(b"123456\n".to_vec());
+        let error = read_post_training_record_bounded(&mut oversized, &mut output, 5)
+            .expect_err("delimiter beyond the byte limit must be rejected");
+        assert!(error.to_string().contains("maximum of 5 bytes"));
+
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(read_post_training_record_bounded(&mut empty, &mut output, 0).is_err());
+    }
+
+    #[test]
+    fn streaming_json_digest_matches_canonical_json_bytes() {
+        let value = json!({
+            "algorithm": "forward_kl",
+            "rows": [[1.0, 2.0], [3.0, 4.0]],
+            "enabled": true
+        });
+        let encoded = serde_json::to_vec(&value).unwrap();
+        let (bytes, digest) = serialized_json_digest(&value, "test serialization").unwrap();
+        assert_eq!(bytes, u64::try_from(encoded.len()).unwrap());
+        assert_eq!(digest, format!("{:x}", Sha256::digest(&encoded)));
+        assert_eq!(
+            canonical_sha256(&value).unwrap(),
+            format!("sha256:{digest}")
         );
     }
 
@@ -4581,6 +5454,10 @@ mod tests {
     fn verifier_adapter_mismatch_is_not_coerced() {
         struct WrongVerifier;
         impl RewardVerifier for WrongVerifier {
+            fn identity(&self) -> &str {
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }
+
             fn adapter_name(&self) -> &str {
                 "unit_tests"
             }
@@ -4610,6 +5487,126 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("adapter mismatch"), "{error}");
+    }
+
+    #[test]
+    fn grpo_verifier_mismatch_rejects_before_generating_rollouts() {
+        struct WrongVerifier;
+
+        impl RewardVerifier for WrongVerifier {
+            fn identity(&self) -> &str {
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }
+
+            fn adapter_name(&self) -> &str {
+                "wrong_verifier"
+            }
+
+            fn verify(
+                &self,
+                _spec: &VerifierSpec,
+                _request: VerificationRequest<'_>,
+            ) -> Result<Verification> {
+                unreachable!("verifier mismatch must reject during adapter preflight")
+            }
+        }
+
+        let (_dir, request) = test_request(TestPostTrainingAlgorithm::Grpo);
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestGrpoRuntime::new();
+        let mut adapters = PostTrainingPhaseRuntime::Grpo {
+            runtime: &mut policy,
+            verifier: &WrongVerifier,
+        };
+        let error = drive_resumable_post_training_phase(
+            &test_sha("wrong-verifier-preflight"),
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut None,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("verifier adapter mismatch"), "{error}");
+        assert_eq!(policy.model_tokens, 0);
+        assert_eq!(publisher.restore_calls, 0);
+    }
+
+    #[test]
+    fn grpo_rejects_non_finite_verifier_reward_before_numeric_batch() {
+        struct NonFiniteVerifier;
+
+        impl RewardVerifier for NonFiniteVerifier {
+            fn identity(&self) -> &str {
+                "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+            }
+
+            fn adapter_name(&self) -> &str {
+                "exact_answer"
+            }
+
+            fn verify(
+                &self,
+                _spec: &VerifierSpec,
+                _request: VerificationRequest<'_>,
+            ) -> Result<Verification> {
+                Ok(Verification {
+                    reward: f64::NAN,
+                    passed: false,
+                    components: BTreeMap::new(),
+                })
+            }
+        }
+
+        let (_dir, mut request) = test_request(TestPostTrainingAlgorithm::Grpo);
+        request.phase.steps = Some(1);
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut runtime = TestGrpoRuntime::new();
+        let mut phase_runtime = PostTrainingPhaseRuntime::Grpo {
+            runtime: &mut runtime,
+            verifier: &NonFiniteVerifier,
+        };
+        let error = drive_resumable_post_training_phase(
+            &test_sha("non-finite-verifier-reward"),
+            &request,
+            &mut phase_runtime,
+            &mut publisher,
+            &mut None,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("non-finite reward"), "{error}");
+        assert_eq!(runtime.generation_calls, 1);
+        assert_eq!(runtime.prepare_calls, 0);
+        assert_eq!(runtime.optimizer_steps, 0);
+        assert_eq!(publisher.apply_calls, 0);
+    }
+
+    #[test]
+    fn deserialized_post_training_state_revalidates_artifact_identities() {
+        let empty_uri: PostTrainingCommittedState = serde_json::from_value(json!({
+            "model": {"uri": "", "sha256": test_sha("model")}
+        }))
+        .unwrap();
+        let error = empty_uri.validate().unwrap_err().to_string();
+        assert!(error.contains("checkpoint URI is empty"), "{error}");
+
+        let malformed_optimizer: PostTrainingCommittedState = serde_json::from_value(json!({
+            "model": {"uri": "test://model", "sha256": test_sha("model")},
+            "optimizer": {"uri": "test://optimizer", "sha256": "not-a-digest"}
+        }))
+        .unwrap();
+        let error = malformed_optimizer.validate().unwrap_err().to_string();
+        assert!(error.contains("artifact digest"), "{error}");
     }
 
     #[test]
@@ -4646,52 +5643,385 @@ mod tests {
         assert!(error.contains("invalid JSON"), "{error}");
     }
 
-    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    #[test]
+    fn task_example_reader_rejects_oversized_plain_record_before_visiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.txt");
+        fs::write(&path, format!("{}\n", "x".repeat(65))).unwrap();
+        let task: TaskConfig = serde_json::from_value(json!({"type": "causal_lm"})).unwrap();
+        let mut visits = 0usize;
+        let error = visit_task_examples_while_with_record_limit(&path, &task, 64, |_| {
+            visits += 1;
+            Ok(true)
+        })
+        .unwrap_err();
+        let error = format!("{error:#}");
 
-    struct TestSequencePolicy {
-        identity: String,
-        backward_calls: usize,
-        optimizer_steps: usize,
-        model_tokens: u64,
+        assert!(error.contains("maximum of 64 bytes"), "{error}");
+        assert_eq!(visits, 0);
     }
 
-    impl SequenceLogProbabilityProvider for TestSequencePolicy {
-        fn identity(&self) -> &str {
+    #[test]
+    fn task_example_reader_rejects_oversized_zstd_record_before_visiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.txt.zst");
+        let payload = format!("{}\n", "x".repeat(65));
+        let compressed = zstd::stream::encode_all(payload.as_bytes(), 0).unwrap();
+        fs::write(&path, compressed).unwrap();
+        let task: TaskConfig = serde_json::from_value(json!({"type": "causal_lm"})).unwrap();
+        let mut visits = 0usize;
+        let error = visit_task_examples_while_with_record_limit(&path, &task, 64, |_| {
+            visits += 1;
+            Ok(true)
+        })
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("maximum of 64 bytes"), "{error}");
+        assert_eq!(visits, 0);
+    }
+
+    #[test]
+    fn task_example_reader_early_stop_does_not_read_later_oversized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("early-stop.txt");
+        fs::write(&path, format!("first\n{}\n", "x".repeat(65))).unwrap();
+        let task: TaskConfig = serde_json::from_value(json!({"type": "causal_lm"})).unwrap();
+        let mut visits = 0usize;
+        let count = visit_task_examples_while_with_record_limit(&path, &task, 64, |_| {
+            visits += 1;
+            Ok(false)
+        })
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(visits, 1);
+    }
+
+    #[test]
+    fn authenticated_post_training_batches_stream_sequentially_across_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preference.jsonl");
+        let rows = ["p0", "p1", "p2"]
+            .into_iter()
+            .map(|prompt| json!({"prompt": prompt, "chosen": "yes", "rejected": "no"}))
+            .map(|row| serde_json::to_string(&row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, rows).unwrap();
+        let task: TaskConfig =
+            serde_json::from_value(json!({"type": "pairwise_preference"})).unwrap();
+        let source = AuthenticatedPostTrainingInput::open(&path).unwrap();
+        let mut stream = PostTrainingBatchStream::new(
+            source,
+            task,
+            PostTrainingRecordPosition {
+                epoch: 0,
+                record: 0,
+            },
+            2,
+        )
+        .unwrap();
+
+        let error = stream
+            .next_batch(MAX_POST_TRAINING_UPDATE_EXAMPLES + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("target batch exceeds"), "{error}");
+
+        let first = stream.next_batch(2).unwrap();
+        assert_eq!(first.end.epoch, 0);
+        assert_eq!(first.end.record, 2);
+        assert!(matches!(
+            &first.examples[..],
+            [
+                TaskExample::PairwisePreference { prompt: first, .. },
+                TaskExample::PairwisePreference { prompt: second, .. }
+            ] if first == "p0" && second == "p1"
+        ));
+
+        let second = stream.next_batch(2).unwrap();
+        assert_eq!(second.end.epoch, 1);
+        assert_eq!(second.end.record, 1);
+        assert!(matches!(
+            &second.examples[..],
+            [
+                TaskExample::PairwisePreference { prompt: first, .. },
+                TaskExample::PairwisePreference { prompt: second, .. }
+            ] if first == "p2" && second == "p0"
+        ));
+
+        let final_batch = stream.next_batch(2).unwrap();
+        assert_eq!(final_batch.end.epoch, 2);
+        assert_eq!(final_batch.end.record, 0);
+        assert!(matches!(
+            &final_batch.examples[..],
+            [
+                TaskExample::PairwisePreference { prompt: first, .. },
+                TaskExample::PairwisePreference { prompt: second, .. }
+            ] if first == "p1" && second == "p2"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_post_training_stream_rejects_path_replacement_before_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preference.jsonl");
+        let replacement = dir.path().join("replacement.jsonl");
+        fs::write(
+            &path,
+            serde_json::to_string(
+                &json!({"prompt": "original", "chosen": "yes", "rejected": "no"}),
+            )
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        fs::write(
+            &replacement,
+            serde_json::to_string(
+                &json!({"prompt": "replaced", "chosen": "yes", "rejected": "no"}),
+            )
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        let task: TaskConfig =
+            serde_json::from_value(json!({"type": "pairwise_preference"})).unwrap();
+        let source = AuthenticatedPostTrainingInput::open(&path).unwrap();
+        let mut stream = PostTrainingBatchStream::new(
+            source,
+            task,
+            PostTrainingRecordPosition {
+                epoch: 0,
+                record: 0,
+            },
+            1,
+        )
+        .unwrap();
+
+        fs::rename(&replacement, &path).unwrap();
+        let error = stream.next_batch(1).unwrap_err().to_string();
+        assert!(
+            error.contains("changed after it was authenticated"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_post_training_stream_rejects_same_inode_mutation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preference.jsonl");
+        let original = serde_json::to_string(
+            &json!({"prompt": "original", "chosen": "yes", "rejected": "no"}),
+        )
+        .unwrap()
+            + "\n";
+        let modified = serde_json::to_string(
+            &json!({"prompt": "modified", "chosen": "yes", "rejected": "no"}),
+        )
+        .unwrap()
+            + "\n";
+        assert_eq!(original.len(), modified.len());
+        fs::write(&path, original).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let task: TaskConfig =
+            serde_json::from_value(json!({"type": "pairwise_preference"})).unwrap();
+        let source = AuthenticatedPostTrainingInput::open(&path).unwrap();
+        let mut stream = PostTrainingBatchStream::new(
+            source,
+            task,
+            PostTrainingRecordPosition {
+                epoch: 0,
+                record: 0,
+            },
+            1,
+        )
+        .unwrap();
+
+        fs::write(&path, modified).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        let error = stream.next_batch(1).unwrap_err().to_string();
+        assert!(
+            error.contains("changed after it was authenticated"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_post_training_input_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let link = dir.path().join("input.jsonl");
+        fs::write(
+            &target,
+            "{\"prompt\":\"p\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n",
+        )
+        .unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = match AuthenticatedPostTrainingInput::open(&link) {
+            Ok(_) => panic!("symlinked post-training input unexpectedly authenticated"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("non-symlink regular file"), "{error}");
+    }
+
+    const ABC_SHA256: &str =
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn test_device_receipt(content: &impl Serialize, model_tokens: u64) -> DeviceExecutionReceipt {
+        DeviceExecutionReceipt {
+            execution_sha256: canonical_sha256(content).unwrap(),
+            model_tokens,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestDpoFault {
+        MalformedReceipt,
+        PartialSummary,
+        TokenCountMismatch,
+        NonFiniteSummary,
+        NegativeLoss,
+    }
+
+    struct TestDpoRuntime {
+        identity: String,
+        frozen_identity: String,
+        frozen_tokenizer_identity: String,
+        prepare_calls: usize,
+        optimizer_steps: usize,
+        model_tokens: u64,
+        rng_ranges: Vec<ModelExecutionRngRange>,
+        fault: Option<TestDpoFault>,
+    }
+
+    impl TestDpoRuntime {
+        fn new(identity: impl Into<String>) -> Self {
+            Self {
+                identity: identity.into(),
+                frozen_identity: test_sha("abc"),
+                frozen_tokenizer_identity: "tokenizer-sha256:test".to_owned(),
+                prepare_calls: 0,
+                optimizer_steps: 0,
+                model_tokens: 0,
+                rng_ranges: Vec::new(),
+                fault: None,
+            }
+        }
+    }
+
+    impl DpoDeviceBatchRuntime for TestDpoRuntime {
+        fn trainable_identity(&self) -> &str {
             &self.identity
         }
 
-        fn tokenizer_identity(&self) -> &str {
+        fn trainable_tokenizer_identity(&self) -> &str {
             "tokenizer-sha256:test"
         }
 
-        fn continuation_log_probs(
-            &mut self,
-            _prompt: &str,
-            continuation: &str,
-            _max_sequence_tokens: usize,
-        ) -> Result<Vec<f64>> {
-            self.model_tokens += 1;
-            Ok(vec![if continuation == "yes" { -0.2 } else { -0.8 }])
+        fn frozen_identity(&self) -> &str {
+            &self.frozen_identity
         }
-    }
 
-    impl PreferencePolicy for TestSequencePolicy {
+        fn frozen_tokenizer_identity(&self) -> &str {
+            &self.frozen_tokenizer_identity
+        }
+
         fn model_tokens_processed(&self) -> u64 {
             self.model_tokens
         }
 
-        fn backward_pairwise_log_probs(
+        fn prepare_device_batch(
             &mut self,
-            _example: &TaskExample,
-            chosen_gradients: &[f64],
-            rejected_gradients: &[f64],
-        ) -> Result<()> {
+            request: DpoDeviceBatchRequest<'_>,
+        ) -> Result<DpoDeviceBatchResult> {
+            validate_sha256_identity(request.batch_sha256, "test DPO batch")?;
+            request.base.validate()?;
+            let examples = u64::try_from(request.examples.len()).unwrap();
             ensure!(
-                chosen_gradients.len() == 1 && rejected_gradients.len() == 1,
-                "unexpected test gradient shape"
+                request.rng.len() == examples * 2,
+                "test DPO runtime received the wrong RNG geometry"
             );
-            self.backward_calls += 1;
-            Ok(())
+            let mut loss_sum = 0.0;
+            let mut preference_correct = 0;
+            let mut implicit_reward_margin_sum = 0.0;
+            for (index, example) in request.examples.iter().enumerate() {
+                let TaskExample::PairwisePreference { .. } = example else {
+                    bail!("test DPO runtime received another task type");
+                };
+                let offset = u64::try_from(index).unwrap() * 2;
+                let chosen_rng = request.rng.substream(offset)?;
+                let rejected_rng = request.rng.substream(offset + 1)?;
+                let chosen_jitter =
+                    ((chosen_rng.seed ^ chosen_rng.counter) & 0xffff) as f64 * f64::EPSILON;
+                let rejected_jitter =
+                    ((rejected_rng.seed ^ rejected_rng.counter) & 0xffff) as f64 * f64::EPSILON;
+                let objective = dpo_loss(
+                    PairwiseLogProbabilities {
+                        policy_chosen: -0.2 + chosen_jitter,
+                        policy_rejected: -0.8 + rejected_jitter,
+                        reference_chosen: -0.5,
+                        reference_rejected: -0.5,
+                    },
+                    request.beta,
+                    request.label_smoothing,
+                )?;
+                loss_sum += objective.loss;
+                preference_correct += u64::from(objective.preference_correct);
+                implicit_reward_margin_sum += objective.implicit_reward_margin;
+            }
+            ensure!(request.loss_weight.is_finite(), "invalid test loss weight");
+            self.prepare_calls += 1;
+            self.rng_ranges.push(request.rng);
+            let model_tokens = examples * 2;
+            self.model_tokens += model_tokens;
+            let mut result = DpoDeviceBatchResult {
+                receipt: test_device_receipt(
+                    &(
+                        "test-dpo-device-v1",
+                        request.batch_sha256,
+                        request.base,
+                        request.max_sequence_tokens,
+                        request.beta,
+                        request.label_smoothing,
+                        request.sequence_reduction,
+                        request.loss_weight,
+                        request.rng,
+                        loss_sum,
+                        preference_correct,
+                        implicit_reward_margin_sum,
+                        "backward-staged",
+                    ),
+                    model_tokens,
+                ),
+                examples,
+                loss_sum,
+                preference_correct,
+                implicit_reward_margin_sum,
+            };
+            match self.fault {
+                Some(TestDpoFault::MalformedReceipt) => {
+                    result.receipt.execution_sha256 = "not-a-digest".to_owned();
+                }
+                Some(TestDpoFault::PartialSummary) => result.examples -= 1,
+                Some(TestDpoFault::TokenCountMismatch) => {
+                    result.receipt.model_tokens += 1;
+                }
+                Some(TestDpoFault::NonFiniteSummary) => result.loss_sum = f64::NAN,
+                Some(TestDpoFault::NegativeLoss) => result.loss_sum = -1.0,
+                None => {}
+            }
+            Ok(result)
         }
 
         fn optimizer_step(&mut self, learning_rate_scale: f64) -> Result<()> {
@@ -4701,39 +6031,53 @@ mod tests {
         }
     }
 
-    struct TestReference;
-
-    impl SequenceLogProbabilityProvider for TestReference {
-        fn identity(&self) -> &str {
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        }
-
-        fn tokenizer_identity(&self) -> &str {
-            "tokenizer-sha256:test"
-        }
-
-        fn continuation_log_probs(
-            &mut self,
-            _prompt: &str,
-            _continuation: &str,
-            _max_sequence_tokens: usize,
-        ) -> Result<Vec<f64>> {
-            Ok(vec![-0.5])
-        }
+    #[test]
+    fn dpo_device_runtime_rejects_tokenizer_misalignment_before_model_work() {
+        let (_dir, request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        let mut runtime = TestDpoRuntime::new("candidate:dpo");
+        runtime.frozen_tokenizer_identity = "tokenizer-sha256:drifted".to_owned();
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut runtime,
+        };
+        let error = validate_and_capture_runtime_identities(&request.phase, &mut adapters)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tokenizer identities differ"), "{error}");
+        assert_eq!(runtime.prepare_calls, 0);
     }
 
-    struct TestStudent {
-        gradients: Vec<Vec<Vec<f64>>>,
+    struct TestForwardKlRuntime {
+        prepare_calls: usize,
         optimizer_steps: usize,
         model_tokens: u64,
+        rng_ranges: Vec<ModelExecutionRngRange>,
     }
 
-    impl DistillationPolicy for TestStudent {
-        fn identity(&self) -> &str {
+    impl TestForwardKlRuntime {
+        fn new() -> Self {
+            Self {
+                prepare_calls: 0,
+                optimizer_steps: 0,
+                model_tokens: 0,
+                rng_ranges: Vec::new(),
+            }
+        }
+    }
+
+    impl ForwardKlDeviceBatchRuntime for TestForwardKlRuntime {
+        fn trainable_identity(&self) -> &str {
             "candidate:student"
         }
 
-        fn tokenizer_identity(&self) -> &str {
+        fn trainable_tokenizer_identity(&self) -> &str {
+            "tokenizer-sha256:test"
+        }
+
+        fn frozen_identity(&self) -> &str {
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        }
+
+        fn frozen_tokenizer_identity(&self) -> &str {
             "tokenizer-sha256:test"
         }
 
@@ -4741,22 +6085,78 @@ mod tests {
             self.model_tokens
         }
 
-        fn student_token_logits(
+        fn prepare_device_batch(
             &mut self,
-            _example: &TaskExample,
-            _max_sequence_tokens: usize,
-        ) -> Result<Vec<Vec<f64>>> {
-            self.model_tokens += 1;
-            Ok(vec![vec![0.0, 0.0]])
-        }
-
-        fn backward_student_logits(
-            &mut self,
-            _example: &TaskExample,
-            gradients: &[Vec<f64>],
-        ) -> Result<()> {
-            self.gradients.push(gradients.to_vec());
-            Ok(())
+            request: ForwardKlDeviceBatchRequest<'_>,
+        ) -> Result<ForwardKlDeviceBatchResult> {
+            validate_sha256_identity(request.batch_sha256, "test forward-KL batch")?;
+            request.base.validate()?;
+            let examples = u64::try_from(request.examples.len()).unwrap();
+            ensure!(
+                request.rng.len() == examples,
+                "test forward-KL runtime received the wrong RNG geometry"
+            );
+            let teacher = [3.0_f64.ln(), 0.0];
+            let mut loss_sum = 0.0;
+            let mut forward_kl_sum = 0.0;
+            let mut teacher_entropy_sum = 0.0;
+            let mut top1_agreement_sum = 0.0;
+            for (index, example) in request.examples.iter().enumerate() {
+                ensure!(
+                    matches!(
+                        example,
+                        TaskExample::Autoregressive { .. }
+                            | TaskExample::SupervisedGeneration { .. }
+                    ),
+                    "test forward-KL runtime received another task type"
+                );
+                let execution_rng = request.rng.substream(u64::try_from(index).unwrap())?;
+                let jitter =
+                    ((execution_rng.seed ^ execution_rng.counter) & 0xffff) as f64 * f64::EPSILON;
+                let student = [jitter, 0.0];
+                let objective = forward_kl_distillation(
+                    &[DistillationToken {
+                        teacher_logits: &teacher,
+                        student_logits: &student,
+                        weight: 1.0,
+                    }],
+                    request.temperature,
+                    request.scale_by_temperature_squared,
+                )?;
+                loss_sum += objective.loss;
+                forward_kl_sum += objective.mean_forward_kl;
+                teacher_entropy_sum += objective.teacher_entropy;
+                top1_agreement_sum += objective.top1_agreement;
+            }
+            ensure!(request.loss_weight.is_finite(), "invalid test loss weight");
+            self.prepare_calls += 1;
+            self.rng_ranges.push(request.rng);
+            self.model_tokens += examples;
+            Ok(ForwardKlDeviceBatchResult {
+                receipt: test_device_receipt(
+                    &(
+                        "test-forward-kl-device-v1",
+                        request.batch_sha256,
+                        request.base,
+                        request.max_sequence_tokens,
+                        request.temperature,
+                        request.scale_by_temperature_squared,
+                        request.loss_weight,
+                        request.rng,
+                        loss_sum,
+                        forward_kl_sum,
+                        teacher_entropy_sum,
+                        top1_agreement_sum,
+                        "backward-staged",
+                    ),
+                    examples,
+                ),
+                examples,
+                loss_sum,
+                forward_kl_sum,
+                teacher_entropy_sum,
+                top1_agreement_sum,
+            })
         }
 
         fn optimizer_step(&mut self, learning_rate_scale: f64) -> Result<()> {
@@ -4766,87 +6166,206 @@ mod tests {
         }
     }
 
-    struct TestTeacher;
-
-    impl TeacherDistributionProvider for TestTeacher {
-        fn identity(&self) -> &str {
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        }
-
-        fn tokenizer_identity(&self) -> &str {
-            "tokenizer-sha256:test"
-        }
-
-        fn token_logits(
-            &mut self,
-            _example: &TaskExample,
-            _max_sequence_tokens: usize,
-        ) -> Result<Vec<Vec<f64>>> {
-            Ok(vec![vec![3.0_f64.ln(), 0.0]])
-        }
-    }
-
-    struct TestGrpoPolicy {
-        backward_calls: usize,
+    struct TestGrpoRuntime {
+        generation_calls: usize,
+        prepare_calls: usize,
         optimizer_steps: usize,
         model_tokens: u64,
+        rollout_tokens: usize,
+        has_reference: bool,
+        generation_ranges: Vec<ModelExecutionRngRange>,
+        scoring_ranges: Vec<ModelExecutionRngRange>,
     }
 
-    impl RolloutGenerator for TestGrpoPolicy {
-        fn identity(&self) -> &str {
+    impl TestGrpoRuntime {
+        fn new() -> Self {
+            Self {
+                generation_calls: 0,
+                prepare_calls: 0,
+                optimizer_steps: 0,
+                model_tokens: 0,
+                rollout_tokens: 1,
+                has_reference: false,
+                generation_ranges: Vec::new(),
+                scoring_ranges: Vec::new(),
+            }
+        }
+
+        fn with_reference() -> Self {
+            Self {
+                has_reference: true,
+                ..Self::new()
+            }
+        }
+    }
+
+    impl GrpoDeviceBatchRuntime for TestGrpoRuntime {
+        fn trainable_identity(&self) -> &str {
             "candidate:policy"
         }
 
-        fn generate(&mut self, request: RolloutRequest<'_>) -> Result<Vec<GeneratedRollout>> {
-            ensure!(request.count == 2, "test expected a two-rollout group");
-            ensure!(
-                request.max_sequence_tokens == 128,
-                "test sequence length was not propagated"
-            );
-            self.model_tokens += u64::try_from(request.count).unwrap();
-            Ok(vec![
-                GeneratedRollout {
-                    text: "ok".to_owned(),
-                    token_ids: vec![1],
-                    behavior_token_log_probs: vec![0.0],
-                },
-                GeneratedRollout {
-                    text: "wrong".to_owned(),
-                    token_ids: vec![2],
-                    behavior_token_log_probs: vec![0.0],
-                },
-            ])
-        }
-    }
-
-    impl GrpoPolicy for TestGrpoPolicy {
-        fn tokenizer_identity(&self) -> &str {
+        fn trainable_tokenizer_identity(&self) -> &str {
             "tokenizer-sha256:test"
+        }
+
+        fn frozen_identity(&self) -> Option<&str> {
+            self.has_reference.then_some(
+                "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            )
+        }
+
+        fn frozen_tokenizer_identity(&self) -> Option<&str> {
+            self.has_reference.then_some("tokenizer-sha256:test")
         }
 
         fn model_tokens_processed(&self) -> u64 {
             self.model_tokens
         }
 
-        fn current_token_log_probs(
+        fn generate_device_batch(
             &mut self,
-            _prompt: &str,
-            _rollout: &GeneratedRollout,
-            _max_sequence_tokens: usize,
-        ) -> Result<Vec<f64>> {
-            self.model_tokens += 1;
-            Ok(vec![0.0])
+            request: GrpoGenerationBatchRequest<'_>,
+        ) -> Result<GrpoGeneratedBatch> {
+            validate_sha256_identity(request.batch_sha256, "test GRPO batch")?;
+            request.base.validate()?;
+            let examples = u64::try_from(request.examples.len()).unwrap();
+            let group_size = u64::try_from(request.group_size).unwrap();
+            ensure!(
+                request.rng.len() == examples * group_size,
+                "test GRPO generator received the wrong RNG geometry"
+            );
+            self.generation_calls += 1;
+            self.generation_ranges.push(request.rng);
+            self.model_tokens += examples * group_size;
+            let groups = request
+                .examples
+                .iter()
+                .map(|_| {
+                    (0..request.group_size)
+                        .map(|index| GeneratedRolloutText {
+                            text: if index == 0 { "ok" } else { "wrong" }.to_owned(),
+                            token_count: self.rollout_tokens,
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(GrpoGeneratedBatch {
+                generation_sha256: canonical_sha256(&(
+                    "test-grpo-generation-v1",
+                    request.batch_sha256,
+                    request.base,
+                    request.group_size,
+                    request.max_sequence_tokens,
+                    request.sampling,
+                    request.rng,
+                    self.rollout_tokens,
+                ))?,
+                groups,
+            })
         }
 
-        fn backward_rollout_log_probs(
+        fn prepare_device_batch(
             &mut self,
-            _prompt: &str,
-            _rollout: &GeneratedRollout,
-            gradients: &[f64],
-        ) -> Result<()> {
-            ensure!(gradients.len() == 1, "unexpected test gradient shape");
-            self.backward_calls += 1;
-            Ok(())
+            request: GrpoDeviceBatchRequest<'_>,
+        ) -> Result<GrpoDeviceBatchResult> {
+            validate_sha256_identity(request.batch_sha256, "test GRPO batch")?;
+            request.base.validate()?;
+            let examples = u64::try_from(request.examples.len()).unwrap();
+            let rollouts = request
+                .generation
+                .groups
+                .iter()
+                .try_fold(0_u64, |total, group| {
+                    total.checked_add(u64::try_from(group.len()).unwrap())
+                })
+                .context("test GRPO rollout count overflow")?;
+            ensure!(
+                request.rng.len() == rollouts,
+                "test GRPO scorer received the wrong RNG geometry"
+            );
+            ensure!(
+                request.rewards.len() == request.generation.groups.len(),
+                "test GRPO rewards are not grouped"
+            );
+            let mut loss_sum = 0.0;
+            let mut mean_reward_sum = 0.0;
+            let mut reward_stddev_sum = 0.0;
+            let mut mean_kl_sum = 0.0;
+            let mut clipped_fraction_sum = 0.0;
+            for (group, rewards) in request.generation.groups.iter().zip(request.rewards) {
+                ensure!(
+                    group.len() == rewards.len(),
+                    "test GRPO reward count differs"
+                );
+                let current: Vec<_> = group
+                    .iter()
+                    .map(|rollout| vec![0.0; rollout.token_count])
+                    .collect();
+                let behavior = current.clone();
+                let reference: Option<Vec<_>> = self.has_reference.then(|| {
+                    group
+                        .iter()
+                        .map(|rollout| vec![-0.1; rollout.token_count])
+                        .collect()
+                });
+                let scalar: Vec<_> = rewards
+                    .iter()
+                    .enumerate()
+                    .map(|(index, reward)| GrpoRollout {
+                        reward: *reward,
+                        current_token_log_probs: &current[index],
+                        behavior_token_log_probs: &behavior[index],
+                        reference_token_log_probs: reference
+                            .as_ref()
+                            .map(|rows| rows[index].as_slice()),
+                    })
+                    .collect();
+                let objective = grpo_loss(
+                    &scalar,
+                    request.clip_epsilon,
+                    request.advantage_epsilon,
+                    request.kl_coefficient,
+                )?;
+                loss_sum += objective.loss;
+                mean_reward_sum += objective.mean_reward;
+                reward_stddev_sum += objective.reward_stddev;
+                mean_kl_sum += objective.mean_kl;
+                clipped_fraction_sum += objective.clipped_fraction;
+            }
+            ensure!(request.loss_weight.is_finite(), "invalid test loss weight");
+            self.prepare_calls += 1;
+            self.scoring_ranges.push(request.rng);
+            self.model_tokens += rollouts;
+            Ok(GrpoDeviceBatchResult {
+                receipt: test_device_receipt(
+                    &(
+                        "test-grpo-device-v1",
+                        request.batch_sha256,
+                        request.base,
+                        &request.generation.generation_sha256,
+                        request.rewards,
+                        request.clip_epsilon,
+                        request.advantage_epsilon,
+                        request.kl_coefficient,
+                        request.loss_weight,
+                        request.rng,
+                        loss_sum,
+                        mean_reward_sum,
+                        reward_stddev_sum,
+                        mean_kl_sum,
+                        clipped_fraction_sum,
+                        "backward-staged",
+                    ),
+                    rollouts * 2,
+                ),
+                examples,
+                rollouts,
+                loss_sum,
+                mean_reward_sum,
+                reward_stddev_sum,
+                mean_kl_sum,
+                clipped_fraction_sum,
+            })
         }
 
         fn optimizer_step(&mut self, learning_rate_scale: f64) -> Result<()> {
@@ -4858,7 +6377,7 @@ mod tests {
 
     #[test]
     fn post_training_configuration_is_strict_and_pinned() {
-        let digest = "0000000000000000000000000000000000000000000000000000000000000000";
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let config: PostTrainingConfig = serde_json::from_value(json!({
             "algorithm": "dpo",
             "reference": {
@@ -4869,6 +6388,18 @@ mod tests {
         }))
         .unwrap();
         config.validate().unwrap();
+
+        let noncanonical: PostTrainingConfig = serde_json::from_value(json!({
+            "algorithm": "dpo",
+            "reference": {
+                "adapter": "hermes_checkpoint",
+                "artifact": "reference",
+                "sha256": digest.trim_start_matches("sha256:")
+            }
+        }))
+        .unwrap();
+        let error = noncanonical.validate().unwrap_err().to_string();
+        assert!(error.contains("sha256:<64 lowercase hex>"), "{error}");
 
         let unpinned: PostTrainingConfig = serde_json::from_value(json!({
             "algorithm": "forward_kl",
@@ -4890,6 +6421,290 @@ mod tests {
     }
 
     #[test]
+    fn revision_identity_binds_the_loader_and_its_parameters() {
+        let base = FrozenModelSpec {
+            adapter: "remote_model".to_owned(),
+            artifact: None,
+            sha256: None,
+            revision: Some("commit-123".to_owned()),
+            parameters: BTreeMap::from([("model".to_owned(), json!("owner/teacher"))]),
+        };
+        let identity = base.immutable_identity().unwrap();
+        validate_sha256_identity(&identity, "revision identity").unwrap();
+        assert_eq!(identity, base.clone().immutable_identity().unwrap());
+
+        let mut another_adapter = base.clone();
+        another_adapter.adapter = "another_remote_model".to_owned();
+        assert_ne!(identity, another_adapter.immutable_identity().unwrap());
+
+        let mut another_model = base.clone();
+        another_model
+            .parameters
+            .insert("model".to_owned(), json!("owner/another-teacher"));
+        assert_ne!(identity, another_model.immutable_identity().unwrap());
+
+        let mut ambiguous = base;
+        ambiguous.revision = Some(" commit-123".to_owned());
+        let error = ambiguous.immutable_identity().unwrap_err().to_string();
+        assert!(error.contains("trimmed"), "{error}");
+    }
+
+    #[test]
+    fn native_post_training_rejects_unbounded_geometry_before_model_use() {
+        let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.batch_size = Some(MAX_POST_TRAINING_UPDATE_EXAMPLES + 1);
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
+        };
+        let mut no_hook = None;
+        let error = drive_resumable_post_training_phase(
+            &test_sha("bounded-geometry"),
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exceeding the limit"), "{error}");
+        assert_eq!(policy.model_tokens, 0);
+        assert_eq!(publisher.restore_calls, 0);
+
+        let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Grpo);
+        request.phase.sequence_length = Some(MAX_POST_TRAINING_SEQUENCE_TOKENS);
+        let Some(PostTrainingConfig::Grpo {
+            group_size,
+            sampling,
+            ..
+        }) = request.phase.post_training.as_mut()
+        else {
+            panic!("test request is not GRPO");
+        };
+        *group_size = 9;
+        sampling.max_new_tokens = MAX_POST_TRAINING_SEQUENCE_TOKENS;
+        let error = validate_resumable_phase(&request.phase)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rollout update exceeds"), "{error}");
+    }
+
+    #[test]
+    fn native_post_training_revalidates_optimizer_scalars() {
+        let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.loss_weight = Some(-1.0);
+        let error = validate_resumable_phase(&request.phase)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("loss_weight"), "{error}");
+
+        request.phase.loss_weight = Some(1.0);
+        request.phase.learning_rate_scale = Some(f64::NAN);
+        let error = validate_resumable_phase(&request.phase)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("learning_rate_scale"), "{error}");
+    }
+
+    #[test]
+    fn native_post_training_rejects_unimplemented_memory_update_mode() {
+        let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.memory_update_mode = Some(
+            serde_json::from_value(json!({
+                "type": "wake_only",
+                "schedule": {
+                    "clock": "optimizer_steps",
+                    "terminal_consolidation": "distill_into_base_v1",
+                    "tiers": [
+                        {"id": "fast", "update_period": 2, "reserve_slots": 1},
+                        {"id": "slow", "update_period": 4, "reserve_slots": 1}
+                    ]
+                }
+            }))
+            .unwrap(),
+        );
+
+        let error = validate_resumable_phase(&request.phase)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not implement memory_update_mode"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn malformed_device_batch_receipts_never_reach_optimizer_publication() {
+        for (fault, expected) in [
+            (TestDpoFault::MalformedReceipt, "device execution receipt"),
+            (TestDpoFault::PartialSummary, "partial batch summary"),
+            (TestDpoFault::TokenCountMismatch, "model-token counter"),
+            (TestDpoFault::NonFiniteSummary, "empty or non-finite"),
+            (TestDpoFault::NegativeLoss, "must be non-negative"),
+        ] {
+            let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+            request.phase.steps = Some(1);
+            let mut publisher = TestUpdatePublisher::new(false);
+            let mut runtime = TestDpoRuntime::new("candidate:dpo");
+            runtime.fault = Some(fault);
+            let mut adapters = PostTrainingPhaseRuntime::Dpo {
+                runtime: &mut runtime,
+            };
+            let error = drive_resumable_post_training_phase(
+                &test_sha("adversarial-device-receipt"),
+                &request,
+                &mut adapters,
+                &mut publisher,
+                &mut None,
+                None,
+                None,
+                usize::MAX,
+                &mut TestPhaseProgress::default(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(runtime.prepare_calls, 1);
+            assert_eq!(runtime.optimizer_steps, 0);
+            assert_eq!(publisher.apply_calls, 0);
+        }
+    }
+
+    #[test]
+    fn each_update_uses_one_device_batch_call_per_algorithm() {
+        {
+            let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+            request.phase.batch_size = Some(2);
+            request.phase.steps = Some(1);
+            let mut publisher = TestUpdatePublisher::new(false);
+            let mut runtime = TestDpoRuntime::new("candidate:dpo");
+            let mut adapters = PostTrainingPhaseRuntime::Dpo {
+                runtime: &mut runtime,
+            };
+            let outcome = drive_resumable_post_training_phase(
+                &test_sha("batched-dpo"),
+                &request,
+                &mut adapters,
+                &mut publisher,
+                &mut None,
+                None,
+                None,
+                usize::MAX,
+                &mut TestPhaseProgress::default(),
+            )
+            .unwrap();
+            let ResumablePostTrainingOutcome::Complete { cursor, .. } = outcome else {
+                panic!("batched DPO did not complete");
+            };
+            assert_eq!(runtime.prepare_calls, 1);
+            assert_eq!(runtime.rng_ranges[0].len(), 4);
+            assert_eq!(cursor.progress.examples, 2);
+        }
+
+        {
+            let (directory, mut request) = test_request(TestPostTrainingAlgorithm::ForwardKl);
+            let data = directory.path().join("instruction-distillation.jsonl");
+            std::fs::write(
+                &data,
+                concat!(
+                    "{\"instruction\":\"first\",\"response\":\"one\"}\n",
+                    "{\"instruction\":\"second\",\"response\":\"two\"}\n"
+                ),
+            )
+            .unwrap();
+            request.phase.task = Some(TaskConfig::InstructionTuning {
+                instruction: "Follow the instruction.".to_owned(),
+            });
+            request.phase.data = Some(data);
+            request.phase.batch_size = Some(2);
+            request.phase.steps = Some(1);
+            let mut publisher = TestUpdatePublisher::new(false);
+            let mut runtime = TestForwardKlRuntime::new();
+            let mut adapters = PostTrainingPhaseRuntime::ForwardKl {
+                runtime: &mut runtime,
+            };
+            drive_resumable_post_training_phase(
+                &test_sha("batched-forward-kl"),
+                &request,
+                &mut adapters,
+                &mut publisher,
+                &mut None,
+                None,
+                None,
+                usize::MAX,
+                &mut TestPhaseProgress::default(),
+            )
+            .unwrap();
+            assert_eq!(runtime.prepare_calls, 1);
+            assert_eq!(runtime.rng_ranges[0].len(), 2);
+        }
+
+        {
+            let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Grpo);
+            request.phase.batch_size = Some(2);
+            request.phase.steps = Some(1);
+            let mut publisher = TestUpdatePublisher::new(false);
+            let mut runtime = TestGrpoRuntime::new();
+            let mut adapters = PostTrainingPhaseRuntime::Grpo {
+                runtime: &mut runtime,
+                verifier: &ExactAnswerVerifier,
+            };
+            drive_resumable_post_training_phase(
+                &test_sha("batched-grpo"),
+                &request,
+                &mut adapters,
+                &mut publisher,
+                &mut None,
+                None,
+                None,
+                usize::MAX,
+                &mut TestPhaseProgress::default(),
+            )
+            .unwrap();
+            assert_eq!(runtime.generation_calls, 1);
+            assert_eq!(runtime.prepare_calls, 1);
+            assert_eq!(runtime.generation_ranges[0].len(), 4);
+            assert_eq!(runtime.scoring_ranges[0].len(), 4);
+        }
+    }
+
+    #[test]
+    fn grpo_rejects_oversized_generated_rollouts_before_scoring_or_backward() {
+        let (_directory, mut request) = test_request(TestPostTrainingAlgorithm::Grpo);
+        request.phase.steps = Some(1);
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestGrpoRuntime::new();
+        policy.rollout_tokens = 33;
+        let mut adapters = PostTrainingPhaseRuntime::Grpo {
+            runtime: &mut policy,
+            verifier: &ExactAnswerVerifier,
+        };
+        let mut no_hook = None;
+        let error = drive_resumable_post_training_phase(
+            &test_sha("oversized-rollout"),
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("configured token limit"), "{error}");
+        assert_eq!(policy.model_tokens, 2, "only generation may have run");
+        assert_eq!(policy.prepare_calls, 0);
+        assert_eq!(publisher.apply_calls, 0);
+    }
+
+    #[test]
     fn frozen_local_artifacts_are_verified_and_changed_bytes_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("teacher.safetensors");
@@ -4898,7 +6713,8 @@ mod tests {
             adapter: "hermes_checkpoint".to_owned(),
             artifact: Some(path.clone()),
             sha256: Some(
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
+                "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    .to_owned(),
             ),
             revision: None,
             parameters: BTreeMap::new(),
@@ -4923,7 +6739,8 @@ mod tests {
             adapter: "hermes_checkpoint".to_owned(),
             artifact: Some(link),
             sha256: Some(
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
+                "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    .to_owned(),
             ),
             revision: None,
             parameters: BTreeMap::new(),
@@ -4938,6 +6755,7 @@ mod tests {
         fail_checkpoint_call: Option<usize>,
         durable: Option<serde_json::Value>,
         metrics: Vec<(MetricContext, MetricEvent)>,
+        replace_input_after_metric: Option<(PathBuf, PathBuf)>,
     }
 
     impl PhaseProgressSink for TestPhaseProgress {
@@ -4953,6 +6771,9 @@ mod tests {
         fn metric(&mut self, context: MetricContext, event: MetricEvent) -> Result<()> {
             event.validate()?;
             self.metrics.push((context, event));
+            if let Some((replacement, input)) = self.replace_input_after_metric.take() {
+                fs::rename(replacement, input)?;
+            }
             Ok(())
         }
     }
@@ -4961,8 +6782,11 @@ mod tests {
         identity: String,
         fail_before_publication_once: bool,
         apply_calls: usize,
+        restore_calls: usize,
         plans: BTreeMap<String, PreparedPostTrainingUpdate>,
         receipts: BTreeMap<String, PostTrainingUpdateReceipt>,
+        replace_input_after_restore: Option<(PathBuf, PathBuf)>,
+        replace_input_after_publication: Option<(PathBuf, PathBuf)>,
     }
 
     impl TestUpdatePublisher {
@@ -4971,8 +6795,11 @@ mod tests {
                 identity: test_sha("publisher-v1"),
                 fail_before_publication_once,
                 apply_calls: 0,
+                restore_calls: 0,
                 plans: BTreeMap::new(),
                 receipts: BTreeMap::new(),
+                replace_input_after_restore: None,
+                replace_input_after_publication: None,
             }
         }
     }
@@ -4986,6 +6813,10 @@ mod tests {
             &mut self,
             state: &PostTrainingCommittedState,
         ) -> Result<PostTrainingRestoreReceipt> {
+            self.restore_calls += 1;
+            if let Some((replacement, input)) = self.replace_input_after_restore.take() {
+                fs::rename(replacement, input)?;
+            }
             Ok(PostTrainingRestoreReceipt::for_state(
                 self.identity.clone(),
                 state,
@@ -5029,6 +6860,9 @@ mod tests {
             self.plans.insert(plan.transaction_id.clone(), plan.clone());
             self.receipts
                 .insert(plan.transaction_id.clone(), receipt.clone());
+            if let Some((replacement, input)) = self.replace_input_after_publication.take() {
+                fs::rename(replacement, input)?;
+            }
             Ok(receipt)
         }
     }
@@ -5321,17 +7155,10 @@ mod tests {
                 .context("test host phase has no post-training config")?
             {
                 PostTrainingConfig::Dpo { .. } => {
-                    let mut policy = TestSequencePolicy {
-                        identity: "candidate:dpo".to_owned(),
-                        backward_calls: 0,
-                        optimizer_steps: 0,
-                        model_tokens: 0,
-                    };
-                    let mut reference = TestReference;
+                    let mut policy = TestDpoRuntime::new("candidate:dpo");
                     let mut context = PostTrainingExecutionContext {
-                        adapters: PostTrainingPhaseAdapters::Dpo {
-                            policy: &mut policy,
-                            reference: &mut reference,
+                        runtime: PostTrainingPhaseRuntime::Dpo {
+                            runtime: &mut policy,
                         },
                         publisher: &mut publisher,
                         boundary_hook: Some(&mut controller),
@@ -5340,16 +7167,10 @@ mod tests {
                     operation(&mut context)
                 }
                 PostTrainingConfig::ForwardKl { .. } => {
-                    let mut policy = TestStudent {
-                        gradients: Vec::new(),
-                        optimizer_steps: 0,
-                        model_tokens: 0,
-                    };
-                    let mut teacher = TestTeacher;
+                    let mut policy = TestForwardKlRuntime::new();
                     let mut context = PostTrainingExecutionContext {
-                        adapters: PostTrainingPhaseAdapters::ForwardKl {
-                            policy: &mut policy,
-                            teacher: &mut teacher,
+                        runtime: PostTrainingPhaseRuntime::ForwardKl {
+                            runtime: &mut policy,
                         },
                         publisher: &mut publisher,
                         boundary_hook: Some(&mut controller),
@@ -5358,15 +7179,10 @@ mod tests {
                     operation(&mut context)
                 }
                 PostTrainingConfig::Grpo { .. } => {
-                    let mut policy = TestGrpoPolicy {
-                        backward_calls: 0,
-                        optimizer_steps: 0,
-                        model_tokens: 0,
-                    };
+                    let mut policy = TestGrpoRuntime::new();
                     let mut context = PostTrainingExecutionContext {
-                        adapters: PostTrainingPhaseAdapters::Grpo {
-                            policy: &mut policy,
-                            reference: None,
+                        runtime: PostTrainingPhaseRuntime::Grpo {
+                            runtime: &mut policy,
                             verifier: &ExactAnswerVerifier,
                         },
                         publisher: &mut publisher,
@@ -5387,7 +7203,7 @@ mod tests {
     }
 
     fn test_sha(label: &str) -> String {
-        format!("sha256:{:x}", Sha256::digest(label.as_bytes()))
+        sha256_identity(label.as_bytes())
     }
 
     fn test_request(
@@ -5502,21 +7318,56 @@ mod tests {
     }
 
     fn install_periodic_sleep(request: &mut PhaseExecutionRequest) {
-        let workflow = crate::workflow::load_workflow(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.education.example.json"),
-        )
-        .unwrap();
-        request.phase.periodic_sleep = Some(
-            workflow
-                .phases
-                .first()
-                .and_then(|phase| phase.periodic_sleep.clone())
-                .expect("education workflow has periodic sleep"),
-        );
+        let workflow: serde_json::Value =
+            serde_json::from_str(include_str!("../workflow.education.example.json")).unwrap();
+        let sleep = workflow
+            .get("phases")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|phases| phases.first())
+            .and_then(|phase| phase.get("periodic_sleep"))
+            .cloned()
+            .expect("education workflow has periodic sleep");
+        request.phase.periodic_sleep = Some(serde_json::from_value(sleep).unwrap());
+    }
+
+    fn install_positive_grpo_reference(directory: &Path, request: &mut PhaseExecutionRequest) {
+        let artifact = directory.join("grpo-reference.safetensors");
+        fs::write(&artifact, b"abc").unwrap();
+        let PostTrainingConfig::Grpo {
+            kl_coefficient,
+            reference,
+            ..
+        } = request.phase.post_training.as_mut().unwrap()
+        else {
+            panic!("positive GRPO reference installed on a non-GRPO phase");
+        };
+        *kl_coefficient = 0.04;
+        *reference = Some(FrozenModelSpec {
+            adapter: "test".to_owned(),
+            artifact: Some(artifact),
+            sha256: Some(ABC_SHA256.to_owned()),
+            revision: None,
+            parameters: BTreeMap::new(),
+        });
     }
 
     fn run_interruption_case(algorithm: TestPostTrainingAlgorithm, after_publication: bool) {
-        let (_dir, request) = test_request(algorithm);
+        run_interruption_case_with_grpo_reference(algorithm, after_publication, false);
+    }
+
+    fn run_interruption_case_with_grpo_reference(
+        algorithm: TestPostTrainingAlgorithm,
+        after_publication: bool,
+        positive_grpo_kl: bool,
+    ) {
+        assert!(
+            !positive_grpo_kl || matches!(algorithm, TestPostTrainingAlgorithm::Grpo),
+            "a positive GRPO reference is only valid for GRPO"
+        );
+        let (directory, mut request) = test_request(algorithm);
+        if positive_grpo_kl {
+            install_positive_grpo_reference(directory.path(), &mut request);
+        }
         let workflow = test_sha("workflow-v2");
         let mut publisher = TestUpdatePublisher::new(!after_publication);
         let mut first_sink = TestPhaseProgress {
@@ -5524,36 +7375,22 @@ mod tests {
             ..TestPhaseProgress::default()
         };
         let mut no_hook = None;
-        let mut dpo_policy = TestSequencePolicy {
-            identity: "candidate:dpo".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut dpo_reference = TestReference;
-        let mut student = TestStudent {
-            gradients: Vec::new(),
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut teacher = TestTeacher;
-        let mut grpo_policy = TestGrpoPolicy {
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
+        let mut dpo_policy = TestDpoRuntime::new("candidate:dpo");
+        let mut student = TestForwardKlRuntime::new();
+        let mut grpo_policy = if positive_grpo_kl {
+            TestGrpoRuntime::with_reference()
+        } else {
+            TestGrpoRuntime::new()
         };
         let mut adapters = match algorithm {
-            TestPostTrainingAlgorithm::Dpo => PostTrainingPhaseAdapters::Dpo {
-                policy: &mut dpo_policy,
-                reference: &mut dpo_reference,
+            TestPostTrainingAlgorithm::Dpo => PostTrainingPhaseRuntime::Dpo {
+                runtime: &mut dpo_policy,
             },
-            TestPostTrainingAlgorithm::ForwardKl => PostTrainingPhaseAdapters::ForwardKl {
-                policy: &mut student,
-                teacher: &mut teacher,
+            TestPostTrainingAlgorithm::ForwardKl => PostTrainingPhaseRuntime::ForwardKl {
+                runtime: &mut student,
             },
-            TestPostTrainingAlgorithm::Grpo => PostTrainingPhaseAdapters::Grpo {
-                policy: &mut grpo_policy,
-                reference: None,
+            TestPostTrainingAlgorithm::Grpo => PostTrainingPhaseRuntime::Grpo {
+                runtime: &mut grpo_policy,
                 verifier: &ExactAnswerVerifier,
             },
         };
@@ -5604,12 +7441,44 @@ mod tests {
         assert_eq!(publisher.apply_calls, 2);
         assert_eq!(cursor.progress.optimizer_steps, 2);
         assert_eq!(cursor.progress.examples, 2);
-        assert_eq!(
-            cursor.rng.counter > 0,
-            matches!(algorithm, TestPostTrainingAlgorithm::Grpo)
-        );
+        let expected_rng_counter = match algorithm {
+            TestPostTrainingAlgorithm::Dpo => 4,
+            TestPostTrainingAlgorithm::ForwardKl => 2,
+            TestPostTrainingAlgorithm::Grpo => 8,
+        };
+        assert_eq!(cursor.rng.counter, expected_rng_counter);
         assert_eq!(report.optimizer_steps, 2);
         assert_eq!(resumed_sink.metrics.len(), 2);
+        if positive_grpo_kl {
+            assert!(report.metrics["mean_kl"] > 0.0);
+            let expected_reference = test_sha("abc");
+            assert_eq!(
+                report.frozen_model_identity.as_deref(),
+                Some(expected_reference.as_str())
+            );
+        }
+        match algorithm {
+            TestPostTrainingAlgorithm::Dpo => {
+                assert_eq!(dpo_policy.prepare_calls, 3);
+                assert_eq!(dpo_policy.rng_ranges[0], dpo_policy.rng_ranges[1]);
+                assert_eq!(dpo_policy.rng_ranges[2].start, 2);
+            }
+            TestPostTrainingAlgorithm::ForwardKl => {
+                assert_eq!(student.prepare_calls, 3);
+                assert_eq!(student.rng_ranges[0], student.rng_ranges[1]);
+                assert_eq!(student.rng_ranges[2].start, 1);
+            }
+            TestPostTrainingAlgorithm::Grpo => {
+                assert_eq!(grpo_policy.generation_calls, 3);
+                assert_eq!(grpo_policy.prepare_calls, 3);
+                assert_eq!(
+                    grpo_policy.generation_ranges[0],
+                    grpo_policy.generation_ranges[1]
+                );
+                assert_eq!(grpo_policy.scoring_ranges[0], grpo_policy.scoring_ranges[1]);
+                assert_eq!(grpo_policy.generation_ranges[2].start, 4);
+            }
+        }
     }
 
     fn run_periodic_boundary_interruption_case(
@@ -5637,36 +7506,18 @@ mod tests {
             fail_checkpoint_call: after_boundary_publication.then_some(4),
             ..TestPhaseProgress::default()
         };
-        let mut dpo_policy = TestSequencePolicy {
-            identity: "candidate:dpo".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut dpo_reference = TestReference;
-        let mut student = TestStudent {
-            gradients: Vec::new(),
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut teacher = TestTeacher;
-        let mut grpo_policy = TestGrpoPolicy {
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
+        let mut dpo_policy = TestDpoRuntime::new("candidate:dpo");
+        let mut student = TestForwardKlRuntime::new();
+        let mut grpo_policy = TestGrpoRuntime::new();
         let mut adapters = match algorithm {
-            TestPostTrainingAlgorithm::Dpo => PostTrainingPhaseAdapters::Dpo {
-                policy: &mut dpo_policy,
-                reference: &mut dpo_reference,
+            TestPostTrainingAlgorithm::Dpo => PostTrainingPhaseRuntime::Dpo {
+                runtime: &mut dpo_policy,
             },
-            TestPostTrainingAlgorithm::ForwardKl => PostTrainingPhaseAdapters::ForwardKl {
-                policy: &mut student,
-                teacher: &mut teacher,
+            TestPostTrainingAlgorithm::ForwardKl => PostTrainingPhaseRuntime::ForwardKl {
+                runtime: &mut student,
             },
-            TestPostTrainingAlgorithm::Grpo => PostTrainingPhaseAdapters::Grpo {
-                policy: &mut grpo_policy,
-                reference: None,
+            TestPostTrainingAlgorithm::Grpo => PostTrainingPhaseRuntime::Grpo {
+                runtime: &mut grpo_policy,
                 verifier: &ExactAnswerVerifier,
             },
         };
@@ -5728,6 +7579,271 @@ mod tests {
         assert!(cursor.last_boundary_receipt.is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn late_input_replacement_cannot_commit_a_published_update() {
+        let (dir, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.steps = Some(1);
+        let input = request.phase.data.clone().unwrap();
+        let replacement = dir.path().join("replacement-preference.jsonl");
+        fs::write(
+            &replacement,
+            concat!(
+                "{\"prompt\":\"changed-1\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n",
+                "{\"prompt\":\"changed-2\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n"
+            ),
+        )
+        .unwrap();
+        let mut publisher = TestUpdatePublisher::new(false);
+        publisher.replace_input_after_publication = Some((replacement, input));
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
+        };
+        let mut no_hook = None;
+        let mut progress = TestPhaseProgress::default();
+        let error = drive_resumable_post_training_phase(
+            &test_sha("late-input-replacement"),
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut progress,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("changed after it was authenticated"),
+            "{error}"
+        );
+        assert_eq!(publisher.apply_calls, 1);
+        assert_eq!(
+            publisher.restore_calls, 1,
+            "changed input should reject before restoring the published update"
+        );
+        let envelope: PostTrainingResumeEnvelope =
+            serde_json::from_value(progress.durable.unwrap()).unwrap();
+        let (cursor, boundary) = envelope.into_parts().unwrap();
+        assert!(boundary.is_none());
+        assert!(cursor.pending.is_some());
+        assert_eq!(cursor.progress.optimizer_steps, 0);
+        assert_eq!(cursor.committed.model, cursor.input_checkpoint);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metric_callback_input_replacement_cannot_commit_the_phase_cursor() {
+        let (dir, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.steps = Some(1);
+        let input = request.phase.data.clone().unwrap();
+        let replacement = dir.path().join("replacement-after-metric.jsonl");
+        fs::write(
+            &replacement,
+            concat!(
+                "{\"prompt\":\"changed-1\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n",
+                "{\"prompt\":\"changed-2\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n"
+            ),
+        )
+        .unwrap();
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
+        };
+        let mut no_hook = None;
+        let mut progress = TestPhaseProgress {
+            replace_input_after_metric: Some((replacement, input)),
+            ..TestPhaseProgress::default()
+        };
+        let error = drive_resumable_post_training_phase(
+            &test_sha("metric-input-replacement"),
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut progress,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("changed after it was authenticated"),
+            "{error}"
+        );
+        assert_eq!(progress.checkpoint_calls, 1);
+        let envelope: PostTrainingResumeEnvelope =
+            serde_json::from_value(progress.durable.unwrap()).unwrap();
+        let (cursor, boundary) = envelope.into_parts().unwrap();
+        assert!(boundary.is_none());
+        assert!(cursor.pending.is_some());
+        assert_eq!(cursor.progress.optimizer_steps, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_resume_rechecks_input_after_restoring_its_final_checkpoint() {
+        let (dir, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.steps = Some(1);
+        let workflow = test_sha("completed-resume-input-replacement");
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
+        };
+        let mut no_hook = None;
+        let complete = drive_resumable_post_training_phase(
+            &workflow,
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap();
+        let ResumablePostTrainingOutcome::Complete { cursor, .. } = complete else {
+            panic!("one-step phase did not complete");
+        };
+
+        let input = request.phase.data.clone().unwrap();
+        let replacement = dir.path().join("replacement-on-final-restore.jsonl");
+        fs::write(
+            &replacement,
+            concat!(
+                "{\"prompt\":\"changed-1\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n",
+                "{\"prompt\":\"changed-2\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n"
+            ),
+        )
+        .unwrap();
+        publisher.replace_input_after_restore = Some((replacement, input));
+
+        let error = drive_resumable_post_training_phase(
+            &workflow,
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            Some(PostTrainingResumeEnvelope::wake(cursor)),
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("changed after it was authenticated"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn completed_exact_eof_cursor_replays_without_another_update() {
+        let (_dir, request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        let workflow = test_sha("completed-exact-eof-resume");
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
+        };
+        let mut no_hook = None;
+        let complete = drive_resumable_post_training_phase(
+            &workflow,
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap();
+        let ResumablePostTrainingOutcome::Complete { cursor, report } = complete else {
+            panic!("two-record phase did not complete");
+        };
+        assert_eq!(
+            cursor.position,
+            PostTrainingRecordPosition {
+                epoch: 1,
+                record: 0
+            }
+        );
+        assert_eq!(report.optimizer_steps, 2);
+
+        let replayed = drive_resumable_post_training_phase(
+            &workflow,
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            Some(PostTrainingResumeEnvelope::wake(cursor.clone())),
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap();
+        let ResumablePostTrainingOutcome::Complete {
+            cursor: replayed,
+            report,
+        } = replayed
+        else {
+            panic!("completed exact-EOF cursor unexpectedly yielded");
+        };
+        assert_eq!(replayed, cursor);
+        assert_eq!(report.optimizer_steps, 2);
+        assert_eq!(
+            publisher.apply_calls, 2,
+            "completed replay applied an update"
+        );
+    }
+
+    #[test]
+    fn step_limited_phase_does_not_parse_unconsumed_lookahead() {
+        let (_dir, mut request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        request.phase.steps = Some(1);
+        fs::write(
+            request.phase.data.as_ref().unwrap(),
+            concat!(
+                "{\"prompt\":\"used\",\"chosen\":\"yes\",\"rejected\":\"no\"}\n",
+                "this record is outside the configured step limit\n"
+            ),
+        )
+        .unwrap();
+        let workflow = test_sha("step-limited-raw-lookahead");
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
+        };
+        let mut no_hook = None;
+        let complete = drive_resumable_post_training_phase(
+            &workflow,
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            None,
+            usize::MAX,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap();
+        let ResumablePostTrainingOutcome::Complete { cursor, report } = complete else {
+            panic!("one-step phase did not complete");
+        };
+        assert_eq!(cursor.position.epoch, 0);
+        assert_eq!(cursor.position.record, 1);
+        assert_eq!(report.optimizer_steps, 1);
+        assert_eq!(publisher.apply_calls, 1);
+    }
+
     #[test]
     fn dpo_resumes_before_optimizer_publication_without_double_apply() {
         run_interruption_case(TestPostTrainingAlgorithm::Dpo, false);
@@ -5756,6 +7872,53 @@ mod tests {
     #[test]
     fn grpo_resumes_after_optimizer_publication_without_double_apply() {
         run_interruption_case(TestPostTrainingAlgorithm::Grpo, true);
+    }
+
+    #[test]
+    fn positive_kl_grpo_resumes_before_optimizer_publication_exactly() {
+        run_interruption_case_with_grpo_reference(TestPostTrainingAlgorithm::Grpo, false, true);
+    }
+
+    #[test]
+    fn positive_kl_grpo_resumes_after_optimizer_publication_exactly() {
+        run_interruption_case_with_grpo_reference(TestPostTrainingAlgorithm::Grpo, true, true);
+    }
+
+    #[test]
+    fn prepared_update_rejects_rehashed_but_forged_rng_geometry() {
+        let (_directory, request) = test_request(TestPostTrainingAlgorithm::Dpo);
+        let mut publisher = TestUpdatePublisher::new(true);
+        let mut runtime = TestDpoRuntime::new("candidate:dpo");
+        let mut phase_runtime = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut runtime,
+        };
+        let mut progress = TestPhaseProgress::default();
+        let error = drive_resumable_post_training_phase(
+            &test_sha("forged-rng-geometry"),
+            &request,
+            &mut phase_runtime,
+            &mut publisher,
+            &mut None,
+            None,
+            None,
+            usize::MAX,
+            &mut progress,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("injected interruption"), "{error}");
+        let envelope: PostTrainingResumeEnvelope =
+            serde_json::from_value(progress.durable.unwrap()).unwrap();
+        let (mut cursor, boundary) = envelope.into_parts().unwrap();
+        assert!(boundary.is_none());
+        let pending = cursor.pending.as_mut().unwrap();
+        pending.rng_end += 1;
+        pending.transaction_id = pending.computed_transaction_id().unwrap();
+        let error = cursor.validate_internal().unwrap_err().to_string();
+        assert!(
+            error.contains("exactly two model RNG substreams"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -5809,16 +7972,9 @@ mod tests {
         )
         .unwrap();
         let mut publisher = TestUpdatePublisher::new(false);
-        let mut policy = TestSequencePolicy {
-            identity: "candidate:dpo".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut reference = TestReference;
-        let mut adapters = PostTrainingPhaseAdapters::Dpo {
-            policy: &mut policy,
-            reference: &mut reference,
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
         };
         let mut hook: Option<&mut dyn PostTrainingBoundaryHook> = Some(&mut controller);
         let outcome = drive_resumable_post_training_phase(
@@ -5872,14 +8028,9 @@ mod tests {
         )
         .unwrap();
         let mut publisher = TestUpdatePublisher::new(false);
-        let mut policy = TestGrpoPolicy {
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut adapters = PostTrainingPhaseAdapters::Grpo {
-            policy: &mut policy,
-            reference: None,
+        let mut policy = TestGrpoRuntime::new();
+        let mut adapters = PostTrainingPhaseRuntime::Grpo {
+            runtime: &mut policy,
             verifier: &ExactAnswerVerifier,
         };
         let mut hook: Option<&mut dyn PostTrainingBoundaryHook> = Some(&mut controller);
@@ -5927,21 +8078,14 @@ mod tests {
             )
             .unwrap();
             let mut publisher = TestUpdatePublisher::new(false);
-            let mut policy = TestSequencePolicy {
-                identity: "candidate:dpo".to_owned(),
-                backward_calls: 0,
-                optimizer_steps: 0,
-                model_tokens: 0,
-            };
-            let mut reference = TestReference;
+            let mut policy = TestDpoRuntime::new("candidate:dpo");
             let mut first_sink = TestPhaseProgress {
                 fail_checkpoint_call: Some(failed_checkpoint),
                 ..TestPhaseProgress::default()
             };
             {
-                let mut adapters = PostTrainingPhaseAdapters::Dpo {
-                    policy: &mut policy,
-                    reference: &mut reference,
+                let mut adapters = PostTrainingPhaseRuntime::Dpo {
+                    runtime: &mut policy,
                 };
                 let mut hook: Option<&mut dyn PostTrainingBoundaryHook> = Some(&mut controller);
                 let first = drive_resumable_post_training_phase(
@@ -5970,9 +8114,8 @@ mod tests {
             let (_, boundary) = resume.clone().into_parts().unwrap();
             assert!(boundary.is_some(), "boundary publication was not durable");
             let outcome = {
-                let mut adapters = PostTrainingPhaseAdapters::Dpo {
-                    policy: &mut policy,
-                    reference: &mut reference,
+                let mut adapters = PostTrainingPhaseRuntime::Dpo {
+                    runtime: &mut policy,
                 };
                 let mut hook: Option<&mut dyn PostTrainingBoundaryHook> = Some(&mut controller);
                 drive_resumable_post_training_phase(
@@ -6003,16 +8146,9 @@ mod tests {
         install_periodic_sleep(&mut request);
         let mut publisher = TestUpdatePublisher::new(false);
         let mut hook = TestBoundaryHook::new(false);
-        let mut policy = TestSequencePolicy {
-            identity: "candidate:dpo".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut reference = TestReference;
-        let mut adapters = PostTrainingPhaseAdapters::Dpo {
-            policy: &mut policy,
-            reference: &mut reference,
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
+        let mut adapters = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
         };
         let mut boundary_hook: Option<&mut dyn PostTrainingBoundaryHook> = Some(&mut hook);
         let error = drive_resumable_post_training_phase(
@@ -6221,23 +8357,16 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_cursor_tamper_and_adapter_drift() {
+    fn resume_rejects_cursor_tamper_and_device_runtime_drift() {
         let (_dir, request) = test_request(TestPostTrainingAlgorithm::Dpo);
         let workflow = test_sha("workflow-v2");
         let mut publisher = TestUpdatePublisher::new(false);
         let mut sink = TestPhaseProgress::default();
         let mut no_hook = None;
-        let mut policy = TestSequencePolicy {
-            identity: "candidate:dpo".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut reference = TestReference;
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
         let cursor = {
-            let mut adapters = PostTrainingPhaseAdapters::Dpo {
-                policy: &mut policy,
-                reference: &mut reference,
+            let mut adapters = PostTrainingPhaseRuntime::Dpo {
+                runtime: &mut policy,
             };
             let yielded = drive_resumable_post_training_phase(
                 &workflow,
@@ -6279,9 +8408,8 @@ mod tests {
         };
 
         policy.identity = "candidate:drifted".to_owned();
-        let mut drifted = PostTrainingPhaseAdapters::Dpo {
-            policy: &mut policy,
-            reference: &mut reference,
+        let mut drifted = PostTrainingPhaseRuntime::Dpo {
+            runtime: &mut policy,
         };
         let error = drive_resumable_post_training_phase(
             &workflow,
@@ -6300,23 +8428,92 @@ mod tests {
     }
 
     #[test]
+    fn grpo_resume_rejects_verifier_implementation_drift() {
+        struct VersionedExactVerifier(&'static str);
+
+        impl RewardVerifier for VersionedExactVerifier {
+            fn identity(&self) -> &str {
+                self.0
+            }
+
+            fn adapter_name(&self) -> &str {
+                ExactAnswerVerifier.adapter_name()
+            }
+
+            fn verify(
+                &self,
+                spec: &VerifierSpec,
+                request: VerificationRequest<'_>,
+            ) -> Result<Verification> {
+                ExactAnswerVerifier.verify(spec, request)
+            }
+        }
+
+        let (_dir, request) = test_request(TestPostTrainingAlgorithm::Grpo);
+        let workflow = test_sha("workflow-v2-verifier-identity");
+        let mut publisher = TestUpdatePublisher::new(false);
+        let mut policy = TestGrpoRuntime::new();
+        let mut no_hook = None;
+        let first = VersionedExactVerifier(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let cursor = {
+            let mut adapters = PostTrainingPhaseRuntime::Grpo {
+                runtime: &mut policy,
+                verifier: &first,
+            };
+            let outcome = drive_resumable_post_training_phase(
+                &workflow,
+                &request,
+                &mut adapters,
+                &mut publisher,
+                &mut no_hook,
+                None,
+                None,
+                1,
+                &mut TestPhaseProgress::default(),
+            )
+            .unwrap();
+            let ResumablePostTrainingOutcome::Yielded(cursor) = outcome else {
+                panic!("one-update budget should yield");
+            };
+            cursor
+        };
+
+        let second = VersionedExactVerifier(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        let mut adapters = PostTrainingPhaseRuntime::Grpo {
+            runtime: &mut policy,
+            verifier: &second,
+        };
+        let error = drive_resumable_post_training_phase(
+            &workflow,
+            &request,
+            &mut adapters,
+            &mut publisher,
+            &mut no_hook,
+            None,
+            Some(PostTrainingResumeEnvelope::wake(cursor)),
+            1,
+            &mut TestPhaseProgress::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("identity changed across resume"), "{error}");
+    }
+
+    #[test]
     fn native_executor_integrates_with_phase_executor_contract() {
         let (_dir, request) = test_request(TestPostTrainingAlgorithm::Dpo);
         let workflow = test_sha("workflow-v2");
         let mut executor = NativePostTrainingPhaseExecutor::new(&workflow).unwrap();
         let mut publisher = TestUpdatePublisher::new(false);
-        let mut policy = TestSequencePolicy {
-            identity: "candidate:dpo".to_owned(),
-            backward_calls: 0,
-            optimizer_steps: 0,
-            model_tokens: 0,
-        };
-        let mut reference = TestReference;
+        let mut policy = TestDpoRuntime::new("candidate:dpo");
         {
             let mut context = PostTrainingExecutionContext {
-                adapters: PostTrainingPhaseAdapters::Dpo {
-                    policy: &mut policy,
-                    reference: &mut reference,
+                runtime: PostTrainingPhaseRuntime::Dpo {
+                    runtime: &mut policy,
                 },
                 publisher: &mut publisher,
                 boundary_hook: None,

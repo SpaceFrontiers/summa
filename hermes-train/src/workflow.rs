@@ -1,19 +1,35 @@
 //! Strict version-2 training workflow configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::fs;
 
 use anyhow::{Context, Result, bail, ensure};
 use hermes_llm::ModelDef;
 use serde::{Deserialize, Serialize};
 
+use crate::artifact_io::{read_regular_bounded, validate_sha256_identity};
 use crate::posttrain::PostTrainingConfig;
 use crate::sleep::{DreamingConfig, ImitationConfig, KnowledgeSeedingConfig, SleepSchedule};
 use crate::task::{TaskAdapter, TaskConfig, TaskExecution};
 use crate::tensor_sleep::{RetentionGateConfig, TensorConsolidationConfig};
+use crate::tier_optimizer::TierOptimizerConfig;
 
 pub const WORKFLOW_VERSION: u32 = 2;
+const MAX_WORKFLOW_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WORKFLOW_PHASES: usize = 4_096;
+const MAX_WORKFLOW_NAME_BYTES: usize = 1_024;
+const MAX_PHASE_NAME_BYTES: usize = 256;
+const MAX_PHASE_BATCH_SIZE: usize = 65_536;
+const MAX_PHASE_GRADIENT_ACCUMULATION: usize = 1_048_576;
+const MAX_PHASE_SHUFFLE_SAMPLES: usize = 262_144;
+const MAX_PHASE_BATCH_TOKENS: usize = 8 * 1024 * 1024;
+// The checked-in education curriculum intentionally shuffles 65,536 examples
+// at 4,096 tokens. This is a documented high-memory (~2 GiB for one raw i64
+// token vector per sample) production tradeoff, and forms the upper bound.
+const MAX_PHASE_SHUFFLE_TOKENS: usize = 256 * 1024 * 1024;
 
 fn default_one_f64() -> f64 {
     1.0
@@ -210,7 +226,11 @@ impl InModelSleepConfig {
                 && !self.candidate_directory.as_os_str().is_empty(),
             "sleep phase `{phase_name}` requires retention_suite and candidate_directory"
         );
-        validate_sha256_label(&self.retention_suite_sha256).with_context(|| {
+        validate_sha256_identity(
+            &self.retention_suite_sha256,
+            "sleep retention suite identity",
+        )
+        .with_context(|| {
             format!("sleep phase `{phase_name}` has an invalid retention-suite hash")
         })?;
         self.tensor_config().validate().with_context(|| {
@@ -269,11 +289,12 @@ impl QuantizationConfig {
                     !teacher_checkpoint.as_os_str().is_empty(),
                     "workflow phase `{phase_name}` quantization distillation requires teacher_checkpoint"
                 );
-                validate_sha256_label(teacher_sha256).with_context(|| {
-                    format!(
-                        "workflow phase `{phase_name}` has an invalid quantization teacher hash"
-                    )
-                })?;
+                validate_sha256_identity(teacher_sha256, "quantization teacher identity")
+                    .with_context(|| {
+                        format!(
+                            "workflow phase `{phase_name}` has an invalid quantization teacher hash"
+                        )
+                    })?;
                 ensure!(
                     temperature.is_finite() && *temperature > 0.0,
                     "workflow phase `{phase_name}` quantization temperature must be finite and positive"
@@ -298,18 +319,51 @@ impl QuantizationConfig {
     }
 }
 
-fn validate_sha256_label(value: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .context("digest must use sha256:<64 lowercase hex>")?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "digest must use sha256:<64 lowercase hex>"
-    );
-    Ok(())
+/// Memory-tier update policy for optimizer-bearing workflow phases.
+///
+/// `wake_only` is the capacity- and cadence-matched sleep ablation. It keeps
+/// each tier's independent optimizer and configured update period, but applies
+/// due prospective base updates directly, fastest-to-slowest. It never runs
+/// consolidation, transfers or reclaims reserve slots, or generates dreams.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryUpdateMode {
+    WakeOnly {
+        schedule: SleepSchedule,
+        #[serde(default)]
+        tier_optimizer: TierOptimizerConfig,
+    },
+}
+
+impl MemoryUpdateMode {
+    pub fn schedule(&self) -> &SleepSchedule {
+        match self {
+            Self::WakeOnly { schedule, .. } => schedule,
+        }
+    }
+
+    pub fn tier_optimizer(&self) -> &TierOptimizerConfig {
+        match self {
+            Self::WakeOnly { tier_optimizer, .. } => tier_optimizer,
+        }
+    }
+
+    pub fn validate(&self, phase_name: &str) -> Result<()> {
+        match self {
+            Self::WakeOnly {
+                schedule,
+                tier_optimizer,
+            } => {
+                schedule.validate().with_context(|| {
+                    format!("invalid wake_only memory schedule in workflow phase `{phase_name}`")
+                })?;
+                tier_optimizer.validate().with_context(|| {
+                    format!("invalid wake_only tier optimizer in workflow phase `{phase_name}`")
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Serialized phase definition. Algorithm-specific knobs are namespaced under
@@ -350,6 +404,10 @@ pub struct PhaseV2 {
     /// optimizer-step or model-token boundaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub periodic_sleep: Option<InModelSleepConfig>,
+    /// Explicit non-sleep update policy for memory tiers. Mutually exclusive
+    /// with `periodic_sleep`; ordinary models leave both fields absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_update_mode: Option<MemoryUpdateMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization: Option<QuantizationConfig>,
 
@@ -376,10 +434,7 @@ impl PhaseV2 {
 
     fn validate(&self) -> Result<()> {
         let name = &self.name;
-        ensure!(
-            !name.trim().is_empty(),
-            "workflow phase name must not be empty"
-        );
+        validate_workflow_identifier(name, "workflow phase name", MAX_PHASE_NAME_BYTES)?;
         if let Some(task) = &self.task {
             task.validate()
                 .with_context(|| format!("invalid task in workflow phase `{name}`"))?;
@@ -389,7 +444,23 @@ impl PhaseV2 {
         validate_positive(self.batch_size, "batch_size", name)?;
         validate_positive(self.gradient_accumulation, "gradient_accumulation", name)?;
         validate_positive(self.epochs, "epochs", name)?;
+        validate_positive(self.shuffle_buffer, "shuffle_buffer", name)?;
         validate_positive(self.steps, "steps", name)?;
+        ensure!(
+            self.batch_size
+                .is_none_or(|value| value <= MAX_PHASE_BATCH_SIZE),
+            "workflow phase `{name}` batch_size exceeds the {MAX_PHASE_BATCH_SIZE}-sample limit"
+        );
+        ensure!(
+            self.gradient_accumulation
+                .is_none_or(|value| value <= MAX_PHASE_GRADIENT_ACCUMULATION),
+            "workflow phase `{name}` gradient_accumulation exceeds the {MAX_PHASE_GRADIENT_ACCUMULATION}-microbatch limit"
+        );
+        ensure!(
+            self.shuffle_buffer
+                .is_none_or(|value| value <= MAX_PHASE_SHUFFLE_SAMPLES),
+            "workflow phase `{name}` shuffle_buffer exceeds the {MAX_PHASE_SHUFFLE_SAMPLES}-sample limit"
+        );
         if let Some(loss_weight) = self.loss_weight {
             ensure!(
                 loss_weight.is_finite() && loss_weight > 0.0,
@@ -425,6 +496,29 @@ impl PhaseV2 {
                 self.batch_size.is_some(),
                 "workflow phase `{name}` ({}) requires batch_size",
                 self.kind.name()
+            );
+            let sequence_length = self.sequence_length.expect("required above");
+            let batch_size = self.batch_size.expect("required above");
+            let sequences_per_example = self
+                .task
+                .as_ref()
+                .expect("required above")
+                .maximum_model_sequences_per_example();
+            ensure!(
+                sequence_length
+                    .checked_mul(batch_size)
+                    .and_then(|tokens| tokens.checked_mul(sequences_per_example))
+                    .is_some_and(|tokens| tokens <= MAX_PHASE_BATCH_TOKENS),
+                "workflow phase `{name}` batch geometry exceeds the {MAX_PHASE_BATCH_TOKENS}-token materialization limit"
+            );
+            let shuffle_buffer = self.shuffle_buffer_or_default();
+            ensure!(
+                shuffle_buffer <= MAX_PHASE_SHUFFLE_SAMPLES
+                    && sequence_length
+                        .checked_mul(shuffle_buffer)
+                        .and_then(|tokens| tokens.checked_mul(sequences_per_example))
+                        .is_some_and(|tokens| tokens <= MAX_PHASE_SHUFFLE_TOKENS),
+                "workflow phase `{name}` shuffle geometry exceeds the {MAX_PHASE_SHUFFLE_TOKENS}-token buffer limit"
             );
         } else {
             ensure!(
@@ -479,6 +573,16 @@ impl PhaseV2 {
             PhaseKind::Sft => ensure!(
                 execution == Some(TaskExecution::SupervisedGeneration),
                 "workflow phase `{name}` (sft) requires a supervised-generation task"
+            ),
+            PhaseKind::Distillation => ensure!(
+                matches!(
+                    execution,
+                    Some(
+                        TaskExecution::AutoregressiveTokenPrediction
+                            | TaskExecution::SupervisedGeneration
+                    )
+                ),
+                "workflow phase `{name}` (distillation) requires an autoregressive or supervised-generation task"
             ),
             PhaseKind::Preference => ensure!(
                 execution == Some(TaskExecution::PairwisePreference),
@@ -582,6 +686,18 @@ impl PhaseV2 {
                 "workflow phase `{name}` periodic_sleep must not set standalone_trigger_clock"
             );
         }
+        if let Some(mode) = &self.memory_update_mode {
+            ensure!(
+                self.kind.uses_optimizer(),
+                "workflow phase `{name}` ({}) cannot set memory_update_mode",
+                self.kind.name()
+            );
+            ensure!(
+                self.periodic_sleep.is_none(),
+                "workflow phase `{name}` cannot combine memory_update_mode with periodic_sleep"
+            );
+            mode.validate(name)?;
+        }
         Ok(())
     }
 
@@ -614,6 +730,23 @@ fn validate_positive(value: Option<usize>, field: &str, phase_name: &str) -> Res
     Ok(())
 }
 
+fn validate_workflow_identifier(value: &str, label: &str, maximum_bytes: usize) -> Result<()> {
+    ensure!(!value.is_empty(), "{label} must not be empty");
+    ensure!(
+        value.trim() == value,
+        "{label} must not have leading or trailing whitespace"
+    );
+    ensure!(
+        !value.chars().any(char::is_control),
+        "{label} must not contain control characters"
+    );
+    ensure!(
+        value.len() <= maximum_bytes,
+        "{label} exceeds the {maximum_bytes}-byte limit"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowV2 {
@@ -625,25 +758,7 @@ pub struct WorkflowV2 {
 
 impl WorkflowV2 {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.version == WORKFLOW_VERSION,
-            "unsupported workflow version {}; this build supports version {WORKFLOW_VERSION}",
-            self.version
-        );
-        if let Some(name) = &self.name {
-            ensure!(!name.trim().is_empty(), "workflow name must not be empty");
-        }
-        ensure!(!self.phases.is_empty(), "workflow contains no phases");
-        let mut names = BTreeSet::new();
-        for phase in &self.phases {
-            ensure!(
-                names.insert(phase.name.clone()),
-                "duplicate workflow phase name `{}`",
-                phase.name
-            );
-            phase.validate()?;
-        }
-        Ok(())
+        validate_workflow_parts(self.version, self.name.as_deref(), &self.phases)
     }
 
     pub fn resolve(mut self, source: &Path) -> Result<ResolvedWorkflow> {
@@ -660,6 +775,33 @@ impl WorkflowV2 {
     }
 }
 
+fn validate_workflow_parts(version: u32, name: Option<&str>, phases: &[PhaseV2]) -> Result<()> {
+    ensure!(
+        version == WORKFLOW_VERSION,
+        "unsupported workflow version {}; this build supports version {WORKFLOW_VERSION}",
+        version
+    );
+    if let Some(name) = name {
+        validate_workflow_identifier(name, "workflow name", MAX_WORKFLOW_NAME_BYTES)?;
+    }
+    ensure!(!phases.is_empty(), "workflow contains no phases");
+    ensure!(
+        phases.len() <= MAX_WORKFLOW_PHASES,
+        "workflow contains {} phases, exceeding the {MAX_WORKFLOW_PHASES}-phase limit",
+        phases.len()
+    );
+    let mut names = BTreeSet::new();
+    for phase in phases {
+        ensure!(
+            names.insert(phase.name.as_str()),
+            "duplicate workflow phase name `{}`",
+            phase.name
+        );
+        phase.validate()?;
+    }
+    Ok(())
+}
+
 /// Fully validated workflow with file references resolved against its source.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -672,12 +814,7 @@ pub struct ResolvedWorkflow {
 
 impl ResolvedWorkflow {
     pub fn validate(&self) -> Result<()> {
-        WorkflowV2 {
-            version: self.version,
-            name: self.name.clone(),
-            phases: self.phases.clone(),
-        }
-        .validate()
+        validate_workflow_parts(self.version, self.name.as_deref(), &self.phases)
     }
 }
 
@@ -738,37 +875,99 @@ pub fn validate_workflow_for_model(workflow: &ResolvedWorkflow, model: &ModelDef
         .collect::<Vec<_>>();
     if memory_layers == 0 {
         ensure!(
-            optimizer_phases
-                .iter()
-                .all(|phase| phase.periodic_sleep.is_none())
-                && standalone_sleep.is_empty(),
-            "in-model sleep requires a MAL model with an explicit memory hierarchy; no implicit topology upgrade is performed"
+            optimizer_phases.iter().all(|phase| {
+                phase.periodic_sleep.is_none() && phase.memory_update_mode.is_none()
+            }) && standalone_sleep.is_empty(),
+            "memory update modes and in-model sleep require a MAL model with an explicit memory hierarchy; no implicit topology upgrade is performed"
         );
         return Ok(());
     }
 
     if !optimizer_phases.is_empty() {
+        let periodic_count = optimizer_phases
+            .iter()
+            .filter(|phase| phase.periodic_sleep.is_some())
+            .count();
+        let wake_only_count = optimizer_phases
+            .iter()
+            .filter(|phase| phase.memory_update_mode.is_some())
+            .count();
         ensure!(
-            optimizer_phases
-                .iter()
-                .all(|phase| phase.periodic_sleep.is_some()),
-            "sleep-capable MAL models require identical periodic_sleep on every optimizer-bearing phase, including QAT"
+            periodic_count == optimizer_phases.len() || wake_only_count == optimizer_phases.len(),
+            "memory MAL models require one identical update policy on every optimizer-bearing phase: periodic_sleep or memory_update_mode wake_only, including QAT"
         );
-        let reference = optimizer_phases[0]
-            .periodic_sleep
-            .as_ref()
-            .expect("checked every optimizer phase has periodic sleep");
-        ensure!(
-            optimizer_phases
-                .iter()
-                .all(|phase| phase.periodic_sleep.as_ref() == Some(reference)),
-            "all optimizer-bearing phases in one memory-model workflow must use an identical periodic_sleep configuration"
-        );
-        validate_sleep_schedule_for_model(model, &reference.schedule, &optimizer_phases[0].name)?;
+        if periodic_count == optimizer_phases.len() {
+            let reference = optimizer_phases[0]
+                .periodic_sleep
+                .as_ref()
+                .expect("checked every optimizer phase has periodic sleep");
+            ensure!(
+                optimizer_phases
+                    .iter()
+                    .all(|phase| phase.periodic_sleep.as_ref() == Some(reference)),
+                "all optimizer-bearing phases in one memory-model workflow must use an identical periodic_sleep configuration"
+            );
+            validate_sleep_schedule_for_model(
+                model,
+                &reference.schedule,
+                &optimizer_phases[0].name,
+            )?;
+            validate_dreaming_topology(model, reference, &optimizer_phases[0].name)?;
+        } else {
+            ensure!(
+                standalone_sleep.is_empty(),
+                "memory_update_mode wake_only is a no-sleep ablation and cannot be combined with standalone sleep phases"
+            );
+            let reference = optimizer_phases[0]
+                .memory_update_mode
+                .as_ref()
+                .expect("checked every optimizer phase has a memory update mode");
+            ensure!(
+                optimizer_phases
+                    .iter()
+                    .all(|phase| phase.memory_update_mode.as_ref() == Some(reference)),
+                "all optimizer-bearing phases in one memory-model workflow must use an identical memory_update_mode configuration"
+            );
+            validate_sleep_schedule_for_model(
+                model,
+                reference.schedule(),
+                &optimizer_phases[0].name,
+            )?;
+        }
     }
     for (phase, sleep) in standalone_sleep {
         validate_sleep_schedule_for_model(model, &sleep.schedule, &phase.name)?;
+        validate_dreaming_topology(model, sleep, &phase.name)?;
     }
+    Ok(())
+}
+
+fn validate_dreaming_topology(
+    model: &ModelDef,
+    sleep: &InModelSleepConfig,
+    phase_name: &str,
+) -> Result<()> {
+    if sleep.dreaming.is_none() {
+        return Ok(());
+    }
+    let has_exploration_route = (0..model.num_layers).any(|layer| {
+        model
+            .block_for_layer(layer)
+            .memory
+            .as_ref()
+            .is_some_and(|memory| {
+                memory.tiers.iter().any(|tier| {
+                    tier.ffn
+                        .moe
+                        .as_ref()
+                        .is_some_and(|moe| moe.experts > moe.top_k)
+                })
+            })
+    });
+    ensure!(
+        has_exploration_route,
+        "workflow phase `{phase_name}` enables Dreaming, but the MAL memory hierarchy has no persistent FFN MoE with an expert outside ordinary top-k"
+    );
     Ok(())
 }
 
@@ -817,8 +1016,8 @@ pub fn validate_sleep_schedule_for_model(
 }
 
 pub fn load_workflow(path: &Path) -> Result<ResolvedWorkflow> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read workflow {}", path.display()))?;
+    let bytes = read_regular_bounded(path, MAX_WORKFLOW_JSON_BYTES, "workflow JSON")
+        .with_context(|| format!("failed to read workflow {}", path.display()))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid workflow JSON in {}", path.display()))?;
     let version = value
@@ -880,7 +1079,7 @@ mod tests {
                     "reference": {
                         "adapter": "hermes_checkpoint",
                         "artifact": "reference",
-                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                        "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     }
                 });
                 phase
@@ -899,7 +1098,7 @@ mod tests {
                     "reference": {
                         "adapter": "hermes_checkpoint",
                         "artifact": "reference",
-                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                        "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     },
                     "sampling": {"max_new_tokens": 128}
                 });
@@ -909,14 +1108,14 @@ mod tests {
                 let mut phase = training_phase(
                     "distill",
                     "distillation",
-                    serde_json::json!({"type": "causal_lm"}),
+                    serde_json::json!({"type": "instruction_tuning"}),
                 );
                 phase["post_training"] = serde_json::json!({
                     "algorithm": "forward_kl",
                     "teacher": {
                         "adapter": "hermes_checkpoint",
                         "artifact": "teacher",
-                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                        "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     }
                 });
                 phase
@@ -1050,13 +1249,106 @@ mod tests {
     }
 
     #[test]
+    fn education_workflow_fits_the_bounded_shuffle_budget() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.education.example.json");
+        load_workflow(&path)
+            .unwrap_or_else(|error| panic!("education workflow is invalid: {error:#}"));
+    }
+
+    #[test]
     fn incompatible_workflow_versions_are_rejected_without_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.json");
         fs::write(&path, r#"{"version":1,"stages":[]}"#).unwrap();
 
-        let error = load_workflow(&path).unwrap_err().to_string();
+        let error = load_workflow(&path).unwrap_err();
+        let error = format!("{error:#}");
         assert!(error.contains("unsupported workflow version 1"), "{error}");
+    }
+
+    #[test]
+    fn workflow_file_is_bounded_before_json_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-workflow.json");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_WORKFLOW_JSON_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = load_workflow(&path).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
+    fn memory_sized_phase_geometry_is_bounded_without_limiting_steps() {
+        let phase = |field: &str, value: usize| {
+            let mut phase = training_phase(
+                "bounded",
+                "pretrain",
+                serde_json::json!({"type": "causal_lm"}),
+            );
+            phase[field] = serde_json::json!(value);
+            let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "phases": [phase]
+            }))
+            .unwrap();
+            workflow.validate().unwrap_err().to_string()
+        };
+
+        assert!(phase("batch_size", MAX_PHASE_BATCH_SIZE + 1).contains("batch_size exceeds"));
+        assert!(
+            phase("gradient_accumulation", MAX_PHASE_GRADIENT_ACCUMULATION + 1)
+                .contains("gradient_accumulation exceeds")
+        );
+        assert!(
+            phase("shuffle_buffer", MAX_PHASE_SHUFFLE_SAMPLES + 1)
+                .contains("shuffle_buffer exceeds")
+        );
+
+        let mut enormous_batch = training_phase(
+            "token-budget",
+            "pretrain",
+            serde_json::json!({"type": "causal_lm"}),
+        );
+        enormous_batch["sequence_length"] = serde_json::json!(MAX_PHASE_BATCH_TOKENS);
+        enormous_batch["batch_size"] = serde_json::json!(2);
+        enormous_batch["shuffle_buffer"] = serde_json::json!(1);
+        enormous_batch["steps"] = serde_json::json!(usize::MAX);
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [enormous_batch]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("batch geometry"), "{error}");
+
+        let mut retrieval = training_phase(
+            "retrieval-memory",
+            "continued_pretrain",
+            serde_json::json!({"type": "retrieval_representation"}),
+        );
+        retrieval["sequence_length"] = serde_json::json!(4096);
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [retrieval]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("shuffle geometry"), "{error}");
+
+        let mut long_run = training_phase(
+            "long-run",
+            "pretrain",
+            serde_json::json!({"type": "causal_lm"}),
+        );
+        long_run["steps"] = serde_json::json!(usize::MAX);
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [long_run]
+        }))
+        .unwrap();
+        workflow.validate().unwrap();
     }
 
     #[test]
@@ -1088,6 +1380,63 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(unknown.contains("sequnce_length"), "{unknown}");
+
+        let mut zero_shuffle = training_phase(
+            "zero-shuffle",
+            "pretrain",
+            serde_json::json!({"type": "causal_lm"}),
+        );
+        zero_shuffle["shuffle_buffer"] = serde_json::json!(0);
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [zero_shuffle]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("shuffle_buffer must be positive"), "{error}");
+
+        for invalid_name in [" leading", "trailing ", "line\nbreak"] {
+            let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "phases": [training_phase(
+                    invalid_name,
+                    "pretrain",
+                    serde_json::json!({"type": "causal_lm"})
+                )]
+            }))
+            .unwrap();
+            let error = workflow.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("whitespace") || error.contains("control characters"),
+                "{error}"
+            );
+        }
+
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [training_phase(
+                &"x".repeat(MAX_PHASE_NAME_BYTES + 1),
+                "pretrain",
+                serde_json::json!({"type": "causal_lm"})
+            )]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("byte limit"), "{error}");
+
+        let valid_phase: PhaseV2 = serde_json::from_value(training_phase(
+            "bounded",
+            "pretrain",
+            serde_json::json!({"type": "causal_lm"}),
+        ))
+        .unwrap();
+        let workflow = WorkflowV2 {
+            version: WORKFLOW_VERSION,
+            name: None,
+            phases: vec![valid_phase; MAX_WORKFLOW_PHASES + 1],
+        };
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("phase limit"), "{error}");
     }
 
     #[test]
@@ -1115,6 +1464,42 @@ mod tests {
         .unwrap();
         let error = rl.validate().unwrap_err().to_string();
         assert!(error.contains("verifiable-reward task"), "{error}");
+
+        let mut invalid_distillation = training_phase(
+            "distill-ranking",
+            "distillation",
+            serde_json::json!({"type": "retrieval_ranking"}),
+        );
+        invalid_distillation["post_training"] = serde_json::json!({
+            "algorithm": "forward_kl",
+            "teacher": {"adapter": "test", "revision": "teacher-v1"}
+        });
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [invalid_distillation]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("autoregressive or supervised-generation"),
+            "{error}"
+        );
+
+        let mut supervised_distillation = training_phase(
+            "distill-instructions",
+            "distillation",
+            serde_json::json!({"type": "instruction_tuning"}),
+        );
+        supervised_distillation["post_training"] = serde_json::json!({
+            "algorithm": "forward_kl",
+            "teacher": {"adapter": "test", "revision": "teacher-v1"}
+        });
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [supervised_distillation]
+        }))
+        .unwrap();
+        workflow.validate().unwrap();
 
         let missing_config: WorkflowV2 = serde_json::from_value(serde_json::json!({
             "version": 2,
@@ -1223,5 +1608,233 @@ mod tests {
             panic!("expected distillation")
         };
         assert_eq!(teacher_checkpoint, &dir.path().join("teacher.safetensors"));
+    }
+
+    fn wake_only_workflow() -> ResolvedWorkflow {
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [{
+                "name": "wake",
+                "type": "pretrain",
+                "task": {"type": "causal_lm"},
+                "data": "wake.jsonl",
+                "sequence_length": 8,
+                "batch_size": 1,
+                "gradient_accumulation": 1,
+                "steps": 2,
+                "memory_update_mode": {
+                    "type": "wake_only",
+                    "schedule": {
+                        "clock": "optimizer_steps",
+                        "terminal_consolidation": "distill_into_base_v1",
+                        "tiers": [
+                            {"id": "fast", "update_period": 1, "reserve_slots": 1},
+                            {"id": "slow", "update_period": 2, "reserve_slots": 2}
+                        ]
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        workflow.resolve(Path::new("workflow.json")).unwrap()
+    }
+
+    fn memory_model(mixed: bool) -> ModelDef {
+        let topology = if mixed {
+            "block: sleeping pattern: [ordinary, sleeping]"
+        } else {
+            "block: sleeping"
+        };
+        hermes_llm::parse_mal(&format!(
+            r#"
+            ffn base {{ hidden_dim: 12 activation: swiglu dropout: 0.0 }}
+            memory cms {{
+                tier fast {{
+                    ffn: base
+                    reserve_experts {{ capacity: 1 rank: 3 top_k: 1 }}
+                }}
+                tier slow {{
+                    ffn: base residual_init: zero
+                    reserve_experts {{ capacity: 2 rank: 3 top_k: 1 }}
+                }}
+            }}
+            block ordinary {{
+                attention: {{ num_heads: 1 dropout: 0.0 position_encoding: none }}
+                ffn: base dropout: 0.0
+            }}
+            block sleeping {{
+                attention: {{ num_heads: 1 dropout: 0.0 position_encoding: none }}
+                memory: cms dropout: 0.0
+            }}
+            model memory-test {{
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 2
+                {topology}
+            }}
+            "#
+        ))
+        .unwrap()
+    }
+
+    fn dreaming_memory_model() -> ModelDef {
+        hermes_llm::parse_mal(
+            r#"
+            ffn dense { hidden_dim: 12 activation: swiglu dropout: 0.0 }
+            ffn routed {
+                hidden_dim: 12 activation: swiglu dropout: 0.0
+                moe { experts: 2 top_k: 1 }
+            }
+            memory cms {
+                tier fast {
+                    ffn: routed
+                    reserve_experts { capacity: 1 rank: 3 top_k: 1 }
+                }
+                tier slow {
+                    ffn: dense residual_init: zero
+                    reserve_experts { capacity: 2 rank: 3 top_k: 1 }
+                }
+            }
+            block sleeping {
+                attention: { num_heads: 1 dropout: 0.0 position_encoding: none }
+                memory: cms dropout: 0.0
+            }
+            model memory-test {
+                vocab_size: 16 max_seq_len: 8 hidden_size: 8 num_layers: 2
+                block: sleeping
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    fn periodic_sleep_config(with_dreaming: bool) -> InModelSleepConfig {
+        let mut value = serde_json::json!({
+            "schedule": {
+                "clock": "optimizer_steps",
+                "terminal_consolidation": "distill_into_base_v1",
+                "tiers": [
+                    {"id": "fast", "update_period": 1, "reserve_slots": 1},
+                    {"id": "slow", "update_period": 2, "reserve_slots": 2}
+                ]
+            },
+            "knowledge_seeding": {
+                "chunk_tokens": 8,
+                "teacher_rollouts": 1,
+                "detached_student_rollouts": 1,
+                "temperature": 1.0,
+                "forward_kl_weight": 1.0
+            },
+            "imitation": {
+                "semantic_judge_hash": format!("sha256:{}", "0".repeat(64)),
+                "semantic_weight": 1.0,
+                "maximum_edit_distance": 8,
+                "grpo_group_size": 2
+            },
+            "retention_suite": "retention.json",
+            "retention_suite_sha256": format!("sha256:{}", "0".repeat(64)),
+            "retention": {
+                "evaluator_hash": format!("sha256:{}", "0".repeat(64)),
+                "suite_hash": format!("sha256:{}", "0".repeat(64)),
+                "max_anchor_forward_kl": 0.1,
+                "max_anchor_regression": 0.1,
+                "min_incorporation_gain": 0.0
+            },
+            "receiver_learning_rate": 0.0001,
+            "receiver_weight_decay": 0.0,
+            "grpo_clip_epsilon": 0.2,
+            "grpo_advantage_epsilon": 0.000001,
+            "grpo_kl_coefficient": 0.04,
+            "candidate_directory": "candidates"
+        });
+        if with_dreaming {
+            value["dreaming"] = serde_json::to_value(DreamingConfig::paper_reproduction()).unwrap();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn dreaming_requires_a_persistent_memory_moe_exploration_route() {
+        let mut workflow = wake_only_workflow();
+        workflow.phases[0].memory_update_mode = None;
+        workflow.phases[0].periodic_sleep = Some(periodic_sleep_config(true));
+
+        let error = validate_workflow_for_model(&workflow, &memory_model(false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("persistent FFN MoE"), "{error}");
+
+        validate_workflow_for_model(&workflow, &dreaming_memory_model()).unwrap();
+
+        workflow.phases[0].periodic_sleep = Some(periodic_sleep_config(false));
+        validate_workflow_for_model(&workflow, &memory_model(false)).unwrap();
+    }
+
+    #[test]
+    fn wake_only_is_an_explicit_uniform_memory_update_policy() {
+        let workflow = wake_only_workflow();
+        validate_workflow_for_model(&workflow, &memory_model(false)).unwrap();
+
+        let mut missing = workflow.clone();
+        let mut second = missing.phases[0].clone();
+        second.name = "missing-policy".into();
+        second.memory_update_mode = None;
+        missing.phases.push(second);
+        let error = validate_workflow_for_model(&missing, &memory_model(false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("one identical update policy"), "{error}");
+
+        let mut combined = workflow.clone();
+        combined.phases[0].periodic_sleep = Some(
+            serde_json::from_value(serde_json::json!({
+                "schedule": {
+                    "clock": "optimizer_steps",
+                    "terminal_consolidation": "distill_into_base_v1",
+                    "tiers": [
+                        {"id": "fast", "update_period": 1, "reserve_slots": 1},
+                        {"id": "slow", "update_period": 2, "reserve_slots": 2}
+                    ]
+                },
+                "knowledge_seeding": {
+                    "chunk_tokens": 8,
+                    "teacher_rollouts": 1,
+                    "detached_student_rollouts": 1,
+                    "temperature": 1.0,
+                    "forward_kl_weight": 1.0
+                },
+                "imitation": {
+                    "semantic_judge_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "semantic_weight": 1.0,
+                    "maximum_edit_distance": 8,
+                    "grpo_group_size": 2
+                },
+                "retention_suite": "retention.json",
+                "retention_suite_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "retention": {
+                    "evaluator_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "suite_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "max_anchor_forward_kl": 0.1,
+                    "max_anchor_regression": 0.1,
+                    "min_incorporation_gain": 0.0
+                },
+                "receiver_learning_rate": 0.0001,
+                "receiver_weight_decay": 0.0,
+                "grpo_clip_epsilon": 0.2,
+                "grpo_advantage_epsilon": 0.000001,
+                "grpo_kl_coefficient": 0.04,
+                "candidate_directory": "candidates"
+            }))
+            .unwrap(),
+        );
+        let error = combined.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot combine"), "{error}");
+    }
+
+    #[test]
+    fn mixed_memory_and_ordinary_layers_are_an_explicitly_unsupported_topology() {
+        let error = validate_workflow_for_model(&wake_only_workflow(), &memory_model(true))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("model mixes"), "{error}");
+        assert!(error.contains("every layer"), "{error}");
     }
 }

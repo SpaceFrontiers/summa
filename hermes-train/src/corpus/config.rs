@@ -7,6 +7,19 @@ use serde_json::Value;
 /// Current on-disk corpus configuration and manifest schema.
 pub const CORPUS_SCHEMA_VERSION: u32 = 2;
 
+// These limits bound work derived from one small configuration before the
+// pipeline reaches a byte-bounded remote response or shard writer. They are
+// deliberately far above the production recipe while preventing values such
+// as `usize::MAX` from turning a typo or hostile recipe into an allocation or
+// CPU denial of service.
+const MAX_DISCOVERY_QUERIES: usize = 4_096;
+const MAX_DISCOVERY_HITS: usize = 1_000_000_000;
+pub(super) const MAX_DISCOVERY_BATCH_SIZE: usize = 65_536;
+const MAX_CLASSIFICATION_RULES: usize = 4_096;
+const MAX_CLASSIFICATION_TERMS: usize = 4_096;
+const MAX_TRANSFORMATIONS: usize = 1_024;
+const MAX_COPIES_PER_RECORD: usize = 4_096;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorpusBuildConfig {
@@ -47,6 +60,10 @@ impl CorpusBuildConfig {
         self.deduplication.validate()?;
         self.classification.validate()?;
         ensure!(
+            self.transformations.len() <= MAX_TRANSFORMATIONS,
+            "corpus transformations exceed the {MAX_TRANSFORMATIONS}-item limit"
+        );
+        ensure!(
             self.transformations.iter().all(|item| item.copies > 0),
             "every transformation must emit at least one copy"
         );
@@ -55,6 +72,10 @@ impl CorpusBuildConfig {
             ensure!(
                 !transform.name.trim().is_empty(),
                 "transformation names must not be empty"
+            );
+            ensure!(
+                transform.name != "source",
+                "transformation name `source` is reserved for canonical corpus views"
             );
             ensure!(
                 transform_names.insert(transform.name.as_str()),
@@ -93,10 +114,15 @@ impl DiscoveryConfig {
             "corpus discovery requires at least one query"
         );
         ensure!(
-            self.materialization_batch_size > 0,
-            "materialization_batch_size must be positive"
+            self.queries.len() <= MAX_DISCOVERY_QUERIES,
+            "corpus discovery queries exceed the {MAX_DISCOVERY_QUERIES}-item limit"
+        );
+        ensure!(
+            (1..=MAX_DISCOVERY_BATCH_SIZE).contains(&self.materialization_batch_size),
+            "materialization_batch_size must be within 1..={MAX_DISCOVERY_BATCH_SIZE}"
         );
         let mut names = std::collections::BTreeSet::new();
+        let mut total_limit = 0usize;
         for query in &self.queries {
             ensure!(
                 !query.name.trim().is_empty() && !query.text.trim().is_empty(),
@@ -108,9 +134,16 @@ impl DiscoveryConfig {
                 query.name
             );
             ensure!(
-                query.limit > 0,
-                "query `{}` limit must be positive",
+                (1..=MAX_DISCOVERY_HITS).contains(&query.limit),
+                "query `{}` limit must be within 1..={MAX_DISCOVERY_HITS}",
                 query.name
+            );
+            total_limit = total_limit.checked_add(query.limit).ok_or_else(|| {
+                anyhow::anyhow!("aggregate discovery query limit overflows usize")
+            })?;
+            ensure!(
+                total_limit <= MAX_DISCOVERY_HITS,
+                "aggregate discovery query limit exceeds {MAX_DISCOVERY_HITS} hits"
             );
         }
         Ok(())
@@ -178,7 +211,7 @@ impl Default for DeduplicationConfig {
 }
 
 impl DeduplicationConfig {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             self.by_record_key || self.by_normalized_text,
             "deduplication must enable record-key or normalized-text matching"
@@ -198,13 +231,28 @@ pub struct ClassificationConfig {
 
 impl ClassificationConfig {
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.default_topic
+                .as_deref()
+                .is_none_or(|label| !label.trim().is_empty())
+                && self
+                    .default_difficulty
+                    .as_deref()
+                    .is_none_or(|label| !label.trim().is_empty()),
+            "classification default labels must not be empty"
+        );
         validate_rules("topic", &self.topic_rules)?;
         validate_rules("difficulty", &self.difficulty_rules)
     }
 }
 
 fn validate_rules(kind: &str, rules: &[ClassificationRule]) -> Result<()> {
+    ensure!(
+        rules.len() <= MAX_CLASSIFICATION_RULES,
+        "{kind} classification rules exceed the {MAX_CLASSIFICATION_RULES}-item limit"
+    );
     let mut labels = std::collections::BTreeSet::new();
+    let mut total_terms = 0usize;
     for rule in rules {
         ensure!(
             !rule.label.trim().is_empty(),
@@ -215,9 +263,19 @@ fn validate_rules(kind: &str, rules: &[ClassificationRule]) -> Result<()> {
             "duplicate {kind} classification label `{}`",
             rule.label
         );
+        total_terms = total_terms
+            .checked_add(rule.any_terms.len())
+            .and_then(|count| count.checked_add(rule.all_terms.len()))
+            .and_then(|count| count.checked_add(rule.none_terms.len()))
+            .ok_or_else(|| anyhow::anyhow!("{kind} classification term count overflows usize"))?;
+        ensure!(
+            total_terms <= MAX_CLASSIFICATION_TERMS,
+            "{kind} classification terms exceed the {MAX_CLASSIFICATION_TERMS}-item limit"
+        );
         ensure!(
             !rule.any_terms.is_empty()
                 || !rule.all_terms.is_empty()
+                || !rule.none_terms.is_empty()
                 || !rule.metadata_equals.is_empty(),
             "{kind} rule `{}` has no predicates",
             rule.label
@@ -302,6 +360,10 @@ impl RepetitionConfig {
     fn validate(&self) -> Result<()> {
         ensure!(self.base_copies > 0, "base_copies must be positive");
         ensure!(
+            self.max_copies_per_record <= MAX_COPIES_PER_RECORD,
+            "max_copies_per_record exceeds the {MAX_COPIES_PER_RECORD}-copy limit"
+        );
+        ensure!(
             self.max_copies_per_record >= self.base_copies,
             "max_copies_per_record must cover base_copies"
         );
@@ -311,6 +373,13 @@ impl RepetitionConfig {
                 .chain(self.difficulty_copies.values())
                 .all(|copies| *copies > 0 && *copies <= self.max_copies_per_record),
             "configured repetition copies must be positive and within max_copies_per_record"
+        );
+        ensure!(
+            self.topic_copies
+                .keys()
+                .chain(self.difficulty_copies.keys())
+                .all(|label| !label.trim().is_empty()),
+            "configured repetition labels must not be empty"
         );
         Ok(())
     }
@@ -325,7 +394,7 @@ pub struct TokenTarget {
 }
 
 impl TokenTarget {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(self.minimum > 0, "minimum token target must be positive");
         ensure!(
             self.minimum <= self.desired && self.desired <= self.maximum,
@@ -346,7 +415,7 @@ pub struct ShardingConfig {
 }
 
 impl ShardingConfig {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             self.max_tokens_per_shard > 0,
             "max_tokens_per_shard must be positive"

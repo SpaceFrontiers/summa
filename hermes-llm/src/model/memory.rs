@@ -131,6 +131,25 @@ pub struct MemorySlotStatus {
     pub parameter_ids: Vec<ParamId>,
 }
 
+/// Where a reserve slot sits in the model. Initialization is salted by all
+/// three coordinates so no two slots start from the same `A`, matching the
+/// per-layer salting that slot reclamation already applies.
+#[derive(Clone, Copy)]
+struct SlotPosition {
+    layer: usize,
+    tier: usize,
+    slot: usize,
+}
+
+impl SlotPosition {
+    fn seed(self) -> u64 {
+        let mixed = mix_seed(self.slot as u64, 0x41)
+            ^ (self.layer as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ (self.tier as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        mix_seed(mixed, 0x41)
+    }
+}
+
 #[derive(Module, Debug)]
 struct LowRankExpertSlot {
     router: Linear,
@@ -145,8 +164,8 @@ struct LowRankExpertSlot {
 }
 
 impl LowRankExpertSlot {
-    fn new(hidden: usize, rank: usize, slot: usize, device: &Device) -> Self {
-        let a_values = deterministic_values(hidden * rank, mix_seed(slot as u64, 0x41));
+    fn new(hidden: usize, rank: usize, position: SlotPosition, device: &Device) -> Self {
+        let a_values = deterministic_values(hidden * rank, position.seed());
         Self {
             router: LinearConfig::new(hidden, 1).with_bias(false).init(device),
             a: Param::from_tensor(Tensor::from_data(
@@ -304,10 +323,20 @@ struct LowRankExpertReserve {
 }
 
 impl LowRankExpertReserve {
-    fn new(hidden: usize, capacity: usize, rank: usize, top_k: usize, device: &Device) -> Self {
+    fn new(
+        hidden: usize,
+        capacity: usize,
+        rank: usize,
+        top_k: usize,
+        layer: usize,
+        tier: usize,
+        device: &Device,
+    ) -> Self {
         Self {
             slots: (0..capacity)
-                .map(|slot| LowRankExpertSlot::new(hidden, rank, slot, device))
+                .map(|slot| {
+                    LowRankExpertSlot::new(hidden, rank, SlotPosition { layer, tier, slot }, device)
+                })
                 .collect(),
             fallback_a: Tensor::from_data(
                 TensorData::new(
@@ -672,16 +701,22 @@ pub struct MemoryChain {
 }
 
 impl MemoryChain {
+    pub(crate) fn has_tier(&self, tier: usize) -> bool {
+        tier < self.tiers.len()
+    }
+
     pub(crate) fn new(
         config: &ModelDef,
         block: &BlockDef,
         definition: &MemoryDef,
+        layer: usize,
         device: &Device,
     ) -> Self {
         let tiers = definition
             .tiers
             .iter()
-            .map(|definition| {
+            .enumerate()
+            .map(|(tier, definition)| {
                 let mut tier_block = block.clone();
                 tier_block.memory = None;
                 tier_block.ffn = definition.ffn.clone();
@@ -696,6 +731,8 @@ impl MemoryChain {
                         definition.reserve_experts.capacity,
                         definition.reserve_experts.rank,
                         definition.reserve_experts.top_k,
+                        layer,
+                        tier,
                         device,
                     ),
                     name: definition.name.clone(),
@@ -868,6 +905,45 @@ impl MemoryChain {
         Ok(ids.0)
     }
 
+    /// Float parameters that are eligible for ordinary wake gradients in one
+    /// tier. Activation changes only at consolidation boundaries, so this uses
+    /// the runtime mirror instead of reading checkpoint mask/generation tensors
+    /// back from the device on every optimizer step.
+    pub(crate) fn tier_active_parameter_ids(&self, tier: usize) -> Result<Vec<ParamId>> {
+        let tier = self
+            .tiers
+            .get(tier)
+            .ok_or_else(|| anyhow::anyhow!("memory tier {tier} does not exist"))?;
+        #[derive(Default)]
+        struct FloatIds(Vec<ParamId>);
+        impl ModuleVisitor for FloatIds {
+            fn visit_float<const D: usize>(&mut self, parameter: &Param<Tensor<D>>) {
+                self.0.push(parameter.id);
+            }
+        }
+        let mut ids = FloatIds::default();
+        tier.feed_forward.visit(&mut ids);
+        ids.0.extend(
+            tier.reserve
+                .slots
+                .iter()
+                .filter(|slot| slot.runtime_active)
+                .flat_map(LowRankExpertSlot::parameter_ids),
+        );
+        Ok(ids.0)
+    }
+
+    /// Dormant reserve parameters across the complete chain, derived without
+    /// synchronizing the serialized activation tensors to the host.
+    pub(crate) fn dormant_parameter_ids(&self) -> Vec<ParamId> {
+        self.tiers
+            .iter()
+            .flat_map(|tier| &tier.reserve.slots)
+            .filter(|slot| !slot.runtime_active)
+            .flat_map(LowRankExpertSlot::parameter_ids)
+            .collect()
+    }
+
     /// Float parameters of the tier's persistent base FFN/MoE, excluding all
     /// preallocated reserve experts. Terminal consolidation targets exactly
     /// this scope before it can reclaim the bounded slow reserve.
@@ -983,7 +1059,8 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray().autodiff();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         let run = |memory: &MemoryChain| {
             let input = Tensor::<2>::random([5, 8], Distribution::Default, &device);
             memory
@@ -1060,7 +1137,8 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
 
         let reserve = &memory.tiers[0].reserve;
         assert!(reserve.active_slots.is_empty());
@@ -1103,11 +1181,109 @@ mod tests {
     }
 
     #[test]
+    fn lightweight_parameter_scopes_follow_the_runtime_activation_cache() {
+        let config = memory_config();
+        let device = Device::ndarray();
+        let block = config.block.clone();
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
+
+        let all = memory
+            .tier_parameter_ids(0)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        let base = memory
+            .tier_base_parameter_ids(0)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        let active = memory
+            .tier_active_parameter_ids(0)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        let dormant = memory
+            .dormant_parameter_ids()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(active, base);
+        assert_eq!(
+            active
+                .union(&dormant)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            all
+        );
+
+        let activated = memory.tiers[0].reserve.slots[1]
+            .parameter_ids()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        memory.activate_slot(0, 1).unwrap();
+        let active_after = memory
+            .tier_active_parameter_ids(0)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        let dormant_after = memory
+            .dormant_parameter_ids()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(active_after, base.union(&activated).copied().collect());
+        assert!(dormant_after.is_disjoint(&activated));
+        assert_eq!(
+            active_after
+                .union(&dormant_after)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            all
+        );
+
+        // Scope selection must not consult checkpoint tensors on the ordinary
+        // wake path. A direct snapshot mutation is intentionally invisible
+        // until the explicit boundary/load synchronization runs.
+        let checkpoint_only = memory.tiers[0].reserve.slots[0]
+            .parameter_ids()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        memory.tiers[0].reserve.slots[0].active = memory.tiers[0].reserve.slots[0]
+            .active
+            .clone()
+            .map(|value| Tensor::<1, Bool>::from_data([true], &value.device()));
+        let before_sync = memory
+            .dormant_parameter_ids()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(checkpoint_only.is_subset(&before_sync));
+
+        memory.sync_state();
+        let after_sync = memory
+            .tier_active_parameter_ids(0)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.val())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(checkpoint_only.is_subset(&after_sync));
+        assert_eq!(memory.tiers[0].reserve.active_slots, vec![0, 1]);
+    }
+
+    #[test]
     fn routing_cache_survives_autodiff_validation() {
         let config = memory_config();
         let device = Device::ndarray().autodiff();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         memory.activate_slot(0, 1).unwrap();
 
         let inference = memory.valid();
@@ -1131,7 +1307,8 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         memory.activate_slot(0, 1).unwrap();
         let reserve = &mut memory.tiers[0].reserve;
         reserve.slots[1].b = reserve.slots[1]
@@ -1164,7 +1341,7 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray().autodiff();
         let block = config.block.clone();
-        let memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         let reserve = &memory.tiers[0].reserve;
         let input = Tensor::<2>::random([5, 8], Distribution::Default, &device);
 
@@ -1190,7 +1367,8 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         let reserve = &memory.tiers[0].reserve;
         let first = &reserve.slots[0];
         let expected = first.router.num_params() * reserve.slots.len()
@@ -1217,7 +1395,8 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         memory.activate_slot(0, 0).unwrap();
         assert!(memory.statuses(0)[0].active);
         memory.reset_slot(0, 0, 17).unwrap();
@@ -1238,7 +1417,8 @@ mod tests {
         let config = memory_config();
         let device = Device::ndarray();
         let block = config.block.clone();
-        let mut memory = MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), &device);
+        let mut memory =
+            MemoryChain::new(&config, &block, block.memory.as_ref().unwrap(), 0, &device);
         let slot = &mut memory.tiers[0].reserve.slots[0];
         slot.generation = slot
             .generation

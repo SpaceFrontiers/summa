@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::pipeline::{
+    AuthenticatedCorpus, MAX_CORPUS_JSONL_RECORD_BYTES, corpus_manifest_configuration_sha256,
+    read_corpus_jsonl_record, read_corpus_metadata_file,
+};
 use super::{
     CorpusManifest, CorpusManifestBody, CorpusStageStats, ShardManifest, ShardingConfig,
     TokenTarget,
@@ -32,11 +36,21 @@ const COMPOSITION_PROGRESS_VERSION: u32 = 1;
 const PROGRESS_FILE: &str = "composition-progress.json";
 const PROGRESS_TEMP_FILE: &str = ".composition-progress.next";
 const WORK_IDENTITY_FILE: &str = "composition-work.json";
+const MAX_CURRICULUM_STAGES: usize = 64;
+const MAX_STRATA_PER_STAGE: usize = 64;
+// Composition keeps one spool descriptor per stratum open. Staying below a
+// typical per-process descriptor limit also bounds the progress matrix.
+const MAX_TOTAL_CURRICULUM_STRATA: usize = 128;
+const MAX_CURRICULUM_SELECTORS: usize = 65_536;
 
 #[cfg(test)]
 thread_local! {
     static TEST_INTERRUPTION: std::cell::RefCell<Option<(&'static str, usize)>> = const {
         std::cell::RefCell::new(None)
+    };
+    #[cfg(unix)]
+    static TEST_SOURCE_REPLACEMENT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
     };
 }
 
@@ -45,6 +59,28 @@ fn set_test_interruption(boundary: &'static str, occurrence: usize) {
     TEST_INTERRUPTION.with(|configured| {
         *configured.borrow_mut() = Some((boundary, occurrence));
     });
+}
+
+#[cfg(all(test, unix))]
+fn set_test_source_replacement() {
+    TEST_SOURCE_REPLACEMENT.with(|configured| configured.set(true));
+}
+
+#[cfg(all(test, unix))]
+fn maybe_test_replace_source(path: &Path) -> Result<()> {
+    let replace = TEST_SOURCE_REPLACEMENT.with(|configured| configured.replace(false));
+    if replace {
+        let parked = path.with_extension("test-authenticated-original");
+        fs::rename(path, &parked)?;
+        fs::write(path, b"{\"record_key\":\"malicious\",\"tokens\":[9]}\n")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(all(test, unix)))]
+#[inline]
+fn maybe_test_replace_source(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -144,12 +180,7 @@ pub struct CurriculumCompositionConfig {
 
 impl CurriculumCompositionConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| {
-            format!(
-                "failed to read curriculum composition configuration {}",
-                path.display()
-            )
-        })?;
+        let bytes = read_corpus_metadata_file(path, "curriculum composition configuration")?;
         let config: Self = serde_json::from_slice(&bytes).with_context(|| {
             format!("invalid curriculum composition JSON in {}", path.display())
         })?;
@@ -176,9 +207,34 @@ impl CurriculumCompositionConfig {
             !self.stages.is_empty(),
             "curriculum composition requires at least one stage"
         );
+        ensure!(
+            self.stages.len() <= MAX_CURRICULUM_STAGES,
+            "curriculum composition exceeds the {MAX_CURRICULUM_STAGES}-stage limit"
+        );
         let mut names = BTreeSet::new();
+        let mut total_strata = 0usize;
+        let mut total_selectors = 0usize;
         for stage in &self.stages {
             stage.validate()?;
+            total_strata = total_strata
+                .checked_add(stage.strata.len())
+                .context("curriculum stratum count overflows usize")?;
+            ensure!(
+                total_strata <= MAX_TOTAL_CURRICULUM_STRATA,
+                "curriculum composition exceeds the {MAX_TOTAL_CURRICULUM_STRATA}-stratum limit"
+            );
+            total_selectors = total_selectors
+                .checked_add(stage.when.selector_count()?)
+                .context("curriculum selector count overflows usize")?;
+            for stratum in &stage.strata {
+                total_selectors = total_selectors
+                    .checked_add(stratum.when.selector_count()?)
+                    .context("curriculum selector count overflows usize")?;
+            }
+            ensure!(
+                total_selectors <= MAX_CURRICULUM_SELECTORS,
+                "curriculum composition exceeds the {MAX_CURRICULUM_SELECTORS}-selector limit"
+            );
             ensure!(
                 names.insert(stage.name.as_str()),
                 "duplicate curriculum stage `{}`",
@@ -205,21 +261,15 @@ impl CurriculumCompositionConfig {
     ) -> Result<(PathBuf, CurriculumManifest)> {
         self.validate()?;
         let source_path = resolve_relative(config_path, &self.source_manifest);
-        ensure_regular_file(&source_path, "source corpus manifest")?;
-        let source: CorpusManifest = serde_json::from_slice(
-            &fs::read(&source_path)
-                .with_context(|| format!("failed to read {}", source_path.display()))?,
-        )
-        .with_context(|| format!("invalid corpus manifest {}", source_path.display()))?;
+        let authenticated_source = AuthenticatedCorpus::open_data_path(&source_path)?
+            .context("source_manifest must identify an authenticated corpus manifest")?;
+        let source = authenticated_source.manifest().clone();
         ensure!(
             source.manifest_sha256 == self.source_manifest_sha256,
             "source corpus manifest identity changed: expected {}, got {}",
             self.source_manifest_sha256,
             source.manifest_sha256
         );
-        let source_root = source_path.parent().unwrap_or_else(|| Path::new("."));
-        ensure_real_directory(source_root, "source corpus root")?;
-        source.verify(source_root)?;
 
         create_and_validate_directory(output_root, "curriculum output root")?;
         create_and_validate_directory(work_directory, "curriculum work directory")?;
@@ -267,20 +317,24 @@ impl CurriculumCompositionConfig {
                 open_or_create_spools(&work_path, self, &source, &identity, &mut progress)?;
             if !progress.state.spooling_complete {
                 for shard_index in progress.state.next_source_shard..source.build.shards.len() {
-                    spool_source_shard(
-                        &source.build.shards[shard_index],
-                        source_root,
-                        &self.stages,
-                        &mut spools,
-                    )?;
+                    authenticated_source.with_shard(shard_index, |path, file| {
+                        maybe_test_replace_source(path)?;
+                        spool_source_shard(
+                            &source.build.shards[shard_index],
+                            path,
+                            file,
+                            &self.stages,
+                            &mut spools,
+                        )
+                    })?;
                     finish_spools(&mut spools)?;
                     progress.state.next_source_shard = shard_index + 1;
                     capture_spool_checkpoints(&spools, &mut progress.state.spools)?;
                     persist_progress(&progress_path, &mut progress)?;
                     maybe_test_interrupt("source_shard")?;
                 }
-                source
-                    .verify(source_root)
+                authenticated_source
+                    .ensure_still_published()
                     .context("source corpus changed while curriculum spools were being prepared")?;
                 progress.state.spooling_complete = true;
                 persist_progress(&progress_path, &mut progress)?;
@@ -312,8 +366,6 @@ impl CurriculumCompositionConfig {
                 progress.state.completed_stages.push(summary);
                 persist_progress(&progress_path, &mut progress)?;
             }
-        } else {
-            validate_staging_tree(self, &source, &identity, &staging_path, &progress)?;
         }
 
         let body = CurriculumManifestBody {
@@ -640,12 +692,12 @@ pub enum CurriculumUnmatchedPolicy {
 impl CurriculumStageConfig {
     fn validate(&self) -> Result<()> {
         validate_component("curriculum stage name", &self.name)?;
-        validate_token_target(&self.token_target)?;
-        ensure!(
-            self.sharding.max_tokens_per_shard > 0,
-            "stage `{}` max_tokens_per_shard must be positive",
-            self.name
-        );
+        self.token_target
+            .validate()
+            .with_context(|| format!("invalid token target for stage `{}`", self.name))?;
+        self.sharding
+            .validate()
+            .with_context(|| format!("invalid sharding for stage `{}`", self.name))?;
         ensure!(
             self.max_fraction_deviation.is_finite()
                 && (0.0..=1.0).contains(&self.max_fraction_deviation),
@@ -653,10 +705,11 @@ impl CurriculumStageConfig {
             self.name
         );
         ensure!(
-            !self.strata.is_empty(),
-            "stage `{}` requires at least one stratum",
+            (1..=MAX_STRATA_PER_STAGE).contains(&self.strata.len()),
+            "stage `{}` requires 1..={MAX_STRATA_PER_STAGE} strata",
             self.name
         );
+        self.when.validate("stage predicate")?;
         let mut names = BTreeSet::new();
         let mut total_weight = 0_u64;
         for stratum in &self.strata {
@@ -673,6 +726,7 @@ impl CurriculumStageConfig {
                 self.name,
                 stratum.name
             );
+            stratum.when.validate("stratum predicate")?;
             total_weight = total_weight
                 .checked_add(stratum.weight)
                 .context("curriculum stratum weights overflow u64")?;
@@ -705,6 +759,27 @@ pub struct CurriculumPredicate {
 }
 
 impl CurriculumPredicate {
+    fn validate(&self, label: &str) -> Result<()> {
+        ensure!(
+            self.topics
+                .iter()
+                .chain(&self.difficulties)
+                .chain(&self.views)
+                .all(|value| !value.trim().is_empty()),
+            "{label} contains an empty selector"
+        );
+        self.selector_count().map(|_| ())
+    }
+
+    fn selector_count(&self) -> Result<usize> {
+        self.topics
+            .len()
+            .checked_add(self.difficulties.len())
+            .and_then(|count| count.checked_add(self.views.len()))
+            .and_then(|count| count.checked_add(self.metadata_equals.len()))
+            .context("curriculum predicate selector count overflows usize")
+    }
+
     fn matches(&self, record: &TokenizedCorpusRecord) -> bool {
         matches_optional(&self.topics, record.topic.as_deref())
             && matches_optional(&self.difficulties, record.difficulty.as_deref())
@@ -754,11 +829,35 @@ pub struct CurriculumManifest {
 impl CurriculumManifest {
     pub fn verify(&self, root: &Path) -> Result<()> {
         ensure_real_directory(root, "curriculum manifest root")?;
+        self.verify_structure()?;
+        for stage in &self.build.stages {
+            let path = safe_join(root, &stage.manifest_path)?;
+            let authenticated = AuthenticatedCorpus::open_data_path(&path)?
+                .context("curriculum stage path must identify an authenticated corpus manifest")?;
+            let manifest = authenticated.manifest();
+            ensure!(
+                manifest.manifest_sha256 == stage.manifest_sha256,
+                "stage `{}` manifest identity changed",
+                stage.name
+            );
+            ensure!(
+                manifest.build.stats.emitted_views == stage.records
+                    && manifest.build.stats.exposure_tokens == stage.tokens,
+                "stage `{}` summary does not match its corpus manifest",
+                stage.name
+            );
+            authenticated.ensure_still_published()?;
+        }
+        Ok(())
+    }
+
+    fn verify_structure(&self) -> Result<()> {
         ensure!(
             self.build.version == CURRICULUM_COMPOSITION_VERSION,
             "unsupported curriculum manifest version {}",
             self.build.version
         );
+        validate_component("curriculum manifest build_id", &self.build.build_id)?;
         ensure!(
             is_sha256(&self.build.config_sha256) && is_sha256(&self.build.source_manifest_sha256),
             "curriculum manifest contains an invalid content identity"
@@ -789,24 +888,6 @@ impl CurriculumManifest {
                 "curriculum manifest repeats stage `{}`",
                 stage.name
             );
-            let path = safe_join(root, &stage.manifest_path)?;
-            ensure_regular_file(&path, "curriculum stage manifest")?;
-            let manifest: CorpusManifest = serde_json::from_slice(&fs::read(&path)?)
-                .with_context(|| format!("invalid stage manifest {}", path.display()))?;
-            ensure!(
-                manifest.manifest_sha256 == stage.manifest_sha256,
-                "stage `{}` manifest identity changed",
-                stage.name
-            );
-            let stage_root = path.parent().unwrap_or_else(|| Path::new("."));
-            ensure_real_directory(stage_root, "curriculum stage root")?;
-            manifest.verify(stage_root)?;
-            ensure!(
-                manifest.build.stats.emitted_views == stage.records
-                    && manifest.build.stats.exposure_tokens == stage.tokens,
-                "stage `{}` summary does not match its corpus manifest",
-                stage.name
-            );
             ensure!(
                 stage
                     .stratum_records
@@ -823,6 +904,16 @@ impl CurriculumManifest {
                     .try_fold(0_u64, |total, value| { total.checked_add(*value) })
                     == Some(stage.tokens),
                 "stage `{}` stratum token counts do not sum to the stage total",
+                stage.name
+            );
+            ensure!(
+                stage.stratum_records.keys().eq(stage.stratum_tokens.keys()),
+                "stage `{}` record and token strata differ",
+                stage.name
+            );
+            ensure!(
+                stage.records > 0 && stage.tokens > 0,
+                "stage `{}` is empty",
                 stage.name
             );
         }
@@ -863,20 +954,22 @@ struct SpoolWriter {
 
 fn spool_source_shard(
     shard: &ShardManifest,
-    source_root: &Path,
+    path: &Path,
+    file: &mut File,
     stages: &[CurriculumStageConfig],
     spools: &mut [Vec<SpoolWriter>],
 ) -> Result<()> {
-    let path = safe_join(source_root, &shard.path)?;
-    let mut reader = open_source_shard(&path)?;
+    let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut line_number = 0_u64;
+    let mut tokens = 0_u64;
     loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        if read_corpus_jsonl_record(&mut reader, &mut line, "source corpus row")? == 0 {
             break;
         }
-        line_number += 1;
+        line_number = line_number
+            .checked_add(1)
+            .context("source corpus row count overflows u64")?;
         while line
             .last()
             .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
@@ -895,7 +988,16 @@ fn spool_source_shard(
             )
         })?;
         record.validate()?;
+        tokens = checked_add(tokens, record.tokens.len())?;
         let canonical = serde_json::to_vec(&record)?;
+        ensure!(
+            canonical
+                .len()
+                .checked_add(1)
+                .is_some_and(|line_bytes| line_bytes <= MAX_CORPUS_JSONL_RECORD_BYTES),
+            "canonical source row at {}:{line_number} exceeds the JSONL record limit of {MAX_CORPUS_JSONL_RECORD_BYTES}",
+            path.display()
+        );
         for (stage_index, stage) in stages.iter().enumerate() {
             if !stage.when.matches(&record) {
                 continue;
@@ -935,19 +1037,19 @@ fn spool_source_shard(
             spool.bytes = checked_add(spool.bytes, canonical.len() + 1)?;
         }
     }
+    ensure!(
+        line_number == shard.records,
+        "source shard {} yielded {line_number} records but its manifest declares {}",
+        path.display(),
+        shard.records
+    );
+    ensure!(
+        tokens == shard.tokens,
+        "source shard {} yielded {tokens} tokens but its manifest declares {}",
+        path.display(),
+        shard.tokens
+    );
     Ok(())
-}
-
-fn open_source_shard(path: &Path) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open source shard {}", path.display()))?;
-    if path.extension().is_some_and(|extension| extension == "zst") {
-        let decoder = zstd::stream::read::Decoder::new(file)
-            .with_context(|| format!("failed to decode source shard {}", path.display()))?;
-        Ok(Box::new(BufReader::new(decoder)))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
 }
 
 fn finish_spools(spools: &mut [Vec<SpoolWriter>]) -> Result<()> {
@@ -1045,9 +1147,10 @@ fn open_or_create_spools(
         }
         Some(PathKind::File) => {
             ensure_regular_file(&identity_path, "curriculum work identity")?;
-            let actual: CompositionWorkIdentity =
-                serde_json::from_slice(&fs::read(&identity_path)?)
-                    .context("invalid curriculum work identity")?;
+            let actual: CompositionWorkIdentity = serde_json::from_slice(
+                &read_corpus_metadata_file(&identity_path, "curriculum work identity")?,
+            )
+            .context("invalid curriculum work identity")?;
             ensure!(
                 actual == expected_identity,
                 "curriculum work identity changed during resume"
@@ -1207,8 +1310,11 @@ fn validate_spool_tree(
     validate_work_entries(work_path, &state.spools)?;
     let identity_path = work_path.join(WORK_IDENTITY_FILE);
     ensure_regular_file(&identity_path, "curriculum work identity")?;
-    let identity: CompositionWorkIdentity = serde_json::from_slice(&fs::read(&identity_path)?)
-        .context("invalid curriculum work identity")?;
+    let identity: CompositionWorkIdentity = serde_json::from_slice(&read_corpus_metadata_file(
+        &identity_path,
+        "curriculum work identity",
+    )?)
+    .context("invalid curriculum work identity")?;
     ensure!(
         identity
             == (CompositionWorkIdentity {
@@ -1387,8 +1493,9 @@ fn verify_stage_replay(
         let mut shard_records = 0_u64;
         let mut shard_tokens = 0_u64;
         loop {
-            actual.clear();
-            if reader.read_until(b'\n', &mut actual)? == 0 {
+            if read_corpus_jsonl_record(&mut reader, &mut actual, "completed curriculum shard row")?
+                == 0
+            {
                 break;
             }
             trim_line_ending(&mut actual);
@@ -1408,9 +1515,12 @@ fn verify_stage_replay(
                     )
                 })
                 .expect("validated stage has strata");
-            expected.clear();
             ensure!(
-                spool_readers[selected].read_until(b'\n', &mut expected)? > 0,
+                read_corpus_jsonl_record(
+                    &mut spool_readers[selected],
+                    &mut expected,
+                    "curriculum spool row",
+                )? > 0,
                 "completed stage `{}` consumes beyond its durable spool",
                 stage.name
             );
@@ -1553,8 +1663,11 @@ fn validate_staging_tree(
     let root_manifest_path = staging_root.join("curriculum-manifest.json");
     if path_kind(&root_manifest_path)?.is_some() {
         ensure_regular_file(&root_manifest_path, "root curriculum manifest")?;
-        let actual: CurriculumManifest = serde_json::from_slice(&fs::read(&root_manifest_path)?)
-            .context("invalid root curriculum manifest")?;
+        let actual: CurriculumManifest = serde_json::from_slice(&read_corpus_metadata_file(
+            &root_manifest_path,
+            "root curriculum manifest",
+        )?)
+        .context("invalid root curriculum manifest")?;
         let body = CurriculumManifestBody {
             version: composition.version,
             build_id: composition.build_id.clone(),
@@ -1568,7 +1681,10 @@ fn validate_staging_tree(
             build: body,
         };
         ensure!(actual == expected, "root curriculum manifest changed");
-        actual.verify(staging_root)?;
+        // Every completed stage was authenticated by the loop immediately
+        // above. Revalidating the root structure must not stream the entire
+        // multi-billion-token curriculum a second time.
+        actual.verify_structure()?;
         if let Some(expected_hash) = &progress.state.root_manifest_sha256 {
             ensure!(
                 expected_hash == &actual.manifest_sha256,
@@ -1602,27 +1718,19 @@ fn verify_completed_stage(
     let stage_root = staging_root.join(&stage.name);
     ensure_real_directory(&stage_root, "completed curriculum stage")?;
     let manifest_path = stage_root.join("manifest.json");
-    ensure_regular_file(&manifest_path, "completed stage manifest")?;
-    let manifest: CorpusManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
-        .with_context(|| format!("invalid stage manifest {}", manifest_path.display()))?;
+    let authenticated = AuthenticatedCorpus::open_data_path(&manifest_path)?
+        .context("completed stage must contain an authenticated corpus manifest")?;
+    let manifest = authenticated.manifest();
     ensure!(
         manifest.manifest_sha256 == summary.manifest_sha256,
         "completed stage `{}` manifest identity changed",
         stage.name
     );
-    let stage_identity = canonical_json_sha256(&serde_json::json!({
-        "composition_sha256": composition_sha256,
-        "source_manifest_sha256": source.manifest_sha256,
-        "stage": stage,
-    }))?;
     ensure!(
-        manifest.build.config_sha256 == stage_identity
-            && manifest.build.build_id == stage.name
-            && manifest.build.config.build_id == stage.name,
+        manifest.build.build_id == stage.name && manifest.build.config.build_id == stage.name,
         "completed stage `{}` configuration identity changed",
         stage.name
     );
-    manifest.verify(&stage_root)?;
     ensure!(
         manifest.build.stats.emitted_views == summary.records
             && manifest.build.stats.exposure_tokens == summary.tokens,
@@ -1644,6 +1752,7 @@ fn verify_completed_stage(
         stage.name
     );
     ensure_exact_stage_entries(&stage_root, &manifest.build.shards, true)?;
+    authenticated.ensure_still_published()?;
     Ok(())
 }
 
@@ -1690,8 +1799,11 @@ fn publish_or_verify_stage_manifest(stage_root: &Path, expected: &CorpusManifest
         None => write_new_json(&path, expected)?,
         Some(PathKind::File) => {
             ensure_regular_file(&path, "stage manifest")?;
-            let actual: CorpusManifest = serde_json::from_slice(&fs::read(&path)?)
-                .context("invalid existing stage manifest")?;
+            let actual: CorpusManifest = serde_json::from_slice(&read_corpus_metadata_file(
+                &path,
+                "existing stage manifest",
+            )?)
+            .context("invalid existing stage manifest")?;
             ensure!(
                 actual.manifest_sha256 == expected.manifest_sha256
                     && canonical_json_sha256(&actual.build)?
@@ -1716,8 +1828,11 @@ fn publish_or_verify_root_manifest(
         None => write_new_json(&path, expected)?,
         Some(PathKind::File) => {
             ensure_regular_file(&path, "root curriculum manifest")?;
-            let actual: CurriculumManifest = serde_json::from_slice(&fs::read(&path)?)
-                .context("invalid existing root curriculum manifest")?;
+            let actual: CurriculumManifest = serde_json::from_slice(&read_corpus_metadata_file(
+                &path,
+                "existing root curriculum manifest",
+            )?)
+            .context("invalid existing root curriculum manifest")?;
             ensure!(
                 actual == *expected,
                 "existing root curriculum manifest differs from deterministic resumed output"
@@ -1814,8 +1929,8 @@ fn compose_stage(
             })
             .expect("validated stage has strata");
         let prior_offset = readers[selected].stream_position()?;
-        buffer.clear();
-        let read = readers[selected].read_until(b'\n', &mut buffer)?;
+        let read =
+            read_corpus_jsonl_record(&mut readers[selected], &mut buffer, "curriculum spool row")?;
         ensure!(
             read > 0,
             "stage `{}` stratum `{}` exhausted after {} tokens; available={} while stage target={} (adjust weights, predicates, or target)",
@@ -1902,11 +2017,6 @@ fn compose_stage(
     corpus_config.token_target = stage.token_target.clone();
     corpus_config.sharding = stage.sharding.clone();
     corpus_config.validate()?;
-    let stage_identity = canonical_json_sha256(&serde_json::json!({
-        "composition_sha256": composition_sha256,
-        "source_manifest_sha256": source.manifest_sha256,
-        "stage": stage,
-    }))?;
     let stratum_records = stage
         .strata
         .iter()
@@ -1938,24 +2048,25 @@ fn compose_stage(
         exposure_tokens: stage_progress.total_tokens,
         ..CorpusStageStats::default()
     };
-    let body = CorpusManifestBody {
+    let deduplicator = serde_json::json!({
+        "type": "stratified_curriculum_composition",
+        "composition_sha256": composition_sha256,
+        "source_manifest_sha256": source.manifest_sha256,
+        "seed": composition.seed,
+        "stage": stage.name,
+        "stratum_records": stratum_records,
+        "stratum_tokens": stratum_tokens,
+        "available_stratum_records": available_stratum_records,
+        "available_stratum_tokens": available_stratum_tokens,
+    });
+    let mut body = CorpusManifestBody {
         version: source.build.version,
         build_id: stage.name.clone(),
-        config_sha256: stage_identity,
+        config_sha256: String::new(),
         config: corpus_config,
         discovery: source.build.discovery.clone(),
         materializer: source.build.materializer.clone(),
-        deduplicator: serde_json::json!({
-            "type": "stratified_curriculum_composition",
-            "composition_sha256": composition_sha256,
-            "source_manifest_sha256": source.manifest_sha256,
-            "seed": composition.seed,
-            "stage": stage.name,
-            "stratum_records": stratum_records,
-            "stratum_tokens": stratum_tokens,
-            "available_stratum_records": available_stratum_records,
-            "available_stratum_tokens": available_stratum_tokens,
-        }),
+        deduplicator,
         tokenizer: source.build.tokenizer.clone(),
         stats,
         desired_token_target_reached: true,
@@ -1963,12 +2074,17 @@ fn compose_stage(
         difficulty_counts: stage_progress.difficulty_counts.clone(),
         shards: stage_progress.shards.clone(),
     };
+    body.config_sha256 = corpus_manifest_configuration_sha256(&body)?;
     let manifest = CorpusManifest {
         manifest_sha256: canonical_json_sha256(&body)?,
         build: body,
     };
     publish_or_verify_stage_manifest(&stage_root, &manifest)?;
-    manifest.verify(&stage_root)?;
+    // Rows came from authenticated, parsed spools and `RawShardWriter`
+    // computed the exact hashes and counters while writing them. The common
+    // pre-publication validation below performs the one full independent
+    // readback (and resume validates completed output before trusting it), so
+    // rereading every multi-billion-token stage here would be redundant.
     ensure_exact_stage_entries(&stage_root, &manifest.build.shards, true)?;
     sync_directory(&stage_root)?;
 
@@ -2078,25 +2194,44 @@ impl RawShardWriter {
 
     fn would_rotate(&self, tokens: u64) -> bool {
         self.open.as_ref().is_some_and(|shard| {
-            shard.records > 0 && shard.tokens.saturating_add(tokens) > self.max_tokens
+            shard.records > 0
+                && shard
+                    .tokens
+                    .checked_add(tokens)
+                    .is_none_or(|total| total > self.max_tokens)
         })
     }
 
     fn push(&mut self, json: &[u8], tokens: u64) -> Result<()> {
         ensure!(
+            tokens <= self.max_tokens,
+            "one curriculum record contains {tokens} tokens, exceeding max_tokens_per_shard {}",
+            self.max_tokens
+        );
+        ensure!(
             !self.would_rotate(tokens),
             "curriculum shard must be checkpointed before rotation"
+        );
+        ensure!(
+            json.len()
+                .checked_add(1)
+                .is_some_and(|line_bytes| line_bytes <= MAX_CORPUS_JSONL_RECORD_BYTES),
+            "curriculum JSONL row exceeds the record limit of {MAX_CORPUS_JSONL_RECORD_BYTES} bytes"
         );
         if self.open.is_none() {
             self.open()?;
         }
         let shard = self.open.as_mut().expect("shard is open");
+        // Validate accounting before mutating the file so an arithmetic error
+        // cannot leave an unindexed row in the in-progress shard.
+        let records = checked_add(shard.records, 1)?;
+        let total_tokens = checked_add(shard.tokens, tokens)?;
         shard.writer.write_all(json)?;
         shard.writer.write_all(b"\n")?;
         shard.hasher.update(json);
         shard.hasher.update(b"\n");
-        shard.records = checked_add(shard.records, 1)?;
-        shard.tokens = checked_add(shard.tokens, tokens)?;
+        shard.records = records;
+        shard.tokens = total_tokens;
         Ok(())
     }
 
@@ -2138,15 +2273,6 @@ impl RawShardWriter {
             sha256: hex(&shard.hasher.finalize()),
         }))
     }
-}
-
-fn validate_token_target(target: &TokenTarget) -> Result<()> {
-    ensure!(target.minimum > 0, "minimum token target must be positive");
-    ensure!(
-        target.minimum <= target.desired && target.desired <= target.maximum,
-        "token targets must satisfy minimum <= desired <= maximum"
-    );
-    Ok(())
 }
 
 fn validate_component(label: &str, value: &str) -> Result<()> {
@@ -2312,15 +2438,19 @@ fn load_progress(path: &Path) -> Result<Option<CompositionProgress>> {
                 sync_directory(parent)?;
             }
             ensure_regular_file(path, "composition progress")?;
-            let progress: CompositionProgress = serde_json::from_slice(&fs::read(path)?)
-                .context("invalid composition progress JSON")?;
+            let progress: CompositionProgress =
+                serde_json::from_slice(&read_corpus_metadata_file(path, "composition progress")?)
+                    .context("invalid composition progress JSON")?;
             progress.verify_hash()?;
             Ok(Some(progress))
         }
         (None, Some(PathKind::File)) => {
             ensure_regular_file(&temporary, "composition progress temporary file")?;
-            let progress: CompositionProgress = serde_json::from_slice(&fs::read(&temporary)?)
-                .context("invalid composition progress recovery JSON")?;
+            let progress: CompositionProgress = serde_json::from_slice(&read_corpus_metadata_file(
+                &temporary,
+                "composition progress temporary file",
+            )?)
+            .context("invalid composition progress recovery JSON")?;
             progress.verify_hash()?;
             fs::rename(&temporary, path)?;
             sync_directory(parent)?;
@@ -2556,19 +2686,21 @@ mod tests {
                 revision: "1".to_owned(),
             },
         };
-        let body = CorpusManifestBody {
+        let deduplicator = json!({"type": "test"});
+        let tokenizer = TokenizerSnapshot {
+            implementation: "test".to_owned(),
+            revision: "1".to_owned(),
+            vocabulary_size: 10,
+        };
+        let mut body = CorpusManifestBody {
             version: 2,
             build_id: "source".to_owned(),
-            config_sha256: "source-config".to_owned(),
+            config_sha256: String::new(),
             config,
             discovery: component.clone(),
             materializer: component,
-            deduplicator: json!({"type": "test"}),
-            tokenizer: TokenizerSnapshot {
-                implementation: "test".to_owned(),
-                revision: "1".to_owned(),
-                vocabulary_size: 10,
-            },
+            deduplicator,
+            tokenizer,
             stats: CorpusStageStats {
                 unique_records: records,
                 unique_tokens: tokens,
@@ -2586,6 +2718,7 @@ mod tests {
                 sha256: hex(&Sha256::digest(&bytes)),
             }],
         };
+        body.config_sha256 = corpus_manifest_configuration_sha256(&body).unwrap();
         let manifest = CorpusManifest {
             manifest_sha256: canonical_json_sha256(&body).unwrap(),
             build: body,
@@ -2716,6 +2849,79 @@ mod tests {
     }
 
     #[test]
+    fn composition_validation_bounds_spool_geometry_and_rejects_empty_selectors() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source_path, source) = source_corpus(source_dir.path());
+
+        let mut too_many_strata = config(&source_path, &source);
+        let prototype = too_many_strata.stages[0].strata[0].clone();
+        too_many_strata.stages[0].strata = (0..=MAX_STRATA_PER_STAGE)
+            .map(|index| CurriculumStratumConfig {
+                name: format!("stratum-{index}"),
+                ..prototype.clone()
+            })
+            .collect();
+        assert!(too_many_strata.validate().is_err());
+
+        let mut empty_selector = config(&source_path, &source);
+        empty_selector.stages[0].strata[0].when.topics = vec!["".to_owned()];
+        assert!(empty_selector.validate().is_err());
+    }
+
+    #[test]
+    fn curriculum_manifest_requires_matching_record_and_token_strata() {
+        let body = CurriculumManifestBody {
+            version: CURRICULUM_COMPOSITION_VERSION,
+            build_id: "curriculum".to_owned(),
+            config_sha256: "0".repeat(64),
+            source_manifest_sha256: "1".repeat(64),
+            seed: 1,
+            stages: vec![CurriculumStageSummary {
+                name: "stage".to_owned(),
+                manifest_path: "stage/manifest.json".to_owned(),
+                manifest_sha256: "2".repeat(64),
+                records: 1,
+                tokens: 1,
+                stratum_records: BTreeMap::from([("records-only".to_owned(), 1)]),
+                stratum_tokens: BTreeMap::from([("tokens-only".to_owned(), 1)]),
+            }],
+        };
+        let manifest = CurriculumManifest {
+            manifest_sha256: canonical_json_sha256(&body).unwrap(),
+            build: body,
+        };
+        let error = manifest.verify_structure().unwrap_err().to_string();
+        assert!(error.contains("record and token strata differ"), "{error}");
+    }
+
+    #[test]
+    fn raw_shard_writer_rejects_one_record_larger_than_the_shard_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = RawShardWriter::resume(root.path(), 2, 0).unwrap();
+
+        let error = writer.push(br#"{"tokens":[1,2,3]}"#, 3).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("one curriculum record contains 3 tokens"),
+            "{error}"
+        );
+        assert!(error.contains("max_tokens_per_shard 2"), "{error}");
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn raw_shard_writer_rotates_when_token_accounting_would_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = RawShardWriter::resume(root.path(), u64::MAX, 0).unwrap();
+        writer.open().unwrap();
+        let shard = writer.open.as_mut().unwrap();
+        shard.records = 1;
+        shard.tokens = u64::MAX;
+
+        assert!(writer.would_rotate(1));
+    }
+
+    #[test]
     fn resumes_exactly_after_source_and_stage_shard_interruptions() {
         let source_dir = tempfile::tempdir().unwrap();
         let (source_path, source) = source_corpus(source_dir.path());
@@ -2827,6 +3033,43 @@ mod tests {
             resumed_publish.manifest_sha256,
             clean_manifest.manifest_sha256
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_replacement_during_spooling_never_advances_durable_progress() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source_path, source) = source_corpus(source_dir.path());
+        let config = config(&source_path, &source);
+        let config_path = source_dir.path().join("composition.json");
+        write_new_json(&config_path, &config).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+
+        set_test_source_replacement();
+        let error = config
+            .run(&config_path, output.path(), work.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corpus shard"), "{error}");
+
+        let staging = output.path().join(".education.building");
+        let progress = load_progress(&staging.join(PROGRESS_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.state.next_source_shard, 0);
+        assert!(!progress.state.spooling_complete);
+        assert!(!output.path().join("education").exists());
+
+        let published = source_dir.path().join(&source.build.shards[0].path);
+        let parked = published.with_extension("test-authenticated-original");
+        fs::remove_file(&published).unwrap();
+        fs::rename(parked, published).unwrap();
+
+        let (result_path, manifest) = config
+            .run(&config_path, output.path(), work.path())
+            .unwrap();
+        manifest.verify(&result_path).unwrap();
     }
 
     #[test]

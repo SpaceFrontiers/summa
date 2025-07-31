@@ -11,7 +11,8 @@ use postgres::{Client, Config as PostgresConfig, NoTls, Row};
 use postgres_native_tls::{MakeTlsConnector, set_postgresql_alpn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+
+use crate::artifact_io::{sha256_identity, validate_sha256_identity};
 
 use super::{DiscoveryHit, SourceSnapshot};
 
@@ -192,7 +193,7 @@ impl PostgresTlsTrust {
                 !certificate_pem_environment.trim().is_empty(),
                 "postgres TLS certificate_pem_environment must not be empty"
             );
-            validate_sha256_label(certificate_sha256, "postgres TLS certificate")?;
+            validate_sha256_identity(certificate_sha256, "postgres TLS certificate")?;
         }
         Ok(())
     }
@@ -342,7 +343,7 @@ fn postgres_tls_connector(
                     "postgres TLS certificate environment variable `{certificate_pem_environment}` is not set"
                 )
             })?;
-            let actual = format!("sha256:{:x}", Sha256::digest(pem.as_bytes()));
+            let actual = sha256_identity(pem.as_bytes());
             ensure!(
                 actual == *certificate_sha256,
                 "postgres TLS certificate digest does not match certificate_sha256"
@@ -426,20 +427,6 @@ fn validate_server_name(name: &str) -> Result<()> {
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             }),
         "postgres verified TLS server name `{name}` is not a valid DNS name"
-    );
-    Ok(())
-}
-
-fn validate_sha256_label(value: &str, subject: &str) -> Result<()> {
-    let Some(digest) = value.strip_prefix("sha256:") else {
-        bail!("{subject} digest must use sha256:<64 lowercase hex>");
-    };
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{subject} digest must use sha256:<64 lowercase hex>"
     );
     Ok(())
 }

@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -23,8 +23,10 @@ use crate::metrics::{DeviceUtilizationMetrics, MetricEvent};
 // Enough for a multi-minute sleep/checkpoint boundary at the default cadence,
 // while remaining a fixed and tiny memory budget.
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+const MAX_CHANNEL_CAPACITY: usize = 4_096;
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const MAX_SAMPLE_BYTES: usize = 64 * 1024;
 const MEBIBYTE: u64 = 1024 * 1024;
 
 /// Exact process/query configuration. The device selector is passed as a
@@ -59,8 +61,8 @@ impl NvidiaSmiSamplerConfig {
         );
         validate_physical_device_selector(&self.physical_device)?;
         ensure!(
-            self.channel_capacity > 0,
-            "device sample channel capacity must be positive"
+            (1..=MAX_CHANNEL_CAPACITY).contains(&self.channel_capacity),
+            "device sample channel capacity must be in 1..={MAX_CHANNEL_CAPACITY}"
         );
         Ok(())
     }
@@ -290,15 +292,14 @@ fn run_reader(
         .name("hermes-nvidia-smi-stderr".into())
         .spawn(move || read_bounded(stderr, MAX_DIAGNOSTIC_BYTES));
     let mut output = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut last_collected_at_unix_ms = 0_u64;
     loop {
-        line.clear();
-        match output.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => match collection_timestamp(&mut last_collected_at_unix_ms).and_then(
+        match read_sample_line_bounded(&mut output, &mut line, MAX_SAMPLE_BYTES) {
+            Ok(None) => break,
+            Ok(Some(line)) => match collection_timestamp(&mut last_collected_at_unix_ms).and_then(
                 |collected_at_unix_ms| {
-                    parse_nvidia_smi_line(&line, interval, collected_at_unix_ms)
+                    parse_nvidia_smi_line(line, interval, collected_at_unix_ms)
                         .map(|metrics| (collected_at_unix_ms, metrics))
                 },
             ) {
@@ -323,9 +324,7 @@ fn run_reader(
                     push_diagnostic(
                         diagnostics,
                         dropped_diagnostics,
-                        DeviceSamplerDiagnostic::ProcessExited(format!(
-                            "failed to read stdout: {error}"
-                        )),
+                        DeviceSamplerDiagnostic::InvalidSample(error.to_string()),
                     );
                 }
                 break;
@@ -345,13 +344,7 @@ fn run_reader(
     // Terminate and reap the private process group before the join; telemetry
     // remains fail-soft and Drop can safely call the same idempotent cleanup.
     if unexpected_eof && status.is_none() {
-        stop_child(child);
-        status = {
-            let mut child = lock_unpoisoned(child);
-            child
-                .as_mut()
-                .and_then(|process| process.try_wait().ok().flatten())
-        };
+        status = stop_child(child);
     }
     let stderr = stderr_reader
         .ok()
@@ -375,22 +368,78 @@ fn run_reader(
     }
 }
 
-fn stop_child(child: &Mutex<Option<Child>>) {
-    let mut child = lock_unpoisoned(child);
-    if let Some(process) = child.as_mut() {
-        #[cfg(unix)]
-        {
-            let process_group = -(process.id() as i32);
-            // SAFETY: the child was placed in a private process group before
-            // spawn; a negative pid targets only that group. Failure is
-            // harmless because `Child::kill` below remains the fallback.
-            unsafe {
-                libc::kill(process_group, libc::SIGKILL);
-            }
+fn read_sample_line_bounded<'a>(
+    reader: &mut (impl BufRead + ?Sized),
+    output: &'a mut Vec<u8>,
+    maximum_bytes: usize,
+) -> Result<Option<&'a str>> {
+    ensure!(
+        maximum_bytes > 0,
+        "device sample byte limit must be positive"
+    );
+    output.clear();
+    let capture_bytes = maximum_bytes
+        .checked_add(1)
+        .context("device sample byte limit overflows usize")?;
+    loop {
+        let available = reader
+            .fill_buf()
+            .context("failed to read nvidia-smi stdout")?;
+        if available.is_empty() {
+            break;
         }
-        let _ = process.kill();
-        let _ = process.wait();
+        let through_delimiter = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        let remaining = capture_bytes
+            .checked_sub(output.len())
+            .context("device sample capture length overflow")?;
+        let copied = through_delimiter.min(remaining);
+        output.extend_from_slice(&available[..copied]);
+        reader.consume(copied);
+        if copied < through_delimiter
+            || output.len() == capture_bytes
+            || output.last() == Some(&b'\n')
+        {
+            break;
+        }
     }
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let payload_bytes = output
+        .len()
+        .checked_sub(usize::from(output.last() == Some(&b'\n')))
+        .context("device sample byte count underflows usize")?;
+    ensure!(
+        payload_bytes <= maximum_bytes,
+        "nvidia-smi sample exceeds the maximum of {maximum_bytes} bytes"
+    );
+    let line = std::str::from_utf8(output).context("nvidia-smi sample is not UTF-8")?;
+    Ok(Some(line))
+}
+
+/// Terminate and reap the sampler's private process group, returning its exit
+/// status. Takes the handle so the raw group signal is issued at most once:
+/// reaping frees the pid, and the kernel may hand the same pid — and therefore
+/// the same process-group id — to an unrelated process afterwards.
+fn stop_child(child: &Mutex<Option<Child>>) -> Option<ExitStatus> {
+    let mut guard = lock_unpoisoned(child);
+    let mut process = guard.take()?;
+    #[cfg(unix)]
+    {
+        let process_group = -(process.id() as i32);
+        // SAFETY: the child was placed in a private process group before
+        // spawn; a negative pid targets only that group, and the process is
+        // still unreaped here so that group id cannot have been recycled.
+        // Failure is harmless because `Child::kill` below remains the fallback.
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+    let _ = process.kill();
+    process.wait().ok()
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -532,6 +581,7 @@ fn unavailable(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -539,6 +589,29 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn sample_reader_bounds_payload_and_validates_utf8() {
+        let mut output = Vec::new();
+        let mut exact = Cursor::new(b"12345678\nnext".to_vec());
+        assert_eq!(
+            read_sample_line_bounded(&mut exact, &mut output, 8).unwrap(),
+            Some("12345678\n")
+        );
+
+        let mut oversized = Cursor::new(b"123456789\n".to_vec());
+        let error = read_sample_line_bounded(&mut oversized, &mut output, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum of 8 bytes"), "{error}");
+        assert_eq!(output.len(), 9);
+
+        let mut invalid = Cursor::new(vec![0xff, b'\n']);
+        let error = read_sample_line_bounded(&mut invalid, &mut output, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not UTF-8"), "{error}");
+    }
 
     #[test]
     fn parser_converts_units_and_accepts_unavailable_optional_fields() {
@@ -594,6 +667,14 @@ mod tests {
     }
 
     #[test]
+    fn sampler_channel_allocation_is_operationally_bounded() {
+        let mut config = NvidiaSmiSamplerConfig::new(Duration::from_secs(1), "0").unwrap();
+        config.channel_capacity = MAX_CHANNEL_CAPACITY + 1;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("1..="), "{error}");
+    }
+
+    #[test]
     fn unavailable_program_is_fail_soft_and_observable() {
         let config = NvidiaSmiSamplerConfig::new(Duration::from_secs(1), "0").unwrap();
         let (sampler, diagnostic) = NvidiaSmiSampler::start_fail_soft_with_program(
@@ -637,7 +718,7 @@ mod tests {
         let program = directory.path().join("closed-stdout-nvidia-smi");
         executable(
             &program,
-            "#!/bin/sh\nprintf 'helper closed stdout\\n' >&2\nexec 1>&-\nsleep 30\n",
+            "#!/bin/sh\nprintf 'helper closed stdout\\n' >&2\nexec 1>&-\nexec sleep 30\n",
         );
         let config = NvidiaSmiSamplerConfig::new(Duration::from_secs(1), "0").unwrap();
         let started = Instant::now();

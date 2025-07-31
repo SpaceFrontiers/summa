@@ -17,7 +17,9 @@ use crate::native_sleep::{
     NativeSleepPhaseContextFactory, NativeSleepPhaseExecutor, NativeSleepPhaseOutcome,
     NativeSleepProgressSink,
 };
-use crate::posttrain::{NativePostTrainingPhaseExecutor, PostTrainingExecutionContext};
+use crate::posttrain::{
+    NativePostTrainingPhaseExecutor, PostTrainingExecutionContext, validate_resumable_phase,
+};
 use crate::runtime::{
     ALL_PHASE_KINDS, ExecutorRegistry, ImmutableModelCheckpoint, PhaseExecutionRequest,
     PhaseExecutionResult, PhaseExecutor, PhaseProgressSink, RuntimeStatus, WorkflowRunState,
@@ -35,13 +37,14 @@ pub struct NativeHostMetricJournal {
     pub run_id: String,
 }
 
-/// Factory which lends one concrete set of trainable/frozen adapters and its
+/// Factory which lends one concrete device-owned batch runtime and its
 /// idempotent publisher to the built-in DPO, forward-KL, or GRPO executor.
 ///
 /// The callback must be invoked exactly once. Implementations normally load
 /// the model/optimizer generation named by `request`, construct
-/// [`PostTrainingExecutionContext`], and lend it to `operation`. No adapter is
-/// stored globally or inferred by trainer core.
+/// [`PostTrainingExecutionContext`], and lend it to `operation`. The runtime
+/// may jointly own trainable and frozen models so it can fuse/batch their
+/// execution; no per-example host-score adapter is inferred by trainer core.
 pub trait NativePostTrainingContextFactory {
     fn identity(&self) -> &str;
 
@@ -178,6 +181,12 @@ impl NativeWorkflowAdapters {
                     }
                     PhaseKind::Promotion => anyhow::bail!("built-in promotion is not supported"),
                     _ if phase.post_training.is_some() => {
+                        validate_resumable_phase(phase).with_context(|| {
+                            format!(
+                                "phase `{}` is incompatible with the native post-training executor",
+                                phase.name
+                            )
+                        })?;
                         let factory = self.post_training.as_deref().with_context(|| {
                             format!(
                                 "phase `{}` has typed post_training and requires a registered native post-training context factory",
@@ -223,6 +232,10 @@ impl NativeWorkflowAdapters {
     fn dispatch_identity(&self, workflow: &ResolvedWorkflow) -> Result<String> {
         let plan = self.dispatch_plan(workflow)?;
         let signature = workflow_signature(workflow)?;
+        let external_identity = self
+            .external
+            .as_ref()
+            .map(ExternalPhaseExecutor::execution_identity);
         let mut hasher = Sha256::new();
         hash_part(&mut hasher, b"hermes-native-workflow-host");
         hash_part(&mut hasher, &NATIVE_HOST_DISPATCH_VERSION.to_le_bytes());
@@ -231,9 +244,7 @@ impl NativeWorkflowAdapters {
             hash_part(&mut hasher, &serde_json::to_vec(route)?);
         }
         for identity in [
-            self.external
-                .as_ref()
-                .map(ExternalPhaseExecutor::expected_sha256),
+            external_identity.as_deref(),
             self.sleep.phase_factory_identity(),
             self.post_training
                 .as_deref()
@@ -296,6 +307,12 @@ pub struct NativeWorkflowHost {
     context: NativeWorkflowContext,
     checkpoint: AtomicRuntimeCheckpoint,
     dispatch_sha256: String,
+    // A failed executor may have appended metrics after the last durable
+    // runtime boundary. Continuing with the same in-memory journal could make
+    // that failed-attempt tail part of a later commit. Reopening through
+    // `resume` validates and truncates the journal to the exact committed
+    // prefix before execution continues.
+    recovery_required: bool,
 }
 
 impl NativeWorkflowHost {
@@ -364,6 +381,7 @@ impl NativeWorkflowHost {
             context,
             checkpoint,
             dispatch_sha256,
+            recovery_required: false,
         })
     }
 
@@ -380,13 +398,21 @@ impl NativeWorkflowHost {
     }
 
     pub fn drive_until_yield_or_complete(&mut self) -> Result<RuntimeStatus> {
-        run_until_yield_or_complete(
+        ensure!(
+            !self.recovery_required,
+            "native workflow host must be reopened with resume after an execution or persistence error"
+        );
+        let result = run_until_yield_or_complete(
             &self.workflow,
             &mut self.state,
             &mut self.registry,
             &mut self.context,
             &mut self.checkpoint,
-        )
+        );
+        if result.is_err() {
+            self.recovery_required = true;
+        }
+        result
     }
 }
 
@@ -517,6 +543,9 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use anyhow::bail;
 
     use super::*;
@@ -569,6 +598,12 @@ mod tests {
     fn external(path: &Path) -> ExternalPhaseExecutor {
         let bytes = b"native-host-test-worker-v1";
         fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions).unwrap();
+        }
         ExternalPhaseExecutor::new(path, Vec::new(), identity("native-host-test-worker-v1"))
             .unwrap()
     }
@@ -658,6 +693,58 @@ mod tests {
         let plan = adapters.dispatch_plan(&workflow).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].dispatch, NativeHostDispatch::NativePostTraining);
+    }
+
+    #[test]
+    fn invalid_native_post_training_fails_before_runtime_state_creation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worker = temporary.path().join("worker");
+        let state = temporary.path().join("runtime.json");
+        let mut workflow = education_workflow();
+        workflow
+            .phases
+            .retain(|phase| phase.name == "preference-dpo");
+        assert_eq!(workflow.phases.len(), 1);
+        workflow.phases[0].shuffle_buffer = Some(32);
+
+        let error = match NativeWorkflowHost::start(
+            workflow,
+            education_adapters(&worker, false),
+            &state,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("incompatible native post-training phase unexpectedly started"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("deterministic input order"), "{error}");
+        assert!(!state.exists(), "invalid phase created runtime state");
+    }
+
+    #[test]
+    fn execution_error_requires_reopening_at_the_committed_prefix() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worker = temporary.path().join("worker");
+        let state = temporary.path().join("runtime.json");
+        let mut host = NativeWorkflowHost::start(
+            education_workflow(),
+            education_adapters(&worker, true),
+            &state,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let first = host
+            .drive_until_yield_or_complete()
+            .unwrap_err()
+            .to_string();
+        assert!(first.contains("must not execute periodic wake"), "{first}");
+        let second = host
+            .drive_until_yield_or_complete()
+            .unwrap_err()
+            .to_string();
+        assert!(second.contains("reopened with resume"), "{second}");
     }
 
     #[test]

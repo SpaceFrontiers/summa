@@ -37,7 +37,7 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(config: &ModelDef, block: &BlockDef, device: &Device) -> Self {
+    pub fn new(config: &ModelDef, block: &BlockDef, layer: usize, device: &Device) -> Self {
         let (attention, ssm) = match &block.ssm {
             Some(ssm) => (None, Some(MambaMixer::new(config, ssm, device))),
             None => (Some(MultiHeadAttention::new(config, block, device)), None),
@@ -60,7 +60,7 @@ impl TransformerBlock {
             memory: block
                 .memory
                 .as_ref()
-                .map(|memory| MemoryChain::new(config, block, memory, device)),
+                .map(|memory| MemoryChain::new(config, block, memory, layer, device)),
             attn_norm: make_norm(),
             ffn_norm: make_norm(),
             residual_dropout: DropoutConfig::new(block.dropout).init(),
@@ -420,6 +420,28 @@ impl TransformerBlock {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer has no memory chain"))?
             .tier_parameter_ids(tier)
+    }
+
+    pub(crate) fn has_memory_tier(&self, tier: usize) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|memory| memory.has_tier(tier))
+    }
+
+    pub(crate) fn memory_tier_active_parameter_ids(
+        &self,
+        tier: usize,
+    ) -> anyhow::Result<Vec<ParamId>> {
+        self.memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer has no memory chain"))?
+            .tier_active_parameter_ids(tier)
+    }
+
+    pub(crate) fn dormant_memory_parameter_ids(&self) -> Vec<ParamId> {
+        self.memory
+            .as_ref()
+            .map_or_else(Vec::new, MemoryChain::dormant_parameter_ids)
     }
 
     pub(crate) fn memory_tier_base_parameter_ids(

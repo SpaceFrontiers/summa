@@ -52,6 +52,50 @@ hermes-train train \
   --output checkpoint
 ```
 
+For the schedule- and capacity-matched no-sleep ablation in the stock wake
+trainer, replace `periodic_sleep` on every wake phase with the same typed
+`memory_update_mode` object and omit the sleep-runtime flags:
+
+```json
+{
+  "memory_update_mode": {
+    "type": "wake_only",
+    "schedule": {
+      "clock": "optimizer_steps",
+      "terminal_consolidation": "distill_into_base_v1",
+      "tiers": [
+        { "id": "fast", "update_period": 100, "reserve_slots": 2 },
+        { "id": "medium", "update_period": 400, "reserve_slots": 4 },
+        { "id": "slow", "update_period": 3200, "reserve_slots": 8 }
+      ]
+    },
+    "tier_optimizer": {
+      "learning_rate": 0.0003,
+      "beta_1": 0.9,
+      "beta_2": 0.95,
+      "epsilon": 1e-8,
+      "weight_decay": 0.1
+    }
+  }
+}
+```
+
+`wake_only` retains each tier's independent clock and pending gradients and
+applies due base updates fastest-to-slowest. It performs no consolidation,
+transfer, reserve activation/reset, or Dreaming. Checkpoints bind the exact
+mode, schedule, optimizer settings, clocks, moments, and pending accumulators.
+The native DPO, forward-KL, and GRPO executor rejects `memory_update_mode`
+instead of silently applying its ordinary optimizer; for memory-model tier
+scheduling, those phases currently support `periodic_sleep` only.
+The stock trainer accepts either `[fast, slow]` or `[fast, medium, slow]` so its
+typed tier metrics remain unambiguous. Memory training currently requires the
+memory hierarchy in every model layer; mixed memory/ordinary-FFN layer
+topologies are rejected explicitly.
+
+Runs without the CUDA plus `training-fusion` stack are labelled smoke-only in
+the JSON and are not CUDA acceptance evidence. The embedded compact model is
+intended only for quick local smoke runs.
+
 Create the runtime's `workflow_signature` without touching checkpoint or
 runtime state. Use every training-semantic option from the eventual invocation;
 the output path itself is not part of the signature:
@@ -132,6 +176,16 @@ is accepted only when the trainer supplies an authenticated
 idempotent boundary hook. Trainable policy adapters report a monotonic exact
 model-token counter; the executor samples it around each deterministic update
 instead of estimating token usage from padded sequence geometry.
+
+Forward-KL accepts causal-LM and supervised-generation task examples, including
+instruction tuning, and applies the task's explicit prompt/target structure.
+Every local frozen teacher or reference uses the same canonical
+`sha256:<64 lowercase hex>` identity as runtime checkpoints; alternate digest
+spellings are rejected rather than normalized. Revision-pinned remote models
+derive that canonical runtime identity from the adapter, immutable revision,
+and adapter parameters, so equal revision labels from different providers or
+model repositories cannot alias one another. Context factories should use
+`FrozenModelSpec::immutable_identity()` as their exact expected value.
 
 The complete education recipe combines periodic sleep with phase kinds outside
 the wake trainer and therefore uses the public embedded host in `native_host`.
@@ -293,9 +347,11 @@ Sleep schedules, Knowledge Seeding, semantic/edit imitation with GRPO,
 retention transactions, dream selection by model-loss gradient alignment,
 isolated frozen-model LM-head LoRA trials (paper geometry rank 64 / alpha 128),
 and ReSTEM updates have an in-process tensor implementation. Each built-in
-trial derives final-normalized hidden features once, trains only `[rank,
-hidden]` and `[rank, vocabulary]` adapter tensors, and adds their delta to the
-frozen base projection. Its content-addressed receipt binds the adapter to the
+trial supervises only the generated continuation, derives its final-normalized
+hidden features once, caches the immutable evaluation features across trials,
+and trains only `[rank, hidden]` and `[rank, vocabulary]` adapter tensors with
+batched device GEMMs. It adds their delta to the frozen base projection. Its
+content-addressed receipt binds the adapter to the
 immutable base checkpoint and exact model-parameter digest, logical
 output-projection target, exact shapes, candidate, and evaluator. The stock
 runtime provides model-owned rollout generation, a frozen
@@ -317,8 +373,10 @@ gradient-accumulation window is discarded for every scope. One global norm and
 clip covers wake and tier gradients before a completed optimizer window is
 committed.
 
-Dream generation adds exactly one deterministic-random expert per token from
-outside each persistent FFN MoE's ordinary top-k. Reserve-memory routers remain
+Dream generation prefills each wake prefix once and then uses the ordinary KV
+or recurrent inference state for linear-time single-token decoding. It adds
+exactly one deterministic-random expert per token from outside each persistent
+FFN MoE's ordinary top-k. Reserve-memory routers remain
 ordinary top-1 from the initial zero fallback onward. Their capacity-width
 projection is fixed; dormant learned rows stay off graph behind parameter-free
 zero columns, and activation replaces columns without growing router work.

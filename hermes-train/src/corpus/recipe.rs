@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::pipeline::read_corpus_metadata_file;
 use super::{
     CorpusBuildConfig, CorpusManifest, CorpusPipeline, CorpusTokenizer, PostgresRecordMaterializer,
     PostgresRecordMaterializerConfig, SearchApiClient, SearchApiConfig, SqliteDeduplicator,
@@ -21,8 +22,7 @@ pub struct SearchApiPostgresCorpusRecipe {
 
 impl SearchApiPostgresCorpusRecipe {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read corpus recipe {}", path.display()))?;
+        let bytes = read_corpus_metadata_file(path, "corpus recipe")?;
         let recipe: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid corpus recipe JSON in {}", path.display()))?;
         recipe.corpus.validate()?;

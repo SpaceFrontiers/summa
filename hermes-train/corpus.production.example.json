@@ -209,6 +209,7 @@
     "max_retries": 3,
     "retry_initial_ms": 1000,
     "retry_max_ms": 30000,
+    "max_response_bytes": 67108864,
     "auth": null
   },
   "postgres": {

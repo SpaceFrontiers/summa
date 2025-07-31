@@ -7,38 +7,53 @@
 //! No corpus, network handle, or caller-provided reward enters this module.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+use std::fs;
 
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::{AutodiffModule, Module, ModuleVisitor, Param};
 use burn::tensor::{Int, Tensor, TensorData};
+use burn_nn::loss::CrossEntropyLossConfig;
 use burn_optim::GradientsParams;
 use hermes_llm::{Device, MemoryRouting, Transformer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::artifact_io::{
+    atomic_write_new, ensure_directory, read_regular_bounded, sha256_identity,
+    validate_sha256_identity,
+};
 use crate::builtin_sleep_adapters::{PinnedLocalArtifact, PinnedWakeContextJournal};
-use crate::sleep::{ConsolidationTxn, DreamTrial, GeneratedDream, RngReservation};
+use crate::sleep::{ConsolidationTxn, DreamTrial, DreamingConfig, GeneratedDream, RngReservation};
 use crate::tensor_sleep::{TokenRolloutBatch, TransformerDreamOps, model_parameter_hash};
 
 pub const DREAM_SEQUENCE_SET_VERSION: u32 = 1;
-const DREAM_CANDIDATE_VERSION: u32 = 2;
-const DREAM_MANIFEST_VERSION: u32 = 2;
-const DREAM_GENERATION_RECEIPT_VERSION: u32 = 2;
-const DREAM_ADAPTER_VERSION: u32 = 2;
-const RESTEM_POLICY_VERSION: u32 = 2;
-const GENERATION_POLICY_ADAPTER_VERSION: u32 = 1;
-const DREAM_ROUTING_NAME: &str = "memory_dream_random_extra_expert_v1";
+const DREAM_CANDIDATE_VERSION: u32 = 3;
+const DREAM_MANIFEST_VERSION: u32 = 3;
+const DREAM_GENERATION_RECEIPT_VERSION: u32 = 3;
+const DREAM_ADAPTER_VERSION: u32 = 3;
+pub(crate) const RESTEM_POLICY_VERSION: u32 = 3;
+const GENERATION_POLICY_ADAPTER_VERSION: u32 = 2;
+const DREAM_ROUTING_NAME: &str = "memory_dream_cached_random_extra_expert_v2";
 const DREAM_LORA_TARGET_MODULE: &str = "transformer.output_projection";
 const GENERATION_POLICY_TARGET_MODULE: &str = "transformer.output_projection.dream_policy";
 const GRADIENT_PROJECTION_DOMAIN: u64 = 0x6772_6164_2d70_726f;
 const GENERATION_DOMAIN: u64 = 0x6472_6561_6d2d_6765;
 const LORA_DOMAIN: u64 = 0x6c6f_7261_2d74_7269;
 
-static TEMPORARY_ORDINAL: AtomicU64 = AtomicU64::new(0);
+const MAX_DREAM_JSON_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DREAM_ADAPTER_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DREAM_ADAPTER_PARAMETER_BYTES: u64 = MAX_DREAM_ADAPTER_BYTES - MAX_DREAM_JSON_BYTES;
+const MAX_DREAM_LM_HEAD_DATA_BYTES: usize = 512 * 1024 * 1024;
+const MAX_DREAM_SEQUENCES: usize = 4_096;
+const MAX_DREAM_SEQUENCE_TOKENS: usize = 65_536;
+const MAX_DREAM_SEQUENCE_TOTAL_TOKENS: usize = 4 * 1024 * 1024;
+const MAX_DREAM_SEQUENCE_ID_BYTES: usize = 1_024;
+const MAX_RESTEM_POLICY_GENERATIONS: usize = 4_096;
+const MAX_DREAM_CANDIDATE_TOKENS: usize =
+    MAX_DREAM_SEQUENCE_TOKENS + BuiltinDreamingRuntimeConfig::MAX_NEW_TOKENS;
 
 fn default_max_new_tokens() -> usize {
     32
@@ -109,6 +124,10 @@ pub struct BuiltinDreamingRuntimeConfig {
 }
 
 impl BuiltinDreamingRuntimeConfig {
+    pub const MAX_NEW_TOKENS: usize = 4_096;
+    pub const MAX_GRADIENT_DIMENSIONS: usize = 4_096;
+    pub const MAX_LORA_STEPS: usize = 1_024;
+
     pub fn resolve_paths(mut self, base: &Path) -> Result<Self> {
         ensure!(!base.as_os_str().is_empty(), "Dreaming path base is empty");
         if self.artifact_directory.is_relative() {
@@ -135,10 +154,25 @@ impl BuiltinDreamingRuntimeConfig {
         );
         ensure!(self.max_new_tokens > 0, "Dreaming must generate tokens");
         ensure!(
+            self.max_new_tokens <= Self::MAX_NEW_TOKENS,
+            "Dreaming max_new_tokens exceeds the {}-token operational limit",
+            Self::MAX_NEW_TOKENS
+        );
+        ensure!(
             self.gradient_dimensions > 0,
             "Dreaming gradient projection is empty"
         );
+        ensure!(
+            self.gradient_dimensions <= Self::MAX_GRADIENT_DIMENSIONS,
+            "Dreaming gradient dimensions exceed the {}-dimension operational limit",
+            Self::MAX_GRADIENT_DIMENSIONS
+        );
         ensure!(self.lora_steps > 0, "Dreaming LoRA steps must be positive");
+        ensure!(
+            self.lora_steps <= Self::MAX_LORA_STEPS,
+            "Dreaming LoRA steps exceed the {}-step operational limit",
+            Self::MAX_LORA_STEPS
+        );
         ensure!(
             self.generation_temperature.is_finite() && self.generation_temperature > 0.0,
             "Dreaming generation temperature must be finite and positive"
@@ -146,6 +180,16 @@ impl BuiltinDreamingRuntimeConfig {
         ensure!(
             self.generation_policy_rank > 0 && self.generation_policy_alpha > 0,
             "Dreaming generation-policy LoRA geometry must be positive"
+        );
+        ensure!(
+            self.generation_policy_rank <= DreamingConfig::MAX_LORA_RANK,
+            "Dreaming generation-policy LoRA rank exceeds the {}-rank operational limit",
+            DreamingConfig::MAX_LORA_RANK
+        );
+        ensure!(
+            self.generation_policy_alpha <= DreamingConfig::MAX_LORA_ALPHA,
+            "Dreaming generation-policy LoRA alpha exceeds the {} operational limit",
+            DreamingConfig::MAX_LORA_ALPHA
         );
         ensure!(
             self.lora_learning_rate.is_finite() && self.lora_learning_rate > 0.0,
@@ -156,15 +200,15 @@ impl BuiltinDreamingRuntimeConfig {
             "Dreaming ReSTEM learning rate must be finite and positive"
         );
         if let Some(journal) = &self.wake_context_journal {
-            validate_sha256(&journal.sha256, "wake-context journal")?;
+            validate_sha256_identity(&journal.sha256, "wake-context journal")?;
         }
-        validate_sha256(&self.reference_set.sha256, "Dreaming reference set")?;
-        validate_sha256(
+        validate_sha256_identity(&self.reference_set.sha256, "Dreaming reference set")?;
+        validate_sha256_identity(
             &self.independent_evaluation_set.sha256,
             "Dreaming independent evaluator",
         )?;
         if let Some(policy) = &self.initial_policy {
-            validate_sha256(&policy.sha256, "Dreaming initial policy")?;
+            validate_sha256_identity(&policy.sha256, "Dreaming initial policy")?;
         }
         Ok(())
     }
@@ -218,11 +262,16 @@ impl DreamSequenceSet {
             self.version
         );
         ensure!(!self.sequences.is_empty(), "Dreaming sequence set is empty");
+        ensure!(
+            self.sequences.len() <= MAX_DREAM_SEQUENCES,
+            "Dreaming sequence set exceeds the {MAX_DREAM_SEQUENCES}-sequence operational limit"
+        );
         let mut ids = BTreeSet::new();
+        let mut total_tokens = 0usize;
         for sequence in &self.sequences {
             ensure!(
-                !sequence.id.trim().is_empty(),
-                "Dreaming sequence id is empty"
+                !sequence.id.trim().is_empty() && sequence.id.len() <= MAX_DREAM_SEQUENCE_ID_BYTES,
+                "Dreaming sequence id must contain 1..={MAX_DREAM_SEQUENCE_ID_BYTES} bytes"
             );
             ensure!(
                 ids.insert(sequence.id.as_str()),
@@ -235,8 +284,23 @@ impl DreamSequenceSet {
                 sequence.id
             );
             ensure!(
-                sequence.token_ids.iter().all(|token| *token >= 0),
-                "Dreaming sequence `{}` contains a negative token",
+                sequence.token_ids.len() <= MAX_DREAM_SEQUENCE_TOKENS,
+                "Dreaming sequence `{}` exceeds the {MAX_DREAM_SEQUENCE_TOKENS}-token operational limit",
+                sequence.id
+            );
+            total_tokens = total_tokens
+                .checked_add(sequence.token_ids.len())
+                .context("Dreaming sequence-set token count overflow")?;
+            ensure!(
+                total_tokens <= MAX_DREAM_SEQUENCE_TOTAL_TOKENS,
+                "Dreaming sequence set exceeds the {MAX_DREAM_SEQUENCE_TOTAL_TOKENS}-token operational limit"
+            );
+            ensure!(
+                sequence
+                    .token_ids
+                    .iter()
+                    .all(|token| u32::try_from(*token).is_ok()),
+                "Dreaming sequence `{}` contains a token outside the u32 range",
                 sequence.id
             );
         }
@@ -327,19 +391,20 @@ impl AdapterReceipt {
             "unsupported dream-adapter version {}",
             self.version
         );
-        validate_sha256(&self.base_checkpoint_sha256, "dream LoRA base checkpoint")?;
-        validate_sha256(
+        validate_sha256_identity(&self.base_checkpoint_sha256, "dream LoRA base checkpoint")?;
+        validate_sha256_identity(
             &self.base_model_parameter_sha256,
             "dream LoRA base-model parameters",
         )?;
-        validate_sha256(
+        validate_sha256_identity(
             &self.candidate_artifact_hash,
             "dream LoRA candidate artifact",
         )?;
-        validate_sha256(&self.evaluator_hash, "dream LoRA evaluator")?;
+        validate_sha256_identity(&self.evaluator_hash, "dream LoRA evaluator")?;
         ensure!(
-            !self.candidate_id.trim().is_empty(),
-            "dream LoRA candidate ID is empty"
+            !self.candidate_id.trim().is_empty()
+                && self.candidate_id.len() <= MAX_DREAM_SEQUENCE_ID_BYTES,
+            "dream LoRA candidate ID is invalid"
         );
         ensure!(
             self.target_module == DREAM_LORA_TARGET_MODULE,
@@ -351,12 +416,18 @@ impl AdapterReceipt {
             "dream LoRA receipt has invalid geometry"
         );
         ensure!(
+            self.rank <= DreamingConfig::MAX_LORA_RANK
+                && self.alpha <= DreamingConfig::MAX_LORA_ALPHA,
+            "dream LoRA receipt geometry exceeds operational limits"
+        );
+        ensure!(
             self.a_shape == [self.rank, self.input_features]
                 && self.b_shape == [self.rank, self.output_features],
             "dream LoRA tensor shapes do not match its target geometry"
         );
         ensure!(
             self.steps > 0
+                && self.steps <= BuiltinDreamingRuntimeConfig::MAX_LORA_STEPS
                 && self.learning_rate.is_finite()
                 && self.learning_rate > 0.0
                 && [
@@ -417,22 +488,22 @@ impl RestemPolicyState {
             self.version
         );
         if let Some(parent) = &self.parent_policy_sha256 {
-            validate_sha256(parent, "ReSTEM parent policy")?;
+            validate_sha256_identity(parent, "ReSTEM parent policy")?;
         }
         if let Some(parent) = &self.parent_adapter_sha256 {
-            validate_sha256(parent, "ReSTEM parent adapter")?;
+            validate_sha256_identity(parent, "ReSTEM parent adapter")?;
         }
         ensure!(
             self.parent_policy_sha256.is_some() == self.parent_adapter_sha256.is_some(),
             "ReSTEM parent binding is incomplete"
         );
-        validate_sha256(&self.source_checkpoint_sha256, "ReSTEM source checkpoint")?;
-        validate_sha256(
+        validate_sha256_identity(&self.source_checkpoint_sha256, "ReSTEM source checkpoint")?;
+        validate_sha256_identity(
             &self.source_model_parameter_sha256,
             "ReSTEM source model parameters",
         )?;
-        validate_sha256(&self.topology_sha256, "ReSTEM model topology")?;
-        validate_sha256(&self.adapter_sha256, "ReSTEM generation adapter")?;
+        validate_sha256_identity(&self.topology_sha256, "ReSTEM model topology")?;
+        validate_sha256_identity(&self.adapter_sha256, "ReSTEM generation adapter")?;
         ensure!(
             self.target_module == GENERATION_POLICY_TARGET_MODULE,
             "ReSTEM policy targets unsupported module `{}`",
@@ -443,6 +514,15 @@ impl RestemPolicyState {
             "ReSTEM policy has invalid adapter geometry"
         );
         ensure!(
+            self.rank <= DreamingConfig::MAX_LORA_RANK
+                && self.alpha <= DreamingConfig::MAX_LORA_ALPHA,
+            "ReSTEM policy adapter geometry exceeds operational limits"
+        );
+        ensure!(
+            self.iterations <= DreamingConfig::MAX_RESTEM_ITERATIONS,
+            "ReSTEM policy iteration count exceeds the operational limit"
+        );
+        ensure!(
             self.learning_rate.is_finite() && self.learning_rate > 0.0,
             "ReSTEM policy has an invalid learning rate"
         );
@@ -451,19 +531,23 @@ impl RestemPolicyState {
             "ReSTEM policy accepted-candidate evidence is incomplete"
         );
         ensure!(
+            self.accepted_candidates.len() <= DreamingConfig::MAX_CANDIDATES,
+            "ReSTEM policy accepted-candidate evidence exceeds the operational limit"
+        );
+        ensure!(
             (self.iterations == 0) == self.accepted_candidates.is_empty(),
             "ReSTEM policy update count disagrees with accepted trials"
         );
         let mut candidates = BTreeSet::new();
         for hash in &self.accepted_candidates {
-            validate_sha256(hash, "ReSTEM accepted candidate")?;
+            validate_sha256_identity(hash, "ReSTEM accepted candidate")?;
             ensure!(
                 candidates.insert(hash),
                 "ReSTEM policy repeats an accepted candidate"
             );
         }
         for hash in &self.accepted_adapters {
-            validate_sha256(hash, "ReSTEM accepted adapter")?;
+            validate_sha256_identity(hash, "ReSTEM accepted adapter")?;
         }
         Ok(())
     }
@@ -500,20 +584,20 @@ impl GenerationPolicyAdapterReceipt {
             "unsupported generation-policy adapter version {}",
             self.version
         );
-        validate_sha256(
+        validate_sha256_identity(
             &self.source_checkpoint_sha256,
             "generation-policy source checkpoint",
         )?;
-        validate_sha256(
+        validate_sha256_identity(
             &self.source_model_parameter_sha256,
             "generation-policy source model parameters",
         )?;
-        validate_sha256(&self.topology_sha256, "generation-policy topology")?;
+        validate_sha256_identity(&self.topology_sha256, "generation-policy topology")?;
         if let Some(parent) = &self.parent_policy_sha256 {
-            validate_sha256(parent, "generation-policy parent policy")?;
+            validate_sha256_identity(parent, "generation-policy parent policy")?;
         }
         if let Some(parent) = &self.parent_adapter_sha256 {
-            validate_sha256(parent, "generation-policy parent adapter")?;
+            validate_sha256_identity(parent, "generation-policy parent adapter")?;
         }
         ensure!(
             self.parent_policy_sha256.is_some() == self.parent_adapter_sha256.is_some(),
@@ -529,6 +613,11 @@ impl GenerationPolicyAdapterReceipt {
             "generation-policy adapter has invalid geometry"
         );
         ensure!(
+            self.rank <= DreamingConfig::MAX_LORA_RANK
+                && self.alpha <= DreamingConfig::MAX_LORA_ALPHA,
+            "generation-policy adapter geometry exceeds operational limits"
+        );
+        ensure!(
             self.a_shape == [self.rank, self.input_features]
                 && self.b_shape == [self.rank, self.output_features],
             "generation-policy adapter shapes do not match its geometry"
@@ -536,6 +625,14 @@ impl GenerationPolicyAdapterReceipt {
         ensure!(
             self.learning_rate.is_finite() && self.learning_rate > 0.0,
             "generation-policy adapter has invalid learning rate"
+        );
+        ensure!(
+            self.iterations <= DreamingConfig::MAX_RESTEM_ITERATIONS,
+            "generation-policy adapter iteration count exceeds the operational limit"
+        );
+        ensure!(
+            self.accepted_candidates.len() <= DreamingConfig::MAX_CANDIDATES,
+            "generation-policy adapter accepted-trial evidence exceeds the operational limit"
         );
         ensure!(
             self.accepted_candidates.len() == self.accepted_trial_adapters.len()
@@ -555,7 +652,7 @@ impl GenerationPolicyAdapterReceipt {
             .iter()
             .chain(&self.accepted_trial_adapters)
         {
-            validate_sha256(hash, "generation-policy accepted artifact")?;
+            validate_sha256_identity(hash, "generation-policy accepted artifact")?;
         }
         let a_values = self
             .rank
@@ -577,6 +674,7 @@ pub struct BuiltinDreamOps {
     evaluation_set: DreamSequenceSet,
     initial_policy: Option<RestemPolicyState>,
     generation_policy: Option<HostLmHeadLora>,
+    evaluation_cache: Option<DeviceEvaluationCache>,
     bound_teacher_sha256: String,
     device: Device,
 }
@@ -622,6 +720,7 @@ impl BuiltinDreamOps {
             evaluation_set,
             initial_policy,
             generation_policy: None,
+            evaluation_cache: None,
             bound_teacher_sha256,
             device,
         };
@@ -660,8 +759,8 @@ impl BuiltinDreamOps {
         phase_input_sha256: &str,
         teacher_sha256: &str,
     ) -> Result<()> {
-        validate_sha256(phase_input_sha256, "Dreaming phase input")?;
-        validate_sha256(teacher_sha256, "Dreaming transaction teacher")?;
+        validate_sha256_identity(phase_input_sha256, "Dreaming phase input")?;
+        validate_sha256_identity(teacher_sha256, "Dreaming transaction teacher")?;
         ensure!(
             self.journal.source_checkpoint_sha256() == phase_input_sha256,
             "Dreaming wake journal belongs to {}, authenticated phase input is {}",
@@ -732,7 +831,7 @@ impl BuiltinDreamOps {
 
     fn generation_receipt_path(&self, txn: &ConsolidationTxn) -> PathBuf {
         let mut key = Sha256::new();
-        key.update(b"hermes-dream-generation-receipt-key-v1\0");
+        key.update(b"hermes-dream-generation-receipt-key-v2\0");
         key.update(txn.id.to_le_bytes());
         key.update(self.journal.sha256().as_bytes());
         key.update(
@@ -770,7 +869,7 @@ impl BuiltinDreamOps {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = read_regular_file(&path, "Dreaming generation receipt")?;
+        let bytes = read_regular_json(&path, "Dreaming generation receipt")?;
         let receipt: DreamGenerationReceipt = serde_json::from_slice(&bytes)?;
         let shared_candidate = txn.candidate_hash.as_deref().unwrap_or(&txn.student_hash);
         let (policy_sha256, adapter_sha256) = self.generation_policy_identity();
@@ -788,7 +887,7 @@ impl BuiltinDreamOps {
                     == self.config.generation_temperature.to_bits(),
             "completed Dreaming generation receipt disagrees with retry request"
         );
-        validate_sha256(&receipt.manifest_sha256, "Dreaming receipt manifest")?;
+        validate_sha256_identity(&receipt.manifest_sha256, "Dreaming receipt manifest")?;
         let dreams = self.load(txn, &receipt.manifest_sha256)?;
         ensure!(
             dreams.len() == candidate_count,
@@ -798,7 +897,7 @@ impl BuiltinDreamOps {
     }
 
     fn read_candidate(&self, hash: &str) -> Result<DreamCandidateArtifact> {
-        let bytes = read_addressed(&self.candidate_path(hash)?, hash, "dream candidate")?;
+        let bytes = read_addressed_json(&self.candidate_path(hash)?, hash, "dream candidate")?;
         let artifact: DreamCandidateArtifact = serde_json::from_slice(&bytes)?;
         ensure!(
             artifact.version == DREAM_CANDIDATE_VERSION,
@@ -806,8 +905,9 @@ impl BuiltinDreamOps {
             artifact.version
         );
         ensure!(
-            artifact.wake_journal_sha256 == self.journal.sha256(),
-            "dream candidate belongs to another wake journal"
+            artifact.wake_journal_sha256 == self.journal.sha256()
+                && artifact.source_checkpoint_sha256 == self.journal.source_checkpoint_sha256(),
+            "dream candidate belongs to another wake journal or source checkpoint"
         );
         ensure!(
             artifact.routing == DREAM_ROUTING_NAME,
@@ -826,8 +926,28 @@ impl BuiltinDreamOps {
             "dream candidate is too short"
         );
         ensure!(
+            artifact.token_ids.len() <= MAX_DREAM_CANDIDATE_TOKENS,
+            "dream candidate exceeds the {MAX_DREAM_CANDIDATE_TOKENS}-token operational limit"
+        );
+        ensure!(
+            artifact.wake_record_id.len() <= MAX_DREAM_SEQUENCE_ID_BYTES
+                && !artifact.wake_record_id.trim().is_empty(),
+            "dream candidate wake-record id is invalid"
+        );
+        ensure!(
+            artifact.ordinal < DreamingConfig::MAX_CANDIDATES,
+            "dream candidate ordinal exceeds the operational limit"
+        );
+        ensure!(
             artifact.wake_token_count > 0 && artifact.wake_token_count < artifact.token_ids.len(),
             "dream candidate has an invalid wake-prefix length"
+        );
+        ensure!(
+            artifact
+                .token_ids
+                .iter()
+                .all(|token| u32::try_from(*token).is_ok()),
+            "dream candidate contains a token outside the u32 range"
         );
         ensure!(
             artifact.generation_temperature.is_finite() && artifact.generation_temperature > 0.0,
@@ -839,10 +959,10 @@ impl BuiltinDreamOps {
             "dream candidate has an incomplete generation-policy binding"
         );
         if let Some(policy) = &artifact.generation_policy_sha256 {
-            validate_sha256(policy, "dream candidate generation policy")?;
+            validate_sha256_identity(policy, "dream candidate generation policy")?;
         }
         if let Some(adapter) = &artifact.generation_policy_adapter_sha256 {
-            validate_sha256(adapter, "dream candidate generation adapter")?;
+            validate_sha256_identity(adapter, "dream candidate generation adapter")?;
         }
         Ok(artifact)
     }
@@ -869,8 +989,82 @@ impl BuiltinDreamOps {
     }
 
     fn sequence_lm_head_rows(&self, model: &Transformer, tokens: &[i64]) -> Result<LmHeadRows> {
-        self.model_sequence(model, tokens, "LoRA sequence")?;
-        let rows = tokens.len() - 1;
+        self.wake_lm_head_rows(model, tokens, 1, "LoRA sequence")
+    }
+
+    fn candidate_lm_head_rows(
+        &self,
+        model: &Transformer,
+        artifact: &DreamCandidateArtifact,
+    ) -> Result<LmHeadRows> {
+        ensure!(
+            artifact.wake_token_count > 0 && artifact.wake_token_count < artifact.token_ids.len(),
+            "dream LoRA candidate has an invalid wake-prefix length"
+        );
+        self.wake_lm_head_rows(
+            model,
+            &artifact.token_ids,
+            artifact.wake_token_count,
+            "dream LoRA candidate",
+        )
+    }
+
+    fn evaluation_lm_head_rows(
+        &mut self,
+        model: &Transformer,
+        model_parameter_sha256: &str,
+    ) -> Result<Vec<DeviceLmHeadRows>> {
+        if let Some(cache) = self
+            .evaluation_cache
+            .as_ref()
+            .filter(|cache| cache.model_parameter_sha256 == model_parameter_sha256)
+        {
+            return Ok(cache.rows.clone());
+        }
+        let total_rows =
+            self.evaluation_set
+                .sequences
+                .iter()
+                .try_fold(0usize, |total, sequence| {
+                    total
+                        .checked_add(sequence.token_ids.len() - 1)
+                        .context("Dreaming evaluation row count overflow")
+                })?;
+        checked_lm_head_row_geometry(
+            total_rows,
+            model.config().hidden_size,
+            model.config().vocab_size,
+        )?;
+        let rows = self
+            .evaluation_set
+            .sequences
+            .iter()
+            .map(|sequence| self.sequence_lm_head_rows(model, &sequence.token_ids))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|rows| rows.into_device(&self.device))
+            .collect::<Result<Vec<_>>>()?;
+        self.evaluation_cache = Some(DeviceEvaluationCache {
+            model_parameter_sha256: model_parameter_sha256.to_owned(),
+            rows: rows.clone(),
+        });
+        Ok(rows)
+    }
+
+    fn wake_lm_head_rows(
+        &self,
+        model: &Transformer,
+        tokens: &[i64],
+        target_start: usize,
+        label: &str,
+    ) -> Result<LmHeadRows> {
+        self.model_sequence(model, tokens, label)?;
+        ensure!(
+            target_start > 0 && target_start < tokens.len(),
+            "{label} has an invalid supervised-token range"
+        );
+        let input_rows = tokens.len() - 1;
+        let rows = tokens.len() - target_start;
         let devices = model.devices();
         ensure!(
             devices.len() == 1,
@@ -879,11 +1073,14 @@ impl BuiltinDreamOps {
         );
         let device = devices[0].clone();
         let inputs = Tensor::<2, Int>::from_data(
-            TensorData::new(tokens[..rows].to_vec(), [1, rows]),
+            TensorData::new(tokens[..input_rows].to_vec(), [1, input_rows]),
             &device,
         );
         let positions = Tensor::<1, Int>::from_data(
-            TensorData::new((0..rows as i64).collect::<Vec<_>>(), [rows]),
+            TensorData::new(
+                ((target_start - 1) as i64..input_rows as i64).collect::<Vec<_>>(),
+                [rows],
+            ),
             &device,
         );
         let projector = model.prepare_selected_logits(inputs, positions);
@@ -901,8 +1098,9 @@ impl BuiltinDreamOps {
             .context("reading frozen LM-head base logits")?;
         let hidden = model.config().hidden_size;
         let vocab = model.config().vocab_size;
+        let (feature_values, logit_values) = checked_lm_head_row_geometry(rows, hidden, vocab)?;
         ensure!(
-            features.len() == rows * hidden && base_logits.len() == rows * vocab,
+            features.len() == feature_values && base_logits.len() == logit_values,
             "frozen LM-head feature/logit shape mismatch"
         );
         ensure!(
@@ -918,7 +1116,10 @@ impl BuiltinDreamOps {
             vocab: model.config().vocab_size,
             features,
             base_logits,
-            targets: tokens[1..].iter().map(|token| *token as usize).collect(),
+            targets: tokens[target_start..]
+                .iter()
+                .map(|token| *token as usize)
+                .collect(),
         })
     }
 
@@ -933,45 +1134,71 @@ impl BuiltinDreamOps {
             "ReSTEM dream sequence has an invalid wake-prefix length"
         );
         let rows = artifact.token_ids.len() - artifact.wake_token_count;
-        let mut features = Vec::with_capacity(rows * model.config().hidden_size);
-        let mut base_logits = Vec::with_capacity(rows * model.config().vocab_size);
-        let mut targets = Vec::with_capacity(rows);
+        let (feature_values, logit_values) = checked_lm_head_row_geometry(
+            rows,
+            model.config().hidden_size,
+            model.config().vocab_size,
+        )?;
+        let mut feature_rows = Vec::new();
+        feature_rows
+            .try_reserve_exact(rows)
+            .context("reserving ReSTEM hidden-state tensors")?;
+        let mut logit_rows = Vec::new();
+        logit_rows
+            .try_reserve_exact(rows)
+            .context("reserving ReSTEM logit tensors")?;
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(rows)
+            .context("reserving ReSTEM target rows")?;
+        let devices = model.devices();
+        ensure!(
+            devices.len() == 1,
+            "frozen ReSTEM model spans {} devices",
+            devices.len()
+        );
+        let device = &devices[0];
+        let mut state = model.make_state_with_capacity(1, artifact.token_ids.len() - 1, device);
         for generated in 0..rows {
             let prefix = artifact.wake_token_count + generated;
             let step_seed =
                 mix64(artifact.generation_seed ^ generated as u64 ^ artifact.routing_seed);
-            self.device.seed(step_seed);
+            device.seed(step_seed);
+            let input_tokens = if generated == 0 {
+                &artifact.token_ids[..prefix]
+            } else {
+                &artifact.token_ids[prefix - 1..prefix]
+            };
             let input = Tensor::<2, Int>::from_data(
-                TensorData::new(artifact.token_ids[..prefix].to_vec(), [1, prefix]),
-                &self.device,
+                TensorData::new(input_tokens.to_vec(), [1, input_tokens.len()]),
+                device,
             );
-            let position = Tensor::<1, Int>::from_data(
-                TensorData::new(vec![(prefix - 1) as i64], [1]),
-                &self.device,
-            );
-            let projector = model.prepare_selected_logits_with_memory_routing(
-                input,
-                position,
-                MemoryRouting::Dream { seed: step_seed },
-            );
-            features.extend(
-                projector
-                    .hidden(0..1)
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec::<f32>()
-                    .context("reading ReSTEM dream hidden state")?,
-            );
-            base_logits.extend(
-                projector
-                    .logits(0..1)
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec::<f32>()
-                    .context("reading ReSTEM dream base logits")?,
-            );
+            let (hidden, logits) = model
+                .forward_next_features_and_logits_with_state_and_memory_routing(
+                    input,
+                    &mut state,
+                    MemoryRouting::Dream { seed: step_seed },
+                );
+            feature_rows.push(hidden);
+            logit_rows.push(logits);
             targets.push(artifact.token_ids[prefix] as usize);
         }
+        let features = Tensor::cat(feature_rows, 0)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading ReSTEM dream hidden states")?;
+        let base_logits = Tensor::cat(logit_rows, 0)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading ReSTEM dream base logits")?;
+        ensure!(
+            features.len() == feature_values
+                && base_logits.len() == logit_values
+                && targets.len() == rows,
+            "ReSTEM LM-head feature/logit shape mismatch"
+        );
         ensure!(
             features
                 .iter()
@@ -1116,12 +1343,16 @@ impl BuiltinDreamOps {
         head_sha256: &str,
         head: &RestemPolicyState,
     ) -> Result<HostLmHeadLora> {
-        validate_sha256(head_sha256, "ReSTEM head policy")?;
+        validate_sha256_identity(head_sha256, "ReSTEM head policy")?;
         let mut current_hash = head_sha256.to_owned();
         let mut current = head.clone();
         let mut seen = BTreeSet::new();
         let mut head_adapter = None;
         loop {
+            ensure!(
+                seen.len() < MAX_RESTEM_POLICY_GENERATIONS,
+                "ReSTEM policy chain exceeds the {MAX_RESTEM_POLICY_GENERATIONS}-generation operational limit"
+            );
             ensure!(
                 seen.insert(current_hash.clone()),
                 "ReSTEM policy parent chain contains a cycle"
@@ -1139,7 +1370,7 @@ impl BuiltinDreamOps {
                 );
                 break;
             };
-            let bytes = read_addressed(
+            let bytes = read_addressed_json(
                 &self.policy_path(&parent_hash)?,
                 &parent_hash,
                 "ReSTEM parent policy",
@@ -1197,6 +1428,11 @@ impl TransformerDreamOps for BuiltinDreamOps {
     ) -> Result<(String, Vec<GeneratedDream>)> {
         self.validate_transaction(txn)?;
         ensure!(candidate_count > 0, "Dreaming candidate count is zero");
+        ensure!(
+            candidate_count <= DreamingConfig::MAX_CANDIDATES,
+            "Dreaming candidate count exceeds the {}-candidate operational limit",
+            DreamingConfig::MAX_CANDIDATES
+        );
         let reservation = txn
             .dream_generation_rng
             .context("Dreaming generation has no persisted RNG reservation")?;
@@ -1207,14 +1443,30 @@ impl TransformerDreamOps for BuiltinDreamOps {
         let MemoryRouting::Dream { seed: routing_seed } = routing else {
             bail!("Dreaming generation must use random-extra-expert routing");
         };
+        ensure!(
+            routing_seed == txn.id,
+            "Dreaming routing seed must equal the persisted transaction ID"
+        );
         if let Some(completed) =
             self.completed_generation(txn, candidate_count, reservation, routing_seed)?
         {
             return Ok(completed);
         }
         self.validate_generation_policy_for_model(model)?;
+        let generation_model = model.clone().valid();
+        let generation_devices = generation_model.devices();
         ensure!(
-            self.config.max_new_tokens < model.config().max_seq_len,
+            generation_devices.len() == 1,
+            "Dreaming generation model spans {} devices",
+            generation_devices.len()
+        );
+        let generation_device = &generation_devices[0];
+        let generation_policy = self
+            .generation_policy
+            .as_ref()
+            .map(|policy| DeviceLmHeadPolicy::from_host(policy, generation_device));
+        ensure!(
+            self.config.max_new_tokens < generation_model.config().max_seq_len,
             "Dreaming continuation must be shorter than model context"
         );
 
@@ -1222,48 +1474,51 @@ impl TransformerDreamOps for BuiltinDreamOps {
         for ordinal in 0..candidate_count {
             let generation_seed = derive_seed(txn, reservation, GENERATION_DOMAIN, ordinal as u64);
             let record = &self.journal.records()[self.select_context_index(generation_seed)];
-            let available = model.config().max_seq_len - self.config.max_new_tokens;
+            let available = generation_model.config().max_seq_len - self.config.max_new_tokens;
             let keep = record.token_ids.len().min(available).max(1);
             let mut tokens = record.token_ids[record.token_ids.len() - keep..].to_vec();
             ensure!(
-                tokens
-                    .iter()
-                    .all(|token| *token >= 0 && (*token as usize) < model.config().vocab_size),
+                tokens.iter().all(|token| {
+                    *token >= 0 && (*token as usize) < generation_model.config().vocab_size
+                }),
                 "wake context `{}` contains an out-of-vocabulary token",
                 record.id
             );
+            let state_capacity = keep
+                .checked_add(self.config.max_new_tokens - 1)
+                .context("Dreaming inference-state capacity overflow")?;
+            let mut state =
+                generation_model.make_state_with_capacity(1, state_capacity, generation_device);
             for step in 0..self.config.max_new_tokens {
                 let step_seed = mix64(generation_seed ^ step as u64 ^ routing_seed);
-                self.device.seed(step_seed);
-                let input = Tensor::<2, Int>::from_data(
-                    TensorData::new(tokens.clone(), [1, tokens.len()]),
-                    &self.device,
-                );
-                let position = Tensor::<1, Int>::from_data(
-                    TensorData::new(vec![(tokens.len() - 1) as i64], [1]),
-                    &self.device,
-                );
-                let projector = model.prepare_selected_logits_with_memory_routing(
-                    input,
-                    position,
-                    MemoryRouting::Dream { seed: step_seed },
-                );
-                let features = projector
-                    .hidden(0..1)
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec::<f32>()
-                    .context("reading Dreaming generation hidden state")?;
-                let base_logits = projector
-                    .logits(0..1)
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec::<f32>()
-                    .context("reading Dreaming logits")?;
-                let logits = match &self.generation_policy {
-                    Some(policy) => policy.adapted(&features, &base_logits)?.1,
-                    None => base_logits,
+                generation_device.seed(step_seed);
+                let input_tokens = if step == 0 {
+                    &tokens[..]
+                } else {
+                    &tokens[tokens.len() - 1..]
                 };
+                let input = Tensor::<2, Int>::from_data(
+                    TensorData::new(input_tokens.to_vec(), [1, input_tokens.len()]),
+                    generation_device,
+                );
+                let (features, base_logits) = generation_model
+                    .forward_next_features_and_logits_with_state_and_memory_routing(
+                        input,
+                        &mut state,
+                        MemoryRouting::Dream { seed: step_seed },
+                    );
+                let logits = match &generation_policy {
+                    Some(policy) => policy.adapted(features, base_logits)?,
+                    None => base_logits,
+                }
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .context("reading Dreaming generation logits")?;
+                ensure!(
+                    logits.len() == generation_model.config().vocab_size,
+                    "Dreaming generation logit shape mismatch"
+                );
                 let next = sample_temperature(
                     &logits,
                     self.config.generation_temperature,
@@ -1271,7 +1526,7 @@ impl TransformerDreamOps for BuiltinDreamOps {
                 )?;
                 tokens.push(next as i64);
             }
-            self.model_sequence(model, &tokens, "generated dream")?;
+            self.model_sequence(&generation_model, &tokens, "generated dream")?;
             let (policy_sha256, adapter_sha256) = self.generation_policy_identity();
             let artifact = DreamCandidateArtifact {
                 version: DREAM_CANDIDATE_VERSION,
@@ -1290,7 +1545,7 @@ impl TransformerDreamOps for BuiltinDreamOps {
                 token_ids: tokens.clone(),
             };
             let bytes = canonical_json(&artifact)?;
-            let artifact_hash = sha256_bytes(&bytes);
+            let artifact_hash = sha256_identity(&bytes);
             publish_immutable(&self.candidate_path(&artifact_hash)?, &bytes)?;
             let gradient = gradient_fingerprint(
                 model,
@@ -1322,7 +1577,7 @@ impl TransformerDreamOps for BuiltinDreamOps {
             dreams: dreams.clone(),
         };
         let bytes = canonical_json(&manifest)?;
-        let hash = sha256_bytes(&bytes);
+        let hash = sha256_identity(&bytes);
         publish_immutable(&self.manifest_path(&hash)?, &bytes)?;
         let receipt = DreamGenerationReceipt {
             version: DREAM_GENERATION_RECEIPT_VERSION,
@@ -1350,7 +1605,8 @@ impl TransformerDreamOps for BuiltinDreamOps {
 
     fn load(&mut self, txn: &ConsolidationTxn, manifest: &str) -> Result<Vec<GeneratedDream>> {
         self.validate_transaction(txn)?;
-        let bytes = read_addressed(&self.manifest_path(manifest)?, manifest, "dream manifest")?;
+        let bytes =
+            read_addressed_json(&self.manifest_path(manifest)?, manifest, "dream manifest")?;
         let artifact: DreamManifest = serde_json::from_slice(&bytes)?;
         ensure!(
             artifact.version == DREAM_MANIFEST_VERSION,
@@ -1360,6 +1616,10 @@ impl TransformerDreamOps for BuiltinDreamOps {
         ensure!(
             artifact.transaction_id == txn.id,
             "dream manifest transaction mismatch"
+        );
+        ensure!(
+            Some(artifact.generation_reservation) == txn.dream_generation_rng,
+            "dream manifest RNG reservation differs from its transaction"
         );
         ensure!(
             artifact.wake_journal_sha256 == self.journal.sha256()
@@ -1379,12 +1639,22 @@ impl TransformerDreamOps for BuiltinDreamOps {
             "dream manifest generation-policy binding mismatch"
         );
         ensure!(!artifact.dreams.is_empty(), "dream manifest is empty");
+        ensure!(
+            artifact.dreams.len() <= DreamingConfig::MAX_CANDIDATES,
+            "dream manifest exceeds the {}-candidate operational limit",
+            DreamingConfig::MAX_CANDIDATES
+        );
         let mut ids = BTreeSet::new();
-        for dream in &artifact.dreams {
+        for (ordinal, dream) in artifact.dreams.iter().enumerate() {
+            ensure!(
+                !dream.id.trim().is_empty() && dream.id.len() <= MAX_DREAM_SEQUENCE_ID_BYTES,
+                "dream manifest contains an invalid id"
+            );
             ensure!(
                 ids.insert(dream.id.as_str()),
                 "dream manifest repeats an id"
             );
+            validate_sha256_identity(&dream.artifact_hash, "dream candidate")?;
             ensure!(
                 dream.gradient.len() == self.config.gradient_dimensions
                     && dream.gradient.iter().all(|value| value.is_finite()),
@@ -1395,6 +1665,45 @@ impl TransformerDreamOps for BuiltinDreamOps {
             ensure!(
                 candidate.transaction_id == txn.id,
                 "dream candidate transaction mismatch"
+            );
+            ensure!(
+                candidate.ordinal == ordinal
+                    && candidate.generation_seed
+                        == derive_seed(
+                            txn,
+                            artifact.generation_reservation,
+                            GENERATION_DOMAIN,
+                            ordinal as u64,
+                        )
+                    && candidate.routing_seed == txn.id,
+                "dream candidate ordinal or generation seed is inconsistent with its manifest"
+            );
+            ensure!(
+                candidate.token_ids.len() - candidate.wake_token_count
+                    == self.config.max_new_tokens,
+                "dream candidate continuation length differs from runtime configuration"
+            );
+            let record = self
+                .journal
+                .records()
+                .iter()
+                .find(|record| record.id == candidate.wake_record_id)
+                .context("dream candidate wake record is absent from its journal")?;
+            ensure!(
+                candidate.wake_token_count <= record.token_ids.len()
+                    && candidate.token_ids[..candidate.wake_token_count]
+                        == record.token_ids[record.token_ids.len() - candidate.wake_token_count..],
+                "dream candidate wake prefix differs from its journal record"
+            );
+            ensure!(
+                dream.id
+                    == format!(
+                        "dream-{}-{ordinal}-{}",
+                        txn.id,
+                        short_hash(&dream.artifact_hash)
+                    )
+                    && dream.diversity_key == mix64(candidate.generation_seed ^ ordinal as u64),
+                "dream manifest identity metadata is inconsistent with its candidate"
             );
         }
         Ok(artifact.dreams)
@@ -1447,6 +1756,10 @@ impl TransformerDreamOps for BuiltinDreamOps {
     ) -> Result<DreamTrial> {
         self.validate_transaction(txn)?;
         ensure!(rank > 0 && alpha > 0, "Dreaming LoRA geometry is empty");
+        ensure!(
+            rank <= DreamingConfig::MAX_LORA_RANK && alpha <= DreamingConfig::MAX_LORA_ALPHA,
+            "Dreaming LoRA geometry exceeds operational limits"
+        );
         let trial_rng = txn
             .dream_trial_rngs
             .iter()
@@ -1463,42 +1776,42 @@ impl TransformerDreamOps for BuiltinDreamOps {
             .candidate_hash
             .as_deref()
             .context("Dreaming LoRA transaction has no immutable candidate checkpoint hash")?;
-        validate_sha256(base_checkpoint_sha256, "Dreaming LoRA base checkpoint")?;
+        validate_sha256_identity(base_checkpoint_sha256, "Dreaming LoRA base checkpoint")?;
         let base_model_parameter_sha256 = txn
             .dream_shared_checkpoint_hash
             .as_deref()
             .context("Dreaming LoRA transaction has no shared model-parameter hash")?;
-        validate_sha256(
+        validate_sha256_identity(
             base_model_parameter_sha256,
             "Dreaming LoRA base-model parameters",
         )?;
 
         // `valid` detaches the forked model and disables training-only dropout.
-        // All optimization below happens in the two host adapter tensors; the
-        // frozen Transformer supplies only final hidden features and base
-        // output-projection logits.
+        // All optimization below happens in two isolated device-owned adapter
+        // tensors; the frozen Transformer supplies only final hidden features
+        // and base output-projection logits.
         let frozen_model = isolated_model.valid();
-        let training = self.sequence_lm_head_rows(&frozen_model, &artifact.token_ids)?;
-        let evaluation = self
-            .evaluation_set
-            .sequences
-            .iter()
-            .map(|sequence| self.sequence_lm_head_rows(&frozen_model, &sequence.token_ids))
-            .collect::<Result<Vec<_>>>()?;
+        let training = self
+            .candidate_lm_head_rows(&frozen_model, &artifact)?
+            .into_device(&self.device)?;
+        let evaluation =
+            self.evaluation_lm_head_rows(&frozen_model, base_model_parameter_sha256)?;
         let seed = derive_seed(txn, trial_rng, LORA_DOMAIN, 0);
-        let mut adapter = HostLmHeadLora::new(training.hidden, training.vocab, rank, alpha, seed)?;
-        let training_loss_before = adapter.loss(&training)?;
-        let evaluation_loss_before = mean_loss(&adapter, &evaluation)?;
+        let adapter = HostLmHeadLora::new(training.hidden, training.vocab, rank, alpha, seed)?;
+        let mut adapter = DeviceLmHeadLora::from_host(adapter, &self.device);
+        let training_loss_before = adapter.loss_value(&training)?;
+        let evaluation_loss_before = adapter.mean_loss_value(&evaluation)?;
         for _ in 0..self.config.lora_steps {
             adapter.train_step(&training, self.config.lora_learning_rate)?;
         }
-        let training_loss_after = adapter.loss(&training)?;
-        let evaluation_loss_after = mean_loss(&adapter, &evaluation)?;
+        let training_loss_after = adapter.loss_value(&training)?;
+        let evaluation_loss_after = adapter.mean_loss_value(&evaluation)?;
         let improvement = evaluation_loss_before - evaluation_loss_after;
         ensure!(
             improvement.is_finite(),
             "Dreaming trial produced a non-finite reward"
         );
+        let adapter = adapter.into_host()?;
 
         let receipt = AdapterReceipt {
             version: DREAM_ADAPTER_VERSION,
@@ -1525,14 +1838,17 @@ impl TransformerDreamOps for BuiltinDreamOps {
         };
         receipt.validate()?;
         let header = serde_json::to_vec(&receipt)?;
-        let mut bytes =
-            Vec::with_capacity(8 + header.len() + 4 * (adapter.a.len() + adapter.b.len()));
+        let capacity = adapter_payload_capacity(header.len(), adapter.a.len(), adapter.b.len())?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .context("reserving isolated dream LoRA artifact")?;
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&header);
         for value in adapter.a.iter().chain(&adapter.b) {
             bytes.extend_from_slice(&value.to_bits().to_le_bytes());
         }
-        let adapter_hash = sha256_bytes(&bytes);
+        let adapter_hash = sha256_identity(&bytes);
         publish_immutable(&self.adapter_path(&adapter_hash)?, &bytes)?;
         Ok(DreamTrial {
             candidate_id: candidate.id.clone(),
@@ -1551,17 +1867,33 @@ impl TransformerDreamOps for BuiltinDreamOps {
     ) -> Result<String> {
         self.validate_transaction(txn)?;
         ensure!(iterations > 0, "ReSTEM iterations must be positive");
+        ensure!(
+            iterations <= DreamingConfig::MAX_RESTEM_ITERATIONS,
+            "ReSTEM iteration count exceeds the operational limit"
+        );
+        ensure!(
+            accepted.len() <= DreamingConfig::MAX_CANDIDATES,
+            "ReSTEM accepted-trial count exceeds the operational limit"
+        );
+        let policy_work = accepted
+            .len()
+            .checked_mul(iterations)
+            .context("ReSTEM policy work overflows usize")?;
+        ensure!(
+            policy_work <= DreamingConfig::MAX_POLICY_WORK,
+            "ReSTEM policy work exceeds the operational limit"
+        );
         self.validate_generation_policy_for_model(model)?;
         let source_checkpoint_sha256 = txn
             .candidate_hash
             .as_deref()
             .context("ReSTEM transaction has no immutable candidate checkpoint hash")?;
-        validate_sha256(source_checkpoint_sha256, "ReSTEM source checkpoint")?;
+        validate_sha256_identity(source_checkpoint_sha256, "ReSTEM source checkpoint")?;
         let source_model_parameter_sha256 = txn
             .dream_shared_checkpoint_hash
             .as_deref()
             .context("ReSTEM transaction has no shared model-parameter hash")?;
-        validate_sha256(
+        validate_sha256_identity(
             source_model_parameter_sha256,
             "ReSTEM source model parameters",
         )?;
@@ -1640,11 +1972,17 @@ impl TransformerDreamOps for BuiltinDreamOps {
                 ),
             )?,
         };
+        let frozen_model = model.clone().valid();
         let training_sets = verified
             .iter()
-            .map(|(_, _, candidate, _)| self.dream_sequence_lm_head_rows(model, candidate))
+            .map(|(_, _, candidate, _)| self.dream_sequence_lm_head_rows(&frozen_model, candidate))
             .collect::<Result<Vec<_>>>()?;
         if !training_sets.is_empty() {
+            let training_sets = training_sets
+                .into_iter()
+                .map(|rows| rows.into_device(&self.device))
+                .collect::<Result<Vec<_>>>()?;
+            let mut device_adapter = DeviceLmHeadLora::from_host(adapter, &self.device);
             let reward_sum = verified
                 .iter()
                 .map(|(_, receipt, _, _)| receipt.independent_task_improvement)
@@ -1657,9 +1995,11 @@ impl TransformerDreamOps for BuiltinDreamOps {
                 for (data, (_, receipt, _, _)) in training_sets.iter().zip(&verified) {
                     let reward_weight =
                         receipt.independent_task_improvement * verified.len() as f32 / reward_sum;
-                    adapter.train_step(data, self.config.restem_learning_rate * reward_weight)?;
+                    device_adapter
+                        .train_step(data, self.config.restem_learning_rate * reward_weight)?;
                 }
             }
+            adapter = device_adapter.into_host()?;
         }
         let accepted_candidates = verified
             .iter()
@@ -1700,14 +2040,18 @@ impl TransformerDreamOps for BuiltinDreamOps {
             };
             receipt.validate()?;
             let header = serde_json::to_vec(&receipt)?;
-            let mut bytes =
-                Vec::with_capacity(8 + header.len() + 4 * (adapter.a.len() + adapter.b.len()));
+            let capacity =
+                adapter_payload_capacity(header.len(), adapter.a.len(), adapter.b.len())?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(capacity)
+                .context("reserving generation-policy LoRA artifact")?;
             bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
             bytes.extend_from_slice(&header);
             for value in adapter.a.iter().chain(&adapter.b) {
                 bytes.extend_from_slice(&value.to_bits().to_le_bytes());
             }
-            let hash = sha256_bytes(&bytes);
+            let hash = sha256_identity(&bytes);
             publish_immutable(&self.generation_policy_adapter_path(&hash)?, &bytes)?;
             hash
         };
@@ -1734,7 +2078,7 @@ impl TransformerDreamOps for BuiltinDreamOps {
         };
         state.validate()?;
         let bytes = canonical_json(&state)?;
-        let hash = sha256_bytes(&bytes);
+        let hash = sha256_identity(&bytes);
         publish_immutable(&self.policy_path(&hash)?, &bytes)?;
         Ok(hash)
     }
@@ -1748,6 +2092,264 @@ struct LmHeadRows {
     features: Vec<f32>,
     base_logits: Vec<f32>,
     targets: Vec<usize>,
+}
+
+fn checked_lm_head_row_geometry(
+    rows: usize,
+    hidden: usize,
+    vocab: usize,
+) -> Result<(usize, usize)> {
+    ensure!(rows > 0 && hidden > 0 && vocab > 1, "invalid LM-head rows");
+    let feature_values = rows
+        .checked_mul(hidden)
+        .context("LM-head feature geometry overflows usize")?;
+    let logit_values = rows
+        .checked_mul(vocab)
+        .context("LM-head logit geometry overflows usize")?;
+    let data_bytes = feature_values
+        .checked_add(logit_values)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .context("LM-head dataset geometry overflows usize")?;
+    ensure!(
+        data_bytes <= MAX_DREAM_LM_HEAD_DATA_BYTES,
+        "LM-head dataset exceeds the {MAX_DREAM_LM_HEAD_DATA_BYTES}-byte operational limit"
+    );
+    Ok((feature_values, logit_values))
+}
+
+impl LmHeadRows {
+    fn validate_for(&self, hidden: usize, vocab: usize) -> Result<()> {
+        let (feature_values, logit_values) =
+            checked_lm_head_row_geometry(self.rows, hidden, vocab)?;
+        ensure!(
+            self.hidden == hidden
+                && self.vocab == vocab
+                && self.rows == self.targets.len()
+                && self.features.len() == feature_values
+                && self.base_logits.len() == logit_values,
+            "LM-head LoRA dataset shape mismatch"
+        );
+        ensure!(
+            self.targets.iter().all(|target| *target < vocab),
+            "LM-head LoRA target is outside vocabulary"
+        );
+        Ok(())
+    }
+
+    fn into_device(self, device: &Device) -> Result<DeviceLmHeadRows> {
+        self.validate_for(self.hidden, self.vocab)?;
+        let rows = self.rows;
+        let hidden = self.hidden;
+        let vocab = self.vocab;
+        let targets = self
+            .targets
+            .into_iter()
+            .map(i64::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("LM-head LoRA target exceeds i64")?;
+        Ok(DeviceLmHeadRows {
+            rows,
+            hidden,
+            vocab,
+            features: Tensor::<2>::from_data(
+                TensorData::new(self.features, [rows, hidden]),
+                device,
+            ),
+            base_logits: Tensor::<2>::from_data(
+                TensorData::new(self.base_logits, [rows, vocab]),
+                device,
+            ),
+            targets: Tensor::<1, Int>::from_data(TensorData::new(targets, [rows]), device),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct DeviceLmHeadRows {
+    rows: usize,
+    hidden: usize,
+    vocab: usize,
+    features: Tensor<2>,
+    base_logits: Tensor<2>,
+    targets: Tensor<1, Int>,
+}
+
+struct DeviceEvaluationCache {
+    model_parameter_sha256: String,
+    rows: Vec<DeviceLmHeadRows>,
+}
+
+struct DeviceLmHeadLora {
+    hidden: usize,
+    vocab: usize,
+    rank: usize,
+    alpha: usize,
+    scale: f32,
+    a: Tensor<2>,
+    b: Tensor<2>,
+}
+
+struct DeviceLmHeadPolicy {
+    hidden: usize,
+    vocab: usize,
+    scale: f32,
+    a: Tensor<2>,
+    b: Tensor<2>,
+}
+
+impl DeviceLmHeadPolicy {
+    fn from_host(adapter: &HostLmHeadLora, device: &Device) -> Self {
+        Self {
+            hidden: adapter.hidden,
+            vocab: adapter.vocab,
+            scale: adapter.scale,
+            a: Tensor::<2>::from_data(
+                TensorData::new(adapter.a.clone(), [adapter.rank, adapter.hidden]),
+                device,
+            ),
+            b: Tensor::<2>::from_data(
+                TensorData::new(adapter.b.clone(), [adapter.rank, adapter.vocab]),
+                device,
+            ),
+        }
+    }
+
+    fn adapted(&self, features: Tensor<2>, base_logits: Tensor<2>) -> Result<Tensor<2>> {
+        ensure!(
+            features.dims() == [1, self.hidden] && base_logits.dims() == [1, self.vocab],
+            "device generation-policy feature/logit shape mismatch"
+        );
+        Ok(base_logits
+            + features
+                .matmul(self.a.clone().transpose())
+                .matmul(self.b.clone())
+                .mul_scalar(self.scale))
+    }
+}
+
+impl DeviceLmHeadLora {
+    fn from_host(adapter: HostLmHeadLora, device: &Device) -> Self {
+        let a = Tensor::<2>::from_data(
+            TensorData::new(adapter.a, [adapter.rank, adapter.hidden]),
+            device,
+        )
+        .require_grad();
+        let b = Tensor::<2>::from_data(
+            TensorData::new(adapter.b, [adapter.rank, adapter.vocab]),
+            device,
+        )
+        .require_grad();
+        Self {
+            hidden: adapter.hidden,
+            vocab: adapter.vocab,
+            rank: adapter.rank,
+            alpha: adapter.alpha,
+            scale: adapter.scale,
+            a,
+            b,
+        }
+    }
+
+    fn loss(&self, data: &DeviceLmHeadRows) -> Result<Tensor<1>> {
+        ensure!(
+            data.rows > 0 && data.hidden == self.hidden && data.vocab == self.vocab,
+            "device LM-head LoRA dataset shape mismatch"
+        );
+        let logits = data.base_logits.clone()
+            + data
+                .features
+                .clone()
+                .matmul(self.a.clone().transpose())
+                .matmul(self.b.clone())
+                .mul_scalar(self.scale);
+        Ok(CrossEntropyLossConfig::new()
+            .init(&logits.device())
+            .forward(logits, data.targets.clone()))
+    }
+
+    fn loss_value(&self, data: &DeviceLmHeadRows) -> Result<f32> {
+        let value = self
+            .loss(data)?
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading device LM-head LoRA loss")?[0];
+        ensure!(value.is_finite(), "device LM-head LoRA loss is non-finite");
+        Ok(value)
+    }
+
+    fn mean_loss_value(&self, sets: &[DeviceLmHeadRows]) -> Result<f32> {
+        ensure!(!sets.is_empty(), "Dreaming evaluation set is empty");
+        let losses = sets
+            .iter()
+            .map(|set| self.loss(set))
+            .collect::<Result<Vec<_>>>()?;
+        let value = Tensor::cat(losses, 0)
+            .mean()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading mean device LM-head LoRA loss")?[0];
+        ensure!(
+            value.is_finite(),
+            "mean device LM-head LoRA loss is non-finite"
+        );
+        Ok(value)
+    }
+
+    fn train_step(&mut self, data: &DeviceLmHeadRows, learning_rate: f32) -> Result<()> {
+        ensure!(
+            learning_rate.is_finite() && learning_rate > 0.0,
+            "device LM-head LoRA learning rate is invalid"
+        );
+        let mut gradients = self.loss(data)?.backward();
+        let grad_a = self
+            .a
+            .grad_remove(&mut gradients)
+            .context("device LM-head LoRA produced no A gradient")?;
+        let grad_b = self
+            .b
+            .grad_remove(&mut gradients)
+            .context("device LM-head LoRA produced no B gradient")?;
+        let mean_gradient_norm = (grad_a.clone().square().sum() + grad_b.clone().square().sum())
+            .sqrt()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading device LM-head LoRA gradient norm")?[0];
+        ensure!(
+            mean_gradient_norm.is_finite(),
+            "device LM-head LoRA gradient norm is non-finite"
+        );
+        // The paper-inspired host recipe clipped the summed full-batch
+        // gradient. CrossEntropyLoss emits a mean gradient, so restore the sum
+        // norm before applying the same update rule.
+        let denominator = (mean_gradient_norm * data.rows as f32).max(1.0);
+        let rate = learning_rate / denominator;
+        self.a =
+            Tensor::from_inner(self.a.clone().inner() - grad_a.mul_scalar(rate)).require_grad();
+        self.b =
+            Tensor::from_inner(self.b.clone().inner() - grad_b.mul_scalar(rate)).require_grad();
+        Ok(())
+    }
+
+    fn into_host(self) -> Result<HostLmHeadLora> {
+        let a = self
+            .a
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading trained LM-head LoRA A")?;
+        let b = self
+            .b
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .context("reading trained LM-head LoRA B")?;
+        HostLmHeadLora::from_parts(self.hidden, self.vocab, self.rank, self.alpha, a, b)
+    }
 }
 
 /// Isolated LoRA on the frozen model's logical output projection.
@@ -1766,25 +2368,78 @@ struct HostLmHeadLora {
     b: Vec<f32>,
 }
 
+fn checked_lora_parameter_geometry(
+    hidden: usize,
+    vocab: usize,
+    rank: usize,
+    alpha: usize,
+) -> Result<(usize, usize)> {
+    ensure!(
+        hidden > 0 && vocab > 1 && rank > 0 && alpha > 0,
+        "invalid LM-head LoRA shape"
+    );
+    ensure!(
+        rank <= DreamingConfig::MAX_LORA_RANK && alpha <= DreamingConfig::MAX_LORA_ALPHA,
+        "LM-head LoRA geometry exceeds the configured operational limits"
+    );
+    let a_values = rank
+        .checked_mul(hidden)
+        .context("LM-head LoRA A shape overflow")?;
+    let b_values = rank
+        .checked_mul(vocab)
+        .context("LM-head LoRA B shape overflow")?;
+    let parameter_bytes = a_values
+        .checked_add(b_values)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .context("LM-head LoRA parameter size overflow")?;
+    ensure!(
+        u64::try_from(parameter_bytes).context("LM-head LoRA parameter size exceeds u64")?
+            <= MAX_DREAM_ADAPTER_PARAMETER_BYTES,
+        "LM-head LoRA parameters exceed the {MAX_DREAM_ADAPTER_PARAMETER_BYTES}-byte operational limit"
+    );
+    Ok((a_values, b_values))
+}
+
+fn adapter_payload_capacity(
+    header_bytes: usize,
+    a_values: usize,
+    b_values: usize,
+) -> Result<usize> {
+    let capacity = a_values
+        .checked_add(b_values)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|parameter_bytes| parameter_bytes.checked_add(header_bytes))
+        .and_then(|payload| payload.checked_add(std::mem::size_of::<u64>()))
+        .context("dream LoRA adapter payload size overflow")?;
+    ensure!(
+        u64::try_from(capacity).context("dream LoRA adapter payload exceeds u64")?
+            <= MAX_DREAM_ADAPTER_BYTES,
+        "dream LoRA adapter payload exceeds the {MAX_DREAM_ADAPTER_BYTES}-byte limit"
+    );
+    Ok(capacity)
+}
+
+fn zeroed_f32(count: usize, label: &str) -> Result<Vec<f32>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .with_context(|| format!("reserving {label}"))?;
+    values.resize(count, 0.0);
+    Ok(values)
+}
+
 impl HostLmHeadLora {
     fn new(hidden: usize, vocab: usize, rank: usize, alpha: usize, seed: u64) -> Result<Self> {
-        ensure!(
-            hidden > 0 && vocab > 1 && rank > 0 && alpha > 0,
-            "invalid LM-head LoRA shape"
-        );
-        let a_values = rank
-            .checked_mul(hidden)
-            .context("LM-head LoRA A shape overflow")?;
-        let b_values = rank
-            .checked_mul(vocab)
-            .context("LM-head LoRA B shape overflow")?;
+        let (a_values, b_values) = checked_lora_parameter_geometry(hidden, vocab, rank, alpha)?;
         let mut state = seed;
-        let a = (0..a_values)
-            .map(|_| {
-                state = mix64(state);
-                (((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32) * 0.01
-            })
-            .collect();
+        let mut a = Vec::new();
+        a.try_reserve_exact(a_values)
+            .context("reserving LM-head LoRA A parameters")?;
+        for _ in 0..a_values {
+            state = mix64(state);
+            a.push((((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32) * 0.01);
+        }
+        let b = zeroed_f32(b_values, "LM-head LoRA B parameters")?;
         Ok(Self {
             hidden,
             vocab,
@@ -1792,7 +2447,7 @@ impl HostLmHeadLora {
             alpha,
             scale: alpha as f32 / rank as f32,
             a,
-            b: vec![0.0; b_values],
+            b,
         })
     }
 
@@ -1804,19 +2459,9 @@ impl HostLmHeadLora {
         a: Vec<f32>,
         b: Vec<f32>,
     ) -> Result<Self> {
+        let (a_values, b_values) = checked_lora_parameter_geometry(hidden, vocab, rank, alpha)?;
         ensure!(
-            hidden > 0 && vocab > 1 && rank > 0 && alpha > 0,
-            "invalid LM-head LoRA shape"
-        );
-        ensure!(
-            a.len()
-                == rank
-                    .checked_mul(hidden)
-                    .context("LM-head LoRA A shape overflow")?
-                && b.len()
-                    == rank
-                        .checked_mul(vocab)
-                        .context("LM-head LoRA B shape overflow")?,
+            a.len() == a_values && b.len() == b_values,
             "LM-head LoRA parameter lengths do not match geometry"
         );
         ensure!(
@@ -1834,6 +2479,7 @@ impl HostLmHeadLora {
         })
     }
 
+    #[cfg(test)]
     fn adapted(&self, features: &[f32], base_logits: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
         ensure!(
             features.len() == self.hidden,
@@ -1850,13 +2496,17 @@ impl HostLmHeadLora {
                 .all(|value| value.is_finite()),
             "LM-head LoRA input is non-finite"
         );
-        let mut low_rank = vec![0.0_f32; self.rank];
+        let mut low_rank = zeroed_f32(self.rank, "LM-head LoRA activation")?;
         for (rank, low_rank_value) in low_rank.iter_mut().enumerate() {
             for (feature, value) in features.iter().copied().enumerate() {
                 *low_rank_value += value * self.a[rank * self.hidden + feature];
             }
         }
-        let mut output = base_logits.to_vec();
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(base_logits.len())
+            .context("reserving adapted LM-head logits")?;
+        output.extend_from_slice(base_logits);
         for (token, output_value) in output.iter_mut().enumerate() {
             let mut residual = 0.0;
             for (rank, low_rank_value) in low_rank.iter().copied().enumerate() {
@@ -1867,15 +2517,9 @@ impl HostLmHeadLora {
         Ok((low_rank, output))
     }
 
+    #[cfg(test)]
     fn loss(&self, data: &LmHeadRows) -> Result<f32> {
-        ensure!(
-            data.hidden == self.hidden
-                && data.vocab == self.vocab
-                && data.rows == data.targets.len()
-                && data.features.len() == data.rows * data.hidden
-                && data.base_logits.len() == data.rows * data.vocab,
-            "LM-head LoRA dataset shape mismatch"
-        );
+        data.validate_for(self.hidden, self.vocab)?;
         let mut sum = 0.0;
         for row in 0..data.rows {
             let (_, logits) = self.adapted(
@@ -1887,25 +2531,18 @@ impl HostLmHeadLora {
         Ok(sum / data.rows as f32)
     }
 
+    #[cfg(test)]
     fn train_step(&mut self, data: &LmHeadRows, learning_rate: f32) -> Result<()> {
-        ensure!(
-            data.hidden == self.hidden
-                && data.vocab == self.vocab
-                && data.rows > 0
-                && data.rows == data.targets.len()
-                && data.features.len() == data.rows * data.hidden
-                && data.base_logits.len() == data.rows * data.vocab,
-            "LM-head LoRA training data shape mismatch"
-        );
-        let mut grad_a = vec![0.0_f32; self.a.len()];
-        let mut grad_b = vec![0.0_f32; self.b.len()];
+        data.validate_for(self.hidden, self.vocab)?;
+        let mut grad_a = zeroed_f32(self.a.len(), "LM-head LoRA A gradient")?;
+        let mut grad_b = zeroed_f32(self.b.len(), "LM-head LoRA B gradient")?;
         for row in 0..data.rows {
             let features = &data.features[row * self.hidden..(row + 1) * self.hidden];
             let base_logits = &data.base_logits[row * self.vocab..(row + 1) * self.vocab];
             let (low_rank, logits) = self.adapted(features, base_logits)?;
             let mut error = softmax_host(&logits)?;
             error[data.targets[row]] -= 1.0;
-            let mut grad_low_rank = vec![0.0_f32; self.rank];
+            let mut grad_low_rank = zeroed_f32(self.rank, "LM-head LoRA activation gradient")?;
             for (rank, grad_low_rank_value) in grad_low_rank.iter_mut().enumerate() {
                 for (token, error_value) in error.iter().copied().enumerate() {
                     grad_b[rank * self.vocab + token] += self.scale * low_rank[rank] * error_value;
@@ -1942,17 +2579,7 @@ impl HostLmHeadLora {
     }
 }
 
-fn mean_loss(adapter: &HostLmHeadLora, sets: &[LmHeadRows]) -> Result<f32> {
-    ensure!(!sets.is_empty(), "independent evaluation set is empty");
-    Ok(sets
-        .iter()
-        .map(|set| adapter.loss(set))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .sum::<f32>()
-        / sets.len() as f32)
-}
-
+#[cfg(test)]
 fn softmax_host(logits: &[f32]) -> Result<Vec<f32>> {
     ensure!(!logits.is_empty(), "softmax input is empty");
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -1969,6 +2596,7 @@ fn softmax_host(logits: &[f32]) -> Result<Vec<f32>> {
     Ok(values)
 }
 
+#[cfg(test)]
 fn cross_entropy(logits: &[f32], target: usize) -> Result<f32> {
     ensure!(
         target < logits.len(),
@@ -2140,7 +2768,7 @@ fn sample_temperature(logits: &[f32], temperature: f32, seed: u64) -> Result<usi
 }
 
 fn model_topology_sha256(model: &Transformer) -> Result<String> {
-    Ok(sha256_bytes(&canonical_json(model.config())?))
+    Ok(sha256_identity(&canonical_json(model.config())?))
 }
 
 fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -2149,50 +2777,42 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn validate_sha256(value: &str, label: &str) -> Result<()> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{label} hash must start with `sha256:`"))?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{label} hash must contain 64 lowercase hexadecimal digits"
-    );
-    Ok(())
-}
-
 fn short_hash(hash: &str) -> &str {
     &hash[7..19]
 }
 
 fn addressed_path(root: &Path, kind: &str, hash: &str, extension: &str) -> Result<PathBuf> {
-    validate_sha256(hash, kind)?;
+    validate_sha256_identity(hash, kind)?;
     Ok(root
         .join(kind)
         .join(format!("{}.{}", &hash[7..], extension)))
 }
 
 fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "{label} {} must be a regular non-symlink file",
-        path.display()
-    );
-    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
+    read_regular_bounded(path, MAX_DREAM_ADAPTER_BYTES, label)
+        .with_context(|| format!("failed to read {label} {}", path.display()))
+}
+
+fn read_regular_json(path: &Path, label: &str) -> Result<Vec<u8>> {
+    read_regular_bounded(path, MAX_DREAM_JSON_BYTES, label)
+        .with_context(|| format!("failed to read {label} {}", path.display()))
 }
 
 fn read_addressed(path: &Path, expected: &str, label: &str) -> Result<Vec<u8>> {
-    validate_sha256(expected, label)?;
+    validate_sha256_identity(expected, label)?;
     let bytes = read_regular_file(path, label)?;
-    let observed = sha256_bytes(&bytes);
+    let observed = sha256_identity(&bytes);
+    ensure!(
+        observed == expected,
+        "{label} content hash changed: expected {expected}, observed {observed}"
+    );
+    Ok(bytes)
+}
+
+fn read_addressed_json(path: &Path, expected: &str, label: &str) -> Result<Vec<u8>> {
+    validate_sha256_identity(expected, label)?;
+    let bytes = read_regular_json(path, label)?;
+    let observed = sha256_identity(&bytes);
     ensure!(
         observed == expected,
         "{label} content hash changed: expected {expected}, observed {observed}"
@@ -2201,68 +2821,11 @@ fn read_addressed(path: &Path, expected: &str, label: &str) -> Result<Vec<u8>> {
 }
 
 fn ensure_real_directory(path: &Path) -> Result<()> {
-    if !path.exists() {
-        fs::create_dir_all(path)
-            .with_context(|| format!("creating Dreaming directory {}", path.display()))?;
-    }
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting Dreaming directory {}", path.display()))?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "Dreaming directory {} must be a real directory",
-        path.display()
-    );
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
+    ensure_directory(path, "Dreaming directory")
 }
 
 fn publish_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("immutable artifact has no parent")?;
-    ensure_real_directory(parent)?;
-    if path.exists() {
-        ensure!(
-            read_regular_file(path, "immutable Dreaming artifact")? == bytes,
-            "immutable Dreaming artifact {} already differs",
-            path.display()
-        );
-        return Ok(());
-    }
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .context("artifact name is not UTF-8")?;
-    let temporary = parent.join(format!(
-        ".{name}.tmp.{}.{}",
-        std::process::id(),
-        TEMPORARY_ORDINAL.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        output.write_all(bytes)?;
-        output.sync_all()?;
-        drop(output);
-        match fs::hard_link(&temporary, path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => ensure!(
-                read_regular_file(path, "immutable Dreaming artifact")? == bytes,
-                "immutable Dreaming artifact publication raced with different bytes"
-            ),
-            Err(error) => return Err(error.into()),
-        }
-        fs::remove_file(&temporary)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    atomic_write_new(path, bytes)
 }
 
 #[cfg(test)]
@@ -2311,7 +2874,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         PinnedLocalArtifact {
             path,
-            sha256: sha256_bytes(&bytes),
+            sha256: sha256_identity(&bytes),
         }
     }
 
@@ -2370,7 +2933,7 @@ mod tests {
             .push(WakeContextRecord {
                 id: "wake-10-0".into(),
                 optimizer_step: 10,
-                token_ids: vec![1, 2, 3, 4],
+                token_ids: vec![2, 3, 4, 1],
             })
             .unwrap();
         let journal_path = directory.path().join("wake.json");
@@ -2402,7 +2965,7 @@ mod tests {
                 &evaluation_set,
             ),
             initial_policy: None,
-            max_new_tokens: 2,
+            max_new_tokens: 1,
             gradient_dimensions: 16,
             lora_steps,
             lora_learning_rate: 0.25,
@@ -2426,18 +2989,24 @@ mod tests {
     fn manual_candidate(
         operations: &BuiltinDreamOps,
         txn: &ConsolidationTxn,
-        id: &str,
         tokens: Vec<i64>,
     ) -> GeneratedDream {
+        let ordinal = 0;
+        let generation_seed = derive_seed(
+            txn,
+            txn.dream_generation_rng.unwrap(),
+            GENERATION_DOMAIN,
+            ordinal,
+        );
         let artifact = DreamCandidateArtifact {
             version: DREAM_CANDIDATE_VERSION,
             transaction_id: txn.id,
-            ordinal: 0,
+            ordinal: ordinal as usize,
             wake_journal_sha256: operations.journal.sha256().to_owned(),
             source_checkpoint_sha256: operations.journal.source_checkpoint_sha256().to_owned(),
             wake_record_id: operations.journal.records()[0].id.clone(),
             wake_token_count: 1,
-            generation_seed: 19,
+            generation_seed,
             routing_seed: txn.id,
             routing: DREAM_ROUTING_NAME.into(),
             generation_policy_sha256: operations
@@ -2453,13 +3022,13 @@ mod tests {
             token_ids: tokens,
         };
         let bytes = canonical_json(&artifact).unwrap();
-        let artifact_hash = sha256_bytes(&bytes);
+        let artifact_hash = sha256_identity(&bytes);
         publish_immutable(&operations.candidate_path(&artifact_hash).unwrap(), &bytes).unwrap();
         GeneratedDream {
-            id: id.into(),
+            id: format!("dream-{}-{ordinal}-{}", txn.id, short_hash(&artifact_hash)),
             artifact_hash,
             gradient: vec![0.25; operations.config.gradient_dimensions],
-            diversity_key: 19,
+            diversity_key: mix64(generation_seed ^ ordinal),
         }
     }
 
@@ -2488,9 +3057,52 @@ mod tests {
             dreams,
         };
         let bytes = canonical_json(&manifest).unwrap();
-        let hash = sha256_bytes(&bytes);
+        let hash = sha256_identity(&bytes);
         publish_immutable(&operations.manifest_path(&hash).unwrap(), &bytes).unwrap();
         hash
+    }
+
+    #[test]
+    fn dreaming_json_reads_reject_oversized_input_before_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.json");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_DREAM_JSON_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = read_regular_json(&path, "dreaming fixture").unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
+    fn dream_sequence_sets_reject_semantically_unbounded_work() {
+        let sequence = |id: String, token_ids: Vec<i64>| DreamSequence { id, token_ids };
+        let too_many = DreamSequenceSet {
+            version: DREAM_SEQUENCE_SET_VERSION,
+            sequences: (0..=MAX_DREAM_SEQUENCES)
+                .map(|index| sequence(format!("sequence-{index}"), vec![1, 2]))
+                .collect(),
+        };
+        let error = too_many.validate().unwrap_err().to_string();
+        assert!(error.contains("sequence operational limit"), "{error}");
+
+        let too_long = DreamSequenceSet {
+            version: DREAM_SEQUENCE_SET_VERSION,
+            sequences: vec![sequence(
+                "too-long".into(),
+                vec![1; MAX_DREAM_SEQUENCE_TOKENS + 1],
+            )],
+        };
+        let error = too_long.validate().unwrap_err().to_string();
+        assert!(error.contains("token operational limit"), "{error}");
+
+        let invalid_token = DreamSequenceSet {
+            version: DREAM_SEQUENCE_SET_VERSION,
+            sequences: vec![sequence("invalid-token".into(), vec![1, i64::MAX])],
+        };
+        let error = invalid_token.validate().unwrap_err().to_string();
+        assert!(error.contains("outside the u32 range"), "{error}");
     }
 
     #[test]
@@ -2519,6 +3131,102 @@ mod tests {
         assert!(adapter.b.iter().any(|value| *value != 0.0));
         assert_eq!(data.base_logits, base_before);
         assert_eq!(data.features, features_before);
+    }
+
+    #[test]
+    fn device_lm_head_lora_uses_batched_tensor_updates() {
+        let rows = LmHeadRows {
+            rows: 2,
+            hidden: 2,
+            vocab: 3,
+            features: vec![0.5, -1.0, -0.25, 0.75],
+            base_logits: vec![0.1, -0.2, 0.3, -0.4, 0.2, 0.1],
+            targets: vec![1, 2],
+        };
+        let device = Device::ndarray().autodiff();
+        let rows = rows.into_device(&device).unwrap();
+        let adapter = HostLmHeadLora::new(2, 3, 2, 4, 17).unwrap();
+        let mut adapter = DeviceLmHeadLora::from_host(adapter, &device);
+        let before = adapter.loss_value(&rows).unwrap();
+        for _ in 0..4 {
+            adapter.train_step(&rows, 0.25).unwrap();
+        }
+        let after = adapter.loss_value(&rows).unwrap();
+        assert!(after < before, "before={before}, after={after}");
+        let adapter = adapter.into_host().unwrap();
+        assert!(adapter.b.iter().any(|value| *value != 0.0));
+
+        let features = vec![0.25, -0.75];
+        let base_logits = vec![0.1, -0.2, 0.3];
+        let expected = adapter.adapted(&features, &base_logits).unwrap().1;
+        let inference_device = Device::ndarray();
+        let policy = DeviceLmHeadPolicy::from_host(&adapter, &inference_device);
+        let actual = policy
+            .adapted(
+                Tensor::<2>::from_data(TensorData::new(features, [1, 2]), &inference_device),
+                Tensor::<2>::from_data(TensorData::new(base_logits, [1, 3]), &inference_device),
+            )
+            .unwrap()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn isolated_candidate_lora_supervises_only_the_dream_continuation() {
+        let seed = seed(vec![1, 2], 1);
+        let operations = BuiltinDreamOps::load(seed.config.clone(), seed.device.clone()).unwrap();
+        let mut artifact = operations
+            .read_candidate(
+                &manual_candidate(&operations, &seed.txn, vec![1, 2, 3, 4]).artifact_hash,
+            )
+            .unwrap();
+        artifact.wake_token_count = 3;
+
+        let rows = operations
+            .candidate_lm_head_rows(&seed.model, &artifact)
+            .unwrap();
+        assert_eq!(rows.rows, 1);
+        assert_eq!(rows.targets, vec![4]);
+        assert_eq!(rows.features.len(), tiny_config().hidden_size);
+        assert_eq!(rows.base_logits.len(), tiny_config().vocab_size);
+    }
+
+    #[test]
+    fn lora_geometry_overflow_fails_before_parameter_allocation() {
+        let oversized_rows = MAX_DREAM_LM_HEAD_DATA_BYTES / std::mem::size_of::<f32>() / 5 + 1;
+        let error = checked_lm_head_row_geometry(oversized_rows, 2, 3).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("dataset exceeds"),
+            "{error:#}"
+        );
+
+        let error = HostLmHeadLora::new(usize::MAX, 3, 2, 4, 17)
+            .err()
+            .expect("overflowing LoRA geometry must be rejected");
+        assert!(format!("{error:#}").contains("shape overflow"), "{error:#}");
+
+        let adapter = HostLmHeadLora::new(2, 3, 2, 4, 17).unwrap();
+        let malformed_rows = LmHeadRows {
+            rows: usize::MAX,
+            hidden: 2,
+            vocab: 3,
+            features: Vec::new(),
+            base_logits: Vec::new(),
+            targets: Vec::new(),
+        };
+        let error = adapter.loss(&malformed_rows).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("geometry overflows"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -2577,13 +3285,45 @@ mod tests {
     }
 
     #[test]
+    fn dream_manifest_reauthenticates_candidate_provenance() {
+        let seed = seed(vec![1, 2], 1);
+        let mut operations =
+            BuiltinDreamOps::load(seed.config.clone(), seed.device.clone()).unwrap();
+        let mut dream = manual_candidate(&operations, &seed.txn, vec![1, 2]);
+        let mut artifact = operations.read_candidate(&dream.artifact_hash).unwrap();
+        artifact.generation_seed ^= 1;
+        let bytes = canonical_json(&artifact).unwrap();
+        dream.artifact_hash = sha256_identity(&bytes);
+        publish_immutable(
+            &operations.candidate_path(&dream.artifact_hash).unwrap(),
+            &bytes,
+        )
+        .unwrap();
+        dream.id = format!(
+            "dream-{}-0-{}",
+            seed.txn.id,
+            short_hash(&dream.artifact_hash)
+        );
+        dream.diversity_key = mix64(artifact.generation_seed);
+        let manifest = publish_manifest(&operations, &seed.txn, vec![dream]);
+
+        let error = operations.load(&seed.txn, &manifest).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation seed is inconsistent"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn isolated_lm_head_lora_is_shape_bound_and_cannot_mutate_shared_model() {
         // Candidate and evaluator have the same input token but competing
         // targets. A real gradient step toward token 2 therefore worsens the
         // held-out token-3 objective and must be rejected by run_dreaming.
         let mut seed = seed(vec![1, 3], 8);
         let operations = BuiltinDreamOps::load(seed.config, seed.device.clone()).unwrap();
-        let candidate = manual_candidate(&operations, &seed.txn, "reject-me", vec![1, 2]);
+        let candidate = manual_candidate(&operations, &seed.txn, vec![1, 2]);
         seed.txn.dream_trial_rngs.push(DreamTrialRng {
             candidate_id: candidate.id.clone(),
             reservation: RngReservation {
@@ -2600,6 +3340,14 @@ mod tests {
         let trial = backend
             .isolated_lora_trial(&seed.txn, &candidate, 4, 8)
             .unwrap();
+        assert_eq!(
+            backend
+                .operations()
+                .evaluation_cache
+                .as_ref()
+                .map(|cache| cache.model_parameter_sha256.as_str()),
+            Some(before.as_str())
+        );
         assert!(
             trial.independent_task_improvement < 0.0,
             "competing-target trial unexpectedly improved by {}",
@@ -2625,7 +3373,7 @@ mod tests {
     fn accepted_lora_drives_a_content_addressed_idempotent_restem_receipt() {
         let mut seed = seed(vec![1, 2], 1);
         let operations = BuiltinDreamOps::load(seed.config.clone(), seed.device.clone()).unwrap();
-        let candidate = manual_candidate(&operations, &seed.txn, "accept-me", vec![1, 2]);
+        let candidate = manual_candidate(&operations, &seed.txn, vec![1, 2]);
         let candidate_artifact = operations.read_candidate(&candidate.artifact_hash).unwrap();
         let policy_training_rows = operations
             .dream_sequence_lm_head_rows(&seed.model, &candidate_artifact)
@@ -2757,7 +3505,7 @@ mod tests {
         let mut seed = seed(vec![1, 3], 1);
         let mut operations =
             BuiltinDreamOps::load(seed.config.clone(), seed.device.clone()).unwrap();
-        let candidate = manual_candidate(&operations, &seed.txn, "reject-me", vec![1, 2]);
+        let candidate = manual_candidate(&operations, &seed.txn, vec![1, 2]);
         seed.txn.generated_manifest =
             Some(publish_manifest(&operations, &seed.txn, vec![candidate]));
         seed.txn.dream_shared_checkpoint_hash = Some(model_parameter_hash(&seed.model).unwrap());
@@ -2804,8 +3552,7 @@ mod tests {
         next_txn.trigger_clock += 1;
         next_txn.dream_generation_rng.as_mut().unwrap().start += 100;
         next_txn.dream_shared_checkpoint_hash = Some(model_parameter_hash(&seed.model).unwrap());
-        let next_candidate =
-            manual_candidate(&next_operations, &next_txn, "reject-again", vec![1, 2]);
+        let next_candidate = manual_candidate(&next_operations, &next_txn, vec![1, 2]);
         next_txn.generated_manifest = Some(publish_manifest(
             &next_operations,
             &next_txn,
@@ -2868,10 +3615,50 @@ mod tests {
                 .to_string()
                 .contains("geometry")
         );
+        for (invalid, expected) in [
+            (
+                BuiltinDreamingRuntimeConfig {
+                    max_new_tokens: BuiltinDreamingRuntimeConfig::MAX_NEW_TOKENS + 1,
+                    ..seed.config.clone()
+                },
+                "max_new_tokens",
+            ),
+            (
+                BuiltinDreamingRuntimeConfig {
+                    gradient_dimensions: BuiltinDreamingRuntimeConfig::MAX_GRADIENT_DIMENSIONS + 1,
+                    ..seed.config.clone()
+                },
+                "gradient dimensions",
+            ),
+            (
+                BuiltinDreamingRuntimeConfig {
+                    lora_steps: BuiltinDreamingRuntimeConfig::MAX_LORA_STEPS + 1,
+                    ..seed.config.clone()
+                },
+                "LoRA steps",
+            ),
+            (
+                BuiltinDreamingRuntimeConfig {
+                    generation_policy_rank: DreamingConfig::MAX_LORA_RANK + 1,
+                    ..seed.config.clone()
+                },
+                "LoRA rank",
+            ),
+            (
+                BuiltinDreamingRuntimeConfig {
+                    generation_policy_alpha: DreamingConfig::MAX_LORA_ALPHA + 1,
+                    ..seed.config.clone()
+                },
+                "LoRA alpha",
+            ),
+        ] {
+            let error = invalid.validate().unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
 
         let mut operations =
             BuiltinDreamOps::load(seed.config.clone(), seed.device.clone()).unwrap();
-        let candidate = manual_candidate(&operations, &seed.txn, "reject-me", vec![1, 2]);
+        let candidate = manual_candidate(&operations, &seed.txn, vec![1, 2]);
         seed.txn.generated_manifest =
             Some(publish_manifest(&operations, &seed.txn, vec![candidate]));
         seed.txn.dream_shared_checkpoint_hash = Some(model_parameter_hash(&seed.model).unwrap());
