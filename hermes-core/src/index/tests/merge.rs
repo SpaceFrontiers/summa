@@ -595,6 +595,11 @@ async fn test_large_scale_merge_correctness() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_auto_merge_triggered() {
     use crate::directories::MmapDirectory;
+
+    /// Each commit flushes at least one segment, so this is a deterministic
+    /// lower bound on how many segments the merge policy had to work with.
+    const COMMITS: usize = 12;
+
     let tmp_dir = tempfile::tempdir().unwrap();
     let dir = MmapDirectory::new(tmp_dir.path());
 
@@ -615,8 +620,8 @@ async fn test_auto_merge_triggered() {
         .await
         .unwrap();
 
-    // Create 12 segments with ~50 docs each (4x the aggressive threshold of 3)
-    for batch in 0..12 {
+    // Create COMMITS segments with ~50 docs each (4x the aggressive threshold of 3)
+    for batch in 0..COMMITS {
         for i in 0..50 {
             let mut doc = Document::new();
             doc.add_text(title, format!("document_{} batch_{} alpha bravo", i, batch));
@@ -632,27 +637,39 @@ async fn test_auto_merge_triggered() {
         writer.commit().await.unwrap();
     }
 
-    let pre_merge = writer.segment_manager.get_segment_ids().await.len();
-
+    // Deliberately do not sample a live segment count as the baseline. Auto-merge
+    // runs in the background during the commit loop above, so a count taken here
+    // may already be collapsed; comparing against it makes the assertion fail
+    // precisely when auto-merge worked well. `COMMITS` is the race-free baseline.
+    //
     // wait_for_merging_thread waits for the single in-flight merge. After it completes,
     // re-evaluate since segments accumulated while the merge was running.
     writer.wait_for_merging_thread().await;
     writer.maybe_merge().await;
     writer.wait_for_merging_thread().await;
 
-    // After commit + auto-merge, segment count should be reduced
     let index = Index::open(dir.clone(), config.clone()).await.unwrap();
     let segment_count = index.segment_readers().await.unwrap().len();
-    eprintln!(
-        "Segments: {} before merge, {} after auto-merge",
-        pre_merge, segment_count
+    eprintln!("Segments: {COMMITS} committed, {segment_count} after auto-merge");
+    assert!(
+        segment_count >= 1,
+        "auto-merge must leave the index readable, got {segment_count} segments"
     );
     assert!(
-        segment_count < pre_merge,
-        "Expected auto-merge to reduce segments from {}, got {}",
-        pre_merge,
-        segment_count
+        segment_count < COMMITS,
+        "expected auto-merge to collapse the {COMMITS} committed segments without force_merge, got {segment_count}"
     );
+
+    // Merging must be lossless: every document from every batch survives.
+    for batch in 0..COMMITS {
+        let query = format!("batch_{batch}");
+        let results = index.query(&query, 100).await.unwrap();
+        assert_eq!(
+            results.hits.len(),
+            50,
+            "batch {batch} lost documents during auto-merge"
+        );
+    }
 }
 
 /// Regression test: commit with dense vector fields + aggressive merge policy.
