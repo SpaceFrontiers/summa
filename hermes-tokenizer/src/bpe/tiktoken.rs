@@ -290,8 +290,10 @@ impl Tokenizer {
     /// Shared construction tail ([`Self::new`], [`Self::new_ranked`] and
     /// [`Self::from_ranks`]): derive `vocab_inv` and the pair-rank table
     /// from the finished merges/vocab, seed the pretoken cache, and
-    /// assemble the tokenizer with default pipeline settings (GPT-2
-    /// pretokenization, no added tokens, no NFC).
+    /// assemble the tokenizer with placeholder pipeline settings (GPT-2
+    /// pretokenization, no added tokens, no NFC) that every loader must
+    /// overwrite for its actual scheme. A raw rank table does not carry
+    /// its pretokenizer or special-token definitions.
     fn from_tables(
         merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         ranked_merges: Option<RankedMerges>,
@@ -832,33 +834,42 @@ impl Tokenizer {
     ///
     /// [`WorkerPool`]: crate::batch::WorkerPool
     pub fn add_special_token(&mut self, content: Vec<u8>, id: TokenId) {
-        let idx = id.0 as usize;
-        // Loader-phase mutation of the shared model tables: `make_mut`
-        // copies only when a fork holds the tables too (never during
-        // loading, where this is called).
-        let vocab = Arc::make_mut(&mut self.vocab);
-        if idx >= vocab.len() {
-            vocab.resize(idx + 1, Arc::from(Vec::new().as_slice()));
-        }
-        if vocab[idx].is_empty() {
-            vocab[idx] = content.clone().into();
-            // If `content` duplicates an already-present vocab byte
-            // string, `vocab_inv` switches to the new ID (unconditional
-            // overwrite). The short-cache overwrite that keeps a matching
-            // pretoken resolving to `vocab_inv`'s answer happens in
-            // `set_added_tokens` below, which re-derives every added-token
-            // cache overwrite from the updated `vocab_inv` — the same
-            // computation a fork's reseed + re-apply performs (see
-            // [`Self::fork_sized`]), so parent and forked workers agree.
-            Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
-        }
+        self.add_special_tokens([(content, id)]);
+    }
+
+    /// Register a batch of special added tokens. All vocabulary entries are
+    /// written first, then [`Self::set_added_tokens`] rebuilds the matcher
+    /// and cache overwrites once instead of once per token.
+    pub fn add_special_tokens(&mut self, tokens: impl IntoIterator<Item = (Vec<u8>, TokenId)>) {
         let mut added = self.added_tokens.clone();
-        added.push(AddedTokenDef {
-            content: content.into(),
-            id,
-            lstrip: false,
-            rstrip: false,
-        });
+        for (content, id) in tokens {
+            let idx = id.0 as usize;
+            // Loader-phase mutation of the shared model tables: `make_mut`
+            // copies only when a fork holds the tables too (never during
+            // loading, where this is called).
+            let vocab = Arc::make_mut(&mut self.vocab);
+            if idx >= vocab.len() {
+                vocab.resize(idx + 1, Arc::from(Vec::new().as_slice()));
+            }
+            if vocab[idx].is_empty() {
+                vocab[idx] = content.clone().into();
+                // If `content` duplicates an already-present vocab byte
+                // string, `vocab_inv` switches to the new ID (unconditional
+                // overwrite). The short-cache overwrite that keeps a matching
+                // pretoken resolving to `vocab_inv`'s answer happens in
+                // `set_added_tokens` below, which re-derives every added-token
+                // cache overwrite from the updated `vocab_inv` — the same
+                // computation a fork's reseed + re-apply performs (see
+                // [`Self::fork_sized`]), so parent and forked workers agree.
+                Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
+            }
+            added.push(AddedTokenDef {
+                content: content.into(),
+                id,
+                lstrip: false,
+                rstrip: false,
+            });
+        }
         self.set_added_tokens(added);
     }
 
@@ -1405,5 +1416,43 @@ impl Debug for Tokenizer {
             .field("pair_ranks", &self.pair_ranks.is_some())
             .field("byte_remapping", &self.byte_remapping.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_special_tokens_extend_vocab_and_match_atomically() {
+        let vocab = (0..=u8::MAX).map(|byte| vec![byte]).collect();
+        let mut tokenizer = Tokenizer::new(HashMap::default(), vocab, None);
+
+        tokenizer.add_special_tokens([
+            (b"<first>".to_vec(), TokenId(300)),
+            (b"<second>".to_vec(), TokenId(301)),
+        ]);
+        tokenizer.add_special_token(b"<third>".to_vec(), TokenId(302));
+
+        let mut ids = Vec::new();
+        tokenizer.encode_with_added_tokens_flat(b"x<first>y<second>z<third>", &mut ids);
+        assert_eq!(
+            ids,
+            vec![
+                u32::from(b'x'),
+                300,
+                u32::from(b'y'),
+                301,
+                u32::from(b'z'),
+                302,
+            ]
+        );
+        assert_eq!(tokenizer.vocab_size(), 303);
+        assert_eq!(
+            tokenizer
+                .decode(&[TokenId(300), TokenId(301), TokenId(302)])
+                .collect::<Vec<_>>(),
+            b"<first><second><third>"
+        );
     }
 }

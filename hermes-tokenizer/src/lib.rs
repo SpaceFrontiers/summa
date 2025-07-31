@@ -1,7 +1,7 @@
 //! Stable-Rust, byte-level BPE tokenization for Hermes.
 //!
 //! The optimized merge engine and pretokenizers are derived from GigaToken
-//! 0.9.0. The public wrapper is intentionally narrower: local or in-memory
+//! 0.10.0. The public wrapper is intentionally narrower: local or in-memory
 //! Hugging Face `tokenizer.json` artifacts, persistent per-thread caches,
 //! deterministic batch order, and the vocabulary operations required by
 //! Hermes training, inference, and visualization.
@@ -23,7 +23,7 @@ use crate::bpe::Tokenizer as BpeEngine;
 use crate::token::TokenId;
 
 /// GigaToken revision from which the optimized byte-level core was extracted.
-pub const UPSTREAM_GIGATOKEN_REVISION: &str = "542367a3efed134883fb4f1140b49c04e6fad3a3";
+pub const UPSTREAM_GIGATOKEN_REVISION: &str = "34a1599f0c0ae7d7cd0d1c530e6522320158b360";
 
 /// Thread-safe tokenizer with persistent single-document and Rayon-worker
 /// caches. Token IDs remain those of the source `tokenizer.json`.

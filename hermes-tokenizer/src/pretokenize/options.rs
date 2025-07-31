@@ -66,10 +66,24 @@ impl PretokenizerType {
         }
     }
 
+    /// Canonical names for every scheme, in variant order. Loader error
+    /// messages should derive their accepted values from this list.
+    pub const NAMES: [&'static str; 9] = [
+        "gpt2",
+        "gpt4",
+        "qwen2",
+        "qwen35",
+        "olmo3",
+        "deepseek_v3",
+        "o200k",
+        "nemotron",
+        "kimi",
+    ];
+
     /// The scheme named by a lowercase identifier, as used by loaders whose
     /// source format carries no split regex (e.g. tiktoken-rank repos, whose
     /// regex lives in remote code) and the Python bindings. Accepts each
-    /// variant's canonical name plus the common tiktoken aliases.
+    /// canonical name from [`Self::NAMES`] plus the common tiktoken aliases.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "gpt2" | "r50k" => PretokenizerType::GPT2,

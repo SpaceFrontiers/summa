@@ -193,6 +193,9 @@ fn current_checkpoint_tokenizer_matches_hugging_face_when_available() {
         "NFC café; NFD cafe\u{301}; emoji 🦀🚀".to_owned(),
         " \t  whitespace\n\n                        end".to_owned(),
         "literal <|endoftext|> and <|padding|>".to_owned(),
+        ".data (self _name".to_owned(),
+        "1234 123456789 CamelCaseWord".to_owned(),
+        "xé\u{301}y  \n  end".to_owned(),
     ];
     let alphabet = [
         'a', 'Z', '0', ' ', '\n', '\t', '.', ',', 'é', '\u{301}', 'Ж', '中', 'ع', '🦀',
