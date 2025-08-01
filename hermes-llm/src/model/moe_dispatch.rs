@@ -239,6 +239,7 @@ mod gpu {
 
     use super::MoeDispatchBackend;
     use crate::model::cube_tensor::{empty_like, empty_like_dtype, into_contiguous};
+    use crate::model::launch::linear_cube_count;
 
     const THREADS: u32 = 256;
 
@@ -341,38 +342,44 @@ mod gpu {
         hidden: u32,
         top_k: u32,
     ) {
-        let route = CUBE_POS_X as usize;
-        let lane = UNIT_POS_X as usize;
-        let hidden = hidden as usize;
-        let sorted = inverse[route] as usize;
-        let token = route / top_k as usize;
-        let mut partial = f32::cast_from(0.0f32);
-        let mut column = lane;
-        while column < hidden {
-            partial += f32::cast_from(grad[token * hidden + column])
-                * f32::cast_from(routed[sorted * hidden + column]);
-            column += THREADS as usize;
-        }
-        let mut reduction = Shared::new_slice(THREADS as usize);
-        reduction[lane] = partial;
-        sync_cube();
-        let mut distance = 128u32;
-        while distance > 0 {
-            let current = reduction[lane];
-            let neighbor = if lane < distance as usize {
-                reduction[lane + distance as usize]
-            } else {
-                0.0f32
-            };
-            sync_cube();
-            if lane < distance as usize {
-                reduction[lane] = current + neighbor;
+        // One cube per route; the count may be factored into (x, y), so the
+        // route index is the linearized cube position, and excess cubes from
+        // the factoring overshoot exit early (uniform per cube, so the
+        // barriers below stay in sync).
+        let route = CUBE_POS;
+        if route < grad_weights.len() {
+            let lane = UNIT_POS_X as usize;
+            let hidden = hidden as usize;
+            let sorted = inverse[route] as usize;
+            let token = route / top_k as usize;
+            let mut partial = f32::cast_from(0.0f32);
+            let mut column = lane;
+            while column < hidden {
+                partial += f32::cast_from(grad[token * hidden + column])
+                    * f32::cast_from(routed[sorted * hidden + column]);
+                column += THREADS as usize;
             }
+            let mut reduction = Shared::new_slice(THREADS as usize);
+            reduction[lane] = partial;
             sync_cube();
-            distance /= 2;
-        }
-        if lane == 0 {
-            grad_weights[route] = reduction[0];
+            let mut distance = 128u32;
+            while distance > 0 {
+                let current = reduction[lane];
+                let neighbor = if lane < distance as usize {
+                    reduction[lane + distance as usize]
+                } else {
+                    0.0f32
+                };
+                sync_cube();
+                if lane < distance as usize {
+                    reduction[lane] = current + neighbor;
+                }
+                sync_cube();
+                distance /= 2;
+            }
+            if lane == 0 {
+                grad_weights[route] = reduction[0];
+            }
         }
     }
 
@@ -391,7 +398,7 @@ mod gpu {
         let client = input.client.clone();
         route_gather_forward::launch::<F, R>(
             &client,
-            CubeCount::Static((elements as u32).div_ceil(THREADS), 1, 1),
+            linear_cube_count((elements as u32).div_ceil(THREADS)),
             CubeDim::new_1d(THREADS),
             input.into_tensor_arg(),
             order.into_tensor_arg(),
@@ -418,7 +425,7 @@ mod gpu {
         let client = grad.client.clone();
         route_gather_backward::launch::<F, R>(
             &client,
-            CubeCount::Static((elements as u32).div_ceil(THREADS), 1, 1),
+            linear_cube_count((elements as u32).div_ceil(THREADS)),
             CubeDim::new_1d(THREADS),
             grad.into_tensor_arg(),
             inverse.into_tensor_arg(),
@@ -449,7 +456,7 @@ mod gpu {
         let client = routed.client.clone();
         route_combine_forward::launch::<F, R>(
             &client,
-            CubeCount::Static((elements as u32).div_ceil(THREADS), 1, 1),
+            linear_cube_count((elements as u32).div_ceil(THREADS)),
             CubeDim::new_1d(THREADS),
             routed.into_tensor_arg(),
             weights.into_tensor_arg(),
@@ -485,7 +492,7 @@ mod gpu {
         let client = routed.client.clone();
         route_combine_routed_backward::launch::<F, R>(
             &client,
-            CubeCount::Static((routed_elements as u32).div_ceil(THREADS), 1, 1),
+            linear_cube_count((routed_elements as u32).div_ceil(THREADS)),
             CubeDim::new_1d(THREADS),
             weights.clone().into_tensor_arg(),
             inverse.clone().into_tensor_arg(),
@@ -497,7 +504,7 @@ mod gpu {
         );
         route_combine_weight_backward::launch::<F, R>(
             &client,
-            CubeCount::Static(routes as u32, 1, 1),
+            linear_cube_count(routes as u32),
             CubeDim::new_1d(THREADS),
             routed.into_tensor_arg(),
             inverse.into_tensor_arg(),

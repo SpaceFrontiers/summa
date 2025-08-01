@@ -19,6 +19,7 @@ use half::bf16;
 
 use super::cube_tensor::{empty_like, into_contiguous};
 use super::fused_attention::AttentionBackend;
+use super::launch::linear_cube_count;
 
 const MAX_HEAD_DIM: usize = 128;
 const ELEMENTWISE_THREADS: u32 = 256;
@@ -260,7 +261,7 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         let total = (rows * cols) as u32;
         attention_backward_probabilities_kernel::launch::<CudaRuntime>(
             &client,
-            CubeCount::Static(total.div_ceil(SOFTMAX_THREADS), 1, 1),
+            linear_cube_count(total.div_ceil(SOFTMAX_THREADS)),
             CubeDim::new_1d(SOFTMAX_THREADS),
             scores.into_tensor_arg(),
             log_sum_exp.into_tensor_arg(),
@@ -286,11 +287,9 @@ impl AttentionBackend for CubeBackend<CudaRuntime> {
         let [_, _, rows, sequence] = scores.shape().dims();
         assert!(row_offset + rows <= sequence);
         let total = scores.meta.num_elements();
-        let cube_count = CubeCount::Static(
+        let cube_count = linear_cube_count(
             u32::try_from(total.div_ceil(ELEMENTWISE_THREADS as usize))
-                .expect("attention score tensor exceeds the CUDA launch grid"),
-            1,
-            1,
+                .expect("attention score tensor exceeds a u32 workgroup count"),
         );
         let client = scores.client.clone();
         if scores.can_mut() && scores.is_nonoverlapping() {

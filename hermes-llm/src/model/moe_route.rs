@@ -170,6 +170,10 @@ mod gpu {
                 routes as u32,
                 expert_count as u32,
             );
+            // `stable_route_pack` indexes cubes by CUBE_POS_X, so this 1-D
+            // count must stay within the 65,535 workgroups-per-dimension
+            // dispatch limit. It always does: the assertion above bounds
+            // `expert_count` by ROUTE_THREADS (256).
             stable_route_pack::launch::<R>(
                 &client,
                 CubeCount::Static(expert_count as u32, 1, 1),

@@ -102,6 +102,7 @@ mod gpu {
 
     use super::FusedSwiGluBackend;
     use crate::model::cube_tensor::{empty_like, into_contiguous};
+    use crate::model::launch::linear_cube_count;
 
     const THREADS: u32 = 256;
 
@@ -164,7 +165,7 @@ mod gpu {
         let client = input.client.clone();
         swiglu_forward::launch::<F, R>(
             &client,
-            CubeCount::Static((elements as u32).div_ceil(THREADS), 1, 1),
+            linear_cube_count((elements as u32).div_ceil(THREADS)),
             CubeDim::new_1d(THREADS),
             input.into_tensor_arg(),
             output.clone().into_tensor_arg(),
@@ -192,7 +193,7 @@ mod gpu {
         let client = input.client.clone();
         swiglu_backward::launch::<F, R>(
             &client,
-            CubeCount::Static((elements as u32).div_ceil(THREADS), 1, 1),
+            linear_cube_count((elements as u32).div_ceil(THREADS)),
             CubeDim::new_1d(THREADS),
             input.into_tensor_arg(),
             grad.into_tensor_arg(),

@@ -95,6 +95,51 @@ successfully; its service supervisor can invoke the resume form. The runtime
 will not silently change worker identity, metric history, or workflow
 configuration.
 
+## Held-out evaluation
+
+`hermes-train eval` scores an existing checkpoint on held-out shards with a
+forward-only pass. It reuses the trainer's objective forward pass, batching, and
+JSONL/`.jsonl.zst` streaming, so its numbers are directly comparable with
+training-time metrics. It constructs no optimizer, records no autodiff tape,
+writes no token cache, and touches no `TrainingState` or metric journal, so a
+live run stays exactly resumable while it is evaluated. The evaluation device is
+never `.autodiff()` — dropout is therefore the identity — and the model is never
+`prepare_inference()`d, because mixed-precision decode weights would change the
+reported loss.
+
+```bash
+hermes-train eval \
+  --config model.mal --tokenizer tokenizer.json \
+  --checkpoint out/generations/sha256-.../weights.safetensors \
+  --data holdout-a.jsonl.zst --data holdout-b.jsonl.zst \
+  --objective causal_lm --sequence-length 1024 --batch-size 8 \
+  --max-batches 200 --output eval-causal.json
+```
+
+`--objective causal_lm` reports the token-weighted mean cross-entropy over every
+supervised token plus its perplexity; per-batch means are never averaged
+unweighted, which would bias the result toward short batches.
+`--objective contrastive_retrieval` reports in-batch top-1 accuracy from the same
+similarity matrix the training loss uses, plus MRR and recall@`--recall-k`, with
+per-batch candidate counts. Use `--retrieval-layer` and `--temperature` to match
+the retrieval training phase; query and document prefixes come from the built-in
+task defaults. In-batch negatives make retrieval accuracy depend on the
+candidate-pool size, so a trailing batch that cannot be filled is dropped and
+counted in `dropped_samples`; token-weighted language losses score it exactly.
+
+`--shuffle-buffer` (default `0`, source order) is the only setting `--seed`
+affects, and the JSON report deliberately excludes timing, so identical inputs
+produce a byte-identical report. Config, tokenizer, checkpoint, and every shard
+are recorded with their digests: the shard identity is the same authenticated
+value the trainer's run signature consumes. A checkpoint/model mismatch, an
+out-of-range retrieval layer, a sequence length past `max_seq_len`, and data too
+small for one batch all fail loudly. Adjusted conditions — a config vocabulary
+overridden by the tokenizer, a `--seed` that cannot matter, dropped trailing
+samples — are written to stderr and to the report's `warnings` array, because
+the CLI's default log filter would otherwise hide them. `--output` refuses
+trainer artifact names such as `current.json` or `weights.safetensors`, so a
+mistyped path cannot overwrite a live run.
+
 ## Configured corpus discovery
 
 The corpus pipeline accepts replaceable search, record-materialization,

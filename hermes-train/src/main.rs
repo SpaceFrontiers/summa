@@ -68,6 +68,7 @@ use sha2::{Digest, Sha256};
 
 mod checkpoint;
 mod data;
+mod eval;
 mod muon;
 mod trainer;
 mod wake;
@@ -106,6 +107,8 @@ struct Cli {
 enum Command {
     /// Pretrain or fine-tune a MAL-defined language model.
     Train(TrainArgs),
+    /// Score a checkpoint on held-out data with a forward-only pass.
+    Eval(EvalArgs),
     /// Validate and resolve a strict WorkflowV2 file.
     ValidateWorkflow(ValidateWorkflowArgs),
     /// Verify an exact-resume checkpoint with the trainer's strict schema.
@@ -194,6 +197,61 @@ struct TrainArgs {
     /// creating output, checkpoint, metric, token-cache, or sleep-runtime state.
     #[arg(long)]
     print_run_signature: bool,
+}
+
+/// Held-out objectives supported by the forward-only `eval` command. These are
+/// the objectives the wake trainer can optimize end to end, so their reported
+/// numbers are directly comparable with training-time metrics.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EvalObjective {
+    #[value(name = "causal_lm")]
+    CausalLm,
+    #[value(name = "contrastive_retrieval")]
+    ContrastiveRetrieval,
+}
+
+#[derive(clap::Args)]
+struct EvalArgs {
+    /// MAL source or exported JSON model configuration.
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(short = 't', long)]
+    tokenizer: PathBuf,
+    /// Safetensors weights to score. Loaded strictly against --config.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// Held-out shard, repeatable. Structured objectives require .jsonl/.jsonl.zst.
+    #[arg(long = "data", required = true)]
+    data: Vec<PathBuf>,
+    #[arg(long, value_enum)]
+    objective: EvalObjective,
+    #[arg(long)]
+    sequence_length: usize,
+    #[arg(long)]
+    batch_size: usize,
+    /// Stop after this many complete batches. Unset evaluates every shard.
+    #[arg(long)]
+    max_batches: Option<usize>,
+    /// Reservoir-shuffle capacity. Zero reads shards in source order, which is
+    /// the reproducible default; --seed only matters above zero.
+    #[arg(long, default_value_t = 0)]
+    shuffle_buffer: usize,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Rank cut-off for the reported retrieval recall.
+    #[arg(long, default_value_t = 10)]
+    recall_k: usize,
+    /// One-based retrieval read-out layer; omitted reads the final layer. Must
+    /// match the layer the retrieval training phase used.
+    #[arg(long)]
+    retrieval_layer: Option<usize>,
+    /// Softmax temperature for the contrastive loss. Omitted uses the task
+    /// default, exactly as an unset workflow objective would.
+    #[arg(long)]
+    temperature: Option<f64>,
+    /// JSON report path. The human-readable summary is always printed.
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -1182,21 +1240,23 @@ struct ObjectiveForward {
     router_loss: Option<Tensor<1>>,
     stats: BatchStats,
     retrieval_correct: Option<Tensor<1>>,
-    /// Student outputs used by QAT distillation. Language objectives store
-    /// selected vocabulary logits; retrieval stores the unscaled similarity
-    /// matrix. Absent outside a teacher-distillation phase.
-    distillation_logits: Option<Tensor<2>>,
+    /// Model outputs retained from the same forward pass when the caller asks
+    /// for them. Language objectives store selected vocabulary logits;
+    /// retrieval stores the unscaled similarity matrix. QAT distillation
+    /// consumes them as student outputs and forward-only evaluation consumes
+    /// the retrieval matrix for rank metrics. Absent otherwise.
+    captured_logits: Option<Tensor<2>>,
 }
 
 fn objective_loss(
     model: &Transformer,
     batch: TrainingBatch,
     objective: &TaskConfig,
-    capture_distillation_logits: bool,
+    capture_logits: bool,
 ) -> Result<ObjectiveForward> {
     let stats = batch.stats();
     let mut retrieval_correct = None;
-    let (loss, router_loss, distillation_logits) = match batch {
+    let (loss, router_loss, captured_logits) = match batch {
         TrainingBatch::Language(batch) => {
             let data::LanguageBatch {
                 input_ids,
@@ -1210,7 +1270,7 @@ fn objective_loss(
                         loss_positions.is_none(),
                         "causal_lm batch unexpectedly contains a target mask"
                     );
-                    if capture_distillation_logits {
+                    if capture_logits {
                         let (loss, router_loss, logits) =
                             model.forward_loss_and_logits_with_router(input_ids, targets);
                         (loss, router_loss, Some(logits))
@@ -1226,7 +1286,7 @@ fn objective_loss(
                 | TaskConfig::QaReasoning { .. } => {
                     let positions = loss_positions
                         .ok_or_else(|| anyhow::anyhow!("structured batch has no target mask"))?;
-                    if capture_distillation_logits {
+                    if capture_logits {
                         let (loss, router_loss, logits) = model
                             .forward_masked_loss_and_logits_with_router(
                                 input_ids, targets, positions,
@@ -1270,7 +1330,7 @@ fn objective_loss(
             let (documents, document_router_loss) =
                 model.forward_embeddings_with_router(document_ids, document_end_positions, layer);
             let similarities = queries.matmul(documents.transpose());
-            let distillation_logits = capture_distillation_logits.then(|| similarities.clone());
+            let captured_logits = capture_logits.then(|| similarities.clone());
             let logits = similarities.div_scalar(temperature);
             retrieval_correct = Some(
                 logits
@@ -1286,7 +1346,7 @@ fn objective_loss(
                 .init(&labels.device())
                 .forward(logits, labels);
             let router_loss = sum_optional_tensors(query_router_loss, document_router_loss);
-            (loss, router_loss, distillation_logits)
+            (loss, router_loss, captured_logits)
         }
     };
     Ok(ObjectiveForward {
@@ -1294,7 +1354,7 @@ fn objective_loss(
         router_loss,
         stats,
         retrieval_correct,
-        distillation_logits,
+        captured_logits,
     })
 }
 
@@ -1759,6 +1819,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().command {
         Command::Train(args) => trainer::train(args),
+        Command::Eval(args) => eval::evaluate(args),
         Command::ValidateWorkflow(args) => validate_workflow_command(args),
         Command::VerifyCheckpoint(args) => verify_checkpoint_command(args),
         Command::PrepareCorpus(args) => prepare_corpus_command(args),
@@ -2791,11 +2852,11 @@ mod tests {
         let ObjectiveForward {
             loss: task_loss,
             router_loss,
-            distillation_logits,
+            captured_logits,
             ..
         } = objective_loss(&student, batch, &objective, true).unwrap();
         assert!(router_loss.is_none());
-        let student_logits = distillation_logits.unwrap();
+        let student_logits = captured_logits.unwrap();
         let expected_student_logits =
             student.forward_selected_logits(input_ids.clone(), positions.clone());
         let actual_logits = student_logits
@@ -2866,11 +2927,11 @@ mod tests {
         let ObjectiveForward {
             loss: task_loss,
             router_loss,
-            distillation_logits,
+            captured_logits,
             ..
         } = objective_loss(&student, batch, &objective, true).unwrap();
         assert!(router_loss.is_none());
-        let student_logits = distillation_logits.unwrap();
+        let student_logits = captured_logits.unwrap();
 
         let query_ids = Tensor::<2, Int>::from_data([[1, 2, 0, 0]], &device);
         let query_positions = Tensor::<1, Int>::from_data([1], &device);

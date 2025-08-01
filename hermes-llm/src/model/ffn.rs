@@ -899,7 +899,20 @@ pub(super) fn host_route_plan(
         .expect("MoE routes must be readable");
     let mut assignments = vec![Vec::<i64>::new(); expert_count];
     for (position, expert) in route_experts.into_iter().enumerate() {
-        assignments[expert as usize].push(position as i64);
+        // A raw `expert as usize` index would surface a corrupt readback as a
+        // bare "index out of bounds" far from the objective cause.
+        let slot = usize::try_from(expert)
+            .ok()
+            .filter(|slot| *slot < expert_count)
+            .unwrap_or_else(|| {
+                panic!(
+                    "MoE route readback returned expert index {expert} at route {position}, \
+                     outside the valid range 0..{expert_count}: the router produced invalid \
+                     indices or the device readback is corrupt (e.g. a previously failed \
+                     kernel dispatch on this queue)"
+                )
+            });
+        assignments[slot].push(position as i64);
     }
     let counts = assignments.iter().map(Vec::len).collect::<Vec<_>>();
     let route_order = assignments.iter().flatten().copied().collect::<Vec<_>>();
@@ -1013,6 +1026,18 @@ mod tests {
     #[test]
     fn gpu_sparse_dispatch_matches_masked_reference() {
         assert_sparse_dispatch_matches_masked_reference(crate::model::default_device());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MoE route readback returned expert index 7 at route 1, outside the valid \
+                    range 0..4"
+    )]
+    fn host_route_plan_names_corrupt_readback_instead_of_index_out_of_bounds() {
+        let device = Device::ndarray();
+        let indices =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![0_i64, 7, 1, 2], [2, 2]), &device);
+        host_route_plan(indices, 4, 4, &device);
     }
 
     #[test]

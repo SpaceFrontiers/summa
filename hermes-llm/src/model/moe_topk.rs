@@ -66,6 +66,7 @@ mod gpu {
 
     use super::MoeTop2Backend;
     use crate::model::cube_tensor::{empty_like_dtype, into_contiguous};
+    use crate::model::launch::linear_cube_count;
 
     const THREADS: u32 = 256;
 
@@ -113,7 +114,7 @@ mod gpu {
                 ($float:ty) => {
                     top2_indices_kernel::launch::<$float, R>(
                         &client,
-                        CubeCount::Static((tokens as u32).div_ceil(THREADS), 1, 1),
+                        linear_cube_count((tokens as u32).div_ceil(THREADS)),
                         CubeDim::new_1d(THREADS),
                         logits.into_tensor_arg(),
                         output.clone().into_tensor_arg(),

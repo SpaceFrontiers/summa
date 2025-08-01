@@ -16,6 +16,7 @@ use burn::backend::ops::FloatTensorOps;
 
 use super::{FloatTensor, IntTensor, LinearCrossEntropyBackend};
 use crate::model::cube_tensor::{empty_like, empty_like_dtype, into_contiguous};
+use crate::model::launch::linear_cube_count;
 
 const CE_THREADS: u32 = 256;
 
@@ -37,72 +38,78 @@ fn ce_row_statistics(
 ) {
     let stored_vocab = stored_vocab as usize;
     let logical_vocab = logical_vocab as usize;
-    let row = CUBE_POS_X as usize;
-    let lane = UNIT_POS_X as usize;
-    let threads = CE_THREADS as usize;
-    let base = row * stored_vocab;
-    let target = usize::cast_from(targets[row_offset as usize + row]);
+    // One cube per row; the count may be factored into (x, y), so the row
+    // index is the linearized cube position, and excess cubes from the
+    // factoring overshoot exit early (uniform per cube, so the barriers
+    // below stay in sync). `stats` holds exactly three values per row.
+    let row = CUBE_POS;
+    if row < stats.len() / 3 {
+        let lane = UNIT_POS_X as usize;
+        let threads = CE_THREADS as usize;
+        let base = row * stored_vocab;
+        let target = usize::cast_from(targets[row_offset as usize + row]);
 
-    let mut running_max = f32::cast_from(f32::NEG_INFINITY);
-    let mut running_sum = 0.0f32;
-    let mut target_logit = 0.0f32;
-    let iterations = (logical_vocab + threads - 1) / threads;
-    for i in 0..iterations {
-        let col = lane + i * threads;
-        if col < logical_vocab {
-            let mut x = logits[base + col];
-            if use_bias {
-                x += bias[col];
-            }
-            if x > running_max {
-                running_sum = running_sum * (running_max - x).exp() + 1.0;
-                running_max = x;
-            } else {
-                running_sum += (x - running_max).exp();
-            }
-            if col == target {
-                target_logit = x;
+        let mut running_max = f32::cast_from(f32::NEG_INFINITY);
+        let mut running_sum = 0.0f32;
+        let mut target_logit = 0.0f32;
+        let iterations = (logical_vocab + threads - 1) / threads;
+        for i in 0..iterations {
+            let col = lane + i * threads;
+            if col < logical_vocab {
+                let mut x = logits[base + col];
+                if use_bias {
+                    x += bias[col];
+                }
+                if x > running_max {
+                    running_sum = running_sum * (running_max - x).exp() + 1.0;
+                    running_max = x;
+                } else {
+                    running_sum += (x - running_max).exp();
+                }
+                if col == target {
+                    target_logit = x;
+                }
             }
         }
-    }
 
-    let mut shared_max = Shared::new_slice(CE_THREADS as usize);
-    let mut shared_sum = Shared::new_slice(CE_THREADS as usize);
-    let mut shared_target = Shared::new_slice(CE_THREADS as usize);
-    shared_max[lane] = running_max;
-    shared_sum[lane] = running_sum;
-    shared_target[lane] = target_logit;
-    sync_cube();
-
-    #[unroll]
-    for level in 0..8 {
-        let stride = (CE_THREADS as usize) >> (level + 1);
-        if lane < stride {
-            let m_a = shared_max[lane];
-            let s_a = shared_sum[lane];
-            let m_b = shared_max[lane + stride];
-            let s_b = shared_sum[lane + stride];
-            let m = if m_a > m_b { m_a } else { m_b };
-            // Empty lanes carry (-inf, 0); guard the exp so they combine
-            // as exact zeros instead of NaN.
-            let mut s = 0.0f32;
-            if s_a > 0.0 {
-                s += s_a * (m_a - m).exp();
-            }
-            if s_b > 0.0 {
-                s += s_b * (m_b - m).exp();
-            }
-            shared_max[lane] = m;
-            shared_sum[lane] = s;
-            shared_target[lane] = shared_target[lane] + shared_target[lane + stride];
-        }
+        let mut shared_max = Shared::new_slice(CE_THREADS as usize);
+        let mut shared_sum = Shared::new_slice(CE_THREADS as usize);
+        let mut shared_target = Shared::new_slice(CE_THREADS as usize);
+        shared_max[lane] = running_max;
+        shared_sum[lane] = running_sum;
+        shared_target[lane] = target_logit;
         sync_cube();
-    }
 
-    if lane == 0 {
-        stats[row * 3] = shared_max[0];
-        stats[row * 3 + 1] = shared_sum[0];
-        stats[row * 3 + 2] = shared_target[0];
+        #[unroll]
+        for level in 0..8 {
+            let stride = (CE_THREADS as usize) >> (level + 1);
+            if lane < stride {
+                let m_a = shared_max[lane];
+                let s_a = shared_sum[lane];
+                let m_b = shared_max[lane + stride];
+                let s_b = shared_sum[lane + stride];
+                let m = if m_a > m_b { m_a } else { m_b };
+                // Empty lanes carry (-inf, 0); guard the exp so they combine
+                // as exact zeros instead of NaN.
+                let mut s = 0.0f32;
+                if s_a > 0.0 {
+                    s += s_a * (m_a - m).exp();
+                }
+                if s_b > 0.0 {
+                    s += s_b * (m_b - m).exp();
+                }
+                shared_max[lane] = m;
+                shared_sum[lane] = s;
+                shared_target[lane] = shared_target[lane] + shared_target[lane + stride];
+            }
+            sync_cube();
+        }
+
+        if lane == 0 {
+            stats[row * 3] = shared_max[0];
+            stats[row * 3 + 1] = shared_sum[0];
+            stats[row * 3 + 2] = shared_target[0];
+        }
     }
 }
 
@@ -162,7 +169,7 @@ fn launch_statistics<R: CubeRuntime>(
     let stats = empty_like(logits, Shape::new([rows, 3]));
     ce_row_statistics::launch::<R>(
         &logits.client.clone(),
-        CubeCount::Static(rows as u32, 1, 1),
+        linear_cube_count(rows as u32),
         CubeDim::new_1d(CE_THREADS),
         logits.clone().into_tensor_arg(),
         bias.clone().into_tensor_arg(),
@@ -195,7 +202,7 @@ fn launch_gradient<R: CubeRuntime>(
         ($float:ty) => {
             ce_row_gradient::launch::<$float, R>(
                 &logits.client.clone(),
-                CubeCount::Static(total.div_ceil(CE_THREADS), 1, 1),
+                linear_cube_count(total.div_ceil(CE_THREADS)),
                 CubeDim::new_1d(CE_THREADS),
                 logits.clone().into_tensor_arg(),
                 bias.clone().into_tensor_arg(),

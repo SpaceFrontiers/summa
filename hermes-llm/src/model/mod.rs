@@ -33,6 +33,7 @@ mod fused_swiglu;
 mod fusion;
 #[cfg(feature = "cuda")]
 mod grouped_linear;
+mod launch;
 mod linear_cross_entropy;
 mod mamba;
 mod matmul;
@@ -355,6 +356,53 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0, f32::max);
         assert!(difference < 1e-3, "maximum logit difference: {difference}");
+    }
+
+    /// Regression for the wgpu 65,535 workgroups-per-dimension dispatch
+    /// limit: a >16k-token forward through a hybrid MoE model used to emit
+    /// linear 1-D cube counts like [131072, 1, 1] (softplus over
+    /// tokens x channels), fail wgpu validation, and then surface as a
+    /// garbage MoE route readback. The forward must complete with finite
+    /// logits now that oversized linear launches are factored.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_moe_forward_above_16k_tokens_dispatches_legally() {
+        let config = crate::mal::parse_mal(
+            r#"
+            ssm smoke_ssm { state_dim: 16 conv_kernel: 4 expand: 2 }
+            ffn smoke_moe {
+                hidden_dim: 128
+                moe { experts: 4 top_k: 2 }
+            }
+            block smoke_block { ssm: smoke_ssm ffn: smoke_moe }
+            model dispatch_smoke {
+                vocab_size: 64
+                max_seq_len: 8320
+                hidden_size: 256
+                num_layers: 1
+                block: smoke_block
+            }
+            "#,
+        )
+        .unwrap();
+        let device = default_device();
+        device.seed(41);
+        let model = Transformer::new(&config, &device).unwrap();
+        // 16,640 tokens x 512 scan channels = 66,560 softplus workgroups at
+        // 128 threads: above the per-dimension limit, so this forward
+        // panicked before the launch factoring.
+        let (batch, seq_len) = (2, 8320);
+        let ids = (0..batch * seq_len)
+            .map(|index| (index % 61) as i64)
+            .collect::<Vec<_>>();
+        let input = Tensor::<2, Int>::from_data(TensorData::new(ids, [batch, seq_len]), &device);
+        let logits = model.forward(input, 0);
+        assert_eq!(logits.dims(), [batch, seq_len, 64]);
+        let values = logits.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "oversized-dispatch forward must produce finite logits"
+        );
     }
 
     #[test]

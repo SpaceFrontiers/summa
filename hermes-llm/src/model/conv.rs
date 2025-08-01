@@ -165,6 +165,7 @@ mod gpu {
     use half::bf16;
 
     use crate::model::cube_tensor::{empty_like, empty_like_dtype, into_contiguous};
+    use crate::model::launch::linear_cube_count;
 
     const ELEMENTWISE_THREADS: u32 = 256;
     const REDUCTION_THREADS: u32 = 32;
@@ -243,36 +244,42 @@ mod gpu {
         output_len: u32,
         #[comptime] kernel_size: usize,
     ) {
-        let param = CUBE_POS_X as usize;
-        let channel = param / kernel_size;
-        let k = param % kernel_size;
-        let lane = UNIT_POS_X as usize;
-        let batch = batch as usize;
-        let channels = channels as usize;
-        let input_len = input_len as usize;
-        let output_len = output_len as usize;
-        let sample_count = batch * output_len;
-        let mut weight_sum = 0.0f32;
-        let mut bias_sum = 0.0f32;
-        let mut sample = lane;
-        while sample < sample_count {
-            let batch_idx = sample / output_len;
-            let t = sample % output_len;
-            let grad_idx = (batch_idx * channels + channel) * output_len + t;
-            let grad_value = f32::cast_from(grad[grad_idx]);
-            let input_idx = (batch_idx * channels + channel) * input_len + t + k;
-            weight_sum += grad_value * f32::cast_from(input[input_idx]);
-            if k == 0 {
-                bias_sum += grad_value;
+        // One cube per weight parameter; the count may be factored into
+        // (x, y), so the parameter index is the linearized cube position,
+        // and excess cubes from the factoring overshoot exit early
+        // (uniform per cube, so the plane reduction stays in sync).
+        let param = CUBE_POS;
+        if param < grad_weight.len() {
+            let channel = param / kernel_size;
+            let k = param % kernel_size;
+            let lane = UNIT_POS_X as usize;
+            let batch = batch as usize;
+            let channels = channels as usize;
+            let input_len = input_len as usize;
+            let output_len = output_len as usize;
+            let sample_count = batch * output_len;
+            let mut weight_sum = 0.0f32;
+            let mut bias_sum = 0.0f32;
+            let mut sample = lane;
+            while sample < sample_count {
+                let batch_idx = sample / output_len;
+                let t = sample % output_len;
+                let grad_idx = (batch_idx * channels + channel) * output_len + t;
+                let grad_value = f32::cast_from(grad[grad_idx]);
+                let input_idx = (batch_idx * channels + channel) * input_len + t + k;
+                weight_sum += grad_value * f32::cast_from(input[input_idx]);
+                if k == 0 {
+                    bias_sum += grad_value;
+                }
+                sample += REDUCTION_THREADS as usize;
             }
-            sample += REDUCTION_THREADS as usize;
-        }
-        let weight_sum = plane_sum(weight_sum);
-        let bias_sum = plane_sum(bias_sum);
-        if lane == 0 {
-            grad_weight[param] = weight_sum;
-            if k == 0 {
-                grad_bias[channel] = bias_sum;
+            let weight_sum = plane_sum(weight_sum);
+            let bias_sum = plane_sum(bias_sum);
+            if lane == 0 {
+                grad_weight[param] = weight_sum;
+                if k == 0 {
+                    grad_bias[channel] = bias_sum;
+                }
             }
         }
     }
@@ -304,7 +311,7 @@ mod gpu {
                 ($float:ty) => {
                     depthwise_conv1d_forward::launch::<$float, R>(
                         &client,
-                        CubeCount::Static(total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
+                        linear_cube_count(total.div_ceil(ELEMENTWISE_THREADS)),
                         CubeDim::new_1d(ELEMENTWISE_THREADS),
                         input.into_tensor_arg(),
                         weight.into_tensor_arg(),
@@ -356,7 +363,7 @@ mod gpu {
                 ($float:ty) => {{
                     depthwise_conv1d_backward_input::launch::<$float, R>(
                         &client,
-                        CubeCount::Static(input_total.div_ceil(ELEMENTWISE_THREADS), 1, 1),
+                        linear_cube_count(input_total.div_ceil(ELEMENTWISE_THREADS)),
                         CubeDim::new_1d(ELEMENTWISE_THREADS),
                         weight.into_tensor_arg(),
                         grad.clone().into_tensor_arg(),
@@ -368,7 +375,7 @@ mod gpu {
                     );
                     depthwise_conv1d_backward_params::launch::<$float, R>(
                         &client,
-                        CubeCount::Static((channels * kernel_size) as u32, 1, 1),
+                        linear_cube_count((channels * kernel_size) as u32),
                         CubeDim::new_1d(REDUCTION_THREADS),
                         input.into_tensor_arg(),
                         grad.into_tensor_arg(),

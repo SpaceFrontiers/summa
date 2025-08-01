@@ -320,6 +320,7 @@ mod gpu {
     use super::GroupedLinearBackend;
     use crate::model::cube_tensor::{empty_like, into_contiguous, zeros_like_dtype};
     use crate::model::fused_swiglu::FusedSwiGluBackend;
+    use crate::model::launch::linear_cube_count;
 
     const ZERO_THREADS: u32 = 256;
 
@@ -357,7 +358,7 @@ mod gpu {
         let elements = output.meta.shape.num_elements() as u32;
         fill_zero::launch::<half::bf16, R>(
             &output.client,
-            CubeCount::Static(elements.div_ceil(ZERO_THREADS), 1, 1),
+            linear_cube_count(elements.div_ceil(ZERO_THREADS)),
             CubeDim::new_1d(ZERO_THREADS),
             output.clone().into_tensor_arg(),
         );

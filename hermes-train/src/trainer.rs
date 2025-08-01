@@ -1766,7 +1766,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         router_loss,
                         stats: batch_stats,
                         retrieval_correct,
-                        distillation_logits,
+                        captured_logits,
                     } = objective_loss(
                         forward_model,
                         training_batch,
@@ -1775,7 +1775,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                     )?;
                     let distillation_loss = match (
                         teacher_logits,
-                        distillation_logits,
+                        captured_logits,
                         quantization_teacher.as_ref(),
                     ) {
                         (Some(teacher_logits), Some(student_logits), Some(teacher)) => {

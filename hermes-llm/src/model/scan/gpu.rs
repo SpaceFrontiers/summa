@@ -27,6 +27,7 @@ use half::bf16;
 
 use super::{CHECKPOINTED_SCAN_INTERVAL, MambaBackend};
 use crate::model::cube_tensor::{empty_like, empty_like_dtype, into_contiguous, zeros_like_dtype};
+use crate::model::launch::{MAX_CUBES_PER_DIM, linear_cube_count};
 
 const THREADS_PER_CUBE: u32 = 128;
 const PLANE_WIDTH: u32 = 32;
@@ -691,6 +692,20 @@ fn selective_scan_backward_segmented<F: Float>(
     }
 }
 
+/// The sweep and parallel scan kernels index the channel tile by
+/// `CUBE_POS_X` and the batch by `CUBE_POS_Y`, so linear-count factoring
+/// does not apply to them: both grid axes must stay within the 65,535
+/// workgroups-per-dimension dispatch limit directly. That would take over
+/// a million channels or 65,535 sequences, but fail loudly rather than
+/// let wgpu reject the dispatch and poison later readbacks.
+fn assert_structured_scan_grid(channel_tiles: u32, batch: usize) {
+    assert!(
+        channel_tiles <= MAX_CUBES_PER_DIM && batch <= MAX_CUBES_PER_DIM as usize,
+        "selective scan launch of {channel_tiles} channel tiles x {batch} batches exceeds the \
+         65,535 workgroups-per-dimension dispatch limit; reduce the batch or channel count"
+    );
+}
+
 /// Materializes the softplus activation for the non-segmented scan
 /// inference paths (decode, prefill without states). The training
 /// kernels compute softplus in-kernel from the raw delta and never
@@ -709,7 +724,7 @@ fn materialize_softplus<R: CubeRuntime>(
     let delta_total = (batch * seq_len * channels) as u32;
     softplus_forward::launch::<f32, R>(
         &delta_raw.client,
-        CubeCount::Static(delta_total.div_ceil(THREADS_PER_CUBE), 1, 1),
+        linear_cube_count(delta_total.div_ceil(THREADS_PER_CUBE)),
         CubeDim::new_1d(THREADS_PER_CUBE),
         delta_raw.clone().into_tensor_arg(),
         delta.clone().into_tensor_arg(),
@@ -798,6 +813,10 @@ impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
             // the segments left-to-right with the state in registers —
             // a single launch and a single input read, no stitched-carry
             // kernels.
+            assert_structured_scan_grid(
+                (channels as u32).div_ceil(BACKWARD_CHANNELS as u32),
+                batch,
+            );
             macro_rules! launch_forward {
                 ($float:ty) => {{
                     selective_scan_forward_swept::launch::<$float, R>(
@@ -839,7 +858,7 @@ impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
             if serial_blocks >= SERIAL_SCAN_MIN_BLOCKS {
                 selective_scan_forward_serial::launch::<R>(
                     &client,
-                    CubeCount::Static(serial_blocks, 1, 1),
+                    linear_cube_count(serial_blocks),
                     CubeDim::new_1d(THREADS_PER_CUBE),
                     delta.clone().into_tensor_arg(),
                     xs.clone().into_tensor_arg(),
@@ -858,6 +877,7 @@ impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
                     save_states,
                 );
             } else {
+                assert_structured_scan_grid((channels as u32).div_ceil(FORWARD_CHANNELS), batch);
                 selective_scan_forward_parallel::launch::<R>(
                     &client,
                     CubeCount::Static(
@@ -892,7 +912,7 @@ impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
             let total = (batch * channels) as u32;
             selective_scan_step::launch::<R>(
                 &client,
-                CubeCount::Static(total.div_ceil(THREADS_PER_CUBE), 1, 1),
+                linear_cube_count(total.div_ceil(THREADS_PER_CUBE)),
                 CubeDim::new_1d(THREADS_PER_CUBE),
                 delta.into_tensor_arg(),
                 xs.clone().into_tensor_arg(),
@@ -975,6 +995,7 @@ impl<R: CubeRuntime> MambaBackend for CubeBackend<R> {
         // One block per (batch, channel tile) sweeps the checkpoint
         // segments right-to-left with the adjoint in registers — the
         // exact reverse recurrence, native in both F32 and BF16.
+        assert_structured_scan_grid((channels as u32).div_ceil(BACKWARD_CHANNELS as u32), batch);
         macro_rules! launch_backward {
             ($float:ty) => {{
                 selective_scan_backward_segmented::launch::<$float, R>(

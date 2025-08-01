@@ -1954,6 +1954,55 @@ pub(crate) fn count_samples(
     )
 }
 
+/// Smallest self-contained byte-level BPE accepted by the production
+/// tokenizer: IDs 0..=255 are the raw byte alphabet and 256 is EOS. Shared by
+/// the data-pipeline and forward-only evaluation tests.
+#[cfg(test)]
+pub(crate) fn write_test_tokenizer(directory: &Path) -> Tokenizer {
+    let allowed: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
+    let mut byte_to_unicode = ['\0'; 256];
+    for &byte in &allowed {
+        byte_to_unicode[byte as usize] = byte as char;
+    }
+    let mut offset = 0_u32;
+    for byte in 0..=255_u8 {
+        if byte_to_unicode[byte as usize] == '\0' {
+            byte_to_unicode[byte as usize] = char::from_u32(256 + offset).unwrap();
+            offset += 1;
+        }
+    }
+    let mut vocabulary = serde_json::Map::new();
+    for (id, piece) in byte_to_unicode.into_iter().enumerate() {
+        vocabulary.insert(piece.to_string(), serde_json::json!(id));
+    }
+    vocabulary.insert("<eos>".to_owned(), serde_json::json!(256));
+    let tokenizer = serde_json::json!({
+        "model": {
+            "type": "BPE",
+            "vocab": vocabulary,
+            "merges": [],
+        },
+        "added_tokens": [{
+            "id": 256,
+            "content": "<eos>",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true,
+        }],
+        "pre_tokenizer": {
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "use_regex": true,
+        },
+        "decoder": { "type": "ByteLevel" },
+    });
+    let path = directory.join("tokenizer.json");
+    fs::write(&path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    Tokenizer::from_file(path).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2569,51 +2618,6 @@ mod tests {
         } else {
             writer.flush().unwrap();
         }
-    }
-
-    fn write_test_tokenizer(directory: &Path) -> Tokenizer {
-        let allowed: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
-        let mut byte_to_unicode = ['\0'; 256];
-        for &byte in &allowed {
-            byte_to_unicode[byte as usize] = byte as char;
-        }
-        let mut offset = 0_u32;
-        for byte in 0..=255_u8 {
-            if byte_to_unicode[byte as usize] == '\0' {
-                byte_to_unicode[byte as usize] = char::from_u32(256 + offset).unwrap();
-                offset += 1;
-            }
-        }
-        let mut vocabulary = serde_json::Map::new();
-        for (id, piece) in byte_to_unicode.into_iter().enumerate() {
-            vocabulary.insert(piece.to_string(), serde_json::json!(id));
-        }
-        vocabulary.insert("<eos>".to_owned(), serde_json::json!(256));
-        let tokenizer = serde_json::json!({
-            "model": {
-                "type": "BPE",
-                "vocab": vocabulary,
-                "merges": [],
-            },
-            "added_tokens": [{
-                "id": 256,
-                "content": "<eos>",
-                "single_word": false,
-                "lstrip": false,
-                "rstrip": false,
-                "normalized": false,
-                "special": true,
-            }],
-            "pre_tokenizer": {
-                "type": "ByteLevel",
-                "add_prefix_space": false,
-                "use_regex": true,
-            },
-            "decoder": { "type": "ByteLevel" },
-        });
-        let path = directory.join("tokenizer.json");
-        fs::write(&path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
-        Tokenizer::from_file(path).unwrap()
     }
 
     fn update_causal_digest(

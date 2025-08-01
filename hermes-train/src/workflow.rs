@@ -818,6 +818,32 @@ impl ResolvedWorkflow {
     }
 }
 
+/// Validate a one-based retrieval read-out layer against a model topology.
+///
+/// `context` names the caller, such as a quoted workflow phase for training or
+/// `eval` for forward-only evaluation, so both paths report the same failures
+/// with the same wording. Retrieval embeddings are read after `layer`, so at
+/// least one full-attention layer must precede the read-out.
+pub fn validate_retrieval_layer_for_model(
+    layer: usize,
+    model: &ModelDef,
+    context: &str,
+) -> Result<()> {
+    ensure!(
+        layer > 0 && layer <= model.num_layers,
+        "{context} requests retrieval layer {layer}, model has {} layers",
+        model.num_layers
+    );
+    ensure!(
+        (0..layer).any(|index| {
+            let block = model.block_for_layer(index);
+            !block.is_ssm() && block.attention.window_size.is_none()
+        }),
+        "{context} retrieval layer {layer} has no full-attention layer at or before it"
+    );
+    Ok(())
+}
+
 /// Validate one complete workflow against the exact MAL topology it will
 /// mutate. This is deliberately separate from the generic WorkflowV2 schema:
 /// orchestration can remain model-neutral, while launch tooling can fail before
@@ -837,20 +863,11 @@ pub fn validate_workflow_for_model(workflow: &ResolvedWorkflow, model: &ModelDef
             );
         }
         if let Some(layer) = phase.task.as_ref().and_then(TaskConfig::retrieval_layer) {
-            ensure!(
-                layer > 0 && layer <= model.num_layers,
-                "workflow phase `{}` requests retrieval layer {layer}, model has {} layers",
-                phase.name,
-                model.num_layers
-            );
-            ensure!(
-                (0..layer).any(|index| {
-                    let block = model.block_for_layer(index);
-                    !block.is_ssm() && block.attention.window_size.is_none()
-                }),
-                "workflow phase `{}` retrieval layer {layer} has no full-attention layer at or before it",
-                phase.name
-            );
+            validate_retrieval_layer_for_model(
+                layer,
+                model,
+                &format!("workflow phase `{}`", phase.name),
+            )?;
         }
     }
 
