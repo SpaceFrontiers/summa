@@ -8,6 +8,7 @@
 //! but an explicit `--output` report is created. A live run therefore remains
 //! byte-for-byte resumable while it is being evaluated.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -21,8 +22,8 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::data::{
-    BatchStats, PhaseDataBinding, SampleStreamConfig, TrainingBatch, TrainingSample, make_batch,
-    visit_samples,
+    BatchStats, OversizedRecordPolicy, PhaseDataBinding, SampleStreamConfig, TrainingBatch,
+    TrainingSample, make_batch, visit_samples,
 };
 use crate::{
     EvalArgs, EvalObjective, ObjectiveForward, add_batch_stats, file_sha256, load_config,
@@ -30,7 +31,11 @@ use crate::{
 };
 
 /// Report schema version. Increment when a field changes meaning.
-const EVAL_REPORT_VERSION: u32 = 1;
+///
+/// v2 added the four supervised-generation objectives: the `task` block that
+/// pins their prompt framing, the `supervised_generation` metrics block, and
+/// `oversized_records`.
+const EVAL_REPORT_VERSION: u32 = 2;
 
 /// File names the trainer publishes inside its own output root. Refusing them
 /// keeps a mistyped `--output` from overwriting a live run's state with a
@@ -82,10 +87,16 @@ struct EvalDataSource {
     /// signature input for the same data.
     identity: String,
     samples_read: usize,
+    /// Records this shard could not frame at `--sequence-length`; see
+    /// [`EvalReport::oversized_records`].
+    oversized_records: usize,
 }
 
-#[derive(Debug, Serialize)]
-struct CausalLmMetrics {
+/// Cross-entropy over the tokens an objective supervises, plus its perplexity.
+/// For `causal_lm` that is every packed token; for supervised generation it is
+/// the target positions only, exactly as the training loss weights them.
+#[derive(Clone, Copy, Debug, Serialize)]
+struct LanguageMetrics {
     loss: f64,
     perplexity: f64,
 }
@@ -113,6 +124,10 @@ struct CandidateCounts {
 struct EvalReport {
     version: u32,
     objective: &'static str,
+    /// The complete task configuration this evaluation framed its prompts with,
+    /// including instruction text. A post-training run must repeat it exactly
+    /// for the two numbers to be comparable.
+    task: TaskConfig,
     config: String,
     config_sha256: String,
     tokenizer: String,
@@ -133,6 +148,11 @@ struct EvalReport {
     truncated_tokens: usize,
     /// Samples read but not scored because they could not fill a batch.
     dropped_samples: usize,
+    /// Supervised records skipped because their prompt framing, complete
+    /// target, and EOS do not fit `--sequence-length`. Training aborts on these;
+    /// evaluation must not let one over-long held-out record void the whole run,
+    /// so it counts them here and warns instead.
+    oversized_records: usize,
     /// Every condition that degraded or adjusted this evaluation, in the order
     /// it was detected. Also written to stderr, because the CLI's default log
     /// filter would otherwise hide a `warn!` from an operator.
@@ -140,7 +160,11 @@ struct EvalReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     router_loss: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    causal_lm: Option<CausalLmMetrics>,
+    causal_lm: Option<LanguageMetrics>,
+    /// Target-only cross-entropy for `summarization`, `instruction_tuning`,
+    /// `qa_reasoning`, and `retrieval_planning`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supervised_generation: Option<LanguageMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retrieval: Option<RetrievalMetrics>,
 }
@@ -291,7 +315,11 @@ impl<'a> Evaluation<'a> {
         Ok(())
     }
 
-    fn causal_lm_metrics(&self) -> Result<Option<CausalLmMetrics>> {
+    /// Token-weighted mean cross-entropy over the tokens this objective
+    /// supervises. `causal_lm` supervises every packed token; supervised
+    /// generation supervises target positions only, because the trainer's masked
+    /// loss — reused verbatim here — divides by exactly those positions.
+    fn language_metrics(&self) -> Result<Option<LanguageMetrics>> {
         let Some(loss) = self.language_loss.mean() else {
             return Ok(None);
         };
@@ -300,7 +328,7 @@ impl<'a> Evaluation<'a> {
             perplexity.is_finite(),
             "mean held-out loss {loss} overflows perplexity; check that --config and --checkpoint match"
         );
-        Ok(Some(CausalLmMetrics { loss, perplexity }))
+        Ok(Some(LanguageMetrics { loss, perplexity }))
     }
 
     fn retrieval_metrics(&self) -> Result<Option<RetrievalMetrics>> {
@@ -335,22 +363,30 @@ impl<'a> Evaluation<'a> {
 }
 
 impl EvalArgs {
-    /// Build the exact task configuration the trainer would use. Retrieval
-    /// defaults are deserialized rather than restated so query and document
-    /// prefixes stay identical to an unset workflow objective.
+    /// Build the exact task configuration the trainer would use. Task defaults
+    /// are deserialized rather than restated so retrieval prefixes and
+    /// supervised instructions stay identical to an unset workflow objective.
     fn objective_config(&self) -> Result<TaskConfig> {
+        if !matches!(self.objective, EvalObjective::ContrastiveRetrieval) {
+            ensure!(
+                self.retrieval_layer.is_none() && self.temperature.is_none(),
+                "--retrieval-layer and --temperature only apply to --objective contrastive_retrieval"
+            );
+        }
+        if !self.objective.is_supervised_generation() {
+            ensure!(
+                self.instruction.is_none(),
+                "--instruction only applies to a supervised-generation objective"
+            );
+        }
+        ensure!(
+            !self.require_reasoning || matches!(self.objective, EvalObjective::QaReasoning),
+            "--require-reasoning only applies to --objective qa_reasoning"
+        );
         let objective = match self.objective {
-            EvalObjective::CausalLm => {
-                ensure!(
-                    self.retrieval_layer.is_none() && self.temperature.is_none(),
-                    "--retrieval-layer and --temperature only apply to --objective contrastive_retrieval"
-                );
-                TaskConfig::CausalLm {}
-            }
+            EvalObjective::CausalLm => TaskConfig::CausalLm {},
             EvalObjective::ContrastiveRetrieval => {
-                let mut objective: TaskConfig =
-                    serde_json::from_value(json!({"type": "retrieval_representation"}))
-                        .context("built-in retrieval objective defaults are invalid")?;
+                let mut objective = task_defaults("retrieval_representation")?;
                 let TaskConfig::RetrievalRepresentation {
                     temperature, layer, ..
                 } = &mut objective
@@ -363,10 +399,48 @@ impl EvalArgs {
                 *layer = self.retrieval_layer;
                 objective
             }
+            EvalObjective::Summarization => self.supervised_config("summarization")?,
+            EvalObjective::InstructionTuning => self.supervised_config("instruction_tuning")?,
+            EvalObjective::RetrievalPlanning => self.supervised_config("retrieval_planning")?,
+            EvalObjective::QaReasoning => {
+                let mut objective = self.supervised_config("qa_reasoning")?;
+                let TaskConfig::QaReasoning {
+                    require_reasoning, ..
+                } = &mut objective
+                else {
+                    unreachable!("qa_reasoning deserialized to another task");
+                };
+                *require_reasoning = self.require_reasoning;
+                objective
+            }
         };
         objective.validate()?;
         Ok(objective)
     }
+
+    /// A supervised-generation task with the trainer's default instruction,
+    /// optionally overridden to match a training phase that set its own.
+    fn supervised_config(&self, name: &str) -> Result<TaskConfig> {
+        let mut objective = task_defaults(name)?;
+        if let Some(configured) = &self.instruction {
+            let instruction = match &mut objective {
+                TaskConfig::Summarization { instruction }
+                | TaskConfig::InstructionTuning { instruction }
+                | TaskConfig::RetrievalPlanning { instruction }
+                | TaskConfig::QaReasoning { instruction, .. } => instruction,
+                other => unreachable!("`{}` is not a supervised task", other.name()),
+            };
+            *instruction = configured.clone();
+        }
+        Ok(objective)
+    }
+}
+
+/// Deserialize a task by tag alone, so every field this command does not expose
+/// keeps the built-in default a workflow phase would get.
+fn task_defaults(name: &str) -> Result<TaskConfig> {
+    serde_json::from_value(json!({"type": name}))
+        .with_context(|| format!("built-in `{name}` task defaults are invalid"))
 }
 
 /// Report a degraded or adjusted condition to both the operator and the report.
@@ -471,6 +545,17 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
         args.sequence_length,
         args.recall_k,
     );
+    // Training aborts when a supervised record's prompt, complete target, and
+    // EOS exceed `sequence_length`, because a phase must not optimize a silently
+    // reduced dataset. Evaluation deliberately differs: one over-long held-out
+    // record must not void an entire evaluation, so it is skipped, counted per
+    // shard and in total, and warned about.
+    let oversized_records = Cell::new(0usize);
+    let oversized = if args.objective.is_supervised_generation() {
+        OversizedRecordPolicy::Skip(&oversized_records)
+    } else {
+        OversizedRecordPolicy::Abort
+    };
     let mut samples: Vec<TrainingSample> = Vec::with_capacity(args.batch_size);
     let mut sources = Vec::with_capacity(args.data.len());
     let mut reached_max_batches = false;
@@ -478,6 +563,7 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
         if reached_max_batches {
             break;
         }
+        let oversized_before = oversized_records.get();
         let binding = PhaseDataBinding::open(path)?;
         let samples_read = visit_samples(
             path,
@@ -491,6 +577,7 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
                 // belong to a live run's output directory.
                 token_cache: None,
                 data_binding: &binding,
+                oversized,
             },
             |sample| {
                 samples.push(sample);
@@ -511,7 +598,18 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
             path: path.display().to_string(),
             identity: binding.signature_identity().to_owned(),
             samples_read,
+            oversized_records: oversized_records.get() - oversized_before,
         });
+    }
+    let oversized_records = oversized_records.get();
+    if oversized_records > 0 {
+        warn_operator(
+            &mut warnings,
+            format!(
+                "skipped {oversized_records} held-out record(s) whose prompt, complete target, and EOS exceed --sequence-length {}; they are excluded from every reported number",
+                args.sequence_length
+            ),
+        );
     }
     let mut dropped_samples = 0;
     if !samples.is_empty() {
@@ -530,13 +628,17 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
     }
     ensure!(
         evaluation.batches > 0,
-        "held-out data produced no complete batch of --batch-size {}; {dropped_samples} sample(s) were read",
-        args.batch_size
+        "held-out data produced no complete batch of --batch-size {}; {dropped_samples} sample(s) were read and {oversized_records} record(s) did not fit --sequence-length {}",
+        args.batch_size,
+        args.sequence_length
     );
 
+    let language = evaluation.language_metrics()?;
+    let supervised = args.objective.is_supervised_generation();
     let report = EvalReport {
         version: EVAL_REPORT_VERSION,
         objective: objective.name(),
+        task: objective.clone(),
         config: args.config.display().to_string(),
         config_sha256: file_sha256(&args.config)?,
         tokenizer: args.tokenizer.display().to_string(),
@@ -556,9 +658,11 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
         supervised_tokens: evaluation.stats.supervised_tokens,
         truncated_tokens: evaluation.stats.truncated_tokens,
         dropped_samples,
+        oversized_records,
         warnings,
         router_loss: evaluation.router_loss.mean(),
-        causal_lm: evaluation.causal_lm_metrics()?,
+        causal_lm: language.filter(|_| !supervised),
+        supervised_generation: language.filter(|_| supervised),
         retrieval: evaluation.retrieval_metrics()?,
     };
     write_report(&report, args.output.as_deref())?;
@@ -610,9 +714,15 @@ fn print_summary(report: &EvalReport, elapsed_seconds: f64) {
         "dropped samples      {} (incomplete trailing batch)",
         report.dropped_samples
     );
-    if let Some(causal_lm) = &report.causal_lm {
-        println!("loss                 {:.6}", causal_lm.loss);
-        println!("perplexity           {:.4}", causal_lm.perplexity);
+    println!(
+        "oversized records    {} (target does not fit sequence_length)",
+        report.oversized_records
+    );
+    // Exactly one language block is ever populated: the objective decides
+    // whether the same token-weighted mean is a causal or a target-only loss.
+    if let Some(language) = report.causal_lm.or(report.supervised_generation) {
+        println!("loss                 {:.6}", language.loss);
+        println!("perplexity           {:.4}", language.perplexity);
     }
     if let Some(retrieval) = &report.retrieval {
         println!("loss                 {:.6}", retrieval.loss);
@@ -643,10 +753,13 @@ mod tests {
     use super::*;
     use crate::data::write_test_tokenizer;
 
+    /// `max_seq_len` must clear the supervised objectives' fixed prompt framing:
+    /// their built-in instructions plus target markers already occupy more than
+    /// the retrieval tests' 56 positions before any record text.
     const EVAL_MODEL: &str = r#"
 ffn base { hidden_dim: 12 activation: swiglu dropout: 0.0 }
 model tiny {
-    vocab_size: 257 max_seq_len: 64 hidden_size: 8 num_layers: 2
+    vocab_size: 257 max_seq_len: 256 hidden_size: 8 num_layers: 2
     block: {
         attention: { num_heads: 1 dropout: 0.0 position_encoding: none }
         ffn: base
@@ -704,8 +817,18 @@ model tiny {
             recall_k: 2,
             retrieval_layer: None,
             temperature: None,
+            instruction: None,
+            require_reasoning: false,
             output: Some(fixture.output.clone()),
         }
+    }
+
+    /// Supervised prompts carry a full instruction and target marker before any
+    /// record text, so they need a longer sequence than the retrieval fixtures.
+    fn supervised_args(fixture: &Fixture, objective: EvalObjective, batch_size: usize) -> EvalArgs {
+        let mut arguments = args(fixture, objective, batch_size);
+        arguments.sequence_length = SUPERVISED_SEQUENCE_LENGTH;
+        arguments
     }
 
     fn report(path: &Path) -> serde_json::Value {
@@ -736,6 +859,93 @@ model tiny {
                 )
             })
             .collect()
+    }
+
+    const SUPERVISED_SEQUENCE_LENGTH: usize = 192;
+
+    /// Summaries are a fixed 21 ASCII bytes wide for `rows <= 10`, and the test
+    /// tokenizer is a merge-free byte-level BPE, so the exact number of
+    /// supervised target tokens is known: 21 target tokens plus the EOS the
+    /// model must also predict.
+    const SUMMARY_TARGET_TOKENS: usize = "summary of document 0".len() + 1;
+
+    fn summarization_records(rows: usize) -> String {
+        assert!(rows <= 10, "summary width is only fixed for one digit");
+        (0..rows)
+            .map(|index| {
+                format!(
+                    "{{\"document\":\"held-out source prose about topic {index}, long enough that the document is truncated before the reserved target\",\"summary\":\"summary of document {index}\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    fn instruction_records(rows: usize) -> String {
+        (0..rows)
+            .map(|index| {
+                format!(
+                    "{{\"instruction\":\"translate line {index}\",\"input\":\"bonjour {index}\",\"response\":\"hello {index}\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    fn qa_records(rows: usize) -> String {
+        (0..rows)
+            .map(|index| {
+                format!(
+                    "{{\"question\":\"what is held-out fact {index}?\",\"answer\":\"held-out answer {index}\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    /// Answers grow one phrase per row, so per-record supervised token counts
+    /// differ and batch grouping cannot be invariant by accident.
+    fn variable_length_qa_records(rows: usize) -> String {
+        (0..rows)
+            .map(|index| {
+                let answer = vec!["answer"; index + 1].join(" ");
+                format!("{{\"question\":\"what is fact {index}?\",\"answer\":\"{answer}\"}}\n")
+            })
+            .collect()
+    }
+
+    /// Planning records deliberately omit `context`, exactly as the production
+    /// held-out shard does, so the optional-source branch is the one evaluated.
+    fn planning_records(rows: usize) -> String {
+        (0..rows)
+            .map(|index| {
+                format!(
+                    "{{\"request\":\"find document {index}\",\"plan\":\"search {index}, then read it\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    fn supervised_fixtures() -> Vec<(EvalObjective, &'static str, Fixture)> {
+        vec![
+            (
+                EvalObjective::Summarization,
+                "summarization",
+                fixture(&summarization_records(9)),
+            ),
+            (
+                EvalObjective::InstructionTuning,
+                "instruction_tuning",
+                fixture(&instruction_records(9)),
+            ),
+            (
+                EvalObjective::QaReasoning,
+                "qa_reasoning",
+                fixture(&qa_records(9)),
+            ),
+            (
+                EvalObjective::RetrievalPlanning,
+                "retrieval_planning",
+                fixture(&planning_records(9)),
+            ),
+        ]
     }
 
     #[test]
@@ -836,6 +1046,239 @@ model tiny {
             (grouped_loss - single_loss).abs() < 1e-3,
             "token-weighted means diverged across batch groupings: {grouped_loss} vs {single_loss}"
         );
+    }
+
+    /// Every supervised-generation objective reports the same quantity the
+    /// trainer optimizes for it: a token-weighted mean cross-entropy over target
+    /// positions only. Prompt and padding positions must never contribute, which
+    /// is why the exactly known target-token count is asserted for one objective
+    /// and `supervised_tokens` must stay far below `compute_tokens` for all.
+    #[test]
+    fn eval_supervised_objectives_report_finite_target_only_loss_and_are_deterministic() {
+        for (objective, name, fixture) in supervised_fixtures() {
+            evaluate(supervised_args(&fixture, objective, 3)).unwrap();
+            let first = fs::read(&fixture.output).unwrap();
+            let parsed = report(&fixture.output);
+            let loss = finite(&parsed, "/supervised_generation/loss");
+            let perplexity = finite(&parsed, "/supervised_generation/perplexity");
+            assert!(loss > 0.0, "{name}: {parsed}");
+            assert!(
+                (perplexity - loss.exp()).abs() < 1e-9,
+                "{name}: perplexity {perplexity} does not match loss {loss}"
+            );
+            assert_eq!(parsed["objective"], name, "{parsed}");
+            assert_eq!(parsed["task"]["type"], name, "{parsed}");
+            assert!(parsed["causal_lm"].is_null(), "{name}: {parsed}");
+            assert!(parsed["retrieval"].is_null(), "{name}: {parsed}");
+            assert_eq!(parsed["examples"], 9, "{name}: {parsed}");
+            assert_eq!(parsed["batches"], 3, "{name}: {parsed}");
+            assert_eq!(parsed["dropped_samples"], 0, "{name}: {parsed}");
+            assert_eq!(parsed["oversized_records"], 0, "{name}: {parsed}");
+            let supervised = parsed["supervised_tokens"].as_u64().unwrap();
+            let compute = parsed["compute_tokens"].as_u64().unwrap();
+            assert_eq!(compute, 9 * SUPERVISED_SEQUENCE_LENGTH as u64, "{parsed}");
+            assert!(
+                supervised > 0 && supervised * 4 < compute,
+                "{name}: {supervised} supervised of {compute} computed tokens is not target-only"
+            );
+            if matches!(objective, EvalObjective::Summarization) {
+                // Nine fixed-width summaries plus the EOS after each: the loss
+                // denominator is exactly the target, never the truncated source.
+                assert_eq!(supervised, 9 * SUMMARY_TARGET_TOKENS as u64, "{parsed}");
+                assert!(
+                    parsed["truncated_tokens"].as_u64().unwrap() > 0,
+                    "sources long enough to truncate must be counted: {parsed}"
+                );
+            }
+
+            // The report carries no timing or environment noise, so the same
+            // seed must reproduce it byte for byte.
+            evaluate(supervised_args(&fixture, objective, 3)).unwrap();
+            assert_eq!(first, fs::read(&fixture.output).unwrap(), "{name}");
+        }
+    }
+
+    /// The same held-out target tokens must produce the same mean however they
+    /// are grouped into batches. Targets here differ in length, so an unweighted
+    /// average of per-batch means could not hold this property.
+    #[test]
+    fn eval_qa_reasoning_loss_is_token_weighted_across_unequal_batch_groupings() {
+        const BATCH: u64 = 4;
+
+        let fixture = fixture(&variable_length_qa_records(7));
+        let mut single = supervised_args(&fixture, EvalObjective::QaReasoning, 1);
+        single.output = Some(fixture.output.with_file_name("single.json"));
+        evaluate(single).unwrap();
+        let single = report(&fixture.output.with_file_name("single.json"));
+        let samples = single["examples"].as_u64().unwrap();
+        assert_eq!(samples, 7, "{single}");
+        assert_eq!(single["batches"].as_u64().unwrap(), samples, "{single}");
+
+        let mut grouped = supervised_args(&fixture, EvalObjective::QaReasoning, BATCH as usize);
+        grouped.output = Some(fixture.output.with_file_name("grouped.json"));
+        evaluate(grouped).unwrap();
+        let grouped = report(&fixture.output.with_file_name("grouped.json"));
+        // The short trailing batch is scored, not dropped: target-only losses
+        // are token weighted and can absorb it exactly.
+        assert_eq!(grouped["batches"], 2, "{grouped}");
+        assert_eq!(grouped["examples"].as_u64().unwrap(), samples, "{grouped}");
+        assert_eq!(grouped["dropped_samples"], 0, "{grouped}");
+        assert_eq!(single["supervised_tokens"], grouped["supervised_tokens"]);
+
+        let single_loss = finite(&single, "/supervised_generation/loss");
+        let grouped_loss = finite(&grouped, "/supervised_generation/loss");
+        assert!(
+            (grouped_loss - single_loss).abs() < 1e-3,
+            "token-weighted means diverged across batch groupings: {grouped_loss} vs {single_loss}"
+        );
+    }
+
+    /// Training must abort when a supervised target cannot fit the geometry,
+    /// because a run must not optimize a silently reduced dataset. Evaluation
+    /// must not: one over-long held-out record cannot be allowed to void an
+    /// entire evaluation. It is skipped, counted, and warned about instead.
+    #[test]
+    fn eval_skips_and_counts_oversized_supervised_records_that_training_rejects() {
+        let mut records = summarization_records(6);
+        records.push_str(&format!(
+            "{{\"document\":\"short source\",\"summary\":\"{}\"}}\n",
+            "an over-long held-out summary ".repeat(10)
+        ));
+        let fixture = fixture(&records);
+
+        evaluate(supervised_args(&fixture, EvalObjective::Summarization, 3)).unwrap();
+        let parsed = report(&fixture.output);
+        assert_eq!(parsed["oversized_records"], 1, "{parsed}");
+        assert_eq!(parsed["data"][0]["oversized_records"], 1, "{parsed}");
+        assert_eq!(parsed["data"][0]["samples_read"], 6, "{parsed}");
+        // The other six records are scored exactly as if the shard had only
+        // ever contained them.
+        assert_eq!(parsed["examples"], 6, "{parsed}");
+        assert_eq!(
+            parsed["supervised_tokens"].as_u64().unwrap(),
+            6 * SUMMARY_TARGET_TOKENS as u64,
+            "{parsed}"
+        );
+        finite(&parsed, "/supervised_generation/loss");
+        let warnings = parsed["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{parsed}");
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .contains("skipped 1 held-out record"),
+            "{parsed}"
+        );
+
+        // The trainer's own streaming path over the same shard still refuses it.
+        let tokenizer = Tokenizer::from_file(&fixture.tokenizer).unwrap();
+        let binding = PhaseDataBinding::open(&fixture.data).unwrap();
+        let error = format!(
+            "{:#}",
+            crate::data::count_samples(
+                &fixture.data,
+                &TaskConfig::Summarization {
+                    instruction: "Summarize the document faithfully and concisely.".to_owned(),
+                },
+                &tokenizer,
+                SUPERVISED_SEQUENCE_LENGTH,
+                None,
+                &binding,
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("targets are never truncated"), "{error}");
+    }
+
+    #[test]
+    fn eval_rejects_retrieval_flags_on_supervised_objectives() {
+        let fixture = fixture(&qa_records(4));
+        for objective in [
+            EvalObjective::Summarization,
+            EvalObjective::InstructionTuning,
+            EvalObjective::QaReasoning,
+            EvalObjective::RetrievalPlanning,
+        ] {
+            let mut temperature = supervised_args(&fixture, objective, 2);
+            temperature.temperature = Some(0.1);
+            let error = format!("{:#}", evaluate(temperature).unwrap_err());
+            assert!(error.contains("contrastive_retrieval"), "{error}");
+
+            let mut layer = supervised_args(&fixture, objective, 2);
+            layer.retrieval_layer = Some(1);
+            let error = format!("{:#}", evaluate(layer).unwrap_err());
+            assert!(error.contains("contrastive_retrieval"), "{error}");
+        }
+    }
+
+    #[test]
+    fn eval_rejects_supervised_prompt_flags_on_other_objectives() {
+        let fixture = fixture(&causal_records(4));
+        for objective in [EvalObjective::CausalLm, EvalObjective::ContrastiveRetrieval] {
+            let mut instruction = args(&fixture, objective, 2);
+            instruction.instruction = Some("Summarize.".to_owned());
+            let error = format!("{:#}", evaluate(instruction).unwrap_err());
+            assert!(error.contains("supervised-generation"), "{error}");
+        }
+
+        // `require_reasoning` changes the qa_reasoning target framing only.
+        let mut reasoning = supervised_args(&fixture, EvalObjective::Summarization, 2);
+        reasoning.require_reasoning = true;
+        let error = format!("{:#}", evaluate(reasoning).unwrap_err());
+        assert!(error.contains("qa_reasoning"), "{error}");
+    }
+
+    /// A held-out number is only comparable with a training loss if the prompt
+    /// framing matches, so the exact task — instruction text included — is part
+    /// of the report a post-training run has to reproduce.
+    #[test]
+    fn eval_records_the_task_that_framed_supervised_prompts() {
+        let fixture = fixture(&qa_records(6));
+        let mut arguments = supervised_args(&fixture, EvalObjective::QaReasoning, 3);
+        arguments.instruction = Some("Answer from the passages.".to_owned());
+        evaluate(arguments).unwrap();
+        let parsed = report(&fixture.output);
+        assert_eq!(parsed["version"], 2, "{parsed}");
+        assert_eq!(parsed["task"]["type"], "qa_reasoning", "{parsed}");
+        assert_eq!(
+            parsed["task"]["instruction"], "Answer from the passages.",
+            "{parsed}"
+        );
+        assert_eq!(parsed["task"]["require_reasoning"], false, "{parsed}");
+    }
+
+    /// A reasoning trace is part of the supervised target, not of the prompt, so
+    /// the scored tokens must cover the whole `Reasoning:`/`Answer:` framing.
+    /// `--require-reasoning` additionally refuses a shard without traces, rather
+    /// than quietly scoring a different target than the training phase did.
+    #[test]
+    fn eval_qa_reasoning_supervises_the_reasoning_trace_and_requires_it_when_asked() {
+        const FRAMED_TARGET: &str = "Reasoning:\nrecall fact 0\n\nAnswer:\nanswer 0";
+
+        let records: String = (0..6)
+            .map(|index| {
+                format!(
+                    "{{\"question\":\"fact {index}?\",\"reasoning\":\"recall fact {index}\",\"answer\":\"answer {index}\"}}\n"
+                )
+            })
+            .collect();
+        let traced = fixture(&records);
+        let mut arguments = supervised_args(&traced, EvalObjective::QaReasoning, 3);
+        arguments.require_reasoning = true;
+        evaluate(arguments).unwrap();
+        let parsed = report(&traced.output);
+        assert_eq!(parsed["task"]["require_reasoning"], true, "{parsed}");
+        assert_eq!(
+            parsed["supervised_tokens"].as_u64().unwrap(),
+            6 * (FRAMED_TARGET.len() + 1) as u64,
+            "{parsed}"
+        );
+
+        let bare = fixture(&qa_records(6));
+        let mut arguments = supervised_args(&bare, EvalObjective::QaReasoning, 3);
+        arguments.require_reasoning = true;
+        let error = format!("{:#}", evaluate(arguments).unwrap_err());
+        assert!(error.contains("`reasoning` is required"), "{error}");
     }
 
     #[test]

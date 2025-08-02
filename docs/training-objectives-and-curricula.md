@@ -127,6 +127,39 @@ task defaults. In-batch negatives make retrieval accuracy depend on the
 candidate-pool size, so a trailing batch that cannot be filled is dropped and
 counted in `dropped_samples`; token-weighted language losses score it exactly.
 
+### Supervised-generation objectives
+
+`--objective summarization`, `instruction_tuning`, `qa_reasoning`, and
+`retrieval_planning` score the four supervised-generation tasks on their own
+JSONL contracts (`document`/`summary`, `instruction`/`response` with optional
+`system` and `input`, `question`/`answer` with optional `reasoning`,
+`request`/`plan` with optional `context`). Each reports
+`supervised_generation.loss` and `.perplexity`: the token-weighted mean
+cross-entropy over **target positions only**. Prompt and EOS-padding positions
+never contribute, because the command reuses the trainer's masked-loss forward
+pass and the same task adapter framing, so the reported number is the training
+loss for that phase minus gradients — comparable straight across a train/eval
+boundary. `supervised_tokens` is therefore much smaller than `compute_tokens`,
+and `truncated_tokens` counts source text dropped to reserve room for the target.
+
+Prompt framing must match the training phase exactly, so the report echoes the
+complete task in its `task` block. `--instruction` overrides the built-in
+instruction for phases that set their own, and `--require-reasoning` mirrors
+`qa_reasoning`'s `require_reasoning`, which demands a `reasoning` field and
+supervises the `Reasoning:`/`Answer:` target framing. Retrieval-only flags are
+rejected on these objectives and vice versa. Because targets are never
+truncated and padding cannot reach earlier positions through causal attention,
+the reported loss is unchanged by `--batch-size` and by any
+`--sequence-length` long enough to hold the record; use the training phase's
+sequence length so truncation behaviour matches too.
+
+`--sequence-length` is where evaluation deliberately differs from training. A
+supervised record whose prompt framing, complete target, and EOS do not fit
+makes `train` abort — a run must not optimize a silently reduced dataset — but
+one over-long held-out record must not void a whole evaluation. `eval` skips it,
+counts it in `oversized_records` (per shard and in total), and warns on stderr
+and in `warnings`; it is excluded from every reported number.
+
 `--shuffle-buffer` (default `0`, source order) is the only setting `--seed`
 affects, and the JSON report deliberately excludes timing, so identical inputs
 produce a byte-identical report. Config, tokenizer, checkpoint, and every shard

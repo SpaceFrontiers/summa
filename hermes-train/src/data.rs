@@ -34,6 +34,7 @@ pub(crate) use batch::{
     BatchStats, EncodedText, LanguageBatch, RetrievalBatch, TrainingBatch, TrainingSample,
     make_batch,
 };
+pub(crate) use structured::OversizedRecordPolicy;
 use structured::visit_structured_samples;
 
 const TOKENIZE_BATCH: usize = 1_000;
@@ -1849,44 +1850,54 @@ fn visit_samples_in_order(
     path: &Path,
     objective: &TaskConfig,
     tokenizer: &Tokenizer,
-    seq_len: usize,
-    token_cache: Option<&Path>,
-    data_binding: &PhaseDataBinding,
+    config: SampleStreamConfig<'_>,
     mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
-    ensure!(seq_len > 0, "sequence_length must be positive");
+    ensure!(config.seq_len > 0, "sequence_length must be positive");
     match objective {
-        TaskConfig::CausalLm {} => {
-            visit_causal_samples(path, tokenizer, seq_len, token_cache, data_binding, visit)
-        }
+        TaskConfig::CausalLm {} => visit_causal_samples(
+            path,
+            tokenizer,
+            config.seq_len,
+            config.token_cache,
+            config.data_binding,
+            visit,
+        ),
         _ => {
             ensure!(
-                data_binding.authenticated_corpus().is_none(),
+                config.data_binding.authenticated_corpus().is_none(),
                 "prepared corpus manifests are only valid for causal-LM phases"
             );
             let mut count = None;
-            data_binding.with_readers(path, |source_path, reader| {
-                count = Some(visit_structured_samples(
-                    source_path,
-                    reader,
-                    objective,
-                    tokenizer,
-                    seq_len,
-                    &mut visit,
-                )?);
-                Ok(true)
-            })?;
+            config
+                .data_binding
+                .with_readers(path, |source_path, reader| {
+                    count = Some(visit_structured_samples(
+                        source_path,
+                        reader,
+                        objective,
+                        tokenizer,
+                        config.seq_len,
+                        config.oversized,
+                        &mut visit,
+                    )?);
+                    Ok(true)
+                })?;
             count.context("direct structured phase data produced no reader")
         }
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SampleStreamConfig<'a> {
     pub(crate) seq_len: usize,
     pub(crate) shuffle_buffer: usize,
     pub(crate) seed: u64,
     pub(crate) token_cache: Option<&'a Path>,
     pub(crate) data_binding: &'a PhaseDataBinding,
+    /// Disposition of a supervised record that cannot be framed at `seq_len`.
+    /// Training aborts; forward-only evaluation skips and counts.
+    pub(crate) oversized: OversizedRecordPolicy<'a>,
 }
 
 pub(crate) fn visit_samples(
@@ -1897,33 +1908,17 @@ pub(crate) fn visit_samples(
     mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
     if config.shuffle_buffer == 0 {
-        return visit_samples_in_order(
-            path,
-            objective,
-            tokenizer,
-            config.seq_len,
-            config.token_cache,
-            config.data_binding,
-            visit,
-        );
+        return visit_samples_in_order(path, objective, tokenizer, config, visit);
     }
 
     let mut shuffler = ShuffleBuffer::new(config.shuffle_buffer, config.seed);
     let mut keep_going = true;
-    let count = visit_samples_in_order(
-        path,
-        objective,
-        tokenizer,
-        config.seq_len,
-        config.token_cache,
-        config.data_binding,
-        |sample| {
-            if let Some(sample) = shuffler.push(sample) {
-                keep_going = visit(sample)?;
-            }
-            Ok(keep_going)
-        },
-    )?;
+    let count = visit_samples_in_order(path, objective, tokenizer, config, |sample| {
+        if let Some(sample) = shuffler.push(sample) {
+            keep_going = visit(sample)?;
+        }
+        Ok(keep_going)
+    })?;
 
     if keep_going {
         for sample in shuffler.finish() {
@@ -1947,9 +1942,16 @@ pub(crate) fn count_samples(
         path,
         objective,
         tokenizer,
-        seq_len,
-        token_cache,
-        data_binding,
+        SampleStreamConfig {
+            seq_len,
+            shuffle_buffer: 0,
+            seed: 0,
+            token_cache,
+            data_binding,
+            // Counting is what a training run will stream, so a record the
+            // trainer cannot frame must fail here too.
+            oversized: OversizedRecordPolicy::Abort,
+        },
         |_| Ok(true),
     )
 }
@@ -2159,6 +2161,7 @@ mod tests {
             &task,
             &tokenizer,
             64,
+            OversizedRecordPolicy::Abort,
             |_| Ok(true),
         )
         .unwrap_err();
@@ -3110,9 +3113,14 @@ mod tests {
                 &path,
                 &objective,
                 &tokenizer,
-                64,
-                None,
-                &binding,
+                SampleStreamConfig {
+                    seq_len: 64,
+                    shuffle_buffer: 0,
+                    seed: 0,
+                    token_cache: None,
+                    data_binding: &binding,
+                    oversized: OversizedRecordPolicy::Abort,
+                },
                 |sample| {
                     observed.push(sample);
                     Ok(true)

@@ -1137,6 +1137,16 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
             &device,
         )?;
         adamw_optimizer = optimizer;
+        // The resume load restores the checkpoint's parameter IDs into the
+        // model, so the selection captured from the freshly constructed model
+        // above no longer identifies its matrices. Re-derive it from the model
+        // that will actually be differentiated; a stale selection extracts zero
+        // Muon gradients and fails the first resumed optimizer step.
+        muon_parameter_ids = initial_model.muon_parameter_ids();
+        ensure!(
+            !muon_parameter_ids.is_empty(),
+            "restored model has no hidden matrix parameters for Muon"
+        );
         ensure!(
             state.global_step <= total_steps,
             "checkpoint step {} exceeds requested total {total_steps}",
@@ -1170,7 +1180,12 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         );
         ensure!(
             state.workflow_signature == signature,
-            "checkpoint workflow or training configuration differs from this invocation"
+            "checkpoint workflow or training configuration differs from this invocation{}",
+            if args.checkpoint.is_none() {
+                "; a run started from `--checkpoint` must repeat the same `--checkpoint` when resuming, because the initial checkpoint identity is part of the run signature"
+            } else {
+                ""
+            }
         );
         ensure!(
             state.data_manifest_hash.as_ref() == Some(&data_manifests[state.phase]),
@@ -1629,6 +1644,11 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                             seed: shuffle_seed,
                             token_cache: Some(&token_cache_path),
                             data_binding,
+                            // A supervised record this phase cannot frame is a
+                            // geometry bug the operator must fix: training over
+                            // a silently reduced dataset would report a loss
+                            // over an unknown subset of it.
+                            oversized: OversizedRecordPolicy::Abort,
                         },
                         |sample| {
                             visited = visited

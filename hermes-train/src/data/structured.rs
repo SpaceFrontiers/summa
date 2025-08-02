@@ -1,5 +1,7 @@
 //! JSONL schemas and tokenization for task-aligned objectives.
 
+use std::cell::Cell;
+use std::fmt;
 use std::io::BufRead;
 use std::path::Path;
 
@@ -8,8 +10,77 @@ use hermes_llm::Tokenizer;
 use hermes_train::task::{
     SegmentedText, SupervisedPromptSegments, TaskAdapter, TaskConfig, TaskExample,
 };
+use tracing::warn;
 
 use super::{EncodedText, TrainingSample, is_jsonl, read_training_jsonl_record};
+
+/// A supervised-generation record whose prompt framing, complete target, and
+/// EOS cannot fit `sequence_length`. Targets are never truncated, so such a
+/// record has no valid encoding at this geometry.
+///
+/// It is a distinct error type rather than a plain message so that a caller can
+/// tell "this record does not fit" apart from "this record is malformed"
+/// without matching on strings. Training treats both as fatal; forward-only
+/// evaluation skips and counts only this one (see [`OversizedRecordPolicy`]).
+#[derive(Debug)]
+pub(crate) struct OversizedSupervisedRecord {
+    /// Tokens the un-truncatable framing needs: prefix, suffix, target, EOS,
+    /// and — when the task requires a source — one source token.
+    required_tokens: usize,
+    /// Tokens the geometry provides, which is `sequence_length + 1` because the
+    /// batch is shifted by one position.
+    capacity: usize,
+    sequence_length: usize,
+}
+
+impl fmt::Display for OversizedSupervisedRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "instruction, target marker, complete target, EOS, and any required source token need {} tokens but sequence_length {} provides {}; targets are never truncated",
+            self.required_tokens, self.sequence_length, self.capacity
+        )
+    }
+}
+
+impl std::error::Error for OversizedSupervisedRecord {}
+
+/// What to do with a record that [`OversizedSupervisedRecord`] rejects.
+///
+/// Training must abort: a phase that silently dropped part of its own dataset
+/// would report a loss over an unknown subset of it, and the geometry is the
+/// operator's to fix. Forward-only evaluation must not, because one over-long
+/// held-out record would otherwise make an entire evaluation fail; it skips the
+/// record and counts it so the drop is reported rather than silent.
+#[derive(Clone, Copy)]
+pub(crate) enum OversizedRecordPolicy<'a> {
+    Abort,
+    Skip(&'a Cell<usize>),
+}
+
+impl OversizedRecordPolicy<'_> {
+    /// Decide whether streaming may continue past `error`. Returns the error
+    /// unchanged unless it is an oversized record this policy absorbs.
+    fn absorb(&self, error: anyhow::Error) -> Result<()> {
+        let Self::Skip(skipped) = self else {
+            return Err(error);
+        };
+        if !error
+            .chain()
+            .any(|cause| cause.is::<OversizedSupervisedRecord>())
+        {
+            return Err(error);
+        }
+        warn!("skipping oversized record: {error:#}");
+        skipped.set(
+            skipped
+                .get()
+                .checked_add(1)
+                .context("oversized record count overflows usize")?,
+        );
+        Ok(())
+    }
+}
 
 fn supervised_prompt_segments<'a>(
     value: &'a serde_json::Value,
@@ -61,17 +132,22 @@ fn make_supervised_sample(
         .and_then(|tokens| tokens.checked_add(target.len()))
         .and_then(|tokens| tokens.checked_add(1))
         .context("supervised example token count overflows usize")?;
-    ensure!(
-        fixed_tokens <= capacity,
-        "instruction, target marker, complete target, and EOS require {fixed_tokens} tokens but sequence_length {seq_len} provides {capacity}; targets are never truncated"
-    );
-    let kept_source = source.len().min(capacity - fixed_tokens);
-    if source_required {
-        ensure!(
-            kept_source > 0,
-            "sequence_length {seq_len} leaves no token for the source after reserving the target"
-        );
+    // A record needs the whole framing plus, when the task requires a source,
+    // at least one source token. Both shortfalls mean the same thing — this
+    // record has no valid encoding at this geometry — so both raise the typed
+    // error an evaluation can skip and count.
+    let required_tokens = fixed_tokens
+        .checked_add(usize::from(source_required))
+        .context("supervised example token count overflows usize")?;
+    if required_tokens > capacity {
+        return Err(anyhow::Error::new(OversizedSupervisedRecord {
+            required_tokens,
+            capacity,
+            sequence_length: seq_len,
+        }));
     }
+    let kept_source = source.len().min(capacity - fixed_tokens);
+    debug_assert!(!source_required || kept_source > 0);
     let truncated_tokens = source.len() - kept_source;
     let prompt_len = prefix.len() + kept_source + suffix.len();
     ensure!(prompt_len > 0, "supervised prompt tokenized to empty");
@@ -235,6 +311,7 @@ pub(super) fn visit_structured_samples(
     objective: &TaskConfig,
     tokenizer: &Tokenizer,
     seq_len: usize,
+    oversized: OversizedRecordPolicy<'_>,
     mut visit: impl FnMut(TrainingSample) -> Result<bool>,
 ) -> Result<usize> {
     ensure!(
@@ -260,7 +337,14 @@ pub(super) fn visit_structured_samples(
         }
         let value: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("invalid JSONL at {}:{line_number}", path.display()))?;
-        let sample = structured_sample(&value, objective, tokenizer, seq_len, path, line_number)?;
+        let sample =
+            match structured_sample(&value, objective, tokenizer, seq_len, path, line_number) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    oversized.absorb(error)?;
+                    continue;
+                }
+            };
         count = count
             .checked_add(1)
             .context("structured sample count overflows usize")?;

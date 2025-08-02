@@ -685,6 +685,170 @@ fn qat_cli_publishes_a_sealed_candidate_and_resume_authenticates_it() {
     );
 }
 
+fn read_training_state(output: &Path) -> Value {
+    let pointer: Value =
+        serde_json::from_slice(&fs::read(output.join("current.json")).unwrap()).unwrap();
+    let generation = pointer["generation"]
+        .as_str()
+        .expect("durable checkpoint pointer names a generation");
+    let state = output
+        .join("generations")
+        .join(generation)
+        .join("training-state.json");
+    serde_json::from_slice(&fs::read(state).unwrap()).unwrap()
+}
+
+/// A preempted ordinary (non-memory) wake run must resume and keep optimizing.
+///
+/// `load_training_state` restores the checkpoint's parameter IDs into the
+/// model, so any Muon matrix selection captured before that load is stale.
+/// `GradientsParams::from_params` then extracts nothing under the stale IDs and
+/// the first resumed optimizer step used to fail with
+/// `Muon gradient is missing for parameter ...`, which made `--resume`
+/// unusable for every model without a memory hierarchy.
+#[test]
+fn preempted_wake_run_resumes_and_keeps_optimizing() {
+    const TOTAL_STEPS: usize = 12;
+    let temporary = TempDir::new().unwrap();
+    let (model, tokenizer, _) = write_common_inputs(temporary.path(), ORDINARY_MODEL);
+    let data = temporary.path().join("stream.jsonl");
+    let mut rows = String::new();
+    for row in 0..48_i64 {
+        let first = row % 200 + 1;
+        let tokens = (first..first + 12)
+            .map(|token| token.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        rows.push_str(&format!("{{\"tokens\":[{tokens}]}}\n"));
+    }
+    fs::write(&data, rows).unwrap();
+    let workflow = temporary.path().join("wake.json");
+    fs::write(
+        &workflow,
+        serde_json::to_vec_pretty(&json!({
+            "version": 2,
+            "phases": [{
+                "name": "wake",
+                "type": "continued_pretrain",
+                "task": {"type": "causal_lm"},
+                "data": data,
+                "sequence_length": 4,
+                "batch_size": 1,
+                "gradient_accumulation": 1,
+                "epochs": 1,
+                "shuffle_buffer": 1,
+                "steps": TOTAL_STEPS
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = temporary.path().join("run");
+
+    // Preempt the run as soon as it has published one resumable generation.
+    let mut child = Command::new(binary())
+        .arg("train")
+        .arg("--config")
+        .arg(&model)
+        .arg("--tokenizer")
+        .arg(&tokenizer)
+        .arg("--workflow")
+        .arg(&workflow)
+        .arg("--output")
+        .arg(&output)
+        .args(["--warmup-steps", "0", "--checkpoint-every", "1"])
+        .spawn()
+        .expect("launching hermes-train");
+    let pointer = output.join("current.json");
+    for _ in 0..600 {
+        if pointer.is_file() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    child.kill().expect("preempting the trainer");
+    child.wait().expect("reaping the preempted trainer");
+    assert!(
+        pointer.is_file(),
+        "the trainer published no resumable generation to preempt"
+    );
+
+    let preempted = read_training_state(&output)["global_step"]
+        .as_u64()
+        .expect("checkpoint records a global step");
+    assert!(preempted >= 1, "preempted before the first optimizer step");
+    assert!(
+        preempted < TOTAL_STEPS as u64,
+        "the phase finished before it could be preempted, so this test would not resume mid-phase"
+    );
+
+    let resumed = run_train(&model, &tokenizer, &workflow, &output, &["--resume"]);
+    assert!(resumed.status.success(), "{}", diagnostic(&resumed));
+    assert_eq!(
+        read_training_state(&output)["global_step"].as_u64(),
+        Some(TOTAL_STEPS as u64),
+        "the resumed run did not finish the planned optimizer steps"
+    );
+}
+
+/// A fine-tuning run started from `--checkpoint` must stay resumable. The
+/// initial checkpoint's identity is part of the run signature, so the resumed
+/// invocation has to repeat it; omitting it must fail with an actionable
+/// message instead of an unexplained configuration mismatch.
+#[test]
+fn finetune_from_checkpoint_resumes_only_with_the_same_initial_checkpoint() {
+    let temporary = TempDir::new().unwrap();
+    let (model, tokenizer, data) = write_common_inputs(temporary.path(), ORDINARY_MODEL);
+    let workflow = temporary.path().join("wake.json");
+    fs::write(
+        &workflow,
+        serde_json::to_vec_pretty(&wake_workflow(&data, None)).unwrap(),
+    )
+    .unwrap();
+
+    // Publish a base checkpoint with an ordinary run, then fine-tune from it.
+    let base_output = temporary.path().join("base");
+    let base = run_train(&model, &tokenizer, &workflow, &base_output, &[]);
+    assert!(base.status.success(), "{}", diagnostic(&base));
+    let pointer: Value =
+        serde_json::from_slice(&fs::read(base_output.join("current.json")).unwrap()).unwrap();
+    let initial = base_output
+        .join("generations")
+        .join(pointer["generation"].as_str().unwrap())
+        .join("weights.safetensors");
+    assert!(initial.is_file());
+
+    let output = temporary.path().join("finetune");
+    let first = run_train(
+        &model,
+        &tokenizer,
+        &workflow,
+        &output,
+        &["--checkpoint", initial.to_str().unwrap()],
+    );
+    assert!(first.status.success(), "{}", diagnostic(&first));
+
+    // Resuming without the initial checkpoint cannot reconstruct the run
+    // signature, and says exactly what is missing.
+    let bare = run_train(&model, &tokenizer, &workflow, &output, &["--resume"]);
+    assert!(!bare.status.success(), "{}", diagnostic(&bare));
+    let error = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        error.contains("must repeat the same `--checkpoint`"),
+        "{error}"
+    );
+
+    // Repeating it resumes the fine-tune idempotently.
+    let resumed = run_train(
+        &model,
+        &tokenizer,
+        &workflow,
+        &output,
+        &["--resume", "--checkpoint", initial.to_str().unwrap()],
+    );
+    assert!(resumed.status.success(), "{}", diagnostic(&resumed));
+}
+
 fn memory_schedule() -> SleepSchedule {
     SleepSchedule {
         clock: UpdateClock::OptimizerSteps,

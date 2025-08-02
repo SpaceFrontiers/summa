@@ -82,8 +82,8 @@ use checkpoint::{
 #[cfg(test)]
 use data::TrainingSample;
 use data::{
-    BatchStats, PhaseDataBinding, SampleStreamConfig, TrainingBatch, count_samples,
-    indexed_causal_sample_count, make_batch, visit_samples,
+    BatchStats, OversizedRecordPolicy, PhaseDataBinding, SampleStreamConfig, TrainingBatch,
+    count_samples, indexed_causal_sample_count, make_batch, visit_samples,
 };
 use muon::BatchedMuon;
 use wake::{ResolvedWakePlan, load_wake_plan};
@@ -178,8 +178,10 @@ struct TrainArgs {
     /// Physical NVIDIA index, GPU UUID, or PCI bus ID passed to nvidia-smi.
     #[arg(long, default_value = "0")]
     gpu_physical_device: String,
-    /// Safetensors checkpoint to fine-tune from.
-    #[arg(long, conflicts_with = "resume")]
+    /// Safetensors checkpoint to fine-tune from. Its exact identity is part of
+    /// the run signature, so `--resume` must repeat the same value; the resumed
+    /// weights themselves always come from --output, never from this file.
+    #[arg(long)]
     checkpoint: Option<PathBuf>,
     /// Resume weights, optimizer state, schedule, and corpus position from --output.
     #[arg(long)]
@@ -202,12 +204,35 @@ struct TrainArgs {
 /// Held-out objectives supported by the forward-only `eval` command. These are
 /// the objectives the wake trainer can optimize end to end, so their reported
 /// numbers are directly comparable with training-time metrics.
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum EvalObjective {
     #[value(name = "causal_lm")]
     CausalLm,
     #[value(name = "contrastive_retrieval")]
     ContrastiveRetrieval,
+    #[value(name = "summarization")]
+    Summarization,
+    #[value(name = "instruction_tuning")]
+    InstructionTuning,
+    #[value(name = "qa_reasoning")]
+    QaReasoning,
+    #[value(name = "retrieval_planning")]
+    RetrievalPlanning,
+}
+
+impl EvalObjective {
+    /// Supervised-generation objectives score only their target tokens, so they
+    /// share one report block, one prompt-framing contract, and the
+    /// oversized-record policy that a prompt-plus-target geometry needs.
+    fn is_supervised_generation(self) -> bool {
+        matches!(
+            self,
+            Self::Summarization
+                | Self::InstructionTuning
+                | Self::QaReasoning
+                | Self::RetrievalPlanning
+        )
+    }
 }
 
 #[derive(clap::Args)]
@@ -249,6 +274,17 @@ struct EvalArgs {
     /// default, exactly as an unset workflow objective would.
     #[arg(long)]
     temperature: Option<f64>,
+    /// Instruction text for a supervised-generation objective. It is part of
+    /// every prompt, so it must match the training phase's `task.instruction`
+    /// for the reported loss to be comparable. Omitted uses the same built-in
+    /// default an unset workflow objective would.
+    #[arg(long)]
+    instruction: Option<String>,
+    /// `qa_reasoning` only: require a `reasoning` field and supervise the
+    /// `Reasoning:`/`Answer:` target framing, exactly as the training phase's
+    /// `require_reasoning` does.
+    #[arg(long)]
+    require_reasoning: bool,
     /// JSON report path. The human-readable summary is always printed.
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
@@ -3000,9 +3036,17 @@ mod tests {
     fn training_decreases_loss_and_checkpoint_roundtrips() {
         let mut config = small_hybrid();
         for block in config.pattern.as_mut().unwrap() {
-            block.dropout = 0.1;
-            block.attention.dropout = 0.1;
-            block.ffn.dropout = 0.1;
+            // Deliberately zero, and do not "restore" this to a live rate. The
+            // dropout masks are drawn from the backend's *global* device RNG,
+            // which every concurrently running test that builds a model also
+            // draws from. With dropout enabled the in-process model and the
+            // checkpoint-restored model see different masks on their shared
+            // training step, and the round-trip comparison below fails
+            // nondeterministically. Nothing here asserts dropout behaviour, and
+            // the final comparison runs under `.valid()` with dropout disabled.
+            block.dropout = 0.0;
+            block.attention.dropout = 0.0;
+            block.ffn.dropout = 0.0;
         }
         let device = hermes_llm::default_device().autodiff();
         device.seed(41);
