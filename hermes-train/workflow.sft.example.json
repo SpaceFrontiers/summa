@@ -20,10 +20,30 @@
       "learning_rate_scale": 1.0
     },
     {
+      "name": "replay-retrieval-language-foundations-seq512",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/01-language-foundations-retrieval.jsonl.zst",
+      "sequence_length": 512,
+      "batch_size": 8,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "steps": 1200,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5
+    },
+    {
       "name": "replay-1-language-foundations-seq512",
       "type": "continued_pretrain",
-      "task": { "type": "causal_lm" },
-      "data": "/opt/hermes-run/moe-300m-v5-optimized-20260731/data/01-language-foundations-causal.jsonl.zst",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/01-language-foundations-causal.jsonl.zst",
       "sequence_length": 512,
       "batch_size": 32,
       "gradient_accumulation": 2,
@@ -51,10 +71,30 @@
       "learning_rate_scale": 1.0
     },
     {
+      "name": "replay-retrieval-school-fundamentals-seq512",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/02-school-fundamentals-retrieval.jsonl.zst",
+      "sequence_length": 512,
+      "batch_size": 8,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "steps": 1200,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5
+    },
+    {
       "name": "replay-2-school-fundamentals-seq1024",
       "type": "continued_pretrain",
-      "task": { "type": "causal_lm" },
-      "data": "/opt/hermes-run/moe-300m-v5-optimized-20260731/data/02-school-fundamentals-causal.jsonl.zst",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/02-school-fundamentals-causal.jsonl.zst",
       "sequence_length": 1024,
       "batch_size": 16,
       "gradient_accumulation": 2,
@@ -83,6 +123,24 @@
       "learning_rate_scale": 1.0
     },
     {
+      "name": "replay-retrieval-university-core-seq768",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/03-university-core-retrieval.jsonl.zst",
+      "sequence_length": 768,
+      "batch_size": 8,
+      "gradient_accumulation": 2,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "steps": 1200,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5
+    },
+    {
       "name": "sft-4-qa-reasoning-rag-seq2048",
       "type": "sft",
       "task": {
@@ -101,10 +159,30 @@
       "learning_rate_scale": 1.0
     },
     {
+      "name": "replay-retrieval-advanced-scholarship-seq1024",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/04-advanced-scholarship-retrieval.jsonl.zst",
+      "sequence_length": 1024,
+      "batch_size": 4,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 2048,
+      "steps": 1200,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5
+    },
+    {
       "name": "replay-3-university-core-seq2048",
       "type": "continued_pretrain",
-      "task": { "type": "causal_lm" },
-      "data": "/opt/hermes-run/moe-300m-v5-optimized-20260731/data/03-university-core-causal.jsonl.zst",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/03-university-core-causal.jsonl.zst",
       "sequence_length": 2048,
       "batch_size": 8,
       "gradient_accumulation": 2,
@@ -134,8 +212,10 @@
     {
       "name": "replay-4-advanced-scholarship-seq4096",
       "type": "continued_pretrain",
-      "task": { "type": "causal_lm" },
-      "data": "/opt/hermes-run/moe-300m-v5-optimized-20260731/data/04-advanced-scholarship-causal.jsonl.zst",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/04-advanced-scholarship-causal.jsonl.zst",
       "sequence_length": 4096,
       "batch_size": 4,
       "gradient_accumulation": 2,
