@@ -59,6 +59,7 @@ cargo test --workspace
 | ---------------------------- | ------------------------------------------------------------------------------------------ |
 | **hermes-core**              | Core search engine library (async, BM25 ranking, WAND optimization, segment-based storage) |
 | **hermes-server**            | gRPC server for remote search and index operations                                         |
+| **hermes-broker**            | gRPC broker routing the same protocol across many hermes-server instances                  |
 | **hermes-tool**              | CLI for index management and data processing pipelines                                     |
 | **hermes-wasm**              | WebAssembly bindings for browser-based search and indexing                                 |
 | **hermes-web**               | Vue/WASM search UI                                                                         |

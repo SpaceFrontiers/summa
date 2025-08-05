@@ -3,6 +3,12 @@
 [`hermes.proto`](hermes.proto) is the single wire-contract source for the
 Hermes gRPC server and both maintained clients.
 
+[`hermes-broker.proto`](hermes-broker.proto) is the broker-only control
+surface (`hermes.broker.BrokerService`: topology and backend inspection).
+It lives in a separate file precisely so `hermes.proto` — and the generated
+Python/TypeScript clients CI keeps in lockstep with it — never changes for
+broker concerns. The broker re-serves `hermes.proto` verbatim.
+
 The protocol exposes:
 
 - `SearchService` for search, document retrieval by `DocAddress`, and index

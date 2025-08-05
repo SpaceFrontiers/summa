@@ -18,6 +18,7 @@ WORKDIR /app
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
+COPY hermes-broker ./hermes-broker
 COPY hermes-core ./hermes-core
 COPY hermes-llm ./hermes-llm
 COPY hermes-mal ./hermes-mal

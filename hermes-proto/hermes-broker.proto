@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package hermes.broker;
+
+// Broker-only control surface. Lives in a separate file so the hermes.proto
+// wire contract (and the generated Python/TypeScript clients that CI keeps in
+// lockstep with it) never churns for broker concerns. Field numbers follow
+// the same rule as hermes.proto: never renumber, never reuse.
+service BrokerService {
+  // Topology as the broker currently routes it: logical indexes, their
+  // shards, and the replicas serving each shard.
+  rpc GetTopology(GetTopologyRequest) returns (GetTopologyResponse);
+
+  // Raw discovered backends, independent of index placement.
+  rpc GetBackends(GetBackendsRequest) returns (GetBackendsResponse);
+
+  // Force an immediate re-poll of every backend's index list.
+  rpc RefreshTopology(RefreshTopologyRequest) returns (RefreshTopologyResponse);
+}
+
+message GetTopologyRequest {
+  // Empty = all indexes.
+  string index_name = 1;
+}
+
+message GetTopologyResponse {
+  repeated IndexTopology indexes = 1;
+}
+
+message IndexTopology {
+  string index_name = 1;
+  // Partition order is routing order (placement-rule order).
+  repeated Partition partitions = 2;
+  // "passthrough" while the index lives on a single shard; "rank" or "score"
+  // once partitioned merging applies.
+  string merge_policy = 3;
+  // Empty when the index has no primary key or the schema is not yet cached.
+  string primary_key_field = 4;
+  // True when the index name was seen on several shard ids without a
+  // placement rule pinning it (migration transient): reads are served from a
+  // deterministic shard, writes are refused.
+  bool ambiguous = 5;
+}
+
+message Partition {
+  string shard_id = 1;
+  repeated ReplicaState replicas = 2;
+}
+
+message ReplicaState {
+  // Pod name in kubernetes discovery, backend id in static discovery.
+  string backend_id = 1;
+  string address = 2;
+  // "master" | "follower"
+  string role = 3;
+  // "healthy" | "suspect" | "evicted"
+  string health = 4;
+  uint32 num_docs = 5;
+  uint32 num_segments = 6;
+  // Milliseconds since the backend's index list was last refreshed.
+  uint64 index_map_age_ms = 7;
+}
+
+message GetBackendsRequest {}
+
+message GetBackendsResponse {
+  repeated BackendState backends = 1;
+}
+
+message BackendState {
+  string backend_id = 1;
+  string address = 2;
+  string shard_id = 3;
+  // "master" | "follower"
+  string role = 4;
+  // "healthy" | "suspect" | "evicted"
+  string health = 5;
+  repeated string indexes = 6;
+  uint64 index_map_age_ms = 7;
+  uint64 consecutive_failures = 8;
+  bool ready = 9;
+}
+
+message RefreshTopologyRequest {}
+
+message RefreshTopologyResponse {
+  uint32 backends_polled = 1;
+}

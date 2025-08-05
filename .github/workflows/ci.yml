@@ -72,6 +72,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Broker end-to-end against real hermes-server
+        run: |
+          cargo build -p hermes-server --bin hermes-server
+          cargo test -p hermes-broker --test e2e_real_server -- --ignored
+
       - name: Validate model-bound training workflows
         run: |
           cargo run -p hermes-train -- validate-workflow \

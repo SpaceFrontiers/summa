@@ -175,6 +175,9 @@ jobs:
       - name: Publish hermes-server
         run: cargo publish -p hermes-server --no-verify
 
+      - name: Publish hermes-broker
+        run: cargo publish -p hermes-broker --no-verify
+
       - name: Publish hermes-tool
         run: cargo publish -p hermes-tool --no-verify
 
@@ -321,5 +324,26 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract broker metadata
+        id: broker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/hermes-broker
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.bump-version.outputs.new_version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.bump-version.outputs.new_version }}
+            type=raw,value=latest
+
+      - name: Build and push broker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: hermes-broker/Dockerfile
+          push: true
+          tags: ${{ steps.broker-meta.outputs.tags }}
+          labels: ${{ steps.broker-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
