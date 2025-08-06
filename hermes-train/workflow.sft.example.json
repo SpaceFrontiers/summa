@@ -33,7 +33,6 @@
       "gradient_accumulation": 4,
       "epochs": 1,
       "shuffle_buffer": 4096,
-      "steps": 1200,
       "loss_weight": 1.0,
       "learning_rate_scale": 0.5
     },
@@ -84,7 +83,6 @@
       "gradient_accumulation": 4,
       "epochs": 1,
       "shuffle_buffer": 4096,
-      "steps": 1200,
       "loss_weight": 1.0,
       "learning_rate_scale": 0.5
     },
@@ -136,7 +134,6 @@
       "gradient_accumulation": 2,
       "epochs": 1,
       "shuffle_buffer": 4096,
-      "steps": 1200,
       "loss_weight": 1.0,
       "learning_rate_scale": 0.5
     },
@@ -172,7 +169,6 @@
       "gradient_accumulation": 4,
       "epochs": 1,
       "shuffle_buffer": 2048,
-      "steps": 1200,
       "loss_weight": 1.0,
       "learning_rate_scale": 0.5
     },
