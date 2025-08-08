@@ -127,6 +127,13 @@ task defaults. In-batch negatives make retrieval accuracy depend on the
 candidate-pool size, so a trailing batch that cannot be filled is dropped and
 counted in `dropped_samples`; token-weighted language losses score it exactly.
 
+For measurements that the streaming evaluator cannot make, use
+[`retrieval-pool-eval`](retrieval-pool-eval.md) to rank against one global
+candidate pool and [`generate-eval`](generation-eval.md) to score free-running
+decodes. The former exposes retrieval regressions after the in-batch metric
+saturates; the latter catches generation failures that teacher-forced loss can
+hide.
+
 ### Supervised-generation objectives
 
 `--objective summarization`, `instruction_tuning`, `qa_reasoning`, and

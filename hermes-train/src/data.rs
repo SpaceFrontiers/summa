@@ -34,8 +34,10 @@ pub(crate) use batch::{
     BatchStats, EncodedText, LanguageBatch, RetrievalBatch, TrainingBatch, TrainingSample,
     make_batch,
 };
-pub(crate) use structured::OversizedRecordPolicy;
 use structured::visit_structured_samples;
+pub(crate) use structured::{
+    OversizedRecordPolicy, OversizedSupervisedRecord, encode_retrieval_text, frame_supervised,
+};
 
 const TOKENIZE_BATCH: usize = 1_000;
 const TOKEN_CACHE_MAGIC: &[u8; 8] = b"HERTOK01";
@@ -138,7 +140,7 @@ impl PhaseDataBinding {
 
     /// Stream every source through authenticated handles. The final identity
     /// check deliberately runs even when the visitor errors or exits early.
-    fn with_readers(
+    pub(crate) fn with_readers(
         &self,
         path: &Path,
         mut visit: impl FnMut(&Path, &mut dyn BufRead) -> Result<bool>,

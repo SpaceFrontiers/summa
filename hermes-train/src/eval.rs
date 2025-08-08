@@ -34,8 +34,9 @@ use crate::{
 ///
 /// v2 added the four supervised-generation objectives: the `task` block that
 /// pins their prompt framing, the `supervised_generation` metrics block, and
-/// `oversized_records`.
-const EVAL_REPORT_VERSION: u32 = 2;
+/// `oversized_records`. v3 makes retrieval rank metrics use the same
+/// deterministic first-index tie-break as top-1 argmax.
+const EVAL_REPORT_VERSION: u32 = 3;
 
 /// File names the trainer publishes inside its own output root. Refusing them
 /// keeps a mistyped `--output` from overwriting a live run's state with a
@@ -78,6 +79,29 @@ impl WeightedMean {
     fn mean(&self) -> Option<f64> {
         (self.weight > 0.0).then(|| self.weighted_sum / self.weight)
     }
+}
+
+/// One-based rank under the same deterministic tie-break as an argmax that
+/// returns the lowest candidate index. A positive tied with an earlier
+/// candidate is therefore not awarded an optimistic rank of one.
+pub(super) fn rank_with_index_tiebreak(scores: &[f32], positive_index: usize) -> Result<usize> {
+    let positive = *scores.get(positive_index).with_context(|| {
+        format!(
+            "positive index {positive_index} is outside {} scores",
+            scores.len()
+        )
+    })?;
+    ensure!(
+        scores.iter().all(|score| score.is_finite()),
+        "retrieval scores contain a non-finite value"
+    );
+    Ok(1 + scores
+        .iter()
+        .enumerate()
+        .filter(|(index, score)| {
+            **score > positive || (**score == positive && *index < positive_index)
+        })
+        .count())
 }
 
 #[derive(Debug, Serialize)]
@@ -295,10 +319,7 @@ impl<'a> Evaluation<'a> {
                             format!("retrieval label {label} is outside {candidates} candidates")
                         })?;
                     let row = &scores[query * candidates..(query + 1) * candidates];
-                    let positive = row[label];
-                    // Count strictly better candidates so tied scores never
-                    // produce an optimistic rank of zero.
-                    let rank = 1 + row.iter().filter(|score| **score > positive).count();
+                    let rank = rank_with_index_tiebreak(row, label)?;
                     self.retrieval_reciprocal_rank.push(1.0 / rank as f64, 1)?;
                     self.retrieval_recall_at_k
                         .push(f64::from(u8::from(rank <= self.recall_k)), 1)?;
@@ -438,20 +459,20 @@ impl EvalArgs {
 
 /// Deserialize a task by tag alone, so every field this command does not expose
 /// keeps the built-in default a workflow phase would get.
-fn task_defaults(name: &str) -> Result<TaskConfig> {
+pub(super) fn task_defaults(name: &str) -> Result<TaskConfig> {
     serde_json::from_value(json!({"type": name}))
         .with_context(|| format!("built-in `{name}` task defaults are invalid"))
 }
 
 /// Report a degraded or adjusted condition to both the operator and the report.
 /// `tracing` alone is not enough here: the CLI's default filter hides warnings.
-fn warn_operator(warnings: &mut Vec<String>, message: String) {
+pub(super) fn warn_operator(warnings: &mut Vec<String>, message: String) {
     eprintln!("warning: {message}");
     warn!("{message}");
     warnings.push(message);
 }
 
-fn validate_report_path(output: &Path) -> Result<()> {
+pub(super) fn validate_report_path(output: &Path) -> Result<()> {
     ensure!(
         !output.is_dir(),
         "--output {} is a directory",
@@ -515,7 +536,8 @@ pub(super) fn evaluate(args: EvalArgs) -> Result<()> {
         args.sequence_length,
         config.max_seq_len
     );
-    if let Some(layer) = objective.retrieval_layer() {
+    if matches!(objective, TaskConfig::RetrievalRepresentation { .. }) {
+        let layer = objective.retrieval_layer().unwrap_or(config.num_layers);
         validate_retrieval_layer_for_model(layer, &config, "eval")?;
     }
 
@@ -752,6 +774,20 @@ mod tests {
 
     use super::*;
     use crate::data::write_test_tokenizer;
+
+    #[test]
+    fn retrieval_rank_uses_the_same_first_index_tiebreak_as_top1() {
+        let scores = [0.5, 1.0, 1.0, 0.25];
+        let device = hermes_llm::default_device();
+        let argmax = burn::tensor::Tensor::<1>::from_floats(scores, &device)
+            .argmax(0)
+            .into_scalar::<i64>();
+        assert_eq!(argmax, 1, "backend argmax tie-break changed");
+        assert_eq!(rank_with_index_tiebreak(&scores, 1).unwrap(), 1);
+        assert_eq!(rank_with_index_tiebreak(&scores, 2).unwrap(), 2);
+        assert!(rank_with_index_tiebreak(&scores, 4).is_err());
+        assert!(rank_with_index_tiebreak(&[0.5, f32::NAN], 0).is_err());
+    }
 
     /// `max_seq_len` must clear the supervised objectives' fixed prompt framing:
     /// their built-in instructions plus target markers already occupy more than
@@ -1238,7 +1274,7 @@ model tiny {
         arguments.instruction = Some("Answer from the passages.".to_owned());
         evaluate(arguments).unwrap();
         let parsed = report(&fixture.output);
-        assert_eq!(parsed["version"], 2, "{parsed}");
+        assert_eq!(parsed["version"], 3, "{parsed}");
         assert_eq!(parsed["task"]["type"], "qa_reasoning", "{parsed}");
         assert_eq!(
             parsed["task"]["instruction"], "Answer from the passages.",

@@ -69,7 +69,9 @@ use sha2::{Digest, Sha256};
 mod checkpoint;
 mod data;
 mod eval;
+mod generate_eval;
 mod muon;
+mod retrieval_pool;
 mod trainer;
 mod wake;
 
@@ -109,6 +111,10 @@ enum Command {
     Train(TrainArgs),
     /// Score a checkpoint on held-out data with a forward-only pass.
     Eval(EvalArgs),
+    /// Rank retrieval queries against a full document pool, not their own batch.
+    RetrievalPoolEval(RetrievalPoolArgs),
+    /// Decode freely from a checkpoint and score the decodes, not the loss.
+    GenerateEval(GenerateEvalArgs),
     /// Validate and resolve a strict WorkflowV2 file.
     ValidateWorkflow(ValidateWorkflowArgs),
     /// Verify an exact-resume checkpoint with the trainer's strict schema.
@@ -285,6 +291,123 @@ struct EvalArgs {
     /// `require_reasoning` does.
     #[arg(long)]
     require_reasoning: bool,
+    /// JSON report path. The human-readable summary is always printed.
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+}
+
+/// Supervised-generation tasks, the only ones that can be decoded from. Value
+/// names match `eval`'s so the two commands take the same `--objective` spelling.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GenerationObjective {
+    #[value(name = "summarization")]
+    Summarization,
+    #[value(name = "instruction_tuning")]
+    InstructionTuning,
+    #[value(name = "qa_reasoning")]
+    QaReasoning,
+    #[value(name = "retrieval_planning")]
+    RetrievalPlanning,
+}
+
+impl GenerationObjective {
+    fn task_name(self) -> &'static str {
+        match self {
+            Self::Summarization => "summarization",
+            Self::InstructionTuning => "instruction_tuning",
+            Self::QaReasoning => "qa_reasoning",
+            Self::RetrievalPlanning => "retrieval_planning",
+        }
+    }
+}
+
+/// Decode freely from a checkpoint using the trainer's own prompt framing and
+/// score the decodes. See `docs/generation-eval.md`.
+#[derive(clap::Args)]
+struct GenerateEvalArgs {
+    /// MAL source or exported JSON model configuration.
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(short = 't', long)]
+    tokenizer: PathBuf,
+    /// Safetensors weights to decode with. Loaded strictly against --config.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// Held-out shard, repeatable. Requires .jsonl/.jsonl.zst.
+    #[arg(long = "data", required = true)]
+    data: Vec<PathBuf>,
+    #[arg(long, value_enum)]
+    objective: GenerationObjective,
+    /// Prompt budget. The gold target's length is reserved inside it, exactly as
+    /// training reserves it, so the decode prompt matches the trained prompt.
+    #[arg(long)]
+    sequence_length: usize,
+    #[arg(long, default_value_t = 60)]
+    max_new_tokens: usize,
+    /// `<= 0` selects greedy decoding, which is the reproducible default and the
+    /// setting under which degenerate copying is visible.
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f64,
+    #[arg(long)]
+    top_k: Option<usize>,
+    #[arg(long, default_value_t = 1.0)]
+    repetition_penalty: f64,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Stop after scoring this many records. Unset decodes every record, which is
+    /// slow: decoding is autoregressive.
+    #[arg(long)]
+    max_records: Option<usize>,
+    /// Instruction text. It is part of every prompt, so it must match the
+    /// training phase's `task.instruction` for decodes to be in distribution.
+    #[arg(long)]
+    instruction: Option<String>,
+    /// `qa_reasoning` only: supervise and expect the `Reasoning:`/`Answer:`
+    /// framing, exactly as the training phase's `require_reasoning` does.
+    #[arg(long)]
+    require_reasoning: bool,
+    /// Write every prompt, decode, and gold target here for review. Metrics
+    /// summarize; only reading decodes catches a new failure mode.
+    #[arg(long)]
+    samples: Option<PathBuf>,
+    /// JSON report path. The human-readable summary is always printed.
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+}
+
+/// Rank each query's positive against a pool built from every distinct document
+/// the shards mention, instead of against its own batch. See
+/// `docs/retrieval-pool-eval.md`.
+#[derive(clap::Args)]
+struct RetrievalPoolArgs {
+    /// MAL source or exported JSON model configuration.
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(short = 't', long)]
+    tokenizer: PathBuf,
+    /// Safetensors weights to score. Loaded strictly against --config.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// Retrieval shard, repeatable. Contributes both queries and pool documents.
+    #[arg(long = "data", required = true)]
+    data: Vec<PathBuf>,
+    /// Extra shard whose documents enlarge the pool without contributing
+    /// queries. Use it to make ranking harder than the query set alone allows.
+    #[arg(long = "distractors")]
+    distractors: Vec<PathBuf>,
+    #[arg(long)]
+    sequence_length: usize,
+    /// Sequences embedded per forward pass. Unlike `eval`, this does not change
+    /// the candidate set: the pool is always every pooled document.
+    #[arg(long)]
+    batch_size: usize,
+    /// Rank cut-off for the reported recall.
+    #[arg(long, default_value_t = 10)]
+    recall_k: usize,
+    /// One-based retrieval read-out layer; omitted reads the final layer. Must
+    /// match the layer the retrieval training phase used.
+    #[arg(long)]
+    retrieval_layer: Option<usize>,
     /// JSON report path. The human-readable summary is always printed.
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
@@ -1876,6 +1999,8 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Train(args) => trainer::train(args),
         Command::Eval(args) => eval::evaluate(args),
+        Command::RetrievalPoolEval(args) => retrieval_pool::evaluate(args),
+        Command::GenerateEval(args) => generate_eval::evaluate(args),
         Command::ValidateWorkflow(args) => validate_workflow_command(args),
         Command::VerifyCheckpoint(args) => verify_checkpoint_command(args),
         Command::PrepareCorpus(args) => prepare_corpus_command(args),
@@ -2204,6 +2329,45 @@ mod tests {
             sleep_runtime: None,
             sleep_runtime_sha256: None,
             print_run_signature: false,
+        }
+    }
+
+    /// `eval` and `generate-eval` are run back to back on the same objective, so
+    /// a reader must not have to remember that one spells it `qa_reasoning` and
+    /// the other `qa-reasoning`. Derived value names would kebab-case these.
+    #[test]
+    fn generate_eval_objectives_are_spelled_exactly_as_eval_spells_them() {
+        for objective in [
+            "summarization",
+            "instruction_tuning",
+            "qa_reasoning",
+            "retrieval_planning",
+        ] {
+            for command in ["eval", "generate-eval"] {
+                let mut arguments = vec![
+                    "hermes-train",
+                    command,
+                    "--config",
+                    "model.mal",
+                    "--tokenizer",
+                    "tokenizer.json",
+                    "--checkpoint",
+                    "weights.safetensors",
+                    "--data",
+                    "holdout.jsonl",
+                    "--objective",
+                    objective,
+                    "--sequence-length",
+                    "128",
+                ];
+                if command == "eval" {
+                    arguments.extend(["--batch-size", "2"]);
+                }
+                assert!(
+                    Cli::try_parse_from(arguments).is_ok(),
+                    "`{command} --objective {objective}` must parse"
+                );
+            }
         }
     }
 

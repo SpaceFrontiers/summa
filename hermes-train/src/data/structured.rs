@@ -105,7 +105,30 @@ fn encode_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
         .collect())
 }
 
-fn make_supervised_sample(
+/// One supervised record split into the tokens the model is prompted with and
+/// the tokens it is supervised to produce.
+///
+/// Training and free-running decoding both consume this, so a decode prompt is
+/// the training prompt by construction rather than by convention. Assembling a
+/// prompt independently would put it out of distribution and make a healthy
+/// model look broken — a mistake already made once by hand.
+pub(crate) struct SupervisedFraming {
+    pub(crate) prompt_tokens: Vec<i64>,
+    /// Token range inside `prompt_tokens` that came from the truncatable source.
+    /// Generation metrics use this rather than the original source so text the
+    /// model never saw cannot count as grounded overlap.
+    pub(crate) source_range: std::ops::Range<usize>,
+    pub(crate) target_tokens: Vec<i64>,
+    pub(crate) truncated_tokens: usize,
+}
+
+/// Tokenize and truncate one supervised record at `seq_len`.
+///
+/// The source is the only truncatable part, and the target's own length is
+/// reserved before truncating it. Decoding therefore has to supply the gold
+/// target too: reserving the same budget is what makes the generated prompt
+/// identical to the one the loss was measured against.
+pub(crate) fn frame_supervised(
     tokenizer: &Tokenizer,
     prefix: &str,
     source: &str,
@@ -113,7 +136,7 @@ fn make_supervised_sample(
     target: &str,
     seq_len: usize,
     source_required: bool,
-) -> Result<TrainingSample> {
+) -> Result<SupervisedFraming> {
     let prefix = encode_tokens(tokenizer, prefix)?;
     let source = encode_tokens(tokenizer, source)?;
     let suffix = encode_tokens(tokenizer, suffix)?;
@@ -149,27 +172,68 @@ fn make_supervised_sample(
     let kept_source = source.len().min(capacity - fixed_tokens);
     debug_assert!(!source_required || kept_source > 0);
     let truncated_tokens = source.len() - kept_source;
-    let prompt_len = prefix.len() + kept_source + suffix.len();
-    ensure!(prompt_len > 0, "supervised prompt tokenized to empty");
 
-    let mut tokens = Vec::with_capacity(capacity);
-    tokens.extend(prefix);
-    tokens.extend_from_slice(&source[..kept_source]);
-    tokens.extend(suffix);
-    tokens.extend(target.iter().copied());
-    tokens.push(i64::from(tokenizer.eos_token_id()));
-    tokens.resize(capacity, i64::from(tokenizer.eos_token_id()));
-
-    // Combined token `i` is target position `i - 1` in the shifted batch.
-    let loss_positions = (prompt_len - 1..prompt_len + target.len()).collect();
-    Ok(TrainingSample::Supervised {
-        tokens,
-        loss_positions,
+    let source_start = prefix.len();
+    let source_end = source_start + kept_source;
+    let mut prompt_tokens = Vec::with_capacity(prefix.len() + kept_source + suffix.len());
+    prompt_tokens.extend(prefix);
+    prompt_tokens.extend_from_slice(&source[..kept_source]);
+    prompt_tokens.extend(suffix);
+    ensure!(
+        !prompt_tokens.is_empty(),
+        "supervised prompt tokenized to empty"
+    );
+    Ok(SupervisedFraming {
+        prompt_tokens,
+        source_range: source_start..source_end,
+        target_tokens: target,
         truncated_tokens,
     })
 }
 
-fn encode_retrieval_text(
+fn make_supervised_sample(
+    tokenizer: &Tokenizer,
+    prefix: &str,
+    source: &str,
+    suffix: &str,
+    target: &str,
+    seq_len: usize,
+    source_required: bool,
+) -> Result<TrainingSample> {
+    let framing = frame_supervised(
+        tokenizer,
+        prefix,
+        source,
+        suffix,
+        target,
+        seq_len,
+        source_required,
+    )?;
+    let capacity = seq_len + 1;
+    let prompt_len = framing.prompt_tokens.len();
+    let target_len = framing.target_tokens.len();
+
+    let mut tokens = Vec::with_capacity(capacity);
+    tokens.extend(framing.prompt_tokens);
+    tokens.extend(framing.target_tokens);
+    tokens.push(i64::from(tokenizer.eos_token_id()));
+    tokens.resize(capacity, i64::from(tokenizer.eos_token_id()));
+
+    // Combined token `i` is target position `i - 1` in the shifted batch.
+    let loss_positions = (prompt_len - 1..prompt_len + target_len).collect();
+    Ok(TrainingSample::Supervised {
+        tokens,
+        loss_positions,
+        truncated_tokens: framing.truncated_tokens,
+    })
+}
+
+/// Frame one retrieval text exactly as retrieval training frames it: task
+/// prefix segments kept whole, the document body truncated to fit, EOS appended,
+/// and `end_position` pointing at that EOS. The pool evaluator shares this so a
+/// pool embedding is never computed from a differently framed prompt than the
+/// one the objective was trained on.
+pub(crate) fn encode_retrieval_text(
     tokenizer: &Tokenizer,
     text: &SegmentedText,
     seq_len: usize,
@@ -363,6 +427,50 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::data::write_test_tokenizer;
+
+    /// The guarantee `generate-eval` rests on: the tokens a decode is prompted
+    /// with are exactly the training sample's tokens up to the target. Training
+    /// and decoding share [`frame_supervised`], and this pins that they cannot
+    /// drift apart — a hand-built prompt would be out of distribution and would
+    /// report a failure that is not there.
+    #[test]
+    fn the_decode_prompt_is_the_training_sample_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let tokenizer = write_test_tokenizer(directory.path());
+        let seq_len = 96;
+        let (prefix, source, suffix, target) = (
+            "Follow the instruction.\n\nInstruction:\n",
+            "summarize this held-out source text",
+            "\n\nResponse:\n",
+            "a short response",
+        );
+        let framing =
+            frame_supervised(&tokenizer, prefix, source, suffix, target, seq_len, true).unwrap();
+        let TrainingSample::Supervised { tokens, .. } =
+            make_supervised_sample(&tokenizer, prefix, source, suffix, target, seq_len, true)
+                .unwrap()
+        else {
+            panic!("expected a supervised sample")
+        };
+        assert_eq!(
+            framing.prompt_tokens,
+            tokens[..framing.prompt_tokens.len()],
+            "decode prompt diverged from the training prompt prefix"
+        );
+        assert_eq!(
+            framing.target_tokens,
+            tokens[framing.prompt_tokens.len()
+                ..framing.prompt_tokens.len() + framing.target_tokens.len()],
+            "target tokens diverged from the training sample"
+        );
+        let encoded_source = encode_tokens(&tokenizer, source).unwrap();
+        assert_eq!(
+            &framing.prompt_tokens[framing.source_range.clone()],
+            &encoded_source[..framing.source_range.len()],
+            "visible source range does not identify the source inside the prompt"
+        );
+    }
 
     fn assert_supervised_contract(
         task: TaskConfig,
