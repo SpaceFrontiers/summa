@@ -1,0 +1,179 @@
+{
+  "version": 2,
+  "name": "retriever-300m-moe-sft-v1-20260804",
+  "phases": [
+    {
+      "name": "sft-1-qa-rag-v3-seq2048",
+      "type": "sft",
+      "task": {
+        "type": "qa_reasoning",
+        "instruction": "Solve the problem carefully and provide the final answer.",
+        "require_reasoning": false
+      },
+      "data": "/opt/hermes-run/sft-data-v3/train-qa.jsonl.zst",
+      "sequence_length": 2048,
+      "batch_size": 8,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "steps": 1800,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 1.0
+    },
+    {
+      "name": "replay-retr-university-seq768",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/03-university-core-retrieval.jsonl.zst",
+      "sequence_length": 768,
+      "batch_size": 8,
+      "gradient_accumulation": 2,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5,
+      "steps": 150
+    },
+    {
+      "name": "sft-2-instruction-seq2048",
+      "type": "sft",
+      "task": {
+        "type": "instruction_tuning",
+        "instruction": "Follow the instruction and provide the requested response."
+      },
+      "data": "/data/sft-mixture/v2-20260804/train-instruction.jsonl.zst",
+      "sequence_length": 2048,
+      "batch_size": 8,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 2048,
+      "steps": 1200,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 1.0
+    },
+    {
+      "name": "replay-causal-foundations-seq512",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/01-language-foundations-causal.jsonl.zst",
+      "sequence_length": 512,
+      "batch_size": 32,
+      "gradient_accumulation": 2,
+      "epochs": 1,
+      "shuffle_buffer": 32768,
+      "steps": 400,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5
+    },
+    {
+      "name": "sft-3-summarization-seq4096",
+      "type": "sft",
+      "task": {
+        "type": "summarization",
+        "instruction": "Summarize the document faithfully and concisely."
+      },
+      "data": "/data/summarization-pairs/v1-20260803/train.jsonl.zst",
+      "sequence_length": 4096,
+      "batch_size": 4,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "steps": 800,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 1.0
+    },
+    {
+      "name": "replay-retr-advanced-seq1024",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/04-advanced-scholarship-retrieval.jsonl.zst",
+      "sequence_length": 1024,
+      "batch_size": 4,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 2048,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5,
+      "steps": 150
+    },
+    {
+      "name": "replay-causal-university-seq2048",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "causal_lm"
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/03-university-core-causal.jsonl.zst",
+      "sequence_length": 2048,
+      "batch_size": 8,
+      "gradient_accumulation": 2,
+      "epochs": 1,
+      "shuffle_buffer": 8192,
+      "steps": 400,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5
+    },
+    {
+      "name": "sft-4-qa-mixture-seq4096",
+      "type": "sft",
+      "task": {
+        "type": "qa_reasoning",
+        "instruction": "Solve the problem carefully and provide the final answer.",
+        "require_reasoning": false
+      },
+      "data": "/data/sft-mixture/v1-20260804/train-qa.jsonl.zst",
+      "sequence_length": 4096,
+      "batch_size": 4,
+      "gradient_accumulation": 8,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "steps": 600,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 1.0
+    },
+    {
+      "name": "replay-retr-school-seq512",
+      "type": "continued_pretrain",
+      "task": {
+        "type": "retrieval_representation",
+        "temperature": 0.05,
+        "layer": 24
+      },
+      "data": "/opt/hermes-run/moe-300m-v4/data/02-school-fundamentals-retrieval.jsonl.zst",
+      "sequence_length": 512,
+      "batch_size": 8,
+      "gradient_accumulation": 4,
+      "epochs": 1,
+      "shuffle_buffer": 4096,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 0.5,
+      "steps": 150
+    },
+    {
+      "name": "sft-5-planning-seq1024",
+      "type": "sft",
+      "task": {
+        "type": "retrieval_planning",
+        "instruction": "Create a concise retrieval plan as an ordered action trace."
+      },
+      "data": "/data/rag-tasks/v2-20260804/train-planning.jsonl.zst",
+      "sequence_length": 1024,
+      "batch_size": 16,
+      "gradient_accumulation": 2,
+      "epochs": 1,
+      "shuffle_buffer": 16384,
+      "steps": 900,
+      "loss_weight": 1.0,
+      "learning_rate_scale": 1.0
+    }
+  ]
+}
