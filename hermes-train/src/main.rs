@@ -816,7 +816,24 @@ fn validate_model_wake_plan(config: &ModelDef, workflow: &ResolvedWakePlan) -> R
 #[derive(Clone, Copy)]
 struct PhasePlan {
     samples: Option<usize>,
+    natural_steps: Option<usize>,
     steps: usize,
+}
+
+fn select_phase_steps(
+    phase_name: &str,
+    samples: usize,
+    batch_size: usize,
+    gradient_accumulation: usize,
+    epochs: usize,
+    max_steps: Option<usize>,
+) -> Result<(usize, usize)> {
+    let steps_per_epoch = (samples / batch_size).div_euclid(gradient_accumulation);
+    let natural_steps = steps_per_epoch.checked_mul(epochs).with_context(|| {
+        format!("workflow phase `{phase_name}` optimizer-step count overflows usize")
+    })?;
+    let selected_steps = max_steps.map_or(natural_steps, |cap| natural_steps.min(cap));
+    Ok((natural_steps, selected_steps))
 }
 
 fn planned_sample_count(
@@ -862,8 +879,8 @@ fn plan_training(
     let mut total_steps = 0usize;
     let mut plan = Vec::with_capacity(workflow.phases.len());
     for (phase_index, phase) in workflow.phases.iter().enumerate() {
-        let (samples, steps) = match phase.steps {
-            Some(steps) => (None, steps),
+        let (samples, natural_steps, steps) = match phase.steps {
+            Some(steps) => (None, None, steps),
             None => {
                 let samples = planned_sample_count(
                     &phase.data,
@@ -873,16 +890,15 @@ fn plan_training(
                     &token_cache_paths[phase_index],
                     &data_bindings[phase_index],
                 )?;
-                let steps_per_epoch =
-                    (samples / phase.batch_size).div_euclid(phase.gradient_accumulation);
-                let optimizer_steps =
-                    steps_per_epoch.checked_mul(phase.epochs).with_context(|| {
-                        format!(
-                            "workflow phase `{}` optimizer-step count overflows usize",
-                            phase.name
-                        )
-                    })?;
-                (Some(samples), optimizer_steps)
+                let (natural_steps, selected_steps) = select_phase_steps(
+                    &phase.name,
+                    samples,
+                    phase.batch_size,
+                    phase.gradient_accumulation,
+                    phase.epochs,
+                    phase.max_steps,
+                )?;
+                (Some(samples), Some(natural_steps), selected_steps)
             }
         };
         ensure!(
@@ -907,7 +923,11 @@ fn plan_training(
         total_steps = total_steps
             .checked_add(steps)
             .ok_or_else(|| anyhow::anyhow!("workflow optimizer-step count overflows usize"))?;
-        plan.push(PhasePlan { samples, steps });
+        plan.push(PhasePlan {
+            samples,
+            natural_steps,
+            steps,
+        });
     }
     Ok((plan, total_steps))
 }
@@ -1875,6 +1895,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn natural_epoch_step_cap_never_overasks_or_runs_unbounded() {
+        // 1,600 samples / 8 per batch / 4-way accumulation = 50 steps.
+        assert_eq!(
+            select_phase_steps("retrieval", 1_600, 8, 4, 1, None).unwrap(),
+            (50, 50)
+        );
+        assert_eq!(
+            select_phase_steps("retrieval", 1_600, 8, 4, 1, Some(20)).unwrap(),
+            (50, 20)
+        );
+        // A cap larger than the data is not an exact request: the natural
+        // epoch wins, avoiding the deterministic short-shard crash that an
+        // exact `steps` value would cause.
+        assert_eq!(
+            select_phase_steps("retrieval", 1_600, 8, 4, 1, Some(200)).unwrap(),
+            (50, 50)
+        );
+    }
+
+    #[test]
     fn coincident_wake_only_updates_emit_ordered_committed_metrics() {
         let schedule: hermes_train::sleep::SleepSchedule =
             serde_json::from_value(serde_json::json!({
@@ -2093,6 +2133,7 @@ mod tests {
                 epochs: 1,
                 shuffle_buffer: 1,
                 steps: Some(1),
+                max_steps: None,
                 loss_weight: 1.0,
                 learning_rate_scale: 1.0,
                 quantization: Some(WorkflowQuantizationPlan {

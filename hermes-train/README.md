@@ -19,6 +19,14 @@ Validate and inspect resolved paths before a run:
 hermes-train validate-workflow --workflow hermes-train/workflow.example.json
 ```
 
+Optimization phases may use `steps` for an exact optimizer-step request, or
+omit it to consume their configured epochs. Use `max_steps` with the latter to
+cap a natural-epoch plan: the resolved length is
+`min(epoch_steps, max_steps)`. `steps` and `max_steps` are mutually exclusive.
+This distinction matters for replay shards: an exact request can overrun a
+small shard and fail, while an uncapped large shard can silently dominate the
+workflow. The SFT example uses `max_steps` for retrieval replay for that reason.
+
 For the complete education recipe, also bind validation to the exact
 sleep-capable MAL before creating any run state. This rejects missing sleep
 hooks, mixed memory/ordinary layers, and tier-name or reserve-capacity drift:

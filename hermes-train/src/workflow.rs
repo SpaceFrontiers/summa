@@ -390,6 +390,12 @@ pub struct PhaseV2 {
     pub shuffle_buffer: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steps: Option<usize>,
+    /// Cap a data-derived epoch plan without asserting that the corpus can
+    /// supply exactly this many optimizer steps. Mutually exclusive with
+    /// `steps`: `steps` is an exact request, while `max_steps` is
+    /// `min(natural_epoch_steps, max_steps)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_weight: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,6 +452,23 @@ impl PhaseV2 {
         validate_positive(self.epochs, "epochs", name)?;
         validate_positive(self.shuffle_buffer, "shuffle_buffer", name)?;
         validate_positive(self.steps, "steps", name)?;
+        validate_positive(self.max_steps, "max_steps", name)?;
+        ensure!(
+            self.steps.is_none() || self.max_steps.is_none(),
+            "workflow phase `{name}` cannot set both steps and max_steps"
+        );
+        ensure!(
+            self.max_steps.is_none()
+                || matches!(
+                    self.kind,
+                    PhaseKind::Pretrain
+                        | PhaseKind::ContinuedPretrain
+                        | PhaseKind::Sft
+                        | PhaseKind::Quantization
+                ),
+            "workflow phase `{name}` ({}) cannot set max_steps because its executor does not implement adaptive data-derived step caps",
+            self.kind.name()
+        );
         ensure!(
             self.batch_size
                 .is_none_or(|value| value <= MAX_PHASE_BATCH_SIZE),
@@ -560,6 +583,7 @@ impl PhaseV2 {
                         && self.epochs.is_none()
                         && self.shuffle_buffer.is_none()
                         && self.steps.is_none()
+                        && self.max_steps.is_none()
                         && self.loss_weight.is_none()
                         && self.learning_rate_scale.is_none(),
                     "workflow phase `{name}` ({}) must not set task execution or optimizer geometry",
@@ -1273,6 +1297,26 @@ mod tests {
     }
 
     #[test]
+    fn sft_retrieval_replay_is_adaptively_capped() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflow.sft.example.json");
+        let workflow = load_workflow(&path)
+            .unwrap_or_else(|error| panic!("SFT workflow is invalid: {error:#}"));
+        let retrieval = workflow
+            .phases
+            .iter()
+            .filter(|phase| {
+                matches!(
+                    phase.task.as_ref(),
+                    Some(TaskConfig::RetrievalRepresentation { .. })
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retrieval.len(), 4);
+        assert!(retrieval.iter().all(|phase| phase.steps.is_none()));
+        assert!(retrieval.iter().all(|phase| phase.max_steps == Some(150)));
+    }
+
+    #[test]
     fn incompatible_workflow_versions_are_rejected_without_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.json");
@@ -1454,6 +1498,38 @@ mod tests {
         };
         let error = workflow.validate().unwrap_err().to_string();
         assert!(error.contains("phase limit"), "{error}");
+    }
+
+    #[test]
+    fn exact_steps_and_natural_epoch_cap_are_mutually_exclusive() {
+        let mut phase = training_phase(
+            "bounded-retrieval",
+            "continued_pretrain",
+            serde_json::json!({"type": "retrieval_representation"}),
+        );
+        phase["max_steps"] = serde_json::json!(5);
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [phase]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("both steps and max_steps"), "{error}");
+
+        let mut phase = training_phase(
+            "bounded-retrieval",
+            "continued_pretrain",
+            serde_json::json!({"type": "retrieval_representation"}),
+        );
+        phase.as_object_mut().unwrap().remove("steps");
+        phase["max_steps"] = serde_json::json!(0);
+        let workflow: WorkflowV2 = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "phases": [phase]
+        }))
+        .unwrap();
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("max_steps must be positive"), "{error}");
     }
 
     #[test]

@@ -753,7 +753,7 @@ mod tests {
         let program = directory.path().join("fake-nvidia-smi");
         executable(
             &program,
-            "#!/bin/sh\nprintf 'malformed\\n'\ni=0\nwhile [ \"$i\" -lt 64 ]; do\n  printf '3, 92, 2048, 40960, 255.5, 67\\n'\n  i=$((i + 1))\ndone\nsleep 30\n",
+            "#!/bin/sh\nprintf 'malformed\\n'\ni=0\nwhile [ \"$i\" -lt 64 ]; do\n  printf '3, 92, 2048, 40960, 255.5, 67\\n'\n  i=$((i + 1))\ndone\nexec sleep 30\n",
         );
         let mut config = NvidiaSmiSamplerConfig::new(Duration::from_millis(250), "3").unwrap();
         config.channel_capacity = 1;
@@ -765,11 +765,7 @@ mod tests {
             let drain = sampler.drain();
             if !drain.samples.is_empty()
                 && drain.diagnostics.iter().any(|diagnostic| {
-                    matches!(
-                        diagnostic,
-                        DeviceSamplerDiagnostic::InvalidSample(_)
-                            | DeviceSamplerDiagnostic::DroppedSamples(_)
-                    )
+                    matches!(diagnostic, DeviceSamplerDiagnostic::DroppedSamples(_))
                 })
             {
                 break drain;
@@ -780,8 +776,18 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(drain.samples.len(), 1);
-        assert_eq!(drain.samples[0].metrics.device_index, 3);
+        // The channel holds at most one queued sample, but the producer may
+        // refill it while `drain()` consumes it. Therefore one drain can
+        // legitimately observe more than the channel capacity. The dropped
+        // diagnostic above is the observable proof that overflow stayed
+        // bounded; an exact vector length would be a scheduler race.
+        assert!(!drain.samples.is_empty());
+        assert!(
+            drain
+                .samples
+                .iter()
+                .all(|sample| sample.metrics.device_index == 3)
+        );
         let stopped = Instant::now();
         drop(sampler);
         assert!(stopped.elapsed() < Duration::from_secs(2));

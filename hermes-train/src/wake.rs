@@ -44,6 +44,7 @@ pub(crate) struct ResolvedWakePhase {
     pub(crate) epochs: usize,
     pub(crate) shuffle_buffer: usize,
     pub(crate) steps: Option<usize>,
+    pub(crate) max_steps: Option<usize>,
     pub(crate) loss_weight: f64,
     pub(crate) learning_rate_scale: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +115,7 @@ fn project_wake_workflow(workflow: WorkflowV2) -> Result<ResolvedWakePlan> {
             epochs,
             shuffle_buffer,
             steps: phase.steps,
+            max_steps: phase.max_steps,
             loss_weight,
             learning_rate_scale,
             quantization,
@@ -171,6 +173,7 @@ mod tests {
         assert_eq!(phase.epochs, 1);
         assert_eq!(phase.shuffle_buffer, 8192);
         assert_eq!(phase.steps, Some(10));
+        assert_eq!(phase.max_steps, None);
         assert_eq!(phase.learning_rate_scale, 0.25);
         assert_eq!(phase.objective.name(), "summarization");
     }

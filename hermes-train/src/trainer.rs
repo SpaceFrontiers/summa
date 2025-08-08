@@ -1498,13 +1498,19 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
         .iter()
         .zip(&phase_plan)
         .map(|(phase, plan)| {
+            let step_summary = match plan.natural_steps {
+                Some(natural) if natural > plan.steps => {
+                    format!("{}(capped_from={natural})", plan.steps)
+                }
+                _ => plan.steps.to_string(),
+            };
             format!(
                 "{}:{}:samples={}:steps={}",
                 phase.name,
                 phase.objective.name(),
                 plan.samples
                     .map_or_else(|| "streaming".to_owned(), |n| n.to_string()),
-                plan.steps,
+                step_summary,
             )
         })
         .collect::<Vec<_>>()
@@ -2213,9 +2219,7 @@ pub(super) fn train(args: TrainArgs) -> Result<()> {
                         step_input_wait_seconds = 0.0;
                         step_host_to_device_seconds = 0.0;
                         step_accelerator_seconds = 0.0;
-                        if step >= total_steps
-                            || phase.steps.is_some_and(|limit| steps_in_phase >= limit)
-                        {
+                        if step >= total_steps || steps_in_phase >= phase_plan[phase_index].steps {
                             phase_limit_reached = true;
                             break;
                         }
